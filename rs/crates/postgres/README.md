@@ -130,7 +130,8 @@ Plain strings passed to `@@@` are treated as full-text search queries. Query bui
 
 ### Search Function
 
-For cases where you need scores or want to join search results explicitly:
+For cases where you need scores or want to join search results explicitly. `id` is the
+Antfly document ID as text, so cast the column it matches:
 
 ```sql
 SELECT t.*, s.score
@@ -139,7 +140,7 @@ JOIN antfly_search(
     'http://localhost:8080/db/v1/',
     'my_table',
     'fix my computer'
-) s ON t.id = s.id
+) s ON s.id = t.id::text
 ORDER BY s.score DESC;
 ```
 
@@ -150,7 +151,13 @@ RETURNS TABLE (id TEXT, score FLOAT8, data JSONB)
 
 ### Triggers
 
-Automatically sync row changes to Antfly (useful when not using the index AM):
+Automatically sync row changes to Antfly (useful when not using the index AM).
+The trigger does not create the Antfly table, so create it first:
+
+```bash
+curl -X POST http://localhost:8080/db/v1/tables/my_table \
+  -H "Content-Type: application/json" -d '{"num_shards": 1}'
+```
 
 ```sql
 CREATE TRIGGER sync_to_antfly

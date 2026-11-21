@@ -920,11 +920,11 @@ fn chunkStorageKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.Arti
     if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
     if (artifact_ref.kind != .embedding) return null;
     const source = artifact_ref.source orelse return null;
-    if (source.kind != .chunk) return null;
+    if (source.kind != .chunk and !(source.kind == .asset and source.unit_id != null)) return null;
     const chunk_ref = types.ArtifactRef{
         .document_id = artifact_ref.document_id,
         .name = source.name,
-        .kind = .chunk,
+        .kind = source.kind,
         .chunk_id = source.chunk_id,
         .window_index = source.window_index,
         .unit_id = source.unit_id,
@@ -1006,7 +1006,7 @@ fn hydrateDirectChunkAncestors(
     const chunk_payloads = try loadDirectChunkPayloads(alloc, owned.hits, shaper);
     defer freeOptionalOwnedBytes(alloc, chunk_payloads);
 
-    if (req.include_stored) {
+    defer if (req.include_stored) {
         for (owned.hits, 0..) |*hit, i| {
             if (hit.stored_data != null) continue;
             if (chunk_payloads[i]) |payload| {
@@ -1014,7 +1014,7 @@ fn hydrateDirectChunkAncestors(
                 chunk_payloads[i] = null;
             }
         }
-    }
+    };
 
     try hydrateArtifactRevisions(alloc, &owned, chunk_payloads, shaper);
     if (!req.hierarchy_include_source and !req.hierarchy_include_unit) return owned;
@@ -1024,14 +1024,31 @@ fn hydrateDirectChunkAncestors(
     for (owned.hits, 0..) |hit, i| {
         const chunk_key = (try chunkStorageKeyForHitAlloc(alloc, hit)) orelse continue;
         defer alloc.free(chunk_key);
-        const payload = chunk_payloads[i] orelse hit.stored_data orelse continue;
+        const payload = chunk_payloads[i] orelse hit.stored_data;
         const info = parseChunkAncestorInfoAlloc(alloc, chunk_key, payload) catch |err| switch (err) {
             error.InvalidChunkArtifact, error.InvalidInternalUserKey => continue,
             else => return err,
         };
         if (req.hierarchy_include_source) source_count += 1;
-        if (req.hierarchy_include_unit and info.unit_key != null) unit_count += 1;
         infos[i] = info;
+        if (req.hierarchy_include_unit and info.unit_key != null and hit.ancestor_unit_data == null) {
+            // A direct unit member and its unit ancestor share a storage key.
+            // Reuse the complete member payload even when the hit itself has
+            // already been projected to a smaller set of requested fields.
+            if (std.mem.eql(u8, chunk_key, info.unit_key.?)) {
+                if (chunk_payloads[i]) |full| {
+                    if (req.include_stored and hit.stored_data == null) {
+                        owned.hits[i].ancestor_unit_data = try alloc.dupe(u8, full);
+                    } else {
+                        owned.hits[i].ancestor_unit_data = full;
+                        chunk_payloads[i] = null;
+                    }
+                }
+                // This key was already read, including a definitive miss.
+                alloc.free(info.unit_key.?);
+                infos[i].?.unit_key = null;
+            } else unit_count += 1;
+        }
     }
 
     if (req.hierarchy_include_source and source_count > 0) {
@@ -1069,12 +1086,11 @@ fn hydrateArtifactRevisions(alloc: Allocator, result: *types.SearchResult, paylo
             defer state_key.deinit(alloc);
             try internal_keys.appendDocumentPrefix(&state_key, alloc, ref.document_id);
             try state_key.append(alloc, internal_keys.asset_state_kind);
-            // An embedding hit reports its source chunk (see reconcileArtifactRef),
-            // and its payload above is that chunk's: fingerprint the chunk
-            // producer's state too, so both revisions describe the reported member.
+            // Dense hits report the source chunk or document unit. Fingerprint
+            // the producer that owns that member's payload.
             const producer = if (ref.kind == .chunk and ref.source != null and ref.source.?.kind == .asset)
                 ref.source.?.name
-            else if (ref.kind == .embedding and ref.source != null and ref.source.?.kind == .chunk)
+            else if (ref.kind == .embedding and ref.source != null and (ref.source.?.kind == .chunk or (ref.source.?.kind == .asset and ref.source.?.unit_id != null)))
                 ref.source.?.name
             else
                 ref.name;
@@ -1180,7 +1196,7 @@ fn loadDirectChunkPayloads(
     return loaded;
 }
 
-fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload: []const u8) !ChunkAncestorInfo {
+fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload: ?[]const u8) !ChunkAncestorInfo {
     var decoded = (try artifact_ids.decodeArtifactRefAlloc(alloc, chunk_key)) orelse return error.InvalidChunkArtifact;
     defer decoded.deinit(alloc);
     // Native keys own source identity. Generic asset payloads are application
@@ -1191,7 +1207,7 @@ fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload:
         .parent_doc_key = parent_doc_key,
         .unit_key = if (decoded.unit_id) |unit| try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, decoded.name, unit) else null,
     };
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload orelse return error.InvalidChunkArtifact, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidChunkArtifact;
     const object = parsed.value.object;
@@ -1277,7 +1293,8 @@ fn hydrateDirectChunkUnitAncestors(
     const unit_keys = try alloc.alloc([]const u8, unit_count);
     defer alloc.free(unit_keys);
     var index: usize = 0;
-    for (infos) |maybe_info| {
+    for (infos, result.hits) |maybe_info, hit| {
+        if (hit.ancestor_unit_data != null) continue;
         const info = maybe_info orelse continue;
         const unit_key = info.unit_key orelse continue;
         unit_keys[index] = unit_key;
@@ -1300,7 +1317,7 @@ fn hydrateDirectChunkUnitAncestors(
     index = 0;
     for (result.hits, infos) |*hit, maybe_info| {
         const info = maybe_info orelse continue;
-        if (info.unit_key == null) continue;
+        if (info.unit_key == null or hit.ancestor_unit_data != null) continue;
         if (loaded[index]) |bytes| {
             hit.ancestor_unit_data = bytes;
             loaded[index] = null;
@@ -1362,6 +1379,7 @@ fn containsDocId(doc_ids: []const []const u8, expected: []const u8) bool {
 const ResolvedPatternDocIds = struct {
     ids: []const []const u8 = &.{},
     ordinal_set: ?doc_set.ResolvedDocSet = null,
+    borrowed_ordinal_set: ?*const doc_set.ResolvedDocSet = null,
     active: bool = false,
     all: bool = false,
     owned: bool = false,
@@ -1378,66 +1396,182 @@ fn freeResolvedDocIds(alloc: Allocator, ids: []const []const u8) void {
     if (ids.len > 0) alloc.free(@constCast(ids));
 }
 
+fn patternLegacyMembershipAlloc(
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    control: @import("../../../search/query.zig").ExecutionControl,
+) !std.StringHashMapUnmanaged(void) {
+    var membership: std.StringHashMapUnmanaged(void) = .empty;
+    errdefer membership.deinit(alloc);
+    if (set.* == .doc_keys) {
+        for (set.doc_keys) |key| {
+            try control.check();
+            try membership.put(alloc, key, {});
+        }
+    }
+    return membership;
+}
+
+const PatternParentMemo = struct {
+    const Key = struct { hit: []const u8, document: []const u8 };
+    const Context = struct {
+        pub fn hash(_: @This(), key: Key) u64 {
+            return std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, key.hit), key.document);
+        }
+        pub fn eql(_: @This(), a: Key, b: Key) bool {
+            return std.mem.eql(u8, a.hit, b.hit) and std.mem.eql(u8, a.document, b.document);
+        }
+    };
+    parents: std.HashMapUnmanaged(Key, ?[]u8, Context, 80) = .empty,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        var values = self.parents.valueIterator();
+        while (values.next()) |value| if (value.*) |parent| alloc.free(parent);
+        self.parents.deinit(alloc);
+    }
+
+    fn get(self: *@This(), alloc: Allocator, executor: StoredPatternFilterExecutor, hit: types.SearchHit) !?[]const u8 {
+        const key = Key{ .hit = hit.id, .document = if (hit.artifact_ref) |artifact| artifact.document_id else "" };
+        if (self.parents.get(key)) |value| return value;
+        const parent = executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
+            error.InvalidChunkArtifact, error.StoredDocMissing => null,
+            else => return err,
+        };
+        errdefer if (parent) |id| alloc.free(id);
+        try self.parents.put(alloc, key, parent);
+        return parent;
+    }
+};
+
+// One memo per result pass. All operands use the same read generation,
+// and the hit IDs and resolved parent keys outlive the memo.
+const PatternOrdinalMemo = struct {
+    sets: std.StringHashMapUnmanaged(doc_set.ResolvedDocSet) = .empty,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        var values = self.sets.valueIterator();
+        while (values.next()) |value| value.deinit(alloc);
+        self.sets.deinit(alloc);
+    }
+
+    fn get(
+        self: *@This(),
+        alloc: Allocator,
+        executor: StoredPatternFilterExecutor,
+        key: []const u8,
+        generation: ?u64,
+    ) !?*const doc_set.ResolvedDocSet {
+        const resolve = executor.resolve_doc_ids_to_doc_set orelse return null;
+        if (self.sets.getPtr(key)) |set| return set;
+        var set = try resolve(executor.ctx, alloc, &.{key}, generation);
+        errdefer set.deinit(alloc);
+        const slot = try self.sets.getOrPut(alloc, key);
+        slot.value_ptr.* = set;
+        return slot.value_ptr;
+    }
+};
+
 fn resolvePatternDocIdsAlloc(
     alloc: Allocator,
     set: *const doc_set.ResolvedDocSet,
+    legacy: *const std.StringHashMapUnmanaged(void),
     hits: []const types.SearchHit,
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
+    parents: ?*PatternParentMemo,
+    ordinal_memo: *PatternOrdinalMemo,
+    control: @import("../../../search/query.zig").ExecutionControl,
 ) !ResolvedPatternDocIds {
     return switch (set.*) {
         .all => .{ .all = true },
         .none => .{ .active = true },
         .doc_keys => |keys| .{ .ids = keys, .active = true },
-        .ordinals, .ordinal_bitmap => blk: {
-            if (allHitsHaveDocOrdinals(hits)) break :blk .{
-                .ordinal_set = try doc_set.cloneAlloc(alloc, set),
-                .active = true,
-            };
-            const resolve = executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
-            const ids = (try resolve(executor.ctx, alloc, set, generation)) orelse return error.UnsupportedQueryRequest;
-            break :blk .{ .ids = ids, .active = true, .owned = true };
-        },
+        .ordinals, .ordinal_bitmap => try resolvePatternOrdinalHitsAlloc(alloc, set, legacy, hits, generation, executor, parents, ordinal_memo, control),
     };
 }
 
-fn resolvePatternDocIdsFromPublicIdsAlloc(
+fn resolvePatternOrdinalHitsAlloc(
     alloc: Allocator,
-    ids: []const []const u8,
+    set: *const doc_set.ResolvedDocSet,
+    legacy: *const std.StringHashMapUnmanaged(void),
     hits: []const types.SearchHit,
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
+    parents: ?*PatternParentMemo,
+    ordinal_memo: *PatternOrdinalMemo,
+    control: @import("../../../search/query.zig").ExecutionControl,
 ) !ResolvedPatternDocIds {
-    if (ids.len == 0) return .{ .active = true };
-    const resolve = executor.resolve_doc_ids_to_doc_set orelse return .{ .ids = ids, .active = true };
-    var resolved = try resolve(executor.ctx, alloc, ids, generation);
-    errdefer resolved.deinit(alloc);
-    switch (resolved) {
-        .all => {
-            resolved.deinit(alloc);
-            return .{ .all = true };
-        },
-        .none => {
-            resolved.deinit(alloc);
-            return .{ .active = true };
-        },
-        .doc_keys => |keys| {
-            return .{ .ids = keys, .active = true, .ordinal_set = resolved };
-        },
-        .ordinals, .ordinal_bitmap => {
-            if (allHitsHaveDocOrdinals(hits)) return .{ .ordinal_set = resolved, .active = true };
-            const project = executor.resolve_doc_set_doc_ids orelse {
-                resolved.deinit(alloc);
-                return error.UnsupportedQueryRequest;
-            };
-            const projected = (try project(executor.ctx, alloc, &resolved, generation)) orelse {
-                resolved.deinit(alloc);
-                return error.UnsupportedQueryRequest;
-            };
-            resolved.deinit(alloc);
-            return .{ .ids = projected, .active = true, .owned = true };
-        },
+    if (allHitsHaveDocOrdinals(hits)) return .{ .borrowed_ordinal_set = set, .active = true };
+
+    var matched = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (matched.items) |id| alloc.free(id);
+        matched.deinit(alloc);
     }
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const temp = scratch.allocator();
+    var unresolved: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
+    for (hits) |hit| {
+        try control.check();
+        if (hit.doc_ordinal != null) continue;
+        const parent = if (parents) |memo| try memo.get(alloc, executor, hit) else null;
+        const key = parent orelse hit.id;
+        if (legacy.contains(key)) continue;
+        if (try ordinal_memo.get(alloc, executor, key, generation)) |hit_set| {
+            if (hit_set.* == .none) continue;
+            if (hit_set.* == .ordinals) {
+                for (hit_set.ordinals) |ordinal| {
+                    if (!set.containsOrdinal(ordinal)) continue;
+                    try appendPatternMatch(alloc, &matched, hit.id);
+                    break;
+                }
+                continue;
+            }
+        }
+        const entry = try unresolved.getOrPut(temp, key);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(temp, hit.id);
+    }
+
+    if (unresolved.count() != 0) {
+        const project = executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
+        var bitmap_it = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+        var offset: usize = 0;
+        // A reverse-only identity has no keyed access path. Bound the
+        // compatibility work independently of the bitmap cardinality.
+        const reverse_probe_limit = 65_536;
+        var probes: usize = 0;
+        while (unresolved.count() != 0) {
+            try control.check();
+            var batch: [256]doc_set.DocOrdinal = undefined;
+            const ordinals = if (bitmap_it) |*it| blk: {
+                var len: usize = 0;
+                while (len < batch.len) : (len += 1) batch[len] = it.next() orelse break;
+                break :blk batch[0..len];
+            } else blk: {
+                const keys = set.ordinals[offset..][0..@min(batch.len, set.ordinals.len - offset)];
+                offset += keys.len;
+                break :blk keys;
+            };
+            if (ordinals.len == 0) break;
+            probes += ordinals.len;
+            if (probes > reverse_probe_limit) return error.QueryCandidateBudgetExceeded;
+            const batch_set = doc_set.ResolvedDocSet{ .ordinals = ordinals };
+            const keys = (try project(executor.ctx, alloc, &batch_set, generation)) orelse return error.UnsupportedQueryRequest;
+            defer freeResolvedDocIds(alloc, keys);
+            for (keys) |key| if (unresolved.fetchRemove(key)) |entry| {
+                for (entry.value.items) |id| try appendPatternMatch(alloc, &matched, id);
+            };
+        }
+    }
+    return .{ .borrowed_ordinal_set = set, .ids = try matched.toOwnedSlice(alloc), .active = true, .owned = true };
+}
+
+fn appendPatternMatch(alloc: Allocator, matched: *std.ArrayListUnmanaged([]const u8), key: []const u8) !void {
+    const id = try alloc.dupe(u8, key);
+    errdefer alloc.free(id);
+    try matched.append(alloc, id);
 }
 
 fn allHitsHaveDocOrdinals(hits: []const types.SearchHit) bool {
@@ -1448,11 +1582,14 @@ fn allHitsHaveDocOrdinals(hits: []const types.SearchHit) bool {
 }
 
 fn resolvedPatternContainsHit(resolved: ResolvedPatternDocIds, hit: types.SearchHit) bool {
+    if (resolved.borrowed_ordinal_set) |set| {
+        return if (hit.doc_ordinal) |ordinal| set.containsOrdinal(ordinal) else containsDocId(resolved.ids, hit.id);
+    }
     if (resolved.ordinal_set) |*set| {
         return switch (set.*) {
             .doc_keys => containsDocId(resolved.ids, hit.id),
             .ordinals, .ordinal_bitmap => blk: {
-                const ordinal = hit.doc_ordinal orelse return false;
+                const ordinal = hit.doc_ordinal orelse return containsDocId(resolved.ids, hit.id);
                 break :blk set.containsOrdinal(ordinal);
             },
             .all => true,
@@ -1460,6 +1597,13 @@ fn resolvedPatternContainsHit(resolved: ResolvedPatternDocIds, hit: types.Search
         };
     }
     return containsDocId(resolved.ids, hit.id);
+}
+
+fn resolvedPatternContainsSharedHit(resolved: ResolvedPatternDocIds, hit: types.SearchHit, match_id: []const u8) bool {
+    if (resolved.borrowed_ordinal_set == null and resolved.ordinal_set == null) {
+        return containsDocId(resolved.ids, match_id) or containsDocId(resolved.ids, hit.id);
+    }
+    return resolvedPatternContainsHit(resolved, hit);
 }
 
 fn resolvedDocFilterFromRequest(req: types.SearchRequest) ?*const doc_set.ResolvedDocFilter {
@@ -1496,7 +1640,7 @@ fn loadParentStoredForGroupedHits(
 
 // Verification over an exact, bounded key set is not table enumeration. Check
 // the actual result identities too; a bare result-size limit is not a proof.
-fn storedValueVerificationInput(req: types.SearchRequest, hits: []const types.SearchHit) graph_exec.CompiledPatternFilter.VerificationInput {
+fn storedValueVerificationInput(req: types.SearchRequest, hits: []const types.SearchHit, keep: []const bool) graph_exec.CompiledPatternFilter.VerificationInput {
     var single: [1][]const u8 = undefined;
     const keys = if (req.value_search_candidate_keys.len != 0)
         req.value_search_candidate_keys
@@ -1507,8 +1651,12 @@ fn storedValueVerificationInput(req: types.SearchRequest, hits: []const types.Se
         single[0] = children.parent_id;
         break :blk if (children.parent_ids.len != 0) children.parent_ids else &single;
     } else return .scan;
-    if (keys.len > types.max_canonical_hierarchy_groups or hits.len > keys.len) return .scan;
-    for (hits) |hit| {
+    if (keys.len > types.max_canonical_hierarchy_groups) return .scan;
+    var count: usize = 0;
+    for (hits, keep) |hit, survives| {
+        if (!survives) continue;
+        count += 1;
+        if (count > keys.len) return .scan;
         const included = for (keys) |key| {
             if (std.mem.eql(u8, hit.id, key)) break true;
         } else false;
@@ -1528,41 +1676,132 @@ pub fn applyStoredSearchPatternFilters(
     const resolved_filter = resolvedDocFilterFromRequest(req);
     if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and !has_native_doc_ids and resolved_filter == null) return result;
 
-    var resolved_include = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.include, result.hits, req.identity_read_generation, executor)
-    else
-        ResolvedPatternDocIds{};
-    defer resolved_include.deinit(alloc);
+    const member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
 
-    var resolved_exclude = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.exclude, result.hits, req.identity_read_generation, executor)
-    else
-        ResolvedPatternDocIds{};
-    defer resolved_exclude.deinit(alloc);
+    var parents: PatternParentMemo = .{};
+    defer parents.deinit(alloc);
+    var ordinals: PatternOrdinalMemo = .{};
+    defer ordinals.deinit(alloc);
 
-    var native_include = if (has_positive_doc_ids)
-        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.filter_doc_ids, result.hits, req.identity_read_generation, executor)
-    else
-        ResolvedPatternDocIds{};
-    defer native_include.deinit(alloc);
+    const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+    var include_keys: std.StringHashMapUnmanaged(void) = .empty;
+    defer include_keys.deinit(alloc);
+    var exclude_keys: std.StringHashMapUnmanaged(void) = .empty;
+    defer exclude_keys.deinit(alloc);
+    if (resolved_filter) |filter| {
+        include_keys = try patternLegacyMembershipAlloc(alloc, &filter.legacy_include, control);
+        exclude_keys = try patternLegacyMembershipAlloc(alloc, &filter.legacy_exclude, control);
+    }
 
-    var native_exclude = if (req.exclude_doc_ids.len > 0)
-        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.exclude_doc_ids, result.hits, req.identity_read_generation, executor)
-    else
-        ResolvedPatternDocIds{};
-    defer native_exclude.deinit(alloc);
+    const keep_hits = try alloc.alloc(bool, result.hits.len);
+    defer alloc.free(keep_hits);
+    @memset(keep_hits, true);
+    if (has_native_doc_ids or resolved_filter != null) {
+        const candidates = try alloc.dupe(types.SearchHit, result.hits);
+        defer alloc.free(candidates);
+        const indexes = try alloc.alloc(usize, candidates.len);
+        defer alloc.free(indexes);
+        for (indexes, 0..) |*index, i| index.* = i;
+        var candidate_len = candidates.len;
+        if ((has_positive_doc_ids and req.filter_doc_ids.len == 0) or
+            (if (resolved_filter) |filter| filter.exclude == .all or (filter.include == .none and include_keys.count() == 0) else false))
+        {
+            @memset(keep_hits, false);
+            candidate_len = 0;
+        }
+        var owned_explicit_include: ?doc_set.ResolvedDocSet = null;
+        defer if (owned_explicit_include) |*set| set.deinit(alloc);
+        var owned_explicit_exclude: ?doc_set.ResolvedDocSet = null;
+        defer if (owned_explicit_exclude) |*set| set.deinit(alloc);
+        const raw_explicit_include = doc_set.ResolvedDocSet{ .doc_keys = req.filter_doc_ids };
+        const raw_explicit_exclude = doc_set.ResolvedDocSet{ .doc_keys = req.exclude_doc_ids };
+        if (candidate_len != 0) {
+            if (executor.resolve_doc_ids_to_doc_set) |resolve| {
+                if (has_positive_doc_ids) owned_explicit_include = try resolve(executor.ctx, alloc, req.filter_doc_ids, req.identity_read_generation);
+                if (req.exclude_doc_ids.len != 0) owned_explicit_exclude = try resolve(executor.ctx, alloc, req.exclude_doc_ids, req.identity_read_generation);
+            }
+        }
+        const no_legacy: std.StringHashMapUnmanaged(void) = .empty;
+        const Gate = struct {
+            operand: ?*const doc_set.ResolvedDocSet,
+            legacy: *const std.StringHashMapUnmanaged(void),
+            shared: bool = false,
+            exclude: bool = false,
+        };
+        const gates = [_]Gate{
+            .{ .operand = if (resolved_filter) |filter| &filter.include else null, .legacy = &include_keys, .shared = true },
+            .{ .operand = if (has_positive_doc_ids) if (owned_explicit_include) |*set| set else &raw_explicit_include else null, .legacy = &no_legacy },
+            .{ .operand = if (resolved_filter) |filter| &filter.exclude else null, .legacy = &exclude_keys, .shared = true, .exclude = true },
+            .{ .operand = if (req.exclude_doc_ids.len != 0) if (owned_explicit_exclude) |*set| set else &raw_explicit_exclude else null, .legacy = &no_legacy, .exclude = true },
+        };
+        // First apply key-only gates and ordinal gates to hits whose ordinal
+        // is already known. Only surviving unresolved hits need rebuilding.
+        for ([_]bool{ true, false }) |cheap| {
+            for (gates) |gate| {
+                if (candidate_len == 0) break;
+                const operand = gate.operand orelse continue;
+                const key_only = operand.* != .ordinals and operand.* != .ordinal_bitmap;
+                if ((!cheap and key_only) or
+                    (!gate.exclude and operand.* == .all) or
+                    (gate.exclude and operand.* == .none and gate.legacy.count() == 0)) continue;
+                var resolved = if (cheap and !key_only)
+                    ResolvedPatternDocIds{ .borrowed_ordinal_set = operand, .active = true }
+                else
+                    try resolvePatternDocIdsAlloc(alloc, operand, gate.legacy, candidates[0..candidate_len], req.identity_read_generation, executor, if (gate.shared and parent_aware) &parents else null, &ordinals, control);
+                defer resolved.deinit(alloc);
+                var surviving: usize = 0;
+                for (candidates[0..candidate_len], indexes[0..candidate_len]) |hit, index| {
+                    try control.check();
+                    // Legacy exclusions settle membership even when the hit
+                    // has no ordinal and the gate also has an ordinal arm.
+                    if (cheap and gate.exclude and gate.legacy.count() != 0 and hit.doc_ordinal == null) {
+                        const parent = if (gate.shared and parent_aware) try parents.get(alloc, executor, hit) else null;
+                        if (gate.legacy.contains(parent orelse hit.id)) {
+                            keep_hits[index] = false;
+                            continue;
+                        }
+                    }
+                    if (!key_only and (cheap == (hit.doc_ordinal == null))) {
+                        candidates[surviving] = hit;
+                        indexes[surviving] = index;
+                        surviving += 1;
+                        continue;
+                    }
+                    const needs_parent = gate.shared and parent_aware and (key_only or gate.legacy.count() != 0);
+                    const parent = if (needs_parent) try parents.get(alloc, executor, hit) else null;
+                    const match_id = parent orelse hit.id;
+                    const matches = resolved.all or if (gate.shared)
+                        gate.legacy.contains(match_id) or
+                            resolvedPatternContainsSharedHit(resolved, hit, match_id)
+                    else
+                        resolvedPatternContainsHit(resolved, hit);
+                    if (matches == gate.exclude) {
+                        keep_hits[index] = false;
+                        continue;
+                    }
+                    candidates[surviving] = hit;
+                    indexes[surviving] = index;
+                    surviving += 1;
+                }
+                candidate_len = surviving;
+            }
+        }
+    }
 
     var filter_query = if (req.filter_query_json.len > 0)
-        try std.json.parseFromSlice(std.json.Value, alloc, req.filter_query_json, .{})
+        try std.json.parseFromSlice(std.json.Value, alloc, req.filter_query_json, .{ .parse_numbers = false })
     else
         null;
     defer if (filter_query) |*parsed| parsed.deinit();
+    if (filter_query) |*parsed| try graph_exec.normalizePatternNumbers(&parsed.value);
 
     var exclusion_query = if (req.exclusion_query_json.len > 0)
-        try std.json.parseFromSlice(std.json.Value, alloc, req.exclusion_query_json, .{})
+        try std.json.parseFromSlice(std.json.Value, alloc, req.exclusion_query_json, .{ .parse_numbers = false })
     else
         null;
     defer if (exclusion_query) |*parsed| parsed.deinit();
+    if (exclusion_query) |*parsed| try graph_exec.normalizePatternNumbers(&parsed.value);
 
     var matcher_arena = std.heap.ArenaAllocator.init(alloc);
     defer matcher_arena.deinit();
@@ -1580,22 +1819,20 @@ pub fn applyStoredSearchPatternFilters(
     var local_value_work: @import("../../../search/value_query.zig").Work = .{};
     defer local_value_work.deinit(alloc);
     const value_work = req.value_search_work orelse &local_value_work;
-    const verification_input = storedValueVerificationInput(req, result.hits);
-    if (compiled_filter) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
-    if (compiled_exclusion) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
+    if (std.mem.indexOfScalar(bool, keep_hits, true) != null) {
+        const verification_input = storedValueVerificationInput(req, result.hits, keep_hits);
+        if (compiled_filter) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
+        if (compiled_exclusion) |compiled| try compiled.bindValueWork(value_work, req.value_search_execution, verification_input);
+    }
 
     const logical_verification = (if (compiled_filter) |compiled| compiled.hasLogicalValues() else false) or
         (if (compiled_exclusion) |compiled| compiled.hasLogicalValues() else false);
     const filter_needs_stored = if (compiled_filter) |compiled| compiled.needsStoredDoc() else false;
     const exclusion_needs_stored = if (compiled_exclusion) |compiled| compiled.needsStoredDoc() else false;
     const needs_stored = filter_needs_stored or exclusion_needs_stored;
+    const exact_numbers = (if (compiled_filter) |compiled| compiled.hasStandardRange() else false) or
+        (if (compiled_exclusion) |compiled| compiled.hasStandardRange() else false);
 
-    // Member/chunk-mode hits are a separate full-text/vector document from
-    // their parent row: their own stored payload never carries the parent's
-    // fields. When the caller wired parent resolution, match against the
-    // resolved parent row instead of the hit's own stored data (issue #931).
-    const member_mode = req.return_mode == .member or req.return_mode == .chunk;
-    const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
     // load_parent_stored projects the parent row through the RESPONSE
     // request's own field selection (`req.fields`/`req.include_all_fields`).
     // A predicate field the caller didn't ask back in the response (e.g.
@@ -1615,6 +1852,7 @@ pub fn applyStoredSearchPatternFilters(
     var missing_indices = std.ArrayListUnmanaged(usize).empty;
     defer missing_indices.deinit(alloc);
     for (result.hits, 0..) |hit, i| {
+        if (!keep_hits[i]) continue;
         if (needs_stored and !parent_aware and hit.stored_data == null) try missing_indices.append(alloc, i);
     }
 
@@ -1644,11 +1882,10 @@ pub fn applyStoredSearchPatternFilters(
     // Decide first and commit second. Every fallible parse/load/match happens
     // while the caller still owns an untouched result, so errors preserve the
     // input. The commit phase only moves or destroys already-owned hits.
-    const keep_hits = try alloc.alloc(bool, result.hits.len);
-    defer alloc.free(keep_hits);
     var loaded_missing_index: usize = 0;
     var kept_len: usize = 0;
     for (result.hits, 0..) |hit, i| {
+        if (!keep_hits[i]) continue;
         _ = arena_state.reset(.retain_capacity);
         const hit_alloc = arena_state.allocator();
         const batch_loaded_stored = if (needs_stored and hit.stored_data == null and loaded_many != null) blk: {
@@ -1657,11 +1894,7 @@ pub fn applyStoredSearchPatternFilters(
         } else null;
         const parsed_stored = if (needs_stored) blk: {
             const maybe_stored: ?[]u8 = if (parent_aware) pblk: {
-                const parent_id = executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
-                    error.InvalidChunkArtifact, error.StoredDocMissing => break :pblk null,
-                    else => return err,
-                };
-                defer alloc.free(parent_id);
+                const parent_id = (try parents.get(alloc, executor, hit)) orelse break :pblk null;
                 if (parent_stored_cache.get(parent_id)) |cached| break :pblk cached;
                 const loaded = try executor.load_parent_stored.?(executor.ctx, alloc, unprojected_parent_req, parent_id);
                 errdefer if (loaded) |bytes| alloc.free(bytes);
@@ -1686,7 +1919,10 @@ pub fn applyStoredSearchPatternFilters(
                 try values.Work.charge(&value_work.documents, 1, req.value_search_execution.max_documents);
                 try values.Work.charge(&value_work.bytes, @intCast(stored.len), req.value_search_execution.max_bytes);
             }
-            break :blk try std.json.parseFromSlice(std.json.Value, hit_alloc, stored, .{});
+            break :blk try std.json.parseFromSliceLeaky(std.json.Value, hit_alloc, stored, .{
+                .parse_numbers = !exact_numbers,
+                .allocate = .alloc_always,
+            });
         } else null;
 
         // Member/chunk-mode hits are a separate document from their parent
@@ -1697,43 +1933,26 @@ pub fn applyStoredSearchPatternFilters(
         // lowerTextQueryToStoredPatternValueAlloc) must match the resolved
         // parent id, not the chunk's own hit.id, or it silently matches
         // nothing (PR #957 review blocker 6).
-        const resolved_match_parent_id: ?[]u8 = if (parent_aware) pidblk: {
-            break :pidblk executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
-                error.InvalidChunkArtifact, error.StoredDocMissing => break :pidblk null,
-                else => return err,
-            };
-        } else null;
-        defer if (resolved_match_parent_id) |parent_id| alloc.free(parent_id);
+        const resolved_match_parent_id = if (parent_aware and (compiled_filter != null or compiled_exclusion != null))
+            try parents.get(alloc, executor, hit)
+        else
+            null;
         const match_id: []const u8 = resolved_match_parent_id orelse hit.id;
 
         var keep = true;
-        if (has_positive_doc_ids) {
-            keep = resolvedPatternContainsHit(native_include, hit);
-        }
-        if (keep and resolved_include.active) {
-            keep = resolvedPatternContainsHit(resolved_include, hit);
-        }
-        if (keep and req.exclude_doc_ids.len > 0) {
-            keep = !resolvedPatternContainsHit(native_exclude, hit);
-        }
-        if (keep and resolved_exclude.all) {
-            keep = false;
-        }
-        if (keep and resolved_exclude.active) {
-            keep = !resolvedPatternContainsHit(resolved_exclude, hit);
-        }
         if (keep and compiled_filter != null) {
             const compiled = compiled_filter.?;
-            keep = if (filter_needs_stored)
-                try compiled.matches(hit_alloc, match_id, parsed_stored.?.value)
+            keep = if (filter_needs_stored and exact_numbers)
+                try compiled.matchesPreservedNumbers(hit_alloc, match_id, parsed_stored.?)
             else
-                try compiled.matches(hit_alloc, match_id, .null);
+                try compiled.matches(hit_alloc, match_id, if (filter_needs_stored) parsed_stored.? else .null);
         }
         if (keep and compiled_exclusion != null) {
-            keep = !(if (exclusion_needs_stored)
-                try compiled_exclusion.?.matches(hit_alloc, match_id, parsed_stored.?.value)
+            const compiled = compiled_exclusion.?;
+            keep = !(if (exclusion_needs_stored and exact_numbers)
+                try compiled.matchesPreservedNumbers(hit_alloc, match_id, parsed_stored.?)
             else
-                try compiled_exclusion.?.matches(hit_alloc, match_id, .null));
+                try compiled.matches(hit_alloc, match_id, if (exclusion_needs_stored) parsed_stored.? else .null));
         }
 
         keep_hits[i] = keep;
@@ -1894,9 +2113,7 @@ pub fn resolveChunkParentId(
     resolver: ChunkParentResolver,
 ) ![]u8 {
     if (hit.artifact_ref) |artifact_ref| {
-        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
-            return try alloc.dupe(u8, artifact_ref.document_id);
-        }
+        return try alloc.dupe(u8, artifact_ref.document_id);
     }
 
     if (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isAssetArtifactKey(hit.id)) {
@@ -1909,9 +2126,7 @@ pub fn resolveChunkParentId(
     }) |artifact_ref_value| {
         var artifact_ref = artifact_ref_value;
         defer artifact_ref.deinit(alloc);
-        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
-            return try alloc.dupe(u8, artifact_ref.document_id);
-        }
+        return try alloc.dupe(u8, artifact_ref.document_id);
     }
 
     const stored = if (hit.stored_data) |stored_data|
@@ -1926,6 +2141,25 @@ pub fn resolveChunkParentId(
     const parent = parsed.value.object.get("_parent_doc_key") orelse parsed.value.object.get("parent_doc_key") orelse return try alloc.dupe(u8, hit.id);
     if (parent != .string) return error.InvalidChunkArtifact;
     return try alloc.dupe(u8, parent.string);
+}
+
+test "source grouping trusts a whole document embedding in a mixed page index" {
+    const a = std.testing.allocator;
+    const loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedDocumentRead;
+        }
+    };
+    var hit: types.SearchHit = .{
+        .id = @constCast("doc"),
+        .artifact_ref = .{ .kind = .embedding, .name = @constCast("text"), .document_id = @constCast("doc") },
+    };
+    for ([_]?[]u8{ null, @constCast("{\"parent_doc_key\":\"other\"}") }) |payload| {
+        hit.stored_data = payload;
+        const parent = try resolveChunkParentId(a, hit, .{ .ctx = null, .load_stored = loader.load });
+        defer a.free(parent);
+        try std.testing.expectEqualStrings("doc", parent);
+    }
 }
 
 const ArtifactIdentityMatch = enum {
@@ -1998,6 +2232,12 @@ fn externalizeSearchHitIdentity(alloc: Allocator, hit: *types.SearchHit) !void {
 fn externalizeChunkHitIdentity(alloc: Allocator, hit: *types.ChunkHit) !void {
     var resolved = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, hit.id);
     defer resolved.deinit(alloc);
+
+    // A shard may already have externalized this member before the coordinator
+    // shapes its grouped page. Recover that public identity and validate it
+    // against the retained reference instead of clearing provenance on pass two.
+    if (resolved.artifact_ref == null)
+        resolved.artifact_ref = try artifact_ids.decodeArtifactPublicIdAlloc(alloc, resolved.id);
 
     const id = try alloc.dupe(u8, resolved.id);
     alloc.free(hit.id);
@@ -2371,6 +2611,109 @@ test "applyStoredSearchPatternFilters skips stored loads for doc_id-only filters
     try std.testing.expectEqual(@as(usize, 0), loader.many_calls);
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "optional numeric range result membership keeps exceptional keys without reverse projection" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        calls: usize = 0,
+        fn failReverse(_: ?*anyopaque, _: Allocator, _: *const doc_set.ResolvedDocSet, _: ?u64) anyerror!?[]const []const u8 {
+            return error.UnexpectedReverseProjection;
+        }
+
+        fn resolve(ctx: ?*anyopaque, a: Allocator, keys: []const []const u8, _: ?u64) anyerror!doc_set.ResolvedDocSet {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            try std.testing.expectEqualSlices(u8, "recoverable", keys[0]);
+            return try doc_set.fromOrdinalsAlloc(a, &.{7});
+        }
+    };
+    var primary = try doc_set.fromOrdinalsAlloc(alloc, &.{ 4, 7 });
+    defer primary.deinit(alloc);
+    var legacy = try doc_set.cloneDocKeysAlloc(alloc, &.{"legacy"});
+    defer legacy.deinit(alloc);
+    const hits: []const types.SearchHit = &.{
+        .{ .id = @constCast("legacy") },
+        .{ .id = @constCast("recoverable") },
+        .{ .id = @constCast("mapped"), .doc_ordinal = 4 },
+    };
+    var membership = try patternLegacyMembershipAlloc(alloc, &legacy, .{});
+    defer membership.deinit(alloc);
+    var memo: PatternOrdinalMemo = .{};
+    defer memo.deinit(alloc);
+    var harness: Harness = .{};
+    const executor: StoredPatternFilterExecutor = .{
+        .ctx = &harness,
+        .load_stored = TestStoredLoader.loadStored,
+        .resolve_doc_set_doc_ids = Harness.failReverse,
+        .resolve_doc_ids_to_doc_set = Harness.resolve,
+    };
+    for (0..2) |_| {
+        var resolved = try resolvePatternDocIdsAlloc(alloc, &primary, &membership, hits, null, executor, null, &memo, .{});
+        defer resolved.deinit(alloc);
+        try std.testing.expect(resolvedPatternContainsHit(resolved, hits[1]));
+        try std.testing.expect(resolvedPatternContainsHit(resolved, hits[2]));
+    }
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+}
+
+test "optional numeric range skips reverse exclusions for rejected hits" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        fn failReverse(_: ?*anyopaque, _: Allocator, _: *const doc_set.ResolvedDocSet, _: ?u64) anyerror!?[]const []const u8 {
+            return error.UnexpectedReverseProjection;
+        }
+    };
+    var filter = doc_set.ResolvedDocFilter{ .include = try doc_set.cloneDocKeysAlloc(alloc, &.{"allowed"}) };
+    defer filter.deinit(alloc);
+    filter.exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{9});
+    var raw = types.SearchResult{ .alloc = alloc, .hits = &.{}, .total_hits = 1 };
+    errdefer raw.deinit();
+    const key = try alloc.dupe(u8, "rejected");
+    const hits = alloc.alloc(types.SearchHit, 1) catch |err| {
+        alloc.free(key);
+        return err;
+    };
+    hits[0] = .{ .id = key };
+    raw.hits = hits;
+    var result = try applyStoredSearchPatternFilters(alloc, .{ .resolved_doc_filter = &filter }, raw, .{
+        .ctx = null,
+        .load_stored = TestStoredLoader.loadStored,
+        .resolve_doc_set_doc_ids = Harness.failReverse,
+    });
+    defer result.deinit();
+    raw.hits = &.{};
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+}
+
+test "optional numeric range applies legacy exclusions before reverse inclusion" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        fn failReverse(_: ?*anyopaque, _: Allocator, _: *const doc_set.ResolvedDocSet, _: ?u64) anyerror!?[]const []const u8 {
+            return error.UnexpectedReverseProjection;
+        }
+    };
+    var filter = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(alloc, &.{7}) };
+    defer filter.deinit(alloc);
+    filter.exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{9});
+    filter.legacy_exclude = try doc_set.cloneDocKeysAlloc(alloc, &.{"rejected"});
+    var raw = types.SearchResult{ .alloc = alloc, .hits = &.{}, .total_hits = 1 };
+    errdefer raw.deinit();
+    const key = try alloc.dupe(u8, "rejected");
+    const hits = alloc.alloc(types.SearchHit, 1) catch |err| {
+        alloc.free(key);
+        return err;
+    };
+    hits[0] = .{ .id = key };
+    raw.hits = hits;
+    var result = try applyStoredSearchPatternFilters(alloc, .{ .resolved_doc_filter = &filter }, raw, .{
+        .ctx = null,
+        .load_stored = TestStoredLoader.loadStored,
+        .resolve_doc_set_doc_ids = Harness.failReverse,
+    });
+    defer result.deinit();
+    raw.hits = &.{};
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
 }
 
 test "applyStoredSearchPatternFilters applies native doc id constraints without stored loads" {
@@ -3544,6 +3887,46 @@ test "externalizeSearchResultArtifactIds externalizes nested unit chunk hits" {
     try std.testing.expectEqualStrings("page:000001", artifact_ref.unit_id.?);
 }
 
+test "externalizeSearchResultArtifactIds preserves public nested identity and revisions across coordinator passes" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            const ref: types.ArtifactRef = .{
+                .document_id = @constCast("doc:a"),
+                .name = @constCast("chunks"),
+                .kind = .chunk,
+                .chunk_id = 3,
+                .unit_id = @constCast("page:1"),
+                .revision = @constCast("payload-cut"),
+                .derivation_revision = @constCast("producer-cut"),
+            };
+            var hit: types.ChunkHit = .{ .id = try artifact_ids.internalKeyForArtifactRefAlloc(a, ref) };
+            defer hit.deinit(a);
+            hit.artifact_ref = try ref.clone(a);
+            for (0..3) |_| {
+                try externalizeChunkHitIdentity(a, &hit);
+                const actual = hit.artifact_ref orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqualStrings("doc:a", actual.document_id);
+                try std.testing.expectEqualStrings("chunks", actual.name);
+                try std.testing.expectEqualStrings("page:1", actual.unit_id.?);
+                try std.testing.expectEqual(@as(?u32, 3), actual.chunk_id);
+                try std.testing.expectEqualStrings("payload-cut", actual.revision.?);
+                try std.testing.expectEqualStrings("producer-cut", actual.derivation_revision.?);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "externalizeSearchResultArtifactIds rejects mismatched public nested provenance" {
+    const a = std.testing.allocator;
+    const ref: types.ArtifactRef = .{ .document_id = @constCast("doc:a"), .name = @constCast("chunks"), .kind = .chunk, .chunk_id = 0 };
+    var hit: types.ChunkHit = .{ .id = try artifact_ids.artifactPublicIdAlloc(a, ref) };
+    defer hit.deinit(a);
+    hit.artifact_ref = try ref.clone(a);
+    hit.artifact_ref.?.chunk_id = 1;
+    try std.testing.expectError(error.InvalidChunkArtifact, externalizeChunkHitIdentity(a, &hit));
+}
+
 test "reshapeChunkBackedResult source grouping folds assets embeddings and mixed members before paging" {
     const alloc = std.testing.allocator;
     for (0..3) |variant| {
@@ -3719,6 +4102,78 @@ test "native asset members hydrate source authority and revision identity" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "direct PDF member preserves stored page metadata with independent ancestor projection" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        unit: []const u8,
+        reads: usize = 0,
+        missing: bool = false,
+        const page = "{\"unit_id\":\"page:000001\",\"text\":\"extracted text\",\"provenance\":{\"page_number\":1,\"width\":612}}";
+        fn load(raw: ?*anyopaque, a: Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!std.mem.eql(u8, key, self.unit)) return null;
+            self.reads += 1;
+            return if (self.missing) null else try a.dupe(u8, page);
+        }
+    };
+    const unit = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc", "pages", "page:000001");
+    defer alloc.free(unit);
+    const embedding = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, unit, "visual");
+    defer alloc.free(embedding);
+    const projected_page = "{\"unit_id\":\"page:000001\"}";
+    for ([_]bool{ true, false, false }, [_]bool{ false, false, true }) |projected, missing| {
+        const hits = try alloc.alloc(types.SearchHit, 1);
+        hits[0] = .{
+            .id = try alloc.dupe(u8, unit),
+            .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, embedding),
+            .stored_data = if (projected) try alloc.dupe(u8, projected_page) else null,
+        };
+        var loader: Loader = .{ .unit = unit, .missing = missing };
+        var result = try reshapeChunkBackedResult(alloc, .{ .return_mode = .member, .include_stored = true, .hierarchy_include_unit = true }, .{ .alloc = alloc, .hits = hits, .total_hits = 1 }, .{ .ctx = &loader, .load_stored = Loader.load, .resolve_parent_id = TestChunkParentShaper.resolveParentId, .load_parent_stored = TestChunkParentShaper.loadParentStored });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), loader.reads);
+        if (missing) {
+            try std.testing.expect(result.hits[0].stored_data == null);
+            try std.testing.expect(result.hits[0].ancestor_unit_data == null);
+            continue;
+        }
+        try std.testing.expectEqualStrings(if (projected) projected_page else Loader.page, result.hits[0].stored_data.?);
+        try std.testing.expectEqualStrings(Loader.page, result.hits[0].ancestor_unit_data.?);
+    }
+}
+
+test "direct PDF member and page embedding share the page producer derivation" {
+    const a = std.testing.allocator;
+    const page = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", "pages", "page:000001");
+    defer a.free(page);
+    const embedding = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, page, "visual");
+    defer a.free(embedding);
+    var state: std.ArrayList(u8) = .empty;
+    defer state.deinit(a);
+    try internal_keys.appendDocumentPrefix(&state, a, "doc");
+    try state.append(a, internal_keys.asset_state_kind);
+    try internal_keys.appendEncodedComponent(&state, a, "pages");
+    const Loader = struct {
+        key: []const u8,
+        reads: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqualStrings(self.key, key);
+            self.reads += 1;
+            return try alloc.dupe(u8, "page producer state");
+        }
+    };
+    var loader: Loader = .{ .key = state.items };
+    const hits = try a.alloc(types.SearchHit, 2);
+    for (hits, [_][]const u8{ page, embedding }) |*hit, key| hit.* = .{ .id = try a.dupe(u8, page), .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(a, key), .stored_data = try a.dupe(u8, "{}") };
+    var result: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = @intCast(hits.len) };
+    defer result.deinit();
+    try hydrateArtifactRevisions(a, &result, &.{ null, null }, .{ .ctx = &loader, .load_stored = Loader.load, .load_parent_stored = TestChunkParentShaper.loadParentStored, .resolve_parent_id = TestChunkParentShaper.resolveParentId });
+    try std.testing.expectEqual(@as(usize, 1), loader.reads);
+    try std.testing.expectEqualStrings(hits[0].artifact_ref.?.revision.?, hits[1].artifact_ref.?.revision.?);
+    try std.testing.expectEqualStrings(hits[0].artifact_ref.?.derivation_revision.?, hits[1].artifact_ref.?.derivation_revision.?);
+}
+
 test "a dense chunk member reports its chunk with the chunk's revisions" {
     const alloc = std.testing.allocator;
     const Loader = struct {
@@ -3782,10 +4237,11 @@ test "native member value verification retains scan policy and work budgets" {
             return error.TestUnexpectedLoad;
         }
     };
-    for ([_]enum { keys, provenance, parent, unbounded, outside, budget }{ .keys, .provenance, .parent, .unbounded, .outside, .budget }) |mode| {
-        const hits = try alloc.alloc(types.SearchHit, 1);
+    for ([_]enum { keys, provenance, parent, unbounded, outside, survivors, budget }{ .keys, .provenance, .parent, .unbounded, .outside, .survivors, .budget }) |mode| {
+        const hits = try alloc.alloc(types.SearchHit, if (mode == .survivors) 2 else 1);
         hits[0] = .{ .id = try alloc.dupe(u8, if (mode == .outside) "outside" else "doc"), .stored_data = try alloc.dupe(u8, "{\"source_id\":\"selected\"}") };
-        var result: types.SearchResult = .{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+        if (mode == .survivors) hits[1] = .{ .id = try alloc.dupe(u8, "outside") };
+        var result: types.SearchResult = .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(hits.len) };
         defer result.deinit();
         var req: types.SearchRequest = .{ .filter_query_json = "{\"value\":{\"kind\":\"equals\",\"field\":\"source_id\",\"text\":\"selected\"}}" };
         if (mode == .provenance) {
@@ -3799,13 +4255,13 @@ test "native member value verification retains scan policy and work budgets" {
         }
         if (mode == .budget) req.value_search_execution.max_bytes = 1;
         const executor: StoredPatternFilterExecutor = .{ .ctx = null, .load_stored = Loader.unused };
-        if (mode == .unbounded or mode == .outside) {
+        if (mode == .unbounded) {
             try std.testing.expectError(error.ValueSearchRequiresScan, applyStoredSearchPatternFilters(alloc, req, result, executor));
         } else if (mode == .budget) {
             try std.testing.expectError(error.ValueSearchLimitExceeded, applyStoredSearchPatternFilters(alloc, req, result, executor));
         } else {
             result = try applyStoredSearchPatternFilters(alloc, req, result, executor);
-            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            try std.testing.expectEqual(@as(usize, if (mode == .outside) 0 else 1), result.hits.len);
         }
         try std.testing.expect(!req.value_search_execution.allow_scan);
     }

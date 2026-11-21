@@ -61,9 +61,20 @@ fn filesystemCapacitySupported(target: std.Build.ResolvedTarget) bool {
     };
 }
 
+pub fn addNativeFdCacheSource(module: *std.Build.Module, filesystem_source: std.Build.LazyPath, target: std.Build.ResolvedTarget) void {
+    if (!filesystemCapacitySupported(target)) return;
+    module.addCSourceFile(.{
+        .file = filesystem_source.dirname().path(module.owner, "native_fd_cache.c"),
+        .flags = &.{ "-std=c11", "-ffreestanding" },
+    });
+}
+
 fn configureModule(module: *std.Build.Module, options: ModuleOptions) *std.Build.Module {
     if (options.link_libc) {
         addFilesystemCapacitySource(module, options.filesystem_capacity_source_file, options.target);
+    }
+    if (options.target.result.os.tag == .linux or options.link_libc) {
+        addNativeFdCacheSource(module, options.filesystem_capacity_source_file, options.target);
     }
     return module;
 }

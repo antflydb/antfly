@@ -138,7 +138,10 @@ pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anyty
 
 /// Dedicated retained-history control entries require native ordered dispatch
 /// and a durable all-applying-member activation barrier.
-pub const batch_history_control_protocol_version: u16 = 30;
+pub const batch_history_control_protocol_version: u16 = 31;
+/// Version 30 applies immutable direct producer effects atomically with their
+/// source. Older members must reject the envelope before admitting the source.
+pub const batch_prepared_enrichments_protocol_version: u16 = 30;
 /// Version 29 understands dense text-origin and int8-stub flags. Activation
 /// certifies every applying replica before these envelopes or fragments appear.
 pub const batch_dense_artifact_flags_protocol_version: u16 = 29;
@@ -204,7 +207,7 @@ test "data raft protocol advertisement requires native history apply support" {
     const std = @import("std");
     try std.testing.expectEqual(batch_protocol_version, maximumForHistoryApply(true));
     try std.testing.expect(maximumForHistoryApply(false) < batch_history_control_protocol_version);
-    try std.testing.expectEqual(@as(u16, 29), maximumForHistoryApply(false));
+    try std.testing.expectEqual(batch_prepared_enrichments_protocol_version, maximumForHistoryApply(false));
 }
 
 test "completion recovery protocol classifies decoded envelope versions without downgrading legacy" {

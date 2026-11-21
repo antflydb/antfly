@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const change_journal_mod = @import("change_journal.zig");
 const catch_up_policy = @import("catch_up_policy.zig");
 const replay_source_mod = @import("replay_source.zig");
+const wal_trace = @import("../../write_amplification_trace.zig");
 const derived_types = @import("derived_types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const db_types = @import("../types.zig");
@@ -27,6 +28,7 @@ const docstore_mod = @import("../../docstore.zig");
 const mem_backend_mod = @import("../../mem_backend.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
+const platform_clock = @import("antfly_platform").clock;
 
 pub const ApplyFn = batcher.ApplyFn;
 pub const PersistProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64) anyerror!void;
@@ -160,6 +162,14 @@ pub const CatchUpOptions = struct {
     partial_ctx: ?*anyopaque = null,
     load_partial_fn: ?LoadPartialFn = null,
     save_partial_fn: ?SavePartialFn = null,
+    /// Clock for the `deadline_ns`/`max_call_ns` admission checks below.
+    /// Defaults to the bare monotonicTimeNs() (real OS monotonic time),
+    /// preserving existing behavior for every caller outside shadow-index
+    /// repair. The repair path injects the DB's repair pacing clock so this
+    /// module's deadline checks observe the same clock as the deadline was
+    /// computed against (VOPR's controlled clock under simulation, the real
+    /// OS monotonic clock in production).
+    clock: ?platform_clock.Clock = null,
 };
 
 pub const catch_up_max_records_per_window_default: usize = 2048;
@@ -242,6 +252,7 @@ fn catchUpIndexFromReplaySource(
     apply_fn: ApplyFn,
     options: CatchUpOptions,
 ) !CatchUpStats {
+    wal_trace.recordOp(.source_turn);
     const hint = targetHintForManagedIndex(index_ref);
     var stats = CatchUpStats{};
     const next_sequence = from_sequence;
@@ -288,7 +299,7 @@ pub fn catchUpIndexFromMatchingCursor(
 ) !CatchUpStats {
     var stats = CatchUpStats{};
     var completed_windows: usize = 0;
-    const call_started_ns = monotonicTimeNs();
+    const call_started_ns = catchUpNowNs(options.clock);
     var call_bytes: u64 = 0;
     // Scratch belongs to this catch-up call, rather than one replay window.
     // Its allocator charges retained capacity to the replay memory budget.
@@ -317,7 +328,7 @@ pub fn catchUpIndexFromMatchingCursor(
             if (scratch_budget) |*budget| _ = budget.releaseUnusedCredit();
         }
         if (options.deadline_ns) |deadline| {
-            if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
+            if (catchUpNowNs(options.clock) >= deadline) return error.CatchUpDeadlineExceeded;
         }
         var builder = ReplayChunkBuilder.init(alloc, index_ref, options.resource_manager, options.max_chunk_bytes);
         if (options.max_call_bytes != 0)
@@ -378,7 +389,7 @@ pub fn catchUpIndexFromMatchingCursor(
         // replay cursor is disposable; a retry reopens it from the last
         // durably persisted applied sequence.
         if (options.deadline_ns) |deadline| {
-            if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
+            if (catchUpNowNs(options.clock) >= deadline) return error.CatchUpDeadlineExceeded;
         }
         stats.scanned_entries += if (chunk_stats.scanned_entries != 0) chunk_stats.scanned_entries else chunk_stats.matched_entries;
         stats.replay_scan_batches += chunk_stats.scan_batches;
@@ -430,7 +441,7 @@ pub fn catchUpIndexFromMatchingCursor(
             break :blk limit;
         } else null;
         const apply_started_ns = monotonicTimeNs();
-        const outcome = applyBatchBounded(apply_ctx, apply_fn, batch, index_ref, options.max_items_per_window, resume_offset, yield_deadline) catch |err| {
+        const outcome = applyBatchBounded(apply_ctx, apply_fn, batch, index_ref, options.max_items_per_window, resume_offset, yield_deadline, options.clock) catch |err| {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             logCatchUpError(index_ref, "journal_apply", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
             return err;
@@ -495,11 +506,11 @@ pub fn catchUpIndexFromMatchingCursor(
         // exception, but cannot multiply it across coalesced chunks.
         if (options.max_call_bytes != 0 and call_bytes >= options.max_call_bytes) break;
         if (options.max_call_ns != 0) {
-            if (monotonicTimeNs() - call_started_ns >= options.max_call_ns) break;
+            if (catchUpNowNs(options.clock) - call_started_ns >= options.max_call_ns) break;
             if (options.resource_manager) |manager| if (manager.shouldDeferOptionalMaintenanceForForegroundTraffic()) break;
         }
         if (options.deadline_ns) |deadline| {
-            if (monotonicTimeNs() >= deadline) break;
+            if (catchUpNowNs(options.clock) >= deadline) break;
         }
         if (options.max_windows_per_call > 0 and completed_windows >= options.max_windows_per_call) break;
     }
@@ -525,6 +536,7 @@ fn applyBatchBounded(
     max_items: usize,
     resume_offset: usize,
     yield_deadline: ?u64,
+    clock: ?platform_clock.Clock,
 ) !BoundedApply {
     if (index_ref.kind != .full_text or max_items == 0) return .{ .applied = try apply_fn(apply_ctx, batch, index_ref) };
     // Asset artifact keys are a fourth part, after the documents: full-text
@@ -557,7 +569,7 @@ fn applyBatchBounded(
         defer base += part.len;
         var start = if (resume_offset > base) @min(resume_offset - base, part.len) else 0;
         while (start < part.len) {
-            if (yield_deadline) |deadline| if (subchunks != 0 and monotonicTimeNs() >= deadline)
+            if (yield_deadline) |deadline| if (subchunks != 0 and catchUpNowNs(clock) >= deadline)
                 return .{ .applied = applied_any, .next_offset = base + start };
             const end = @min(start + max_items, part.len);
             const chunk: derived_types.DerivedBatch = switch (part.part) {
@@ -577,6 +589,14 @@ fn applyBatchBounded(
 
 fn monotonicTimeNs() u64 {
     return platform_time.monotonicNs();
+}
+
+/// Resolves `options.clock` for the admission checks in
+/// catchUpIndexFromMatchingCursor/applyBatchBounded, falling back to the bare
+/// monotonicTimeNs() above when no clock was injected (every caller outside
+/// shadow-index repair).
+fn catchUpNowNs(clock: ?platform_clock.Clock) u64 {
+    return if (clock) |value| value.nowRealtimeNs() else monotonicTimeNs();
 }
 
 const ReplayChunkBuilder = struct {
@@ -2064,7 +2084,7 @@ test "catchUpIndex bounds a full text record carrying asset artifact keys" {
     while (true) : (calls += 1) {
         const before_docs = capture.applied_documents;
         const before_artifacts = capture.applied_changed_artifact_keys;
-        const outcome = try applyBatchBounded(&capture, testApplyCapture, batch, index_ref, 2, offset, 1);
+        const outcome = try applyBatchBounded(&capture, testApplyCapture, batch, index_ref, 2, offset, 1, null);
         largest = @max(largest, (capture.applied_documents - before_docs) + (capture.applied_changed_artifact_keys - before_artifacts));
         offset = outcome.next_offset orelse break;
         try std.testing.expect(calls < 20);

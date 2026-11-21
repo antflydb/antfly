@@ -21,6 +21,7 @@ const std = h.std;
 const dependencies = h.antfly.capi_dependencies;
 const contract = dependencies.api_distributed_txn_contract;
 const catalog = dependencies.sql_catalog;
+const wal_trace = @import("../storage/write_amplification_trace.zig");
 const key = "\x00antfly/embedded/sql-commit/v1";
 const Record = struct { id: h.db_mod.types.TxnId, timestamp: u64, tables: []const []const u8 };
 
@@ -53,13 +54,20 @@ pub const Coordinator = struct {
         return commitLocked(self.handle, requests, &.{}, null, out_id, .sql);
     }
 };
-const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
-var test_after_prepare: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
+pub const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
+/// Shared with `sql.zig`'s `commitCoordinated`: the single-table fast path
+/// has no recovery-hint record or separate participant-resolution step of
+/// its own, but it still honors these at the equivalent boundary (right
+/// before its one `beginTransaction`, right before its `commitTransaction`
+/// decision, and right after that decision durably commits), so a fault
+/// injected here fires the same way regardless of which path a given write
+/// takes (lite-single-commit-write-path.md §3.3c).
+pub var test_after_prepare: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
 /// Runs before the recovery hint is stored; an error fails the commit there.
-var test_before_store: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
+pub var test_before_store: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
 /// Runs after a committed decision, in place of participant resolution
 /// succeeding; an error simulates resolution failing.
-var test_after_decision: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
+pub var test_after_decision: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
 var test_contended_acquire: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
 
 pub fn acquire(handle: *h.Handle) Coordinator {
@@ -84,6 +92,14 @@ pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, 
 }
 
 fn store(handle: *h.Handle, record: ?Record) !void {
+    // The cross-database two-phase commit coordinator's own recovery hint:
+    // written before preparing any participant, cleared after every
+    // participant resolves. See `Stage.relational_coordinator_hint`'s doc
+    // comment -- `sql.zig`'s single-store fast path bypasses this
+    // coordinator (and so this commit site) entirely for the common
+    // single-table coordinated-constraint write.
+    const wal_trace_scope = wal_trace.scopeDefault(.relational_coordinator_hint);
+    defer wal_trace_scope.end();
     handle.sql_commit_recovery_needed = true;
     const bytes = if (record) |value| try std.json.Stringify.valueAlloc(handle.alloc, value, .{}) else null;
     defer if (bytes) |value| handle.alloc.free(value);
@@ -163,7 +179,7 @@ pub fn commitWithGraphGuards(handle: *h.Handle, requests: []const contract.Table
 
 /// Whether the native checkpoint publication is in its uncertain window, so a
 /// pending decision may nonetheless be durable. Non-native stores answer yes.
-fn publicationUncertain(handle: *h.Handle) bool {
+pub fn publicationUncertain(handle: *h.Handle) bool {
     const root = handle.parent_handle orelse handle;
     const backend = root.owned_lite_backend orelse return true;
     const docstore = backend.native_docstore orelse return true;
@@ -441,6 +457,18 @@ const OutcomeFixture = struct {
             const value = body.value.object.get("mutation_outcome") orelse return null;
             return if (value == .string) value.string else null;
         }
+        /// The raw 16 bytes behind a `transaction_id` hex field, for a
+        /// caller that resolves it directly through
+        /// `antfly_db_get_transaction_status` rather than through
+        /// another JSON round trip.
+        fn transactionId(self: Reply) ?[16]u8 {
+            const body = self.parsed orelse return null;
+            const value = body.value.object.get("transaction_id") orelse return null;
+            if (value != .string or value.string.len != 32) return null;
+            var out: [16]u8 = undefined;
+            _ = std.fmt.hexToBytes(&out, value.string) catch return null;
+            return out;
+        }
     };
 
     fn sql(self: *OutcomeFixture, request: []const u8) !Reply {
@@ -655,6 +683,52 @@ test "capi SQL outcome COMMIT decision failing inside publication is unknown wit
     try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
     try std.testing.expectEqualStrings("40003", reply.state().?);
     try std.testing.expect(reply.has("transaction_id"));
+}
+
+// lite-single-commit-write-path.md §3.3c: session COMMIT on the fused
+// path (`allow_local_decision = true` in `sql_session.zig`) has no begin
+// record to resolve an ambiguous outcome against, so its
+// `transaction_id` is the retired outcome-receipt writer's bare 16-byte
+// id instead (see `DB.last_ambiguous_fused_marker`'s doc comment). This
+// reuses the exact fault from "capi SQL outcome COMMIT decision failing
+// inside publication is unknown with a receipt" above -- which that
+// test's own comment (mirrored from the autocommit case) establishes
+// lands before the slot write, so the row ends up durably absent -- and
+// additionally resolves the returned `transaction_id` through
+// `antfly_db_get_transaction_status` on a table handle for `t` (the
+// table that holds the marker; a different handle to the same table,
+// exactly like the existing receipt-text scheme's own table-handle
+// tests), checking it agrees with the row state the crash-sweep-style
+// checkers would see.
+test "capi SQL outcome COMMIT on the fused path resolves an unknown outcome's transaction_id to not applied" {
+    const api = @import("db.zig");
+    var f = try OutcomeFixture.init("outcome-commit-decision-uncertain-status");
+    defer f.deinit();
+    try SessionStatements.stage(&f);
+    const Arm = struct {
+        fault: PrimaryFault,
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fault.arm();
+        }
+    };
+    var arm: Arm = .{ .fault = .{ .fixture = &f, .err = error.InputOutput, .publication = true } };
+    test_after_prepare = .{ .ptr = &arm, .run = Arm.run };
+    var reply = try f.sql(SessionStatements.commit);
+    defer reply.deinit();
+    test_after_prepare = null;
+    PrimaryFault.disarm();
+    try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
+    const txn_id = reply.transactionId() orelse return error.TestUnexpectedResult;
+
+    var table_id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("tables.zig").antfly_db_open_table(f.id, .fromSlice("t"), &table_id));
+    defer api.antfly_db_close(table_id);
+    var status: u8 = 0xff;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_transaction_status(table_id, &txn_id, &status));
+    try std.testing.expectEqual(@as(u8, 2), status); // 2 = aborted, matching the row's durable absence.
+
+    try std.testing.expectEqual(@as(usize, 0), try f.rows());
 }
 
 test "capi SQL outcome COMMIT failure after a committed decision is committed" {
@@ -1085,4 +1159,161 @@ test "capi SQL outcome refusals after an unresolved decision are not unknown" {
     try std.testing.expectEqual(error.SqlWriteConflict, errors.notApplied(error.SqlWriteConflict));
     // Committed-pending visibility is not an unknown outcome.
     try std.testing.expectEqualStrings("AF001", errors.describe(error.CommitVisibilityNotSatisfied).code);
+}
+
+// Repro for a previously-reported loss on `commitCoordinatedLocal`'s fused
+// autocommit path (lite-single-commit-write-path.md §3.3c): on a table with
+// a UNIQUE constraint, INSERT item-0, INSERT item-1, UPDATE item-0, then
+// close and reopen. The coordinator's two localization tips are both
+// exercised here: a `SELECT` right after each INSERT (before any reopen)
+// isolates whether item-1 ever becomes visible on this same handle at all,
+// and the explicit `_id` list in each SELECT (rather than a bare row count)
+// tells `item-0`/`item-1` apart instead of just counting rows.
+test "capi SQL outcome relational unique autocommit two inserts and an update survive reopen" {
+    const api = @import("db.zig");
+    const alloc = std.testing.allocator;
+    var directory = try api.TestDirectory.init("relational-unique-two-inserts");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    defer alloc.free(path);
+    const wrapper = try api.openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 }, true);
+    var id = try api.publishHandle(wrapper);
+
+    const Fx = struct {
+        fn sqlOk(hid: ?*anyopaque, request: []const u8) !void {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            const code = api.antfly_db_sql_json(hid, .fromSlice(request), &output);
+            if (code != .ok) {
+                std.debug.print("unexpected {s} for {s}: {s}\n", .{ @tagName(code), request, std.mem.span(h.capi.lastErrorDetail()) });
+                return error.TestUnexpectedResult;
+            }
+        }
+        /// Returns the set of `_id` values currently visible via SELECT,
+        /// sorted, so a caller can assert exactly which rows are present
+        /// instead of just how many.
+        fn ids(hid: ?*anyopaque) ![2]bool {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            const code = api.antfly_db_sql_json(hid, .fromSlice("{\"statement\":\"SELECT _id FROM t\"}"), &output);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, code);
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.ptr.?[0..output.len], .{});
+            defer parsed.deinit();
+            var found: [2]bool = .{ false, false };
+            for (parsed.value.object.get("rows").?.array.items) |row| {
+                const row_id = row.array.items[0].string;
+                if (std.mem.eql(u8, row_id, "item-0")) found[0] = true;
+                if (std.mem.eql(u8, row_id, "item-1")) found[1] = true;
+            }
+            return found;
+        }
+    };
+
+    try Fx.sqlOk(id, "{\"statement\":\"CREATE TABLE t (n BIGINT UNIQUE)\"}");
+
+    try Fx.sqlOk(id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('item-0',100)\"}");
+    try std.testing.expectEqual([2]bool{ true, false }, try Fx.ids(id));
+
+    try Fx.sqlOk(id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('item-1',200)\"}");
+    // Localizes the bug to this call itself vs. a later reopen: item-1 must
+    // be visible on the SAME handle immediately after its own INSERT
+    // returned success.
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+
+    try Fx.sqlOk(id, "{\"statement\":\"UPDATE t SET n = 150 WHERE _id = 'item-0'\"}");
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+
+    api.antfly_db_close(id);
+    const reopened = try api.openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 }, false);
+    id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(id);
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+}
+
+// Same repro as above, but through the exact open path the (now-reverted)
+// capi crash-sim harness used: a `.manual` BackendRuntime with the sim's
+// passthrough IO (`storage/lite/crash_sim_io.zig`'s `SimIo`, armed with no
+// crash plan -- the harness's own "discovery pass"), rather than production
+// `openLiteHandleAlloc`'s hosted connection/owner machinery. If this also
+// passes, the earlier reported loss was specific to the harness's own
+// scenario/checkpoint code, not to this open path or to `commitCoordinatedLocal`.
+test "capi SQL outcome relational unique autocommit two inserts and an update survive reopen under sim io" {
+    const api = @import("db.zig");
+    const db_mod = api.db_mod;
+    const sim_io = @import("../storage/lite/crash_sim_io.zig");
+    const alloc = std.testing.allocator;
+    var directory = try api.TestDirectory.init("relational-unique-simio");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    defer alloc.free(path);
+
+    const sim = try sim_io.SimIo.init(alloc, std.testing.io);
+    defer sim.deinit();
+    sim.setRunLabel("relational-unique-simio");
+
+    const Fx = struct {
+        fn sqlOk(hid: ?*anyopaque, request: []const u8) !void {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            const code = api.antfly_db_sql_json(hid, .fromSlice(request), &output);
+            if (code != .ok) {
+                std.debug.print("unexpected {s} for {s}: {s}\n", .{ @tagName(code), request, std.mem.span(h.capi.lastErrorDetail()) });
+                return error.TestUnexpectedResult;
+            }
+        }
+        fn ids(hid: ?*anyopaque) ![2]bool {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            const code = api.antfly_db_sql_json(hid, .fromSlice("{\"statement\":\"SELECT _id FROM t\"}"), &output);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, code);
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.ptr.?[0..output.len], .{});
+            defer parsed.deinit();
+            var found: [2]bool = .{ false, false };
+            for (parsed.value.object.get("rows").?.array.items) |row| {
+                const row_id = row.array.items[0].string;
+                if (std.mem.eql(u8, row_id, "item-0")) found[0] = true;
+                if (std.mem.eql(u8, row_id, "item-1")) found[1] = true;
+            }
+            return found;
+        }
+    };
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = sim.io() },
+    });
+    defer runtime.deinit();
+    var id = try api.openLiteHandleWithRuntime(alloc, path, sim.io(), runtime.ptr(), .{
+        .create = true,
+        .hosted = false,
+        .no_sync = false,
+    });
+
+    try Fx.sqlOk(id, "{\"statement\":\"CREATE TABLE t (n BIGINT UNIQUE)\"}");
+
+    try Fx.sqlOk(id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('item-0',100)\"}");
+    try std.testing.expectEqual([2]bool{ true, false }, try Fx.ids(id));
+
+    try Fx.sqlOk(id, "{\"statement\":\"INSERT INTO t (_id,n) VALUES ('item-1',200)\"}");
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+
+    try Fx.sqlOk(id, "{\"statement\":\"UPDATE t SET n = 150 WHERE _id = 'item-0'\"}");
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
+
+    api.closeLiteRuntimeHandle(id);
+
+    var runtime2 = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = sim.io() },
+    });
+    defer runtime2.deinit();
+    id = try api.openLiteHandleWithRuntime(alloc, path, sim.io(), runtime2.ptr(), .{
+        .create = false,
+        .hosted = false,
+        .no_sync = false,
+    });
+    defer api.closeLiteRuntimeHandle(id);
+    try std.testing.expectEqual([2]bool{ true, true }, try Fx.ids(id));
 }

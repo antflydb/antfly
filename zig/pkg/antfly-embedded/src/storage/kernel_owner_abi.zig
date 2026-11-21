@@ -45,7 +45,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 120 adds apply-only original terminal legacy resolution.
 // Version 121 returns durable original-terminal recovery outcomes.
 // Version 122 adds read-only original-terminal outcome observations.
-pub const abi_version: u32 = 124;
+// Version 125 includes immutable direct preparation and retained history.
+pub const abi_version: u32 = 125;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -509,6 +510,9 @@ pub const MetadataProjectionKind = enum(u32) {
     job_owner_count = 74,
     /// Compact lake authority, including an explicit unowned-source record.
     lake_source_owner = 75,
+    /// Nonwaiting observation/reconciliation of the shared durable HA outbox.
+    poll_ha_outbox = 76,
+    catalog_table_projection = 77,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };
@@ -1334,6 +1338,10 @@ pub const WriteAdmissionRequest = extern struct {
     /// Empty probes return the compiled owner's grouping capability without
     /// serializing or parsing ordinary writes on tables that have no groups.
     request_json: BorrowedBytes = .{},
+    execution_deadline_ns: u64 = 0,
+    has_execution_deadline: u8 = 0,
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
 };
 
 pub const TableRequest = extern struct {
@@ -1618,6 +1626,7 @@ pub extern fn antfly_storage_owner_restore_control_json(
 /// of JSON: process-local callbacks and absolute monotonic deadlines must not
 /// be lost or reconstructed as a fresh timeout at a compiled boundary.
 pub const QueryOperationRequest = query_abi.QueryOperationRequest;
+pub const query_request_version = query_abi.query_request_version;
 
 pub const ArtifactOperation = enum(u32) {
     corrupt_embedding = 0,
@@ -1955,6 +1964,12 @@ pub extern fn antfly_storage_owner_preflight_write_admission(
     owner: ?*anyopaque,
     request: *const WriteAdmissionRequest,
     out_has_groups: *u8,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_prepare_enrichments(
+    owner: ?*anyopaque,
+    request: *const WriteAdmissionRequest,
+    out_command: *OwnedBytes,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_find_median_key(

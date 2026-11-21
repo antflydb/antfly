@@ -527,9 +527,9 @@ pub fn ownedResident(store: *stores.ArtifactStore, identity: catalog.Digest, tab
 }
 /// Reference is authenticated by the native owner or a verified lake3 token.
 /// Decoded items contain data only; request cancellation never enters residency.
-pub fn loadOwned(_: A, store: *stores.ArtifactStore, identity: catalog.Digest, table: local.common_topology_records.TableRecord, cut: @import("../metadata/lake_source_admission.zig").Cut, now: u64, cancellation: Token, cache: *local.serverless_query_lake_decoded_cache.Cache, groups: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context, cached: ?CachedRead) !Pinned {
+pub fn loadOwned(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, table: local.common_topology_records.TableRecord, cut: @import("../metadata/lake_source_admission.zig").Cut, now: u64, cancellation: Token, cache: *local.serverless_query_lake_decoded_cache.Cache, groups: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context, cached: ?CachedRead) !Pinned {
     try cut.validate();
-    if (cut.expires_ms <= now or !std.mem.eql(u8, &cut.store, &identity) or !std.mem.eql(u8, &cut.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
+    if (cut.expires_ms <= now or !std.mem.eql(u8, &cut.store, &identity) or !std.mem.eql(u8, &cut.desired, &(try catalog.desiredFingerprint(a, table)))) return error.CatalogGenerationChanged;
     const ref: StateRef = .{ .id = cut.state.id, .bytes = cut.state.bytes, .generation = if (cut.state.generation) |value| @constCast(value) else null };
     const expected_domain = domain(table.table_id, identity);
     try validateStateRef(ref, expected_domain, cut.expires_ms);
@@ -575,7 +575,7 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
     const version = (try std.json.parseFromSliceLeaky(struct { version: u16 }, a, bytes, .{ .ignore_unknown_fields = true })).version;
     const result: Descriptor = if (version == 2) modern: {
         const lease = try std.json.parseFromSliceLeaky(LeaseEnvelope, a, bytes, .{ .allocate = .alloc_always });
-        if (lease.expires_ms <= now or lease.expires_ms > now +| max_ttl_ms or lease.expires_ms != scope.fencingToken() or lease.table_id != table.table_id or lease.object_generation != table.object_storage_generation or !std.mem.eql(u8, &lease.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
+        if (lease.expires_ms <= now or lease.expires_ms > now +| max_ttl_ms or lease.expires_ms != scope.fencingToken() or lease.table_id != table.table_id or lease.object_generation != table.object_storage_generation or !std.mem.eql(u8, &lease.desired, &(try catalog.desiredFingerprint(a, table)))) return error.CatalogGenerationChanged;
         try validateStateRef(lease.state, expected_domain, lease.expires_ms);
         const decoded: Decoded = if (cache) |memo| shared: {
             const key = @import("lake_wal_image.zig").digest(.{ .format = "retained-decoded-state-v1", .store = store_identity, .cache_scope = store.cacheScope(store_identity), .table = table.table_id, .incarnation = table.object_storage_generation, .ref = lease.state });
@@ -617,7 +617,7 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
         overlay = decoded.overlay;
         break :modern .{ .expires_ms = lease.expires_ms, .table_id = lease.table_id, .object_generation = lease.object_generation, .desired = lease.desired, .reader_token = lease.reader_token, .publication = state.publication, .pending = state.pending, .catalog_metadata = state.catalog_metadata, .published_only = state.published_only, .recent = state.recent, .recent_cloud = state.recent_cloud, .recent_runs = state.recent_runs };
     } else return error.InvalidQueryRequest;
-    if (result.expires_ms != scope.fencingToken() or result.expires_ms <= now or result.expires_ms > now +| max_ttl_ms or result.table_id != table.table_id or result.object_generation != table.object_storage_generation or !std.mem.eql(u8, &result.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
+    if (result.expires_ms != scope.fencingToken() or result.expires_ms <= now or result.expires_ms > now +| max_ttl_ms or result.table_id != table.table_id or result.object_generation != table.object_storage_generation or !std.mem.eql(u8, &result.desired, &(try catalog.desiredFingerprint(a, table)))) return error.CatalogGenerationChanged;
     try result.publication.validate();
     try context.ensureActive();
     try cancellation.check();
@@ -691,7 +691,7 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     const last = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":1000,\"body\":\"last\"}", .{});
     const image = try images.Image.update(a, null, .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{ .{ .op = .upsert, .row = first }, .{ .op = .upsert, .row = last } } });
     defer image.release();
-    var descriptor: Descriptor = .{ .expires_ms = now + ttl_ms, .table_id = 4, .object_generation = 0, .desired = catalog.desiredFingerprint(table), .publication = publication, .reader_token = @splat(5), .pending = .{ .lsn = 8, .cut_identity = @splat(1), .key_fields = image.key_fields, .change_blocks = &image.blocks, .block_digests = &image.block_digests }, .published_only = false };
+    var descriptor: Descriptor = .{ .expires_ms = now + ttl_ms, .table_id = 4, .object_generation = 0, .desired = try catalog.desiredFingerprint(a, table), .publication = publication, .reader_token = @splat(5), .pending = .{ .lsn = 8, .cut_identity = @splat(1), .key_fields = image.key_fields, .change_blocks = &image.blocks, .block_digests = &image.block_digests }, .published_only = false };
     var cache: Cache = .{ .budget = .{ .backing = a, .limit = 1024 * 1024 } };
     defer cache.deinit();
     const token = try saveCached(a, &artifacts, identity, std.testing.io, descriptor, .none, &cache);
@@ -1081,7 +1081,7 @@ test "external lake global frontier retained missing state and row groups preser
         const publication: catalog.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
         const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
         const row = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":1,\"body\":\"quasar\"}", .{});
-        const descriptor: Descriptor = .{ .expires_ms = now + ttl_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = catalog.desiredFingerprint(table), .publication = publication, .reader_token = @splat(5), .pending = .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} }, .published_only = false };
+        const descriptor: Descriptor = .{ .expires_ms = now + ttl_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = try catalog.desiredFingerprint(a, table), .publication = publication, .reader_token = @splat(5), .pending = .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} }, .published_only = false };
         const token = try save(sa, &store, backend.identity, std.testing.io, descriptor, .none);
         const envelope_ref = try generations.decode(sa, prefix, token, max_bytes);
         const envelope_bytes = try readRetained(&store, envelope_ref, .none);

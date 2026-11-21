@@ -106,6 +106,7 @@ const durable_outbox_store = @import("durable_outbox_store.zig");
 const apply_receipts = @import("apply_receipts.zig");
 
 const replication_commit = @import("commit_integration.zig");
+const wal_trace = @import("../write_amplification_trace.zig");
 
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const ant_json = @import("antfly-json");
@@ -431,7 +432,17 @@ const RowPolicyOutputCheckpoint = struct {
         try self.lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     }
 };
-const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
+/// Test-only override (see `defaultVisibilityWaitTimeoutMs`): lets a crash-
+/// consistency / latency-injection test shrink the ordinarily generous
+/// 5-minute default so a slow-sync scenario's visibility wait can time out
+/// (and be observed doing so) in a bounded test run instead of needing to
+/// actually run for minutes. Never set outside a test.
+pub var test_visibility_wait_timeout_ms: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {};
+
+fn defaultVisibilityWaitTimeoutMs() u64 {
+    if (comptime builtin.is_test) if (test_visibility_wait_timeout_ms) |ms| return ms;
+    return 5 * std.time.ms_per_min;
+}
 const public_schema_json_key = @import("../internal_keys.zig").public_schema_json_key;
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 // Legacy singleton keys remain readable for crash recovery across upgrades.
@@ -659,6 +670,14 @@ pub const OpenOptions = struct {
     /// Borrowed realtime clock for durable repair retry scheduling. Defaults to
     /// the backend runtime clock; the caller must keep an override alive until close.
     index_repair_clock: ?platform_clock.Clock = null,
+    /// Borrowed monotonic clock for shadow-index-repair activation pacing
+    /// (repairActivationAdmissible / observeRepairCatchUpCost and the
+    /// catch-up/activation deadlines they feed). Defaults to the backend
+    /// runtime's monotonic clock, which resolves through std.Io when one is
+    /// borrowed (so VOPR's deterministic clock applies) and through the real
+    /// OS monotonic clock otherwise. The caller must keep an override alive
+    /// until close.
+    repair_pacing_clock: ?platform_clock.Clock = null,
     /// Private proof installed only by a validated `NativeRestoreOpenPlan`.
     /// A path-bound proof prevents a copied option set from silently skipping
     /// configuration for a different DB namespace.
@@ -672,7 +691,6 @@ pub const OpenOptions = struct {
     start_optional_runtime_workers: bool = true,
     /// Managed caches install distributed callbacks before activating replay.
     start_resolver_workers: bool = true,
-    external_derived_checkpoints: bool = true,
     /// Optional durable namespace for replica-local index repair state.
     /// Externally owned roots use this to keep crash-resume intent and replay
     /// pins inside the same atomic storage generation as their indexes.
@@ -1042,7 +1060,6 @@ const EnrichmentAppendContext = struct {
     artifact_publication_dispatcher: ?ArtifactPublicationDispatcher = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     index_repair_checkpoint: ?index_repair_state.Location = null,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
@@ -1070,7 +1087,6 @@ const EnrichmentAppendContext = struct {
             .ordered_artifact_publication_required = self.artifact_publication_dispatcher != null,
             .alloc = self.alloc,
             .store = self.store,
-            .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = self.index_repair_checkpoint,
             .shard_manager = self.shard_manager,
             .change_journal = self.change_journal,
@@ -2642,6 +2658,7 @@ fn splitBootstrapMarkersEqual(a: range_state_mod.SplitBootstrapMarker, b: range_
 }
 
 const lockAtomicWithBackoffProfiled = local_mutation.lockAtomicWithBackoffProfiled;
+const lockAtomicWithBackoffProfiledIo = local_mutation.lockAtomicWithBackoffProfiledIo;
 
 fn lockApplyWithBackoffProfiled(rw_lock: *apply_rw_lock_mod.ApplyRwLock, stats: *MutexContentionStats) ProfiledApplyLock {
     if (!asyncIndexProfileEnabled()) {
@@ -3155,6 +3172,7 @@ pub const DB = struct {
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
     index_repair_clock: ?platform_clock.Clock = null,
+    repair_pacing_clock: ?platform_clock.Clock = null,
     backend_owner_id: u64,
     status_owner_epoch: u64 = 0,
     status_publication_mutex: std.atomic.Mutex = .unlocked,
@@ -3337,6 +3355,16 @@ pub const DB = struct {
     pub const lockApplyForPortableRuntime = local_mutation.lockApplyForPortableRuntime;
     pub const tryLockApplyForPortableRuntime = local_mutation.tryLockApplyForPortableRuntime;
 
+    /// lite-single-commit-write-path.md §7.5 (FK coordinator): exposes
+    /// `mutation_commit.zig`'s `prepareLocalIntegrityDecision` against this
+    /// `*DB` directly, for `capi/sql.zig`'s
+    /// `commitCoordinatedFusedMultiTable` to validate/prepare a NON-leader
+    /// participant table's integrity commands (e.g. a parent's `.attach`/
+    /// `.detach` Reference) while the coordinator holds that table's
+    /// `core.apply_mutex` itself -- never called against a table whose
+    /// lock this function would need to acquire on its own.
+    pub const prepareLocalIntegrityDecision = local_mutation.prepareLocalIntegrityDecision;
+
     fn lockApplySharedForPortableRuntime(self: *DB) !void {
         try self.enforcePortableRuntimeGate();
         lockApplyShared(self);
@@ -3454,6 +3482,11 @@ pub const DB = struct {
         try txn.commit();
         self.local_execution.relational_index_maintenance_sweep.request();
         self.local_execution.relational_index_retry_after_ns.store(0, .release);
+        // Wake the owner-only sweep now instead of waiting for its next
+        // poll (task 3: relational demand should wake maintenance, not
+        // only arm a flag for `independent_maintenance.zig`'s own cadence
+        // to notice up to 5s later).
+        self.independent_maintenance.notify();
         return true;
     }
 
@@ -3550,6 +3583,7 @@ pub const DB = struct {
         try txn.commit();
         self.local_execution.relational_index_maintenance_sweep.request();
         self.local_execution.relational_index_retry_after_ns.store(0, .release);
+        self.independent_maintenance.notify();
         return true;
     }
 
@@ -4014,13 +4048,22 @@ pub const DB = struct {
                 opts.identity_namespace,
                 false,
                 if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
-                opts.external_derived_checkpoints,
                 opts.index_repair_checkpoint_storage,
                 opts.lsm_root_generation,
                 openModeRequiresReadOnlyBackends(opts.open_mode),
             );
             var core_owned = true;
             errdefer if (core_owned) core.deinit(alloc);
+            // openCoreResourcesFromPrimaryStore has no owning runtime to pass
+            // down to IndexRepairCheckpoint's construction, so it defaults to
+            // the global debug Io. Patch in this DB's own backend_runtime Io
+            // here instead: in production that's still the real OS Io
+            // (unchanged behavior), while under VOPR it's VoprIo's seeded,
+            // replay-deterministic Io, matching repairPacingClock's pattern.
+            // See DETERMINISM_AUDIT.md.
+            if (core.index_repair_checkpoint) |*checkpoint| {
+                if (backend_runtime.io()) |borrowed_io| checkpoint.io = borrowed_io;
+            }
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
             owned_async_context = async_context;
@@ -4107,6 +4150,7 @@ pub const DB = struct {
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
                 .index_repair_clock = opts.index_repair_clock,
+                .repair_pacing_clock = opts.repair_pacing_clock,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                 .executor = executor,
                 .start_index_workers = start_index_workers,
@@ -4415,6 +4459,11 @@ pub const DB = struct {
                 const replay_started_ns = monotonicTimeNs();
                 replayPendingDerivedBatches(&db, null, null, .{}) catch |err| switch (err) {
                     error.ArtifactRepairRequired => {},
+                    // Producer replies may still be pending after a crash. Keep
+                    // the journal/checkpoints intact and let the worker resume
+                    // after the owner opens and generated work can run again.
+                    // Workerless callers retain the synchronous drain contract.
+                    error.ReplayDocumentNotVisible => if (!db.start_index_workers) return err,
                     else => return err,
                 };
                 profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
@@ -5350,7 +5399,6 @@ pub const DB = struct {
             .resource_manager = resource_manager,
             .store = async_resources.store,
             .relational_base_rows = relationalColumns(self) != null,
-            .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = async_resources.index_repair_checkpoint,
             .index_manager = async_resources.index_manager,
             .apply_mutex = async_resources.apply_mutex,
@@ -5380,6 +5428,7 @@ pub const DB = struct {
             notifyDerivedAppliedSequenceAdvanced,
             resource_manager,
             self.backend_runtime,
+            persistAppliedSequencesBatchAsync,
         );
     }
 
@@ -5769,7 +5818,6 @@ pub const DB = struct {
             .read_only = openModeRequiresReadOnlyBackends(self.open_mode),
             .clock = runtime_cfg.clock orelse self.backend_runtime.clock(),
             .store = resources.store,
-            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = resources.index_repair_checkpoint,
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
@@ -5952,7 +6000,6 @@ pub const DB = struct {
             .root_incarnation = self.root_incarnation,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
             .store = resources.store,
-            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = resources.index_repair_checkpoint,
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
@@ -6028,7 +6075,6 @@ pub const DB = struct {
                 .alloc = self.runtime_alloc,
                 .io = self.backend_runtime.io(),
                 .store = batch_resources.store,
-                .applied_sequence_checkpoint_path = batch_resources.applied_sequence_checkpoint_path,
                 .shard_manager = batch_resources.shard_manager,
                 .change_journal = batch_resources.change_journal,
                 .replay_source = batch_resources.replay_source,
@@ -6316,6 +6362,17 @@ pub const DB = struct {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
+        // WS6: a coalesced applied-sequence flush still pending when close
+        // starts gets exactly one more chance to run now, while the store is
+        // still fully live. `background_closing` is now true, so
+        // publishManagedProgress's status gate treats this drain as forced
+        // (deterministic status-at-close) rather than waiting on the
+        // ordinary interval. Best-effort: close must proceed even if this
+        // fails (the DB is going away either way; the next open recomputes
+        // status from progress and catalog).
+        if (executor_ready) self.flushAppliedSequencesForIdle() catch |err| {
+            std.log.warn("close-time applied-sequence flush failed err={s}", .{@errorName(err)});
+        };
         self.native_query_warming.stop(self.backend_runtime);
         self.native_query_cleanup.stop(self.backend_runtime);
         if (comptime builtin.os.tag != .freestanding) {
@@ -6388,6 +6445,27 @@ pub const DB = struct {
         self.async_context.promotion_runtime = null;
         self.resolution_owner.deinitContext(self.runtime_alloc);
         self.resolution_append_context = null;
+        // Close must never be able to hang on a ride-along ticket some
+        // worker is blocked waiting on (design doc §3.2a/perf/lwa-commit-eff2):
+        // a worker's own `stageRideAlong`/`submitIndexMutation(durable=false)`
+        // call can leave its ticket queued, not yet resolved, if nothing else
+        // happens to drive the group-commit queue before this point (the
+        // leader-loop fix that stops a foreground write's own leadership turn
+        // once its own ticket is covered means that is no longer guaranteed
+        // to have already happened). Force every currently-queued commit --
+        // ride-along or not -- through to resolution now, while every worker
+        // this function is about to ask to shut down is still running and so
+        // can still notice its own ticket is done, and strictly before that
+        // shutdown request below. A worker that is instead blocked on
+        // something this cannot resolve (not a ride-along ticket) is a
+        // different bug; this exists so a ride-along ticket is never that
+        // something. Best-effort: close must still proceed if this fails --
+        // see `lite close: final durability sync failed` below for the same
+        // tolerance later in this function.
+        // A read-only open has nothing queued and its store refuses sync.
+        if (executor_ready and !openModeRequiresReadOnlyBackends(self.open_mode)) self.core.syncStore(true) catch |err| {
+            std.log.warn("close-time store sync before executor shutdown failed err={s}", .{@errorName(err)});
+        };
         // Derived full-text publishers may be asleep in merge backpressure
         // admission. Close that admission before joining their executor: the
         // merge runtime is the owner of the wakeup predicate, so joining the
@@ -7679,11 +7757,68 @@ pub const DB = struct {
         }
     }
 
+    /// Regression-B test hook: like `batch`, but also reports the commit
+    /// sequence this write's own primary-store group committed at (Lite
+    /// backend only; 0 on a backend with no such concept -- see
+    /// `execution_resources.zig`'s `committed_sequence_out`). Exists so a
+    /// caller can assert `Store.durableSequence() >= committed_sequence_out`
+    /// instead of comparing against whatever `activeCheckpoint()` happens to
+    /// read afterward, which also chases any later, unrelated non-durable
+    /// ride-along commit -- see `lite/crash_consistency_test.zig`'s
+    /// `assertAcknowledgedWriteIsDurable`.
+    pub fn batchWithCommittedSequence(self: *DB, req: types.BatchRequest, committed_sequence_out: *u64) anyerror!void {
+        committed_sequence_out.* = 0;
+        const opts: BatchExecutionOptions = .{ .committed_sequence_out = committed_sequence_out };
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, opts);
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, opts);
+        }
+    }
+
     /// Like `batch`, also reporting whether the primary write became durable.
     /// Callers classify a failure from the flag: after the primary write it
     /// is committed (pending or needing repair); before it, the batch was not
     /// applied unless the error is an unknown outcome. Keeps `batch`'s
     /// ANTFLY_BENCH_METRICS phase profile.
+    /// Capture normalized source mutations and producer outputs without commit.
+    pub const validatePreparedEnrichments = local_mutation.validatePreparedEnrichments;
+
+    pub fn prepareDirectEnrichments(self: *DB, alloc: Allocator, req: types.BatchRequest) ![]u8 {
+        return self.prepareDirectEnrichmentsWithContext(alloc, req, null);
+    }
+
+    pub fn prepareDirectEnrichmentsWithContext(self: *DB, alloc: Allocator, req: types.BatchRequest, context: ?@import("antfly_inference_execution_context").RequestContext) ![]u8 {
+        if (context) |control| try control.check();
+        if (req.commit_requires != .direct_enrichments or req.prepared_enrichments_json != null) return error.InvalidBatchRequest;
+        try @import("commit_requirements.zig").validateRequestBounds(req);
+        const digest = try execution_resources.PreparedEnrichments.requestDigest(alloc, req);
+        if (req.transaction) |control| if (control == .prepare) {
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            if (try manager.loadPreparedEnrichments(alloc, control.prepare.txn_id)) |bytes| {
+                errdefer alloc.free(bytes);
+                var packet = try std.json.parseFromSlice(execution_resources.PreparedEnrichments, alloc, bytes, .{});
+                defer packet.deinit();
+                if (!std.mem.eql(u8, &packet.value.request_digest, &digest)) return error.VersionConflict;
+                return bytes;
+            }
+        };
+        {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            if (try @import("artifact_publication.zig").authority(&read)) |authority| {
+                const validation = (try @import("artifact_producer_validation.zig").load(&read)) orelse return error.CommitRequirementUnavailable;
+                if (validation.authority_epoch != authority.epoch or !std.mem.eql(u8, &validation.namespace, &authority.namespace)) return error.CommitRequirementUnavailable;
+            } else if (try @import("../source_authority.zig").maintenanceMode(&read) == .ordered and self.core.hasGeneratedEnrichmentTargets()) return error.CommitRequirementUnavailable;
+        }
+        var output = execution_resources.PreparationCapture{ .alloc = alloc, .request_digest = digest };
+        try self.batchInternal(req, null, .{ .preparation_capture = &output, .preparation_context = context, .wait_for_sync_level = false });
+        return output.json orelse error.InvalidBatchRequest;
+    }
+
     pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
         return self.batchTrackedWithMarker(req, primary_committed, null);
     }
@@ -7691,6 +7826,23 @@ pub const DB = struct {
     /// `batchTracked` that also commits an outcome-receipt marker atomically
     /// with the primary write (see `apply_receipts.OutcomeMarker`).
     pub fn batchTrackedWithMarker(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker) anyerror!void {
+        return self.batchTrackedWithMarkerAndWriterLaneHook(req, primary_committed, marker, null);
+    }
+
+    /// `batchTrackedWithMarker` plus the WS3 in-process writer lane hook
+    /// (`execution_resources.WriterLaneReleaseHook`): a capi write export
+    /// passes its `HandleGuard`'s release callback here so the connection's
+    /// locks can drop across the primary write's durability wait too, not
+    /// just the DB apply lock. `hook` is forwarded as-is; `null` (the
+    /// default, via `batchTrackedWithMarker`) is a no-op in
+    /// `batchInternalPreparedOwned`.
+    pub fn batchTrackedWithMarkerAndWriterLaneHook(
+        self: *DB,
+        req: types.BatchRequest,
+        primary_committed: *bool,
+        marker: ?apply_receipts.OutcomeMarker,
+        hook: ?execution_resources.WriterLaneReleaseHook,
+    ) anyerror!void {
         primary_committed.* = false;
         var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
         var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
@@ -7703,9 +7855,53 @@ pub const DB = struct {
         const previous = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = previous;
-        self.batchTrackedProfiled(req, primary_committed, marker_write) catch |err| {
+        self.batchTrackedProfiled(req, primary_committed, marker_write, hook) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
                 std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
+                return error.OutcomeUnknown;
+            }
+            return err;
+        };
+    }
+
+    /// lite-single-commit-write-path.md §3.3c: `capi/sql.zig`'s
+    /// `commitCoordinated` single-call fast path. `req` carries the
+    /// primary row writes/deletes/predicates plus `integrity_commands`
+    /// for the UNIQUE claims this write decides for the first time, all
+    /// materialized in one native commit with no begin record and no
+    /// durable intent record -- see `BatchExecutionOptions.integrity_authority`
+    /// and `mutation_commit.zig`'s `prepareLocalIntegrityDecision`. Same
+    /// outcome classification as `batchTrackedWithMarkerAndWriterLaneHook`:
+    /// `primary_committed` distinguishes a durable write from one that
+    /// never applied when this returns `error.OutcomeUnknown`.
+    ///
+    /// `marker` (optional, mirrors `batchTrackedWithMarkerAndWriterLaneHook`):
+    /// the caller's writer-keyed outcome marker, committed atomically with
+    /// the primary write when set. Session COMMIT on this fused path
+    /// (`sql_session.zig`'s `commit`) uses this to give an ambiguous
+    /// outcome a resolvable, bounded receipt -- the retired writer id
+    /// doubles as `transaction_id` -- without a separate durable intent
+    /// record. Autocommit (`sql.zig`'s `mutate`) passes `null`: its own
+    /// ambiguous-outcome contract is the plain receipt-text scheme
+    /// (`outcome_receipts.zig`), not a `transaction_id`.
+    pub fn batchLocalCoordinated(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, child_exists: ?@import("relational_integrity.zig").ChildExistenceCheck) anyerror!void {
+        primary_committed.* = false;
+        var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
+        var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
+        const marker_write: ?docstore_mod.KVPair = if (marker) |m| apply_receipts.outcomeMarkerWrite(m, &marker_key, &marker_value) else null;
+        var progress: backend_types.CommitProgress = .{};
+        const previous = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = previous;
+        const opts: BatchExecutionOptions = .{
+            .primary_committed = primary_committed,
+            .integrity_authority = .local_decision,
+            .outcome_marker_write = marker_write,
+            .relational_child_existence_check = child_exists,
+        };
+        self.batchInternal(req, null, opts) catch |err| {
+            if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
+                std.log.warn("coordinated batch failed after its write may have applied: {s}", .{@errorName(err)});
                 return error.OutcomeUnknown;
             }
             return err;
@@ -7719,8 +7915,18 @@ pub const DB = struct {
         };
     }
 
-    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair) anyerror!void {
-        const opts: BatchExecutionOptions = .{ .primary_committed = primary_committed, .outcome_marker_write = marker_write };
+    fn batchTrackedProfiled(
+        self: *DB,
+        req: types.BatchRequest,
+        primary_committed: *bool,
+        marker_write: ?docstore_mod.KVPair,
+        writer_lane_release_before_wait: ?execution_resources.WriterLaneReleaseHook,
+    ) anyerror!void {
+        const opts: BatchExecutionOptions = .{
+            .primary_committed = primary_committed,
+            .outcome_marker_write = marker_write,
+            .writer_lane_release_before_wait = writer_lane_release_before_wait,
+        };
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
             try self.batchInternal(req, &profile, opts);
@@ -8930,11 +9136,13 @@ pub const DB = struct {
         const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), derived_batch, sequence);
         defer self.alloc.free(replay_payload);
 
-        try appendArtifactSourceRevisionWritesFromReplay(
+        try appendSourceRevisionWritesForEffects(
             self.alloc,
-            replay_payload,
             sequence,
             &store_writes,
+            delete_keys.items,
+            &.{},
+            &.{},
             &owned_store_keys,
             &owned_store_values,
         );
@@ -9102,7 +9310,12 @@ pub const DB = struct {
         const graph_cleanup_maintenance = req.graph_endpoint_cleanup or req.activate_range_tracking;
         if (!graph_cleanup_maintenance or req.row_policy_principal_proof.len != 0)
             try self.maybeFinalizePendingRowPolicyPublication();
-        if (req.row_policy_principal_proof.len != 0) {
+        if (opts.row_policy_lease) |lease| {
+            // Internal capture may borrow the already verified transaction
+            // authority. Replicated votes retain their admission-time proof.
+            if (opts.row_policy_principal == null and req.row_policy_principal_proof.len != 0) return error.RowPolicyAuthenticationRequired;
+            try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        } else if (req.row_policy_principal_proof.len != 0) {
             // Followers do not receive the coordinator's receipt probe. A
             // committed serving intent must become active before checking the
             // next signed mutation against its generation. Defer apply while
@@ -9878,6 +10091,8 @@ pub const DB = struct {
         lane: background_runtime_mod.DurableJobLane,
         owner_id: u64,
     ) void {
+        ctx.index_manager.artifact_cleanup_lane = lane;
+        ctx.index_manager.artifact_cleanup_owner_id = owner_id;
         @import("cleanup_job_owner.zig").schedule(.{
             .ptr = ctx,
             .state = &ctx.index_manager.artifact_cleanup_state,
@@ -9887,12 +10102,40 @@ pub const DB = struct {
             .closing = &ctx.background_closing,
             .advance = advanceArtifactCleanup,
             .name = "generated-artifact",
+            .on_give_up = onGeneratedArtifactCleanupGiveUp,
         });
+    }
+
+    /// `cleanup_job_owner.drain` gives up (and never resubmits on its own)
+    /// once one run exhausts its 8-attempt budget, regardless of whether
+    /// `advance`'s failures were ever going to clear -- see its own doc
+    /// comment; that unconditional stop is the deliberate fix for a prior
+    /// liveness bug (a truly permanent `advance` failure resubmitting
+    /// forever). But "exhausted 8 attempts" is not the same thing as
+    /// "permanent": a dependency rate limit or other bounded burst of
+    /// transient failures can easily outlast one run without ever being
+    /// unrecoverable. Resubmit a bounded number of additional rounds here
+    /// (each its own fresh 8-attempt budget) before truly stopping, so this
+    /// differs from the fixed bug only in being finite -- a genuinely
+    /// permanent failure still stops for good, just after more total
+    /// attempts instead of looping forever.
+    const max_generated_artifact_cleanup_giveup_rounds: u32 = 4;
+    fn onGeneratedArtifactCleanupGiveUp(ptr: *anyopaque, _: anyerror) void {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        const rounds = ctx.index_manager.artifact_cleanup_giveup_rounds.fetchAdd(1, .acq_rel) + 1;
+        if (rounds > max_generated_artifact_cleanup_giveup_rounds) return;
+        const lane = ctx.index_manager.artifact_cleanup_lane orelse return;
+        scheduleGeneratedArtifactCleanupContext(ctx, lane, ctx.index_manager.artifact_cleanup_owner_id);
     }
 
     fn advanceArtifactCleanup(ptr: *anyopaque) !@import("cleanup_job_owner.zig").Advance {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        return try advanceGeneratedArtifactCleanupContext(ctx, null);
+        const result = try advanceGeneratedArtifactCleanupContext(ctx, null);
+        // A successful advance (even mid-burst, interleaved with failures)
+        // demonstrates forward progress; reset the give-up bookkeeping so
+        // an unrelated later burst gets its own full round budget.
+        ctx.index_manager.artifact_cleanup_giveup_rounds.store(0, .release);
+        return result;
     }
 
     const retired_index_artifact_repair_cleanup_page_size: usize = 64;
@@ -10372,12 +10615,52 @@ pub const DB = struct {
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
+        var primary_capture: ?snapshot_admission_mod.SnapshotAdmission.CaptureLease = null;
+        defer if (primary_capture) |*lease| lease.release();
+        var replay_capture: ?snapshot_admission_mod.SnapshotAdmission.CaptureLease = null;
+        defer if (replay_capture) |*lease| lease.release();
+        var apply_locked = true;
         lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-
+        defer if (apply_locked) self.core.unlockApplyShared();
         const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
         defer alloc.free(manifest_key);
-        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse return null;
+        var stored_manifest = try self.core.getStoreValue(alloc, manifest_key);
+        const configured_asset = blk: {
+            self.core.index_manager.catalog_mutex.lockShared();
+            defer self.core.index_manager.catalog_mutex.unlockShared();
+            break :blk self.core.index_manager.getEnrichment(.asset, artifact_name) != null;
+        };
+        if (stored_manifest == null and !configured_asset and self.core.index_manager.denseIndex(artifact_name) != null) {
+            // Mutation admission precedes apply ownership throughout native
+            // publication. Never wait for capture while retaining apply.
+            self.core.unlockApplyShared();
+            apply_locked = false;
+            primary_capture = self.core.snapshot_admission.tryAcquireCapture() orelse return error.StorageReadTemporarilyUnavailable;
+            replay_capture = self.core.snapshot_replay_admission.tryAcquireCapture() orelse return error.StorageReadTemporarilyUnavailable;
+            lockApplyShared(self);
+            apply_locked = true;
+            // A catalog/asset may have appeared while apply ownership was
+            // released. Preserve precedence at the admitted cut too.
+            stored_manifest = try self.core.getStoreValue(alloc, manifest_key);
+        }
+
+        const manifest = stored_manifest orelse {
+            var captured = (@import("dense_index_inspection.zig").capture(self, alloc, doc_key, artifact_name) catch |err| {
+                if (@import("privacy_read.zig").pending(err) or err == error.IndexRebuilding or err == error.DeadlineExceeded) return error.StorageReadTemporarilyUnavailable;
+                return err;
+            }) orelse return null;
+            defer captured.deinit();
+            self.core.unlockApplyShared();
+            apply_locked = false;
+            if (replay_capture) |*lease| lease.release();
+            if (primary_capture) |*lease| lease.release();
+            var inspection = try captured.render(alloc);
+            errdefer inspection.deinit(alloc);
+            try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            return inspection;
+        };
+        if (replay_capture) |*lease| lease.release();
+        if (primary_capture) |*lease| lease.release();
         var manifest_owned = true;
         errdefer if (manifest_owned) alloc.free(manifest);
 
@@ -11191,6 +11474,36 @@ pub const DB = struct {
         return outcome == .produced or outcome == .skipped;
     }
 
+    fn artifactRepairConsumerCoverageComplete(self: *DB, alloc: Allocator, coverage_marker_key: ?[]const u8, extraction_key: ?[]const u8) !bool {
+        if (coverage_marker_key) |marker_key| {
+            if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return false;
+        }
+
+        if (extraction_key) |manifest_key| {
+            const raw = self.core.store.get(alloc, manifest_key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            defer alloc.free(raw);
+            const health = @import("enrichment/document_extraction_completion.zig").publicationState(alloc, raw) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+            if (health != .complete) return false;
+        }
+        return true;
+    }
+
+    fn observedArtifactRepairConsumerCoverageComplete(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
+        const coverage_key = try self.enrichmentFailureCoverageMarkerKeyAlloc(alloc, issue);
+        defer if (coverage_key) |key| alloc.free(key);
+        const extraction_key = try self.documentExtractionRepairKeyAlloc(alloc, issue);
+        defer if (extraction_key) |key| alloc.free(key);
+        lockAtomicWithBackoff(&self.async_context.artifact_repair_issue_mutex);
+        defer self.async_context.artifact_repair_issue_mutex.unlock();
+        return self.artifactRepairConsumerCoverageComplete(alloc, coverage_key, extraction_key);
+    }
+
     fn completeArtifactRepairIssueIfCurrent(
         self: *DB,
         alloc: Allocator,
@@ -11234,22 +11547,7 @@ pub const DB = struct {
         // clears debt first (and stale terminal transitions are rejected) or a
         // terminal transition lands first (and debt remains queued). There is
         // no interleaving that can leave terminal coverage without repair debt.
-        if (coverage_marker_key) |marker_key| {
-            if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return .coverage_incomplete;
-        }
-
-        if (extraction_key) |manifest_key| {
-            const raw = self.core.store.get(alloc, manifest_key) catch |err| switch (err) {
-                error.NotFound => return .coverage_incomplete,
-                else => return err,
-            };
-            defer alloc.free(raw);
-            const health = @import("enrichment/document_extraction_completion.zig").publicationState(alloc, raw) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return .coverage_incomplete,
-            };
-            if (health != .complete) return .coverage_incomplete;
-        }
+        if (!try self.artifactRepairConsumerCoverageComplete(alloc, coverage_marker_key, extraction_key)) return .coverage_incomplete;
         completion.completed_sequence = @max(completion.completed_sequence, revision.sequence);
         completion.pending_issues -|= 1;
 
@@ -11702,11 +12000,15 @@ pub const DB = struct {
         try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, ScanState.scanEntry);
 
         if (state.rows < ScanState.batch_limit) {
-            const ready_key = try internal_keys.artifactRepairKindIndexReadyKeyAlloc(alloc);
-            errdefer alloc.free(ready_key);
-            const ready_value = try alloc.dupe(u8, "2");
-            errdefer alloc.free(ready_value);
-            try writes.append(alloc, .{ .key = ready_key, .value = ready_value });
+            {
+                // Scope the errdefers to the append: once `writes` owns the
+                // buffers, its deferred cleanup frees them on a failed commit.
+                const ready_key = try internal_keys.artifactRepairKindIndexReadyKeyAlloc(alloc);
+                errdefer alloc.free(ready_key);
+                const ready_value = try alloc.dupe(u8, "2");
+                errdefer alloc.free(ready_value);
+                try writes.append(alloc, .{ .key = ready_key, .value = ready_value });
+            }
             const deletes = [_][]const u8{ progress_key, legacy_progress_key };
             try self.core.store.putBatchWithReplayWithOptions(null, writes.items, deletes[0..], null, .{ .defer_commit_flush = true });
             return false;
@@ -12696,6 +12998,45 @@ pub const DB = struct {
         return (self.index_repair_clock orelse self.backend_runtime.clock()).nowRealtimeMs();
     }
 
+    /// Clock for shadow-index-repair activation pacing decisions
+    /// (repairActivationAdmissible / observeRepairCatchUpCost, and the
+    /// catch-up/activation deadlines in rebuildIndexWithShadowReplacementOwned).
+    /// Defaults to the backend runtime's monotonic clock: in production that
+    /// resolves to the real OS monotonic clock (bit-identical to the former
+    /// bare platform_time.monotonicNs() call), while under VOPR it resolves
+    /// through the borrowed std.Io, which VOPR already controls
+    /// deterministically. See DETERMINISM_AUDIT.md.
+    fn repairPacingClock(self: *const DB) platform_clock.Clock {
+        return self.repair_pacing_clock orelse self.backend_runtime.monotonicClock();
+    }
+
+    fn repairPacingNowNs(self: *const DB) u64 {
+        return self.repairPacingClock().nowRealtimeNs();
+    }
+
+    fn repairPacingElapsedNs(self: *const DB, start_ns: u64) u64 {
+        return self.repairPacingNowNs() - start_ns;
+    }
+
+    /// Durable repair/shadow-generation identity (IndexRepairIntent.repair_id,
+    /// dense-artifact-counter attempt ids, shadow generation ids). These are
+    /// not security-sensitive, but they are wire-visible: a repair intent's
+    /// repair_id is part of durable, observable state and can surface through
+    /// status/observability responses. index_repair_state.newRepairId draws
+    /// from the global std.Options.debug_io, bypassing whatever Io this DB was
+    /// actually opened with. In production that is still the real OS secure
+    /// entropy source (unchanged behavior), but under VOPR it bypasses
+    /// VoprIo's seeded, replay-deterministic randomSecure entirely and reads
+    /// real host entropy instead -- DETERMINISM_AUDIT.md's "Direct host
+    /// entropy" risk category. Route through the backend runtime's borrowed
+    /// std.Io, which resolves to VoprIo's seeded PRNG under VOPR and to the
+    /// same real entropy source in production, so repair identities become
+    /// exact-replay-deterministic without changing production behavior.
+    fn newDurableRepairId(self: *const DB, alloc: Allocator) !u128 {
+        if (self.backend_runtime.io()) |io| return index_repair_state.newRepairIdWithIo(alloc, io);
+        return index_repair_state.newRepairId(alloc);
+    }
+
     const progressive_index_repair_audit_interval_ms: u64 = 5 * std.time.ms_per_s;
 
     fn deferIndexRepairForProgress(
@@ -13028,6 +13369,7 @@ pub const DB = struct {
         intent: index_repair_state.IndexRepairIntent,
     ) !bool {
         if (try self.localArtifactSourceRecoveryIsServiceable(alloc, intent)) return true;
+        if (try self.activationFenceAdmissionIsServiceable(alloc, intent)) return true;
         const minimum_replay = (try self.managedInitialBuildMinimumReplay(alloc, intent)) orelse return false;
         if (!initialBuildCanRetireBeforeActivation(intent) or intent.source_replay_state == .pending) return false;
         if (intent.candidate_relative_path) |candidate| {
@@ -13091,6 +13433,68 @@ pub const DB = struct {
             if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or
                 counts.produced.? +| counts.skipped.? != total) return false;
         }
+        return true;
+    }
+
+    /// A `.catalog_admission` repair intent whose durable marker disposition
+    /// is `.activation_fence` (every *ordinary*, non-managed `addIndex`
+    /// always uses this disposition, and a *managed* admission of a
+    /// still-empty table does too -- see `installIndexForReconciliation`)
+    /// names an index whose physical construction already fully succeeded,
+    /// synchronously, inside the original admission call: `addWithOptions`
+    /// opens (and, for a non-empty ordinary admission, backfills) the index
+    /// before it ever persists the catalog/admission-marker transaction, so
+    /// a transient error here can only have hit *post*-commit bookkeeping
+    /// (`recoverCommittedIndexAdmission`'s comment on
+    /// `runUntilIdleWithReplayDrainOptions` has the long version). There is
+    /// no corpus to rebuild and -- unlike `localArtifactSourceRecoveryIsServiceable`'s
+    /// managed_rebuild case above -- no artifact-source replay to wait on:
+    /// this index has no admission debt at all beyond the unfinished
+    /// bookkeeping. Routing it into a shadow rebuild instead of retiring it
+    /// here would use this intent's own (now-stale, captured-at-admission)
+    /// `target_sequence` as the candidate's backfill floor, silently
+    /// discarding every document the live index already applied since.
+    fn activationFenceAdmissionIsServiceable(
+        self: *DB,
+        alloc: Allocator,
+        intent: index_repair_state.IndexRepairIntent,
+    ) !bool {
+        if (intent.trigger != .catalog_admission or intent.work_class != .initial_build) return false;
+        if (!initialBuildCanRetireBeforeActivation(intent) or intent.source_replay_state == .pending) return false;
+        const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, intent.index_name);
+        defer alloc.free(key);
+        const raw = self.core.store.get(alloc, key) catch |err| if (err == error.NotFound) return false else return err;
+        defer alloc.free(raw);
+        const marker = try decodeManagedIndexAdmissionMarker(raw);
+        if (marker.disposition != .activation_fence or marker.config_hash != intent.config_hash) return false;
+        const cfg = self.core.index_manager.get(intent.index_name) orelse return false;
+        if (types.indexConfigHash(cfg.*) != intent.config_hash) return false;
+        // A load failure means this process's own reopen of the index never
+        // reached the live state the marker promises -- that is the
+        // quarantine/`retryQuarantinedIndexLoads` recovery path's debt, not
+        // this one's; fail closed into the ordinary rebuild path below
+        // rather than retiring an intent over an index that is not actually
+        // open.
+        if (self.core.index_manager.loadFailure(intent.index_name) != null) return false;
+        // The premise above -- that the synchronous admission backfill
+        // already covers everything -- is the normal case, but a transient
+        // fault class (or a repeated one) can leave the ordinary canonical
+        // worker still replaying its backlog toward this marker's own
+        // `replay_target_sequence` when this is checked (`startAsyncWorkers`
+        // attaches that worker unconditionally at open, independently of
+        // this repair intent, so it keeps making progress either way).
+        // Verify the durable watermark actually reached what this marker
+        // promised instead of trusting the premise outright: retiring this
+        // intent clears `markUnscopedRepairUnavailable`'s query gate
+        // (`removeIndexRepairIntentAndPinContext` -> `publishRepairAdmission`),
+        // so declaring serviceable here while real backlog remains is
+        // exactly how a worker that never caught up can make search()
+        // silently serve incomplete results instead of `IndexRebuilding`.
+        // Fail closed (not yet serviceable, keep the intent runnable) until
+        // that worker's own progress proves it; a later repair quantum
+        // re-checks this same intent and retires it once it does.
+        const applied = try self.managedIndexAppliedSequence(alloc, intent.index_name);
+        if (applied < marker.replay_target_sequence or applied < intent.target_sequence) return false;
         return true;
     }
 
@@ -13493,7 +13897,7 @@ pub const DB = struct {
                 const now_ms = self.indexRepairNowMs();
                 const target_sequence = self.core.nextDerivedSequence();
                 var replacement_intent = index_repair_state.IndexRepairIntent{
-                    .repair_id = try index_repair_state.newRepairId(alloc),
+                    .repair_id = try self.newDurableRepairId(alloc),
                     .db_identity = state.identity.db_identity,
                     .group_id = self.localRepairGroupId(),
                     .replica_id = state.identity.replica_id,
@@ -14177,6 +14581,8 @@ pub const DB = struct {
     /// Cheap generation, replay, and cardinality checks run first so routine
     /// lag avoids a tree walk. The validation read transaction is stable while
     /// foreground writes continue through the ordinary derived stream.
+    const operator_validation_replay_wait_ns: u64 = 2 * std.time.ns_per_s;
+
     fn validateOperatorDenseGenerationForOnlineRebuild(
         self: *DB,
         alloc: Allocator,
@@ -14382,7 +14788,7 @@ pub const DB = struct {
             self.core.nextDerivedSequence(),
             minimum_target_sequence orelse 0,
         );
-        const repair_id = try index_repair_state.newRepairId(alloc);
+        const repair_id = try self.newDurableRepairId(alloc);
         const index_name = try alloc.dupe(u8, cfg.name);
         var intent_allocations_transferred = false;
         errdefer if (!intent_allocations_transferred) alloc.free(index_name);
@@ -14789,7 +15195,7 @@ pub const DB = struct {
         if (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name) != null) {
             return error.DenseArtifactCounterAlreadyInitialized;
         }
-        const attempt_id = try index_repair_state.newRepairId(alloc);
+        const attempt_id = try self.newDurableRepairId(alloc);
         const marker_key = try denseArtifactCounterBootstrapKeyAlloc(alloc, index_name);
         defer alloc.free(marker_key);
         var marker_value: [dense_artifact_counter_bootstrap_encoded_len]u8 = undefined;
@@ -15784,7 +16190,7 @@ pub const DB = struct {
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             const now_ms = self.indexRepairNowMs();
             const target_sequence = self.core.nextDerivedSequence();
-            const repair_id = try index_repair_state.newRepairId(alloc);
+            const repair_id = try self.newDurableRepairId(alloc);
             const index_name = try alloc.dupe(u8, cfg.name);
             var intent = index_repair_state.IndexRepairIntent{
                 .repair_id = repair_id,
@@ -17171,6 +17577,7 @@ pub const DB = struct {
         lease_authority: IndexRepairLeaseAuthority,
     ) !types.ArtifactRepairResult {
         try checkArtifactRepairCancelled(options);
+        if (req.observe_index_repair) return self.observeIndexRepair(alloc, req, options);
         if (req.target == .index) return try self.repairIndexIssuesWithRequest(
             alloc,
             req,
@@ -17287,21 +17694,19 @@ pub const DB = struct {
                 const applied = try enrichment_state.loadAppliedSequence(alloc, self.core.store, enrichment_runtime_mod.scope_name);
                 // One job submits a failed source once. Polls wait for that
                 // durable replay; a fresh job can explicitly retry its outcome.
-                if (queued != 0 and (queued >= issue.sequence) and
-                    (applied < queued or (req.repair_job_id != null and completion_snapshot.queued_job_id == req.repair_job_id.?)))
+                const same_job = req.repair_job_id != null and completion_snapshot.queued_job_id == req.repair_job_id.?;
+                if (queued != 0 and
+                    ((queued >= issue.sequence and applied < queued) or
+                        (same_job and (queued >= issue.sequence or artifactRepairPublicationSettled(completion_snapshot)))))
                 {
-                    if (applied < queued) {
+                    if (applied < queued and !artifactRepairPublicationSettled(completion_snapshot)) {
                         result.in_progress += 1;
                     } else {
                         const readable = issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*);
                         // A readable asset may be an old payload or a manifest
                         // recording terminal OCR failures. Only a successful
                         // publication's completion fence proves this repair.
-                        const completed = if (!readable)
-                            false
-                        else if (issue.reason == .enrichment_failed)
-                            (try self.completeArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision, completion_key, completion_snapshot.epoch, true)) == .completed
-                        else
+                        const completed = issue.reason != .enrichment_failed and readable and
                             try self.clearArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision);
                         if (completed) {
                             result.repaired += 1;
@@ -17309,9 +17714,9 @@ pub const DB = struct {
                         }
                         // Successful providers may have published a later
                         // derived batch that the index has not applied yet.
-                        // An unchanged, older diagnosis is not a failure of
-                        // this queued attempt; wait for its publication fence.
-                        if (issue.sequence < queued and completion_snapshot.failed_sequence < queued)
+                        // Once publication settles, a consumer that still
+                        // lacks coverage is remaining debt for this attempt.
+                        if (issue.sequence < queued and !artifactRepairPublicationSettled(completion_snapshot))
                             result.in_progress += 1
                         else
                             result.failed += 1;
@@ -17413,6 +17818,11 @@ pub const DB = struct {
             if (result.next_cursor) |cursor| alloc.free(cursor);
             result.next_cursor = if (req.cursor) |cursor| try alloc.dupe(u8, cursor) else null;
             result.has_more = true;
+            // This page will be read again. Only a settled page contributes
+            // terminal outcomes to the durable job's cumulative counts.
+            result.failed = 0;
+            result.unsupported = 0;
+            result.missing_source_docs = 0;
             return result;
         }
         if (result.repaired != 0) {
@@ -17423,6 +17833,118 @@ pub const DB = struct {
             try self.runArtifactRepairMetadataMaintenanceUntilIdle();
         }
         return result;
+    }
+
+    /// An observation reports durable state without creating, resuming, or
+    /// dispatching a repair. A worker can retire its intent between polls.
+    fn observeIndexRepair(self: *DB, alloc: Allocator, req: types.ArtifactRepairRunRequest, options: types.ArtifactRepairRunOptions) !types.ArtifactRepairResult {
+        if (req.target != .index or req.control != null or req.repair_id != null) return error.InvalidArgument;
+        const name = req.index_name orelse return error.InvalidArgument;
+        const cfg = self.core.index_manager.get(name) orelse return error.NotFound;
+        const config_hash = types.indexConfigHash(cfg.*);
+        var result: types.ArtifactRepairResult = .{
+            .limit = if (req.limit == 0) 100 else req.limit,
+            .scanned = 1,
+            .observed_only = true,
+        };
+        var state: ?index_repair_state.State = self.loadIndexRepairState(alloc) catch |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => null,
+            else => return err,
+        };
+        defer if (state) |*loaded| loaded.deinit(alloc);
+        var terminal_reason: ?[]const u8 = null;
+        if (state) |*loaded| if (loaded.findIndex(name)) |index| {
+            const intent = loaded.entries.items[index].intent;
+            if (intent.root_generation != self.core.root_generation or intent.group_id != self.localRepairGroupId() or intent.config_hash != config_hash) {
+                result.observation_changed = true;
+                return result;
+            }
+            result.indexes_degraded_before = 1;
+            result.indexes_degraded_after = 1;
+            result.unresolved = 1;
+            result.debt_remaining = true;
+            if (!indexRepairActionRequired(intent)) {
+                result.in_progress = 1;
+                return result;
+            }
+            const fallback = if (intent.automation == .paused) "index_repair_paused" else "index_repair_failed";
+            terminal_reason = intent.last_error orelse fallback;
+        };
+        if (terminal_reason == null and try self.indexGenerationRepairRequired(alloc, name)) {
+            result.observation_changed = true;
+            return result;
+        }
+
+        // Older jobs may have persisted document-only shards in their polling
+        // set. Check their durable replay outcome as well as the generation.
+        if (req.operator_initiated) try self.observeIndexDocumentRepairs(alloc, req, options, &result);
+        errdefer result.deinit(alloc);
+        if (!result.has_more) {
+            if (terminal_reason) |message| {
+                result.failed += 1;
+                result.terminal_error = try alloc.dupe(u8, message);
+            }
+        }
+        return result;
+    }
+
+    fn artifactRepairPublicationSettled(completion: ArtifactRepairCompletionState) bool {
+        return completion.completed_sequence >= completion.queued_sequence or
+            completion.failed_sequence >= completion.queued_sequence;
+    }
+
+    fn observeIndexDocumentRepairs(self: *DB, alloc: Allocator, req: types.ArtifactRepairRunRequest, options: types.ArtifactRepairRunOptions, result: *types.ArtifactRepairResult) !void {
+        var page = try self.listArtifactRepairIssuesPage(alloc, .{
+            .index_name = req.index_name,
+            .limit = result.limit,
+            .cursor = req.cursor,
+        });
+        defer page.deinit(alloc);
+        if (page.issues.len != 0) {
+            const applied = try enrichment_state.loadAppliedSequence(alloc, self.core.store, enrichment_runtime_mod.scope_name);
+            var failed: u64 = 0;
+            for (page.issues) |issue| {
+                try checkArtifactRepairCancelled(options);
+                const key = try self.artifactRepairCompletionKeyForIssueAlloc(alloc, issue);
+                defer alloc.free(key);
+                const completion = try self.artifactRepairCompletionSnapshot(alloc, key);
+                const queued = completion.queued_sequence;
+                if (queued != 0 and applied < queued and !artifactRepairPublicationSettled(completion)) {
+                    result.document_replay_in_progress += 1;
+                    continue;
+                }
+                if (issue.reason == .enrichment_failed and completion.completed_sequence >= issue.sequence and
+                    (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue)) and
+                    try self.observedArtifactRepairConsumerCoverageComplete(alloc, issue)) continue;
+                if (queued != 0 and issue.sequence < queued and !artifactRepairPublicationSettled(completion)) {
+                    // The source replay applied, but its derived output or
+                    // terminal failure is not visible in the ledger yet.
+                    result.document_replay_in_progress += 1;
+                    continue;
+                }
+                if (queued != 0 and issue.reason != .enrichment_failed and
+                    completion.failed_sequence < queued and try self.artifactNowReadable(alloc, issue)) continue;
+                failed += 1;
+            }
+            result.in_progress += result.document_replay_in_progress;
+            if (result.document_replay_in_progress != 0) {
+                // Keep this page until all pending rows settle. Count failed
+                // rows once when it advances, including those observed above.
+                result.has_more = true;
+                result.debt_remaining = true;
+                result.unresolved += result.document_replay_in_progress;
+                result.next_cursor = if (req.cursor) |cursor| try alloc.dupe(u8, cursor) else null;
+                return;
+            }
+            result.failed += failed;
+            result.unresolved += failed;
+            result.debt_remaining = result.debt_remaining or failed != 0;
+        }
+        if (page.issues.len != 0) result.scanned = page.issues.len;
+        result.has_more = page.has_more;
+        result.debt_remaining = result.debt_remaining or page.has_more;
+        result.next_cursor = page.next_cursor;
+        page.next_cursor = null;
     }
 
     /// Index repair and rebuild also retry the index's permanently failed
@@ -17436,6 +17958,23 @@ pub const DB = struct {
         options: types.ArtifactRepairRunOptions,
         lease_authority: IndexRepairLeaseAuthority,
     ) anyerror!types.ArtifactRepairResult { // explicit: re-enters the artifact repair dispatch
+        if (req.resume_document_repair and req.operator_initiated and req.control == null) {
+            var observation: types.ArtifactRepairResult = .{
+                .limit = if (req.limit == 0) 100 else req.limit,
+                .scanned = 1,
+                .observed_only = true,
+            };
+            var owns_observation = true;
+            defer if (owns_observation) observation.deinit(alloc);
+            try self.observeIndexDocumentRepairs(alloc, req, options, &observation);
+            if (observation.document_replay_in_progress != 0) {
+                // Only poll the existing replay while this page is parked.
+                // Unsupported rows and missing sources are revisited once the
+                // replay settles, so polls do not mutate their diagnostics.
+                owns_observation = false;
+                return observation;
+            }
+        }
         // Operator continuations carry an artifact-ledger cursor. Generation
         // repair has no local cursor and must retain its own request validation.
         var generation_req = req;
@@ -17489,11 +18028,11 @@ pub const DB = struct {
             defer remaining.deinit(alloc);
             if (remaining.issues.len != 0) result.in_progress = 0;
         }
-        try mergeIndexEnrichmentRepairResult(alloc, &result, enrichment);
+        try mergeIndexEnrichmentRepairResult(alloc, &result, enrichment, req.cursor);
         return result;
     }
 
-    fn mergeIndexEnrichmentRepairResult(alloc: Allocator, result: *types.ArtifactRepairResult, enrichment: types.ArtifactRepairResult) !void {
+    fn mergeIndexEnrichmentRepairResult(alloc: Allocator, result: *types.ArtifactRepairResult, enrichment: types.ArtifactRepairResult, cursor: ?[]const u8) !void {
         result.scanned +|= enrichment.scanned;
         result.reprocessed +|= enrichment.reprocessed;
         result.repaired +|= enrichment.repaired;
@@ -17502,10 +18041,12 @@ pub const DB = struct {
         result.unsupported +|= enrichment.unsupported;
         result.unresolved +|= enrichment.unresolved;
         result.in_progress +|= enrichment.in_progress;
-        // Keep scanning after failed documents instead of restarting at the
-        // first page. The table layer wraps this local cursor with its group.
-        result.has_more = enrichment.has_more;
-        if (enrichment.next_cursor) |cursor| result.next_cursor = try alloc.dupe(u8, cursor);
+        result.document_replay_in_progress = enrichment.in_progress;
+        // Document work must settle on its ledger page before later groups or
+        // the generation polling set can complete the job.
+        result.has_more = enrichment.has_more or enrichment.in_progress != 0;
+        const next = if (enrichment.in_progress != 0) cursor else enrichment.next_cursor;
+        if (next) |value| result.next_cursor = try alloc.dupe(u8, value);
         if (enrichment.debt_remaining or enrichment.has_more) result.debt_remaining = true;
     }
 
@@ -17625,6 +18166,21 @@ pub const DB = struct {
                         .failure_streak = 0,
                         .next_retry_at_ms = 0,
                         .replace_last_error = true,
+                    });
+                } else if (current.intent.next_retry_at_ms != 0) {
+                    // The scheduler-paced backoff below assumes a periodic
+                    // background owner will wait it out in real time and try
+                    // again later. A forced call has no such owner waiting on
+                    // its behalf -- the caller IS the next attempt, right now.
+                    // Without this, a transient failure's backoff can survive
+                    // across this short-lived handle's own close/reopen (the
+                    // durable intent persists it) and a direct/embedded caller
+                    // retrying synchronously, exactly as documented for the
+                    // owner-less fallback, would stall for the full scheduler
+                    // backoff window instead of making immediate progress.
+                    try self.updateIndexRepairIntent(alloc, repair_id, .{
+                        .failure_streak = 0,
+                        .next_retry_at_ms = 0,
                     });
                 }
             }
@@ -17914,7 +18470,22 @@ pub const DB = struct {
             var durable_entry = try self.loadIndexRepairEntryById(alloc, repair_id);
             defer durable_entry.deinit(alloc);
             if (durable_entry.intent.trigger == .operator_generation_validation) {
-                switch (try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options)) {
+                var validation = try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options);
+                if (validation == .replay_pending) {
+                    // The failure this repair settles is already durable, but
+                    // the async executor may not have replayed past it yet.
+                    // Drive this index's replay to the current target once,
+                    // bounded, instead of deferring the forced repair to a
+                    // turn nothing schedules.
+                    const clock = self.backend_runtime.monotonicClock();
+                    const index_names = [_][]const u8{cfg.name};
+                    _ = self.waitForCurrentIndexTargets(&index_names, clock.nowRealtimeNs() +| operator_validation_replay_wait_ns) catch |err| switch (err) {
+                        error.EnrichmentWaitTimeout, error.EnrichmentWaitCanceled => {},
+                        else => return err,
+                    };
+                    validation = try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options);
+                }
+                switch (validation) {
                     .online_safe => try self.updateIndexRepairIntent(alloc, repair_id, .{
                         .trigger = .operator_generation_rebuild,
                         .replace_last_error = true,
@@ -17936,7 +18507,7 @@ pub const DB = struct {
         var persisted_build_reprocessed: u64 = 0;
         var build_resume_key: ?[]u8 = null;
         defer if (build_resume_key) |key| alloc.free(key);
-        const generation_id = durable_repair_id orelse try index_repair_state.newRepairId(alloc);
+        const generation_id = durable_repair_id orelse try self.newDurableRepairId(alloc);
         var shadow_base: []u8 = undefined;
         if (durable_repair_id) |repair_id| {
             var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
@@ -18012,8 +18583,6 @@ pub const DB = struct {
         // may keep index data in a separate namespace and need not create
         // this filesystem directory as a side effect of opening an index.
         try self.core.index_manager.createGenerationDirectory(shadow_index_path);
-        const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
-        defer alloc.free(shadow_checkpoint_path);
         if (options.capacity_check) |check| try check.bindCandidateRoot(shadow_base);
         if (resume_requires_ready_manifest) {
             _ = index_generation_manifest.validateReadyWithStorage(
@@ -18067,7 +18636,6 @@ pub const DB = struct {
         shadow_manager.source_payload_store = self.core.index_manager.source_payload_store;
         shadow_manager.setSchemaRegistry(self.core.schema_registry);
         shadow_manager.setIo(self.backend_runtime.io());
-        shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
             shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |transfer_err| {
                 std.log.warn("failed to preserve unopened shadow LSM clone attribution index={s} err={s}", .{
@@ -18110,7 +18678,6 @@ pub const DB = struct {
             .io = self.backend_runtime.io(),
             .store = self.core.store,
             .relational_base_rows = relationalColumns(self) != null,
-            .applied_sequence_checkpoint_path = shadow_checkpoint_path,
             .index_manager = &shadow_manager,
             .apply_mutex = self.async_context.apply_mutex,
             .dense_bulk_session_scope = .external,
@@ -18124,14 +18691,7 @@ pub const DB = struct {
         var build_floor_sequence: u64 = if (resume_building)
             persisted_build_floor_sequence
         else if (resume_candidate)
-            try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-                shadow_manager.generation_storage,
-                alloc,
-                shadow_manager.checkpointIo(),
-                self.core.store,
-                shadow_checkpoint_path,
-                cfg.name,
-            )
+            try apply_state.loadAppliedSequence(alloc, self.core.store, cfg.name)
         else
             0;
         var expected_snapshot_coverage: ?u64 = null;
@@ -18321,7 +18881,7 @@ pub const DB = struct {
         }
         if (completed_snapshot_build) {
             try checkArtifactRepairCancelled(options);
-            try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
+            try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, index_ref, build_floor_sequence);
             if (options.capacity_check) |check| {
                 try check.current(try repairCandidateStorageBytes(alloc, cfg, &shadow_manager, shadow_base));
             }
@@ -18344,12 +18904,11 @@ pub const DB = struct {
         }
         var observed_ns_per_sequence: u64 = 0;
         var catch_up_start_sequence = build_floor_sequence;
-        var catch_up_start_ns = monotonicTimeNs();
+        var catch_up_start_ns = self.repairPacingNowNs();
         const initial_catch_up_target = self.core.nextDerivedSequence();
         const initial_catch_up = try self.catchUpShadowReplacementUntil(
             alloc,
             &shadow_manager,
-            shadow_checkpoint_path,
             index_ref,
             initial_catch_up_target,
             options,
@@ -18364,7 +18923,7 @@ pub const DB = struct {
             observed_ns_per_sequence,
             catch_up_start_sequence,
             converged_sequence,
-            elapsedSince(catch_up_start_ns),
+            self.repairPacingElapsedNs(catch_up_start_ns),
         );
         if (initial_catch_up.yielded) {
             if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
@@ -18435,11 +18994,10 @@ pub const DB = struct {
                 .target_sequence = convergence_target,
             });
             catch_up_start_sequence = converged_sequence;
-            catch_up_start_ns = monotonicTimeNs();
+            catch_up_start_ns = self.repairPacingNowNs();
             const convergence_catch_up = try self.catchUpShadowReplacementUntil(
                 alloc,
                 &shadow_manager,
-                shadow_checkpoint_path,
                 index_ref,
                 convergence_target,
                 options,
@@ -18454,7 +19012,7 @@ pub const DB = struct {
                 observed_ns_per_sequence,
                 catch_up_start_sequence,
                 converged_sequence,
-                elapsedSince(catch_up_start_ns),
+                self.repairPacingElapsedNs(catch_up_start_ns),
             );
             if (convergence_catch_up.yielded) {
                 if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
@@ -18573,7 +19131,7 @@ pub const DB = struct {
             cfg.name,
         );
         defer structural_guard.deinit();
-        const activation_started_ns = monotonicTimeNs();
+        const activation_started_ns = self.repairPacingNowNs();
         const activation_deadline_ns = activation_started_ns +| max_activation_pause_ns;
         if (!structural_guard.acquireCatalogBarrierUntil(activation_deadline_ns)) {
             return error.RepairActivationBudgetExhausted;
@@ -18589,7 +19147,7 @@ pub const DB = struct {
         var activation_metric_recorded = false;
         defer if (!activation_metric_recorded) {
             if (self.core.index_manager.resource_manager) |manager| {
-                manager.recordIndexRepairActivation(monotonicTimeNs() -| activation_started_ns, max_activation_pause_ns);
+                manager.recordIndexRepairActivation(self.repairPacingNowNs() -| activation_started_ns, max_activation_pause_ns);
             }
         };
         try checkArtifactRepairCancelled(options);
@@ -18607,14 +19165,13 @@ pub const DB = struct {
             return error.RepairActivationBudgetExhausted;
         }
         const activation_replay_deadline_ns = repairActivationReplayDeadline(
-            monotonicTimeNs(),
+            self.repairPacingNowNs(),
             activation_deadline_ns,
             max_activation_pause_ns,
         ) orelse return error.RepairActivationBudgetExhausted;
         const activation_catch_up = self.catchUpShadowReplacementUntil(
             alloc,
             &shadow_manager,
-            shadow_checkpoint_path,
             index_ref,
             final_target,
             options,
@@ -18673,12 +19230,12 @@ pub const DB = struct {
         );
         try checkArtifactRepairCancelled(options);
         try checkArtifactRepairActivationOwner(options);
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
         if (durable_repair_id) |repair_id| try self.validateIndexRepairActivationState(alloc, repair_id, options.owner_epoch);
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
         const previous_active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(cfg.name);
         defer if (previous_active_pointer) |value| self.core.index_manager.alloc.free(value);
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
         if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
             .phase = .activating,
             .candidate_applied_sequence = reached_target,
@@ -18687,7 +19244,7 @@ pub const DB = struct {
             .previous_active_relative_path = previous_active_pointer,
             .replace_previous_active_path = true,
         });
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
 
         // Final replay may advance beyond the preliminary ready marker. Make
         // readiness describe the exact durable generation installed by the
@@ -18702,7 +19259,7 @@ pub const DB = struct {
                 .applied_sequence = reached_target,
                 .baseline = guard,
             });
-            try ensureRepairActivationDeadline(activation_deadline_ns);
+            try self.ensureRepairActivationDeadline(activation_deadline_ns);
         };
         try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
             self.core.index_manager.generation_storage,
@@ -18714,7 +19271,7 @@ pub const DB = struct {
             reached_target,
             try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
         );
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
         const manifest_sequence = try index_generation_manifest.validateReadyWithStorage(
             self.core.index_manager.generation_storage,
             alloc,
@@ -18724,7 +19281,7 @@ pub const DB = struct {
             types.indexConfigHash(cfg),
         );
         if (manifest_sequence != reached_target) return error.IndexGenerationManifestMismatch;
-        try ensureRepairActivationDeadline(activation_deadline_ns);
+        try self.ensureRepairActivationDeadline(activation_deadline_ns);
 
         if (cfg.kind == .algebraic) {
             // Certify this physical projection only after the final replay has
@@ -18732,7 +19289,7 @@ pub const DB = struct {
             // namespace, so a crash before pointer publication cannot release
             // the active generation's lifecycle gate.
             try shadow_manager.persistAlgebraicProjectionConfigReady(self.core.store, cfg.name);
-            try ensureRepairActivationDeadline(activation_deadline_ns);
+            try self.ensureRepairActivationDeadline(activation_deadline_ns);
         }
 
         // Transfer the already-open runtime for every index family. Pointer
@@ -18781,7 +19338,7 @@ pub const DB = struct {
         // actual service pause before releasing it.
         // Generation teardown and other post-commit work are measured
         // separately and cannot produce false pause-budget alarms.
-        const activation_pause_ns = monotonicTimeNs() -| activation_started_ns;
+        const activation_pause_ns = self.repairPacingNowNs() -| activation_started_ns;
         self.core.unlockApply();
         apply_lock_held = false;
         structural_guard.releaseCatalogBarrier();
@@ -18853,7 +19410,6 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         shadow_manager: *index_manager_mod.IndexManager,
-        shadow_checkpoint_path: ?[]const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         target_sequence: u64,
         options: types.ArtifactRepairRunOptions,
@@ -18867,18 +19423,10 @@ pub const DB = struct {
         const cooperative = deadline_ns == null and options.yield_check != null;
         var batch_ctx = self.batchContext();
         batch_ctx.index_manager = shadow_manager;
-        batch_ctx.applied_sequence_checkpoint_path = shadow_checkpoint_path;
         batch_ctx.async_context = null;
         batch_ctx.dense_bulk_session_scope = .external;
 
-        var applied = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-            shadow_manager.generation_storage,
-            alloc,
-            shadow_manager.checkpointIo(),
-            self.core.store,
-            shadow_checkpoint_path,
-            index_ref.name,
-        );
+        var applied = try apply_state.loadAppliedSequence(alloc, self.core.store, index_ref.name);
         while (applied < target_sequence) {
             try checkArtifactRepairCancelled(options);
             if (index_ref.kind == .algebraic) {
@@ -18887,7 +19435,7 @@ pub const DB = struct {
                 }
             }
             if (deadline_ns) |deadline| {
-                if (monotonicTimeNs() >= deadline) return error.RepairActivationBudgetExhausted;
+                if (self.repairPacingNowNs() >= deadline) return error.RepairActivationBudgetExhausted;
             }
             var replay_ctx = ReplayApplyContextBatch{
                 .batch = &batch_ctx,
@@ -18900,7 +19448,7 @@ pub const DB = struct {
                 derived_worker.catch_up_max_records_per_window_default;
             var max_items_per_window: usize = 0;
             if (deadline_ns) |deadline| {
-                const now = monotonicTimeNs();
+                const now = self.repairPacingNowNs();
                 if (now >= deadline) return error.CatchUpDeadlineExceeded;
                 const per_sequence_ns = @max(@as(u64, 1), observed_ns_per_sequence);
                 const affordable_sequences = (deadline - now) / per_sequence_ns;
@@ -18934,6 +19482,7 @@ pub const DB = struct {
                     // applied sequence while budget remains.
                     .max_windows_per_call = if (cooperative) 1 else 0,
                     .deadline_ns = deadline_ns,
+                    .clock = self.repairPacingClock(),
                 },
             );
             if (index_ref.kind == .algebraic) {
@@ -18950,13 +19499,13 @@ pub const DB = struct {
                 break :blk applied;
             };
             if (advanced <= applied) return .{ .applied_sequence = applied };
-            try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, shadow_checkpoint_path, index_ref, advanced);
+            try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, index_ref, advanced);
             applied = advanced;
             if (cooperative and applied < target_sequence and options.yield_check.?.requested()) {
                 return .{ .applied_sequence = applied, .yielded = true };
             }
             if (deadline_ns) |deadline| {
-                if (applied < target_sequence and monotonicTimeNs() >= deadline) {
+                if (applied < target_sequence and self.repairPacingNowNs() >= deadline) {
                     return error.RepairActivationBudgetExhausted;
                 }
             }
@@ -19004,10 +19553,10 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         shadow_manager: *index_manager_mod.IndexManager,
-        shadow_checkpoint_path: ?[]const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         sequence: u64,
     ) !void {
+        _ = alloc;
         try shadow_manager.checkpointLsmWalForManagedIndex(index_ref);
         const update = apply_state.AppliedSequenceUpdate{
             .index_name = index_ref.name,
@@ -19017,14 +19566,7 @@ pub const DB = struct {
         const updates = [_]apply_state.AppliedSequenceUpdate{update};
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(shadow_manager, &updates);
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(shadow_manager, &updates);
-        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
-            shadow_manager.generation_storage,
-            alloc,
-            shadow_manager.checkpointIo(),
-            self.core.store,
-            shadow_checkpoint_path,
-            update,
-        );
+        try apply_state.saveAppliedSequenceUpdate(self.core.store, update);
     }
 
     fn finalizeShadowNativePostingGeneration(
@@ -20167,8 +20709,14 @@ pub const DB = struct {
         // Projection borrows the caller's immutable schema and primary snapshot.
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
+        var page: ?[]u8 = null;
+        defer if (page) |bytes| alloc.free(bytes);
         const raw = primary orelse (probe.getLeased(store_key) catch |err| switch (err) {
-            error.NotFound => return null,
+            error.NotFound => virtual: {
+                if (opts.include_primary_digest) return null;
+                page = try virtualPdfPageUnit(self, alloc, probe, store_key);
+                break :virtual page orelse return null;
+            },
             else => return err,
         });
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
@@ -23144,6 +23692,49 @@ pub const DB = struct {
             };
         };
         try cancellation.check();
+        if (physical_primary) {
+            // A physical (`antfly-lsm-checkpoint`) primary is restored by
+            // reusing its LSM files directly, with no per-key import --
+            // including whatever replay-journal bookkeeping those files
+            // already carry under the format and key layout active when
+            // they were captured. A released backup predating this tree's
+            // replay-journal key relocation (`internal_keys.zig`'s
+            // `GlobalReplayKind.next_sequence` moved off 0x02 for WS5's
+            // journal-sharing work) or its credit-ledger format carries
+            // that watermark somewhere `DocStore.lastReplaySequence`'s
+            // current key lookup never looks. Re-seed it at the
+            // authoritative value the backup itself recorded, under this
+            // build's current key and format, exactly as a split
+            // destination's inherited watermark is re-seeded via
+            // `ensureReplayFloor` -- a floor-only raise, so it is a no-op
+            // for a primary already carrying this value under the
+            // current layout.
+            //
+            // Only a genuinely missing watermark under the *current*
+            // (post-relocation) key -- `lastReplaySequence(0)` reads
+            // exactly `internal_keys.replay_meta_next_sequence_key`, the
+            // relocated key, and returns 0 when nothing was ever written
+            // there -- may be seeded from the manifest's
+            // `capture_target_sequence`. That is precisely the legacy/
+            // pre-relocation case this reseed exists for: a v0.2 backup's
+            // journal bookkeeping (its `replay_meta_init_key` marker
+            // included) predates the relocation and still exists, so
+            // `hasReplayEntries()` alone cannot tell the two cases apart.
+            // The manifest is the caller's own claim, not independently
+            // verified truth: `classifyNativeProjectionCatalogCompatibility`
+            // below re-derives this primary's watermark and compares it
+            // against that same manifest value to catch a tampered claim.
+            // Seeding an already-populated current-key watermark from the
+            // manifest first would make that comparison a tautology -- it
+            // would "validate" any upward tamper of `capture_target_sequence`
+            // by construction, since the watermark it compares against was
+            // just copied from the same untrusted value. A downward tamper
+            // remains caught either way: this is a floor-only raise, so it
+            // never lowers an already-higher, genuinely durable watermark.
+            if (opened_primary.store.lastReplaySequence(0) == 0) {
+                try opened_primary.store.ensureReplayNextSequenceAtLeast(native_manifest.?.capture_target_sequence + 1);
+            }
+        }
         if (purpose == .historical_table)
             try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, cancellation);
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
@@ -23151,14 +23742,29 @@ pub const DB = struct {
         // A table-local historical image cannot certify references owned by
         // other tables at a later cut. Keep the candidate unpublished until a
         // cluster-coordinated restore/activation barrier is available.
+        var detach_backup_fence = false;
         if (purpose == .historical_table) {
             const topology_fence = opened_primary.store.get(alloc, @import("relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             if (topology_fence) |bytes| {
-                alloc.free(bytes);
-                return error.CoordinatedConstraintRestoreRequired;
+                defer alloc.free(bytes);
+                const fence = try @import("relational_integrity_topology.zig").Fence.decode(bytes);
+                if (fence.role != .backup_snapshot) return error.CoordinatedConstraintRestoreRequired;
+                var read = try opened_primary.store.beginReadTxn();
+                defer read.abort();
+                const namespace = (try doc_identity.loadNamespaceTxn(&read)) orelse return error.IdentityNamespaceMismatch;
+                if (!namespace.eql(fence.namespace)) return error.IdentityNamespaceMismatch;
+                const catalog = read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                portable_backup.requireUncoordinatedIntegrityState(alloc, &read, catalog) catch |err| switch (err) {
+                    error.CoordinatedConstraintPortableBackupUnsupported => return error.CoordinatedConstraintRestoreRequired,
+                    else => return err,
+                };
+                detach_backup_fence = true;
             }
             const retirement = opened_primary.store.get(alloc, @import("relational_integrity_retirement.zig").key) catch |err| switch (err) {
                 error.NotFound => null,
@@ -23187,6 +23793,11 @@ pub const DB = struct {
                 },
             };
         }
+        // Only this unpublished, proven-uncoordinated candidate may discard
+        // its source backup's writer fence. Other topology roles, retirement,
+        // active/historical constraints and integrity records remain rejected.
+        if (detach_backup_fence)
+            try opened_primary.store.delete(@import("relational_integrity_topology.zig").fence_key);
         if (!streaming_store)
             try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
         // The candidate root owns its identity. Creating it while the staged
@@ -23812,6 +24423,38 @@ pub const DB = struct {
                 // tree intact so the asynchronous restore job can retry.
                 std.log.warn("native backup projection validation deferred index={s} err={s}", .{ projection.name, err_name });
                 return error.NativeBackupProjectionValidationIndeterminate;
+            }
+            // A restored primary store carries forward whatever progress v2
+            // record its source had as an ordinary part of the physical KV
+            // copy -- no extra plumbing needed when both ends speak v2. A
+            // backup captured before progress v2 existed (see
+            // testdata/v02-server: a genuine v0.2.5 release artifact, not an
+            // internal fixture) has no v2 record at all: its per-projection
+            // applied_sequence came from the since-deleted v1 checkpoint
+            // representation and was folded into this authenticated manifest
+            // at capture time. Treat that total absence as a migration, not
+            // corruption: seed v2 once from the manifest's already-
+            // authenticated values, the same way an invalidated projection's
+            // checkpoint is seeded below. A v2 record that *does* exist and
+            // disagrees with the manifest is still a genuine mismatch.
+            //
+            // Dense projections are excluded: their checkpoint authority is
+            // HBC metadata (denseProjectionCheckpointMetadata), not this v2
+            // key, and the comment below already explains why this generic
+            // comparison cannot validate them before physical installation.
+            // Seeding v2 here would route through saveProjectionCheckpoint's
+            // dense branch and overwrite that HBC metadata with the
+            // manifest's generic fields instead of leaving dense's own,
+            // later, physical-coverage check as the sole authority.
+            if (cfg.kind != .dense_vector and
+                try apply_state.loadProgress(alloc, self.core.store, projection.name) == null)
+            {
+                try self.core.saveProjectionCheckpoint(projection.name, .{
+                    .applied_sequence = projection.applied_sequence,
+                    .status = .clean,
+                    .generation = projection.checkpoint_generation,
+                    .config_hash = projection.config_hash,
+                });
             }
             // The primary-only transfer plan cannot validate a dense checkpoint:
             // its authoritative sequence lives in the still-unrestored posting
@@ -26806,14 +27449,58 @@ pub const DB = struct {
         return try @import("../source_admission.zig").lookupStatus(&read, self.core.identity_namespace.table_id, command);
     }
 
-    pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+    fn transactionPreparationRequest(req: types.TransactionIntentRequest) types.BatchRequest {
+        return .{
+            .row_policy_principal_proof = req.row_policy_principal_proof,
+            .row_policy_database = req.row_policy_database,
+            .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+            .range_guards = req.range_guards,
+            .document_version_scheme = req.document_version_scheme,
+            .commit_requires = req.commit_requires,
+            .writes = @ptrCast(req.writes),
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
+            .predicates = req.predicates,
+            .integrity = req.integrity,
+            .integrity_commands = req.integrity_commands,
+            .schema_version = req.schema_version,
+            .relational_schema_version = req.relational_schema_version,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
+            .relational_activation = req.relational_activation,
+            .relational_retirement = req.relational_retirement,
+            .relational_index_maintenance = req.relational_index_maintenance,
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+            .relational_repair = req.relational_repair,
+            .normalized_graph_rows = req.normalized_graph_rows,
+        };
+    }
+
+    pub fn writeTransaction(self: *DB, txn_id: types.TxnId, incoming_req: types.TransactionIntentRequest) !void {
+        var req = incoming_req;
+        var prepared_json: ?[]u8 = null;
+        defer if (prepared_json) |bytes| self.alloc.free(bytes);
+        if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) {
+            var preparation_req = transactionPreparationRequest(req);
+            preparation_req.transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 0 } };
+            prepared_json = try self.prepareDirectEnrichments(self.alloc, preparation_req);
+            req.prepared_enrichments_json = prepared_json;
+        }
         if (comptime storage_engine.enabled) return storage_engine.call("writeTransaction", .{ self, txn_id, req });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.writeTransactionInternal(txn_id, req, null);
+        // The tag must wrap `wait()`, not just the staged call: the actual
+        // apply/fsync happens there, not at `enqueue` time (see
+        // `writeTransactionInternal`'s own doc comment below).
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_intent_write);
+        defer wal_trace_scope.end();
+        const ticket = try self.writeTransactionInternal(txn_id, req, null);
+        try ticket.wait();
     }
 
     pub fn writeReplicatedTransactionAtOrderedReceipt(
@@ -26824,15 +27511,28 @@ pub const DB = struct {
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("writeReplicatedTransactionAtOrderedReceipt", .{ self, txn_id, req, identity });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try self.writeTransactionInternal(txn_id, req, identity);
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_intent_write);
+        defer wal_trace_scope.end();
+        const ticket = try self.writeTransactionInternal(txn_id, req, identity);
+        try ticket.wait();
     }
 
+    /// Returns a durability ticket instead of blocking for the fsync; see
+    /// `writeTransactionInternalOnce`'s doc comment. Both callers above wait
+    /// on it immediately, so this split changes no observable behavior --
+    /// a prerequisite for a future staged caller was explored and found
+    /// unsafe here: `writeTransactionInternalOnce` reads back the record
+    /// `beginTransaction` wrote, and a group-commit member is only applied
+    /// (and so only readable) once something drives/waits its group, not
+    /// at `enqueue` time (`lite/docstore.zig`'s `MutationPlan.apply`). A
+    /// caller cannot defer `wait()` across a step that reads an earlier
+    /// step's own write.
     fn writeTransactionInternal(
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
-    ) !void {
+    ) !backend_erased_mod.Ticket {
         if (ordered_receipt == null or req.row_policy_principal_proof.len != 0)
             try self.maybeFinalizePendingRowPolicyPublication();
         if (ordered_receipt != null and req.row_policy_principal_proof.len != 0 and
@@ -26866,7 +27566,7 @@ pub const DB = struct {
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+            const ticket = self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -26874,19 +27574,26 @@ pub const DB = struct {
                 },
                 else => return preparation.mapError(err),
             };
-            return;
+            return ticket;
         }
     }
 
+    /// Returns a durability ticket instead of blocking for the fsync; its
+    /// single caller, `writeTransactionInternal`, waits on it immediately,
+    /// so every entry point (`writeTransaction`,
+    /// `writeReplicatedTransactionAtOrderedReceipt`) keeps its prior
+    /// fully-synchronous behavior. See `writeTransactionInternal`'s own
+    /// doc comment for why this cannot safely be staged further.
     fn writeTransactionInternalOnce(
         self: *DB,
         txn_id: types.TxnId,
-        req: types.TransactionIntentRequest,
+        incoming_req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
-    ) !void {
+    ) !backend_erased_mod.Ticket {
+        var req = incoming_req;
         const source_purpose = try req.sourcePurpose();
         if (req.completion_source_purpose != null and ordered_receipt == null) return error.ChangefeedCapabilityUnsupported;
         {
@@ -26896,7 +27603,7 @@ pub const DB = struct {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             if (ordered_receipt) |identity| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
-                .already_applied => return,
+                .already_applied => return backend_erased_mod.Ticket.alreadyDurable(),
                 .apply => {},
             };
             if (req.completion_owner) |owner| {
@@ -26921,7 +27628,7 @@ pub const DB = struct {
                         const marker = orderedApplyReceiptWrite(identity, &value_buf);
                         try self.core.store.putBatch(&.{marker}, &.{});
                     }
-                    return;
+                    return backend_erased_mod.Ticket.alreadyDurable();
                 }
             }
         }
@@ -26942,12 +27649,59 @@ pub const DB = struct {
             try manager.requireSourcePurpose(txn_id, command.fingerprint());
             switch (try source_admission_mod.lookupStatus(&read, self.core.identity_namespace.table_id, command)) {
                 .committed => return error.SourceAlreadyCommitted,
-                .prepared => return,
+                .prepared => return backend_erased_mod.Ticket.alreadyDurable(),
                 .absent => {},
             }
         }
         var source_arena = std.heap.ArenaAllocator.init(preparation_alloc);
         defer source_arena.deinit();
+        var packet = if (req.prepared_enrichments_json) |json|
+            try std.json.parseFromSlice(execution_resources.PreparedEnrichments, preparation_alloc, json, .{ .allocate = .alloc_always })
+        else
+            null;
+        defer if (packet) |*value| value.deinit();
+        if (req.commit_requires == .direct_enrichments and packet == null) return error.InvalidBatchRequest;
+        if (packet) |value| {
+            if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
+            const digest = try execution_resources.PreparedEnrichments.requestDigest(preparation_alloc, transactionPreparationRequest(req));
+            if (!std.mem.eql(u8, &digest, &value.value.request_digest)) return error.InvalidBatchRequest;
+            {
+                try self.lockApplyForPortableRuntime();
+                defer self.core.unlockApply();
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                if (try manager.loadPreparedEnrichments(preparation_alloc, txn_id)) |previous| {
+                    defer preparation_alloc.free(previous);
+                    if (!std.mem.eql(u8, previous, req.prepared_enrichments_json.?)) return error.VersionConflict;
+                    if (ordered_receipt) |identity| {
+                        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
+                            .already_applied => return backend_erased_mod.Ticket.alreadyDurable(),
+                            .apply => {},
+                        }
+                        var marker_value: [ordered_apply_receipt_value_len]u8 = undefined;
+                        const marker = orderedApplyReceiptWrite(identity, &marker_value);
+                        try self.core.store.putBatch(&.{marker}, &.{});
+                    }
+                    return backend_erased_mod.Ticket.alreadyDurable();
+                }
+            }
+            const writes = try preparation_alloc.alloc(types.TransactionWrite, value.value.writes.len);
+            errdefer preparation_alloc.free(writes);
+            for (writes, value.value.writes) |*out, write| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+            req.writes = writes;
+            req.deletes = value.value.deletes;
+            req.transforms = &.{};
+            req.graph_writes = value.value.graph_writes;
+            req.graph_deletes = value.value.graph_deletes;
+            // Reuse the capture-only admission pipeline to authenticate the
+            // closed producer set and physical key scopes without inference.
+            var capture: execution_resources.PreparationCapture = .{ .alloc = preparation_alloc };
+            defer if (capture.json) |bytes| preparation_alloc.free(bytes);
+            var capture_req = transactionPreparationRequest(req);
+            capture_req.prepared_enrichments_json = req.prepared_enrichments_json;
+            try self.batchInternal(capture_req, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = row_policy_principal, .row_policy_lease = row_policy_lease });
+        }
+        defer if (packet != null) preparation_alloc.free(req.writes);
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
                 req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
@@ -27158,6 +27912,11 @@ pub const DB = struct {
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        if (packet) |value| {
+            var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            try self.validatePreparedEnrichments(preparation_alloc, value.value, plan.plan());
+        }
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         if (req.source_admission) |command| {
             var source_read = try self.core.store.beginProbeTxn();
@@ -27276,7 +28035,17 @@ pub const DB = struct {
             if (req.integrity.len != 0) try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
             try @import("relational_integrity_retirement.zig").admitCommands(&integrity_read, req.integrity_commands);
             const integrity_operations = if (req.integrity_commands.len != 0) operations: {
-                integrity_effects = try integrity_mod.prepare(preparation_alloc, &integrity_read, req.integrity_commands);
+                // lite-single-commit-write-path.md §7.6: `null` here --
+                // only the `.local_decision` fused path (`prepareLocalIntegrityDecision`
+                // below) can leave a dangling Reference in the first
+                // place (its ride-along `.attach` is not always atomic
+                // with its leader's row write), so only that path needs
+                // to self-heal one. The durable two-phase protocol's own
+                // begin/writeTransaction/commitTransaction/recovery
+                // sequence already keeps a participant's intents and the
+                // coordinator's decision consistent, so this call site
+                // cannot create a dangling Reference itself.
+                integrity_effects = try integrity_mod.prepare(preparation_alloc, &integrity_read, req.integrity_commands, null);
                 break :operations integrity_effects.?.operations;
             } else req.integrity;
             try integrity_mod.validatePreparedEffects(preparation_alloc, &integrity_read, integrity_operations);
@@ -27312,22 +28081,49 @@ pub const DB = struct {
         var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
         defer endpoint_dependencies.deinit();
         try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
+        if (packet) |value| {
+            var reservation_plan = self.core.relational_indexes.acquire();
+            defer if (reservation_plan) |*plan| plan.deinit();
+            const indexes = if (reservation_plan) |plan| plan.plan.boundIndexes().len else 0;
+            try @import("commit_requirements.zig").validateTransactionReservation(value.value, intents.items, predicates.items, indexes, try self.directRetirementReservation(preparation_alloc, intents.items, indexes));
+        }
+        if (packet) |value| if (value.value.artifact_writes.len != 0 or value.value.artifact_deletes.len != 0) {
+            // The retained-source reservation covers generated effects before
+            // this participant votes yes, including output-only tombstones.
+            const first = for (intents.items) |*intent| {
+                if (!isMetadataKey(intent.key)) break intent;
+            } else return error.InvalidBatchRequest;
+            for (value.value.artifact_writes) |write| {
+                first.retained_artifact_bytes = std.math.add(u64, first.retained_artifact_bytes, 16 + write.key.len + write.value.len) catch return error.TransactionTooLarge;
+                first.retained_artifact_keys = std.math.add(u64, first.retained_artifact_keys, 1) catch return error.TransactionTooLarge;
+            }
+            for (value.value.artifact_deletes) |key| {
+                first.retained_artifact_bytes = std.math.add(u64, first.retained_artifact_bytes, 16 + key.len) catch return error.TransactionTooLarge;
+                first.retained_artifact_keys = std.math.add(u64, first.retained_artifact_keys, 1) catch return error.TransactionTooLarge;
+            }
+        };
+
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
-                .already_applied => return,
+                .already_applied => return backend_erased_mod.Ticket.alreadyDurable(),
                 .apply => {},
             }
             var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(identity, &value_buf);
-            try self.core.writeIntentsExtraBatch(
+            // Wait here, not in the caller: the staged commit borrows this
+            // scope's index plan, schema view and preparation allocations.
+            const ticket = try self.core.writeIntentsExtraBatchStaged(
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .ordinary_producer = req.completion_ordinary_producer, .legacy_producer = req.completion_legacy_producer, .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .source_purpose = source_purpose, .source_scope = req.completion_source_scope, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .prepared_enrichments_json = req.prepared_enrichments_json, .ordinary_producer = req.completion_ordinary_producer, .legacy_producer = req.completion_legacy_producer, .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .source_purpose = source_purpose, .source_scope = req.completion_source_scope, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
+            try ticket.wait();
+            return backend_erased_mod.Ticket.alreadyDurable();
         } else {
-            try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+            const ticket = try self.core.writeIntentsExtraBatchStaged(txn_id, intents.items, predicates.items, .{
+                .prepared_enrichments_json = req.prepared_enrichments_json,
                 .ordinary_producer = req.completion_ordinary_producer,
                 .legacy_producer = req.completion_legacy_producer,
                 .completion_owner = req.completion_owner,
@@ -27340,6 +28136,8 @@ pub const DB = struct {
                 .index_span_digests = index_spans,
                 .graph_sources = graph_sources,
             });
+            try ticket.wait();
+            return backend_erased_mod.Ticket.alreadyDurable();
         }
     }
 
@@ -27453,6 +28251,44 @@ pub const DB = struct {
     /// Compute server-owned conservative bounds before voting prepared; the
     /// persisted replacement-aware ledger also counts artifact keys so commit
     /// cannot exceed the retained frame's independent key-count limit.
+    /// Count borrowed physical keys before a yes vote. The intent owner fence
+    /// then prevents background publishers from growing this footprint.
+    fn directRetirementReservation(self: *DB, alloc: Allocator, intents: []const transactions_mod.WriteIntent, indexes: usize) !@import("commit_requirements.zig").OutputBudget {
+        var budget = @import("commit_requirements.zig").OutputBudget{};
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openPhysicalCursorAdapter();
+        defer cursor.close();
+        for (intents) |intent| {
+            if (isMetadataKey(intent.key)) continue;
+            const document_prefix = try internal_keys.documentExactPrefixAlloc(alloc, intent.key);
+            defer alloc.free(document_prefix);
+            // Updates retire old secondary keys too. Scan only reverse-index
+            // ownership for updates; generated artifact retirement is already
+            // captured in the immutable packet. Deletes retire the whole row.
+            const prefix = if (intent.value != null)
+                try std.mem.concat(alloc, u8, &.{ document_prefix, &.{internal_keys.relational_index_reverse_kind} })
+            else
+                try alloc.dupe(u8, document_prefix);
+            defer alloc.free(prefix);
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |record| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, record.key, prefix)) break;
+                // Includes retirement stamps, revision clocks, provenance and
+                // replay references, including replacement/delete metadata.
+                try budget.reserve(2048 + 12 * record.key.len, 12);
+                // Reverse values carry the old tuple used to reconstruct the
+                // forward tombstone. Its size is independent of the new row.
+                if (internal_keys.isRelationalIndexReverseKey(record.key))
+                    try budget.reserve(2048 + 4 * record.value.len, 8);
+                if (internal_keys.isStoredSourceRowKey(record.key)) {
+                    for (0..indexes) |_| try budget.reserve(1024 + 4 * record.value.len + 8 * record.key.len, 8);
+                }
+            }
+        }
+        return budget;
+    }
+
     fn prepareOnlineVectorIntentBoundsLocked(self: *DB, alloc: Allocator, intents: []transactions_mod.WriteIntent, schema_view: ?schema_registry_mod.SchemaView) !void {
         for (intents) |*intent| {
             intent.retained_artifact_bytes = 0;
@@ -27897,6 +28733,27 @@ pub const DB = struct {
     pub fn getTransactionStatus(self: *DB, txn_id: transactions_mod.TxnId) !transactions_mod.TxnStatus {
         if (comptime storage_engine.enabled) return storage_engine.call("getTransactionStatus", .{ self, txn_id });
         return try self.core.getTransactionStatus(txn_id);
+    }
+
+    /// lite-single-commit-write-path.md §3.3c: `antfly_db_get_transaction_status`'s
+    /// fallback for an id that is not a known two-phase decision --
+    /// `expected` is the exact marker `commitCoordinatedLocal` retired on
+    /// an ambiguous outcome (`capi/sql.zig`), remembered on the
+    /// connection's `Owner` (not on `*DB`, which a post-ambiguous-commit
+    /// reconciliation may replace before this is ever checked -- see
+    /// `Owner.last_ambiguous_fused_marker`'s doc comment). The exact
+    /// sequence is needed because the bare 16-byte writer id alone
+    /// (this path's `transaction_id`) cannot disambiguate "this call's
+    /// own sequence landed" from "an earlier call on the same writer
+    /// already had", since nothing else about a retired writer's marker
+    /// key is resolvable from its id alone.
+    pub fn outcomeMarkerFallbackStatus(self: *DB, txn_id: transactions_mod.TxnId, expected: apply_receipts.OutcomeMarker) !transactions_mod.TxnStatus {
+        if (!std.mem.eql(u8, &expected.writer, &txn_id)) return error.TxnNotFound;
+        const persisted = try apply_receipts.readOutcomeMarker(self.alloc, self.core.store, txn_id);
+        return switch (try apply_receipts.outcomeDisposition(persisted, expected.sequence)) {
+            .applied => .committed,
+            .not_applied => .aborted,
+        };
     }
 
     pub fn getCommitVersion(self: *DB, txn_id: transactions_mod.TxnId) !u64 {
@@ -29721,6 +30578,7 @@ pub const DB = struct {
         for (command.mutations) |effect| {
             if (effect.value) |value| try writes.append(self.alloc, .{ .key = effect.key, .value = value }) else try deletes.append(self.alloc, effect.key);
         }
+        try appendSourceRevisionWritesForEffects(self.alloc, sequence, &writes, deletes.items, &.{}, &.{}, &owned_keys, &owned_values);
         try appendDenseArtifactCounterMutations(self.alloc, self.core.store, self.core.index_manager, &writes, deletes.items, &owned_keys, &owned_values);
         var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         try writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
@@ -30185,13 +31043,19 @@ pub const DB = struct {
                     const enrichment = self.enrichmentStatsWithSupervisorState(.{ .enabled = true });
                     const has_producers = enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0 or self.hasConfiguredResolvers();
                     if (replication_lsn == null and has_producers) {
-                        const target = self.currentMaintenanceTargetSequence();
+                        // Each producer consumes its own indexed replay lane.
+                        // A later output/derived-only record need not wake that
+                        // producer and cannot be used as its drain frontier.
+                        const source = self.core.replaySource();
+                        const enrichment_target = try source.latestMatchingSequence(self.alloc, enrichment.applied_sequence, .enrichment);
                         if (enrichment.retrying or enrichment.worker_failed or enrichment.stalled or
-                            ((enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0) and enrichment.applied_sequence < @max(target, enrichment.target_sequence))) return error.IntegrityTopologyBusy;
+                            ((enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0) and enrichment.applied_sequence < @max(enrichment_target, enrichment.target_sequence))) return error.IntegrityTopologyBusy;
                         if (self.hasConfiguredResolvers()) {
                             const resolution = self.resolutionStageStats();
                             const promotion = self.promotionStageStats();
-                            if (!resolution.enabled or !promotion.enabled or resolution.blocked or promotion.blocked or resolution.applied_sequence < target or promotion.applied_sequence < target) return error.IntegrityTopologyBusy;
+                            const resolution_target = try source.latestMatchingSequence(self.alloc, resolution.applied_sequence, .resolution);
+                            const promotion_target = try source.latestMatchingSequence(self.alloc, promotion.applied_sequence, .promotion);
+                            if (!resolution.enabled or !promotion.enabled or resolution.blocked or promotion.blocked or resolution.catch_up_required or promotion.catch_up_required or resolution.applied_sequence < @max(resolution_target, resolution.target_sequence) or promotion.applied_sequence < @max(promotion_target, promotion.target_sequence)) return error.IntegrityTopologyBusy;
                         }
                         // An old participant commit could enqueue a new
                         // primary-changing callback after this freeze. Drain
@@ -31865,6 +32729,18 @@ pub const DB = struct {
     }
 
     fn recoverCommittedIndexAdmission(self: *DB, cfg: types.IndexConfig, activation_err: anyerror) !?u128 {
+        // An outcome-unknown error means the native commit protocol itself
+        // could not confirm whether this index's post-commit bookkeeping (or
+        // even its own catalog admission) actually landed durably -- this is
+        // not an ordinary recoverable activation failure, it is exactly the
+        // class of error `batchTrackedWithMarkerAndWriterLaneHook` already
+        // refuses to swallow for primary writes (see `isOutcomeUnknownError`
+        // above). Treating it as "committed, repair pending" here would let
+        // `addIndex()` report success (null or a repair id) over state this
+        // process does not actually know is correct: a crash or injected
+        // fault during admission activation must surface as an error to the
+        // caller, not get silently absorbed into the repair path.
+        if (isOutcomeUnknownError(activation_err)) return activation_err;
         // Admission remains fail-closed until the durable repair marker is
         // materialized, so this is degraded-but-recoverable state.
         std.log.warn("index catalog admission committed with pending activation index={s} err={s}", .{ cfg.name, @errorName(activation_err) });
@@ -33568,7 +34444,7 @@ pub const DB = struct {
         const clock = self.backend_runtime.monotonicClock();
         const wait = derived_executor_mod.VisibilityWait{
             .clock = clock,
-            .deadline_ns = clock.nowRealtimeNs() +| default_visibility_wait_timeout_ms * std.time.ns_per_ms,
+            .deadline_ns = clock.nowRealtimeNs() +| defaultVisibilityWaitTimeoutMs() * std.time.ns_per_ms,
         };
         while (true) {
             try wait.check();
@@ -33653,7 +34529,7 @@ pub const DB = struct {
             for (revision_values.items) |value| self.alloc.free(value);
             revision_values.deinit(self.alloc);
         }
-        try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, &revision_keys, &revision_values);
+        try appendSourceRevisionWritesForEffects(self.alloc, sequence, &writes, mutation.deletes.items, &.{}, &.{}, &revision_keys, &revision_values);
         var context = self.batchContext();
         var primary_replication = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
         defer primary_replication.deinit(self.alloc);
@@ -34089,7 +34965,7 @@ pub const DB = struct {
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
+        _ = try @import("privacy_read.zig").requireConsumersPublishedWithBudget(self, alloc, .{}, &.{index_name}, null);
 
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
         entry.lockAnalysisShared();
@@ -34869,7 +35745,7 @@ pub const DB = struct {
                 .cancellation = options.cancellation,
             });
         }
-        self.executor.notifySequence(sequence);
+        self.executor.requestSequence(sequence);
         if (!options.follow_new_targets) return;
         if (options.no_progress_timeout_ns != 0) {
             // The threaded executor's waitForAll has no deadline, and the
@@ -34944,7 +35820,7 @@ pub const DB = struct {
             try wait.check();
             return;
         }
-        self.executor.notifySequence(sequence);
+        self.executor.requestSequence(sequence);
         try self.executor.waitForAllWithVisibilityWait(sequence, wait);
     }
 
@@ -34976,7 +35852,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("runDerivedUntilTargets", .{ self, sequence, index_names });
         if (sequence == 0 or index_names.len == 0) return;
         if (!self.executor.hasWorkers()) return;
-        self.executor.notifyIndexes(sequence, index_names);
+        self.executor.requestIndexes(sequence, index_names);
         try self.executor.waitForIndexes(sequence, index_names);
     }
 
@@ -34989,7 +35865,7 @@ pub const DB = struct {
         if (sequence == 0 or index_names.len == 0) return;
         try wait.check();
         if (!self.executor.hasWorkers()) return;
-        self.executor.notifyIndexes(sequence, index_names);
+        self.executor.requestIndexes(sequence, index_names);
         try self.executor.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
     }
 
@@ -35030,6 +35906,28 @@ pub const DB = struct {
         }
     }
 
+    /// NOTE (investigated, deliberately NOT applied): `waitForSyncLevelWithPublicationCut`'s
+    /// `.enrichments`/`.full_index` branches can see a raw
+    /// `error.EnrichmentSourceChanged` escape from here (worker mode's
+    /// `EnrichmentRuntime.waitForAppliedWithVisibilityDeadline` ->
+    /// `refreshVisibilityCut`/`refreshReplayAuthority` -> `probeReplayAuthority`,
+    /// when a concurrent publication commits a newer generation or applied
+    /// sequence between that probe's own two reads), and because the primary
+    /// write is already committed by this point, that uncaught error turns
+    /// an ordinary mid-flight race into a permanent `ANTFLY_STALLED`
+    /// (`batchFailureCode`) -- the grouped-sources "overlap" scenario's fast
+    /// `StalledError`. Retrying it here (bounded by the same `deadline_ns`)
+    /// does fix that case, but it also gives `Owner.maintenanceLoop` more
+    /// time/opportunities to run `maintenanceTurn` -> `resolver_authority.
+    /// pullProjection` -> `ensureConsumerIndex` -> `NativeFile.publishCheckpoint`,
+    /// which hits a *separate*, pre-existing writer-lease race there
+    /// (`inode_lock.assertActiveWriter`: "NativeFile publishing without
+    /// holding the writer lease") and hard-panics the process -- strictly
+    /// worse than the StalledError it replaces. `Owner.maintenanceLoop`'s
+    /// wake scheduling is perf/lwa-xproc-writers' territory, not refresh/
+    /// retirement/lane_pins, so this retry is intentionally left out until
+    /// that lands. See the lwa-enrich-visibility work log for the full panic
+    /// trace.
     /// Unlike `runEnrichmentUntilWithVisibilityDeadline`, never substitutes
     /// the request-visibility default (`sync_wait_timeout_ms`, 5 minutes)
     /// when no deadline is supplied, even when `optional_runtime_workers_enabled`
@@ -35281,6 +36179,11 @@ pub const DB = struct {
         self.notifyResolverReplayRuntimes(sequence);
         try self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, false, publication_cut);
         if (sync_level == .full_index and self.text_merge_runtime == null) {
+            // See the identical drain in `waitForSyncLevelWithPublicationCut`'s
+            // own `.full_index` branch and `write_amplification_trace.zig`'s
+            // `.text_merge_drain` doc comment.
+            const wal_trace_scope = wal_trace.scope(.text_merge_drain);
+            defer wal_trace_scope.end();
             try self.drainScheduledTextMerges();
         }
     }
@@ -35645,7 +36548,33 @@ pub const DB = struct {
                 _ = try self.runRelationalIndexMaintenancePass();
                 return false;
             },
+            .replay_retirement => return try self.advanceReplayJournalRetirement(),
         }
+    }
+
+    /// WS5: owner-only journal retirement, run from the same independent
+    /// maintenance cycle as the other background slices above. The gate is
+    /// the same `ReplicationWriteGate` every other slice here already uses:
+    /// `null` (standalone/Lite) always allows it; a hosted DB's configured
+    /// gate allows it only while this node is the Raft leader for this
+    /// group. One bounded, single-transaction retirement chunk per call;
+    /// `error.NotLeader` tells the caller it correctly skipped its turn.
+    fn advanceReplayJournalRetirement(self: *DB) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (!replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate)) return error.NotLeader;
+        const retirement_stats = try self.core.store.serviceRetirement(self.alloc, true, .{});
+        return !retirement_stats.done;
+    }
+
+    /// One bounded retirement turn; a non-owner (hosted non-leader,
+    /// read-only) is a quiet no-op rather than an error, for callers that
+    /// are not themselves draining anything (they only want to make
+    /// opportunistic progress alongside their own bounded work).
+    fn advanceReplayJournalRetirementBestEffort(self: *DB) !void {
+        _ = self.advanceReplayJournalRetirement() catch |err| switch (err) {
+            error.NotLeader, error.ReadOnly => return,
+            else => return err,
+        };
     }
     fn independentSourceRecoveryCancelled(ptr: *anyopaque) bool {
         const self: *DB = @ptrCast(@alignCast(ptr));
@@ -35814,7 +36743,7 @@ pub const DB = struct {
     fn refreshArtifactProjections(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, limits: @import("artifact_completion_progress.zig").Limits) !void {
         const completion = @import("artifact_completion_progress.zig");
         var requests: completion.AdoptionRequests = .{};
-        try completion.refreshProjectionsWithAdoption(scratch, self.core.store, self.core.index_manager, self.core.applied_sequence_checkpoint_path, self.root_incarnation, document, plan, limits, &requests);
+        try completion.refreshProjectionsWithAdoption(scratch, self.core.store, self.core.index_manager, self.root_incarnation, document, plan, limits, &requests);
         if (requests.count == 0) return;
         // Use the revision-tracked scheduler directory for O(1) deduplication,
         // not a checkpoint-file scan per document. Creation still performs its
@@ -36271,7 +37200,9 @@ pub const DB = struct {
         const retired_unit_jobs = try @import("artifact_unit_jobs.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const retired_authored = try @import("artifact_authored_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const swept_authored = try @import("artifact_authored_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
-        const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored;
+        const retired_prepared = try @import("prepared_producer_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const swept_prepared = try @import("prepared_producer_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
+        const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored and retired_prepared and swept_prepared;
         if (publication_mode == .ordered) {
             var prepared = (try @import("artifact_producer_baseline.zig").prepareRaft(scratch, self.core.store)) orelse {
                 var validation = (try @import("artifact_producer_validation.zig").prepareRaft(scratch, self.core.store)) orelse {
@@ -36609,8 +37540,100 @@ pub const DB = struct {
         try self.flushAppliedSequencesForIdle();
     }
 
+    /// Shared tolerance for `runUntilIdleWithReplayDrainOptions`'s own
+    /// repair-driving preamble (managed-admission materialization, startup
+    /// repair-intent advancement): the same transient write/sync/publish
+    /// I/O class `catch_up_policy.isRecoverableAdmissionError`/
+    /// `isTransientIoError` already retry everywhere a derived worker
+    /// touches storage. Those sites back off and retry in place; this
+    /// preamble has no retry loop of its own and runs once per
+    /// `runUntilIdle` call, so the right response to the same fault class
+    /// here is to stop driving repair work for *this* round rather than
+    /// letting it propagate and abort the replay/catch-up stages later in
+    /// the same function that have nothing to do with repair admission.
+    fn isRecoverableIdleDrainError(err: anyerror) bool {
+        const catch_up_policy = @import("derived/catch_up_policy.zig");
+        return catch_up_policy.isRecoverableAdmissionError(err) or catch_up_policy.isTransientIoError(err);
+    }
+
     fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
         _ = try self.retryPortableRuntimeActivationIfNeeded();
+        // A managed-admission materialization can be left pending by
+        // `recoverCommittedIndexAdmission` when an index's activation commit
+        // hit a transient error (OutcomeUnknown/OutcomeReconciliationRequired/
+        // a real write or sync failure): that path logs the failure and
+        // leaves the demand recorded (`managed_admission_owner.Owner.request`
+        // is never un-requested by a failed pass) for a later retry, but
+        // until now the only caller that ever retried it was the
+        // `indexRepairIntentSummary` status query -- never an idle drain.
+        // Retry it here too so draining to idle (the recovery recipe every
+        // caller, including this process's own crash-consistency sweep,
+        // already uses to wait out background catch-up) is itself able to
+        // resolve a stuck activation once the underlying I/O recovers,
+        // instead of leaving the affected index `IndexRebuilding` forever.
+        if (self.managedAdmissionMaterializationPending()) self.drainManagedIndexAdmissions(self.alloc) catch |err| {
+            // The whole point of retrying this from an idle drain is to
+            // resolve a *transient* I/O fault once the underlying disk
+            // recovers (see the comment above). Propagating that same
+            // transient class here instead would abort this entire call --
+            // including the replay/catch-up stages below, which have
+            // nothing to do with managed admission -- on every single
+            // `runUntilIdle`, for as long as this one read keeps faulting.
+            // Recoverable: let this round skip materialization and continue
+            // into the rest of the drain; a later `runUntilIdle` retries it.
+            if (!isRecoverableIdleDrainError(err)) return err;
+        };
+        // Materializing the admission marker above only converts it into a
+        // durable generation-repair intent (`materializeManagedIndexAdmission
+        // ValueLocked` -> `createGenerationRepairIntentAtTarget`); it does not
+        // itself open or activate anything. An *ordinary* (non-managed)
+        // `addIndex` whose post-commit bookkeeping hit this same transient-
+        // error class (see `recoverCommittedIndexAdmission`) is left exactly
+        // here: catalog-committed, query-gated (`markUnscopedRepairUnavailable`
+        // was never paired with a `clearUnscopedRepairUnavailable`/activation
+        // fence because `completeInstalledIndexAdmission` is skipped whenever
+        // `installed.post_commit_error != null`), with a runnable repair
+        // intent nothing has executed yet. In production that intent is
+        // executed by the independent-maintenance owner's `.repair` work
+        // (`independentMaintenanceRun`), but that owner is only started for a
+        // borrowed-IO runtime under test (`startArtifactRepairMetadataWorkerIfNeeded`)
+        // and plenty of production embeddings never borrow IO either, so
+        // nothing but an explicit `repairRecoverableStartupIndexFailures`/
+        // `advanceIndexRepairIntent` call ever advances it. Drive every
+        // immediately-runnable repair intent to completion here too, bounded
+        // the same way the replay drain above is, so a transient open/
+        // activation fault resolves itself exactly like the managed-admission
+        // case once the underlying I/O recovers, instead of leaving the index
+        // `IndexRebuilding` forever. `activationFenceAdmissionIsServiceable`
+        // (db.zig, next to `localArtifactSourceRecoveryIsServiceable`) makes
+        // this a cheap retire instead of a destructive shadow rebuild for the
+        // ordinary-admission case this drain exists for. A deferred/paused/
+        // terminal intent is left alone -- this is a retry of a known-
+        // transient class, not a repair driver; `repairRecoverableStartupIndexFailures`'s
+        // own `wake` decision is authoritative for whether anything is due
+        // right now.
+        // Shadow rebuilds need a local filesystem; freestanding builds have none.
+        if (builtin.os.tag != .freestanding and !openModeRequiresReadOnlyBackends(self.open_mode)) {
+            var repair_rounds: usize = 0;
+            while (repair_rounds < run_until_idle_max_replay_rounds) : (repair_rounds += 1) {
+                const repair_result = self.repairRecoverableStartupIndexFailures(self.alloc, 8, .{}) catch |err| switch (err) {
+                    error.ReadOnly, error.NotLeader, error.Busy => break,
+                    // `discoverRecoverableStartupIndexFailures`'s own catalog
+                    // reads (and the repair quantum it drives) have no retry
+                    // of their own at this layer. A transient I/O fault there
+                    // -- the exact class every derived-worker retry site in
+                    // `catch_up_policy.zig` treats as recoverable -- must not
+                    // abort the whole idle drain before it ever reaches the
+                    // replay/catch-up stages below: stop driving repair work
+                    // this round (a later `runUntilIdle` retries discovery
+                    // fresh) instead of propagating.
+                    else => if (isRecoverableIdleDrainError(err)) break else return err,
+                };
+                if (repair_result.remaining == 0) break;
+                if (repair_result.wake != .immediate) break;
+                if (repair_result.attempted == 0 and repair_result.repaired == 0) break;
+            }
+        }
         // Manual owners need synchronous resolver drivers both during shadow
         // construction and after a crash between activation and promotion.
         // Creating these drivers does not start background workers.
@@ -37091,6 +38114,31 @@ pub const DB = struct {
             });
             return err;
         };
+        try self.drainReplayJournalRetirementToCompletion();
+    }
+
+    /// WS5: an explicit drain must not return with avoidable retirement debt
+    /// outstanding -- a producer's very next append could otherwise be
+    /// refused for want of credit this call could have released. Consumers
+    /// already caught up and raised the watermark in the drain above; loop
+    /// bounded retirement turns (consume -> progress already done -> retire
+    /// -> release, each its own commit) to completion. A non-owner (hosted:
+    /// not the Raft leader for this group; standalone: a read-only backend)
+    /// has nothing to drain here and simply stops -- it never held the
+    /// reserve to begin with. Called by every explicit full-drain entry
+    /// point (`runUntilIdle*`, reached in turn by the C API drain and
+    /// `cmd/lite.zig run-until-idle`), not by the bounded background-quantum
+    /// helpers (`runBackgroundMaintenanceWithCancellation` and friends),
+    /// which stay bounded and rely on the independent-maintenance worker's
+    /// own `.replay_retirement` slice instead.
+    fn drainReplayJournalRetirementToCompletion(self: *DB) !void {
+        while (true) {
+            const more = self.advanceReplayJournalRetirement() catch |err| switch (err) {
+                error.NotLeader, error.ReadOnly => return,
+                else => return err,
+            };
+            if (!more) return;
+        }
     }
 
     const EnrichmentThroughputSnapshot = struct {
@@ -37143,6 +38191,11 @@ pub const DB = struct {
     pub fn runUntilIdleWithoutWaitingForEnrichmentRetries(self: *DB) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdleWithoutWaitingForEnrichmentRetries", .{self});
         try self.runUntilIdleWithReplayDrainOptions(.{});
+        // WS5: one bounded retirement turn, not a loop to completion --
+        // this call must stay a bounded quantum for a borrowed maintenance
+        // caller. A repeat caller's hosted `catchUpManagedDb`-style "call
+        // until debt clears" loop converges it the rest of the way.
+        try self.advanceReplayJournalRetirementBestEffort();
     }
 
     /// Borrowed maintenance owners must release their group quantum when a
@@ -37155,6 +38208,7 @@ pub const DB = struct {
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation", .{ self, cancellation });
         try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation });
+        try self.advanceReplayJournalRetirementBestEffort();
     }
 
     /// A Lite background turn borrows the file's writer lease. Return pending
@@ -37201,13 +38255,21 @@ pub const DB = struct {
             return self.advanceGraphReplacementForIdentityUntil(null, null, .detached);
         }
         const before = self.core.nextDerivedSequence();
-        try self.runUntilIdleWithReplayDrainOptions(.{
+        self.runUntilIdleWithReplayDrainOptions(.{
             .cancellation = cancellation,
             .drain_relational_indexes = false,
             .drain_graph_replacements = false,
             .bounded_replay = true,
             .max_windows_per_index = 1,
-        });
+        }) catch |err| {
+            // A refused publication can be scoped to one index whose inputs
+            // changed under this snapshot. Merges of the other indexes do not
+            // depend on that replay; run them before reporting the refusal so
+            // a busy index cannot starve them.
+            if (err == error.EnrichmentWaitCanceled and !cancellation.isCancelled())
+                self.drainScheduledTextMerges() catch |merge_err| if (merge_err != error.EnrichmentWaitCanceled) return merge_err;
+            return err;
+        };
         const resolution = self.resolutionStageStats();
         const promotion = self.promotionStageStats();
         const finalized = try self.finalizeDenseProjectionLifecycleForIdle();
@@ -37417,6 +38479,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("publishVectorBlockBasesOnlineReported", .{ self, options });
         var catalog_lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .busy = true };
         defer catalog_lease.release();
+        if (self.core.index_manager.vector_block_storage == null) return .{};
         var session_lock = lockAtomicWithBackoffProfiled(
             &self.async_context.dense_admission.mutex,
             &self.async_context.stats.dense_finish_mutex,
@@ -37425,24 +38488,32 @@ pub const DB = struct {
         session_lock.unlock();
         if (!claimed) return .{ .busy = true };
         defer finishDenseProjectionFinalization(self.async_context);
-        const initial = try self.core.index_manager.publishVectorBlockBasesOnlineReported(options);
-        var published = initial.published;
-        var deferred = initial.deferred;
-        // Fail-closed reconstruction cannot depend on its own clean marker
-        // to enter acceleration maintenance. Permit only candidates whose
-        // durable terminal outcomes already cover the current source corpus.
-        // Nothing here activates the repair or certifies a stale generation.
-        for (self.core.index_manager.dense_indexes.items) |entry| {
-            if (!self.core.index_manager.repairUnavailable(entry.config.name)) continue;
-            const checkpoint = self.core.index_manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
-            if (checkpoint.status != .rebuilding) continue;
-            const expected = (try denseTargetCountForIndexContext(self.async_context, entry.config.name)) orelse continue;
-            if (entry.index.stats().active_count != expected) continue;
-            var repair_options = options;
-            repair_options.covered_rebuilding_index = entry.config.name;
-            const repair = try self.core.index_manager.publishVectorBlockBasesOnlineReported(repair_options);
-            published += repair.published;
-            deferred = deferred or repair.deferred;
+        if (options.cancel_check) |check| if (check.requested()) return .{ .deferred = true };
+        const allow_primary_snapshot = options.allow_primary_snapshot and
+            try denseCorpusCoverageAllowsPrimarySnapshot(self.async_context);
+        var published: usize = 0;
+        var deferred = false;
+        for (self.core.index_manager.dense_indexes.items) |*entry| {
+            if (options.cancel_check) |check| if (check.requested()) return .{ .published = published, .deferred = true };
+            if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
+            if (entry.index.leann != null) continue;
+            var index_options = options;
+            // A complete rebuilding index may repair its missing generation
+            // once even while a sibling producer is paused. Healthy recurring
+            // maintenance still requires whole-corpus completion before a scan.
+            const checkpoint = index_manager_mod.IndexManager.denseProjectionCheckpointMetadataForEntry(entry);
+            const rebuilding = checkpoint != null and checkpoint.?.status == .rebuilding;
+            if (self.core.index_manager.repairUnavailable(entry.config.name)) {
+                if (!rebuilding) continue;
+                const expected = (try denseTargetCountForDenseEntryContext(self.async_context, entry, .all_sources)) orelse continue;
+                if (entry.index.stats().active_count != expected) continue;
+                index_options.covered_rebuilding_index = entry.config.name;
+            }
+            index_options.allow_primary_snapshot = options.allow_primary_snapshot and
+                (allow_primary_snapshot or (rebuilding and (try denseIndexSourceCoverage(self.async_context, entry)).permitsRepair()));
+            const result = try self.core.index_manager.publishVectorBlockBaseForEntryOnlineReported(entry, index_options);
+            published += result.published;
+            deferred = deferred or result.deferred;
         }
         return .{ .published = published, .deferred = deferred };
     }
@@ -37506,14 +38577,11 @@ pub const DB = struct {
 
     fn flushAppliedSequences(self: *DB, force: bool) !void {
         var lifecycle_completed = false;
-        const published = blk: {
-            var seq_lock = lockAtomicWithBackoffProfiled(
-                &self.async_context.applied_sequence_mutex,
-                &self.async_context.stats.applied_sequence_mutex,
-            );
-            defer seq_lock.unlock();
-            break :blk try flushPendingAppliedSequencesLocked(self.async_context, force, &lifecycle_completed);
-        };
+        const ctx = self.async_context;
+        const io = ctx.io orelse std.Options.debug_io;
+        ctx.applied_sequence_flush_mutex.lockUncancelable(io);
+        defer ctx.applied_sequence_flush_mutex.unlock(io);
+        const published = try flushPendingAppliedSequencesLocked(ctx, force, &lifecycle_completed);
         if (lifecycle_completed) {
             notifyQueryVisibilityHook(self.async_context, .publish_blocking);
         } else if (published) {
@@ -38296,7 +39364,7 @@ pub const DB = struct {
                     var cfg = try types.IndexConfig.clone(self.alloc, entry.config);
                     defer cfg.deinit(self.alloc);
                     if (repair.trigger == .artifact_counter_missing) {
-                        const bootstrap_id = try index_repair_state.newRepairId(self.alloc);
+                        const bootstrap_id = try self.newDurableRepairId(self.alloc);
                         try self.ensureDenseArtifactTargetCounterForRepair(
                             self.alloc,
                             cfg,
@@ -38690,6 +39758,14 @@ pub const DB = struct {
                     .status = .clean,
                     .generation = checkpoint.generation + @intFromBool(checkpoint.status == .rebuilding),
                     .config_hash = types.indexConfigHash(entry.config),
+                    // Certify the exact count this loop already verified
+                    // matches the live index (line above gates on it): a
+                    // clean checkpoint with no published_count can never be
+                    // filled in later, since the only other writer
+                    // (finalizeCoveredDenseProjectionCheckpointClaimed)
+                    // requires status == .rebuilding, which this call just
+                    // left behind for good.
+                    .published_count = artifact_target_count,
                 });
             }
         }
@@ -39464,11 +40540,33 @@ pub const DB = struct {
         return self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait, null);
     }
 
+    /// `runEnrichmentUntilWithVisibilityDeadline` itself never retries
+    /// `error.EnrichmentSourceChanged` -- a concurrent owner-turn/group-source
+    /// rebase of the same namespace mid-wait, surfaced the same way
+    /// `groupSourcesReadyThrough`'s own doc comment tolerates it
+    /// ("not ready yet, not a failure -- never a real deadline, so retrying
+    /// costs nothing but a wasted poll tick"). A request-visibility barrier
+    /// at `.enrichments`/`.full_index` must retry it the same way, bounded
+    /// by the same `wait.check()` this call's own deadline already governs,
+    /// rather than surface a transient rebase as a hard visibility failure.
+    fn runEnrichmentUntilWithVisibilityDeadlineRetrying(self: *DB, sequence: u64, cancellation: types.CancellationToken, deadline_ns: ?u64, wait: derived_executor_mod.VisibilityWait) !void {
+        while (true) {
+            self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns) catch |err| switch (err) {
+                error.EnrichmentSourceChanged => {
+                    try wait.check();
+                    continue;
+                },
+                else => return err,
+            };
+            return;
+        }
+    }
+
     fn waitForSyncLevelWithPublicationCut(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool, publication_cut: ?PublicationCut) !void {
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
         else
-            default_visibility_wait_timeout_ms;
+            defaultVisibilityWaitTimeoutMs();
         const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
         const visibility_clock = self.backend_runtime.monotonicClock();
         const deadline_ns = visibility_clock.nowRealtimeNs() +| timeout_ns;
@@ -39500,7 +40598,7 @@ pub const DB = struct {
             .propose, .write => {},
             .enrichments => {
                 if (wait_primary_enrichments)
-                    try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                    try self.runEnrichmentUntilWithVisibilityDeadlineRetrying(sequence, cancellation, deadline_ns, wait);
             },
             .full_text => {
                 try self.runDerivedUntilTargetsWithVisibilityWait(sequence, sync_targets.full_text_indexes, wait);
@@ -39508,7 +40606,7 @@ pub const DB = struct {
             },
             .full_index => {
                 if (has_groups) {
-                    if (wait_primary_enrichments) try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                    if (wait_primary_enrichments) try self.runEnrichmentUntilWithVisibilityDeadlineRetrying(sequence, cancellation, deadline_ns, wait);
                     // Own grouped publications have been accepted before
                     // this cut. Include them once without chasing unrelated
                     // producer scheduling or publications appended afterward.
@@ -39518,6 +40616,18 @@ pub const DB = struct {
                 } else try self.runMaintenanceUntilWithCancellation(sequence, sync_targets, cancellation, deadline_ns);
                 if (self.text_merge_runtime == null) {
                     try wait.check();
+                    // See `write_amplification_trace.zig`'s `.text_merge_drain`
+                    // doc comment: this is the self-sufficiency fallback that
+                    // runs any scheduled text-index merge synchronously when
+                    // no background `TextMergeRuntime` is attached. Tag it
+                    // distinctly so its commit is attributed to this call
+                    // site -- a bounded, periodic background-maintenance
+                    // cost -- rather than folding into the unattributed
+                    // generic `.main_txn_commit` bucket every other
+                    // non-inline publication's own commit still falls back
+                    // to.
+                    const wal_trace_scope = wal_trace.scope(.text_merge_drain);
+                    defer wal_trace_scope.end();
                     try self.drainScheduledTextMerges();
                     try wait.check();
                 }
@@ -39543,49 +40653,94 @@ pub const DB = struct {
         }
     }
 
+    /// Pulled out of `waitForGroupSourcesThrough` so its own `try`s can be
+    /// caught as a unit at that single call site (a bare block's `try`
+    /// propagates out of the *function*, not the block, so there is
+    /// nothing a block-local `catch` could ever attach to).
+    fn groupSourcesReadyThrough(self: *DB, through: u64, producer_sequence: *u64) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer pinned.release();
+        const plan = pinned.plan().group_sources orelse return true;
+        var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = a, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
+        const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const baseline = @import("group_source_baseline.zig");
+        var namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+        const generation = baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation);
+        var settled = true;
+        for (plan.entries) |entry| {
+            const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
+            if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
+            if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
+                settled = false;
+                var source_namespace = namespace;
+                if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
+                const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
+                producer_sequence.* = @max(producer_sequence.*, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
+            }
+        }
+        return settled;
+    }
+
     fn waitForGroupSourcesThrough(self: *DB, through: u64, wait: derived_executor_mod.VisibilityWait) !u64 {
         const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
         var producer_sequence = through;
         while (true) {
             try wait.check();
             if (self.async_context.background_closing.load(.acquire)) return error.Canceled;
-            const ready = blk: {
-                var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
-                defer arena.deinit();
-                const a = arena.allocator();
-                var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
-                defer pinned.release();
-                const plan = pinned.plan().group_sources orelse break :blk true;
-                var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = a, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
-                const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
-                var read = try self.core.store.beginReadTxn();
-                defer read.abort();
-                const baseline = @import("group_source_baseline.zig");
-                var namespace: [24]u8 = undefined;
-                doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-                const generation = baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation);
-                var settled = true;
-                for (plan.entries) |entry| {
-                    const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
-                    if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
-                    if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
-                        settled = false;
-                        var source_namespace = namespace;
-                        if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
-                        const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
-                        producer_sequence = @max(producer_sequence, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
-                    }
-                }
-                break :blk settled;
+            const ready = self.groupSourcesReadyThrough(through, &producer_sequence) catch |err| switch (err) {
+                // The same benign, concurrent-write/owner-turn race
+                // `runGroupSourceSlice` below already tolerates (a staged
+                // debt/baseline record this probe's own reads observe
+                // mid-update) can surface here too, in this read-only
+                // readiness probe rather than the slice that advances it.
+                // Treat it identically: not ready yet, not a failure --
+                // never a real deadline, so retrying costs nothing but a
+                // wasted poll tick.
+                error.EnrichmentSourceChanged => false,
+                else => return err,
             };
             if (ready) return producer_sequence;
-            _ = try self.runGroupSourceSlice();
+            // Drive the identical slice `group_source_owner.Owner.step` runs
+            // in the background, inline, so a foreground visibility wait
+            // doesn't sit idle waiting for that resident owner's own cadence
+            // (a resident owner may not even be registered for every table
+            // that reaches this wait). `runGroupSourceSlice` routinely
+            // returns `EnrichmentSourceChanged` (and the other
+            // `isEnrichmentProgressPending` conditions) when a concurrent
+            // writer or owner turn advances the same partition between this
+            // slice's own reads -- an ordinary mid-flight race, not a
+            // failure. `Owner.step` already treats any error from this
+            // exact call as "no progress this turn, retry" (log and back
+            // off) rather than fatal; mirror that here. Letting it propagate
+            // turned an expected race into a permanent batch failure: the
+            // primary write was already committed, so `batchFailureCode`
+            // surfaced it as ANTFLY_STALLED instead of this loop simply
+            // retrying within its own deadline.
+            _ = self.runGroupSourceSlice() catch |err| {
+                std.log.warn("group source slice deferred during visibility wait: {s}", .{@errorName(err)});
+            };
             if (self.local_execution.optional_runtime_workers_enabled) {
                 // Wake the owner without waiting for a global cursor that
                 // may be blocked on an independent, later request. The
                 // durable source debt above is the completion authority.
                 if (self.enrichment_runtime) |runtime| runtime.notifySequence(producer_sequence);
-            } else try self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
+            } else self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?) catch |err| switch (err) {
+                // Driving the enrichment runtime's own foreground catch-up
+                // pass synchronously here (the no-resident-worker fallback)
+                // reaches the exact same source/catalog staleness checks
+                // its background worker loop already treats as "retry, not
+                // fatal" (`isEnrichmentProgressPending`). Mirror that here
+                // too: this wait's own retry loop is a better fit for that
+                // than failing the whole batch outright.
+                error.EnrichmentSourceChanged => {},
+                else => return err,
+            };
             try wait.check();
             try io.sleep(.fromMilliseconds(5), .awake);
         }
@@ -39617,6 +40772,11 @@ pub const DB = struct {
 
     /// Same-cut standalone producer counters; never usable by ordered owners.
     pub fn privacyLocalIndexSourcesComplete(self: *DB, alloc: Allocator, read: *docstore_mod.DocStore.Txn, index: []const u8, kind: @FieldType(types.IndexConfig, "kind"), plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !bool {
+        return self.privacyLocalIndexSourcesCompleteWithBudget(alloc, read, index, kind, plan, null);
+    }
+
+    pub fn privacyLocalIndexSourcesCompleteWithBudget(self: *DB, alloc: Allocator, read: *docstore_mod.DocStore.Txn, index: []const u8, kind: @FieldType(types.IndexConfig, "kind"), plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, budget: ?*@import("artifact_scan_budget.zig").Budget) !bool {
+        if (budget) |b| try b.check();
         if (try @import("../source_authority.zig").maintenanceMode(read) != .local) return false;
         const generation = self.core.index_manager.coverageGenerationForIndex(index) orelse return false;
         const sources = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index);
@@ -39624,14 +40784,20 @@ pub const DB = struct {
             for (sources) |source| alloc.free(source);
             alloc.free(sources);
         }
-        for (sources) |source| {
-            const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index, source, plan);
-            defer alloc.free(scope);
-            const counts = try DerivedCoverageCounters.load(alloc, read, if (kind == .dense_vector or kind == .sparse_vector) index else scope, generation);
+        const vector = kind == .dense_vector or kind == .sparse_vector;
+        // Vector coverage is certified once for the whole index generation.
+        // Its counter key never depends on a per-source dependency scope.
+        const checks = if (vector) @min(sources.len, 1) else sources.len;
+        for (sources[0..checks]) |source| {
+            if (budget) |b| try b.consume(source.len);
+            const scope: ?[]u8 = if (vector) null else try @import("artifact_producer_readiness.zig").localScopeAllocWithBudget(alloc, index, source, plan, budget);
+            defer if (scope) |value| alloc.free(value);
+            const counts = try DerivedCoverageCounters.load(alloc, read, scope orelse index, generation);
             const total = counts.source_total orelse (try range_cardinality.loadOrProveEmptyFromTxn(read)) orelse return false;
             if (total == 0) continue;
             if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or counts.produced.? +| counts.skipped.? != total) return false;
         }
+        if (budget) |b| try b.check();
         return true;
     }
 
@@ -39767,7 +40933,7 @@ pub const DB = struct {
             // and an empty durable native snapshot. Missing certificates and
             // unfinished generations still require ordinary materialization.
             if (checkpoint.published_count == null and checkpoint.status == .clean) {
-                const previous = apply_state.loadProjectionCheckpointWithSidecar(self.alloc, self.core.index_manager.checkpointIo(), self.core.store, self.core.applied_sequence_checkpoint_path, entry.config.name) catch null;
+                const previous = apply_state.loadProjectionCheckpoint(self.alloc, self.core.store, entry.config.name) catch null;
                 if (previous) |certificate| {
                     const native_snapshot = entry.index.nativeServingSnapshot();
                     if (certificate.status == .clean and certificate.published_count == @as(?u64, 0) and
@@ -40285,6 +41451,19 @@ pub const DB = struct {
         kind: types.IndexKind,
         applied_sequence: u64,
     ) !u64 {
+        // Query admission and public status use the selected source frontier.
+        // Replay/maintenance keep their kind-wide cursor: stable-tip physical
+        // publication certifies that complete journal boundary.
+        const names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
+        defer {
+            for (names) |name| alloc.free(name);
+            alloc.free(names);
+        }
+        if (names.len != 0) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            if (try replay_source_mod.artifactTargetAtCut(alloc, &read, names, applied_sequence, null)) |target| return target;
+        }
         return try self.probeDerivedReplayTargetSequence(
             alloc,
             self.core.replaySource(),
@@ -40386,11 +41565,19 @@ pub const DB = struct {
         }
     }
 
+    /// Shared worker telemetry does not identify a physical consumer. Only
+    /// that consumer's checkpoint and replay debt can make it rebuilding.
+    fn denseCatchUpAffectsIndex(item: types.DBIndexStats, progress: types.DenseCatchUpStats) bool {
+        return item.kind == .dense_vector and progress.active and
+            (item.replay_applied_sequence < item.replay_target_sequence or
+                !std.mem.eql(u8, item.projection_checkpoint_status, "clean"));
+    }
+
     /// Apply lifecycle facts only when the caller also owns a consistent
     /// artifact/coverage refresh boundary.
     fn overlayRuntimeStatusLifecycleFromSnapshot(self: *DB, runtime_stats: *types.DBStats) void {
         for (runtime_stats.indexes) |*item| {
-            const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
+            const dense_catch_up = denseCatchUpAffectsIndex(item.*, runtime_stats.async_indexing.dense_catch_up);
             // This overlay can run over a cached materialization snapshot.
             // Read the live immutable HBC generation's cardinality for the
             // exact-vector certificate instead of pairing a current replay
@@ -40412,26 +41599,10 @@ pub const DB = struct {
             item.catch_up_active = dense_catch_up;
             if (item.kind == .dense_vector) {
                 const progress = runtime_stats.async_indexing.dense_catch_up;
-                if (dense_catch_up) {
-                    if (progress.current_sequence != 0) {
-                        item.replay_applied_sequence = if (item.replay_applied_sequence == 0)
-                            progress.current_sequence
-                        else
-                            @min(item.replay_applied_sequence, progress.current_sequence);
-                        item.catch_up_applied_sequence = progress.current_sequence;
-                    } else {
-                        item.catch_up_applied_sequence = item.replay_applied_sequence;
-                    }
-                    item.catch_up_target_sequence = @max(item.replay_target_sequence, progress.current_target_sequence);
-                    item.replay_target_sequence = item.catch_up_target_sequence;
-                    item.replay_catch_up_required = true;
-                    item.backfill_active = true;
-                } else {
-                    item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
-                    item.catch_up_applied_sequence = item.replay_applied_sequence;
-                    item.catch_up_target_sequence = item.replay_target_sequence;
-                }
-                item.catch_up_phase = progress.phase;
+                item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+                item.catch_up_applied_sequence = item.replay_applied_sequence;
+                item.catch_up_target_sequence = item.replay_target_sequence;
+                item.catch_up_phase = if (dense_catch_up) progress.phase else .idle;
             } else {
                 item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
                 item.catch_up_applied_sequence = item.replay_applied_sequence;
@@ -40857,6 +42028,7 @@ pub const DB = struct {
         // unchanged. Wake an idle worker after the new identity commits.
         self.local_execution.relational_index_maintenance_sweep.request();
         self.local_execution.relational_index_retry_after_ns.store(0, .release);
+        self.independent_maintenance.notify();
         if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(namespace);
     }
 
@@ -41203,6 +42375,7 @@ pub const DB = struct {
             .identity_namespace = target_identity,
             .prefer_existing_identity_namespace = true,
             .unpublished_staging = true,
+            .detach_uncoordinated_cohort = true,
         });
         portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -42328,6 +43501,7 @@ pub const DB = struct {
             .import_derived_indexes = true,
             .embedding_source_fields = options.embedding_source_fields,
             .unpublished_staging = true,
+            .detach_uncoordinated_cohort = true,
             .cancellation = options.cancellation,
         });
         portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
@@ -42361,6 +43535,7 @@ pub const DB = struct {
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
         try portable_backup.importPortableFileWithOptions(alloc, self.core.store, io, file, file_size, .{
             .cohort = cohort,
+            .detach_uncoordinated_cohort = cohort == null,
             .cancellation = cancellation,
             .identity_namespace = target_identity,
             .prefer_existing_identity_namespace = true,
@@ -42694,11 +43869,11 @@ pub const DB = struct {
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                     }
                     try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
-                    if (async_indexing.dense_catch_up.active) {
+                    if (denseCatchUpAffectsIndex(item, async_indexing.dense_catch_up)) {
                         item.catch_up_active = true;
                         item.backfill_active = true;
                     }
-                    item.catch_up_phase = async_indexing.dense_catch_up.phase;
+                    item.catch_up_phase = if (item.catch_up_active) async_indexing.dense_catch_up.phase else .idle;
                     if (self.core.index_manager.vectorBlockProjectionRequiredForDenseIndex(cfg.name) and
                         !self.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
                             cfg.name,
@@ -42950,7 +44125,7 @@ pub const DB = struct {
                         item.hbc_posting = dbHbcPostingStats(try entry.index.postingBacklogStats(), entry.index.getWriteProfile());
                         item.hbc_posting.refresh_pending = entry.index.postingRefreshPending();
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
-                        if (async_indexing.dense_catch_up.active) {
+                        if (denseCatchUpAffectsIndex(item, async_indexing.dense_catch_up)) {
                             item.catch_up_active = true;
                             item.backfill_active = true;
                         }
@@ -44289,7 +45464,7 @@ pub const DB = struct {
         lockApplyShared(self);
         var apply_shared_held = true;
         errdefer if (apply_shared_held) self.core.unlockApplyShared();
-        const privacy_status_published = if (opts.privacy_status) privacy.requirePublished(self, alloc, .{}) catch |err| switch (err) {
+        const privacy_status_published = if (opts.privacy_status) privacy.requireConsumersPublishedWithBudget(self, alloc, .{}, &.{}, null) catch |err| switch (err) {
             error.IndexRebuilding => false,
             else => return err,
         } else false;
@@ -45024,6 +46199,12 @@ pub const DB = struct {
 
     pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
         if (comptime storage_engine.enabled) return storage_engine.call("searchRequestAtCurrentIdentityGeneration", .{ self, req });
+        // Caller owns apply-shared or a published catalog lease. Validation
+        // and lookup therefore observe the same incarnation as execution.
+        for (req.index_alias_fences) |fence| {
+            const incarnation = self.core.index_manager.coverageGenerationForIndex(fence.name) orelse return error.CatalogGenerationChanged;
+            if (incarnation != fence.incarnation) return error.CatalogGenerationChanged;
+        }
         var snapshot_req = req;
         snapshot_req.identity_read_generation = try self.currentIdentityReadGenerationForRequest(snapshot_req.identity_read_generation);
         try self.validateResolvedDocFilterWireContext(snapshot_req);
@@ -45103,20 +46284,13 @@ pub const DB = struct {
             // lagging or partial projection exclude a newer primary value.
             if (!entry.coversPrimaryDocuments() or entry.backfill_active.load(.acquire) != 0) return error.IndexRebuilding;
             // Retained/restored owners may have a persisted checkpoint newer
-            // than a newly attached worker's in-memory observation.
+            // than a newly attached worker's in-memory observation. Progress
+            // v2 lives in the primary KV store itself, so the ordinary read
+            // above already observes it; there is no longer a separate
+            // out-of-band (raw-storage, lease-bypassing) checkpoint location
+            // to additionally consult here.
             var applied = try self.core.loadAppliedSequence(alloc, entry.config.name);
             if (self.executor.appliedSequence(entry.config.name)) |live| applied = @max(applied, live);
-            if (applied < self.core.nextDerivedSequence() and self.retained_remote_query_lease != null) {
-                if (self.primary_lsm_storage) |storage| {
-                    const checkpoint_path = try apply_state.checkpointPathAlloc(alloc, self.core.path);
-                    defer alloc.free(checkpoint_path);
-                    const retained = apply_state.loadProjectionCheckpointFromStorage(alloc, storage, checkpoint_path, entry.config.name) catch |err| switch (err) {
-                        error.FileNotFound => null,
-                        else => return err,
-                    };
-                    if (retained) |checkpoint| applied = @max(applied, checkpoint.applied_sequence);
-                }
-            }
             // The global tail also includes work for unrelated projections.
             // Match the existing readiness/debt contract: inspect replay hints
             // only on the slow path where a global sequence gap exists.
@@ -46395,49 +47569,9 @@ pub const DB = struct {
         return out;
     }
 
-    fn searchRequestRequiresComposedSearch(req: types.SearchRequest) bool {
-        if (req.full_text_queries.len > 0 or req.dense_queries.len > 0 or req.sparse_queries.len > 0) return true;
+    const searchRequestRequiresComposedSearch = @import("query/control_contract.zig").searchRequestRequiresComposedSearch;
 
-        var base_result_sets: u32 = 0;
-        if (req.full_text != null) base_result_sets += 1;
-        if (req.dense != null) base_result_sets += 1;
-        if (req.sparse != null) base_result_sets += 1;
-        switch (req.query) {
-            .dense_knn => base_result_sets += 1,
-            .sparse_knn => base_result_sets += 1,
-            else => {},
-        }
-        return base_result_sets > 1;
-    }
-
-    fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
-        if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
-        if (req.full_text_queries.len != 0) return null;
-        if (req.full_text) |text| switch (text) {
-            .match_all => {},
-            else => return null,
-        };
-        if (!db_query_search.isDefaultMatchAll(req.query)) return null;
-        if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.expand_strategy != null) return null;
-        if (req.dense != null or req.sparse != null) return null;
-        if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
-            var next = req;
-            next.index_name = req.dense_queries[0].index_name;
-            next.full_text = null;
-            next.dense = req.dense_queries[0].query;
-            next.dense_queries = &.{};
-            return next;
-        }
-        if (req.sparse_queries.len == 1 and req.dense_queries.len == 0) {
-            var next = req;
-            next.index_name = req.sparse_queries[0].index_name;
-            next.full_text = null;
-            next.sparse = req.sparse_queries[0].query;
-            next.sparse_queries = &.{};
-            return next;
-        }
-        return null;
-    }
+    const directSingleVectorRequest = @import("query/control_contract.zig").directSingleVectorRequest;
 
     fn searchComposed(
         self: *DB,
@@ -46507,12 +47641,12 @@ pub const DB = struct {
         if (req.dense_queries.len > 0) {
             for (req.dense_queries) |named| {
                 if (self.core.denseIndex(named.index_name)) |entry| {
-                    if (entry.chunk_name != null) return true;
+                    if (entry.memberBacked()) return true;
                 }
             }
         } else if (req.dense != null) {
             if (self.core.denseIndex(req.index_name)) |entry| {
-                if (entry.chunk_name != null) return true;
+                if (entry.memberBacked()) return true;
             }
         }
 
@@ -46545,9 +47679,13 @@ pub const DB = struct {
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .lookup_live_identity = lookupLiveIdentityDirectoryCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
+            .share_legacy_matches = true,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
         });
@@ -46568,6 +47706,8 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .all_docs_visible = allDocsVisibleCallback,
@@ -46823,9 +47963,9 @@ pub const DB = struct {
             allowed: ?*const std.StringHashMapUnmanaged(void) = null,
             ids: std.ArrayListUnmanaged([]const u8) = .empty,
             local_work: values.Work = .{},
-            fn consume(raw: ?*anyopaque, candidate: db_query_search.MatchAllCandidate) anyerror!void {
+            fn consume(raw: ?*anyopaque, candidate: *db_query_search.MatchAllCandidate) anyerror!void {
                 const value_scan: *@This() = @ptrCast(@alignCast(raw.?));
-                var owned = candidate;
+                var owned = candidate.take();
                 defer owned.deinit(value_scan.a);
                 if (value_scan.allowed) |allowed| if (!allowed.contains(owned.id)) return;
                 if (value_scan.req.cancellation) |token| try token.check();
@@ -46980,6 +48120,8 @@ pub const DB = struct {
                 .text_index_entry = textIndexEntryCallback,
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
                 .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+                .primary_residual_scope = primaryResidualScopeCallback,
+                .range_projection_current = rangeProjectionCurrentCallback,
                 .live_filter_doc_set = liveFilterDocSetCallback,
                 .all_docs_visible = allDocsVisibleCallback,
                 .project_ordinals_to_doc_ids = false,
@@ -47020,6 +48162,8 @@ pub const DB = struct {
             .is_expired_key = isNonvisibleStoredSearchKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .live_filter_doc_set_controlled = textLiveFilterDocSetControlledCallback,
             // An absent legacy summary is unknown, not a reason to scan the
@@ -47110,7 +48254,8 @@ pub const DB = struct {
         return entry.config.name;
     }
 
-    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, input: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        const req = directSingleVectorRequest(input) orelse input;
         if (comptime storage_engine.enabled) return storage_engine.call("collectSearchRequestTextStats", .{ self, alloc, req });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
@@ -47167,10 +48312,11 @@ pub const DB = struct {
     fn collectPlanningStatsLocked(
         self: *DB,
         alloc: Allocator,
-        req: types.SearchRequest,
+        input: types.SearchRequest,
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
+        const req = directSingleVectorRequest(input) orelse input;
         _ = exec_ctx;
         try planning_bindings_mod.validateSearchRequestBindings(self.core, self.alloc, req);
         return try planning_adapter_mod.collectSearchRequestStatsAlloc(
@@ -47215,7 +48361,14 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{ .privacy_policy_version = privacy_policy_version });
+        var consumer_arena = std.heap.ArenaAllocator.init(alloc);
+        defer consumer_arena.deinit();
+        var consumers: std.ArrayList([]const u8) = .empty;
+        for (requests) |request| {
+            const entry = self.core.textIndexEntry(request.index_name) orelse return error.IndexNotFound;
+            try consumers.append(consumer_arena.allocator(), entry.config.name);
+        }
+        _ = try @import("privacy_read.zig").requireConsumersPublishedWithBudget(self, alloc, .{ .privacy_policy_version = privacy_policy_version }, consumers.items, null);
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -47241,11 +48394,32 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{ .privacy_policy_version = privacy_policy_version });
+        var consumer_arena = std.heap.ArenaAllocator.init(alloc);
+        defer consumer_arena.deinit();
+        var consumers: std.ArrayList([]const u8) = .empty;
+        for (requests) |request| {
+            const entry = self.core.textIndexEntry(request.index_name) orelse return error.IndexNotFound;
+            try consumers.append(consumer_arena.allocator(), entry.config.name);
+        }
+        _ = try @import("privacy_read.zig").requireConsumersPublishedWithBudget(self, alloc, .{ .privacy_policy_version = privacy_policy_version }, consumers.items, null);
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
         });
+    }
+
+    fn rangeProjectionCurrentCallback(ctx: ?*anyopaque, alloc: Allocator, index_name: []const u8) anyerror!bool {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        const primary_sequence = seq: {
+            var txn = try self.core.store.beginProbeTxn();
+            defer txn.abort();
+            break :seq try self.core.store.lastReplaySequenceFromTxn(&txn, 0);
+        };
+        const resident = self.executor.appliedSequence(index_name) orelse 0;
+        if (resident >= primary_sequence) return true;
+        const applied = @max(resident, try self.core.loadAppliedSequence(alloc, index_name));
+        if (applied >= primary_sequence) return true;
+        return (try self.managedIndexReplayTargetSequence(alloc, index_name, .full_text, applied)) <= applied;
     }
 
     fn textIndexEntryCallback(
@@ -47502,6 +48676,60 @@ pub const DB = struct {
         return try self.core.index_manager.exactScoreDenseEntryWithRequest(entry, controlled);
     }
 
+    fn resolvePrimaryOrdinalKeysCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        ordinals: []const doc_set.DocOrdinal,
+        generation: ?u64,
+        values: []?[]const u8,
+    ) anyerror!void {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (ordinals.len != values.len) return error.InvalidArgument;
+        @memset(values, null);
+        errdefer for (values) |*slot| {
+            if (slot.*) |key| alloc.free(key);
+            slot.* = null;
+        };
+        var offset: usize = 0;
+        while (offset < ordinals.len) {
+            const page = ordinals[offset..][0..@min(256, ordinals.len - offset)];
+            const output = values[offset..][0..page.len];
+            offset += page.len;
+            var positions: [256]usize = undefined;
+            for (positions[0..page.len], 0..) |*slot, slot_index| slot.* = slot_index;
+            std.mem.sort(usize, positions[0..page.len], page, struct {
+                fn less(numbers: []const doc_set.DocOrdinal, lhs: usize, rhs: usize) bool {
+                    return numbers[lhs] < numbers[rhs];
+                }
+            }.less);
+
+            var txn = try self.core.store.beginProbeTxnWithBlockCacheAdmission(.transient);
+            defer txn.abort();
+            var encoded: [256]@TypeOf(internal_keys.identityOrdinalStateKey(0)) = undefined;
+            var keys: [256][]const u8 = undefined;
+            var records: [256]?[]const u8 = undefined;
+            for (positions[0..page.len], 0..) |position, index| {
+                encoded[index] = internal_keys.identityOrdinalStateKey(page[position]);
+                keys[index] = &encoded[index];
+            }
+            try txn.getManySorted(keys[0..page.len], records[0..page.len]);
+            var visible_count: usize = 0;
+            for (positions[0..page.len], records[0..page.len]) |position, record| {
+                const state = try doc_identity.decodeOrdinalState(record orelse continue);
+                if (!(if (generation) |at| state.isVisibleAt(at) else state.isLive())) continue;
+                positions[visible_count] = position;
+                encoded[visible_count] = internal_keys.identityOrdinalToDocKey(page[position]);
+                keys[visible_count] = &encoded[visible_count];
+                visible_count += 1;
+            }
+            if (visible_count == 0) continue;
+            try txn.getManySorted(keys[0..visible_count], records[0..visible_count]);
+            for (positions[0..visible_count], records[0..visible_count]) |position, record| {
+                output[position] = try alloc.dupe(u8, record orelse return error.InvalidDocIdentity);
+            }
+        }
+    }
+
     fn resolveDocSetDocIdsCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -47520,6 +48748,218 @@ pub const DB = struct {
     ) anyerror!doc_set.ResolvedDocSet {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, generation);
+    }
+
+    fn lookupLiveIdentityDirectoryCallback(ctx: ?*anyopaque, alloc: Allocator, keys: []const []const u8, generation: ?u64) anyerror!?[]?doc_set.DocOrdinal {
+        return lookupLiveIdentityDirectoryAlloc(ctx, alloc, keys, generation, true);
+    }
+
+    fn lookupLiveIdentityDirectoryAlloc(ctx: ?*anyopaque, alloc: Allocator, keys: []const []const u8, generation: ?u64, require_complete: bool) !?[]?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        doc_identity.requireLiveDirectoryTxn(&txn) catch |err| switch (err) {
+            error.InvalidDocIdentity => return null,
+            else => return err,
+        };
+        const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(alloc, &txn, keys);
+        errdefer alloc.free(ordinals);
+        for (keys, ordinals) |key, *slot| {
+            const id = slot.* orelse try doc_identity.lookupLiveOrdinalTxn(alloc, &txn, key) orelse {
+                if (!require_complete) continue;
+                // A stored row with neither lookup key can predate the live
+                // directory. Let the compatibility path consult reverse IDs.
+                const stored_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
+                defer alloc.free(stored_key);
+                _ = txn.get(stored_key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                alloc.free(ordinals);
+                return null;
+            };
+            const state = (try doc_identity.lookupStateTxn(&txn, id)) orelse {
+                slot.* = null;
+                if (!require_complete) continue;
+                alloc.free(ordinals);
+                return null;
+            };
+            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+            slot.* = if (visible) id else null;
+        }
+        return ordinals;
+    }
+
+    fn resolveGraphDocIdsToDocSetCallback(ctx: ?*anyopaque, alloc: Allocator, keys: []const []const u8, generation: ?u64) anyerror!doc_set.ResolvedDocSet {
+        var resolved = try resolveDocIdsToDocSetCallback(ctx, alloc, keys, generation);
+        errdefer resolved.deinit(alloc);
+        if (resolved != .doc_keys) return resolved;
+        if (try lookupLiveIdentityDirectoryCallback(ctx, alloc, resolved.doc_keys, generation)) |ordinals| {
+            defer alloc.free(ordinals);
+            var mapped: std.ArrayListUnmanaged(doc_set.DocOrdinal) = .empty;
+            defer mapped.deinit(alloc);
+            for (ordinals) |ordinal| try mapped.append(alloc, ordinal orelse return resolved);
+            const out = try doc_set.fromOrdinalsWithPolicyAlloc(alloc, mapped.items, .{});
+            resolved.deinit(alloc);
+            return out;
+        }
+        return resolved;
+    }
+
+    fn primaryResidualScopeCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+        control: db_query_search.QueryExecutionControl,
+    ) anyerror!?db_query_search.PrimaryResidualPopulation {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try control.check();
+        const duration = ttlDurationNs(self);
+        const cached = cached: {
+            const at = generation orelse break :cached null;
+            lockAtomic(&self.core.identity_visibility.live_mutex);
+            defer self.core.identity_visibility.live_mutex.unlock();
+            if (self.core.identity_visibility.live_generation != at) break :cached null;
+            const scope = if (self.core.identity_visibility.live_set) |*value| value else break :cached null;
+            if (scope.* == .all) break :cached null;
+            break :cached try doc_set.cloneAlloc(alloc, scope);
+        };
+        if (cached) |value| {
+            var scope = value;
+            if (duration == 0) return .{ .rows = scope };
+            defer scope.deinit(alloc);
+            return .{ .rows = try self.primaryResidualVisibleBatches(alloc, &scope, generation, duration, control) };
+        }
+
+        const Scan = struct {
+            db: *DB,
+            alloc: Allocator,
+            read: *docstore_mod.DocStore.Txn,
+            generation: ?u64,
+            duration: u64,
+            now: u64,
+            control: db_query_search.QueryExecutionControl,
+            batch: *std.heap.ArenaAllocator,
+            keys: [64][]const u8 = undefined,
+            count: usize = 0,
+            complete_forward: bool = true,
+            rows: @import("../../encoding/roaring.zig").RoaringBitmap,
+            legacy: std.ArrayListUnmanaged([]const u8) = .empty,
+
+            fn checkpoint(raw: ?*anyopaque, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(raw.?));
+                try state.control.check();
+                return .@"continue";
+            }
+
+            fn collect(raw: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(raw.?));
+                const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.batch.allocator(), key)) orelse return .@"continue";
+                state.keys[state.count] = id;
+                state.count += 1;
+                if (state.count == state.keys.len) try state.flush();
+                return .@"continue";
+            }
+
+            fn flush(state: *@This()) !void {
+                if (state.count == 0) return;
+                try state.control.check();
+                const a = state.batch.allocator();
+                const keys = state.keys[0..state.count];
+                const mapped = try doc_identity.lookupOrdinalsTxnAlloc(a, state.read, keys);
+                const timestamps = if (state.duration != 0) try loadDocumentTimestampsMany(state.db, a, keys) else null;
+                for (keys, mapped, 0..) |key, forward, index| {
+                    if (timestamps) |values| if (values[index]) |ts| if (ttl_mod.isExpired(ts, state.duration, state.now)) continue;
+                    if (forward == null) state.complete_forward = false;
+                    const ordinal = forward orelse try doc_identity.lookupLiveOrdinalTxn(a, state.read, key);
+                    if (ordinal) |id| if (try doc_identity.lookupStateTxn(state.read, id)) |identity| {
+                        if (if (state.generation) |at| identity.isVisibleAt(at) else identity.isLive()) {
+                            try state.rows.add(id);
+                        } else state.complete_forward = false;
+                        continue;
+                    };
+                    state.complete_forward = false;
+                    const copy = try state.alloc.dupe(u8, key);
+                    errdefer state.alloc.free(copy);
+                    try state.legacy.append(state.alloc, copy);
+                }
+                state.count = 0;
+                _ = state.batch.reset(.retain_capacity);
+            }
+        };
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        var batch_arena = std.heap.ArenaAllocator.init(alloc);
+        defer batch_arena.deinit();
+        var stream = Scan{
+            .db = self,
+            .alloc = alloc,
+            .read = &read,
+            .generation = generation,
+            .duration = duration,
+            .now = currentTimeNs(),
+            .control = control,
+            .batch = &batch_arena,
+            .rows = .init(alloc),
+        };
+        errdefer stream.rows.deinit();
+        errdefer {
+            for (stream.legacy.items) |key| alloc.free(key);
+            stream.legacy.deinit(alloc);
+        }
+        const lower = [_]u8{internal_keys.user_namespace};
+        const upper = [_]u8{internal_keys.user_namespace + 1};
+        try self.core.store.scanStoredDocumentRowsReadTxnWithContext(&read, &lower, &upper, false, &stream, Scan.checkpoint, Scan.collect);
+        try stream.flush();
+        if (duration == 0 and stream.complete_forward) {
+            if (generation) |at| {
+                const scope: doc_set.ResolvedDocSet = .{ .ordinal_bitmap = stream.rows };
+                if (doc_set.cloneAlloc(self.alloc, &scope)) |copy| {
+                    lockAtomic(&self.core.identity_visibility.live_mutex);
+                    defer self.core.identity_visibility.live_mutex.unlock();
+                    if (self.core.identity_visibility.live_set) |*old| old.deinit(self.alloc);
+                    self.core.identity_visibility.live_set = copy;
+                    self.core.identity_visibility.live_generation = at;
+                } else |_| {}
+            }
+        }
+        const legacy: doc_set.ResolvedDocSet = if (stream.legacy.items.len == 0) .none else .{ .doc_keys = try stream.legacy.toOwnedSlice(alloc) };
+        return .{ .rows = .{ .ordinal_bitmap = stream.rows }, .legacy = legacy };
+    }
+
+    fn primaryResidualVisibleBatches(
+        self: *DB,
+        alloc: Allocator,
+        scope: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+        duration: u64,
+        control: db_query_search.QueryExecutionControl,
+    ) !doc_set.ResolvedDocSet {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const now = currentTimeNs();
+        if (scope.* == .none) return .none;
+        if (scope.* != .ordinal_bitmap) return error.InvalidData;
+        var visible = @import("../../encoding/roaring.zig").RoaringBitmap.init(alloc);
+        errdefer visible.deinit();
+        var iter = scope.ordinal_bitmap.iterator();
+        while (true) {
+            try control.check();
+            _ = scratch.reset(.retain_capacity);
+            var ordinals: [64]doc_set.DocOrdinal = undefined;
+            var count: usize = 0;
+            while (count < ordinals.len) : (count += 1) ordinals[count] = iter.next() orelse break;
+            if (count == 0) break;
+            const portion = doc_set.ResolvedDocSet{ .ordinals = ordinals[0..count] };
+            const a = scratch.allocator();
+            const ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(a, &portion, generation)) orelse return error.StorageReadTemporarilyUnavailable;
+            const timestamps = try loadDocumentTimestampsMany(self, a, ids);
+            for (ordinals[0..count], timestamps) |ordinal, ts| {
+                if (ts != null and ttl_mod.isExpired(ts.?, duration, now)) continue;
+                try visible.add(ordinal);
+            }
+        }
+        return .{ .ordinal_bitmap = visible };
     }
 
     fn liveFilterDocSetCallback(
@@ -47852,7 +49292,7 @@ pub const DB = struct {
         // query and instead carries it through to applyStoredSearchPatternFilters'
         // parent-aware matcher, same as the full-text arm (issue #931/#957).
         const chunk_backed_for_filter = if (self.core.denseIndex(req.index_name)) |entry|
-            entry.chunk_name != null
+            entry.memberBacked()
         else
             false;
         const member_mode_for_filter = req.return_mode == .member or req.return_mode == .chunk;
@@ -47892,10 +49332,12 @@ pub const DB = struct {
             .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .resolve_hit_key = resolveDenseHitKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_residual_vector_ids = denseResidualVectorIdsCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -47903,6 +49345,8 @@ pub const DB = struct {
             .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -48007,7 +49451,7 @@ pub const DB = struct {
         // through to applyStoredSearchPatternFilters' parent-aware matcher
         // instead of applying it natively (issue #931/#957).
         const chunk_backed_for_filter = if (self.core.denseIndex(identity_prefix_filter.req.index_name)) |entry|
-            entry.chunk_name != null
+            entry.memberBacked()
         else
             false;
         const member_mode_for_filter = identity_prefix_filter.req.return_mode == .member or identity_prefix_filter.req.return_mode == .chunk;
@@ -48037,10 +49481,12 @@ pub const DB = struct {
             .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .resolve_hit_key = resolveDenseHitKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_residual_vector_ids = denseResidualVectorIdsCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -48048,6 +49494,8 @@ pub const DB = struct {
             .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -48105,12 +49553,16 @@ pub const DB = struct {
             .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .sparse_index = sparseIndexCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
-            .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
+            .lookup_doc_nums_for_ordinal_set = sparseDocNumsForOrdinalSetCallback,
+            .lookup_doc_nums_for_parent_keys = sparseDocNumsForParentKeysCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -48253,6 +49705,7 @@ pub const DB = struct {
         resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
         resolved_doc_filter_alloc: ?Allocator = null,
         graph_memory: ?*GraphFilterMemory = null,
+        frontier_scoped: bool = false,
         graph_memory_alloc: ?Allocator = null,
 
         pub fn deinit(self: *@This()) void {
@@ -48445,6 +49898,8 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .project_ordinals_to_doc_ids = false,
@@ -48836,7 +50291,7 @@ pub const DB = struct {
         // composed queries keep their existing synchronization.
         var remaining = req;
         const defaults: types.SearchRequest = .{};
-        inline for (.{ "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation", "document_authority_mode", "document_authority_group" }) |field| {
+        inline for (.{ "index_alias_fences", "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation", "document_authority_mode", "document_authority_group" }) |field| {
             @field(remaining, field) = @field(defaults, field);
         }
         // Empty slices from a decoded wire envelope need not share the
@@ -48944,7 +50399,7 @@ pub const DB = struct {
         try self.enforcePortableRuntimeGate();
         if (ttlDurationNs(self) != 0) return declineDenseSnapshot("ttl");
         const entry = (try denseIndexCallback(self, req.index_name)) orelse return error.IndexNotFound;
-        if (entry.chunk_name != null or entry.embedding_names.len != 0) return declineDenseSnapshot("result_shape");
+        if (entry.memberBacked() or entry.embedding_names.len != 0) return declineDenseSnapshot("result_shape");
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         const summary = self.core.identity_visibility.summary orelse return declineDenseSnapshot("identity_summary");
         if (!doc_identity.allVisibleFromSummary(summary, snapshot_req.identity_read_generation)) return declineDenseSnapshot("visibility");
@@ -49208,7 +50663,7 @@ pub const DB = struct {
 
         var spins: usize = 0;
         while (self.core.index_manager.published_dense_admission.load(.acquire) & published_dense_reader_mask != 0) : (spins += 1) {
-            if (monotonicTimeNs() >= deadline_ns) {
+            if (self.repairPacingNowNs() >= deadline_ns) {
                 const timed_out = self.core.index_manager.published_dense_admission.fetchAnd(published_dense_reader_mask, .release);
                 std.debug.assert(timed_out & published_dense_catalog_closed != 0);
                 return false;
@@ -49274,7 +50729,7 @@ pub const DB = struct {
     fn lockApplyUntil(self: *DB, deadline_ns: u64) bool {
         var spins: usize = 0;
         while (!self.core.tryLockApplyExclusive()) : (spins += 1) {
-            if (monotonicTimeNs() >= deadline_ns) return false;
+            if (self.repairPacingNowNs() >= deadline_ns) return false;
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
@@ -49284,8 +50739,8 @@ pub const DB = struct {
         return true;
     }
 
-    fn ensureRepairActivationDeadline(deadline_ns: u64) !void {
-        if (monotonicTimeNs() >= deadline_ns) return error.RepairActivationBudgetExhausted;
+    fn ensureRepairActivationDeadline(self: *const DB, deadline_ns: u64) !void {
+        if (self.repairPacingNowNs() >= deadline_ns) return error.RepairActivationBudgetExhausted;
     }
 
     fn denseDocKeyCallback(
@@ -49295,6 +50750,11 @@ pub const DB = struct {
     ) anyerror!?[]u8 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.index_manager.lookupDenseDocKey(self.core.store, index_name, vector_id);
+    }
+
+    fn denseResidualVectorIdsCallback(ctx: ?*anyopaque, alloc: Allocator, name: []const u8, keys: []const []const u8, control: db_query_search.QueryExecutionControl) anyerror![]u64 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return self.core.index_manager.lookupDenseVectorIdsForParentKeysControlledAlloc(alloc, self.core.store, name, keys, control);
     }
 
     fn denseVectorIdCallback(
@@ -49315,14 +50775,26 @@ pub const DB = struct {
         return self.core.sparseIndex(index_name);
     }
 
-    fn sparseDocNumsForOrdinalsCallback(
+    fn sparseDocNumsForParentKeysCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
         index_name: []const u8,
-        ordinals: []const u32,
+        keys: []const []const u8,
+        control: db_query_search.QueryExecutionControl,
     ) anyerror![]const u32 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, self.core.store, index_name, ordinals);
+        return try self.core.index_manager.lookupSparseDocNumsForParentKeysControlledAlloc(alloc, self.core.store, index_name, keys, control);
+    }
+
+    fn sparseDocNumsForOrdinalSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        set: *const doc_set.ResolvedDocSet,
+        control: db_query_search.QueryExecutionControl,
+    ) anyerror![]const u32 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.lookupSparseDocNumsForOrdinalSetAlloc(alloc, self.core.store, index_name, set, control);
     }
 
     fn loadRequiredProjectedSearchDocumentCallback(
@@ -49359,7 +50831,7 @@ pub const DB = struct {
         // identity stays unchanged so text/vector fusion merges the same member.
         inline for (.{ self.core.index_manager.denseIndex(req.index_name), self.core.index_manager.sparseIndex(req.index_name) }) |selected| {
             if (selected) |entry| {
-                if (chunk_backed and entry.embedding_names.len == 0 and entry.chunk_name != null)
+                if (chunk_backed and entry.embedding_names.len == 0)
                     presence.embedding_presence_name = entry.embedding_name orelse entry.config.name;
             }
         }
@@ -49391,8 +50863,11 @@ pub const DB = struct {
             .collect_candidates = collectSearchMatchAllCandidatesCallback,
             .collect_candidates_stream = streamSearchMatchAllCandidatesCallback,
             .text_index_entry = textIndexEntryCallback,
+            .resolve_primary_ordinal_keys = resolvePrimaryOrdinalKeysCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .primary_residual_scope = primaryResidualScopeCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
@@ -49410,9 +50885,13 @@ pub const DB = struct {
         options: db_query_search.MatchAllCandidateCollectOptions,
     ) anyerror!db_query_search.MatchAllCandidates {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var identity_scan = PrimaryMatchAllIdentityScan{ .db = self, .req = req };
+        const identity_scope = options.exact_primary_keys != null or options.exact_primary_ordinals != null;
         return try db_query_search.collectMatchAllCandidatesWithOptions(alloc, req, .{
             .ctx = self,
             .primary_key_range = self.core.byteRange(),
+            .scan_ids_ctx = if (identity_scope) &identity_scan else null,
+            .scan_primary_ids = if (identity_scope) PrimaryMatchAllIdentityScan.scan else null,
             .scan_store_range = scanStoreRangeCallback,
             .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
@@ -49437,7 +50916,7 @@ pub const DB = struct {
             .ctx = self,
             .primary_key_range = self.core.byteRange(),
             .scan_ids_ctx = &identity_scan,
-            .scan_ids = PrimaryMatchAllIdentityScan.scan,
+            .scan_primary_ids = PrimaryMatchAllIdentityScan.scan,
             .scan_store_range = scanStoreRangeCallback,
             .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
@@ -49454,15 +50933,57 @@ pub const DB = struct {
         db: *DB,
         req: types.SearchRequest,
         visitor_ctx: ?*anyopaque = null,
-        visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction = undefined,
+        visitor: db_query_search.PrimaryCandidateVisitor = undefined,
         alloc: Allocator = undefined,
+        exceptional: []const []const u8 = &.{},
+        exceptional_index: usize = 0,
+        reverse: bool = false,
+        stopped: bool = false,
         observed_rows: ?*usize = null,
+        ordered_spill_enabled: bool = true,
 
-        fn scan(raw: ?*anyopaque, alloc: Allocator, options: db_query_search.MatchAllCandidateCollectOptions, visitor_ctx: ?*anyopaque, visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) !void {
+        fn scan(raw: ?*anyopaque, alloc: Allocator, options: db_query_search.MatchAllCandidateCollectOptions, visitor_ctx: ?*anyopaque, visitor: db_query_search.PrimaryCandidateVisitor) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.alloc = alloc;
             self.visitor = visitor;
             self.visitor_ctx = visitor_ctx;
+            if (options.exact_primary_keys != null or options.exact_primary_ordinals != null) {
+                try self.scanExactScope(options);
+                return;
+            }
+            if (options.require_complete_primary_population and !options.hasCompletePrimaryKeyScope()) {
+                if (try self.scanSmallOrderedScope(options)) return;
+                var remaining = options;
+                var prefix_scan: SourcePrefix = .{};
+                defer prefix_scan.last_key.deinit(alloc);
+                if (options.stop_after_accepted) |page| {
+                    const scope_size = if (options.constraints) |constraints| scope: {
+                        if (!constraints.positive_filter) break :scope 0;
+                        const count = if (constraints.primary_include_compact)
+                            constraints.primary_include.estimatedCardinality() orelse 0
+                        else
+                            constraints.filter_doc_nums.len;
+                        break :scope count +| (constraints.legacy_filter.estimatedCardinality() orelse 0);
+                    } else 0;
+                    // Probe a bounded prefix when a small page starts at a
+                    // cursor. Sparse scopes can still sort their remainder.
+                    if ((options.primary_key_start_after != null or options.primary_key_stop_before != null) and
+                        scope_size >= 1024 and page <= 256 and page *| 16 < scope_size)
+                    {
+                        prefix_scan.limit = @min(@max(page *| 8, 64), 512);
+                        if (try self.scanSourcePrefix(options, &prefix_scan)) return;
+                        if (prefix_scan.has_key) {
+                            if (options.primary_key_reverse)
+                                remaining.primary_key_stop_before = prefix_scan.last_key.items
+                            else
+                                remaining.primary_key_start_after = prefix_scan.last_key.items;
+                        }
+                    }
+                }
+                if (try self.scanLargeOrderedScope(remaining)) return;
+                try self.scanSourcePopulation(remaining);
+                return;
+            }
             // Explicit historical reads still need identities deleted since
             // that generation. Current reads use the compact live population.
             const historical = if (self.req.identity_read_generation) |generation| generation < try self.db.currentIdentityReadGeneration() else false;
@@ -49491,6 +51012,33 @@ pub const DB = struct {
             defer if (range_lower) |key| alloc.free(key);
             const range_upper = if (owner_range.end.len != 0) try mappingKeyAlloc(alloc, owner_range.end, kind) else null;
             defer if (range_upper) |key| alloc.free(key);
+            var exceptional: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer exceptional.deinit(alloc);
+            const exceptional_keys = options.exceptionalPrimaryKeys();
+            const residual = if (options.hasCompletePrimaryKeyScope() and options.constraints != null and
+                options.constraints.?.legacy_filter == .doc_keys) options.constraints.?.legacy_filter.doc_keys else &.{};
+            for ([_][]const []const u8{ exceptional_keys, residual }) |keys| {
+                for (keys) |id| {
+                    try db_query_search.checkSearchRequestDeadline(self.req);
+                    if (!owner_range.contains(id)) continue;
+                    if (options.primary_key_start_after) |start| if (!std.mem.lessThan(u8, start, id)) continue;
+                    if (options.primary_key_stop_before) |stop| if (!std.mem.lessThan(u8, id, stop)) continue;
+                    try exceptional.append(alloc, id);
+                }
+            }
+            std.mem.sort([]const u8, exceptional.items, {}, struct {
+                fn less(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.lessThan(u8, left, right);
+                }
+            }.less);
+            self.reverse = options.primary_key_reverse;
+            if (self.reverse) std.mem.reverse([]const u8, exceptional.items);
+            self.exceptional = exceptional.items;
+            defer self.exceptional = &.{};
+            if (options.hasCompletePrimaryKeyScope()) {
+                _ = try self.drainExceptionalBefore(null);
+                return;
+            }
             var lower: []const u8 = lower_owned orelse &prefix;
             if (range_lower) |key| if (std.mem.lessThan(u8, lower, key)) {
                 lower = key;
@@ -49505,11 +51053,671 @@ pub const DB = struct {
             {
                 var probe = try self.db.core.store.beginProbeTxn();
                 defer probe.abort();
-                if (try doc_identity.loadNamespaceTxn(&probe) == null) return;
+                if (try doc_identity.loadNamespaceTxn(&probe) == null) {
+                    _ = try self.drainExceptionalBefore(null);
+                    return;
+                }
             }
             var txn = try self.db.core.store.beginCurrentScanTxn();
             defer txn.abort();
             try self.db.core.store.scanReadTxnWithContext(&txn, lower, upper, .{ .reverse = options.primary_key_reverse }, self, visit);
+            if (!self.stopped) _ = try self.drainExceptionalBefore(null);
+        }
+
+        fn scanSmallOrderedScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !bool {
+            const constraints = options.constraints orelse return false;
+            if (!constraints.positive_filter) return false;
+            const legacy = if (constraints.legacy_filter == .doc_keys) constraints.legacy_filter.doc_keys else &.{};
+            const direct_keys = if (constraints.primary_include_compact and constraints.primary_include == .doc_keys)
+                constraints.primary_include.doc_keys
+            else
+                &.{};
+            const limit = 256;
+            var ordinal_buffer: [limit]doc_set.DocOrdinal = undefined;
+            const ordinals: []const doc_set.DocOrdinal = if (constraints.primary_include_compact) switch (constraints.primary_include) {
+                .none, .doc_keys => &.{},
+                .ordinals => |values| values,
+                .ordinal_bitmap => |*bitmap| blk: {
+                    if (bitmap.cardinality() +| legacy.len > limit) return false;
+                    var iterator = bitmap.iterator();
+                    var len: usize = 0;
+                    while (iterator.next()) |ordinal| : (len += 1) ordinal_buffer[len] = ordinal;
+                    break :blk ordinal_buffer[0..len];
+                },
+                .all => return false,
+            } else constraints.filter_doc_nums;
+            if (ordinals.len +| legacy.len +| direct_keys.len > limit) return false;
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            const temp = scratch.allocator();
+            var resolved: [limit]?[]const u8 = undefined;
+            resolvePrimaryOrdinalKeysCallback(self.db, temp, ordinals, self.req.identity_read_generation, resolved[0..ordinals.len]) catch |err| {
+                if (recoverableSourceIdentityError(err)) return false;
+                return err;
+            };
+            const Candidate = struct {
+                id: []const u8,
+                ordinal: ?doc_set.DocOrdinal = null,
+
+                fn less(reverse: bool, left: @This(), right: @This()) bool {
+                    const order = std.mem.order(u8, left.id, right.id);
+                    if (order == .eq) return left.ordinal != null and right.ordinal == null;
+                    return order == if (reverse) std.math.Order.gt else .lt;
+                }
+            };
+            var keys: std.ArrayListUnmanaged(Candidate) = .empty;
+            for (legacy) |id| try keys.append(temp, .{ .id = id });
+            for (direct_keys) |id| try keys.append(temp, .{ .id = id });
+            for (ordinals, resolved[0..ordinals.len]) |ordinal, key| {
+                if (key) |id| try keys.append(temp, .{ .id = id, .ordinal = ordinal });
+            }
+            std.mem.sort(Candidate, keys.items, options.primary_key_reverse, Candidate.less);
+            const owner_range = self.db.core.byteRange();
+            var last: ?[]const u8 = null;
+            for (keys.items) |candidate| {
+                const id = candidate.id;
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                if (last) |prior| if (std.mem.eql(u8, prior, id)) continue;
+                last = id;
+                if (!owner_range.contains(id)) continue;
+                if (options.primary_key_start_after) |after| if (!std.mem.lessThan(u8, after, id)) continue;
+                if (options.primary_key_stop_before) |before| if (!std.mem.lessThan(u8, id, before)) continue;
+                if (try self.visitIdWithOrdinal(id, candidate.ordinal, true) == .stop) return true;
+            }
+            return true;
+        }
+
+        fn scanLargeOrderedScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !bool {
+            if (comptime builtin.os.tag == .freestanding) return false;
+            if (!self.ordered_spill_enabled) return false;
+            var delivery_started = false;
+            return self.scanLargeOrderedScopeWithSpill(options, &delivery_started) catch |err| {
+                if (delivery_started) return err;
+                if (recoverableSourceIdentityError(err) or @import("../../sql/spill.zig").searchSpillUnavailable(err)) return false;
+                return err;
+            };
+        }
+
+        fn scanLargeOrderedScopeWithSpill(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions, delivery_started: *bool) !bool {
+            const constraints = options.constraints orelse return false;
+            if (!constraints.positive_filter) return false;
+            const set = if (constraints.primary_include_compact) constraints.primary_include else doc_set.ResolvedDocSet{ .ordinals = constraints.filter_doc_nums };
+            if (set == .all) return false;
+            const spill = @import("../../sql/spill.zig");
+            const Datum = @import("../../sql/scalar.zig").Datum;
+            const Check = struct {
+                fn run(raw: *anyopaque) !void {
+                    const source_scan: *PrimaryMatchAllIdentityScan = @ptrCast(@alignCast(raw));
+                    try db_query_search.checkSearchRequestDeadline(source_scan.req);
+                }
+            };
+            var manager = spill.initSearchSpill(self.alloc, std.Io.Threaded.global_single_threaded.io(), self, Check.run);
+            defer manager.deinit();
+            var ordered = spill.Sort.init(self.alloc, &manager, &.{.{ .descending = options.primary_key_reverse }}, 512 * 1024);
+            defer ordered.deinit();
+            const unknown_ordinal: u64 = @as(u64, std.math.maxInt(u32)) + 1;
+            const legacy = if (constraints.legacy_filter == .doc_keys) constraints.legacy_filter.doc_keys else &.{};
+            const direct = if (set == .doc_keys) set.doc_keys else &.{};
+            for ([_][]const []const u8{ direct, legacy }) |keys| {
+                for (keys) |id| {
+                    try Check.run(self);
+                    if (!self.orderedScopeContains(options, id)) continue;
+                    try ordered.add(.{ .keys = &.{Datum.fromJson(.{ .string = id })}, .values = &.{}, .ordinal = unknown_ordinal });
+                }
+            }
+
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            var iterator = if (set == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+            const numbers = if (set == .ordinals) set.ordinals else &.{};
+            var offset: usize = 0;
+            while (true) {
+                try Check.run(self);
+                _ = scratch.reset(.retain_capacity);
+                var ordinals: [256]doc_set.DocOrdinal = undefined;
+                var resolved: [256]?[]const u8 = undefined;
+                var len: usize = 0;
+                while (len < ordinals.len) : (len += 1) {
+                    if (iterator) |*cursor| {
+                        ordinals[len] = cursor.next() orelse break;
+                    } else {
+                        if (offset == numbers.len) break;
+                        ordinals[len] = numbers[offset];
+                        offset += 1;
+                    }
+                }
+                if (len == 0) break;
+                try resolvePrimaryOrdinalKeysCallback(self.db, scratch.allocator(), ordinals[0..len], self.req.identity_read_generation, resolved[0..len]);
+                for (ordinals[0..len], resolved[0..len]) |ordinal, value| {
+                    const id = value orelse continue;
+                    if (!self.orderedScopeContains(options, id)) continue;
+                    try ordered.add(.{ .keys = &.{Datum.fromJson(.{ .string = id })}, .values = &.{}, .ordinal = ordinal });
+                }
+            }
+            try ordered.finish();
+            var last: std.ArrayListUnmanaged(u8) = .empty;
+            defer last.deinit(self.alloc);
+            var have_last = false;
+            var delivery = std.heap.ArenaAllocator.init(self.alloc);
+            defer delivery.deinit();
+            var keys: [256][]const u8 = undefined;
+            var ordinals: [256]?doc_set.DocOrdinal = undefined;
+            var len: usize = 0;
+            var batch_size = @min(@max(options.scan_batch_size orelse keys.len, 1), keys.len);
+            const duration = ttlDurationNs(self.db);
+            const now = currentTimeNs();
+            while (try ordered.nextLeased()) |row| {
+                defer row.release();
+                try Check.run(self);
+                const id = (try row.keyCell(0)).value.string;
+                if (have_last and std.mem.eql(u8, id, last.items)) continue;
+                last.clearRetainingCapacity();
+                try last.appendSlice(self.alloc, id);
+                have_last = true;
+                keys[len] = try delivery.allocator().dupe(u8, id);
+                ordinals[len] = std.math.cast(doc_set.DocOrdinal, row.row.ordinal);
+                len += 1;
+                if (len == batch_size) {
+                    if (try self.deliverOrderedBatch(delivery.allocator(), keys[0..len], ordinals[0..len], duration, now, delivery_started) == .stop) return true;
+                    len = 0;
+                    _ = delivery.reset(.retain_capacity);
+                    batch_size = @min(keys.len, batch_size * 2);
+                }
+            }
+            if (len != 0) {
+                _ = try self.deliverOrderedBatch(delivery.allocator(), keys[0..len], ordinals[0..len], duration, now, delivery_started);
+            }
+            return true;
+        }
+
+        fn deliverOrderedBatch(self: *@This(), alloc: Allocator, keys: []const []const u8, ordinals: []const ?doc_set.DocOrdinal, duration: u64, now: u64, delivery_started: *bool) !docstore_mod.DocStore.ScanAction {
+            const timestamps = if (duration == 0) null else try loadDocumentTimestampsManyWithIdentityShape(self.db, alloc, keys, true);
+            defer if (timestamps) |values| alloc.free(values);
+            var present: [256]bool = @splat(false);
+            var resolved: [256]?doc_set.DocOrdinal = @splat(null);
+            {
+                var txn = try self.db.core.store.beginProbeTxn();
+                defer txn.abort();
+                for (keys, ordinals, 0..) |id, ordinal, i| {
+                    try db_query_search.checkSearchRequestDeadline(self.req);
+                    if (timestamps) |values| if (values[i]) |ts| {
+                        if (ttl_mod.isExpired(ts, duration, now)) continue;
+                    };
+                    if (!try sourcePresent(alloc, &txn, id)) continue;
+                    const identity = if (ordinal) |known| PreparedIdentity{ .visible = known } else try self.resolvePreparedIdentity(alloc, &txn, id, null);
+                    switch (identity) {
+                        .invisible => continue,
+                        .unmapped => {},
+                        .visible => |value| resolved[i] = value,
+                    }
+                    present[i] = true;
+                }
+            }
+            for (keys, resolved[0..keys.len], present[0..keys.len]) |id, ordinal, is_present| {
+                if (!is_present) continue;
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                delivery_started.* = true;
+                if (try self.visitor(self.visitor_ctx, id, ordinal, true, true) == .stop) return .stop;
+            }
+            return .@"continue";
+        }
+
+        fn orderedScopeContains(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions, id: []const u8) bool {
+            if (!self.db.core.byteRange().contains(id)) return false;
+            if (options.primary_key_start_after) |after| if (!std.mem.lessThan(u8, after, id)) return false;
+            if (options.primary_key_stop_before) |before| if (!std.mem.lessThan(u8, id, before)) return false;
+            return true;
+        }
+
+        fn scanSourcePopulation(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
+            _ = try self.scanSourcePrefix(options, null);
+        }
+
+        const SourcePrefix = struct {
+            limit: usize = 0,
+            has_key: bool = false,
+            last_key: std.ArrayListUnmanaged(u8) = .empty,
+        };
+
+        /// Returns true when the source range or the visitor is exhausted.
+        fn scanSourcePrefix(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions, prefix: ?*SourcePrefix) !bool {
+            const Scan = struct {
+                owner: *PrimaryMatchAllIdentityScan,
+                arena: std.heap.ArenaAllocator,
+                keys: [256][]const u8 = undefined,
+                len: usize = 0,
+                batch_size: usize,
+                ttl_duration: u64,
+                now: u64,
+                prefix: ?*SourcePrefix,
+                options: db_query_search.MatchAllCandidateCollectOptions,
+                recovery: SourceRecovery,
+                examined: usize = 0,
+                exhausted_budget: bool = false,
+
+                fn checkpoint(raw: ?*anyopaque, _: []const u8) !docstore_mod.DocStore.ScanAction {
+                    const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
+                    try db_query_search.checkSearchRequestDeadline(source_batch.owner.req);
+                    if (source_batch.prefix) |bound| {
+                        if (source_batch.examined == bound.limit) {
+                            source_batch.exhausted_budget = true;
+                            return .stop;
+                        }
+                        source_batch.examined += 1;
+                    }
+                    if (source_batch.owner.observed_rows) |count| count.* += 1;
+                    return .@"continue";
+                }
+
+                fn visit(raw: ?*anyopaque, key: []const u8, _: []const u8) !docstore_mod.DocStore.ScanAction {
+                    const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
+                    try db_query_search.checkSearchRequestDeadline(source_batch.owner.req);
+                    const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(source_batch.arena.allocator(), key)) orelse return .@"continue";
+                    source_batch.keys[source_batch.len] = id;
+                    source_batch.len += 1;
+                    return if (source_batch.len == source_batch.batch_size) source_batch.flush() else .@"continue";
+                }
+
+                fn flush(source_batch: *@This()) !docstore_mod.DocStore.ScanAction {
+                    if (source_batch.len == 0) return .@"continue";
+                    const owner = source_batch.owner;
+                    const keys = source_batch.keys[0..source_batch.len];
+                    const needs_reverse = if (source_batch.options.constraints) |constraints|
+                        constraints.positive_filter and
+                            (if (constraints.primary_include_compact)
+                                constraints.primary_include == .ordinals or constraints.primary_include == .ordinal_bitmap
+                            else
+                                constraints.filter_doc_nums.len != 0)
+                    else
+                        false;
+                    var visible: [256]bool = @splat(true);
+                    var ordinals: [256]?doc_set.DocOrdinal = @splat(null);
+                    {
+                        var txn = try owner.db.core.store.beginProbeTxn();
+                        defer txn.abort();
+                        const temp = source_batch.arena.allocator();
+                        const mapped: ?[]?doc_set.DocOrdinal = doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys) catch |err| fallback: {
+                            if (source_batch.prefix != null or !recoverableSourceIdentityError(err)) return source_batch.rejectSpeculativeBatch(err);
+                            break :fallback null;
+                        };
+                        var failures: [256]?anyerror = @splat(null);
+                        var failed = false;
+                        for (keys, 0..) |id, i| {
+                            const forward: ??doc_set.DocOrdinal = if (mapped) |values| @as(??doc_set.DocOrdinal, values[i]) else null;
+                            const identity = owner.resolvePreparedIdentity(temp, &txn, id, forward) catch |err| {
+                                if (source_batch.prefix != null or !recoverableSourceIdentityError(err)) return source_batch.rejectSpeculativeBatch(err);
+                                failures[i] = err;
+                                failed = true;
+                                continue;
+                            };
+                            switch (identity) {
+                                .invisible => visible[i] = false,
+                                .unmapped => if (needs_reverse) {
+                                    if (source_batch.prefix != null) return source_batch.rejectSpeculativeBatch(error.InvalidDocIdentity);
+                                    failures[i] = error.NotFound;
+                                    failed = true;
+                                },
+                                .visible => |ordinal| ordinals[i] = ordinal,
+                            }
+                        }
+                        if (failed) try owner.recoverScopedSourceBatch(
+                            source_batch.options,
+                            &source_batch.recovery,
+                            temp,
+                            keys,
+                            failures[0..keys.len],
+                            visible[0..keys.len],
+                            ordinals[0..keys.len],
+                        );
+                    }
+                    const timestamps = timestamps: {
+                        if (source_batch.ttl_duration == 0) break :timestamps null;
+                        var eligible_keys: [256][]const u8 = undefined;
+                        var eligible: usize = 0;
+                        for (keys, visible[0..keys.len]) |id, include| {
+                            if (!include) continue;
+                            eligible_keys[eligible] = id;
+                            eligible += 1;
+                        }
+                        if (eligible == 0) break :timestamps null;
+                        break :timestamps try loadDocumentTimestampsManyWithIdentityShape(owner.db, source_batch.arena.allocator(), eligible_keys[0..eligible], true);
+                    };
+                    var timestamp_slot: usize = 0;
+                    for (keys, ordinals[0..keys.len], visible[0..keys.len]) |id, ordinal, include| {
+                        if (!include) continue;
+                        if (timestamps) |values| {
+                            const timestamp = values[timestamp_slot];
+                            timestamp_slot += 1;
+                            if (timestamp) |ts| if (ttl_mod.isExpired(ts, source_batch.ttl_duration, source_batch.now)) continue;
+                        }
+                        if (try owner.visitor(owner.visitor_ctx, id, ordinal, true, true) == .stop) {
+                            owner.stopped = true;
+                            return .stop;
+                        }
+                    }
+                    if (source_batch.prefix) |bound| {
+                        bound.last_key.clearRetainingCapacity();
+                        try bound.last_key.appendSlice(owner.alloc, keys[keys.len - 1]);
+                        bound.has_key = true;
+                    }
+                    // A full batch that did not fill the page encountered
+                    // rejected rows. Amortize subsequent identity probes.
+                    if (source_batch.len == source_batch.batch_size)
+                        source_batch.batch_size = @min(source_batch.keys.len, source_batch.batch_size * 2);
+                    source_batch.len = 0;
+                    _ = source_batch.arena.reset(.retain_capacity);
+                    return .@"continue";
+                }
+
+                fn rejectSpeculativeBatch(source_batch: *@This(), err: anyerror) !docstore_mod.DocStore.ScanAction {
+                    if (source_batch.prefix == null or !recoverableSourceIdentityError(err)) return err;
+                    source_batch.exhausted_budget = true;
+                    source_batch.len = 0;
+                    return .stop;
+                }
+            };
+            const owner_range = self.db.core.byteRange();
+            const after = options.primary_key_start_after;
+            const start = if (after != null and owner_range.contains(after.?)) after.? else owner_range.start;
+            if (after) |key| if (owner_range.end.len != 0 and std.mem.order(u8, key, owner_range.end) != .lt) return true;
+            const lower = if (after != null and std.mem.eql(u8, start, after.?)) exact: {
+                const encoded = try internal_keys.documentExactPrefixAlloc(self.alloc, start);
+                encoded[encoded.len - 1] = 1;
+                break :exact encoded;
+            } else try internal_keys.documentRangeLowerAlloc(self.alloc, start);
+            defer self.alloc.free(lower);
+            const before = options.primary_key_stop_before;
+            const end = if (before) |key| if (owner_range.end.len == 0 or std.mem.order(u8, key, owner_range.end) == .lt) key else owner_range.end else owner_range.end;
+            if (before) |key| if (std.mem.order(u8, key, owner_range.start) != .gt) return true;
+            const upper = if (end.len == 0) null else try internal_keys.documentRangeLowerAlloc(self.alloc, end);
+            defer if (upper) |bound| self.alloc.free(bound);
+            var recovery_budget: ?resource_manager_mod.BudgetedAllocator = if (resource_manager_mod.BudgetedAllocator.fromAllocator(self.alloc) == null)
+                if (self.db.core.index_manager.resource_manager) |manager|
+                    resource_manager_mod.BudgetedAllocator.init(manager, .lsm_read_working_set, self.alloc, 1)
+                else
+                    null
+            else
+                null;
+            defer if (recovery_budget) |*budget| budget.deinit();
+            const recovery_alloc = if (recovery_budget) |*budget| budget.allocator() else self.alloc;
+            var source_batch = Scan{
+                .owner = self,
+                .arena = std.heap.ArenaAllocator.init(self.alloc),
+                .ttl_duration = ttlDurationNs(self.db),
+                .now = currentTimeNs(),
+                .prefix = prefix,
+                .options = options,
+                .recovery = .{ .arena = std.heap.ArenaAllocator.init(recovery_alloc) },
+                .batch_size = @min(@max(options.scan_batch_size orelse 256, 1), 256),
+            };
+            defer source_batch.arena.deinit();
+            defer source_batch.recovery.deinit();
+            var txn = try self.db.core.store.beginCurrentScanTxn();
+            defer txn.abort();
+            try self.db.core.store.scanStoredDocumentRowsReadTxnWithContext(&txn, lower, upper orelse &.{}, options.primary_key_reverse, &source_batch, Scan.checkpoint, Scan.visit);
+            if (!self.stopped) _ = try source_batch.flush();
+            return self.stopped or !source_batch.exhausted_budget;
+        }
+
+        fn recoverableSourceIdentityError(err: anyerror) bool {
+            return err == error.InvalidDocIdentity or err == error.StorageReadTemporarilyUnavailable;
+        }
+
+        const SourceRecovery = struct {
+            const Entry = struct {
+                ordinal: doc_set.DocOrdinal,
+                visible: ?bool = null,
+            };
+            arena: std.heap.ArenaAllocator,
+            // Retain one lazily opened view for the source scan. Individual
+            // read scopes bound each page's pinned blocks and values.
+            read: ?docstore_mod.DocStore.Txn = null,
+            reverse: std.StringHashMapUnmanaged(Entry) = .empty,
+            bitmap: ?@import("../../encoding/roaring.zig").Iterator = null,
+            offset: usize = 0,
+            initialized: bool = false,
+            exhausted: bool = false,
+            proof_failure: ?anyerror = null,
+            explicit_keys: ?std.StringHashMapUnmanaged(void) = null,
+
+            fn deinit(self: *SourceRecovery) void {
+                if (self.read) |*txn| txn.abort();
+                self.arena.deinit();
+            }
+        };
+
+        /// Resolve the finite ordinal scope once for all failed keys in a
+        /// source batch. No candidate is delivered until membership is known.
+        fn recoverScopedSourceBatch(
+            self: *@This(),
+            options: db_query_search.MatchAllCandidateCollectOptions,
+            recovery: *SourceRecovery,
+            alloc: Allocator,
+            keys: []const []const u8,
+            failures: []const ?anyerror,
+            visible: []bool,
+            ordinals: []?doc_set.DocOrdinal,
+        ) !void {
+            const original_error = for (failures) |failure| {
+                if (failure) |err| break if (err == error.NotFound) error.InvalidDocIdentity else err;
+            } else unreachable;
+            const constraints = options.constraints orelse return original_error;
+            if (!constraints.positive_filter) return original_error;
+            const ordinal_set: doc_set.ResolvedDocSet = .{ .ordinals = constraints.filter_doc_nums };
+            const set = if (constraints.primary_include_compact) &constraints.primary_include else &ordinal_set;
+            if (set.* == .all) return original_error;
+
+            var pending: std.StringHashMapUnmanaged(usize) = .empty;
+            defer pending.deinit(alloc);
+            for (keys, failures, 0..) |key, failure, i| {
+                if (failure == null) continue;
+                try pending.put(alloc, key, i);
+                visible[i] = false;
+            }
+
+            if (!recovery.initialized) {
+                // The iterator borrows the request-owned bitmap across batches.
+                recovery.bitmap = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+                recovery.initialized = true;
+            }
+            const numbers = if (set.* == .ordinals) set.ordinals else &.{};
+            try self.recoverKnownSourceKeys(&recovery.read, recovery, &pending, ordinals, visible);
+            // Keep the original identity error if optional recovery memory
+            // cannot be admitted. An incomplete cache cannot prove absence.
+            const cache_alloc = recovery.arena.allocator();
+            while (pending.count() != 0 and !recovery.exhausted) {
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                var page: [256]doc_set.DocOrdinal = undefined;
+                var len: usize = 0;
+                while (len < page.len) : (len += 1) {
+                    if (recovery.bitmap) |*it| {
+                        page[len] = it.next() orelse break;
+                    } else {
+                        if (recovery.offset == numbers.len) break;
+                        page[len] = numbers[recovery.offset];
+                        recovery.offset += 1;
+                    }
+                }
+                recovery.exhausted = len < page.len;
+                if (len == 0) break;
+                std.mem.sort(doc_set.DocOrdinal, page[0..len], {}, std.sort.asc(doc_set.DocOrdinal));
+                var scope = try (try self.sourceRecoveryRead(&recovery.read)).openReadScope(self.alloc);
+                defer scope.close();
+                var encoded: [page.len]@TypeOf(internal_keys.identityOrdinalToDocKey(0)) = undefined;
+                var reverse_keys: [page.len][]const u8 = undefined;
+                for (page[0..len], 0..) |ordinal, i| {
+                    encoded[i] = internal_keys.identityOrdinalToDocKey(ordinal);
+                    reverse_keys[i] = &encoded[i];
+                }
+                var resolved: [page.len]?[]const u8 = undefined;
+                try scope.getManySorted(reverse_keys[0..len], resolved[0..len]);
+                var missing: [page.len]doc_set.DocOrdinal = undefined;
+                var missing_count: usize = 0;
+                for (page[0..len], resolved[0..len]) |ordinal, key| {
+                    try db_query_search.checkSearchRequestDeadline(self.req);
+                    if (key) |id| {
+                        if (recovery.reverse.contains(id)) continue;
+                        const retained = cache_alloc.dupe(u8, id) catch return original_error;
+                        recovery.reverse.put(cache_alloc, retained, .{ .ordinal = ordinal }) catch return original_error;
+                    } else if (recovery.proof_failure == null) {
+                        missing[missing_count] = ordinal;
+                        missing_count += 1;
+                    }
+                }
+                if (missing_count != 0) {
+                    var states: [page.len]bool = undefined;
+                    self.readSourceVisibility(&recovery.read, missing[0..missing_count], states[0..missing_count]) catch |err| {
+                        if (!recoverableSourceIdentityError(err)) return err;
+                        // A failed proof cannot establish a nonmember.
+                        recovery.proof_failure = err;
+                    };
+                    if (recovery.proof_failure == null and std.mem.indexOfScalar(bool, states[0..missing_count], true) != null) {
+                        recovery.proof_failure = error.InvalidDocIdentity;
+                    }
+                }
+                try self.recoverKnownSourceKeys(&recovery.read, recovery, &pending, ordinals, visible);
+            }
+            if (pending.count() == 0) return;
+            const proof_failure = recovery.proof_failure;
+            if (proof_failure) |err| if (err == error.StorageReadTemporarilyUnavailable) return err;
+            if (proof_failure == null and recovery.explicit_keys == null) {
+                var explicit: std.StringHashMapUnmanaged(void) = .empty;
+                for ([_]*const doc_set.ResolvedDocSet{ set, &constraints.legacy_filter }) |key_set| {
+                    if (key_set.* != .doc_keys) continue;
+                    for (key_set.doc_keys) |key| {
+                        try db_query_search.checkSearchRequestDeadline(self.req);
+                        explicit.put(cache_alloc, key, {}) catch return original_error;
+                    }
+                }
+                recovery.explicit_keys = explicit;
+            }
+            var unresolved_error: ?anyerror = null;
+            var unresolved = pending.iterator();
+            while (unresolved.next()) |entry| {
+                const slot = entry.value_ptr.*;
+                const failure = failures[slot].?;
+                if (recovery.proof_failure == null) {
+                    if (!recovery.explicit_keys.?.contains(entry.key_ptr.*)) continue;
+                    if (failure == error.NotFound) {
+                        visible[slot] = true;
+                        continue;
+                    }
+                }
+                if (failure == error.StorageReadTemporarilyUnavailable) return failure;
+                unresolved_error = if (failure == error.NotFound) error.InvalidDocIdentity else failure;
+            }
+            if (unresolved_error) |err| return err;
+        }
+
+        fn recoverKnownSourceKeys(
+            self: *@This(),
+            read: *?docstore_mod.DocStore.Txn,
+            recovery: *SourceRecovery,
+            pending: *std.StringHashMapUnmanaged(usize),
+            ordinals: []?doc_set.DocOrdinal,
+            visible: []bool,
+        ) !void {
+            const Candidate = struct {
+                ordinal: doc_set.DocOrdinal,
+                key: []const u8,
+                slot: usize,
+                fn less(_: void, lhs: @This(), rhs: @This()) bool {
+                    return lhs.ordinal < rhs.ordinal;
+                }
+            };
+            var candidates: [256]Candidate = undefined;
+            var count: usize = 0;
+            var it = pending.iterator();
+            while (it.next()) |entry| {
+                const cached = recovery.reverse.get(entry.key_ptr.*) orelse continue;
+                if (cached.visible) |is_visible| {
+                    if (is_visible) {
+                        ordinals[entry.value_ptr.*] = cached.ordinal;
+                        visible[entry.value_ptr.*] = true;
+                    }
+                    pending.removeByPtr(entry.key_ptr);
+                    continue;
+                }
+                candidates[count] = .{ .ordinal = cached.ordinal, .key = entry.key_ptr.*, .slot = entry.value_ptr.* };
+                count += 1;
+            }
+            if (count == 0) return;
+            std.mem.sort(Candidate, candidates[0..count], {}, Candidate.less);
+            var numbers: [256]doc_set.DocOrdinal = undefined;
+            for (candidates[0..count], 0..) |candidate, i| numbers[i] = candidate.ordinal;
+            var states: [256]bool = undefined;
+            try self.readSourceVisibility(read, numbers[0..count], states[0..count]);
+            for (candidates[0..count], states[0..count]) |candidate, is_visible| {
+                recovery.reverse.getPtr(candidate.key).?.visible = is_visible;
+                if (is_visible) {
+                    ordinals[candidate.slot] = candidate.ordinal;
+                    visible[candidate.slot] = true;
+                }
+                _ = pending.remove(candidate.key);
+            }
+        }
+
+        fn sourceRecoveryRead(self: *@This(), read: *?docstore_mod.DocStore.Txn) !*docstore_mod.DocStore.Txn {
+            if (read.* == null) read.* = try self.db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            return &read.*.?;
+        }
+
+        fn readSourceVisibility(self: *@This(), read: *?docstore_mod.DocStore.Txn, ordinals: []const doc_set.DocOrdinal, visible: []bool) !void {
+            try db_query_search.checkSearchRequestDeadline(self.req);
+            var scope = try (try self.sourceRecoveryRead(read)).openReadScope(self.alloc);
+            defer scope.close();
+            var encoded: [256]@TypeOf(internal_keys.identityOrdinalStateKey(0)) = undefined;
+            var keys: [256][]const u8 = undefined;
+            var values: [256]?[]const u8 = undefined;
+            for (ordinals, 0..) |ordinal, i| {
+                encoded[i] = internal_keys.identityOrdinalStateKey(ordinal);
+                keys[i] = &encoded[i];
+            }
+            try scope.getManySorted(keys[0..ordinals.len], values[0..ordinals.len]);
+            for (values[0..ordinals.len], visible) |raw, *is_visible| {
+                is_visible.* = false;
+                if (raw) |bytes| {
+                    const state = try doc_identity.decodeOrdinalState(bytes);
+                    is_visible.* = if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive();
+                }
+            }
+        }
+
+        fn scanExactScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
+            const owner_range = self.db.core.byteRange();
+            for (options.exceptionalPrimaryKeys()) |id| {
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                if (!owner_range.contains(id)) continue;
+                if (try self.visitId(id, false) == .stop) return;
+            }
+            const ordinals = options.exact_primary_ordinals orelse return;
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            var offset: usize = 0;
+            while (offset < ordinals.len) {
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                _ = scratch.reset(.retain_capacity);
+                var values: [256]?[]const u8 = undefined;
+                const ordinal_batch = ordinals[offset..][0..@min(values.len, ordinals.len - offset)];
+                {
+                    var txn = try self.db.core.store.beginProbeTxn();
+                    defer txn.abort();
+                    const temp = scratch.allocator();
+                    for (ordinal_batch, values[0..ordinal_batch.len]) |ordinal, *value| {
+                        value.* = null;
+                        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse continue;
+                        if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) continue;
+                        const id = (try doc_identity.lookupDocIdTxn(temp, &txn, ordinal)) orelse return error.InvalidDocIdentity;
+                        if (!owner_range.contains(id) or !try sourcePresent(temp, &txn, id)) continue;
+                        value.* = id;
+                    }
+                }
+                const unique = options.exceptionalPrimaryKeys().len == 0;
+                for (ordinal_batch, values[0..ordinal_batch.len]) |ordinal, value| {
+                    if (value) |id| if (try self.visitor(self.visitor_ctx, id, ordinal, unique, false) == .stop) return;
+                }
+                offset += ordinal_batch.len;
+            }
         }
 
         fn mappingKeyAlloc(alloc: Allocator, id: []const u8, kind: u8) ![]u8 {
@@ -49526,37 +51734,100 @@ pub const DB = struct {
                 return error.InvalidDocIdentity;
             const ordinal = std.mem.readInt(u32, value[0..4], .big);
             if (ordinal == 0) return error.InvalidDocIdentity;
-            const state = state: {
-                var txn = try self.db.core.store.beginProbeTxn();
-                defer txn.abort();
-                break :state (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.InvalidDocIdentity;
-            };
-            if (self.req.identity_read_generation) |generation| {
-                if (!state.isVisibleAt(generation)) return .@"continue";
-            } else if (!state.isLive()) return error.InvalidDocIdentity;
             const body = key[2 .. key.len - 2];
-            if (try internal_keys.decodeBodyView(body)) |id| return self.visitId(id);
+            if (try internal_keys.decodeBodyView(body)) |id| return self.visitOrderedId(id, ordinal);
             const id = try internal_keys.decodeBodyAlloc(self.alloc, body);
             defer self.alloc.free(id);
-            return self.visitId(id);
+            return self.visitOrderedId(id, ordinal);
         }
 
-        fn visitId(self: *@This(), id: []const u8) !docstore_mod.DocStore.ScanAction {
-            // Identity rows can outlive their source during cleanup. Probe
-            // keys without hydrating source bodies, so counts and identity-only
-            // pages retain the same presence proof as primary-store scans.
-            const primary_key = try internal_keys.documentKeyAlloc(self.alloc, id);
-            defer self.alloc.free(primary_key);
+        fn drainExceptionalBefore(self: *@This(), bound: ?[]const u8) !docstore_mod.DocStore.ScanAction {
+            while (self.exceptional_index < self.exceptional.len) {
+                const id = self.exceptional[self.exceptional_index];
+                if (bound) |exclusive| {
+                    const order = std.mem.order(u8, id, exclusive);
+                    if (order == .eq or order == (if (self.reverse) std.math.Order.lt else .gt)) break;
+                }
+                self.exceptional_index += 1;
+                while (self.exceptional_index < self.exceptional.len and
+                    std.mem.eql(u8, self.exceptional[self.exceptional_index], id)) self.exceptional_index += 1;
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                if (try self.visitId(id, true) == .stop) {
+                    self.stopped = true;
+                    return .stop;
+                }
+            }
+            return .@"continue";
+        }
+
+        fn visitOrderedId(self: *@This(), id: []const u8, ordinal: doc_set.DocOrdinal) !docstore_mod.DocStore.ScanAction {
             const present = present: {
                 var txn = try self.db.core.store.beginProbeTxn();
                 defer txn.abort();
-                if (try txn.contains(primary_key)) break :present true;
-                const relational_key = try internal_keys.relationalRowKeyAlloc(self.alloc, id);
-                defer self.alloc.free(relational_key);
-                break :present try txn.contains(relational_key);
+                const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.InvalidDocIdentity;
+                if (self.req.identity_read_generation) |generation| {
+                    if (!state.isVisibleAt(generation)) return .@"continue";
+                } else if (!state.isLive()) return error.InvalidDocIdentity;
+                break :present try sourcePresent(self.alloc, &txn, id);
             };
             if (!present) return .@"continue";
-            return self.visitor(self.visitor_ctx, id);
+            if (try self.drainExceptionalBefore(id) == .stop) return .stop;
+            while (self.exceptional_index < self.exceptional.len and
+                std.mem.eql(u8, self.exceptional[self.exceptional_index], id)) self.exceptional_index += 1;
+            const action = try self.visitor(self.visitor_ctx, id, ordinal, true, false);
+            self.stopped = action == .stop;
+            return action;
+        }
+
+        fn sourcePresent(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, id: []const u8) !bool {
+            var buffer: [256]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+            var scratch: std.heap.BufferFirstAllocator = .init(&buffer, alloc);
+            const key_alloc = scratch.allocator();
+            const key = try internal_keys.documentKeyAlloc(key_alloc, id);
+            defer key_alloc.free(key);
+            const kind = &key[key.len - 1];
+            // Private group source anchors are outside the public population.
+            if (kind.* == internal_keys.primary_kind and try txn.contains(key)) return true;
+            kind.* = internal_keys.relational_row_kind;
+            return txn.contains(key);
+        }
+
+        fn visitId(self: *@This(), id: []const u8, unique: bool) !docstore_mod.DocStore.ScanAction {
+            return self.visitIdWithOrdinal(id, null, unique);
+        }
+
+        fn visitIdWithOrdinal(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool) !docstore_mod.DocStore.ScanAction {
+            const ordinal = identity: {
+                var txn = try self.db.core.store.beginProbeTxn();
+                defer txn.abort();
+                if (!try sourcePresent(self.alloc, &txn, id)) return .@"continue";
+                if (known_ordinal) |value| break :identity value;
+                switch (try self.resolvePreparedIdentity(self.alloc, &txn, id, null)) {
+                    .invisible => return .@"continue",
+                    .unmapped => break :identity null,
+                    .visible => |value| break :identity value,
+                }
+            };
+            return self.visitor(self.visitor_ctx, id, ordinal, unique, false);
+        }
+        const PreparedIdentity = union(enum) {
+            unmapped,
+            invisible,
+            visible: doc_set.DocOrdinal,
+        };
+
+        fn resolvePreparedIdentity(
+            self: *@This(),
+            alloc: Allocator,
+            txn: *docstore_mod.DocStore.Txn,
+            id: []const u8,
+            preloaded_forward: ??doc_set.DocOrdinal,
+        ) !PreparedIdentity {
+            const forward = if (preloaded_forward) |value| value else try doc_identity.lookupOrdinalTxn(alloc, txn, id);
+            const ordinal = forward orelse try doc_identity.lookupLiveOrdinalTxn(alloc, txn, id) orelse return .unmapped;
+            const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return .unmapped;
+            const visible = if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive();
+            return if (visible) .{ .visible = ordinal } else .invisible;
         }
     };
 
@@ -49657,7 +51928,6 @@ pub const DB = struct {
         try hits.ensureTotalCapacity(alloc, keys.len);
         for (keys, admission.allowed, admission.ordinals, 0..) |key, admitted, maybe_ordinal, i| {
             if (!admitted) continue;
-            const ordinal = maybe_ordinal orelse return error.InvalidGraphNodeAdmissionResult;
             var stored_data: ?[]u8 = null;
             if (admission.stored_data) |items| {
                 stored_data = items[i] orelse return error.InvalidGraphNodeAdmissionResult;
@@ -49667,7 +51937,7 @@ pub const DB = struct {
             errdefer alloc.free(id);
             hits.appendAssumeCapacity(.{
                 .id = id,
-                .doc_ordinal = ordinal,
+                .doc_ordinal = maybe_ordinal,
                 .stored_data = stored_data,
             });
         }
@@ -50042,9 +52312,13 @@ pub const DB = struct {
         req: types.SearchRequest,
         keys: []const []const u8,
     ) ![]bool {
+        return self.filterGraphKeysWithKnownOrdinalsAlloc(alloc, req, keys, null);
+    }
+
+    fn filterGraphKeysWithKnownOrdinalsAlloc(self: *DB, alloc: Allocator, req: types.SearchRequest, keys: []const []const u8, known: ?[]const ?doc_set.DocOrdinal) ![]bool {
         var filter_req = req;
         filter_req.include_stored = false;
-        const admission = try self.filterGraphKeysWithOrdinalsAlloc(alloc, filter_req, keys);
+        const admission = try self.filterGraphKeyMembershipAlloc(alloc, filter_req, keys, known);
         alloc.free(admission.ordinals);
         return admission.allowed;
     }
@@ -50066,8 +52340,12 @@ pub const DB = struct {
     /// Stored-document matching cannot reproduce an index's analyzer. Preserve
     /// any pre-resolved row authorization when intersecting the new predicate.
     fn graphRequestWithIndexedFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
+        return self.graphRequestWithIndexedFilterForKeysAlloc(req, null, null);
+    }
+
+    fn graphRequestWithIndexedFilterForKeysAlloc(self: *DB, req: types.SearchRequest, keys: ?[]const []const u8, clause_cache: ?db_query_search.IndexedClauseCache) !AlgebraicDocFilterRequest {
         var needs_index = false;
-        for ([_][]const u8{ req.filter_query_json, req.exclusion_query_json }) |json| {
+        for ([_][]const u8{ req.authorization_filter_query_json, req.filter_query_json, req.exclusion_query_json }) |json| {
             if (json.len == 0) continue;
             var local_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(req.graph_execution_limits);
             var workspace = @import("../../graph/work_budget.zig").RetainedAllocator{ .backing = self.alloc, .budget = req.graph_work_budget orelse &local_budget };
@@ -50081,11 +52359,134 @@ pub const DB = struct {
         memory.tracked = .{ .backing = self.alloc, .budget = req.graph_work_budget orelse &memory.local_budget };
         var native = AlgebraicDocFilterRequest{ .req = req, .graph_memory = memory, .graph_memory_alloc = self.alloc };
         errdefer native.deinit();
-        self.prepareGraphIndexedFilter(&native, req) catch |err| return if (err == error.OutOfMemory and memory.tracked.denied) error.GraphWorkBudgetExceeded else err;
+        self.prepareGraphIndexedFilter(&native, req, keys, clause_cache) catch |err| return if (err == error.OutOfMemory and memory.tracked.denied) error.GraphWorkBudgetExceeded else err;
         return native;
     }
 
-    fn prepareGraphIndexedFilter(self: *DB, native: *AlgebraicDocFilterRequest, req: types.SearchRequest) !void {
+    const GraphPredicateFrontier = struct {
+        req: types.SearchRequest,
+        keys: []const []const u8,
+        ordinals: []const ?doc_set.DocOrdinal,
+        legacy: []const bool,
+        key_domain: bool,
+        prior_legacy_include: []const []const u8,
+        prior_legacy_exclude: []const []const u8,
+        include: *const doc_set.ResolvedDocSet,
+        exclude: *const doc_set.ResolvedDocSet,
+
+        fn collect(ctx: *anyopaque, alloc: Allocator) !std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) {
+            const self: *GraphPredicateFrontier = @ptrCast(@alignCast(ctx));
+            const req = self.req;
+            const control = @import("../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+            try control.check();
+            const prior: ?*const doc_set.ResolvedDocFilter = if (req.resolved_doc_filter) |raw| @ptrCast(@alignCast(raw)) else null;
+            var include_keys = try graphFrontierKeySet(alloc, req.filter_doc_ids);
+            defer include_keys.deinit(alloc);
+            var exclude_keys = try graphFrontierKeySet(alloc, req.exclude_doc_ids);
+            defer exclude_keys.deinit(alloc);
+            var allowed_keys = try graphFrontierKeySet(alloc, if (prior != null and prior.?.include == .doc_keys) prior.?.include.doc_keys else &.{});
+            defer allowed_keys.deinit(alloc);
+            var denied_keys = try graphFrontierKeySet(alloc, if (prior != null and prior.?.exclude == .doc_keys) prior.?.exclude.doc_keys else &.{});
+            defer denied_keys.deinit(alloc);
+            var prior_legacy_include = try graphFrontierKeySet(alloc, self.prior_legacy_include);
+            defer prior_legacy_include.deinit(alloc);
+            var prior_legacy_exclude = try graphFrontierKeySet(alloc, self.prior_legacy_exclude);
+            defer prior_legacy_exclude.deinit(alloc);
+            var current_include = try graphFrontierKeySet(alloc, if (self.include.* == .doc_keys) self.include.doc_keys else &.{});
+            defer current_include.deinit(alloc);
+            var current_exclude = try graphFrontierKeySet(alloc, if (self.exclude.* == .doc_keys) self.exclude.doc_keys else &.{});
+            defer current_exclude.deinit(alloc);
+            var result: std.AutoHashMapUnmanaged(doc_set.DocOrdinal, []const u8) = .empty;
+            errdefer result.deinit(alloc);
+            for (self.keys, self.ordinals, self.legacy, 0..) |key, ordinal, legacy, slot| {
+                try control.check();
+                if (ordinal == null and !legacy) continue;
+                if (!containsGraphFrontierRow(self.include, &current_include, key, ordinal) or
+                    containsGraphFrontierRow(self.exclude, &current_exclude, key, ordinal)) continue;
+                if (prior) |filter| {
+                    const allowed = containsGraphFrontierRow(&filter.include, &allowed_keys, key, ordinal) or
+                        (legacy and prior_legacy_include.contains(key));
+                    const denied = containsGraphFrontierRow(&filter.exclude, &denied_keys, key, ordinal) or
+                        (legacy and prior_legacy_exclude.contains(key));
+                    if (!allowed or denied) continue;
+                }
+                if ((req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) and !include_keys.contains(key)) continue;
+                if (exclude_keys.contains(key)) continue;
+                try result.put(alloc, if (self.key_domain) std.math.cast(u32, slot) orelse return error.InvalidData else ordinal.?, key);
+            }
+            return result;
+        }
+    };
+
+    fn graphFrontierKeySet(alloc: Allocator, ids: []const []const u8) !std.StringHashMapUnmanaged(void) {
+        var keys: std.StringHashMapUnmanaged(void) = .empty;
+        errdefer keys.deinit(alloc);
+        for (ids) |id| try keys.put(alloc, id, {});
+        return keys;
+    }
+
+    fn containsGraphFrontierRow(set: *const doc_set.ResolvedDocSet, keys: *const std.StringHashMapUnmanaged(void), key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
+        return switch (set.*) {
+            .all => true,
+            .doc_keys => keys.contains(key),
+            else => if (ordinal) |id| set.containsOrdinal(id) else false,
+        };
+    }
+
+    fn graphPriorKeyOrdinalsAlloc(self: *DB, alloc: Allocator, keys: []const []const u8, generation: ?u64) !doc_set.ResolvedDocSet {
+        const ordinals = (try lookupLiveIdentityDirectoryAlloc(self, alloc, keys, generation, false)) orelse
+            try self.lookupLiveDocOrdinalsNoLock(alloc, keys, generation);
+        defer alloc.free(ordinals);
+        var bitmap = @import("../../encoding/roaring.zig").RoaringBitmap.init(alloc);
+        errdefer bitmap.deinit();
+        for (ordinals) |maybe_ordinal| if (maybe_ordinal) |ordinal| try bitmap.add(ordinal);
+        return .{ .ordinal_bitmap = bitmap };
+    }
+
+    fn graphLegacyVisibilityAlloc(self: *DB, alloc: Allocator, keys: []const []const u8, ordinals: []const ?doc_set.DocOrdinal, req: types.SearchRequest) ![]bool {
+        const legacy = try alloc.alloc(bool, keys.len);
+        errdefer alloc.free(legacy);
+        @memset(legacy, false);
+        if (std.mem.indexOfScalar(?doc_set.DocOrdinal, ordinals, null) == null) return legacy;
+        const control = @import("../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+        var candidates: std.ArrayListUnmanaged(types.SearchHit) = .empty;
+        defer candidates.deinit(alloc);
+        var positions: std.ArrayListUnmanaged(usize) = .empty;
+        defer positions.deinit(alloc);
+        {
+            var txn = try self.core.store.beginProbeTxn();
+            defer txn.abort();
+            for (keys, ordinals, 0..) |key, ordinal, slot| {
+                if (ordinal != null) continue;
+                try control.check();
+                const known = (try doc_identity.lookupOrdinalTxn(alloc, &txn, key)) orelse try doc_identity.lookupLiveOrdinalTxn(alloc, &txn, key);
+                if (known) |id| {
+                    // A mapped but invisible identity cannot become a legacy
+                    // row merely because its stored payload still exists.
+                    if (try doc_identity.lookupStateTxn(&txn, id)) |identity| {
+                        if (!(if (req.identity_read_generation) |at| identity.isVisibleAt(at) else identity.isLive())) continue;
+                    }
+                }
+                try candidates.append(alloc, .{ .id = @constCast(key) });
+                try positions.append(alloc, slot);
+            }
+        }
+        if (candidates.items.len != 0) {
+            const visible = try filterStoredSearchCandidatesMany(self, alloc, candidates.items, false);
+            defer alloc.free(visible);
+            for (positions.items, visible) |slot, keep| legacy[slot] = keep;
+        }
+        return legacy;
+    }
+
+    fn graphPriorLegacyKeysAlloc(alloc: Allocator, executor: db_query_search.StructuredFilterResolverExecutor, keys: []const []const u8, set: *const doc_set.ResolvedDocSet, control: db_query_search.QueryExecutionControl) !doc_set.ResolvedDocSet {
+        return switch (set.*) {
+            .ordinals, .ordinal_bitmap => (try db_query_search.intersectOrdinalScopeWithKeysAlloc(alloc, executor, keys, set, control)) orelse return error.UnsupportedQueryRequest,
+            else => .none,
+        };
+    }
+
+    fn prepareGraphIndexedFilter(self: *DB, native: *AlgebraicDocFilterRequest, req: types.SearchRequest, keys: ?[]const []const u8, clause_cache: ?db_query_search.IndexedClauseCache) !void {
         const a = native.graph_memory.?.tracked.allocator();
         const filter = try a.create(doc_set.ResolvedDocFilter);
         filter.* = .{};
@@ -50093,17 +52494,107 @@ pub const DB = struct {
         native.resolved_doc_filter_alloc = a;
         const executor = db_query_search.StructuredFilterResolverExecutor{
             .ctx = self,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .text_index_entry = textIndexEntryCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .lookup_live_identity = lookupLiveIdentityDirectoryCallback,
+            .resolve_doc_ids_to_doc_set = resolveGraphDocIdsToDocSetCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .range_projection_current = rangeProjectionCurrentCallback,
             .identity_read_generation = req.identity_read_generation,
         };
-        if (req.filter_query_json.len > 0) filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.filter_query_json);
-        if (req.exclusion_query_json.len > 0) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json);
-        if (req.resolved_doc_filter) |raw| {
-            const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(raw));
-            var include = (try doc_set.intersectAlloc(a, &prior.include, &filter.include)) orelse return error.UnsupportedQueryRequest;
+        const ordinals = if (keys) |ids| try self.lookupLiveDocOrdinalsNoLock(a, ids, req.identity_read_generation) else null;
+        defer if (ordinals) |ids| a.free(ids);
+        if (ordinals) |ids| if (std.mem.indexOfScalar(?doc_set.DocOrdinal, ids, null) != null) {
+            if (try lookupLiveIdentityDirectoryAlloc(self, a, keys.?, req.identity_read_generation, false)) |known| {
+                defer a.free(known);
+                for (ids, known) |*slot, ordinal| slot.* = slot.* orelse ordinal;
+            }
+        };
+        const legacy = if (keys) |ids| try self.graphLegacyVisibilityAlloc(a, ids, ordinals.?, req) else null;
+        defer if (legacy) |mask| a.free(mask);
+        const key_domain = if (legacy) |mask| std.mem.indexOfScalar(bool, mask, true) != null else false;
+        var legacy_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer legacy_keys.deinit(a);
+        var legacy_include: doc_set.ResolvedDocSet = .none;
+        defer legacy_include.deinit(a);
+        var legacy_exclude: doc_set.ResolvedDocSet = .none;
+        defer legacy_exclude.deinit(a);
+        if (key_domain and req.resolved_doc_filter != null) {
+            for (keys.?, legacy.?) |key, present| if (present) try legacy_keys.append(a, key);
+            const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(req.resolved_doc_filter.?));
+            const control = db_query_search.QueryExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+            legacy_include = try graphPriorLegacyKeysAlloc(a, executor, legacy_keys.items, &prior.include, control);
+            legacy_exclude = try graphPriorLegacyKeysAlloc(a, executor, legacy_keys.items, &prior.exclude, control);
+        }
+        var input = GraphPredicateFrontier{
+            .req = req,
+            .keys = keys orelse &.{},
+            .ordinals = ordinals orelse &.{},
+            .legacy = legacy orelse &.{},
+            .key_domain = key_domain,
+            .prior_legacy_include = if (legacy_include == .doc_keys) legacy_include.doc_keys else &.{},
+            .prior_legacy_exclude = if (legacy_exclude == .doc_keys) legacy_exclude.doc_keys else &.{},
+            .include = &filter.include,
+            .exclude = &filter.exclude,
+        };
+        var key_probe = db_query_search.GraphKeyProbe{};
+        defer key_probe.deinit(a);
+        const frontier: ?db_query_search.GraphPredicateFrontier = if (keys != null) .{ .ptr = &input, .key_domain = key_domain, .key_probe = if (key_domain) &key_probe else null, .collect = GraphPredicateFrontier.collect } else null;
+        if (key_domain) native.frontier_scoped = true;
+        const budget = native.graph_memory.?.tracked.budget.?;
+        // Indexed exclusions can narrow policy work. Residual exclusions
+        // read stored values only after authorization and the user filter.
+        var residual_exclusion = false;
+        if (req.exclusion_query_json.len > 0) {
+            filter.exclude = db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped, clause_cache, .indexed_only) catch |err| switch (err) {
+                error.GraphResidualFrontierRequired => pending: {
+                    residual_exclusion = true;
+                    break :pending .none;
+                },
+                else => return err,
+            };
+        }
+        if (req.authorization_filter_query_json.len > 0) {
+            filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.authorization_filter_query_json, frontier, budget, &native.frontier_scoped, clause_cache, .allow_residual);
+        }
+        const stripped = try db_query_search.stripInjectedPolicyAlloc(a, req.filter_query_json, req.authorization_filter_query_json);
+        defer if (stripped) |json| if (json.len != 0) a.free(json);
+        const user_filter = stripped orelse req.filter_query_json;
+        if (user_filter.len > 0) {
+            var user = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, user_filter, frontier, budget, &native.frontier_scoped, clause_cache, .allow_residual);
+            defer user.deinit(a);
+            if (key_domain) {
+                // The key frontier already applied the policy and other gates.
+                filter.include.deinit(a);
+                filter.include = user;
+                user = .none;
+            } else {
+                const include = (try doc_set.intersectAlloc(a, &filter.include, &user)) orelse return error.UnsupportedQueryRequest;
+                filter.include.deinit(a);
+                filter.include = include;
+            }
+        }
+        if (residual_exclusion) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json, frontier, budget, &native.frontier_scoped, clause_cache, .allow_residual);
+        if (key_domain and (filter.include == .all or filter.exclude != .none)) {
+            var admitted = try GraphPredicateFrontier.collect(&input, a);
+            defer admitted.deinit(a);
+            const ids = try a.alloc([]const u8, admitted.count());
+            defer a.free(ids);
+            var entries = admitted.valueIterator();
+            for (ids) |*id| id.* = entries.next().?.*;
+            const include = try doc_set.cloneDocKeysAlloc(a, ids);
+            filter.include.deinit(a);
+            filter.exclude.deinit(a);
+            filter.include = include;
+        } else if (!key_domain and req.resolved_doc_filter != null) {
+            const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(req.resolved_doc_filter.?));
+            var prior_include = if (prior.include == .doc_keys) try self.graphPriorKeyOrdinalsAlloc(a, prior.include.doc_keys, req.identity_read_generation) else null;
+            defer if (prior_include) |*set| set.deinit(a);
+            var prior_exclude = if (prior.exclude == .doc_keys) try self.graphPriorKeyOrdinalsAlloc(a, prior.exclude.doc_keys, req.identity_read_generation) else null;
+            defer if (prior_exclude) |*set| set.deinit(a);
+            var include = (try doc_set.intersectAlloc(a, if (prior_include) |*set| set else &prior.include, &filter.include)) orelse return error.UnsupportedQueryRequest;
             errdefer include.deinit(a);
-            const exclude = (try doc_set.unionAlloc(a, &prior.exclude, &filter.exclude)) orelse return error.UnsupportedQueryRequest;
+            const exclude = (try doc_set.unionAlloc(a, if (prior_exclude) |*set| set else &prior.exclude, &filter.exclude)) orelse return error.UnsupportedQueryRequest;
             filter.include.deinit(a);
             filter.exclude.deinit(a);
             filter.include = include;
@@ -50121,19 +52612,34 @@ pub const DB = struct {
         original_req: types.SearchRequest,
         keys: []const []const u8,
     ) !GraphKeyAdmission {
-        var indexed_filter = try self.graphRequestWithIndexedFilterAlloc(original_req);
+        return self.filterGraphKeyMembershipAlloc(alloc, original_req, keys, null);
+    }
+
+    fn filterGraphKeyMembershipAlloc(self: *DB, alloc: Allocator, original_req: types.SearchRequest, keys: []const []const u8, known: ?[]const ?doc_set.DocOrdinal) !GraphKeyAdmission {
+        var indexed_filter = try self.graphRequestWithIndexedFilterForKeysAlloc(original_req, keys, null);
         defer indexed_filter.deinit();
         const req = indexed_filter.req;
-        const ordinals = try self.lookupLiveDocOrdinalsNoLock(
+        const ordinals = if (known) |values| try alloc.dupe(?doc_set.DocOrdinal, values) else try self.lookupLiveDocOrdinalsNoLock(
             alloc,
             keys,
             req.identity_read_generation,
         );
         errdefer alloc.free(ordinals);
 
+        const recovered = if (std.mem.indexOfScalar(?doc_set.DocOrdinal, ordinals, null) != null)
+            try lookupLiveIdentityDirectoryAlloc(self, alloc, keys, req.identity_read_generation, false)
+        else
+            null;
+        defer if (recovered) |values| alloc.free(values);
+        const membership_ordinals = if (recovered) |values| values: {
+            for (values, ordinals) |*slot, original| slot.* = original orelse slot.*;
+            break :values values;
+        } else ordinals;
+        const legacy = try self.graphLegacyVisibilityAlloc(alloc, keys, membership_ordinals, req);
+        defer alloc.free(legacy);
         var live_count: usize = 0;
-        for (ordinals) |ordinal| {
-            if (ordinal != null) live_count += 1;
+        for (membership_ordinals, legacy) |ordinal, present| {
+            if (ordinal != null or present) live_count += 1;
         }
 
         const mask = try alloc.alloc(bool, keys.len);
@@ -50144,11 +52650,13 @@ pub const DB = struct {
             .ordinals = ordinals,
         };
 
-        const loaded = if (req.include_stored)
+        // Stored-only predicates can reuse the requested payload during
+        // verification. Indexed predicates have already produced membership.
+        const preload = if (req.include_stored and (req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0))
             try loadStoredSearchDocumentsMany(self, alloc, keys, null)
         else
             null;
-        defer if (loaded) |items| freeOptionalOwnedBytes(alloc, items);
+        defer if (preload) |items| freeOptionalOwnedBytes(alloc, items);
 
         var hits = try alloc.alloc(types.SearchHit, live_count);
         var initialized: usize = 0;
@@ -50157,11 +52665,11 @@ pub const DB = struct {
             for (hits[0..initialized]) |*hit| hit.deinit(alloc);
             if (hits.len > 0) alloc.free(hits);
         };
-        for (keys, ordinals, 0..) |key, maybe_ordinal, i| {
-            const ordinal = maybe_ordinal orelse continue;
+        for (keys, membership_ordinals, legacy, 0..) |key, ordinal, present, i| {
+            if (ordinal == null and !present) continue;
             const id = try alloc.dupe(u8, key);
             errdefer alloc.free(id);
-            const stored_data = if (loaded) |items| blk: {
+            const stored = if (preload) |items| blk: {
                 const value = items[i] orelse return error.InvalidGraphNodeAdmissionResult;
                 items[i] = null;
                 break :blk value;
@@ -50170,7 +52678,7 @@ pub const DB = struct {
                 .id = id,
                 .doc_ordinal = ordinal,
                 .score = 1.0,
-                .stored_data = stored_data,
+                .stored_data = stored,
             };
             initialized += 1;
         }
@@ -50190,6 +52698,14 @@ pub const DB = struct {
         hits_owned = false;
         defer filtered.deinit();
 
+        const loaded = if (req.include_stored and preload == null and filtered.hits.len != 0) blk: {
+            const admitted = try alloc.alloc([]const u8, filtered.hits.len);
+            defer alloc.free(admitted);
+            for (filtered.hits, admitted) |hit, *key| key.* = hit.id;
+            break :blk try loadStoredSearchDocumentsMany(self, alloc, admitted, null);
+        } else null;
+        defer if (loaded) |items| freeOptionalOwnedBytes(alloc, items);
+
         const stored_data = if (req.include_stored) blk: {
             const values = try alloc.alloc(?[]u8, keys.len);
             @memset(values, null);
@@ -50198,16 +52714,16 @@ pub const DB = struct {
         errdefer if (stored_data) |items| freeOptionalOwnedBytes(alloc, items);
 
         var filtered_index: usize = 0;
-        for (keys, ordinals, 0..) |key, maybe_ordinal, i| {
-            if (maybe_ordinal == null) continue;
+        for (keys, membership_ordinals, legacy, 0..) |key, ordinal, present, i| {
+            if (ordinal == null and !present) continue;
             const allowed = filtered_index < filtered.hits.len and
                 std.mem.eql(u8, key, filtered.hits[filtered_index].id);
             mask[i] = allowed;
             if (!allowed) continue;
             if (stored_data) |items| {
-                items[i] = filtered.hits[filtered_index].stored_data orelse
-                    return error.InvalidGraphNodeAdmissionResult;
-                filtered.hits[filtered_index].stored_data = null;
+                const value = if (loaded) |rows| &rows[filtered_index] else &filtered.hits[filtered_index].stored_data;
+                items[i] = value.* orelse return error.InvalidGraphNodeAdmissionResult;
+                value.* = null;
             }
             filtered_index += 1;
         }
@@ -50243,6 +52759,25 @@ pub const DB = struct {
         indexed_node_filter: ?AlgebraicDocFilterRequest = null,
         indexed_request_filter: ?AlgebraicDocFilterRequest = null,
         decisions: std.StringHashMapUnmanaged(bool) = .empty,
+        clause_membership: db_query_search.IndexedClauseMembership = .{},
+
+        fn reusableIndexedOrdinalsAlloc(self: *GraphNodeAdmissionCache, alloc: Allocator, cached: ?*const AlgebraicDocFilterRequest, keys: []const []const u8) !?[]?doc_set.DocOrdinal {
+            const prepared = cached orelse return null;
+            if (prepared.graph_memory == null) return null;
+            const ordinals = try self.db.lookupLiveDocOrdinalsNoLock(alloc, keys, self.req.identity_read_generation);
+            errdefer alloc.free(ordinals);
+            if (std.mem.indexOfScalar(?doc_set.DocOrdinal, ordinals, null) != null) {
+                if (try lookupLiveIdentityDirectoryAlloc(self.db, alloc, keys, self.req.identity_read_generation, false)) |recovered| {
+                    defer alloc.free(recovered);
+                    for (ordinals, recovered) |*ordinal, fallback| ordinal.* = ordinal.* orelse fallback;
+                }
+            }
+            for (ordinals) |ordinal| if (ordinal == null) {
+                alloc.free(ordinals);
+                return null;
+            };
+            return ordinals;
+        }
 
         fn init(
             db: *DB,
@@ -50268,6 +52803,7 @@ pub const DB = struct {
             var it = self.decisions.keyIterator();
             while (it.next()) |key| self.alloc.free(key.*);
             self.decisions.deinit(self.alloc);
+            self.clause_membership.deinit(self.alloc, self.req.graph_work_budget);
             self.prepared_filters.deinit();
             if (self.indexed_node_filter) |*filter| filter.deinit();
             if (self.indexed_request_filter) |*filter| filter.deinit();
@@ -50307,6 +52843,7 @@ pub const DB = struct {
                 }
                 if (node.external or node.table != null) continue;
                 const key = node.key;
+                if (!std.mem.startsWith(u8, key, self.node_filter.filter_prefix)) continue;
                 if (self.decisions.contains(key)) continue;
                 const entry = try missing_by_key.getOrPut(result_alloc, key);
                 if (entry.found_existing) continue;
@@ -50315,23 +52852,20 @@ pub const DB = struct {
             }
 
             if (missing_keys.items.len > 0) {
-                if (self.indexed_request_filter == null) self.indexed_request_filter = try self.db.graphRequestWithIndexedFilterAlloc(self.req);
-                const missing_mask = try self.db.filterGraphKeysAlloc(
-                    result_alloc,
-                    self.indexed_request_filter.?.req,
-                    missing_keys.items,
-                );
+                const clause_cache: db_query_search.IndexedClauseCache = .{ .memory = &self.clause_membership, .alloc = self.alloc, .budget = self.req.graph_work_budget };
+                var scoped_request: ?AlgebraicDocFilterRequest = null;
+                defer if (scoped_request) |*entry| entry.deinit();
+                const request_ordinals = try self.reusableIndexedOrdinalsAlloc(result_alloc, if (self.indexed_request_filter) |*cached| cached else null, missing_keys.items);
+                defer if (request_ordinals) |values| result_alloc.free(values);
+                if (request_ordinals == null and (self.indexed_request_filter == null or self.indexed_request_filter.?.graph_memory != null)) {
+                    const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(self.req, missing_keys.items, clause_cache);
+                    if (prepared.frontier_scoped or self.indexed_request_filter != null) scoped_request = prepared else self.indexed_request_filter = prepared;
+                }
+                const request_filter = if (scoped_request) |*entry| entry else &self.indexed_request_filter.?;
+                const missing_mask = try self.db.filterGraphKeysWithKnownOrdinalsAlloc(result_alloc, request_filter.req, missing_keys.items, request_ordinals);
                 defer result_alloc.free(missing_mask);
                 if (missing_mask.len != missing_keys.items.len) {
                     return error.InvalidGraphNodeAdmissionResult;
-                }
-
-                for (missing_keys.items, missing_mask) |key, *allowed| {
-                    if (allowed.* and self.node_filter.filter_prefix.len > 0 and
-                        !std.mem.startsWith(u8, key, self.node_filter.filter_prefix))
-                    {
-                        allowed.* = false;
-                    }
                 }
 
                 if (self.node_filter.filter_query_json) |filter_query_json| {
@@ -50345,15 +52879,22 @@ pub const DB = struct {
                         try query_positions.append(result_alloc, i);
                     }
                     if (query_keys.items.len > 0) {
-                        if (self.indexed_node_filter == null) {
+                        var scoped_node: ?AlgebraicDocFilterRequest = null;
+                        defer if (scoped_node) |*entry| entry.deinit();
+                        const node_ordinals = try self.reusableIndexedOrdinalsAlloc(result_alloc, if (self.indexed_node_filter) |*cached| cached else null, query_keys.items);
+                        defer if (node_ordinals) |values| result_alloc.free(values);
+                        if (node_ordinals == null and (self.indexed_node_filter == null or self.indexed_node_filter.?.graph_memory != null)) {
                             var filter_req = self.req;
                             filter_req.filter_query_json = filter_query_json;
                             filter_req.exclusion_query_json = "";
                             filter_req.resolved_doc_filter = null;
-                            self.indexed_node_filter = try self.db.graphRequestWithIndexedFilterAlloc(filter_req);
+                            filter_req.authorization_filter_query_json = "";
+                            const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(filter_req, query_keys.items, clause_cache);
+                            if (prepared.frontier_scoped or self.indexed_node_filter != null) scoped_node = prepared else self.indexed_node_filter = prepared;
                         }
-                        if (self.indexed_node_filter.?.resolved_doc_filter != null) {
-                            const mask = try self.db.filterGraphKeysAlloc(result_alloc, self.indexed_node_filter.?.req, query_keys.items);
+                        const node_filter = if (scoped_node) |*entry| entry else &self.indexed_node_filter.?;
+                        if (node_filter.resolved_doc_filter != null) {
+                            const mask = try self.db.filterGraphKeysWithKnownOrdinalsAlloc(result_alloc, node_filter.req, query_keys.items, node_ordinals);
                             defer result_alloc.free(mask);
                             for (query_positions.items, mask) |position, allowed| missing_mask[position] = allowed;
                         } else {
@@ -50387,6 +52928,8 @@ pub const DB = struct {
             for (nodes, 0..) |node, i| {
                 result[i] = if (node.external or node.table != null)
                     !graph_query_mod.nodeFilterActive(self.node_filter)
+                else if (!std.mem.startsWith(u8, node.key, self.node_filter.filter_prefix))
+                    false
                 else
                     self.decisions.get(node.key) orelse return error.InvalidGraphNodeAdmissionResult;
             }
@@ -50736,7 +53279,10 @@ pub const DB = struct {
         defer alloc.free(store_key);
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
-        const raw = (try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key)) orelse return null;
+        const member = try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key);
+        const page = if (member == null) try virtualPdfPageUnit(self, alloc, &txn, store_key) else null;
+        defer if (page) |bytes| alloc.free(bytes);
+        const raw = member orelse page orelse return null;
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
@@ -51077,6 +53623,82 @@ fn scalarSearchAsset(self: *DB, key: []const u8) bool {
     return entry.content_type.len == 0 or std.mem.eql(u8, entry.content_type, "text/plain");
 }
 
+// A PDF page is stored as a generated vector under its logical unit key.
+// Read only the primary-owned artifact header, including for external payloads.
+fn virtualPdfPageUnit(self: *DB, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, key: []const u8) !?[]u8 {
+    var values: [1]?[]const u8 = .{null};
+    try hydrateVirtualPdfPageUnits(self, alloc, txn, &.{key}, &values);
+    return if (values[0]) |page| @constCast(page) else null;
+}
+
+// Resolve one output per still-missing page per round. Read only physical headers,
+// keeping the configured output precedence and a single catalog cut for the batch.
+fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.DocStore.Txn, keys: []const []const u8, values: []?[]const u8) !void {
+    const Candidate = struct { index: usize, unit: []const u8, number: u32, outputs: []const []const u8 };
+    const Probe = struct {
+        candidate: Candidate,
+        key: []const u8,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return std.mem.lessThan(u8, a.key, b.key);
+        }
+    };
+    var snapshot: ?index_manager_mod.IndexManager.WritePlanSnapshotView = null;
+    defer if (snapshot) |*pinned| pinned.release();
+    var batch = std.heap.ArenaAllocator.init(output);
+    defer batch.deinit();
+    var wave = std.heap.ArenaAllocator.init(output);
+    defer wave.deinit();
+    var offset: usize = 0;
+    while (offset < keys.len) {
+        const end = @min(offset + 128, keys.len);
+        _ = batch.reset(.retain_capacity);
+        var candidates: [128]Candidate = undefined;
+        var count: usize = 0;
+        for (offset..end) |i| {
+            if (values[i] != null or !internal_keys.isDocumentUnitArtifactRecordKey(keys[i])) continue;
+            const ref = (try artifact_ids.decodeArtifactRefAlloc(batch.allocator(), keys[i])) orelse continue;
+            const unit = ref.unit_id orelse continue;
+            if (!std.mem.startsWith(u8, unit, "page:")) continue;
+            const number = std.fmt.parseUnsigned(u32, unit[5..], 10) catch continue;
+            if (number == 0) continue;
+            if (snapshot == null) snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
+            const names = snapshot.?.plan().pdf_page_outputs.get(ref.name) orelse continue;
+            if (names.items.len == 0) continue;
+            candidates[count] = .{ .index = i, .unit = unit, .number = number, .outputs = names.items };
+            count += 1;
+        }
+        while (count != 0) {
+            _ = wave.reset(.retain_capacity);
+            var probes: [128]Probe = undefined;
+            var physical: [128][]const u8 = undefined;
+            var headers: [128]?[]const u8 = undefined;
+            for (candidates[0..count], probes[0..count]) |item, *probe| probe.* = .{ .candidate = item, .key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(wave.allocator(), keys[item.index], item.outputs[0]) };
+            if (!std.sort.isSorted(Probe, probes[0..count], {}, Probe.less)) std.mem.sort(Probe, probes[0..count], {}, Probe.less);
+            for (probes[0..count], physical[0..count]) |probe, *key| key.* = probe.key;
+            try txn.getManySortedPhysical(physical[0..count], headers[0..count]);
+            const received = count;
+            count = 0;
+            for (probes[0..received], headers[0..received]) |probe, header| {
+                var item = probe.candidate;
+                if (header) |bytes| {
+                    const meta = try @import("../artifact_payload.zig").Metadata.decode(bytes);
+                    if (meta.sourceHash()) |source| {
+                        const fingerprint = try std.fmt.allocPrint(wave.allocator(), "{s}:{x:0>16}", .{ item.outputs[0], source });
+                        values[item.index] = try std.json.Stringify.valueAlloc(output, .{ .unit_id = item.unit, .unit_type = "page", .provenance = .{ .page_number = item.number }, ._artifact_unit_fingerprint = fingerprint }, .{});
+                        continue;
+                    }
+                }
+                item.outputs = item.outputs[1..];
+                if (item.outputs.len != 0) {
+                    candidates[count] = item;
+                    count += 1;
+                }
+            }
+        }
+        offset = end;
+    }
+}
+
 fn materializeSearchStoredValue(self: *DB, alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
     if (scalarSearchAsset(self, key)) return try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = raw }, .{});
     return try self.core.index_manager.materializeStoredValueAlloc(alloc, key, raw);
@@ -51372,6 +53994,9 @@ fn loadStoredSearchDocumentsMany(
     defer privacy_arena.deinit();
     const privacy = @import("privacy_read.zig");
     const policy = try privacy.capture(self, privacy_arena.allocator());
+    var virtual_pages = std.heap.ArenaAllocator.init(alloc);
+    defer virtual_pages.deinit();
+    try hydrateVirtualPdfPageUnits(self, virtual_pages.allocator(), &txn, read_keys, read_values);
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
         if (policy != null and policy.?.prepared.policy.mode != .monitor) {
@@ -51674,7 +54299,7 @@ fn acquireNeighborContextGraphSource(ptr: *anyopaque, index_name: []const u8) !e
         return error.GraphMaintenanceInProgress;
     const entry = ctx.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
     const tip = ctx.store.lastReplaySequence(0);
-    const applied = try loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ctx.applied_sequence_checkpoint_path, ref);
+    const applied = try loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ref);
     const from = @max(@max(applied, entry.neighbor_source_sequence), try entry.index.artifactRebuildSequence());
     if (entry.neighbor_refresh.sequence != 0 and entry.neighbor_refresh.sequence <= from)
         entry.clearNeighborRefresh();
@@ -51850,7 +54475,7 @@ fn encodeDirectChangeRecordPayload(
 
 const encodeThinReplayRecordPayload = local_mutation.encodeThinReplayRecordPayload;
 
-const appendArtifactSourceRevisionWritesFromReplay = local_mutation.appendArtifactSourceRevisionWritesFromReplay;
+const appendSourceRevisionWritesForEffects = local_mutation.appendSourceRevisionWritesForEffects;
 
 const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
 
@@ -51941,6 +54566,19 @@ fn remoteRenderConfig(
             config.io = runtime.inferenceIo() orelse runtime.io();
         }
     }
+    if (comptime @hasField(Receiver, "preparation_context")) if (maybe_db) |db| if (db.preparation_context) |context| {
+        config.io = context.io;
+        config.deadline_ns = context.deadline_ns;
+        if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+            config.cancellation = .{ .ptr = &db.preparation_context.?, .is_cancelled_fn = struct {
+                fn check(ptr: *const anyopaque) bool {
+                    const control: *const @import("antfly_inference_execution_context").RequestContext = @ptrCast(@alignCast(ptr));
+                    control.check() catch return true;
+                    return false;
+                }
+            }.check };
+        }
+    };
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         config.max_media_parts = max_media_parts;
     }
@@ -54186,6 +56824,10 @@ fn isExpiredDocumentKey(self: *DB, alloc: Allocator, key: []const u8) !bool {
 }
 
 fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]?i128 {
+    return loadDocumentTimestampsManyWithIdentityShape(self, alloc, keys, false);
+}
+
+fn loadDocumentTimestampsManyWithIdentityShape(self: *DB, alloc: Allocator, keys: []const []const u8, raw_ids: bool) ![]?i128 {
     const timestamps = try alloc.alloc(?i128, keys.len);
     errdefer alloc.free(timestamps);
     @memset(timestamps, null);
@@ -54203,7 +56845,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
     }
 
     for (keys, 0..) |key, i| {
-        if (internal_keys.isInternalUserKey(key)) continue;
+        if (!raw_ids and internal_keys.isInternalUserKey(key)) continue;
         try pending.append(alloc, .{
             .original_index = i,
             .store_key = try internal_keys.ttlKeyAlloc(alloc, key),
@@ -54253,7 +56895,7 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
         // Named vector members resolve their public hit id to the source
         // document/chunk, which may be shared by several embeddings. The
         // artifact reference retains the member's authoritative stored key.
-        const key = if (embedding_presence_name != null and internal_keys.isChunkArtifactRecordKey(hit.id))
+        const key = if (embedding_presence_name != null and (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isDocumentUnitArtifactRecordKey(hit.id)))
             try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, hit.id, embedding_presence_name.?)
         else if (hit.artifact_ref) |artifact_ref|
             try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
@@ -55494,6 +58136,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
+    try appendSourceRevisionWritesForEffects(ctx.alloc, sequence, &store_writes, delete_keys.items, &.{}, &.{}, &owned_store_keys, &owned_store_values);
     var primary_replication = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
     defer primary_replication.deinit(ctx.alloc);
     try primary_replication.stage(ctx, &store_writes);
@@ -55693,7 +58336,12 @@ fn pruneStaleGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: Gr
     defer ctx.alloc.free(due_key);
     const expected_value = try graph_edge_ttl_expiration.encodeAlloc(ctx.alloc, candidate);
     defer ctx.alloc.free(expected_value);
-    var txn = try ctx.store.beginWriteTxn();
+    // Pruning a stale due-record is pure background bookkeeping: losing it in
+    // a crash just means the next TTL sweep re-observes the same due-record,
+    // re-runs this exact staleness check and prunes it again. Join the next
+    // foreground group's commit instead of forcing its own fsync
+    // (lite-single-commit-write-path.md §3.2a's ride-along pattern).
+    var txn = try ctx.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     const actual_value = txn.get(due_key) catch |err| switch (err) {
         error.NotFound => {
@@ -55742,7 +58390,10 @@ fn pruneStaleDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candida
     defer ctx.alloc.free(due_key);
     const expected_value = try graph_edge_ttl_expiration.encodeDirectAlloc(ctx.alloc, candidate);
     defer ctx.alloc.free(expected_value);
-    var txn = try ctx.store.beginWriteTxn();
+    // See pruneStaleGraphTtlCandidateContext: a stale due-record prune is
+    // safe to lose on crash (redone from the same durable due-record on the
+    // next sweep), so it rides along rather than forcing its own fsync.
+    var txn = try ctx.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     const actual_value = txn.get(due_key) catch |err| switch (err) {
         error.NotFound => {
@@ -55962,7 +58613,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
         defer replay_snapshot.abort();
         break :blk try ctx.store.lastReplaySequenceFromTxn(&replay_snapshot, 0);
     };
-    const source_applied = loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ctx.applied_sequence_checkpoint_path, .{ .name = candidate.index_name, .kind = .graph }) catch |err| switch (err) {
+    const source_applied = loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, .{ .name = candidate.index_name, .kind = .graph }) catch |err| switch (err) {
         error.InvalidDerivedApplyState => 0,
         else => return err,
     };
@@ -56262,7 +58913,7 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         };
         var guard: Guard = .{ .required = required };
         _ = try ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(ctx.io, &.{}, &.{}, &.{}, .{ .sequence = sequence, .payload = payload }, null, .{ .ptr = &guard, .validate = Guard.validate });
-    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence, batch.generated_enrichment_refs);
+    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence, batch);
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
@@ -56380,7 +59031,7 @@ fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, chang
         try appendAssetArtifactSourceIndexMutations(ctx.alloc, &writes, artifact_deletes.items, &deletes, &owned_keys, &owned_values, &owned_deletes);
         try appendRetiredDirectGraphTtlDueDeletes(ctx.alloc, ctx.store, ctx.index_manager, writes.items, deletes.items, &deletes, &owned_deletes);
     }
-    try appendArtifactSourceRevisionWritesFromReplay(ctx.alloc, payload, sequence, &writes, &owned_keys, &owned_values);
+    try appendSourceRevisionWritesForEffects(ctx.alloc, sequence, &writes, deletes.items, &.{}, &.{}, &owned_keys, &owned_values);
     const summary = try doc_identity.visibilitySummaryFromWrites(writes.items);
     var catalog: ?table_catalog_mod.Catalog = null;
     for (writes.items) |write| if (std.mem.eql(u8, write.key, table_catalog_mod.key)) {
@@ -56399,7 +59050,8 @@ fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, chang
     return sequence;
 }
 
-fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64, requests: []const enrichment_types.GeneratedEnrichmentRef) !void {
+fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64, batch: derived_types.DerivedBatch) !void {
+    const requests = batch.generated_enrichment_refs;
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(ctx.alloc);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -56412,11 +59064,13 @@ fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionCont
         for (owned_values.items) |value| ctx.alloc.free(value);
         owned_values.deinit(ctx.alloc);
     }
-    try appendArtifactSourceRevisionWritesFromReplay(
+    try appendSourceRevisionWritesForEffects(
         ctx.alloc,
-        payload,
         sequence,
         &writes,
+        batch.deleted_keys,
+        &.{},
+        batch.changed_artifact_keys,
         &owned_keys,
         &owned_values,
     );
@@ -56719,19 +59373,7 @@ fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionCont
 }
 
 fn noPendingEnrichmentReplayThroughContext(ctx: *const BatchExecutionContext, applied_sequence: u64, sequence: u64) !bool {
-    var cursor = try ctx.replay_source.openMatchingCursor(ctx.alloc, applied_sequence, .enrichment);
-    defer cursor.deinit(ctx.alloc);
-    const Probe = struct {
-        through: u64,
-        pending: bool = false,
-        fn consume(ptr: *anyopaque, at: u64, _: []const u8) !void {
-            const probe: *@This() = @ptrCast(@alignCast(ptr));
-            probe.pending = at <= probe.through;
-        }
-    };
-    var probe = Probe{ .through = sequence };
-    _ = try cursor.forEachNext(1, &probe, Probe.consume);
-    return !probe.pending;
+    return try ctx.replay_source.noMatchingRecordThrough(ctx.alloc, applied_sequence, .enrichment, sequence);
 }
 
 fn runMaintenanceUntilContext(ctx: *const BatchExecutionContext, sequence: u64, sync_targets: ManagedSyncTargets) !void {
@@ -58003,7 +60645,21 @@ fn appendResolutionRecordWithProjection(
     defer batch_ctx.alloc.free(payload);
     var backlog_admission = try batch_ctx.executor.admitBacklogBytes(@intCast(payload.len));
     defer backlog_admission.cancel();
-    try batch_ctx.store.putBatchWithReplay(batch_ctx.io, store_writes, store_deletes.items, .{
+    var revision_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+    defer revision_writes.deinit(batch_ctx.alloc);
+    try revision_writes.appendSlice(batch_ctx.alloc, store_writes);
+    var revision_keys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (revision_keys.items) |key| batch_ctx.alloc.free(key);
+        revision_keys.deinit(batch_ctx.alloc);
+    }
+    var revision_values: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (revision_values.items) |value| batch_ctx.alloc.free(value);
+        revision_values.deinit(batch_ctx.alloc);
+    }
+    try appendSourceRevisionWritesForEffects(batch_ctx.alloc, sequence, &revision_writes, store_deletes.items, &.{}, &.{}, &revision_keys, &revision_values);
+    try batch_ctx.store.putBatchWithReplay(batch_ctx.io, revision_writes.items, store_deletes.items, .{
         .sequence = sequence,
         .payload = payload,
     });
@@ -58547,6 +61203,7 @@ fn appendGeneratedBatchFromEnrichment(
         for (owned_counter_values.items) |value| batch_ctx.alloc.free(value);
         owned_counter_values.deinit(batch_ctx.alloc);
     }
+    try appendSourceRevisionWritesForEffects(batch_ctx.alloc, sequence, &store_writes, store_delete_keys.items, store_promotions, batch.changed_artifact_keys, &owned_counter_keys, &owned_counter_values);
     try DB.appendDenseArtifactCounterMutationsWithPromotions(
         batch_ctx.alloc,
         batch_ctx.store,
@@ -58741,7 +61398,6 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             ctx.alloc,
             ctx.index_manager,
             ctx.store,
-            ctx.applied_sequence_checkpoint_path,
             index_ref,
         );
         const target_sequence = try ctx.replay_source.latestMatchingSequence(
@@ -58788,7 +61444,8 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             });
         } else try abortReplayCaptureContext(&replay_ctx, index_ref);
     }
-    try saveAppliedSequencesBatchContext(ctx, updates.items);
+    // Background replay catch-up (apply_state.contributeProgressDeferred).
+    try saveAppliedSequencesBatchContext(ctx, updates.items, true);
     try truncateReplayJournalIfSafeContext(ctx);
     // Replay persisted LEANN graphs at each window; stub what they cover.
     if (saw_entries) elideLocalLeannVectorsContext(ctx);
@@ -58813,7 +61470,6 @@ fn canAdvanceDerivedReplayTargetContext(
         .io = ctx.io,
         .store = ctx.store,
         .relational_base_rows = ctx.relational_base_rows,
-        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
         .snapshot_replay_admission = ctx.snapshot_replay_admission,
@@ -58837,7 +61493,6 @@ fn applyDerivedBatchToIndexReplayContext(
         .alloc = ctx.alloc,
         .io = ctx.io,
         .store = ctx.store,
-        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
         .snapshot_replay_admission = ctx.snapshot_replay_admission,
@@ -58918,6 +61573,7 @@ fn saveAppliedSequencesBatchLockedContext(
     ctx: *const BatchExecutionContext,
     enriched_updates: []const apply_state.AppliedSequenceUpdate,
     async_ctx: ?*AsyncContext,
+    deferred: bool,
 ) !void {
     var generic_updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
     defer generic_updates.deinit(ctx.alloc);
@@ -58936,7 +61592,7 @@ fn saveAppliedSequencesBatchLockedContext(
             // Only an already-certified empty publication may carry its zero
             // count across a source-only native commit. Ordinary native
             // ingest keeps the count-sidecar optimization.
-            try ctx.index_manager.preserveCertifiedEmptyDenseCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, update.index_name);
+            try ctx.index_manager.preserveCertifiedEmptyDenseCheckpoint(ctx.store, update.index_name);
         } else {
             generic_updates.appendAssumeCapacity(update);
         }
@@ -58951,11 +61607,22 @@ fn saveAppliedSequencesBatchLockedContext(
                     update.sequence,
                 ) or lifecycle_completed;
             }
-            if (lifecycle_completed) try DB.saveIndexStatusSnapshots(
+            // No generic consumer advanced, so there is no progress v2 record
+            // to write here; a completed dense lifecycle, or this running as
+            // part of DB.close's drain, still deserves an immediate (not
+            // interval-gated) status refresh.
+            const closing_status_force = lifecycle_completed or active_async_ctx.background_closing.load(.acquire);
+            try publishManagedProgress(
                 ctx.alloc,
                 ctx.store,
                 ctx.index_manager,
-                enriched_updates,
+                &.{},
+                false,
+                if (closing_status_force) enriched_updates else &.{},
+                closing_status_force,
+                // A close drain has no later commit to ride along on, so it
+                // must flush durably regardless of what the caller asked for.
+                deferred and !closing_status_force,
             );
         }
         return;
@@ -58967,39 +61634,33 @@ fn saveAppliedSequencesBatchLockedContext(
         // snapshot.
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-        try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-            ctx.index_manager.generation_storage,
-            ctx.alloc,
-            ctx.index_manager.checkpointIo(),
-            ctx.store,
-            ctx.applied_sequence_checkpoint_path,
-            generic_updates.items,
-        );
         var authoritative_lifecycle_completed = false;
         for (enriched_updates) |update| {
             const completed_now = try finalizeCoveredDenseProjectionCheckpoint(active_async_ctx, update.index_name, update.sequence);
             authoritative_lifecycle_completed = authoritative_lifecycle_completed or
                 (completed_now and ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name));
         }
-        try DB.saveIndexStatusSnapshots(
+        // WS6: one progress commit replaces the separate legacy status
+        // commit(s) that used to follow here, carrying the new v2 progress
+        // record for every generic update plus (interval-gated, or forced by
+        // a completed lifecycle or a DB.close drain) a piggybacked status
+        // refresh.
+        const closing_status_force = authoritative_lifecycle_completed or active_async_ctx.background_closing.load(.acquire);
+        try publishManagedProgress(
             ctx.alloc,
             ctx.store,
             ctx.index_manager,
-            if (authoritative_lifecycle_completed) enriched_updates else generic_updates.items,
+            generic_updates.items,
+            true,
+            if (closing_status_force) enriched_updates else generic_updates.items,
+            closing_status_force,
+            deferred and !closing_status_force,
         );
         return;
     }
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-    try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-        ctx.index_manager.generation_storage,
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        generic_updates.items,
-    );
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
+    try publishManagedProgress(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items, true, generic_updates.items, false, deferred);
 }
 
 const appliedSequenceUpdatesWithConfigHashes = local_mutation.appliedSequenceUpdatesWithConfigHashes;
@@ -59047,6 +61708,114 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
     }
 }
 
+var status_persist_count: @import("antfly_platform").atomic.Value(u64) = .init(0);
+
+/// Count of durable status-snapshot writes actually committed (piggybacked
+/// into a progress commit or, rarely, standalone), as opposed to updates
+/// where status derivation ran but the interval/force gate skipped the
+/// write. Test-only instrumentation for the "at most once per interval"
+/// requirement.
+pub fn statusPersistCountForTest() u64 {
+    return status_persist_count.load(.monotonic);
+}
+
+pub fn resetStatusPersistCountForTest() void {
+    status_persist_count.store(0, .monotonic);
+}
+
+/// The one authoritative progress commit (WS6) for a batch of applied-
+/// sequence updates on a shared consumer set: every update's v2 progress
+/// record, plus — at most once per `IndexManager.status_persist_interval_ns`,
+/// or always when `force_status` is set (an explicit sync or close drain) —
+/// a piggybacked derived `IndexStatusSnapshot` for `status_targets`, land in
+/// exactly one `apply_state.contributeProgress` commit.
+///
+/// This does not replace the physical per-backend effects
+/// (`checkpointManagedProjectionEffectsForAppliedSequenceUpdates`,
+/// `savePhysicalProjectionMetadataForAppliedSequenceUpdates`). Callers must
+/// still run those first: progress v2 must never claim a boundary the
+/// physical effects have not reached. `lsm_wal_checkpointed` records only
+/// that `checkpointLsmWalForManagedIndex` was called for `updates` in this
+/// same pass; the WAL checkpoint marker itself lives on the per-index
+/// backend's own pager and is not readable back from this KV record.
+///
+/// Progress v2 is now the sole durable record of a consumer's applied
+/// sequence/identity: there is no separate legacy checkpoint commit left to
+/// keep in sync, so this call *is* the one docstore-side commit for the
+/// flush pass that reaches it.
+///
+/// `deferred` selects which of `apply_state.contributeProgress`/
+/// `contributeProgressDeferred` carries that commit: `true` for a
+/// background/catch-up flush pass, `false` for a synchronous-ack caller.
+/// See `contributeProgressDeferred`'s doc comment for exactly what that
+/// buys today (avoiding an extra memtable flush under `defer_commit_flush`,
+/// not an elided fsync — the WAL still syncs on every commit regardless of
+/// this flag, which is why it is safe: the physical effects this progress
+/// reports are already durable, so losing the record to any failure before
+/// it is itself durable just makes the consumer replay back to its last
+/// durable watermark, never observe progress ahead of effects) and why
+/// making it also skip the fsync is a separate, larger change this does
+/// not attempt.
+fn publishManagedProgress(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    updates: []const apply_state.AppliedSequenceUpdate,
+    lsm_wal_checkpointed: bool,
+    status_targets: []const apply_state.AppliedSequenceUpdate,
+    force_status: bool,
+    deferred: bool,
+) !void {
+    if (updates.len == 0 and status_targets.len == 0) return;
+
+    const progress = try alloc.alloc(apply_state.Progress, updates.len);
+    defer alloc.free(progress);
+    for (updates, 0..) |update, i| {
+        progress[i] = .{
+            .consumer = update.index_name,
+            .sequence = update.sequence,
+            .status = update.status,
+            .generation = update.generation,
+            .config_hash = update.config_hash,
+            .published_count = update.published_count,
+            .lsm_wal_checkpointed_through = if (lsm_wal_checkpointed) update.sequence else 0,
+        };
+    }
+
+    // Owned, heap-stable backing for every candidate status value: pointers
+    // into it are handed to `contributeProgress` as borrowed `StatusWrite`
+    // slices, so it must outlive that call (freed by `defer`, after use).
+    const status_values = try alloc.alloc([DB.index_status_encoded_len]u8, status_targets.len);
+    defer alloc.free(status_values);
+    var status_writes = std.ArrayListUnmanaged(apply_state.StatusWrite).empty;
+    defer {
+        for (status_writes.items) |write| alloc.free(@constCast(write.key));
+        status_writes.deinit(alloc);
+    }
+    const now_ns = platform_time.awakeNs(index_manager.checkpointIo());
+    const due = status_targets.len > 0 and index_manager.statusPersistDue(now_ns, force_status);
+    if (due) {
+        for (status_targets, 0..) |update, i| {
+            const status_snapshot = DB.collectLiveIndexStatusSnapshot(index_manager, update.index_name) orelse continue;
+            const key = try DB.indexStatusKeyAlloc(alloc, update.index_name);
+            errdefer alloc.free(key);
+            DB.encodeIndexStatusSnapshot(status_snapshot, &status_values[i]);
+            try status_writes.append(alloc, .{ .key = key, .value = &status_values[i] });
+        }
+    }
+
+    if (progress.len == 0 and status_writes.items.len == 0) return;
+    if (deferred) {
+        try apply_state.contributeProgressDeferred(alloc, store, progress, status_writes.items);
+    } else {
+        try apply_state.contributeProgress(alloc, store, progress, status_writes.items);
+    }
+    if (status_writes.items.len > 0) {
+        index_manager.markStatusPersisted(now_ns);
+        _ = status_persist_count.fetchAdd(1, .monotonic);
+    }
+}
+
 fn replayPendingDerivedBatches(
     self: *DB,
     progress_ctx: ?*anyopaque,
@@ -59088,6 +61857,8 @@ fn replayPendingDerivedBatches(
 
     const PersistReplayProgress = struct {
         fn run(ctx: *anyopaque, index_name: []const u8, sequence: u64) !void {
+            const wal_trace_scope = wal_trace.scope(.progress);
+            defer wal_trace_scope.end();
             const progress: *PersistReplayProgressContext = @ptrCast(@alignCast(ctx));
             try progress.db.core.saveAppliedSequence(index_name, sequence);
             try progress.publish(index_name);
@@ -59385,7 +62156,6 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
         .io = self.backend_runtime.io(),
         .store = resources.store,
         .relational_base_rows = relationalColumns(self) != null,
-        .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .snapshot_replay_admission = resources.snapshot_replay_admission,
@@ -60648,7 +63418,6 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .io = self.backend_runtime.io(),
         .store = resources.store,
         .relational_base_rows = relationalColumns(self) != null,
-        .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .snapshot_replay_admission = resources.snapshot_replay_admission,
@@ -60933,7 +63702,17 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     }
     effective = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, effective);
     effective = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, effective);
-    try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
+    // WS5 (a): diagnostic push only -- the actual safety clamp lives in
+    // `Store.serviceRetirement`/`DocStore.serviceRetirement`
+    // (`apply_state.minAppliedSequenceAcrossAllConsumers`, read fresh at
+    // drain time), not in anything pushed from here.
+    ctx.store.noteSafeRetirementWatermark(effective);
+    // WS5: this runs as the derived executor's `truncate_fn`, reached from
+    // the foreground `waitForAll`/`waitForIndexes` catch-up paths -- it only
+    // raises the watermark now. Physical retirement is the owner-only
+    // `DocStore.serviceRetirement`, called from the owning maintenance turn
+    // (not yet wired here; see the WS5 handoff notes).
+    ctx.store.requestRetirement(effective);
 }
 
 const truncateReplayJournalIfSafeContext = local_mutation.truncateReplayJournalIfSafeContext;
@@ -61354,7 +64133,7 @@ fn finishGraphMergeImport(db: anytype, existing_lease: ?*index_manager_mod.Index
         // The rebuild lease already owns the catalog exclusively. Publish
         // coverage without reacquiring the catalog through the generic helper.
         try entry.index.checkpointLsmWalAfterDurableBoundary();
-        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(db.alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path, .{
+        try apply_state.saveAppliedSequenceUpdate(db.core.store, .{
             .index_name = identity.name,
             .sequence = @max(applied, record.value.replay_sequence),
             .config_hash = types.indexConfigHash(entry.config),
@@ -61582,9 +64361,6 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     // stubbed vectors re-embed from the parent's documents, still present
     // until finalize.
     dest_indexes.dense_reembedder = self.core.index_manager.dense_reembedder;
-    const dest_applied_sequence_checkpoint_path = try apply_state.checkpointPathAlloc(self.alloc, dest_dir);
-    defer self.alloc.free(dest_applied_sequence_checkpoint_path);
-    dest_indexes.setAppliedSequenceCheckpointPath(dest_applied_sequence_checkpoint_path);
 
     try clearSplitMetadataFromStore(self.alloc, dest_store);
     try clearSystemMetadataFromSplitDestination(self.alloc, dest_store);
@@ -61625,7 +64401,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
 
     const configs = try self.core.listIndexes(self.alloc);
     defer types.freeIndexConfigs(self.alloc, configs);
-    try registerSplitDestinationIndexesDirect(self.alloc, dest_store, dest_applied_sequence_checkpoint_path, &dest_indexes, configs, replay_floor -| 1);
+    try registerSplitDestinationIndexesDirect(self.alloc, dest_store, &dest_indexes, configs, replay_floor -| 1);
     const collect_skip_doc_keys = true;
     var split_handoffs = try self.core.collectSplitIndexHandoffs(
         &dest_indexes,
@@ -61726,7 +64502,6 @@ fn collectSplitFrontierDocKeys(alloc: Allocator, store: *docstore_mod.DocStore, 
 fn registerSplitDestinationIndexesDirect(
     alloc: Allocator,
     dest_store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     dest_indexes: *index_manager_mod.IndexManager,
     configs: []const types.IndexConfig,
     applied_sequence: u64,
@@ -61744,13 +64519,7 @@ fn registerSplitDestinationIndexesDirect(
         };
     }
     try savePhysicalProjectionMetadataForAppliedSequenceUpdates(dest_indexes, updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
-        alloc,
-        dest_indexes.checkpointIo(),
-        dest_store,
-        applied_sequence_checkpoint_path,
-        updates,
-    );
+    try apply_state.saveAppliedSequences(dest_store, updates);
 }
 
 fn streamRangeIntoSplitDestinationDirect(
@@ -63399,7 +66168,7 @@ fn finishDerivedCatchUpSessionAsync(
         defer if (session.lease) |lease| if (lease.ownsLifecycle())
             ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
         _ = ctx.stats.dense_catch_up.abort_calls.fetchAdd(1, .monotonic);
-        var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, ctx.io orelse std.Options.debug_io);
         ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
         seq_lock.unlock();
         var catch_up_tracked = true;
@@ -63488,29 +66257,28 @@ fn finishDerivedCatchUpSessionAsync(
     const posting_applied_sequence_persisted = capture_advances_applied_sequence and
         ctx.index_manager.densePostingCoverageIncludesByName(index_ref.name, applied_sequence);
     var lifecycle_completed = false;
-    const lifecycle_handoff_persisted = blk: {
-        var seq_lock = lockAtomicWithBackoffProfiled(
-            &ctx.applied_sequence_mutex,
-            &ctx.stats.applied_sequence_mutex,
-        );
+    const lifecycle_handoff_io = ctx.io orelse std.Options.debug_io;
+    // The native capture commit above owns posting durability. It must
+    // still hand the covered sequence to projection finalization before
+    // the executor may skip its generic persistence callback. Without
+    // this explicit note the finished-index flush has nothing to consume,
+    // leaving a durably caught-up index stuck in rebuilding forever.
+    if (posting_applied_sequence_persisted) {
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, lifecycle_handoff_io);
         defer seq_lock.unlock();
-        // The native capture commit above owns posting durability. It must
-        // still hand the covered sequence to projection finalization before
-        // the executor may skip its generic persistence callback. Without
-        // this explicit note the finished-index flush has nothing to consume,
-        // leaving a durably caught-up index stuck in rebuilding forever.
-        if (posting_applied_sequence_persisted) {
-            _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
-            _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
-            try ctx.applied_sequence_coalescer.note(ctx.alloc, index_ref.name, applied_sequence);
-        }
-        const published = try flushFinishedDenseAppliedSequenceLocked(
+        _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
+        _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
+        try ctx.applied_sequence_coalescer.note(ctx.alloc, index_ref.name, applied_sequence);
+    }
+    ctx.applied_sequence_flush_mutex.lockUncancelable(lifecycle_handoff_io);
+    const lifecycle_handoff_persisted = blk: {
+        defer ctx.applied_sequence_flush_mutex.unlock(lifecycle_handoff_io);
+        break :blk try flushFinishedDenseAppliedSequenceLocked(
             ctx,
             index_ref.name,
             if (posting_applied_sequence_persisted) applied_sequence else null,
             &lifecycle_completed,
         );
-        break :blk published;
     };
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
     const finish_ns = elapsedSince(finish_start_ns);
@@ -63637,7 +66405,6 @@ fn canAdvanceDerivedToTargetAfterReplayAsync(ctx_ptr: *anyopaque, index_ref: ind
         ctx.alloc,
         ctx.index_manager,
         ctx.store,
-        ctx.applied_sequence_checkpoint_path,
         index_ref,
     );
     if (persisted_applied >= target_sequence) {
@@ -63719,7 +66486,7 @@ const denseIndexIsArtifactBacked = local_mutation.denseIndexIsArtifactBacked;
 /// at most one vector per source document use the current incarnation's
 /// outcome tuple even when vectors live in artifacts.
 fn densePublicationTargetUsesArtifactCounter(entry: anytype) bool {
-    return entry.external or entry.chunk_name != null or entry.embedding_names.len > 1;
+    return entry.external or entry.memberBacked() or entry.embedding_names.len > 1;
 }
 
 fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
@@ -63728,6 +66495,55 @@ fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
 
 fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !?u64 {
     return try denseTargetCountForIndexContextWithCoverage(ctx, index_name, .all_sources);
+}
+
+// The exact-vector store is shared: repairing A scans B's artifacts too.
+// One complete sibling must not repeatedly rebuild the corpus while another
+// producer is still publishing small batches. Native-only maintenance remains
+// eligible independently of this whole-corpus scan admission. Source-complete
+// rebuilding indexes also have a one-time repair exception at their caller.
+fn denseCorpusCoverageAllowsPrimarySnapshot(ctx: *AsyncContext) !bool {
+    for (ctx.index_manager.dense_indexes.items) |*entry| {
+        if (entry.index.leann != null) continue;
+        if (try denseIndexSourceCoverage(ctx, entry) == .pending) return false;
+    }
+    return true;
+}
+
+// Materialized vector cardinality is not source completion: one document
+// may emit many chunks, and a provider can pause between small output batches.
+// Use the current incarnation's terminal source outcomes to admit expensive
+// primary scans, independently of native WAL/query eligibility.
+const DenseSourceCoverage = enum {
+    authored,
+    unknown,
+    pending,
+    complete,
+
+    fn permitsRepair(self: @This()) bool {
+        return self == .authored or self == .complete;
+    }
+};
+
+fn denseIndexSourceCoverage(ctx: *AsyncContext, entry: *const index_manager_mod.IndexManager.DenseIndex) !DenseSourceCoverage {
+    // Authored vectors have no producer to finish. Their exact physical
+    // cardinality is validated by publication, independently of counters
+    // which may exist for source census/coverage accounting.
+    if (entry.external or entry.managed_direct_field) return .authored;
+    const config = entry.config;
+    const generation = internal_keys.derivedCoverageGenerationForConfig(config.coverage_generation, config.config_json);
+    const counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, config.name, generation, ctx.index_manager.byte_range, ctx);
+    const present: u2 = @as(u2, @intFromBool(counts.produced != null)) +
+        @as(u2, @intFromBool(counts.skipped != null)) +
+        @as(u2, @intFromBool(counts.terminal_failed != null));
+    // Missing legacy counters also describe an unobserved new producer.
+    // Keep the legacy corpus path, but absence must never grant the per-index
+    // repair exception while another producer has known pending work.
+    if (present == 0) return .unknown;
+    if (present != 3) return error.InvalidDerivedCoverageCounter;
+    const successful = std.math.add(u64, counts.produced.?, counts.skipped.?) catch return error.InvalidDerivedCoverageCounter;
+    const terminal = std.math.add(u64, successful, counts.terminal_failed.?) catch return error.InvalidDerivedCoverageCounter;
+    return if (counts.source_total) |total| if (terminal == total) .complete else .pending else .pending;
 }
 
 const DenseTargetCoverage = enum { all_sources, materialized };
@@ -63739,17 +66555,89 @@ fn denseTargetCountForIndexContextWithCoverage(
     index_name: []const u8,
     coverage: DenseTargetCoverage,
 ) !?u64 {
-    // Inline external vectors have no generated-enrichment incarnation, while
-    // one source document can produce multiple chunk-backed or multi-source
-    // vectors. Their durable artifact counter remains authoritative.
     if (ctx.index_manager.denseIndex(index_name)) |entry| {
-        if (densePublicationTargetUsesArtifactCounter(entry)) {
-            return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
-        }
+        return denseTargetCountForDenseEntryContext(ctx, entry, coverage);
+    }
+    // Quarantine retains the authoritative config while the replacement is
+    // built off-catalog. Its activation must still validate durable coverage.
+    const cfg = ctx.index_manager.get(index_name) orelse return null;
+    if (cfg.kind != .dense_vector) return null;
+    if (try ctx.index_manager.denseConfigUsesArtifactTarget(cfg.*)) {
+        return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
     }
     const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
+    const counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+    return denseTargetCountFromCoverage(ctx, index_name, coverage, counts);
+}
+
+// Catalog walkers already own a pinned entry; preserve that identity all the
+// way through target accounting instead of resolving its name again.
+fn denseTargetCountForDenseEntryContext(
+    ctx: *AsyncContext,
+    entry: *const index_manager_mod.IndexManager.DenseIndex,
+    coverage: DenseTargetCoverage,
+) !?u64 {
+    const index_name = entry.config.name;
+    if (densePublicationTargetUsesArtifactCounter(entry)) {
+        const artifact_count = try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
+        // The range-local source cardinality below counts every primary
+        // document in range, regardless of whether it targets this
+        // index -- a sound "pending work" proxy only for a generator
+        // that auto-produces from every document (chunk_name: each
+        // document is chunked and embedded unconditionally). It says
+        // nothing about an `external` index (vectors arrive out of
+        // band, nothing in this corpus is required to ever supply
+        // one -- the "damaged_idx" scheduler-starvation fixture in "db
+        // progressive managed admission serves a checkpointed partial
+        // generation" is exactly such an index, sharing a document
+        // range with others that do have real work, which made an
+        // earlier, unscoped version of this guard defer on it forever)
+        // or a multi-source (`embedding_names.len > 1`) index, whose
+        // producer set is not verified here to be "every document in
+        // range" either. Scope strictly to chunk_name.
+        if (entry.chunk_name != null and artifact_count != null and artifact_count.? == 0) {
+            // A fresh/untouched artifact-backed generation's counter is
+            // trivially zero before any producer (enrichment, for a
+            // chunk generator) has written even its first artifact --
+            // indistinguishable, by count alone, from a genuinely
+            // empty corpus. Same defense denseTargetCountFromCoverage's
+            // bootstrap branch applies to the non-artifact-counter
+            // path: check the range-local source cardinality before
+            // trusting a zero counter as the real target, so a managed
+            // admission whose chunked embeddings simply haven't been
+            // produced yet can never be certified "clean, 0 published"
+            // while source material is still waiting on enrichment
+            // (finalizeCoveredDenseProjectionCheckpointClaimed trusted
+            // this zero unconditionally and could never re-certify
+            // once that vacuous match left `.clean` behind).
+            const generation = internal_keys.derivedCoverageGenerationForConfig(entry.config.coverage_generation, entry.config.config_json);
+            const coverage_counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+            // The raw source_total guard below cannot tell "no chunk has
+            // been visited yet" apart from "every chunk was visited and
+            // legitimately skipped" (e.g. this embedding's own source
+            // field, like `caption`, is structurally absent from every
+            // chunk a `text`-only chunker produces, so nothing will ever
+            // write an artifact) -- both read a nonzero source_total with
+            // artifact_count == 0, and the latter deferred forever. Once
+            // any outcome counter exists, the per-outcome accounting
+            // already distinguishes them (it is the same completeness
+            // proof denseTargetCountFromCoverage's non-artifact-counter
+            // path already applies -- and, for `.materialized` coverage,
+            // the same early, no-skip-accounting-required return of a
+            // present `produced` count that path already trusts without
+            // this guard). Defer to it; only a counter-free generation
+            // (nothing attempted yet) falls back to the source_total
+            // bootstrap check.
+            if (coverage_counts.produced != null or coverage_counts.skipped != null or coverage_counts.terminal_failed != null)
+                return try denseTargetCountFromCoverageForEntry(ctx, index_name, coverage, coverage_counts, entry);
+            const source_total = coverage_counts.source_total orelse return null;
+            if (source_total != 0) return null;
+        }
+        return artifact_count;
+    }
+    const generation = internal_keys.derivedCoverageGenerationForConfig(entry.config.coverage_generation, entry.config.config_json);
     const coverage_counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
-    return denseTargetCountFromCoverage(ctx, index_name, coverage, coverage_counts);
+    return denseTargetCountFromCoverageForEntry(ctx, index_name, coverage, coverage_counts, entry);
 }
 
 // Keep the explicitly pinned entry point for epoch-transition regressions.
@@ -63775,6 +66663,16 @@ fn denseTargetCountFromCoverage(
     coverage: DenseTargetCoverage,
     coverage_counts: DerivedCoverageCounters,
 ) !?u64 {
+    return denseTargetCountFromCoverageForEntry(ctx, index_name, coverage, coverage_counts, null);
+}
+
+fn denseTargetCountFromCoverageForEntry(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    coverage: DenseTargetCoverage,
+    coverage_counts: DerivedCoverageCounters,
+    pinned_entry: ?*const index_manager_mod.IndexManager.DenseIndex,
+) !?u64 {
     const produced = coverage_counts.produced;
     const skipped = coverage_counts.skipped;
     const terminal_failed = coverage_counts.terminal_failed;
@@ -63786,13 +66684,26 @@ fn denseTargetCountFromCoverage(
         // remain a bootstrap fallback before a fresh incarnation processes its
         // first source. Once any outcome exists, it is the only counter fenced
         // to the current catalog generation.
-        const requires_artifact_coverage = if (ctx.index_manager.get(index_name)) |cfg|
+        const requires_artifact_coverage = if (pinned_entry) |entry|
+            try index_manager_mod.denseConfigRequiresArtifactCoverage(ctx.alloc, entry.config)
+        else if (ctx.index_manager.get(index_name)) |cfg|
             cfg.kind == .dense_vector and try index_manager_mod.denseConfigRequiresArtifactCoverage(ctx.alloc, cfg.*)
         else if (ctx.index_manager.denseIndex(index_name)) |entry|
             denseIndexIsArtifactBacked(entry)
         else
             false;
         if (requires_artifact_coverage) {
+            // A fresh, untouched artifact-backed generation's target counter
+            // is trivially zero before any producer has attempted even its
+            // first document -- indistinguishable, by count alone, from a
+            // genuinely empty range. Apply the same range-local cardinality
+            // check the non-artifact-coverage branch below uses, so a gated
+            // or blocked embedder's never-attempted source material defers
+            // (returns null, "not yet determined") instead of vacuously
+            // matching a zero active count and fast-forwarding past it.
+            if (coverage_counts.source_total) |source_count| {
+                if (source_count != 0) return null;
+            }
             return try coverage_counts.artifactCount();
         }
         // A fresh generation on an empty table has no outcome rows to create
@@ -64609,44 +67520,89 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsSliceContext(ctx: *AsyncContext
     return .{ .rebuilt = state.rebuilt, .resume_key = next_key };
 }
 
+/// Batched variant of `persistAppliedSequenceAsync`'s `force = true` path
+/// (see `runtime_types.PersistBatchFn`'s doc comment): notes every consumer
+/// in `snapshots` into the shared coalescer before flushing once, instead
+/// of `persistAppliedSequenceAsync` noting-and-flushing once per consumer.
+/// `waitForAllWithVisibilityWait`/`waitForIndexesWithVisibilityWait` are the
+/// only callers (`io_threaded_runtime.zig`'s `persistSnapshots`); both
+/// already collect every consumer that needs a forced flush before
+/// persisting any of them, which is exactly the shape this needs. Always
+/// called with `force = true`: there is no reason for a batched caller to
+/// want the opportunistic, best-effort semantics `persistAppliedSequenceAsync`'s
+/// `force = false` path has, so this does not implement it.
+fn persistAppliedSequencesBatchAsync(ctx_ptr: *anyopaque, snapshots: []const derived_executor_mod.PersistSnapshotArg, force: bool) !bool {
+    std.debug.assert(force);
+    const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
+    if (snapshots.len == 0) return true;
+    var lifecycle_completed = false;
+    const io = ctx.io orelse std.Options.debug_io;
+    ctx.applied_sequence_flush_mutex.lockUncancelable(io);
+    defer ctx.applied_sequence_flush_mutex.unlock(io);
+    {
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
+        defer seq_lock.unlock();
+        _ = ctx.stats.applied_sequence.note_calls.fetchAdd(snapshots.len, .monotonic);
+        _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
+        for (snapshots) |snapshot| try ctx.applied_sequence_coalescer.note(ctx.alloc, snapshot.index_name, snapshot.sequence);
+    }
+    const published = try flushPendingAppliedSequencesLocked(ctx, true, &lifecycle_completed);
+    if (published) {
+        for (snapshots) |snapshot| {
+            if (ctx.index_manager.denseProjectionCheckpointMetadata(snapshot.index_name) == null) {
+                DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
+            }
+        }
+    }
+    return published;
+}
+
 fn persistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (force) {
         var lifecycle_completed = false;
-        const published = blk: {
-            var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
+        const io = ctx.io orelse std.Options.debug_io;
+        ctx.applied_sequence_flush_mutex.lockUncancelable(io);
+        defer ctx.applied_sequence_flush_mutex.unlock(io);
+        {
+            var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
             defer seq_lock.unlock();
             _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
             _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
             try ctx.applied_sequence_coalescer.note(ctx.alloc, index_name, sequence);
-            break :blk try flushPendingAppliedSequencesLocked(ctx, true, &lifecycle_completed);
-        };
+        }
+        const published = try flushPendingAppliedSequencesLocked(ctx, true, &lifecycle_completed);
         const dense_index = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) != null;
         if (published and !dense_index) {
             DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
         }
         return published;
     }
-    if (!ctx.applied_sequence_mutex.tryLock()) {
+    // Best-effort: skip entirely rather than wait if a flush is already in
+    // flight, instead of blocking this (possibly synchronous, foreground)
+    // caller on it.
+    if (!ctx.applied_sequence_flush_mutex.tryLock()) {
         _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
         return false;
     }
-    errdefer ctx.applied_sequence_mutex.unlock();
+    const io = ctx.io orelse std.Options.debug_io;
+    defer ctx.applied_sequence_flush_mutex.unlock(io);
     var lifecycle_completed = false;
-    _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
-    try ctx.applied_sequence_coalescer.note(ctx.alloc, index_name, sequence);
-    if (shouldDeferAppliedSequenceFlush(ctx, false)) {
-        _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
-        ctx.applied_sequence_mutex.unlock();
-        return false;
-    }
-    if (!ctx.applied_sequence_coalescer.shouldFlush(monotonicTimeNs())) {
-        _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
-        ctx.applied_sequence_mutex.unlock();
-        return false;
+    {
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
+        defer seq_lock.unlock();
+        _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
+        try ctx.applied_sequence_coalescer.note(ctx.alloc, index_name, sequence);
+        if (shouldDeferAppliedSequenceFlush(ctx, false)) {
+            _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
+            return false;
+        }
+        if (!ctx.applied_sequence_coalescer.shouldFlush(monotonicTimeNs())) {
+            _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
+            return false;
+        }
     }
     const published = try flushPendingAppliedSequencesLocked(ctx, false, &lifecycle_completed);
-    ctx.applied_sequence_mutex.unlock();
     const dense_index = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) != null;
     if (published and !dense_index) {
         DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
@@ -64780,26 +67736,28 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         .published_count = serving_count,
     };
     try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
-    try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
-        ctx.index_manager.generation_storage,
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        index_name,
-        clean_checkpoint,
-    );
+    try apply_state.saveProjectionCheckpoint(ctx.store, index_name, clean_checkpoint);
     // Stable-tip finalization can race ahead of the applied-sequence flush
     // which normally refreshes this advisory restart snapshot. Persist the
     // live cardinality at the lifecycle boundary itself so a later failed
     // open never falls back to the empty creation-time snapshot. The clean
     // projection marker remains correctness authority; status-cache failure
-    // must not roll it back or fail an otherwise complete user write.
-    DB.saveIndexStatusSnapshots(
+    // must not roll it back or fail an otherwise complete user write. A
+    // lifecycle completion is forced through regardless of the ordinary
+    // status-persist interval.
+    publishManagedProgress(
         ctx.alloc,
         ctx.store,
         ctx.index_manager,
+        &.{},
+        false,
         &.{.{ .index_name = index_name, .sequence = applied_sequence }},
+        true,
+        // Reached from both synchronous and background catch-up callers
+        // (this finalizer is shared by saveAppliedSequencesBatchLockedContext
+        // and the dense flush passes below); a completed lifecycle marker
+        // is durable rather than guessing.
+        false,
     ) catch |err| {
         std.log.warn("dense status snapshot persistence deferred index={s} sequence={} err={s}", .{
             index_name,
@@ -64836,28 +67794,31 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
     session_lock.unlock();
     if (!claimed) return true;
     defer finishDenseProjectionFinalization(ctx);
+    const allow_primary_snapshot = try denseCorpusCoverageAllowsPrimarySnapshot(ctx);
     var pending = false;
-    for (manager.dense_indexes.items) |entry| {
+    for (manager.dense_indexes.items) |*entry| {
         if (ctx.background_closing.load(.acquire)) return false;
-        const checkpoint = manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
+        const checkpoint = index_manager_mod.IndexManager.denseProjectionCheckpointMetadataForEntry(entry) orelse continue;
         if (checkpoint.status != .rebuilding and checkpoint.status != .clean) continue;
-        const expected = (try denseTargetCountForIndexContextWithCoverage(
+        const expected = (try denseTargetCountForDenseEntryContext(
             ctx,
-            entry.config.name,
+            entry,
             if (checkpoint.status == .clean) .materialized else .all_sources,
         )) orelse continue;
         if (entry.index.stats().active_count != expected) continue;
         const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
-        if (manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected) and
+        if (manager.vectorBlockReadyForDenseEntryAtSequence(entry, sequence, expected) and
             checkpoint.status == .clean) continue;
-        _ = try manager.publishVectorBlockBasesOnline(.{
+        _ = try manager.publishVectorBlockBaseForEntryOnlineReported(entry, .{
             // Ordinary finite loads wait for a stable tip instead of building
             // a new corpus projection after each small foreground batch.
             .require_quiescence = checkpoint.status == .clean,
             .covered_rebuilding_index = entry.config.name,
             .only_index = entry.config.name,
+            .allow_primary_snapshot = allow_primary_snapshot or
+                (checkpoint.status == .rebuilding and (try denseIndexSourceCoverage(ctx, entry)).permitsRepair()),
         });
-        if (!manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected)) {
+        if (!manager.vectorBlockReadyForDenseEntryAtSequence(entry, sequence, expected)) {
             pending = true;
             continue;
         }
@@ -64943,20 +67904,29 @@ fn finalizeCoveredDenseProjectionCheckpointsClaimed(ctx: *AsyncContext) !bool {
     return completed;
 }
 
+/// Caller must hold `applied_sequence_flush_mutex` for the duration of this
+/// call; see that field's doc comment and `flushPendingAppliedSequencesLocked`'s.
 fn flushFinishedDenseAppliedSequenceLocked(
     ctx: *AsyncContext,
     index_name: []const u8,
     posting_persisted_through: ?u64,
     lifecycle_completed: *bool,
 ) !bool {
-    const pending = ctx.applied_sequence_coalescer.takePending(index_name) orelse return false;
+    const pending = blk: {
+        const io = ctx.io orelse std.Options.debug_io;
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
+        defer seq_lock.unlock();
+        const taken = ctx.applied_sequence_coalescer.takePending(index_name) orelse return false;
+        ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
+        break :blk taken;
+    };
     defer ctx.alloc.free(pending.owned_name);
 
     const flush_start_ns = monotonicTimeNs();
     const save_start_ns = monotonicTimeNs();
     var posting_publish_ns: u64 = 0;
     var projection_metadata_ns: u64 = 0;
-    var checkpoint_file_ns: u64 = 0;
+    const checkpoint_file_ns: u64 = 0;
     var status_snapshot_ns: u64 = 0;
     // Checkpointing managed projection effects reaches into live index
     // backends. Hold a shared apply lease so concurrent persistence remains
@@ -64995,28 +67965,35 @@ fn flushFinishedDenseAppliedSequenceLocked(
             const metadata_started = monotonicTimeNs();
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
             projection_metadata_ns +|= elapsedSince(metadata_started);
-            const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-                ctx.index_manager.generation_storage,
-                ctx.alloc,
-                ctx.index_manager.checkpointIo(),
-                ctx.store,
-                ctx.applied_sequence_checkpoint_path,
-                enriched_updates,
-            );
-            checkpoint_file_ns +|= elapsedSince(checkpoint_started);
         }
         const lifecycle_completed_now = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence);
         lifecycle_completed.* = lifecycle_completed_now or lifecycle_completed.*;
-        if (!hbc_authoritative or lifecycle_completed_now) {
-            const status_started = monotonicTimeNs();
-            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-            status_snapshot_ns +|= elapsedSince(status_started);
-        }
+        // WS6: one progress commit carries the v2 record for this consumer
+        // (when it took the generic, non-HBC-authoritative path above) and a
+        // piggybacked status refresh (interval-gated, or forced through by a
+        // completed lifecycle or a DB.close drain), replacing what used to
+        // be a separate status commit here.
+        const closing_status_force = lifecycle_completed_now or ctx.background_closing.load(.acquire);
+        const status_started = monotonicTimeNs();
+        try publishManagedProgress(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager,
+            if (hbc_authoritative) &.{} else enriched_updates,
+            !hbc_authoritative,
+            if (!hbc_authoritative or closing_status_force) enriched_updates else &.{},
+            closing_status_force,
+            // Background dense catch-up finish (finishDerivedCatchUpSessionAsync
+            // is this function's only caller): defer, except a close drain,
+            // which has no later commit to pick this up.
+            !closing_status_force,
+        );
+        status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
     };
 
-    ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
+    // last_flush_ns was already updated under applied_sequence_mutex above,
+    // before this unlocked commit ran.
     const flush_ns = elapsedSince(flush_start_ns);
     _ = ctx.stats.applied_sequence.flush_calls.fetchAdd(1, .monotonic);
     _ = ctx.stats.applied_sequence.flushed_indexes.fetchAdd(1, .monotonic);
@@ -65030,32 +68007,59 @@ fn flushFinishedDenseAppliedSequenceLocked(
     return true;
 }
 
+/// Drains the coalescer under `applied_sequence_mutex` -- a brief critical
+/// section that never yields -- then runs the durable commit below without
+/// that lock held. The caller must hold `applied_sequence_flush_mutex` for
+/// the duration of this call (see that field's doc comment): the commit
+/// below can yield through Io for the WAL group-commit wait, and two
+/// overlapping flushes for the same index could otherwise land out of
+/// order and regress the durable watermark, since
+/// `savePhysicalProjectionMetadataForAppliedSequenceUpdates` and friends
+/// overwrite rather than merge. See DETERMINISM_AUDIT.md.
 fn flushPendingAppliedSequencesLocked(
     ctx: *AsyncContext,
     force: bool,
     lifecycle_completed: *bool,
 ) !bool {
-    if (ctx.applied_sequence_coalescer.pending.count() == 0) return false;
-
     const flush_start_ns = monotonicTimeNs();
     var updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
-    defer updates.deinit(ctx.alloc);
-
-    var it = ctx.applied_sequence_coalescer.pending.iterator();
-    while (it.next()) |entry| {
-        if (!force and shouldDeferAppliedSequenceFlush(ctx, false)) continue;
-        try updates.append(ctx.alloc, .{
-            .index_name = entry.key_ptr.*,
-            .sequence = entry.value_ptr.*,
-        });
+    defer {
+        for (updates.items) |update| ctx.alloc.free(@constCast(update.index_name));
+        updates.deinit(ctx.alloc);
     }
-    if (updates.items.len == 0) return false;
+
+    {
+        const io = ctx.io orelse std.Options.debug_io;
+        var seq_lock = lockAtomicWithBackoffProfiledIo(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex, io);
+        defer seq_lock.unlock();
+        if (ctx.applied_sequence_coalescer.pending.count() == 0) return false;
+        var it = ctx.applied_sequence_coalescer.pending.iterator();
+        while (it.next()) |entry| {
+            if (!force and shouldDeferAppliedSequenceFlush(ctx, false)) continue;
+            // Owned copies: the coalescer's own key strings are freed by
+            // the drain below, which runs in this same locked section, so
+            // updates[].index_name must not borrow pointers into the map.
+            try updates.append(ctx.alloc, .{
+                .index_name = try ctx.alloc.dupe(u8, entry.key_ptr.*),
+                .sequence = entry.value_ptr.*,
+            });
+        }
+        if (updates.items.len == 0) return false;
+        // Drain now, under the same lock that protects the map: nothing
+        // below touches the coalescer's pending map again. A note() that
+        // arrives while the commit below is in flight (unlocked) lands in
+        // the now-empty map and is picked up by the next flush; it can
+        // never be lost or double-counted, since every drained entry above
+        // has its own owned copy.
+        for (updates.items) |update| ctx.applied_sequence_coalescer.removePending(ctx.alloc, update.index_name);
+        ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
+    }
     const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, updates.items);
     defer ctx.alloc.free(enriched_updates);
     const sync_ns: u64 = 0;
     var posting_publish_ns: u64 = 0;
     var projection_metadata_ns: u64 = 0;
-    var checkpoint_file_ns: u64 = 0;
+    const checkpoint_file_ns: u64 = 0;
     var status_snapshot_ns: u64 = 0;
 
     const save_start_ns = monotonicTimeNs();
@@ -65084,16 +68088,6 @@ fn flushPendingAppliedSequencesLocked(
             const metadata_started = monotonicTimeNs();
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             projection_metadata_ns +|= elapsedSince(metadata_started);
-            const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-                ctx.index_manager.generation_storage,
-                ctx.alloc,
-                ctx.index_manager.checkpointIo(),
-                ctx.store,
-                ctx.applied_sequence_checkpoint_path,
-                generic_updates.items,
-            );
-            checkpoint_file_ns +|= elapsedSince(checkpoint_started);
         }
         var authoritative_lifecycle_completed = false;
         for (enriched_updates) |update| {
@@ -65102,20 +68096,46 @@ fn flushPendingAppliedSequencesLocked(
             authoritative_lifecycle_completed = authoritative_lifecycle_completed or
                 (completed_now and ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name));
         }
-        if (generic_updates.items.len > 0) {
-            const status_started = monotonicTimeNs();
-            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
-            status_snapshot_ns +|= elapsedSince(status_started);
-        }
-        if (authoritative_lifecycle_completed) {
-            const status_started = monotonicTimeNs();
-            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-            status_snapshot_ns +|= elapsedSince(status_started);
-        }
+        // WS6: one progress commit replaces what used to be up to two
+        // separate status commits here (one for the generic updates, a
+        // second if an HBC-authoritative lifecycle also completed this
+        // pass), plus the v2 progress record for every generic update.
+        //
+        // `force` here means "the caller needs this watermark flushed now
+        // for synchronous visibility" (it fires on an ordinary write under
+        // most sync levels, not only at shutdown) and must not itself force
+        // a status write, or every write would defeat the status-persist
+        // interval. A completed lifecycle, or this flush running as part of
+        // DB.close's drain (`background_closing`, set before any close-time
+        // flush runs, distinct from the generic per-write `force`), forces
+        // status through deterministically; otherwise it rides the interval
+        // gate inside `publishManagedProgress`.
+        const closing_status_force = authoritative_lifecycle_completed or ctx.background_closing.load(.acquire);
+        const status_started = monotonicTimeNs();
+        try publishManagedProgress(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager,
+            generic_updates.items,
+            generic_updates.items.len > 0,
+            enriched_updates,
+            closing_status_force,
+            // `force == false` is the coalescer's opportunistic background
+            // flush -- no synchronous caller is waiting on it (the only
+            // caller for that case, persistAppliedSequenceAsync, tries the
+            // lock and skips entirely rather than block). `force == true`
+            // means a synchronous caller needs this watermark visible now,
+            // or this is the close drain; both must flush durably.
+            !force and !closing_status_force,
+        );
+        status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
     };
-    ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
-    ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
+    // The coalescer's pending map was already drained (and last_flush_ns
+    // updated) under applied_sequence_mutex above, before this unlocked
+    // commit ran -- see this function's doc comment. Clearing it again
+    // here would discard any note() that arrived while this commit was in
+    // flight.
     const flush_ns = elapsedSince(flush_start_ns);
     _ = ctx.stats.applied_sequence.flush_calls.fetchAdd(1, .monotonic);
     _ = ctx.stats.applied_sequence.flushed_indexes.fetchAdd(@intCast(updates.items.len), .monotonic);
@@ -76632,7 +79652,10 @@ test "db sparse hits resolve doc ordinals through identity not sparse doc nums" 
     const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "doc:a")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 1), ordinal);
 
-    var result = try db.search(alloc, .{
+    var filter = doc_set.ResolvedDocFilter{};
+    defer filter.deinit(alloc);
+    filter.include = try doc_set.fromOrdinalsAlloc(alloc, &.{ordinal});
+    const request = types.SearchRequest{
         .index_name = "sp_v1",
         .query = .{ .sparse_knn = .{
             .indices = &.{1},
@@ -76643,13 +79666,22 @@ test "db sparse hits resolve doc ordinals through identity not sparse doc nums" 
         // Qualification validates persistence/reopen correctness rather than
         // the default approximate-recall operating point.
         .search_effort = 1.0,
-    });
+    };
+    var result = try db.search(alloc, request);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
+
+    var scoped = request;
+    scoped.resolved_doc_filter = &filter;
+    var filtered = try db.search(alloc, scoped);
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.hits.len);
+    try std.testing.expectEqualStrings("doc:a", filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), filtered.hits[0].doc_ordinal);
 }
 
 test "db native checkpoint warming transfers snapshot budgets to a different runtime clock" {
@@ -85679,6 +88711,34 @@ test "producer readiness cached graph relations survive metadata overwrite and r
     try std.testing.expectEqual(@as(usize, 2), fake.extractor_calls);
 }
 
+test "producer readiness non-graph asset skips reextraction across an unrelated metadata edit" {
+    // Sibling of the graph test above: a plain asset enrichment that no
+    // graph index consumes keeps the narrower, declared-source-only reuse
+    // key (`artifactFeedsGraph` is false here), so an edit to a field the
+    // producer never reads must not force a second extractor call.
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var fake = TestAssetProducer{ .extractor_output = "{\"relations\":[]}" };
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{ .enrichment = .{ .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "relations_v1",
+        .kind = .asset,
+        .field = "target_doc",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    for ([_][]const u8{
+        "{\"title\":\"before\",\"target_doc\":\"doc:b\"}",
+        "{\"title\":\"after\",\"target_doc\":\"doc:b\"}",
+    }) |value| {
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = value }}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+}
+
 test "db graph artifact external node targets return ids without document hydration" {
     const alloc = std.testing.allocator;
 
@@ -86940,6 +90000,634 @@ test "db asset producer sync precompute fails closed on permanent item failure" 
             .{ .key = "doc:bad", .value = "{\"body\":\"bad\"}" },
         },
         .sync_level = .enrichments,
+    }));
+
+    try std.testing.expectEqual(@as(usize, 3), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.single_calls);
+
+    const rejected_doc = try db.get(alloc, "doc:bad");
+    defer if (rejected_doc) |value| alloc.free(value);
+    try std.testing.expect(rejected_doc == null);
+
+    const bad_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:bad", "asset", "summary_v1");
+    defer alloc.free(bad_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, bad_key));
+}
+
+test "db commit requirements extraction failure rejects without consumer indexes" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "units",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json =
+        \\{"type":"document_extraction","config":{"checksum_algorithm":"sha256","source":{"checksum_field":"digest"}}}
+        ,
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{}" }}, .commit_requires = .none });
+    var committed = false;
+    try std.testing.expectError(error.CommitRequirementFailed, db.batchTracked(.{
+        .writes = &.{.{ .key = "rejected", .value =
+        \\{"url":"data:text/plain;base64,YWxwaGEgYmV0YQ==","digest":"0000000000000000000000000000000000000000000000000000000000000000"}
+        }},
+        .deletes = &.{"keep"},
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }, &committed));
+    try std.testing.expect(!committed);
+    try std.testing.expect((try db.get(a, "rejected")) == null);
+    const kept = (try db.get(a, "keep")) orelse return error.TestExpectedEqual;
+    defer a.free(kept);
+    const manifest = try internal_keys.artifactNamedPrefixAlloc(a, "rejected", "asset", "units");
+    defer a.free(manifest);
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, manifest));
+}
+
+test "db commit requirements extraction leaves artifact source descendants to replay" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "child-replay", .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "units",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "chunks",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "units",
+        .chunk_size = 16,
+        .chunk_overlap = 0,
+    });
+    try db.addIndex(.{ .name = "child_text", .kind = .full_text, .config_json = "{\"chunk_name\":\"chunks\"}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc", .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}" }},
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    });
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", "units", "document:000001");
+    defer a.free(unit_key);
+    const unit = try db.core.store.get(a, unit_key);
+    defer a.free(unit);
+    // The extraction unit is direct; chunking that unit is an excluded stage.
+    const chunk_prefix = try internal_keys.artifactTypePrefixAlloc(a, "doc", "chunk");
+    defer a.free(chunk_prefix);
+    const chunks = try db.core.store.scanPrefix(a, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(a, chunks);
+    try std.testing.expectEqual(@as(usize, 0), chunks.len);
+    const before = try db.stats(a);
+    defer types.freeDBStats(a, before);
+    var saw_pending = false;
+    for (before.indexes) |index| if (std.mem.eql(u8, index.name, "child_text")) {
+        for (index.source_replay) |source| if (std.mem.eql(u8, source.artifact_name, "chunks")) {
+            try std.testing.expect(!source.producer_complete);
+            saw_pending = true;
+        };
+    };
+    try std.testing.expect(saw_pending);
+    // Run the real replay owner after checking the atomic precommit state.
+    try db.enrichment_runtime.?.start();
+    try db.enrichment_runtime.?.waitForApplied(db.core.nextDerivedSequence());
+    const completed = try db.core.store.scanPrefix(a, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(a, completed);
+    try std.testing.expect(completed.len > 0);
+    try db.runUntilIdle();
+    var found = try db.search(a, .{ .index_name = "child_text", .full_text = .{ .match = .{ .field = "text", .text = "alpha" } }, .return_mode = .chunk });
+    defer found.deinit();
+    try std.testing.expect(found.total_hits > 0);
+}
+
+test "db commit requirements child replay survives materialized visibility waits" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .enrichment = .{ .owner_id = "materialized-children", .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "units",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "chunks",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "units",
+        .chunk_size = 16,
+        .chunk_overlap = 0,
+    });
+    try db.addIndex(.{ .name = "child_text", .kind = .full_text, .config_json = "{\"chunk_name\":\"chunks\"}" });
+    for ([_]types.SyncLevel{ .full_text, .enrichments, .full_index }) |level| {
+        try db.batch(.{
+            .writes = &.{.{ .key = @tagName(level), .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}" }},
+            .sync_level = level,
+            .commit_requires = .direct_enrichments,
+        });
+    }
+    try db.runUntilIdle();
+    var found = try db.search(a, .{ .index_name = "child_text", .full_text = .{ .match = .{ .field = "text", .text = "alpha" } }, .return_mode = .chunk });
+    defer found.deinit();
+    try std.testing.expectEqual(@as(u32, 3), found.total_hits);
+}
+
+test "db commit requirements retain native asset batches across documents" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        single_calls: usize = 0,
+        batch_calls: usize = 0,
+        batch_items: usize = 0,
+        fn one(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_calls += 1;
+            return out.dupe(u8, "single");
+        }
+        fn many(ptr: *anyopaque, out: Allocator, requests: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            self.batch_items += requests.len;
+            const results = try out.alloc([]u8, requests.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (results[0..initialized]) |value| out.free(value);
+                out.free(results);
+            }
+            for (requests, 0..) |request, i| {
+                results[i] = try out.dupe(u8, request.source_text);
+                initialized += 1;
+            }
+            return results;
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .owner_id = "batching", .asset_producer = .{ .ptr = &producer, .vtable = &.{
+            .produce = Producer.one,
+            .produce_batch = Producer.many,
+            .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+        } } },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .execution = .{ .batch_items = 8, .batch_bytes = 8192 },
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "one", .value = "{\"body\":\"one\"}" },
+            .{ .key = "two", .value = "{\"body\":\"two\"}" },
+            .{ .key = "three", .value = "{\"body\":\"three\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    });
+    try std.testing.expectEqual(@as(usize, 1), producer.batch_calls);
+    try std.testing.expectEqual(@as(usize, 3), producer.batch_items);
+    try std.testing.expectEqual(@as(usize, 0), producer.single_calls);
+}
+
+test "db commit requirements output budget stops subsequent producer work atomically" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        calls: usize = 0,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const result = try out.alloc(u8, 5 * 1024 * 1024);
+            @memset(result, 'x');
+            return result;
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .owner_id = "budget", .asset_producer = .{ .ptr = &producer, .vtable = &.{
+            .produce = Producer.produce,
+            .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+        } } },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    });
+    var committed = false;
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.batchTracked(.{
+        .writes = &.{
+            .{ .key = "one", .value = "{\"body\":\"one\"}" },
+            .{ .key = "two", .value = "{\"body\":\"two\"}" },
+            .{ .key = "three", .value = "{\"body\":\"three\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }, &committed));
+    try std.testing.expectEqual(@as(usize, 2), producer.calls);
+    try std.testing.expect(!committed);
+    for ([_][]const u8{ "one", "two", "three" }) |key|
+        try std.testing.expect((try db.get(a, key)) == null);
+}
+
+test "db commit requirements prepared command replays binary artifacts without inference" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        forbidden: bool = false,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbidden) return error.TestUnexpectedResult;
+            self.calls += 1;
+            return out.dupe(u8, &.{ 0xff, 0, 0xfe });
+        }
+    };
+    for ([_]bool{ false, true }) |ordered_apply| {
+        var directory = try TestDirectory.init("commit-requirements");
+        defer directory.cleanup();
+        var fake = Fake{};
+        var db = try DB.open(a, directory.path(), .{
+            .identity_namespace = if (ordered_apply) .{ .table_id = 1, .shard_id = 2, .range_id = 2 } else .{},
+            .online_source_authority = if (ordered_apply) .raft else null,
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .enrichment = .{ .owner_id = "prepared", .asset_producer = .{ .ptr = &fake, .vtable = &.{
+                .produce = Fake.produce,
+                .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+            } } },
+        });
+        defer db.close();
+        try db.addEnrichment(.{
+            .name = "binary",
+            .kind = .asset,
+            .field = "body",
+            .content_type = "application/octet-stream",
+            .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        });
+        if (ordered_apply) {
+            const publication = @import("artifact_publication.zig");
+            var inventory = try db.artifactInventoryCommand(a);
+            defer inventory.catalogs.deinit(a);
+            inventory.binding.effect_protocol = 15;
+            var namespace: publication.Namespace = undefined;
+            doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            const catalogs = try @import("artifact_inventory.zig").catalogs(&txn);
+            const authority: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = catalogs.digest() };
+            try @import("artifact_inventory.zig").stageOrdered(a, &txn, inventory, 1);
+            try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+            try @import("artifact_producer_obligations.zig").begin(a, &txn, authority);
+            try @import("artifact_producer_validation.zig").begin(a, &txn, authority);
+            try txn.commit();
+        }
+        var request = types.BatchRequest{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello\"}" }}, .sync_level = .write, .commit_requires = .direct_enrichments };
+        const packet = try db.prepareDirectEnrichments(a, request);
+        defer a.free(packet);
+        try std.testing.expect((try db.get(a, "doc")) == null);
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        fake.forbidden = true;
+        request.prepared_enrichments_json = packet;
+        if (ordered_apply) try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true) else try db.batch(request);
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "binary");
+        defer a.free(key);
+        const artifact = try db.core.store.get(a, key);
+        defer a.free(artifact);
+        try std.testing.expectEqualSlices(u8, &.{ 0xff, 0, 0xfe }, artifact);
+        if (ordered_apply) {
+            // Identical log-entry replay is a no-op; a different entry may not
+            // reuse a stale source fence.
+            try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
+            try std.testing.expectError(error.VersionConflict, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true));
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            const producer = plan.plan().generated_templates[0];
+            const binding = (try @import("artifact_producer_input.zig").authorizeTemplate(a, &read, producer, plan.plan())).?;
+            var closure = (try @import("prepared_producer_acceptance.zig").read(a, &read, db.root_incarnation, "doc", binding.requirement.id, "binary")).?;
+            defer closure.deinit();
+            try closure.requireCurrent(&read, db.root_incarnation);
+            try db.applyOrderedCommittedMutation(.{ .deletes = &.{"doc"}, .commit_requires = .none }, .{ .term = 1, .index = 4 }, true);
+            try std.testing.expect(try @import("prepared_producer_acceptance.zig").collectCurrentPage(a, db.core.store, db.root_incarnation));
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, closure.receipt_key));
+            // A pinned pre-delete reader retains its coherent old evidence.
+            try closure.requireCurrent(&read, db.root_incarnation);
+        } else try std.testing.expectError(error.VersionConflict, db.batch(request));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    }
+}
+
+test "db commit requirements transaction retains prepared effects through restart and abort" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        forbidden: bool = false,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbidden) return error.TestUnexpectedResult;
+            self.calls += 1;
+            return out.dupe(u8, "prepared transaction output");
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements-transaction");
+    defer directory.cleanup();
+    var fake = Fake{};
+    const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "prepared-transaction", .asset_producer = .{ .ptr = &fake, .vtable = &.{ .produce = Fake.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } } } };
+    var committed: types.TxnId = undefined;
+    var aborted: types.TxnId = undefined;
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
+        try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{\"body\":\"original\"}" }}, .commit_requires = .none });
+        committed = try db.beginTransaction(100);
+        aborted = try db.beginTransaction(101);
+        try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
+        try db.writeTransaction(aborted, .{ .writes = &.{.{ .key = "rejected", .value = "{\"body\":\"abort me\"}" }}, .deletes = &.{"keep"}, .commit_requires = .direct_enrichments });
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        fake.forbidden = true;
+        try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
+        try std.testing.expectError(error.VersionConflict, db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"different\"}" }}, .commit_requires = .direct_enrichments }));
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        try std.testing.expectError(error.VersionConflict, db.writeTransaction(committed, .{ .writes = &.{.{ .key = "bypass", .value = "{}" }}, .commit_requires = .none }));
+        try std.testing.expect((try db.get(a, "accepted")) == null);
+        {
+            const stale_key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
+            defer a.free(stale_key);
+            var writer = try db.core.store.beginWriteTxn();
+            errdefer writer.abort();
+            try writer.put(stale_key, "late old-source output");
+            try std.testing.expectError(error.IntentConflict, writer.commit());
+            writer.abort();
+        }
+        try std.testing.expect((try db.get(a, "rejected")) == null);
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
+        defer a.free(artifact_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(a, artifact_key));
+        try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "accepted", .value = "{}" }}, .commit_requires = .none }));
+        try db.addEnrichment(.{ .name = "later", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"later-generator\"}}" });
+    }
+    fake.forbidden = true;
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        // The durable vote remains retryable after restart and catalog changes.
+        try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
+        try db.commitTransaction(committed, 200);
+        try db.abortTransaction(aborted, 201);
+        // Terminal retries neither publish outputs again nor invoke a model.
+        try db.commitTransaction(committed, 200);
+        try db.abortTransaction(aborted, 201);
+        const accepted = (try db.get(a, "accepted")).?;
+        defer a.free(accepted);
+        const keep = (try db.get(a, "keep")).?;
+        defer a.free(keep);
+        try std.testing.expect((try db.get(a, "rejected")) == null);
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
+        defer a.free(key);
+        const artifact = try db.core.store.get(a, key);
+        defer a.free(artifact);
+        try std.testing.expectEqualStrings("prepared transaction output", artifact);
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    }
+}
+
+test "db commit requirements restored effects release every fallible allocation" {
+    const packet: execution_resources.PreparedEnrichments = .{
+        .request_digest = @splat(1),
+        .catalog_digest = @splat(2),
+        .writes = &.{},
+        .deletes = &.{},
+        .guards = &.{},
+        .artifact_writes = &.{.{ .key = "artifact", .value = &.{ 0xff, 0, 0xfe } }},
+        .artifact_deletes = &.{"retired"},
+        .pending = &.{.{ .kind = .asset, .index_name = "index", .artifact_name = "asset", .doc_key = "doc" }},
+        .coverage = &.{.{ .index_name = @constCast("index"), .doc_key = @constCast("doc"), .outcome = .produced }},
+        .producers = &.{.{ .definition = @splat(3), .doc_key = "doc", .revision = @splat(4) }},
+    };
+    const Check = struct {
+        fn run(a: Allocator, value: execution_resources.PreparedEnrichments) !void {
+            var restored = try local_mutation.restorePreparedEnrichments(a, value);
+            defer restored.deinit(a);
+            try std.testing.expectEqualSlices(u8, value.artifact_writes[0].value, restored.artifact_writes[0].value);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{packet});
+}
+
+test "db commit requirements oversized transaction effects reject before voting prepared" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        calls: usize = 0,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const result = try out.alloc(u8, 4 * 1024 * 1024);
+            @memset(result, 'x');
+            return result;
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements-reservation");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "reservation", .asset_producer = .{ .ptr = &producer, .vtable = &.{ .produce = Producer.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } } } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "large", .kind = .asset, .field = "body", .content_type = "application/octet-stream", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"large-generator\"}}" });
+    const txn = try db.beginTransaction(100);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.writeTransaction(txn, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .commit_requires = .direct_enrichments }));
+    try std.testing.expectEqual(@as(usize, 1), producer.calls);
+    try std.testing.expect((try db.get(a, "doc")) == null);
+    // Failure left no durable intent or exclusive source lock behind.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .none });
+    try db.abortTransaction(txn, 200);
+}
+
+test "db commit requirements missing provider cannot defer required work" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "no-provider" } });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic\"}}",
+    });
+    for ([_]types.SyncLevel{ .propose, .write }) |level| {
+        var committed = false;
+        try std.testing.expectError(error.CommitRequirementUnavailable, db.batchTracked(.{
+            .writes = &.{.{ .key = "rejected", .value = "{\"body\":\"must not be deferred\"}" }},
+            .sync_level = level,
+            .commit_requires = .direct_enrichments,
+        }, &committed));
+        try std.testing.expect(!committed);
+        try std.testing.expect((try db.get(a, "rejected")) == null);
+    }
+}
+
+test "db commit requirements explicit none waits for postcommit enrichment" {
+    const a = std.testing.allocator;
+    const Observer = struct {
+        db: ?*DB = null,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const source = (try self.db.?.get(out, "observed")) orelse return error.SourceMustCommitFirst;
+            defer out.free(source);
+            return out.dupe(u8, "published after source");
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var observer = Observer{};
+    var db = try DB.open(a, directory.path(), .{ .enrichment = .{
+        .owner_id = "commit-requirements",
+        .asset_producer = .{ .ptr = &observer, .vtable = &.{ .produce = Observer.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } },
+    } });
+    defer db.close();
+    observer.db = &db;
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    });
+    // If full_index still implicitly precomputed, the observer would fail
+    // before the source existed. The explicit prerequisite must win.
+    try db.batch(.{ .writes = &.{.{ .key = "observed", .value = "{\"body\":\"hello\"}" }}, .sync_level = .full_index, .commit_requires = .none });
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "observed", "asset", "summary");
+    defer a.free(key);
+    const artifact = try db.core.store.get(a, key);
+    defer a.free(artifact);
+    try std.testing.expectEqualStrings("published after source", artifact);
+}
+
+test "db commit requirements gate write before source and delete publication" {
+    const alloc = std.testing.allocator;
+
+    const FallbackProducer = struct {
+        batch_calls: usize = 0,
+        single_calls: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, alloc_inner: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_calls += 1;
+            if (std.mem.eql(u8, request.source_text, "bad")) return error.BadAssetInput;
+            return try std.fmt.allocPrint(alloc_inner, "ok:{s}", .{request.source_text});
+        }
+
+        fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            return error.BatchItemFailed;
+        }
+    };
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var fake = FallbackProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .execution = .{ .batch_items = 2, .batch_bytes = 1024 },
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:good", .value = "{\"body\":\"good\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.single_calls);
+
+    const good_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:good", "asset", "summary_v1");
+    defer alloc.free(good_key);
+    const good_value = try db.core.store.get(alloc, good_key);
+    defer alloc.free(good_value);
+    try std.testing.expectEqualStrings("ok:good", good_value);
+
+    try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{}" }}, .sync_level = .write, .commit_requires = .none });
+    try std.testing.expectError(error.BadAssetInput, db.batch(.{
+        .deletes = &.{"keep"},
+        .writes = &.{
+            .{ .key = "doc:good", .value = "{\"body\":\"bad\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }));
+
+    try std.testing.expectEqual(@as(usize, 2), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.single_calls);
+
+    const kept = (try db.get(alloc, "keep")) orelse return error.TestExpectedEqual;
+    defer alloc.free(kept);
+    const committed_doc = (try db.get(alloc, "doc:good")) orelse return error.TestExpectedEqual;
+    defer alloc.free(committed_doc);
+    try std.testing.expectEqualStrings("{\"body\":\"good\"}", committed_doc);
+
+    const unchanged_good_value = try db.core.store.get(alloc, good_key);
+    defer alloc.free(unchanged_good_value);
+    try std.testing.expectEqualStrings("ok:good", unchanged_good_value);
+
+    try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{}" }}, .sync_level = .write, .commit_requires = .none });
+    try std.testing.expectError(error.BadAssetInput, db.batch(.{
+        .deletes = &.{"keep"},
+        .writes = &.{
+            .{ .key = "doc:bad", .value = "{\"body\":\"bad\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
     }));
 
     try std.testing.expectEqual(@as(usize, 3), fake.batch_calls);
@@ -90377,6 +94065,39 @@ test "db shared repair completion reprocesses consumer with terminal coverage" {
         .doc_key = "doc:a",
         .outcome = .terminal_failed,
     }});
+
+    try std.testing.expect(try db.artifactNowReadable(alloc, pending[0]));
+    // A successful replay shared with a sibling is no longer pending
+    // even though this consumer still has terminal coverage.
+    const applied_before = try enrichment_state.loadAppliedSequence(alloc, db.core.store, enrichment_runtime_mod.scope_name);
+    const settled_sequence = completion.completed_sequence + 1;
+    var shared_publication = completion;
+    shared_publication.queued_sequence = settled_sequence;
+    shared_publication.queued_job_id = 42;
+    shared_publication.completed_sequence = settled_sequence;
+    encodeArtifactRepairCompletionState(&encoded_completion, shared_publication);
+    try db.core.store.put(completion_key, &encoded_completion);
+    try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, settled_sequence);
+    var observed: types.ArtifactRepairResult = .{ .limit = 1, .observed_only = true };
+    defer observed.deinit(alloc);
+    try db.observeIndexDocumentRepairs(alloc, .{ .index_name = "semantic" }, .{}, &observed);
+    try std.testing.expectEqual(@as(u64, 1), observed.failed);
+    try std.testing.expect(observed.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 0), observed.in_progress);
+
+    var settled = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+        .target = .artifact,
+        .index_name = "semantic",
+        .repair_job_id = 42,
+        .operator_initiated = true,
+    }, .{ .defer_durable_index_repair_execution = true });
+    defer settled.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), settled.failed);
+    try std.testing.expectEqual(@as(u64, 0), settled.in_progress);
+    try std.testing.expect(!settled.has_more and settled.debt_remaining);
+    encodeArtifactRepairCompletionState(&encoded_completion, completion);
+    try db.core.store.put(completion_key, &encoded_completion);
+    try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, applied_before);
 
     var repair = try db.repairArtifactIssues(alloc, .embedding, 1);
     defer repair.deinit(alloc);
@@ -94774,6 +98495,22 @@ test "leann synchronous document provenance pins revisions and tolerates inferen
             if (self.flip) self.revision += 1;
             return vector;
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.revision) };
@@ -94781,7 +98518,7 @@ test "leann synchronous document provenance pins revisions and tolerates inferen
         fn append(_: Allocator, _: *usize, _: []const u8, _: ?[]const u8, _: []const u8, _: []const f32, _: []const []const u8) !void {}
     };
     var fake = Fake{};
-    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .capabilities_fn = Fake.caps };
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .dense_embed_batch_planned_fn = Fake.planned, .capabilities_fn = Fake.caps };
     var directory = try TestDirectory.init("leann-sync-generation");
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .enrichment = .{ .owner_id = "sync", .dense_embedder = provider }, .ttl_cleanup = .{ .enabled = false } });
@@ -99640,7 +103377,7 @@ test "db default full text index searches template chunk text when chunker full 
     var range_hits: usize = 0;
     var range_scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .observed_rows = &range_rows };
     const RangeVisitor = struct {
-        fn visit(raw: ?*anyopaque, id: []const u8) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
             const count: *usize = @ptrCast(@alignCast(raw.?));
             count.* += 1;
             try std.testing.expectEqualStrings("doc:a\x00tail", id);
@@ -100824,6 +104561,12 @@ fn testDenseRevisionReuse(sync_level: types.SyncLevel, with_parts: bool) !void {
             }
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(revision), .batch = .{ .mode = .native, .max_items = 32 } };
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            return batch(raw, result_alloc, name, texts, dims);
+        }
         fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, _: u32) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const rows = try alloc.alloc([]const f32, texts.len);
@@ -100843,7 +104586,7 @@ fn testDenseRevisionReuse(sync_level: types.SyncLevel, with_parts: bool) !void {
     var probe = Probe{};
     var directory = try TestDirectory.init("model-revision-reuse");
     defer directory.cleanup();
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "revision-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = if (with_parts) Probe.parts else null, .text_parts_equivalent_fn = Probe.equivalent, .dense_embed_batch_fn = Probe.batch, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "revision-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = if (with_parts) Probe.parts else null, .text_parts_equivalent_fn = Probe.equivalent, .dense_embed_batch_fn = Probe.batch, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps } } });
     defer db.close();
     try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"passage: {{body}}\",\"embedding_name\":\"model\"}}" });
     for (0..3) |version| {
@@ -100884,6 +104627,22 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
             self.calls += 1;
             if (self.fail) return error.PermanentPromptFailure;
             return alloc.dupe(f32, &.{ if (self.revision == 1) 1 else 0, if (self.revision == 2) 1 else 0, if (std.mem.eql(u8, text, "changed")) 2 else 1 });
+        }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
         }
         fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -100954,7 +104713,7 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
     var directory = try TestDirectory.init("paper-evaluation-contracts");
     defer directory.cleanup();
     var probe = Probe{};
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "paper-contract", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "paper-contract", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps } } });
     defer db.close();
     try db.addEnrichment(Probe.config(1));
     try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"vectors\"}],\"publication_policy\":\"atomic\"}" });
@@ -101025,6 +104784,36 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
         fn caps(_: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(1) };
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(@as(u8, 1)))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
+        fn sparsePlanned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, context: ?@import("antfly_inference_execution_context").RequestContext, generation: embedder_mod.SparseEmbedder.Generation) ![]embedder_mod.SparseEmbedding {
+            if (context) |control| try control.check();
+            if (!std.meta.eql(generation.revision, @as(?[32]u8, @as([32]u8, @splat(1))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc(embedder_mod.SparseEmbedding, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |*row| row.deinit(result_alloc);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embedSparse(raw, result_alloc, name, text);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn revision(_: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
             return @as([32]u8, @splat(1));
         }
@@ -101079,7 +104868,7 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
     var directory = try TestDirectory.init("late-A-generation");
     defer directory.cleanup();
     var probe = Probe{ .hold_at = initial_reprocesses + 1, .rollback = rollback, .sparse = sparse, .recreate = recreate };
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-A", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.embedSparse, .cache_revision_fn = Probe.revision } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-A", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.embedSparse, .sparse_embed_batch_planned_fn = Probe.sparsePlanned, .cache_revision_fn = Probe.revision } } });
     defer db.close();
     probe.db = &db;
     if (relational) try db.setSchemaJson(a,
@@ -101131,6 +104920,95 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged source\",\"metadata\":3}" }}, .sync_level = .full_index });
     try db.runUntilIdle();
     try std.testing.expectEqual(replacement_calls, probe.calls);
+}
+
+test "db sequential managed dense backfills coalesce shared vector snapshot repair" {
+    try testSequentialManagedDenseBackfills(false);
+}
+
+test "db sequential managed dense backfills coalesce shared vector snapshots with workers" {
+    try testSequentialManagedDenseBackfills(true);
+}
+
+fn testSequentialManagedDenseBackfills(workers: bool) !void {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        db: ?*DB = null,
+        workers: bool = false,
+        fn embed(raw: *anyopaque, alloc: Allocator, name: []const u8, _: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            if (self.workers and std.mem.eql(u8, name, "B")) {
+                // Exercise serving and autonomous maintenance between small
+                // backfill calls, rather than only at a manual idle barrier.
+                var result = try self.db.?.search(alloc, .{ .index_name = "A", .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } }, .limit = 1 });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+                // Keep B active beyond the two-second projection quiet
+                // interval so maintenance observes a genuinely busy backfill.
+                sleepNs(50 * std.time.ns_per_ms);
+            }
+            const vector = try alloc.alloc(f32, dims);
+            @memset(vector, 0);
+            vector[if (std.mem.eql(u8, name, "A")) 0 else 1] = 1;
+            return vector;
+        }
+    };
+    var probe: Probe = .{ .workers = workers };
+    var directory = try TestDirectory.init("sequential-dense-vector-snapshots");
+    defer directory.cleanup();
+    const options: OpenOptions = .{
+        .start_index_workers = workers,
+        .start_optional_runtime_workers = workers,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed } },
+    };
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    probe.db = &db;
+    const count = 64;
+    var writes: [count]types.BatchWrite = undefined;
+    var initialized: usize = 0;
+    defer for (writes[0..initialized]) |write| a.free(write.key);
+    for (&writes, 0..) |*write, i| {
+        write.* = .{ .key = try std.fmt.allocPrint(a, "doc:{d}", .{i}), .value = "{\"body\":\"short record\"}" };
+        initialized += 1;
+    }
+    try db.batch(.{ .writes = &writes, .sync_level = .write });
+    for ([_][]const u8{ "A", "B" }) |name| {
+        const config = try std.fmt.allocPrint(a, "{{\"field\":\"embedding\",\"dims\":3,\"execution\":{{\"embedding\":{{\"batch_items\":1}}}},\"generator\":{{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"{s}\"}}}}", .{name});
+        defer a.free(config);
+        const primary_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+        const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
+        try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config });
+        try db.runUntilIdle();
+        // One genuine missing-generation repair is permitted at the idle
+        // boundary; a small replay batch must never trigger another scan.
+        try std.testing.expect(index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - primary_before + index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before <= 1);
+        try std.testing.expectEqual(@as(u64, count), db.core.index_manager.denseIndex(name).?.index.stats().active_count);
+    }
+    try std.testing.expectEqual(@as(usize, count * 2), probe.calls.load(.acquire));
+    for (0..2) |restart| {
+        if (restart != 0) {
+            const primary_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+            const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
+            db.close();
+            db = try DB.open(a, directory.path(), options);
+            try db.runUntilIdle();
+            try std.testing.expectEqual(primary_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+            try std.testing.expectEqual(native_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire));
+            try std.testing.expectEqual(@as(usize, count * 2), probe.calls.load(.acquire));
+        }
+        for ([_][]const u8{ "A", "B" }) |name| {
+            try std.testing.expect(db.core.index_manager.vectorBlockReadyForDenseIndex(name));
+            const query: []const f32 = if (std.mem.eql(u8, name, "A")) &.{ 1, 0, 0 } else &.{ 0, 1, 0 };
+            var result = try db.search(a, .{ .index_name = name, .query = .{ .dense_knn = .{ .vector = query, .k = 1 } }, .limit = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            try std.testing.expectApproxEqAbs(@as(f32, 0), result.hits[0].distance.?, 0.00001);
+        }
+    }
 }
 
 test "db templated dense backfill batches rendered text and preserves media" {
@@ -101550,7 +105428,59 @@ test "db managed index repair keeps failed OCR manifests as debt" {
         var encoded: [artifact_repair_completion_state_len]u8 = undefined;
         encodeArtifactRepairCompletionState(&encoded, completion);
         try db.core.store.put(completion_key, &encoded);
+        const observation: types.ArtifactRepairRunRequest = .{
+            .target = .index,
+            .index_name = "consumer",
+            .operator_initiated = true,
+            .repair_job_id = 42,
+            .observe_index_repair = true,
+        };
+        const deferred = types.ArtifactRepairRunOptions{ .defer_durable_index_repair_execution = true };
+        const before = db.core.nextEnrichmentSequence();
+        var pending = try db.repairArtifactIssuesWithRequestOptions(alloc, observation, deferred);
+        defer pending.deinit(alloc);
+        try std.testing.expect(pending.observed_only and pending.has_more);
+        try std.testing.expectEqual(@as(u64, 1), pending.document_replay_in_progress);
+        try std.testing.expectEqual(@as(u64, 0), pending.failed);
+        try std.testing.expectEqual(before, db.core.nextEnrichmentSequence());
+
+        var unsupported = issue;
+        unsupported.doc_key = "doc:unsupported";
+        unsupported.artifact_name = "unsupported_units";
+        unsupported.repairable = false;
+        try db.recordArtifactRepairIssue(alloc, unsupported);
+        var resume_request = observation;
+        resume_request.observe_index_repair = false;
+        resume_request.resume_document_repair = true;
+        for (0..2) |_| {
+            var poll = try db.repairArtifactIssuesWithRequestOptions(alloc, resume_request, deferred);
+            defer poll.deinit(alloc);
+            try std.testing.expect(poll.observed_only and poll.has_more);
+            try std.testing.expectEqual(@as(u64, 1), poll.document_replay_in_progress);
+            try std.testing.expectEqual(@as(u64, 0), poll.unsupported);
+        }
+        const checked = try db.listArtifactRepairIssuesPage(alloc, .{ .index_name = "consumer" });
+        defer types.freeArtifactRepairIssues(alloc, checked.issues);
+        defer if (checked.next_cursor) |cursor| alloc.free(cursor);
+        var found_unsupported = false;
+        for (checked.issues) |row| {
+            if (!std.mem.eql(u8, row.doc_key, unsupported.doc_key)) continue;
+            try std.testing.expectEqual(@as(u64, 0), row.attempts);
+            try std.testing.expect(try db.clearArtifactRepairIssueIfCurrent(alloc, row, DB.ArtifactRepairIssueRevision.capture(row)));
+            found_unsupported = true;
+        }
+        try std.testing.expect(found_unsupported);
+        try std.testing.expectEqual(before, db.core.nextEnrichmentSequence());
+
         try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, 5);
+        var observed_failure = try db.repairArtifactIssuesWithRequestOptions(alloc, observation, deferred);
+        defer observed_failure.deinit(alloc);
+        try std.testing.expect(observed_failure.observed_only and observed_failure.debt_remaining);
+        try std.testing.expect(!observed_failure.has_more);
+        try std.testing.expectEqual(@as(u64, 0), observed_failure.in_progress);
+        try std.testing.expectEqual(@as(u64, 1), observed_failure.failed);
+        try std.testing.expectEqual(before, db.core.nextEnrichmentSequence());
+
         var result = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
             .target = .artifact,
             .index_name = "consumer",
@@ -101573,6 +105503,11 @@ test "db managed index repair keeps failed OCR manifests as debt" {
         completion.completed_sequence = issue.sequence;
         encodeArtifactRepairCompletionState(&encoded, completion);
         try db.core.store.put(completion_key, &encoded);
+        var observed_success = try db.repairArtifactIssuesWithRequestOptions(alloc, observation, deferred);
+        defer observed_success.deinit(alloc);
+        try std.testing.expect(!observed_success.debt_remaining);
+        try std.testing.expectEqual(@as(u64, 0), observed_success.failed);
+
         var completed = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
             .target = .artifact,
             .index_name = "consumer",
@@ -104682,6 +108617,128 @@ test "db batch persists per-index applied sequence watermark" {
     try std.testing.expectEqualStrings("ft_v1", owner_stats[1].name);
 }
 
+test "db batch publishes managed progress through the real write path (WS6)" {
+    // A synchronous `.full_index` write drives more than one internal flush
+    // pass (pre-existing coalescing granularity, unrelated to WS6), so this
+    // cannot assert an absolute "exactly one commit per write" count end to
+    // end. What WS6 actually guarantees — that every consumer touched by
+    // one flush pass lands in the same single `contributeProgress` commit,
+    // instead of a separate apply_state checkpoint plus up to two separate
+    // status commits per pass — is proven directly, deterministically, at
+    // the unit level by apply_state's "writes exactly one commit for a
+    // batch of consumers" test. This is the integration half: confirming
+    // the real write path actually reaches `contributeProgress` and that
+    // its v2 record is readable afterward.
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    apply_state.resetProgressCommitCountForTest();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expect(apply_state.progressCommitCount() >= 1);
+    const progress = (try apply_state.loadProgress(alloc, db.core.store, "ft_v1")).?;
+    try std.testing.expectEqual(try db.core.loadAppliedSequence(alloc, "ft_v1"), progress.applied_sequence);
+}
+
+test "db status snapshot persists at most once per interval across a write loop (WS6)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // 1,000 real, durably-synced writes can themselves take long enough
+    // wall-clock time to cross the default 5s interval many times over —
+    // that is a property of this test's I/O, not of the gate. Pin the
+    // interval to something the loop cannot plausibly cross so the
+    // assertion below is about the gate, not about how fast this machine's
+    // disk happens to be.
+    db.core.index_manager.status_persist_interval_ns = 3600 * std.time.ns_per_s;
+
+    apply_state.resetProgressCommitCountForTest();
+    resetStatusPersistCountForTest();
+
+    var key_buf: [32]u8 = undefined;
+    for (0..1000) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = key, .value = "{\"title\":\"alpha\"}" },
+            },
+            .sync_level = .full_index,
+        });
+    }
+
+    // Every publication still gets its own progress commit (no coalescing
+    // of the authoritative watermark across unrelated writes): at least one
+    // per write.
+    try std.testing.expect(apply_state.progressCommitCount() >= 1000);
+    // ...but the derived status snapshot, which is cheap to recompute and
+    // not needed for recovery, piggybacks on at most one of those commits
+    // per `status_persist_interval_ns`.
+    try std.testing.expectEqual(@as(u64, 1), statusPersistCountForTest());
+    try std.testing.expect(try db.core.loadAppliedSequence(alloc, "ft_v1") >= 1000);
+}
+
+test "db close deterministically flushes a pending status refresh (WS6)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{});
+        defer db.close();
+
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+        // An interval long enough that nothing inside this test's own
+        // duration would naturally cross it.
+        db.core.index_manager.status_persist_interval_ns = 3600 * std.time.ns_per_s;
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .full_index,
+        });
+        const first_status = (try db.loadIndexStatusSnapshot(alloc, "ft_v1")).?;
+        try std.testing.expectEqual(@as(u64, 1), first_status.doc_count);
+
+        // Within the interval: the persisted snapshot must not move yet.
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+            .sync_level = .full_index,
+        });
+        const still_stale_status = (try db.loadIndexStatusSnapshot(alloc, "ft_v1")).?;
+        try std.testing.expectEqual(@as(u64, 1), still_stale_status.doc_count);
+
+        // db.close() (via deinitWrapperState's close-time drain) must force
+        // one final status refresh through regardless of the interval, not
+        // leave the persisted snapshot stale for the next open.
+    }
+
+    var reopened = try DB.open(alloc, path_tmp.path(), .{ .open_mode = .writer_no_replay, .start_index_workers = false });
+    defer reopened.close();
+    const closed_status = (try reopened.loadIndexStatusSnapshot(alloc, "ft_v1")).?;
+    try std.testing.expectEqual(@as(u64, 2), closed_status.doc_count);
+}
+
 test "db managed projection checkpoints persist status and config identity" {
     const alloc = std.testing.allocator;
 
@@ -104778,9 +108835,15 @@ test "db batch truncates replay logs after managed indexes catch up" {
 
     _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
 
+    // WS5: the index-catch-up path only raises the retirement watermark now
+    // -- it never physically deletes journal entries itself. Physical
+    // retirement is the owner-only `DocStore.serviceRetirement`, normally
+    // driven by the owning maintenance turn; this single-process test
+    // stands in for that turn directly.
     var remaining_journal_entries: usize = std.math.maxInt(usize);
     var attempts: usize = 0;
     while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        _ = try db.core.store.serviceRetirement(alloc, true, .{});
         const journal_entries = try db.core.store.iterateReplayFrom(alloc, 1);
         defer {
             for (journal_entries) |*entry| entry.deinit(alloc);
@@ -104791,6 +108854,128 @@ test "db batch truncates replay logs after managed indexes catch up" {
         sleepPollInterval();
     }
     try std.testing.expectEqual(@as(usize, 0), remaining_journal_entries);
+}
+
+test "WS5 hosted replay retirement is leader-gated: the leader bounds the journal, a non-leader never retires" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |is_leader| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+
+        // The hosted (LSM-backed) primary storage path: the same DB and
+        // DocStore machinery WS5 wires for Lite, now exercised with the
+        // backend the server actually uses.
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{} },
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        // The same `ReplicationWriteGate.allows_background_work` every other
+        // independent-maintenance slice (artifact upload, baseline, producer,
+        // footprint) already keys off -- for a hosted deployment the server
+        // wires this to "is this node currently the Raft leader for this
+        // group". A standalone DB's gate is `null` (always allows); this
+        // test stands in for the hosted wiring directly.
+        const Gate = struct {
+            fn allow(_: *const anyopaque) anyerror!void {}
+        };
+        var gate_ctx: u8 = 0;
+        db.local_execution.replication_write_gate = .{ .borrowed = .{
+            .ptr = &gate_ctx,
+            .check_fn = Gate.allow,
+            .allows_background_work = is_leader,
+        } };
+
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} });
+        _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
+
+        const entries_before = try db.core.store.iterateReplayFrom(alloc, 1);
+        defer {
+            for (entries_before) |*entry| entry.deinit(alloc);
+            alloc.free(entries_before);
+        }
+        try std.testing.expect(entries_before.len > 0);
+
+        if (is_leader) {
+            // One owner-only maintenance turn (what the independent
+            // maintenance worker's `.replay_retirement` slice calls) bounds
+            // the whole journal in this small fixture.
+            var attempts: usize = 0;
+            while (attempts < default_test_wait_attempts) : (attempts += 1) {
+                if (!try db.advanceReplayJournalRetirement()) break;
+            }
+            const entries_after = try db.core.store.iterateReplayFrom(alloc, 1);
+            defer {
+                for (entries_after) |*entry| entry.deinit(alloc);
+                alloc.free(entries_after);
+            }
+            try std.testing.expectEqual(@as(usize, 0), entries_after.len);
+        } else {
+            try std.testing.expectError(error.NotLeader, db.advanceReplayJournalRetirement());
+            const entries_after = try db.core.store.iterateReplayFrom(alloc, 1);
+            defer {
+                for (entries_after) |*entry| entry.deinit(alloc);
+                alloc.free(entries_after);
+            }
+            try std.testing.expectEqual(entries_before.len, entries_after.len);
+        }
+    }
+}
+
+test "WS5 runUntilIdle drains journal retirement to completion at credit capacity" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} });
+    _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
+
+    // Every write-triggered path only enqueues a watermark now (WS5): the
+    // first document's replay entries are still here.
+    {
+        const entries = try db.core.store.iterateReplayFrom(alloc, 1);
+        defer {
+            for (entries) |*entry| entry.deinit(alloc);
+            alloc.free(entries);
+        }
+        try std.testing.expect(entries.len > 0);
+    }
+
+    // Pin capacity to exactly what is outstanding: a same-shaped second
+    // write's replay append no longer fits, so it is refused -- this is the
+    // reserve an explicit drain must not be able to exhaust.
+    const ledger_bytes = blk: {
+        const raw = try db.core.store.get(alloc, internal_keys.journal_credit_ledger_key[0..]);
+        defer alloc.free(raw);
+        break :blk (internal_keys.JournalCreditLedger.decode(raw) orelse return error.TestUnexpectedResult).bytes;
+    };
+    db.core.store.setJournalCreditPolicy(ledger_bytes, 0);
+
+    // The real explicit-drain entry point (also reached by the C API drain
+    // and `cmd/lite.zig run-until-idle`): it must retire the journal to
+    // completion, releasing the credit, not merely raise the watermark.
+    try db.runUntilIdle();
+
+    const ledger_after = blk: {
+        const raw = try db.core.store.get(alloc, internal_keys.journal_credit_ledger_key[0..]);
+        defer alloc.free(raw);
+        break :blk (internal_keys.JournalCreditLedger.decode(raw) orelse return error.TestUnexpectedResult).bytes;
+    };
+    try std.testing.expectEqual(@as(u64, 0), ledger_after);
+
+    // The capacity that refused a second write a moment ago now admits one:
+    // the drain actually released the reserve, not just advanced a cursor.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }} });
 }
 
 test "db async replay truncation retains durable enrichment debt" {
@@ -104834,7 +109019,14 @@ test "db async replay truncation retains durable enrichment debt" {
     // Repair-pin contention is covered with actual scheduled tasks in
     // "db replay truncation waits for repair pins through borrowed VoprIo".
     // This fixture verifies durable retention using the owner's native Io.
+    //
+    // WS5: `truncateReplaySequenceAsync` only raises the retirement
+    // watermark through its clamp (still bounded by the enrichment debt
+    // below) -- it no longer deletes. Drive the owner-only retirement
+    // service directly to exercise the clamp's effect on what actually
+    // survives.
     try truncateReplaySequenceAsync(db.async_context, target_sequence);
+    _ = try db.core.store.serviceRetirement(alloc, true, .{});
 
     const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
     defer {
@@ -105946,10 +110138,22 @@ test "db stats report projection checkpoint replay tail per index hint" {
         var latest_raw: [8]u8 = undefined;
         std.mem.writeInt(u64, &latest_raw, dense_target_sequence, .little);
         const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@backingInt(change_journal_mod.TargetHint.dense_vector)));
-        var batch = try db.core.store.beginWriteBatch();
-        errdefer batch.abort();
-        try batch.put(latest_key[0..], latest_raw[0..]);
-        try batch.commit();
+        {
+            // Scoped tightly around the batch's own lifetime: once `commit()`
+            // returns successfully it has already deinited/invalidated this
+            // batch (see `DocStore.Batch.commitStaged`'s and `StagedBatch.
+            // waitSequence`'s doc comments -- committing is the one place
+            // these release, by convention, and a second release double-frees,
+            // caught as an "incorrect alignment" panic inside
+            // `retained_effects.Capture.deinit`'s `keyIterator` on the now-
+            // `undefined` map). An `errdefer` left armed for the rest of this
+            // test's outer scope would fire on any assertion failure below,
+            // long after the batch it points to was already consumed.
+            var batch = try db.core.store.beginWriteBatch();
+            errdefer batch.abort();
+            try batch.put(latest_key[0..], latest_raw[0..]);
+            try batch.commit();
+        }
 
         const stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
@@ -105959,9 +110163,17 @@ test "db stats report projection checkpoint replay tail per index hint" {
         for (stats.indexes) |index| {
             if (std.mem.eql(u8, index.name, "ft_v1")) {
                 full_text_seen = true;
-                try std.testing.expectEqual(@as(u64, 0), index.replay_target_sequence);
-                try std.testing.expectEqual(@as(u64, 0), index.checkpoint_replay_tail_sequence_count);
-                try std.testing.expect(!index.replay_catch_up_required);
+                // WS5 journal sharing (docstore.zig's
+                // `latestReplaySequenceForOrdinal`) no longer writes a
+                // per-hint latest-sequence marker on every commit; an absent
+                // marker falls back to the shared producer head sequence as
+                // a conservative upper bound, not an exact per-hint
+                // watermark. ft_v1 never got its own marker written here, so
+                // it reports the same upper bound dv_v1's explicit marker
+                // does, not 0.
+                try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
+                try std.testing.expectEqual(dense_target_sequence, index.checkpoint_replay_tail_sequence_count);
+                try std.testing.expect(index.replay_catch_up_required);
             } else if (std.mem.eql(u8, index.name, "dv_v1")) {
                 dense_seen = true;
                 try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
@@ -105988,9 +110200,13 @@ test "db stats report projection checkpoint replay tail per index hint" {
     for (status_stats.indexes) |index| {
         if (std.mem.eql(u8, index.name, "ft_v1")) {
             status_full_text_seen = true;
-            try std.testing.expectEqual(@as(u64, 0), index.replay_target_sequence);
-            try std.testing.expectEqual(@as(u64, 0), index.checkpoint_replay_tail_sequence_count);
-            try std.testing.expect(!index.replay_catch_up_required);
+            // Same WS5 journal-sharing upper bound as the live-DB block
+            // above: ft_v1's never-written per-hint marker falls back to
+            // the shared producer head sequence, persisted and read back
+            // the same way here.
+            try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
+            try std.testing.expectEqual(dense_target_sequence, index.checkpoint_replay_tail_sequence_count);
+            try std.testing.expect(index.replay_catch_up_required);
         } else if (std.mem.eql(u8, index.name, "dv_v1")) {
             status_dense_seen = true;
             try std.testing.expectEqual(dense_target_sequence, index.replay_target_sequence);
@@ -106896,8 +111112,28 @@ test "db replay respects per-index applied watermarks" {
     const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
     try std.testing.expectEqual(appended_sequence, dense_applied);
 
+    // gr_v1's applied_sequence is allowed to advance here even though it
+    // never saw an explicit saveAppliedSequence call of its own: the one
+    // record in range genuinely was scanned (not skipped) and genuinely
+    // has nothing graph-relevant in it (the write only ever touched
+    // dv_v1's embedding), so this is a verified-empty window, not a
+    // vacuous one. "Applied through N" means "complete through N",
+    // which a verified-empty scan satisfies the same way a materialized
+    // write does -- see docs/design/lite-performance/lite-single-commit-
+    // write-path.md §3.2a. The contract this test guards is narrower than
+    // "never moves without an explicit save": an index must never apply or
+    // materialize a record that isn't relevant to it (gr_v1 gets no edges
+    // from a batch with none), and a gated/blocked index must never
+    // advance past work it hasn't done (covered separately by "db
+    // source-only batch retains a certified empty dense generation",
+    // where the embedder is blocked and the index correctly stays put).
+    // A verified-empty advance is allowed, and never advances past the
+    // extent that was actually scanned.
     const graph_applied = try reopened.core.loadAppliedSequence(alloc, "gr_v1");
-    try std.testing.expectEqual(@as(u64, 0), graph_applied);
+    try std.testing.expect(graph_applied <= appended_sequence);
+    const graph_entry = reopened.core.graphIndex("gr_v1") orelse return error.IndexNotFound;
+    const graph_stats = try graph_entry.index.stats(alloc);
+    try std.testing.expectEqual(@as(u64, 0), graph_stats.edge_count);
 }
 
 test "db replay applies dense embeddings from artifact payloads" {
@@ -108132,7 +112368,7 @@ test "db run_until_idle does not hang on an edges-only row when a generated enri
     try std.testing.expect(std.mem.indexOf(u8, b_value, "hello") != null);
 }
 
-test "collectTextDocumentWritesForIndex tolerates a missing document only when told to give up" {
+test "collectTextDocumentWritesForIndex requires durable evidence before retiring a missing document" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -108144,13 +112380,8 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
     defer db.close();
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
 
-    // "doc:never" is targeted for full-text replay but was never written --
-    // the same shape a thin-replay-reconstructed synthetic upsert has for an
-    // `_edges`-only document (issue #938): no primary row will ever appear
-    // for it. Without tolerate_missing_replay_documents this is the ordinary
-    // "not visible yet, retry" signal; with it (set only after bounded
-    // retries on this exact window have been exhausted) it must be a no-op
-    // skip instead.
+    // Absence alone cannot distinguish a legitimate pending producer from
+    // a damaged source row. Both retain debt until evidence or repair arrives.
     const documents = [_]derived_types.DerivedDocument{.{
         .key = "doc:never",
         .targets = &.{.{ .kind = .full_text, .index_name = "ft_v1" }},
@@ -108181,18 +112412,16 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
             "ft_v1",
             false,
             db.core.index_manager.byte_range,
-            .{ .tolerate_missing_replay_documents = true },
+            .{},
         );
         defer collected.deinit();
-        try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+        try std.testing.expectEqual(@as(usize, 1), collected.missing_required);
         try std.testing.expectEqual(@as(usize, 0), collected.docs.items.len);
     }
 
-    // A skipped document is not silently lost: it is counted per owner and
-    // index, both directly and through the same status listDerivedReplayDebt
-    // surfaces.
+    // Retrying never records a successful skip or manufactures coverage.
     try std.testing.expectEqual(
-        @as(u64, 1),
+        @as(u64, 0),
         db.core.index_manager.resource_manager.?.replayDocumentNotVisibleSkippedTotal(
             resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager),
             "ft_v1",
@@ -108206,7 +112435,7 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
     var saw_ft_v1 = false;
     for (debt) |status| {
         if (!std.mem.eql(u8, status.index_name, "ft_v1")) continue;
-        try std.testing.expectEqual(@as(u64, 1), status.replay_document_not_visible_skipped);
+        try std.testing.expectEqual(@as(u64, 0), status.replay_document_not_visible_skipped);
         saw_ft_v1 = true;
     }
     try std.testing.expect(saw_ft_v1);
@@ -111743,6 +115972,57 @@ test "db repair activation admission is time and sequence bounded" {
     );
 }
 
+test "repair activation pacing decisions follow the injected clock, not wall time" {
+    // repairActivationAdmissible/observeRepairCatchUpCost are pure functions
+    // of their numeric inputs (covered above); this proves the *clock reads*
+    // that feed those inputs and the activation deadline checks
+    // (repairPacingNowNs/ensureRepairActivationDeadline) follow whatever
+    // clock DB was given, not the real OS monotonic clock. Under VOPR that
+    // clock is the deterministic std.Io clock VOPR controls; here it is a
+    // ManualClock, frozen until this test advances it explicitly.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var manual = platform_clock.ManualClock{};
+    manual.setRealtimeNs(1_000 * std.time.ns_per_ms);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .repair_pacing_clock = manual.clock() });
+    defer db.close();
+
+    // repairPacingNowNs reads exactly the injected clock's value. The real
+    // OS monotonic clock has certainly advanced past 1_000ms-since-its-own-
+    // epoch by the time this test runs; DB must not see that.
+    try std.testing.expectEqual(@as(u64, 1_000 * std.time.ns_per_ms), db.repairPacingNowNs());
+
+    const activation_deadline_ns: u64 = 1_500 * std.time.ns_per_ms;
+
+    // Scenario A: the injected clock has not reached the activation
+    // deadline. The budget is still admissible.
+    try db.ensureRepairActivationDeadline(activation_deadline_ns);
+
+    // Scenario B: advance only the injected clock past the deadline. The
+    // decision flips purely because the controlled clock crossed the
+    // boundary, reproducibly, with no dependence on real elapsed time.
+    manual.setRealtimeNs(activation_deadline_ns + 1);
+    try std.testing.expectError(
+        error.RepairActivationBudgetExhausted,
+        db.ensureRepairActivationDeadline(activation_deadline_ns),
+    );
+
+    // The flip is exact and reproducible at the boundary itself: >= trips,
+    // one nanosecond short does not.
+    manual.setRealtimeNs(activation_deadline_ns);
+    try std.testing.expectError(
+        error.RepairActivationBudgetExhausted,
+        db.ensureRepairActivationDeadline(activation_deadline_ns),
+    );
+    manual.setRealtimeNs(activation_deadline_ns - 1);
+    try db.ensureRepairActivationDeadline(activation_deadline_ns);
+}
+
 test "db automatic dense repair bootstraps missing coverage metadata" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -111812,6 +116092,59 @@ test "db automatic dense repair bootstraps missing coverage metadata" {
     defer search_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), search_result.total_hits);
     try std.testing.expectEqualStrings("doc:a", search_result.hits[0].id);
+}
+
+test "db quarantined dense bootstrap repairs single chunk artifact sources" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\"embedding_name\":\"model\"", "\"sources\":[{\"artifact\":\"model\"}]" }) |source| {
+        var directory = try TestDirectory.init("quarantined-chunk-source");
+        defer directory.cleanup();
+        var embedder = GateDenseEmbedder{ .allowed_successes = .init(1000) };
+        const config = try std.fmt.allocPrint(alloc, "{{\"field\":\"embedding\",\"dims\":3,{s}}}", .{source});
+        defer alloc.free(config);
+        const cfg: types.IndexConfig = .{ .name = "dense_idx", .kind = .dense_vector, .coverage_generation = 7, .config_json = config };
+        var vector_count: u64 = 0;
+        {
+            var db = try openLegacyDenseTestDB(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false }, .enrichment = .{ .dense_embedder = embedder.interface() } });
+            defer db.close();
+            try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 8 });
+            try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "text", .source_artifact_name = "chunks", .expected_dims = 3 });
+            try db.addIndex(cfg);
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega\"}" }}, .sync_level = .full_index });
+            try db.runUntilIdle();
+            vector_count = db.core.index_manager.denseIndex(cfg.name).?.index.stats().active_count;
+            try std.testing.expect(vector_count > 1);
+            try std.testing.expectEqual(@as(?u64, vector_count), try denseTargetCountForIndexContext(db.async_context, cfg.name));
+            // Source outcomes count documents; this source emits many vectors.
+            var read = try db.core.store.beginReadTxn();
+            const authority = try @import("artifact_publication.zig").authority(&read);
+            read.abort();
+            for ([_][]const u8{ "produced", "skipped", "terminal_failed" }, 0..) |tag, i| {
+                const key = try @import("artifact_coverage_epoch.zig").counter(alloc, authority, cfg.name, cfg.coverage_generation, tag);
+                defer alloc.free(key);
+                var bytes: [8]u8 = undefined;
+                try db.core.store.put(key, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, if (i == 0) 1 else 0));
+            }
+        }
+        const dense_path = try std.fmt.allocPrintSentinel(alloc, "{s}/indexes/{s}", .{ directory.path(), cfg.name }, 0);
+        defer alloc.free(dense_path);
+        {
+            var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path, .{ .dims = 3, .storage_backend = .lsm }, .{});
+            try hbc.markPublishedGenerationIncompleteForTest();
+            hbc.close();
+        }
+        var reopened = try openLegacyDenseTestDB(alloc, directory.path(), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false }, .enrichment = .{ .dense_embedder = embedder.interface() } });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.index_manager.denseIndex(cfg.name) == null);
+        try std.testing.expectEqualStrings("IncompleteBulkPublish", reopened.core.index_manager.loadFailure(cfg.name).?);
+        try std.testing.expectEqual(@as(?u64, vector_count), try denseTargetCountForIndexContext(reopened.async_context, cfg.name));
+        const inference_before = embedder.total_requests.load(.acquire);
+        _ = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
+        const repair_id = (try reopened.indexRepairIdForIndex(alloc, cfg.name)) orelse return error.TestUnexpectedResult;
+        try std.testing.expect((try reopened.advanceIndexRepairIntent(alloc, repair_id, .{})).repaired);
+        try std.testing.expectEqual(vector_count, reopened.core.index_manager.denseIndex(cfg.name).?.index.stats().active_count);
+        try std.testing.expectEqual(inference_before, embedder.total_requests.load(.acquire));
+    }
 }
 
 test "db quarantined dense bootstrap tracks concurrent insert update and delete" {
@@ -111915,6 +116248,9 @@ test "db quarantined dense bootstrap tracks concurrent insert update and delete"
         @as(?u64, 1),
         try DB.loadDenseArtifactTargetCounter(alloc, reopened.core.store, cfg.name),
     );
+
+    try std.testing.expect(reopened.core.index_manager.denseIndex(cfg.name) == null);
+    try std.testing.expectEqual(@as(?u64, 1), try denseTargetCountForIndexContext(reopened.async_context, cfg.name));
 
     const repaired = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
     try std.testing.expect(repaired.repaired);
@@ -114058,14 +118394,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
         // count was never written for the newest source boundary.
         var missing_checkpoint = advanced_checkpoint;
         missing_checkpoint.published_count = null;
-        try apply_state.saveProjectionCheckpointWithSidecar(
-            alloc,
-            db.core.index_manager.checkpointIo(),
-            db.core.store,
-            db.core.applied_sequence_checkpoint_path,
-            cfg.name,
-            missing_checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(db.core.store, cfg.name, missing_checkpoint);
         try std.testing.expect(entry.validateRecoveredNativeServingCertificate(missing_checkpoint));
         const missing_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, missing_stats);
@@ -114075,14 +118404,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
             try std.testing.expectEqual(target_before, index_stats.doc_count);
         }
         entry.recovered_native_serving_certificate = null;
-        try apply_state.saveProjectionCheckpointWithSidecar(
-            alloc,
-            db.core.index_manager.checkpointIo(),
-            db.core.store,
-            db.core.applied_sequence_checkpoint_path,
-            cfg.name,
-            advanced_checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(db.core.store, cfg.name, advanced_checkpoint);
     }
     // A later live write can happen to reach the invalid certificate's
     // cardinality. Status may observe it, but only a publication boundary may
@@ -114475,14 +118797,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
     const restart_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
     var mismatched_restart_checkpoint = restart_checkpoint;
     mismatched_restart_checkpoint.published_count = target_before + 1;
-    try apply_state.saveProjectionCheckpointWithSidecar(
-        alloc,
-        db.core.index_manager.checkpointIo(),
-        db.core.store,
-        db.core.applied_sequence_checkpoint_path,
-        cfg.name,
-        mismatched_restart_checkpoint,
-    );
+    try apply_state.saveProjectionCheckpoint(db.core.store, cfg.name, mismatched_restart_checkpoint);
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{
         .start_optional_runtime_workers = false,
@@ -118495,9 +122810,11 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
             .status = .clean,
             .generation = 3,
         });
-        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
+        // A progress-v2 record that disagrees with HBC's own generation (a
+        // stale/foreign write, or a write from a different incarnation)
+        // must never override the native metadata that is actually serving.
         const mirrored_ahead_sequence: u64 = 1000;
-        try apply_state.saveProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, checkpoint_path, "dense_idx", .{
+        try apply_state.saveProjectionCheckpoint(db.core.store, "dense_idx", .{
             .applied_sequence = mirrored_ahead_sequence,
             .status = .clean,
             .generation = 99,
@@ -118542,7 +122859,7 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
     try std.testing.expectEqual(stats.indexes[0].replay_target_sequence -| checkpoint.applied_sequence, stats.indexes[0].checkpoint_replay_tail_sequence_count);
 }
 
-test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" {
+test "db dense projection checkpoint prefers hbc metadata over a corrupt progress v2 record" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -118584,11 +122901,12 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
             .denseIndex("dense_idx").?.index.experimentalPostingDurableAppliedSequence() orelse
             return error.TestUnexpectedResult;
 
-        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
-        try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
+        // Corrupt the progress v2 record directly (no more separate sidecar
+        // file to corrupt independently of the primary store).
+        try db.core.store.putBatch(&.{.{ .key = "\x00\x00__metadata__:progress:v2:dense_idx", .value = "not-a-progress-v2-record" }}, &.{});
         try std.testing.expectError(
             error.InvalidDerivedApplyState,
-            apply_state.loadProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, checkpoint_path, "dense_idx"),
+            apply_state.loadProjectionCheckpoint(alloc, db.core.store, "dense_idx"),
         );
     }
 
@@ -118906,6 +123224,46 @@ test "db dense target reads atomic outcome and source coverage snapshot" {
     try std.testing.expectError(error.InvalidDerivedCoverageCounter, denseTargetCountForIndexContext(db.async_context, config.name));
 }
 
+test "db dense target coverage defers for pending source material before any outcome exists" {
+    // Regression guard for the bootstrap-watermark bug fixed in
+    // 3a8e943a48 ("bound native_catalog text staging and dense coverage
+    // bootstrap race"): a fresh artifact-backed dense generation whose
+    // source material already exists, but whose embedder has not even been
+    // scheduled yet, has no outcome rows (produced/skipped/terminal_failed)
+    // and a dense artifact target counter bootstrapped at its trivial
+    // starting value of zero -- indistinguishable, by count alone, from a
+    // genuinely empty range. That must defer ("not yet determined"), never
+    // vacuously match a zero active count and let a watermark advance past
+    // work nobody has done.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const config: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense_idx\"}}",
+    };
+    try db.addIndex(config);
+
+    var one: [8]u8 = undefined;
+    std.mem.writeInt(u64, &one, 1, .little);
+    try db.core.store.put(&internal_keys.range_document_count_key, &one);
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
+    defer alloc.free(counter_key);
+    const zero: [8]u8 = @splat(0);
+    try db.core.store.put(counter_key, &zero);
+
+    try std.testing.expectEqual(@as(?u64, null), try denseTargetCountForIndexContext(db.async_context, config.name));
+}
+
 test "db artifact dense target prefers current incarnation outcomes over stale name counter" {
     const alloc = std.testing.allocator;
 
@@ -119158,6 +123516,130 @@ test "db last external dense bulk lease finalizes covered rebuilding generations
     } else return error.TestUnexpectedResult;
     try std.testing.expect(stats.async_indexing.dense_projection_finalizing);
     try std.testing.expect(!dense_stats.dense_vector_projection_pending);
+}
+
+test "db online vector publication visits each catalog entry once" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("online-vector-linear-catalog");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    for (0..8) |i| {
+        const name = try std.fmt.allocPrint(a, "external-{d}", .{i});
+        defer a.free(name);
+        try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+    }
+    try db.runUntilIdle();
+    const checkpoint_lookups = index_manager_mod.test_dense_checkpoint_name_visits.load(.acquire);
+    const catalogs = index_manager_mod.test_vector_publication_catalog_visits.load(.acquire);
+    const entries = index_manager_mod.test_vector_publication_entry_visits.load(.acquire);
+    _ = try db.publishVectorBlockBasesOnlineReported(.{});
+    try std.testing.expectEqual(checkpoint_lookups, index_manager_mod.test_dense_checkpoint_name_visits.load(.acquire));
+    // DB dispatches its pinned entries directly; no name-filtered nested walk.
+    try std.testing.expectEqual(catalogs, index_manager_mod.test_vector_publication_catalog_visits.load(.acquire));
+    try std.testing.expectEqual(entries + 8, index_manager_mod.test_vector_publication_entry_visits.load(.acquire));
+    _ = try db.core.index_manager.publishVectorBlockBasesOnlineReported(.{});
+    try std.testing.expectEqual(catalogs + 8, index_manager_mod.test_vector_publication_catalog_visits.load(.acquire));
+    try std.testing.expectEqual(entries + 16, index_manager_mod.test_vector_publication_entry_visits.load(.acquire));
+}
+
+test "db online vector repair completes independently of partial sibling coverage" {
+    for ([_]bool{ false, true }) |native_round| {
+        const a = std.testing.allocator;
+        var directory = try TestDirectory.init("online-vector-independent-repair");
+        defer directory.cleanup();
+        var storage = lsm_backend_mod.MemoryStorage.init(a);
+        defer storage.deinit();
+        var embedder = GateDenseEmbedder{ .allowed_successes = .init(100) };
+        var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false }, .enrichment = .{ .dense_embedder = embedder.interface() } });
+        defer db.close();
+        try db.addIndex(.{ .name = "A", .kind = .dense_vector, .coverage_generation = 1, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"A\"}}" });
+        try db.batch(.{ .writes = &.{
+            .{ .key = "one", .value = "{\"body\":\"first source\"}" },
+            .{ .key = "two", .value = "{\"body\":\"second source\"}" },
+        }, .sync_level = .full_index });
+        try db.runUntilIdle();
+        embedder.allowed_successes.store(0, .release);
+        try db.addIndex(.{ .name = "B", .kind = .dense_vector, .coverage_generation = 2, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"B\"}}" });
+        try replayPendingDerivedBatches(&db, null, null, .{});
+        try db.flushAppliedSequencesForIdle();
+        var authority_read = try db.core.store.beginReadTxn();
+        const authority = try @import("artifact_publication.zig").authority(&authority_read);
+        authority_read.abort();
+        // Durable producer state: A has both outputs; B has settled one
+        // skipped input and cannot finish its remaining provider work.
+        for ([_][]const u8{ "A", "B" }, 0..) |name, i| {
+            for ([_][]const u8{ "produced", "skipped", "terminal_failed" }, 0..) |tag, j| {
+                const key = try @import("artifact_coverage_epoch.zig").counter(a, authority, name, db.core.index_manager.coverageGenerationForIndex(name).?, tag);
+                defer a.free(key);
+                var value: [8]u8 = undefined;
+                const count: u64 = if (i == 0 and j == 0) 2 else if (i == 1 and j == 1) 1 else 0;
+                try db.core.store.put(key, internal_keys.encodeDerivedCoverageOutcomeCount(&value, count));
+            }
+        }
+        try std.testing.expect(!try denseCorpusCoverageAllowsPrimarySnapshot(db.async_context));
+        const manager = db.core.index_manager;
+        // B's admission changed no A inputs. Model the already-consumed
+        // source-only boundary before removing A's acceleration generation.
+        const stable_tip = db.core.store.lastReplaySequence(0);
+        try manager.ensureDensePostingCoverageByName("A", stable_tip);
+        try db.core.saveAppliedSequence("A", stable_tip);
+        manager.clearVectorBlockGenerationForTest();
+        manager.setVectorBlockStorage(storage.storage());
+        const before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+        // A healthy recurring pass must still suppress this corpus scan.
+        _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A" });
+        try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        var checkpoint = try db.core.loadProjectionCheckpoint(a, "A");
+        checkpoint.status = .rebuilding;
+        try db.core.saveProjectionCheckpoint("A", checkpoint);
+        _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A", .allow_primary_snapshot = false });
+        try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        const produced_key = try @import("artifact_coverage_epoch.zig").counter(a, authority, "A", db.core.index_manager.coverageGenerationForIndex("A").?, "produced");
+        defer a.free(produced_key);
+        var produced_value: [8]u8 = undefined;
+        try db.core.store.put(produced_key, internal_keys.encodeDerivedCoverageOutcomeCount(&produced_value, 1));
+        if (native_round) {
+            _ = try nativeProjectionMaintenanceRound(db.async_context);
+        } else {
+            _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A" });
+        }
+        try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        // Missing counters are not proof of completion. In particular a
+        // newly admitted producer must not acquire the repair exception.
+        for ([_][]const u8{ "produced", "skipped", "terminal_failed" }) |tag| {
+            const key = try @import("artifact_coverage_epoch.zig").counter(a, authority, "A", db.core.index_manager.coverageGenerationForIndex("A").?, tag);
+            defer a.free(key);
+            try db.core.store.delete(key);
+        }
+        if (native_round) {
+            _ = try nativeProjectionMaintenanceRound(db.async_context);
+        } else {
+            _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A" });
+        }
+        try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        for ([_][]const u8{ "produced", "skipped", "terminal_failed" }, 0..) |tag, i| {
+            const key = try @import("artifact_coverage_epoch.zig").counter(a, authority, "A", db.core.index_manager.coverageGenerationForIndex("A").?, tag);
+            defer a.free(key);
+            try db.core.store.put(key, internal_keys.encodeDerivedCoverageOutcomeCount(&produced_value, if (i == 0) 2 else 0));
+        }
+        if (native_round) {
+            _ = try nativeProjectionMaintenanceRound(db.async_context);
+        } else {
+            _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A" });
+        }
+        try std.testing.expectEqual(before + 1, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        try std.testing.expect(manager.vectorBlockReadyForDenseIndex("A"));
+        try std.testing.expect(!try denseCorpusCoverageAllowsPrimarySnapshot(db.async_context));
+        // A's repair completes without another scan or any change to B.
+        _ = try nativeProjectionMaintenanceRound(db.async_context);
+        const repaired = try db.core.loadProjectionCheckpoint(a, "A");
+        try std.testing.expect(repaired.status == .clean);
+        try std.testing.expectEqual(before + 1, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        var result = try db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
+        defer result.deinit();
+        try std.testing.expect(result.hits.len != 0);
+    }
 }
 
 test "db online vector publication leaves foreground and posting mutation admission open" {
@@ -119707,7 +124189,7 @@ test "db external dense ingest finalizes an exactly covered rebuilding checkpoin
     try std.testing.expectEqual(@as(u64, 1), checkpoint.generation);
 }
 
-test "db corrupt projection sidecar degrades non-dense checkpoint and quarantines writes" {
+test "db corrupt progress v2 record degrades non-dense checkpoint and quarantines writes" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -119736,8 +124218,7 @@ test "db corrupt projection sidecar degrades non-dense checkpoint and quarantine
             .config_hash = types.indexConfigHash(text_cfg),
         });
 
-        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
-        try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
+        try db.core.store.putBatch(&.{.{ .key = "\x00\x00__metadata__:progress:v2:ft_idx", .value = "not-a-progress-v2-record" }}, &.{});
     }
 
     {
@@ -120710,7 +125191,6 @@ test "db dense artifact rebuild persists state through external index storage" {
         },
         .physical_root_mode = .external_backend,
         .index_base_path = index_base_path,
-        .external_derived_checkpoints = false,
         .start_index_workers = false,
         .start_optional_runtimes = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -121864,6 +126344,20 @@ test "db graph indexed admission reuses compressed membership and honors cancell
     defer identity.deinit(a);
     const ordinal = identity.ordinals[0];
     try std.testing.expect(before.resolved_doc_filter.?.include.containsOrdinal(ordinal));
+    var frontier_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 32 * 1024 });
+    var frontier_req = req;
+    frontier_req.graph_work_budget = &frontier_budget;
+    {
+        var scoped = try db.graphRequestWithIndexedFilterForKeysAlloc(frontier_req, &.{"b"}, null);
+        defer scoped.deinit();
+        try std.testing.expect(scoped.frontier_scoped);
+        try std.testing.expect(!scoped.resolved_doc_filter.?.include.containsOrdinal(ordinal));
+    }
+    frontier_req.exclusion_query_json = req.filter_query_json;
+    const excluded = try db.filterGraphKeysAlloc(a, frontier_req, &.{"b"});
+    defer a.free(excluded);
+    try std.testing.expect(!excluded[0]);
+    try std.testing.expectEqual(@as(usize, 0), frontier_budget.retained_state_bytes);
     try db.batch(.{ .deletes = &.{"a"}, .sync_level = .full_index });
     var after = try db.graphRequestWithIndexedFilterAlloc(req);
     defer after.deinit();
@@ -124045,7 +128539,7 @@ test "db graph ttl source retirement ignores abandoned replay reservations witho
         break :blk try db.core.store.lastReplaySequenceFromTxn(&txn, 0);
     };
     try std.testing.expect(committed_tip > 0);
-    try std.testing.expectEqual(committed_tip, try loadManagedAppliedSequenceContext(alloc, db.core.index_manager, db.core.store, batch_ctx.applied_sequence_checkpoint_path, .{ .name = "relations_graph", .kind = .graph }));
+    try std.testing.expectEqual(committed_tip, try loadManagedAppliedSequenceContext(alloc, db.core.index_manager, db.core.store, .{ .name = "relations_graph", .kind = .graph }));
     // A mutation can reserve its sequence and fail before the primary commit.
     // With no workers, no executor can certify this nonexistent replay debt.
     const abandoned = db.core.store.reserveNextReplaySequence(1);
@@ -136629,7 +141123,7 @@ test "db dense lsm cache profile benchmark" {
     for (0..reps) |_| {
         const total_start = monotonicTimeNs();
         const profiled_entry = dense_entry;
-        const chunk_backed = profiled_entry.chunk_name != null;
+        const chunk_backed = profiled_entry.memberBacked();
         const group_chunk_parents = db_query_search.shouldGroupChunkParents(req, chunk_backed);
         const effective_k: u32 = if (group_chunk_parents)
             @intCast(profiled_entry.index.metadata.active_count)
@@ -137584,6 +142078,73 @@ test "db native snapshot rejects an external physical root before creating artif
     const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
     defer alloc.free(snapshot_parent);
     try std.testing.expect(!try snapshotPathExists(std.testing.io, snapshot_parent));
+}
+
+test "db external-backend reader observes a writer's latest durable progress v2 record" {
+    // searchLockedWithExecutionContextImpl's logical-value completeness
+    // check used to have a raw-storage fallback here, gated on
+    // `retained_remote_query_lease != null`: a reader attached to a
+    // retained/leased generation (an external physical root sharing the
+    // writer's backing store, exactly like this test's reader) could not
+    // trust its own ordinary read of the applied-sequence watermark. That
+    // was a v1 property, not a cross-process MVCC staleness one: v1 kept
+    // two independently written representations of the same progress (a
+    // scalar KV key, updated through the ordinary docstore write path, and
+    // an "enriched" checkpoint written only to an external file sidecar
+    // via a separate I/O path), and the two could legitimately disagree.
+    // Only the file representation was guaranteed to travel with, and
+    // match, the retained generation's physical content, so the fallback
+    // read it directly through raw storage, bypassing the docstore.
+    //
+    // Progress v2 merges both representations into one record, written
+    // and read through exactly one path (`contributeProgress`/
+    // `loadProgress`, a fresh read each call). There is no longer a second,
+    // independently timed representation that could diverge from it, so
+    // the fallback's raw-storage bypass has nothing left to reconcile.
+    // This test proves the replacement directly: a reader opened with
+    // `physical_root_mode = .external_backend` against the writer's exact
+    // backing store (the same relationship `retained_remote_query_lease`
+    // establishes) observes the writer's latest durable applied sequence
+    // through the ordinary v2 read, with no raw-storage bypass needed.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    defer cleanupTempDir(path);
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "progress-v2-external-reader" });
+    defer runtime_store.deinit();
+
+    var writer = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .primary_runtime_store = &runtime_store,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer writer.close();
+    try writer.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try writer.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+    const writer_applied = try writer.core.loadAppliedSequence(alloc, "ft_v1");
+    try std.testing.expect(writer_applied > 0);
+
+    var reader = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .primary_runtime_store = &runtime_store,
+        .physical_root_mode = .external_backend,
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reader.close();
+    const reader_observed = try apply_state.loadAppliedSequence(alloc, reader.core.store, "ft_v1");
+    try std.testing.expectEqual(writer_applied, reader_observed);
 }
 
 test "native restore backend configuration is resolved exactly once" {
@@ -143272,6 +147833,14 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             // The retired unit still has a live sparse posting. Filtering must
             // follow logical output membership, not the physical artifact tail.
             try std.testing.expectEqualSlices(u32, &expected, nums);
+            const by_key = try owner.core.index_manager.lookupSparseDocNumsForParentKeysAlloc(a, owner.core.store, "chunk_sparse", &.{ "doc\x00", "doc\x00", "absent" });
+            defer a.free(by_key);
+            try std.testing.expectEqualSlices(u32, &expected, by_key);
+            const exact_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(a, "doc\x00", "chunks", "z", 0);
+            defer a.free(exact_key);
+            const exact = try owner.core.index_manager.lookupSparseDocNumsForParentKeysAlloc(a, owner.core.store, "chunk_sparse", &.{exact_key});
+            defer a.free(exact);
+            try std.testing.expectEqualSlices(u32, expected[1..], exact);
             var read = try owner.core.store.beginReadTxn();
             defer read.abort();
             var binary = try @import("artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(a, &read, "doc\x00", "fresh\x00");
@@ -147544,7 +152113,12 @@ test "lite bounded reader integration publishes full text mappings through db" {
         defer result.deinit();
         try std.testing.expectEqual(@as(u32, 1), result.total_hits);
         const entry = db.core.index_manager.textIndexEntry("text").?;
-        try std.testing.expect(entry.persistent.supportsFileBackedSegmentArtifacts());
+        // `.native_catalog` publishes segments inline through the catalog
+        // sink, not through a file-backed SegmentFileStore or the artifact
+        // leases that come with one -- so it never supports file-backed
+        // segment artifacts. It still needs a bounded, real scratch
+        // directory for large-payload typed staging, asserted below.
+        try std.testing.expect(!entry.persistent.supportsFileBackedSegmentArtifacts());
         const scratch_directory = entry.persistent.privateScratchDirectory("virtual fallback").?;
         try std.testing.expectEqualStrings(std.fs.path.dirname(path).?, scratch_directory);
         // Force native typed staging through the production kernel builder.
@@ -147557,7 +152131,13 @@ test "lite bounded reader integration publishes full text mappings through db" {
         });
         const snapshot = entry.persistent.acquireSnapshot();
         defer snapshot.release();
-        for (snapshot.segments) |segment| try std.testing.expect(segment.data == .native);
+        // `.native_catalog` segments publish as owned heap buffers inline
+        // through the catalog sink (see `indexSegmentOwned`'s
+        // `segment_files == null` branch) -- `SegmentData.native` names a
+        // different, file-backed representation entirely (built from a
+        // finished atomic-write source; see `fromNative`/`finishSource` in
+        // `indexSegmentFromSinkBuilder`), so it never applies here.
+        for (snapshot.segments) |segment| try std.testing.expect(segment.data == .heap);
         try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).artifact_file_bytes);
     }
     try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).artifact_file_bytes);
@@ -147859,7 +152439,7 @@ test "db live primary directory bounds reads after deletion and survives reopen 
     try db.batch(.{ .writes = &writes, .sync_level = .full_index });
     try db.batch(.{ .deletes = &deleted, .sync_level = .full_index });
     const Visitor = struct {
-        fn visit(raw: ?*anyopaque, id: []const u8) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
             const count: *usize = @ptrCast(@alignCast(raw.?));
             count.* += 1;
             try std.testing.expectEqualStrings("z", id);
@@ -147923,7 +152503,7 @@ test "db primary scan retains historical identity visibility (#1095)" {
     var seen: usize = 0;
     var historical = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{ .identity_read_generation = created } };
     const Visitor = struct {
-        fn visit(raw: ?*anyopaque, id: []const u8) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
             const count: *usize = @ptrCast(@alignCast(raw.?));
             count.* += 1;
             try std.testing.expectEqualStrings("a", id);
@@ -149027,9 +153607,16 @@ test "public graph metric borrowed wire content migration fences edits abort del
     const kc = try internal_keys.documentKeyAlloc(a, "c");
     defer a.free(kc);
     {
+        // Drop each cached content proof while preserving its revision, the
+        // merged-record equivalent of deleting a separate content-only key.
         var write = try db.core.store.beginWriteTxn();
         errdefer write.abort();
-        for ([_][]const u8{ ka, kb, kc }) |key| try write.delete(&revision.contentKey(revision.keyForPhysical(key).?));
+        for ([_][]const u8{ ka, kb, kc }) |key| {
+            const revision_key = revision.keyForPhysical(key).?;
+            const current_revision = try revision.load(&write, revision_key);
+            var buf: [revision.encoded_len_with_content]u8 = undefined;
+            try write.put(&revision_key, revision.encodeCombined(&buf, .{ .revision = current_revision, .content = null }));
+        }
         try write.commit();
     }
     // This fixture exercises fencing within one page. A real 2 ms clock may
@@ -149075,16 +153662,17 @@ test "public graph metric borrowed wire content migration fences edits abort del
     }
     try std.testing.expect(try db.advanceDocumentAuthorityBackfillPage());
     try std.testing.expect(!db.document_authority_backfill_active.load(.acquire));
-    // Simulate a revision-aware older writer that cannot refresh our cache.
+    // Simulate a revision-aware older writer that cannot refresh our cache:
+    // it advances the revision and drops the content proof in one write.
     var expected_revision: u64 = undefined;
     {
         var write = try db.core.store.beginWriteTxn();
         errdefer write.abort();
-        expected_revision = (try revision.load(&write, revision.keyForPhysical(kb).?)) + 1;
-        var bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &bytes, expected_revision, .little);
+        const revision_key = revision.keyForPhysical(kb).?;
+        expected_revision = (try revision.load(&write, revision_key)) + 1;
+        var buf: [revision.encoded_len_with_content]u8 = undefined;
         try write.write.?.put(kb, "{\"n\":5}");
-        try write.put(&revision.keyForPhysical(kb).?, &bytes);
+        try write.put(&revision_key, revision.encodeCombined(&buf, .{ .revision = expected_revision, .content = null }));
         try write.commit();
     }
     const hits = try a.alloc(types.SearchHit, 1);
@@ -152286,6 +156874,288 @@ test "db manual text producers merge capacity without optional workers visibilit
     try std.testing.expectEqual(@as(i64, 1), completed.value.object.get("count").?.integer);
 }
 
+// Bug repro: a `.full_text` write whose visibility wait times out
+// (`error.CommitVisibilityNotSatisfied` -- the primary write is still
+// durable; only the derived/full-text wait missed its deadline) must not
+// leave `close()` hanging forever. Previously, `DB.close()` -> ... ->
+// `maintenance_scheduler.Scheduler.destroy()` parked forever waiting for
+// `tasks.items.len == 0`: some registration made reachable from the
+// visibility-wait path was never `Handle.await()`'d/`cancel()`'d once the
+// wait itself gave up at its deadline. Run `close()` on its own thread with
+// a bounded deadline so a regression here fails the test instead of
+// hanging the whole suite forever.
+test "full_text visibility wait timeout does not hang DB.close" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("bug1-shutdown-hang");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .io_threaded },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+
+    // Deterministically force the visibility wait below to miss its
+    // deadline: pause the full-text derived worker so it can never advance
+    // past this write (mirrors `io_threaded_runtime.zig`'s own "paused"
+    // worker tests), then shrink the wait timeout to effectively zero.
+    try std.testing.expect(try db.executor.pauseWorker("ft_v1"));
+    test_visibility_wait_timeout_ms = 1;
+    defer test_visibility_wait_timeout_ms = null;
+
+    const request: types.BatchRequest = .{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"beta\"}" }},
+        .sync_level = .full_text,
+    };
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, db.batch(request));
+
+    const Closer = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.db.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            // Closing is stuck: detach rather than join (it may never
+            // return) and fail loudly instead of hanging the whole suite.
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    db_open = false;
+}
+
+// Bug repro, variant 2: same shape as "db manual text producers merge
+// capacity without optional workers visibility timeout preserves a
+// committed transform" above, but instead of releasing the held producer
+// permit and draining before `close()`, close immediately while the permit
+// (and whatever admission/registration its holder's visibility wait left
+// behind) is still outstanding -- the state an abrupt shutdown right after
+// a timed-out `.full_text` write would actually observe.
+test "full_text visibility wait timeout via text merge backpressure does not hang DB.close" {
+    const alloc = std.testing.allocator;
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("bug1-shutdown-hang-2");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .manual },
+        .start_optional_runtime_workers = false,
+        .text_merge = .{ .enabled = true, .max_pending_segments = 12, .max_pending_bytes = 0, .backpressure_max_wait_ms = 100 },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"body\":\"counter\",\"count\":0}" }}, .sync_level = .write });
+    // Deliberately never released: this test exercises `close()` while the
+    // permit (and whatever state its holder's timed-out visibility wait
+    // left behind) is still outstanding, matching an abrupt shutdown right
+    // after a timed-out `.full_text` write. Releasing it would require the
+    // runtime `close()` is tearing down, so this is not a leak either way:
+    // `held` is a plain stack value with no allocation of its own.
+    var held = try db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 12, 0);
+    _ = &held;
+    const request: types.BatchRequest = .{
+        .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }},
+        .sync_level = .full_text,
+    };
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, db.batch(request));
+
+    const Closer = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.db.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    db_open = false;
+}
+
+// Bug repro, variant 3: a zero-length deadline with the derived worker
+// healthy and actively racing to catch up (not paused) -- closing right as
+// background `.full_text` work is in flight for the write whose foreground
+// wait just gave up.
+test "full_text visibility wait timeout with an active derived worker does not hang DB.close" {
+    const alloc = std.testing.allocator;
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("bug1-shutdown-hang-3");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .io_threaded },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    test_visibility_wait_timeout_ms = 0;
+    defer test_visibility_wait_timeout_ms = null;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        defer alloc.free(key);
+        const request: types.BatchRequest = .{
+            .writes = &.{.{ .key = key, .value = "{\"body\":\"beta gamma delta\"}" }},
+            .sync_level = .full_text,
+        };
+        db.batch(request) catch |err| switch (err) {
+            error.CommitVisibilityNotSatisfied => {},
+            else => return err,
+        };
+    }
+
+    const Closer = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.db.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    db_open = false;
+}
+
+// Bug repro, variant 4: a *real*, scheduler-registered text-merge worker
+// (optional runtime workers on, matching production defaults) rather than
+// the manual-producer-assistance mode variant 2 above exercises. The
+// producer permit is held externally (as if a `.full_text` write's
+// visibility wait had just timed out while backpressured) and never
+// released before `close()`.
+test "full_text visibility wait timeout with a live text-merge worker does not hang DB.close" {
+    const alloc = std.testing.allocator;
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("bug1-shutdown-hang-4");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .io_threaded },
+        .text_merge = .{ .enabled = true, .max_pending_segments = 12, .max_pending_bytes = 0, .backpressure_max_wait_ms = 100 },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"body\":\"counter\",\"count\":0}" }}, .sync_level = .write });
+    try std.testing.expect(db.text_merge_runtime.?.isStarted());
+
+    // Claim the rest of the segment budget. Unlike variant 2's manual-mode
+    // runtime (which never races this acquire), the live worker notified by
+    // `addWorker`/the batch above already wins the race to index "counter"
+    // into ft_v1's own first segment before this loop's first attempt can
+    // even run -- `acquireProducerPermitWithApplyOwnership`'s admission
+    // check always observes `active_segments >= 1` by then, deterministically,
+    // not just occasionally. Asking for all 12 therefore always overshoots
+    // by exactly that one already-durable segment and times out every one
+    // of the 200 attempts; ask for 11 so admission succeeds whether this
+    // runs before or after the worker's own segment lands.
+    var held = held_loop: for (0..200) |_| {
+        break :held_loop db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 11, 0) catch |err| switch (err) {
+            error.TextMergeBackpressureTimeout => {
+                std.Thread.yield() catch {};
+                continue;
+            },
+            else => return err,
+        };
+    } else return error.TextMergeBackpressureTimeout;
+    _ = &held;
+    const request: types.BatchRequest = .{
+        .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }},
+        .sync_level = .full_text,
+    };
+    // With a live, scheduler-registered worker (unlike variant 2's manual
+    // mode) the backpressure timeout can surface either wrapped (primary
+    // already committed) or bare (admission blocked before the primary
+    // write landed) depending on exactly when the worker's own activity
+    // interleaves with this call. Holding 11 of ft_v1's 12-segment budget
+    // leaves no room for the worker's own catch-up of this write either, so
+    // the race can also resolve as the worker's bounded recoverable-retry
+    // backoff (`scheduleRecoverableCatchUpRetry`/`catch_up_exhausted`)
+    // giving up first and marking itself permanently failed before this
+    // call's own visibility wait observes the softer, transient error -- a
+    // third legitimate shape of the same underlying backpressure this held
+    // permit models. Only that path logs (the worker's own `std.log.err`
+    // on exhaustion); the other two never do, so the expectation is
+    // declared only once the outcome is known, not unconditionally.
+    db.batch(request) catch |err| switch (err) {
+        error.CommitVisibilityNotSatisfied, error.TextMergeBackpressureTimeout => {},
+        error.AsyncWorkerFailed => @import("antfly_test_error_logs").expectErrorLogs(1),
+        else => return err,
+    };
+
+    const Closer = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.db.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    db_open = false;
+}
+
 comptime {
     if (@import("builtin").is_test) _ = @import("mutation_commit_disposition_test.zig");
 }
@@ -154239,6 +159109,33 @@ test "source semantic media input rejects PDF ancestry on nonempty sources and p
     try std.testing.expectEqual(@as(usize, 1), dense_requests);
 }
 
+test "source semantic media input PDF cardinality changes require removing dense consumers" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/pages.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try @import("../lite/backend.zig").Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtime_workers = false };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    var config = types.EnrichmentConfig{ .name = "visual", .kind = .embedding, .field = "url", .expected_dims = 3 };
+    try db.addEnrichment(config);
+    const index = types.IndexConfig{ .name = "images", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":3,\"embedding_name\":\"visual\"}" };
+    try db.addIndex(index);
+    config.embedding_input = .pdf_page_images;
+    try std.testing.expectError(error.EnrichmentInUse, db.upsertEnrichment(config));
+    try std.testing.expect(try db.deleteIndex("images"));
+    while (try db.advanceGeneratedArtifactCleanupPage("images") != .idle) {}
+    _ = try db.upsertEnrichment(config);
+    try db.addIndex(index);
+    config.embedding_input = .text;
+    try std.testing.expectError(error.EnrichmentInUse, db.upsertEnrichment(config));
+    try std.testing.expect(db.core.index_manager.denseIndex("images").?.memberBacked());
+}
+
 test "source semantic media input PDF producers cannot be bound to sparse consumers" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("source-pdf-sparse");
@@ -154589,6 +159486,21 @@ fn testProducerDefinitionPublication(replace_definition: bool) !void {
         fn caps(_: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(1) };
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(1))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn requireFresh(self: *@This(), alloc: Allocator) !void {
             const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "vectors");
             defer alloc.free(key);
@@ -154620,7 +159532,7 @@ fn testProducerDefinitionPublication(replace_definition: bool) !void {
     var directory = try TestDirectory.init("late-definition");
     defer directory.cleanup();
     var probe = Probe{ .replace_definition = replace_definition };
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-definition", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-definition", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps } } });
     defer db.close();
     probe.db = &db;
     try db.addEnrichment(Probe.config(false));
@@ -154706,6 +159618,18 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
             }
             return rows;
         }
+        fn densePlanned(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            return denseBatch(raw, a, name, texts, dims);
+        }
+        fn sparsePlanned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, context: ?@import("antfly_inference_execution_context").RequestContext, generation: embedder_mod.SparseEmbedder.Generation) ![]embedder_mod.SparseEmbedding {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(generation.revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            return sparseBatch(raw, result_alloc, name, texts);
+        }
         fn denseControlled(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: @import("antfly_inference_execution_context").RequestContext) ![]const []const f32 {
             try context.check();
             return denseBatch(raw, a, name, texts, dims);
@@ -154750,17 +159674,22 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
     var directory = try TestDirectory.init("document-generation-preparation");
     defer directory.cleanup();
     const batch_boundary = mode == .between_batches or shape == .extracted;
-    var probe = Probe{ .change_after_checks = if (sparse)
-        (if (batch_boundary) @as(usize, 1) else 2)
-    else switch (shape) {
-        .extracted => 2,
-        .inline_chunks => if (batch_boundary) @as(usize, 2) else 3,
-        .materialized_chunks => if (batch_boundary) @as(usize, 3) else 4,
-    }, .change = mode != .stable };
+    var probe = Probe{
+        .change_after_checks = if (sparse)
+            (if (batch_boundary) @as(usize, 1) else 2)
+        else switch (shape) {
+            // Leased execution no longer performs the legacy post-call alias
+            // observation; the materializer still fences every completed batch.
+            .extracted => 1,
+            .inline_chunks => if (batch_boundary) @as(usize, 1) else 2,
+            .materialized_chunks => if (batch_boundary) @as(usize, 2) else 3,
+        },
+        .change = mode != .stable,
+    };
     var db = try DB.open(alloc, directory.path(), .{
         .start_optional_runtime_workers = false,
         .start_index_workers = false,
-        .enrichment = .{ .owner_id = "document-generation", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .dense_embed_batch_with_context_fn = Probe.denseControlled, .capabilities_fn = Probe.caps, .foreground_bounded = true }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseOne, .sparse_embed_batch_fn = Probe.sparseBatch, .sparse_embed_batch_with_context_fn = Probe.sparseControlled, .cache_revision_fn = Probe.revisionFn, .foreground_bounded = true } },
+        .enrichment = .{ .owner_id = "document-generation", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .dense_embed_batch_planned_fn = Probe.densePlanned, .dense_embed_batch_with_context_fn = Probe.denseControlled, .capabilities_fn = Probe.caps, .foreground_bounded = true }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseOne, .sparse_embed_batch_fn = Probe.sparseBatch, .sparse_embed_batch_planned_fn = Probe.sparsePlanned, .sparse_embed_batch_with_context_fn = Probe.sparseControlled, .cache_revision_fn = Probe.revisionFn, .foreground_bounded = true } },
     });
     defer db.close();
     const chunk_size: u32 = if (mode == .between_batches or mode == .stable) 256 else 4096;
@@ -154823,4 +159752,2457 @@ test "db ordered source scope controls fence legacy activation and recover nativ
     var directory = try TestDirectory.init("source-scope-control");
     defer directory.cleanup();
     try @import("source_scope_control_native_test.zig").run(std.testing.allocator, directory.path());
+}
+
+test "index alias storage fences reject same-name replacement and survive query leases" {
+    const a = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("alias-fence");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .primary_backend = .{ .mem = .{} } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 41 });
+    const request: types.SearchRequest = .{ .index_alias_fences = &.{.{ .name = "text", .incarnation = 41 }} };
+    var lease = try db.beginQueryReadLease();
+    _ = try db.searchRequestAtCurrentIdentityGeneration(request);
+    lease.release();
+    _ = try db.deleteIndex("text");
+    // Retirement owns the physical name until asynchronous artifact cleanup
+    // completes; replacement must exercise the post-cleanup incarnation fence.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 42 });
+    lease = try db.beginQueryReadLease();
+    defer lease.release();
+    try std.testing.expectError(error.CatalogGenerationChanged, db.searchRequestAtCurrentIdentityGeneration(request));
+    _ = try db.searchRequestAtCurrentIdentityGeneration(.{ .index_alias_fences = &.{.{ .name = "text", .incarnation = 42 }} });
+}
+
+test "db commit requirements reserves existing artifact retirement before a prepared vote" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-retirement-reservation");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try db.batch(.{ .writes = &.{.{ .key = "large", .value = "{\"body\":\"source\"}" }}, .commit_requires = .none });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const writes = try arena.allocator().alloc(docstore_mod.KVPair, 6000);
+    for (writes, 0..) |*write, ordinal| write.* = .{ .key = try internal_keys.chunkArtifactKeyAlloc(arena.allocator(), "large", "chunks", @intCast(ordinal)), .value = "old output" };
+    try db.core.store.putBatch(writes, &.{});
+    const transaction = try db.beginTransaction(100);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.writeTransaction(transaction, .{ .deletes = &.{"large"}, .commit_requires = .direct_enrichments }));
+    // No yes vote or lock escaped; ordinary writes can still update the source.
+    try db.batch(.{ .writes = &.{.{ .key = "large", .value = "{}" }}, .commit_requires = .none });
+    try db.abortTransaction(transaction, 200);
+}
+
+test "db commit requirements preparation carries transaction policy authority" {
+    const request = DB.transactionPreparationRequest(.{ .commit_requires = .direct_enrichments, .row_policy_principal_proof = "signed", .row_policy_database = "main", .row_policy_admitted_at_seconds = 123 });
+    try std.testing.expectEqualStrings("signed", request.row_policy_principal_proof);
+    try std.testing.expectEqualStrings("main", request.row_policy_database);
+    try std.testing.expectEqual(@as(i64, 123), request.row_policy_admitted_at_seconds);
+}
+
+test "db commit requirements canceled owner preparation dispatches no producers" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-cancel-context");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, db.prepareDirectEnrichmentsWithContext(a, .{ .writes = &.{.{ .key = "source", .value = "{}" }}, .commit_requires = .direct_enrichments }, .{ .io = std.testing.io, .deadline_ns = null, .cancellation = types.CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expect((try db.get(a, "source")) == null);
+}
+
+test "db commit requirements capture borrows an authenticated policy lease without replay-time reauthentication" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-policy-capture");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    db.local_execution.row_policy_gate = row_policy_gate_mod.Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1, .row_policy_phase = .active, .row_policy_generation = 7, .row_policy_catalog_epoch = 9 });
+    const principal: row_policy_authority_mod.Payload = .{ .principal = "alice", .roles = &.{}, .auth_revision = 1, .table_id = 1, .table = "docs", .database = "main", .policy_generation = 7, .catalog_epoch = 9, .access = .write, .expires = 1 };
+    var lease = try db.local_execution.row_policy_gate.enterReplicatedPrincipal(&principal);
+    defer lease.release();
+    var capture: execution_resources.PreparationCapture = .{ .alloc = a };
+    defer if (capture.json) |bytes| a.free(bytes);
+    try db.batchInternal(.{ .commit_requires = .direct_enrichments, .row_policy_principal_proof = "already verified before Raft proposal", .row_policy_database = "main", .row_policy_admitted_at_seconds = 1 }, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = &principal, .row_policy_lease = &lease });
+    try std.testing.expect(capture.json != null);
+    try lease.checkAt(1000);
+}
+
+test "db commit requirements reserves old reverse index tuples on updates" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-update-retirement");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .none });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const tuple = try owned.alloc(u8, 24 * 1024);
+    @memset(tuple, 'x');
+    const writes = try owned.alloc(docstore_mod.KVPair, 100);
+    for (writes, 0..) |*write, ordinal| {
+        var key = std.ArrayList(u8).empty;
+        try relational_index_records.appendReverseKey(owned, &key, .{ .generation = 1, .slot = @intCast(ordinal) }, "doc");
+        var value = std.ArrayList(u8).empty;
+        try relational_index_records.appendReverseValue(owned, &value, key.items, tuple);
+        write.* = .{ .key = key.items, .value = value.items };
+    }
+    try db.core.store.putBatch(writes, &.{});
+    const transaction = try db.beginTransaction(100);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.writeTransaction(transaction, .{ .writes = &.{.{ .key = "doc", .value = "{\"small\":true}" }}, .commit_requires = .direct_enrichments }));
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .none });
+    try db.abortTransaction(transaction, 200);
+}
+
+test "db commit requirements sealed retries reject changed range guards and version semantics" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-sealed-guards");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const transaction = try db.beginTransaction(100);
+    const request: types.TransactionIntentRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .direct_enrichments };
+    try db.writeTransaction(transaction, request);
+    var changed = request;
+    changed.range_guards = &.{.{ .bucket = 1, .generation = 999 }};
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(transaction, changed));
+    changed = request;
+    changed.document_version_scheme = .legacy;
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(transaction, changed));
+    try db.writeTransaction(transaction, request);
+    try db.abortTransaction(transaction, 200);
+}
+
+test "db commit requirements reject row policy before producer dispatch" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-policy-before-model");
+    defer directory.cleanup();
+    var provider = CountingDenseEmbedder{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .enrichment = .{ .owner_id = "policy-test", .dense_embedder = provider.interface() } });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{.{ .key = "private", .value = "{\"body\":\"protected tenant source\"}" }}, .commit_requires = .none });
+    try db.addEnrichment(.{ .name = "vectors", .kind = .embedding, .field = "body", .expected_dims = 2, .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"dense\",\"dimensions\":2}" });
+    var view = db.core.acquireSchemaView().?;
+    defer view.release();
+    const schema = view.tableSchema().*;
+    const schema_bytes = try schema_mod.serializeSchema(a, schema);
+    defer a.free(schema_bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_bytes, &digest, .{});
+    const policies = @import("../../system_catalog/policies.zig");
+    const deny: policies.Predicate = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = false } } }}, .root = 0 };
+    const bundle = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{ .table_id = 1, .schema_version = 1, .schema_digest = digest, .policy_generation = 7, .catalog_epoch = 9, .phase = .active, .records = &.{.{ .id = 1, .generation = 7, .table_id = 1, .schema_version = 1, .schema_digest = digest, .name = "deny", .commands = .{ .insert = true, .update = true, .delete = true }, .roles = &.{"public"}, .using = deny, .with_check = deny }}, .settings = &.{} }, .{});
+    defer a.free(bundle);
+    db.local_execution.row_policy_bundle = try row_policy_bundle_mod.Installed.init(a, bundle, 1, schema);
+    db.local_execution.row_policy_gate = row_policy_gate_mod.Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1, .row_policy_phase = .active, .row_policy_generation = 7, .row_policy_catalog_epoch = 9 });
+    const principal: row_policy_authority_mod.Payload = .{ .principal = "alice", .roles = &.{}, .auth_revision = 1, .table_id = 1, .table = "docs", .database = "main", .policy_generation = 7, .catalog_epoch = 9, .access = .write, .expires = 1 };
+    var lease = try db.local_execution.row_policy_gate.enterReplicatedPrincipal(&principal);
+    defer lease.release();
+    const requests = [_]types.BatchRequest{
+        .{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"denied insert\"}" }}, .commit_requires = .direct_enrichments },
+        .{ .writes = &.{.{ .key = "private", .value = "{\"body\":\"denied replacement\"}" }}, .commit_requires = .direct_enrichments },
+        .{ .transforms = &.{.{ .key = "private", .operations = &.{.{ .op = .set, .path = "body", .value_json = "\"denied transform\"" }} }}, .commit_requires = .direct_enrichments },
+    };
+    for (requests) |request| {
+        var capture: execution_resources.PreparationCapture = .{ .alloc = a };
+        defer if (capture.json) |bytes| a.free(bytes);
+        try std.testing.expectError(error.RowPolicyDenied, db.batchInternal(request, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = &principal, .row_policy_lease = &lease }));
+        try std.testing.expect(capture.json == null);
+        try std.testing.expectEqual(@as(usize, 0), provider.calls);
+    }
+}
+
+test "db commit requirements source and planning bounds precede allocation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-planning-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const writes = try a.alloc(types.BatchWrite, @import("commit_requirements.zig").max_output_rows + 1);
+    defer a.free(writes);
+    @memset(writes, .{ .key = "a", .value = "{}" });
+    var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.prepareDirectEnrichments(failed.allocator(), .{ .writes = writes, .commit_requires = .direct_enrichments }));
+    try std.testing.expect(!failed.has_induced_failure);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.batch(.{ .writes = writes, .commit_requires = .direct_enrichments }));
+    const operations = try a.alloc(types.TransformOp, @import("commit_requirements.zig").max_output_rows + 1);
+    defer a.free(operations);
+    @memset(operations, .{ .op = .set, .path = "body", .value_json = "1" });
+    const transforms = [_]types.DocumentTransform{.{ .key = "a", .operations = operations, .upsert = true }};
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.prepareDirectEnrichments(failed.allocator(), .{ .transforms = &transforms, .commit_requires = .direct_enrichments }));
+    try std.testing.expect(!failed.has_induced_failure);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.batch(.{ .transforms = &transforms, .commit_requires = .direct_enrichments }));
+    try db.addEnrichment(.{ .name = "asset", .kind = .asset, .field = "body", .content_type = "application/json" });
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var row = try mapper.extractWrite(a, "a", "{\"body\":\"source words\"}");
+    defer row.deinit(a);
+    var budget: @import("commit_requirements.zig").OutputBudget = .{ .rows = @import("commit_requirements.zig").max_output_rows };
+    try std.testing.expectError(error.CommitRequirementTooLarge, plan.plan().planGeneratedEnrichmentsForRowBounded(failed.allocator(), "a", row, &budget, null));
+    try std.testing.expect(!failed.has_induced_failure);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, plan.plan().planGeneratedEnrichmentsForRowBounded(failed.allocator(), "a", row, null, .{ .io = std.testing.io, .deadline_ns = null, .cancellation = types.CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expect(!failed.has_induced_failure);
+}
+
+test "db commit requirements preserve provider batches across bounded planning windows" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        items: usize = 0,
+        max_items: usize = 0,
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedScalarInference;
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.items += texts.len;
+            self.max_items = @max(self.max_items, texts.len);
+            const result = try alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (result[0..initialized]) |vector| alloc.free(vector);
+                alloc.free(result);
+            }
+            for (result) |*vector| {
+                const values = try alloc.alloc(f32, dims);
+                @memset(values, 1);
+                vector.* = values;
+                initialized += 1;
+            }
+            return result;
+        }
+    };
+    var directory = try TestDirectory.init("direct-planning-windows");
+    defer directory.cleanup();
+    var probe = Probe{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "window-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch } } });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense\"}}" });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const writes = try alloc.alloc(types.BatchWrite, 40);
+    for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(alloc, "doc-{d}", .{i}), .value = try std.fmt.allocPrint(alloc, "{{\"body\":\"unique source {d}\"}}", .{i}) };
+    try db.batch(.{ .writes = writes, .commit_requires = .direct_enrichments });
+    try std.testing.expectEqual(@as(usize, 40), probe.items);
+    try std.testing.expect(probe.calls > 1 and probe.calls < 40);
+    try std.testing.expect(probe.max_items > 1 and probe.max_items <= @import("commit_requirements.zig").max_window_documents);
+    const last = (try db.get(a, "doc-39")) orelse return error.TestUnexpectedResult;
+    defer a.free(last);
+}
+
+test "db commit requirements relational preparation retries a source race" {
+    const Producer = struct {
+        db: ?*DB = null,
+        calls: usize = 0,
+        fn produce(ptr: *anyopaque, a: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) try self.db.?.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"intervening source\"}" }}, .commit_requires = .none, .sync_level = .write });
+            return a.dupe(u8, "prepared result");
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-relational-source-race");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "source-race", .asset_producer = .{ .ptr = &producer, .vtable = &.{ .produce = Producer.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } } } });
+    defer db.close();
+    producer.db = &db;
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"summary\"}}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"requested source\"}" }}, .commit_requires = .direct_enrichments, .sync_level = .write });
+    try std.testing.expectEqual(@as(usize, 2), producer.calls);
+    const source = (try db.get(a, "doc")) orelse return error.TestUnexpectedResult;
+    defer a.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "requested source") != null);
+}
+
+test "db commit requirements coverage candidates share pinned configuration across windows" {
+    const a = std.testing.allocator;
+    const config = try a.alloc(u8, 64 * 1024);
+    defer a.free(config);
+    @memset(config, ' ');
+    var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 128 * 1024);
+    defer quota.deinit();
+    const alloc = quota.allocator();
+    var candidates: std.ArrayListUnmanaged(PrecomputedCoverageCandidate) = .empty;
+    defer {
+        for (candidates.items) |candidate| candidate.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+    var consumers = [_][]u8{@constCast("dense")};
+    for (0..128) |_| try appendPrecomputedCoverageCandidate(alloc, &candidates, .{ .kind = .dense_embedding, .doc_key = "doc", .index_name = "dense", .source_field = "body", .producer_json = config, .source_template = config, .consumer_indexes = &consumers }, true);
+    for (candidates.items) |candidate| {
+        try std.testing.expectEqual(config.ptr, candidate.request.producer_json.ptr);
+        try std.testing.expectEqual(config.ptr, candidate.request.source_template.ptr);
+        try std.testing.expect(candidate.request.consumer_indexes.ptr != consumers[0..].ptr);
+    }
+}
+
+test "db pending producer replay opens without claiming completion and resumes after input arrives" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    var sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+        const batch = derived_types.DerivedBatch{
+            .documents = &.{.{ .key = "pending", .targets = &.{.{ .kind = .dense_vector, .index_name = "dense" }} }},
+        };
+        sequence = db.core.store.reserveNextReplaySequence(1);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, sequence, encoded);
+    }
+    // The synchronous contract still exposes the exact pending dependency.
+    try std.testing.expectError(error.ReplayDocumentNotVisible, DB.open(alloc, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } }));
+    var db = try DB.open(alloc, path, .{ .start_index_workers = true, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    {
+        const debt = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (debt) |*item| item.deinit(alloc);
+            alloc.free(debt);
+        }
+        var found = false;
+        for (debt) |item| if (std.mem.eql(u8, item.index_name, "dense")) {
+            found = true;
+            try std.testing.expect(item.catch_up_required);
+            try std.testing.expect(item.applied_sequence < sequence);
+        };
+        try std.testing.expect(found);
+    }
+    const stored = try internal_keys.documentKeyAlloc(alloc, "pending");
+    defer alloc.free(stored);
+    try db.core.store.putBatch(&.{.{ .key = stored, .value = "{\"embedding\":[1,0]}" }}, &.{});
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "pending", "dense");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+    // This fixture writes below the normal commit notifier. Publish availability
+    // explicitly; a visibility wait alone must not invalidate dependency waits.
+    db.executor.notifySequence(sequence);
+    try db.runDerivedUntil(sequence);
+    const debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (debt) |*item| item.deinit(alloc);
+        alloc.free(debt);
+    }
+    for (debt) |item| if (std.mem.eql(u8, item.index_name, "dense")) {
+        try std.testing.expect(!item.catch_up_required);
+        try std.testing.expectEqual(sequence, item.applied_sequence);
+    };
+}
+
+test "db replay retires deleted parent chunks without resurrecting inline afterimages" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "parent", .value = "{\"body\":\"old\"}" }}, .sync_level = .full_index });
+    try db.batch(.{ .deletes = &.{"parent"}, .sync_level = .full_index });
+    const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 0);
+    defer alloc.free(chunk);
+    const documents = [_]derived_types.DerivedDocument{ .{ .key = chunk }, .{ .key = chunk, .cleaned_value = "{\"text\":\"old\"}" } };
+    var collected = try collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &documents, db.core.index_manager.byte_range, .{}, null);
+    defer collected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+    try std.testing.expectEqual(@as(usize, 0), collected.items.len);
+}
+
+test "db replay retires deleted parent or certified chunk tail but rejects missing live members" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const generations = @import("artifact_chunk_generation.zig");
+    const manifests = @import("artifact_chunk_manifest.zig");
+    const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 0);
+    defer alloc.free(chunk);
+    const tail = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 1);
+    defer alloc.free(tail);
+    const scope = (try manifests.keyForMemberAlloc(alloc, chunk)).?;
+    defer alloc.free(scope);
+    var builder = manifests.Builder.init();
+    try builder.append(0, "accepted");
+    const spec = try generations.Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), builder.finish(), 1);
+    var plan = try generations.Plan.init(alloc, scope, spec);
+    defer plan.deinit();
+    const encoded = spec.encode();
+    try db.core.store.putBatch(&.{.{ .key = plan.head_key, .value = &encoded }}, &.{});
+    var collected = try collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &.{.{ .key = tail }}, db.core.index_manager.byte_range, .{}, null);
+    defer collected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+    try std.testing.expectEqual(@as(usize, 0), collected.items.len);
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &.{.{ .key = chunk }}, db.core.index_manager.byte_range, .{}, null));
+}
+
+test "db pending producer replay never ages missing full text input into completed coverage" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const sequence = db.core.store.reserveNextReplaySequence(1);
+    const batch = derived_types.DerivedBatch{ .documents = &.{.{ .key = "pending", .targets = &.{.{ .kind = .full_text, .index_name = "text" }} }} };
+    var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, sequence);
+    defer change_journal_mod.deinitRecord(alloc, &record);
+    const encoded = try change_journal_mod.encodeRecord(alloc, record);
+    defer alloc.free(encoded);
+    try replay_stream_mod.appendOpaque(alloc, db.core.store, sequence, encoded);
+    // Cross the old retry threshold without sleeping or running a worker.
+    const manager = db.core.index_manager.resource_manager.?;
+    const owner = resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager);
+    var attempts: usize = 0;
+    while (!manager.shouldEscalateReplayDocumentNotVisible(owner, "text", sequence)) : (attempts += 1) {
+        try std.testing.expect(attempts < 100_000);
+    }
+    try std.testing.expectError(error.ReplayDocumentNotVisible, db.runDerivedUntil(sequence));
+    try std.testing.expectEqual(@as(u64, 0), try db.core.loadAppliedSequence(alloc, "text"));
+    try std.testing.expectEqual(@as(u64, 0), manager.replayDocumentNotVisibleSkippedTotal(owner, "text"));
+    const stored = try internal_keys.documentKeyAlloc(alloc, "pending");
+    defer alloc.free(stored);
+    try db.core.store.putBatch(&.{.{ .key = stored, .value = "{\"body\":\"arrived\"}" }}, &.{});
+    try db.runDerivedUntil(sequence);
+    try std.testing.expectEqual(sequence, try db.core.loadAppliedSequence(alloc, "text"));
+}
+
+test "db backup producer freeze uses lane-specific committed replay frontiers" {
+    const a = std.testing.allocator;
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("backup-producer-frontier");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "backup-drain");
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    const applied = db.enrichment_runtime.?.stats().applied_sequence;
+    const unrelated = db.core.reserveDerivedAppendSequence();
+    try std.testing.expect(unrelated > applied);
+    const record = try @import("derived/change_journal.zig").encodeRecord(a, .{ .sequence = unrelated, .target_hints = &.{.full_text} });
+    defer a.free(record);
+    try db.core.store.appendReplayOpaque(a, unrelated, record);
+    const identity = try db.relationalTopologyIdentity();
+    const fence: @import("relational_integrity_topology_contract.zig").Fence = .{ .transition_id = 1, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 2, .peer_group_id = 2, .role = .backup_snapshot, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
+    try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
+    try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
+    try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .cancel }, null);
+    const pending = db.core.reserveDerivedAppendSequence();
+    const input = try @import("derived/change_journal.zig").encodeRecord(a, .{ .sequence = pending, .changed_doc_keys = &.{"doc"}, .target_hints = &.{.enrichment} });
+    defer a.free(input);
+    try db.core.store.appendReplayOpaque(a, pending, input);
+    const next_identity = try db.relationalTopologyIdentity();
+    var next = fence;
+    next.transition_id = 2;
+    next.admission_epoch = next_identity.next_epoch;
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.applyRelationalTopologyControl(.{ .fence = next, .action = .begin }, null));
+    try std.testing.expect((try db.relationalTopologyStatus()).fence == null);
+}
+
+test "db dense index inspection does not expose unprotected or missing artifacts" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("dense-index-inspection");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "dense")) == null);
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "absent")) == null);
+    const large_id = try a.alloc(u8, types.dense_index_inspection_limits.identity_bytes + 1);
+    defer a.free(large_id);
+    @memset(large_id, 'x');
+    // Optional dense inspection must not turn an absent privacy artifact into
+    // an inspection-budget failure for a legal large document identifier.
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, large_id, "absent")) == null);
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.getDocumentArtifactManifest(a, large_id, "dense"));
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "dense");
+    defer a.free(asset_key);
+    try db.core.store.putBatch(&.{.{ .key = asset_key, .value = "{\"manifest_version\":2}" }}, &.{});
+    var busy = db.core.snapshot_replay_admission.acquireMutation();
+    defer busy.release();
+    var asset = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
+    defer asset.deinit(a);
+    try std.testing.expectEqualStrings("{\"manifest_version\":2}", asset.manifest_json);
+    var primary = db.core.snapshot_admission.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    primary.release();
+}
+
+test "db dense index inspection never certifies a missing protected vector" {
+    const a = std.testing.allocator;
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("dense-index-inspection-pending");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+    try addPrivacyAbsentFieldProducer(a, &db, "inspection");
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"safe\",\"version\":5}" }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    var result = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
+    defer result.deinit(a);
+    const parsed = try std.json.parseFromSlice(struct { current: bool, vectors: []const std.json.Value, document_json: []const u8 }, a, result.manifest_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.current);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.vectors.len);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.document_json, "safe") != null);
+}
+
+test "db dense index inspection binds current chunk vectors and never invokes inference" {
+    const a = std.testing.allocator;
+    const catalog = @import("../../privacy/catalog.zig");
+    const document = @import("../../privacy/document.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = document.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = "inspection" }} };
+    const version = try policy.identity(scratch);
+    const root = try document.protectedArtifactName(scratch, version);
+    const embedding = try catalog.managedName(scratch, version, "dense");
+    const chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embedding});
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var embedder: CountingDenseEmbedder = .{};
+    var directory = try TestDirectory.init("dense-index-inspection-current");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface(), .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "inspection");
+    try db.addEnrichment(.{ .name = chunks, .kind = .chunk, .field = "body", .source_artifact_name = root, .chunk_size = 1024 });
+    try db.addEnrichment(.{ .name = embedding, .kind = .embedding, .field = "text", .source_artifact_name = chunks, .expected_dims = 3, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model-B\"}" });
+    const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":3,\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{embedding});
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = config, .coverage_generation = 7 });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Orchard guidance.\",\"version\":5}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    const inspection_budget = @import("artifact_scan_budget.zig");
+    var preflight_limited: inspection_budget.Budget = .{ .max_visits = 1, .max_bytes = 2 * 1024 * 1024 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, @import("privacy_read.zig").requirePublishedWithBudget(&db, a, .{}, &preflight_limited));
+    var preflight_expired: inspection_budget.Budget = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, @import("privacy_read.zig").requirePublishedWithBudget(&db, a, .{}, &preflight_expired));
+    var policy_limited: inspection_budget.Budget = .{ .max_bytes = 1 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, @import("privacy_read.zig").captureWithBudget(&db, a, &policy_limited));
+    // Vector coverage has no source-scope dependency. A plan without a
+    // completion graph and a single counter-read budget must suffice.
+    {
+        var coverage_read = try db.core.store.beginReadTxn();
+        defer coverage_read.abort();
+        var no_graph: index_manager_mod.IndexManager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{} };
+        var vector_budget: inspection_budget.Budget = .{ .max_visits = 2, .max_bytes = 4096 };
+        try std.testing.expect(try db.privacyLocalIndexSourcesCompleteWithBudget(a, &coverage_read, "dense", .dense_vector, &no_graph, &vector_budget));
+        try std.testing.expectEqual(@as(usize, 1), vector_budget.visits);
+    }
+    var replay_busy = db.core.snapshot_replay_admission.acquireMutation();
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.getDocumentArtifactManifest(a, "doc", "dense"));
+    replay_busy.release();
+    var released_primary = db.core.snapshot_admission.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    released_primary.release();
+    const Probe = struct {
+        db: *DB,
+        output_arena: *std.heap.ArenaAllocator,
+        captured: bool = false,
+        rendered: bool = false,
+        fn captureHook(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(!self.db.core.snapshot_admission.lock.tryLockShared());
+            try std.testing.expect(!self.db.core.snapshot_replay_admission.lock.tryLockShared());
+            self.captured = true;
+        }
+        fn renderHook(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(self.db.core.snapshot_admission.lock.tryLockShared());
+            self.db.core.snapshot_admission.lock.unlockShared();
+            try std.testing.expect(self.db.core.snapshot_replay_admission.lock.tryLockShared());
+            self.db.core.snapshot_replay_admission.lock.unlockShared();
+            // Only the outer manifest lookup key belongs to the output arena;
+            // capture payload and per-producer temporaries must be reclaimable.
+            try std.testing.expect(self.output_arena.queryCapacity() < 4096);
+            self.rendered = true;
+        }
+    };
+    var output_arena = std.heap.ArenaAllocator.init(a);
+    defer output_arena.deinit();
+    var probe: Probe = .{ .db = &db, .output_arena = &output_arena };
+    const inspection = @import("dense_index_inspection.zig");
+    inspection.test_after_open = .{ .context = &probe, .run = Probe.captureHook };
+    inspection.test_before_render = .{ .context = &probe, .run = Probe.renderHook };
+    defer {
+        inspection.test_after_open = null;
+        inspection.test_before_render = null;
+    }
+    var arena_result = (try db.getDocumentArtifactManifest(output_arena.allocator(), "doc", "dense")) orelse return error.TestUnexpectedResult;
+    arena_result.deinit(output_arena.allocator());
+    try std.testing.expect(probe.captured and probe.rendered);
+    inspection.test_after_open = null;
+    inspection.test_before_render = null;
+    const calls_before_inspection = embedder.calls;
+    var result = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
+    defer result.deinit(a);
+    const View = struct { current: bool, index_generation: u64, vectors: []const struct { model: []const u8, source_text: []const u8, values: []const f32 } };
+    const parsed = try std.json.parseFromSlice(View, a, result.manifest_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.current);
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.index_generation);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.vectors.len);
+    try std.testing.expectEqualStrings("model-B", parsed.value.vectors[0].model);
+    try std.testing.expectEqualStrings("Orchard guidance.", parsed.value.vectors[0].source_text);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.vectors[0].values.len);
+    try std.testing.expectEqual(calls_before_inspection, embedder.calls);
+    const expected = try embedder_mod.DeterministicDenseEmbedder.embedDense(&embedder.deterministic, a, embedding, "Orchard guidance.", 3);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(f32, expected, parsed.value.vectors[0].values);
+    // Empty unit heads produce no output, but still consume cursor work. One
+    // shared visit budget must stop them before an unbounded manifest walk.
+    const manifests = @import("artifact_chunk_manifest.zig");
+    const generations = @import("artifact_chunk_generation.zig");
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (0..1024) |i| {
+            var unit_buf: [32]u8 = undefined;
+            const unit = try std.fmt.bufPrint(&unit_buf, "empty-{d:0>4}", .{i});
+            const scope = try manifests.scopedKeyAlloc(a, "doc", chunks, unit);
+            defer a.free(scope);
+            const spec = try generations.Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), manifests.Builder.init().finish(), 1);
+            var plan = try generations.Plan.init(a, scope, spec);
+            defer plan.deinit();
+            const encoded = spec.encode();
+            try txn.put(plan.head_key, &encoded);
+        }
+        try txn.commit();
+    }
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.getDocumentArtifactManifest(a, "doc", "dense"));
+    try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .write });
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, "doc", "dense")) == null);
+}
+
+test "privacy protected model migration batches across documents" {
+    try protectedModelBackfillProbe(64, 3, 1024);
+}
+
+test "privacy protected model migration 1024 document diagnostic" {
+    try protectedModelBackfillProbe(1024, 384, 1024);
+}
+
+test "privacy protected model migration spans vector bootstrap boundary" {
+    for ([_]usize{ 4095, 4096, 4097 }) |count| try protectedModelBackfillProbe(count, 3, 1024);
+}
+
+test "privacy protected model migration multi chunk output" {
+    try protectedModelBackfillProbe(16, 3, 8);
+}
+
+// Exercise the local producer path here; the companion HTTP fixture runs the
+// ordered standalone path, holds B while querying A, and crashes/reopens both.
+fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_size: u32) !void {
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
+    const workers = document_count >= 4095;
+    const privacy = @import("../../privacy/document.zig");
+    const catalog = @import("../../privacy/catalog.zig");
+    const Probe = struct {
+        batches: std.atomic.Value(usize) = .init(0),
+        items: std.atomic.Value(usize) = .init(0),
+        largest_batch: std.atomic.Value(usize) = .init(0),
+        privacy_calls: std.atomic.Value(usize) = .init(0),
+        fn check(_: *anyopaque) !void {}
+        fn detect(_: *anyopaque, out: Allocator, _: privacy.contract.Producer, _: []const u8) ![]u8 {
+            return out.dupe(u8, "{\"entities\":{\"email\":[{\"start\":0,\"end\":6,\"text\":\"a@b.co\",\"confidence\":0.9}]},\"long_document\":{\"window_count\":1}}");
+        }
+        fn produce(ptr: *anyopaque, out: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.privacy_calls.fetchAdd(1, .monotonic);
+            return privacy.produce(out, request.config_json, request.source_text, .{ .ptr = ptr, .produce = detect, .check = check });
+        }
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedUnbatchedInference;
+        }
+        fn batch(ptr: *anyopaque, out: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.batches.fetchAdd(1, .monotonic);
+            _ = self.largest_batch.fetchMax(texts.len, .monotonic);
+            const vectors = try out.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| out.free(@constCast(vector));
+                out.free(vectors);
+            }
+            for (texts, vectors) |text, *vector| {
+                try std.testing.expect(std.mem.indexOf(u8, text, "a@b.co") == null);
+                vector.* = try protectedBackfillVector(out, name, text, dims);
+                initialized += 1;
+            }
+            _ = self.items.fetchAdd(texts.len, .release);
+            return vectors;
+        }
+    };
+    var probe: Probe = .{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = privacy.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"body"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = "migration batching" }} };
+    const version = try policy.identity(scratch);
+    const root = try privacy.protectedArtifactName(scratch, version);
+    const resolved = try privacy.resolve(scratch, policy, true);
+    const producer_json = try std.json.Stringify.valueAlloc(scratch, .{ .type = "extractor", .config = resolved.config }, .{});
+    var directory = try TestDirectory.init("protected-backfill-batching");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = workers,
+        .start_optional_runtime_workers = workers,
+        .enrichment = .{
+            .asset_producer = .{ .ptr = &probe, .vtable = &.{ .produce = Probe.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } },
+            .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch },
+        },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.addEnrichment(.{ .name = root, .kind = .asset, .field = privacy.source_field, .content_type = "application/json", .producer_json = producer_json });
+    const writes = try scratch.alloc(types.BatchWrite, document_count);
+    for (writes, 0..) |*write, i| write.* = .{
+        .key = try std.fmt.allocPrint(scratch, "doc-{d:0>4}", .{i}),
+        .value = try std.fmt.allocPrint(scratch, "{{\"body\":\"a@b.co Orchard guidance {d}. {s}\"}}", .{ i, if (chunk_size < 1024) "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega" else "" }),
+    };
+    var migration_calls: usize = 0;
+    var migration_items: usize = 0;
+    var migration_snapshot_builds: usize = 0;
+    var migration_native_merges: usize = 0;
+    var verified_b_items: usize = 0;
+    for ([_][]const u8{ "A", "B" }, 0..) |name, i| {
+        const started = monotonicTimeNs();
+        const calls_before = probe.batches.load(.acquire);
+        const items_before = probe.items.load(.acquire);
+        const privacy_before = probe.privacy_calls.load(.acquire);
+        const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
+        const snapshots_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+
+        const embedding = try catalog.managedName(scratch, version, name);
+        const chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embedding});
+        try db.addEnrichment(.{ .name = chunks, .kind = .chunk, .field = "body", .source_artifact_name = root, .chunk_size = chunk_size });
+        try db.addEnrichment(.{ .name = embedding, .kind = .embedding, .field = "text", .source_artifact_name = chunks, .expected_dims = dimensions, .execution = .{ .batch_items = 32 }, .producer_json = if (i == 0) "{\"provider\":\"antfly\",\"model\":\"model-A\"}" else "{\"provider\":\"antfly\",\"model\":\"model-B\"}" });
+        const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":{d},\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{ dimensions, embedding });
+        try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
+        if (i == 0) try db.batch(.{ .writes = writes, .sync_level = .write });
+        if (workers) {
+            waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, i != 0) catch |err| {
+                std.debug.print("PROTECTED-BACKFILL incomplete docs={d} index={s} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, probe.batches.load(.acquire) - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
+                return err;
+            };
+        } else try db.runUntilIdle();
+        std.debug.print("\nPROTECTED-BACKFILL docs={d} index={s} wall_ms={d} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, (monotonicTimeNs() -| started) / std.time.ns_per_ms, probe.batches.load(.acquire) - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
+        const verified = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024);
+        if (i == 1) {
+            migration_calls = probe.batches.load(.acquire) - calls_before;
+            migration_items = probe.items.load(.acquire) - items_before;
+            verified_b_items = verified;
+            migration_native_merges = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before;
+            migration_snapshot_builds = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before;
+            try std.testing.expectEqual(privacy_before, probe.privacy_calls.load(.acquire));
+        }
+    }
+    try std.testing.expectEqual(verified_b_items, migration_items);
+    if (chunk_size == 1024) try std.testing.expectEqual(document_count, migration_items);
+    try std.testing.expect(migration_snapshot_builds + migration_native_merges <= 4);
+    try std.testing.expect(migration_calls <= (migration_items + 31) / 32);
+    const completed_before_reopen = probe.items.load(.acquire);
+    const privacy_before_reopen = probe.privacy_calls.load(.acquire);
+    db.close();
+    db_open = false;
+    db = try DB.open(a, directory.path(), .{
+        .start_index_workers = workers,
+        .start_optional_runtime_workers = workers,
+        .enrichment = .{
+            .asset_producer = .{ .ptr = &probe, .vtable = &.{ .produce = Probe.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } },
+            .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch },
+        },
+    });
+    db_open = true;
+    if (!workers) try db.runUntilIdle();
+    for ([_][]const u8{ "A", "B" }) |name| {
+        if (workers) try waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, false);
+        const embedding = try catalog.managedName(scratch, version, name);
+        _ = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024);
+    }
+    try std.testing.expectEqual(completed_before_reopen, probe.items.load(.acquire));
+    try std.testing.expectEqual(privacy_before_reopen, probe.privacy_calls.load(.acquire));
+}
+
+// Status/inspection/search only: no explicit replay or maintenance driver may
+// make this owner complete. This exercises the real bootstrap/debounce policy.
+fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8, document: []const u8, count: usize, keep_a_serving: bool) !void {
+    const deadline = monotonicTimeNs() + 120 * std.time.ns_per_s;
+    var next_a_check_ns: u64 = 0;
+    var availability_queries: usize = 0;
+    var availability_query_ns: u64 = 0;
+    while (true) {
+        var covered = false;
+        const stats = try db.stats(a);
+        defer types.freeDBStats(a, stats);
+        for (stats.indexes) |index| if (std.mem.eql(u8, index.name, name)) {
+            covered = index.doc_count == count and index.coverage_produced_count == count and index.coverage_terminal_failed_count == 0;
+        };
+        db.core.index_manager.catalog_mutex.lockShared();
+        const native_ready = db.core.index_manager.vectorBlockReadyForDenseIndex(name);
+        db.core.index_manager.catalog_mutex.unlockShared();
+        if (covered and native_ready) {
+            if (db.getDocumentArtifactManifest(a, document, name) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => null,
+                else => return err,
+            }) |found| {
+                var manifest = found;
+                defer manifest.deinit(a);
+                const parsed = try std.json.parseFromSlice(struct { current: bool }, a, manifest.manifest_json, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                if (parsed.value.current) {
+                    var result = try db.search(a, .{ .index_name = name, .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
+                    defer result.deinit();
+                    try std.testing.expect(result.hits.len != 0);
+                    if (keep_a_serving) std.debug.print("PROTECTED-BACKFILL availability index={s} queries={d} query_wall_ms={d}\n", .{ name, availability_queries, availability_query_ns / std.time.ns_per_ms });
+                    return;
+                }
+            }
+        }
+        // This verifies background progress under sampled queries, not a
+        // saturation workload. Full exact-vector searches with the checked
+        // Debug allocator must leave the producer/maintenance owners CPU time.
+        // The deterministic scoped-frontier regression checks the publication
+        // boundary directly, independently of this sampling interval.
+        if (keep_a_serving and monotonicTimeNs() >= next_a_check_ns) {
+            const query_started_ns = monotonicTimeNs();
+            var result = db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 }) catch |err| {
+                const applied = try db.core.loadAppliedSequence(a, "A");
+                const target = try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, applied);
+                std.debug.print("PROTECTED-BACKFILL A unavailable during {s}: {s} applied={d} target={d} tail={d} live={?d}\n", .{ name, @errorName(err), applied, target, db.core.store.lastReplaySequence(0), db.executor.appliedSequence("A") });
+                const names = try db.core.index_manager.artifactSourceNamesForIndexAlloc(a, "A");
+                defer {
+                    for (names) |source| a.free(source);
+                    a.free(names);
+                }
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                const scoped = try replay_source_mod.artifactTargetAtCut(a, &read, names, applied, null);
+                std.debug.print("PROTECTED-BACKFILL A scoped_target={?d}\n", .{scoped});
+                for (names) |source| {
+                    const key = try internal_keys.artifactSourceRevisionKeyAlloc(a, source);
+                    defer a.free(key);
+                    const raw = read.get(key) catch |failure| switch (failure) {
+                        error.NotFound => null,
+                        else => return failure,
+                    };
+                    std.debug.print("PROTECTED-BACKFILL A source={s} revision={?d}\n", .{ source, if (raw) |bytes| std.mem.readInt(u64, bytes[0..8], .big) else @as(?u64, null) });
+                }
+                const primary = read.get(&internal_keys.primary_source_revision_key) catch |failure| switch (failure) {
+                    error.NotFound => null,
+                    else => return failure,
+                };
+                std.debug.print("PROTECTED-BACKFILL primary_revision={?d}\n", .{if (primary) |bytes| std.mem.readInt(u64, bytes[0..8], .big) else @as(?u64, null)});
+                return err;
+            };
+            defer result.deinit();
+            try std.testing.expect(result.hits.len != 0);
+            availability_queries += 1;
+            const query_ns = monotonicTimeNs() -| query_started_ns;
+            availability_query_ns +|= query_ns;
+            // Bound observation to 10% of wall time even when exact fallback
+            // searches are slow under the checked Debug allocator.
+            next_a_check_ns = monotonicTimeNs() +| @max(std.time.ns_per_s, query_ns *| 9);
+        }
+        if (monotonicTimeNs() >= deadline) {
+            const diagnostic = try std.json.Stringify.valueAlloc(a, .{ .indexes = stats.indexes, .enrichment = stats.enrichment }, .{});
+            defer a.free(diagnostic);
+            std.debug.print("PROTECTED-BACKFILL timeout index={s} covered={} native_ready={} availability_queries={d} query_wall_ms={d} state={s}\n", .{ name, covered, native_ready, availability_queries, availability_query_ns / std.time.ns_per_ms, diagnostic });
+            return error.ProtectedBackfillTimedOut;
+        }
+        sleepNs(100 * std.time.ns_per_ms);
+    }
+}
+
+fn protectedBackfillVector(a: Allocator, model: []const u8, text: []const u8, dimensions: u32) ![]f32 {
+    var provider: embedder_mod.DeterministicDenseEmbedder = .{ .seed = std.hash.Wyhash.hash(0, model) };
+    return embedder_mod.DeterministicDenseEmbedder.embedDense(&provider, a, model, text, dimensions);
+}
+
+test "privacy protected model migration oracle rejects substituted model vectors" {
+    const a = std.testing.allocator;
+    const first = try protectedBackfillVector(a, "model-A", "same protected input", 384);
+    defer a.free(first);
+    const second = try protectedBackfillVector(a, "model-B", "same protected input", 384);
+    defer a.free(second);
+    try std.testing.expect(!std.mem.eql(f32, first, second));
+}
+
+fn verifyProtectedBackfillOutput(a: Allocator, db: *DB, name: []const u8, embedding: []const u8, writes: []const types.BatchWrite, dimensions: u32, multi_chunk: bool) !usize {
+    var vector_count: usize = 0;
+    for (writes) |write| {
+        var manifest = (try db.getDocumentArtifactManifest(a, write.key, name)) orelse return error.TestUnexpectedResult;
+        defer manifest.deinit(a);
+        const View = struct { current: bool, document_id: []const u8, vectors: []const struct { source_text: []const u8, values: []const f32 } };
+        const parsed = try std.json.parseFromSlice(View, a, manifest.manifest_json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.current);
+        try std.testing.expectEqualStrings(write.key, parsed.value.document_id);
+        if (multi_chunk) try std.testing.expect(parsed.value.vectors.len > 1) else try std.testing.expectEqual(@as(usize, 1), parsed.value.vectors.len);
+        var reconstructed: std.ArrayList(u8) = .empty;
+        defer reconstructed.deinit(a);
+        for (parsed.value.vectors) |vector| {
+            try std.testing.expect(std.mem.indexOfScalar(u8, vector.source_text, '@') == null);
+            const expected = try protectedBackfillVector(a, embedding, vector.source_text, dimensions);
+            defer a.free(expected);
+            try std.testing.expectEqualSlices(f32, expected, vector.values);
+            for (vector.source_text) |byte| {
+                if (!std.ascii.isWhitespace(byte)) try reconstructed.append(a, byte);
+            }
+            vector_count += 1;
+        }
+        const source = try std.json.parseFromSlice(struct { body: []const u8 }, a, write.value, .{});
+        defer source.deinit();
+        const protected = try std.mem.replaceOwned(u8, a, source.value.body, "a@b.co", "[EMAIL]");
+        defer a.free(protected);
+        var expected_text: std.ArrayList(u8) = .empty;
+        defer expected_text.deinit(a);
+        for (protected) |byte| {
+            if (!std.ascii.isWhitespace(byte)) try expected_text.append(a, byte);
+        }
+        try std.testing.expectEqualStrings(expected_text.items, reconstructed.items);
+    }
+    return vector_count;
+}
+
+test "privacy scoped readiness serves A while sibling B backfills" {
+    const a = std.testing.allocator;
+    const catalog = @import("../../privacy/catalog.zig");
+    const document = @import("../../privacy/document.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = document.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = "scoped" }} };
+    const version = try policy.identity(scratch);
+    const root = try document.protectedArtifactName(scratch, version);
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var embedder: CountingDenseEmbedder = .{};
+    var directory = try TestDirectory.init("privacy-scoped-readiness");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface(), .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "scoped");
+    const embeddings = [_][]const u8{ try catalog.managedName(scratch, version, "A"), try catalog.managedName(scratch, version, "B") };
+    for ([_][]const u8{ "A", "B" }, embeddings, 0..) |name, embedding, i| {
+        const chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embedding});
+        try db.addEnrichment(.{ .name = chunks, .kind = .chunk, .field = "body", .source_artifact_name = root, .chunk_size = 1024 });
+        try db.addEnrichment(.{ .name = embedding, .kind = .embedding, .field = "text", .source_artifact_name = chunks, .expected_dims = 3, .producer_json = "{\"provider\":\"antfly\",\"model\":\"fixture\"}" });
+        const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":3,\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{embedding});
+        try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
+        const text_name = if (i == 0) "text-A" else "text-B";
+        const text_config = try std.fmt.allocPrint(scratch, "{{\"sources\":[{{\"artifact\":\"{s}\",\"field\":\"text\"}}]}}", .{chunks});
+        // Keep a populated primary text index as A's independent match-all
+        // lane, and an unfinished artifact-backed text B for filter fencing.
+        try db.addIndex(.{ .name = text_name, .kind = .full_text, .config_json = if (i == 0) "{}" else text_config });
+        if (i == 0) {
+            try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Orchard guidance.\"}" }}, .sync_level = .write });
+            try db.runUntilIdle();
+            var baseline_text = try db.search(a, .{ .index_name = "text-A" });
+            defer baseline_text.deinit();
+            try std.testing.expectEqual(@as(usize, 1), baseline_text.hits.len);
+        }
+    }
+    const vector = try embedder_mod.DeterministicDenseEmbedder.embedDense(&embedder.deterministic, scratch, embeddings[0], "Orchard guidance.", 3);
+    const req: types.SearchRequest = .{ .index_name = "A", .dense = .{ .vector = vector, .k = 1 }, .include_stored = true };
+    const a_applied = try db.core.loadAppliedSequence(a, "A");
+    const sibling_tail = try appendDerivedBatchRecord(&db, .{ .documents = &.{.{
+        .key = "doc",
+        .action = .upsert,
+        .cleaned_value = "{\"body\":\"Orchard guidance.\"}",
+        .targets = &.{.{ .kind = .dense_vector, .index_name = "B" }},
+    }} });
+    try std.testing.expect(sibling_tail > a_applied);
+    try std.testing.expectEqual(sibling_tail, try db.core.replaySource().latestMatchingSequence(a, a_applied, .dense_vector));
+    try std.testing.expectEqual(a_applied, try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, a_applied));
+    // Cached projection work is a replay hint, not a mutation to A's source.
+    // The journal intentionally expands its artifact key for replay routing.
+    const a_chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embeddings[0]});
+    const a_chunk = try internal_keys.chunkArtifactKeyAlloc(scratch, "doc", a_chunks, 0);
+    const a_artifact = try expectedChunkEmbeddingArtifactKeyAlloc(scratch, "doc", a_chunks, 0, embeddings[0]);
+    const cached_tail = try appendDerivedBatchRecord(&db, .{ .dense_embeddings = &.{.{ .index_name = "A", .parent_doc_key = "doc", .doc_key = a_chunk, .artifact_key = a_artifact, .vector = &.{} }} });
+    try std.testing.expect(cached_tail > sibling_tail);
+    try std.testing.expectEqual(cached_tail, try db.core.replaySource().latestMatchingSequence(a, a_applied, .dense_vector));
+    try std.testing.expectEqual(a_applied, try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, a_applied));
+    const calls = embedder.calls;
+    var result = try db.search(a, req);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc", result.hits[0].id);
+    try std.testing.expectEqual(calls, embedder.calls);
+    var pending = req;
+    pending.index_name = "B";
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, pending));
+    var direct = req;
+    direct.dense = null;
+    direct.query = .{ .dense_knn = req.dense.? };
+    var direct_result = try db.search(a, direct);
+    defer direct_result.deinit();
+    var named = req;
+    named.dense = null;
+    named.index_name = null;
+    named.dense_queries = &.{.{ .name = "ready", .index_name = "A", .query = req.dense.? }};
+    var named_result = try db.search(a, named);
+    defer named_result.deinit();
+    // Execution removes this text sentinel; admission must remove it too.
+    var sentinel = named;
+    sentinel.index_name = "text-B";
+    sentinel.full_text = .{ .match_all = {} };
+    var sentinel_result = try db.search(a, sentinel);
+    defer sentinel_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sentinel_result.hits.len);
+    const stats = try db.collectSearchRequestTextStats(a, sentinel);
+    try std.testing.expectEqual(@as(usize, 0), stats.len);
+    // Real text filters remain dependencies even on the optimized vector lane.
+    sentinel.primary_text_index_name = "text-B";
+    sentinel.filter_text = .{ .match_all = {} };
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, sentinel));
+    // Default match-all is a text read, not an all-index status observation.
+    var text_result = try db.search(a, .{ .index_name = "text-A" });
+    defer text_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), text_result.hits.len);
+    named.dense_queries = &.{ .{ .name = "ready", .index_name = "A", .query = req.dense.? }, .{ .name = "pending", .index_name = "B", .query = req.dense.? } };
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, named));
+    var stale = req;
+    stale.privacy_policy_version = @splat('0');
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, stale));
+    const checkpoint = try db.core.loadProjectionCheckpoint(a, "A");
+    var dirty = checkpoint;
+    dirty.status = .rebuilding;
+    try db.core.saveProjectionCheckpoint("A", dirty);
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, req));
+    try db.core.saveProjectionCheckpoint("A", checkpoint);
+    var manifest = (try db.getDocumentArtifactManifest(a, "doc", "A")).?;
+    defer manifest.deinit(a);
+    const inspected = try std.json.parseFromSlice(struct { current: bool }, a, manifest.manifest_json, .{ .ignore_unknown_fields = true });
+    defer inspected.deinit();
+    try std.testing.expect(inspected.value.current);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Changed orchard.\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, req));
+    try db.runUntilIdle();
+    var ready_a = try db.search(a, req);
+    defer ready_a.deinit();
+    var ready_b = try db.search(a, pending);
+    defer ready_b.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ready_a.hits.len);
+    try std.testing.expectEqual(@as(usize, 1), ready_b.hits.len);
+    try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .write });
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, req));
+    try db.runUntilIdle();
+    var deleted = try db.search(a, req);
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), deleted.hits.len);
+}
+
+test "privacy scoped readiness status isolates shared catch-up telemetry" {
+    const a: types.DBIndexStats = .{ .name = "A", .kind = .dense_vector, .replay_applied_sequence = 10, .replay_target_sequence = 10, .projection_checkpoint_status = "clean" };
+    const progress: types.DenseCatchUpStats = .{ .active = true, .phase = .replay, .current_sequence = 2, .current_target_sequence = 500 };
+    try std.testing.expect(!DB.denseCatchUpAffectsIndex(a, progress));
+    var pending = a;
+    pending.replay_target_sequence = 11;
+    try std.testing.expect(DB.denseCatchUpAffectsIndex(pending, progress));
+    pending = a;
+    pending.projection_checkpoint_status = "rebuilding";
+    try std.testing.expect(DB.denseCatchUpAffectsIndex(pending, progress));
+    try std.testing.expect(!DB.denseCatchUpAffectsIndex(pending, .{}));
+}
+
+test "db optional numeric range filters lexical and dense candidates on fresh and evolved schemas" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":2,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword"}},"retention_years":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}},"size":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    const original_schema =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword"}}}}}}}
+    ;
+    const PendingDenseMigration = struct {
+        fn authorityPermitted(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    for ([_]bool{ false, true }) |evolved| {
+        var directory = try TestDirectory.init("db");
+        defer directory.cleanup();
+        // Exercise the same filter planning with a dense index whose storage
+        // generation is held at the mixed-version compatibility floor.
+        var db = try DB.open(a, directory.path(), .{
+            .index_backends = .{ .dense_native_migration_policy_source = .{
+                .ptr = &directory,
+                .authority_permitted = PendingDenseMigration.authorityPermitted,
+            } },
+        });
+        defer db.close();
+        try db.setSchemaJson(a, if (evolved) original_schema else schema);
+        try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+        try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
+
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var writes: [640]types.BatchWrite = undefined;
+        for (&writes, 0..) |*write, i| {
+            write.* = .{
+                .key = try std.fmt.allocPrint(scratch, "doc:{d:0>3}", .{i}),
+                .value = try std.json.Stringify.valueAlloc(scratch, .{
+                    .body = "harbor beacon",
+                    .tenant = if (i % 4 == 0) "archive" else "audit",
+                    ._embeddings = .{ .dv = [_]f64{ 1, @as(f64, @floatFromInt(i + 1)) / 640 } },
+                }, .{}),
+            };
+        }
+        const text_index = if (evolved) blk: {
+            try db.batch(.{ .writes = &writes, .sync_level = .full_index });
+            try db.setSchemaJson(a, schema);
+            // Publish the new schema's text projection through the managed
+            // generation builder, including untouched rows of the old epoch.
+            const cfg: types.IndexConfig = .{ .name = "full_text_index_v2", .kind = .full_text, .config_json = "{}" };
+            const repair_id = (try db.admitManagedFullTextIndex(cfg)) orelse return error.TestUnexpectedResult;
+            var published = false;
+            for (0..32) |_| {
+                const step = try db.advanceIndexRepairIntent(a, repair_id, repair_completion_test_options);
+                if (step.repaired) {
+                    published = true;
+                    break;
+                }
+                if (!try db.hasPendingIndexRepairIntents(a) and !db.core.index_manager.repairUnavailable(cfg.name)) {
+                    published = true;
+                    break;
+                }
+                try std.testing.expect(!step.terminal);
+            }
+            try std.testing.expect(published);
+            break :blk cfg.name;
+        } else "ft";
+        var updated: std.ArrayList(types.BatchWrite) = .empty;
+        for (&writes, 0..) |*write, i| {
+            const bucket = (i / 4) % 10;
+            if (evolved and bucket == 9) continue;
+            const fields = if (bucket == 8)
+                ",\"size\":99"
+            else
+                try std.fmt.allocPrint(scratch, ",\"retention_years\":{d}", .{5 + bucket});
+            write.value = try std.fmt.allocPrint(scratch, "{s}{s}}}", .{ write.value[0 .. write.value.len - 1], fields });
+            try updated.append(scratch, write.*);
+        }
+        var offset: usize = 0;
+        while (offset < updated.items.len) : (offset += 128) {
+            try db.batch(.{ .writes = updated.items[offset..][0..@min(128, updated.items.len - offset)], .sync_level = .full_index });
+        }
+
+        for ([_]struct { field: []const u8, value: u32, bucket: ?usize }{
+            .{ .field = "retention_years", .value = 6, .bucket = 1 },
+            .{ .field = "size", .value = 99, .bucket = 8 },
+            .{ .field = "retention_years", .value = 99, .bucket = null },
+        }) |case| {
+            const authorization = "{\"term\":{\"tenant\":\"archive\"}}";
+            const filter = try std.fmt.allocPrint(scratch,
+                \\{{"conjuncts":[{{"numeric_range":{{"field":"{s}","min":{d},"max":{d},"inclusive_max":true}}}},{s}]}}
+            , .{ case.field, case.value, case.value, authorization });
+            const expected: u64 = if (case.bucket != null) 16 else 0;
+            var lexical = try db.search(a, .{
+                .index_name = text_index,
+                .limit = 16,
+                .include_stored = false,
+                .profile = true,
+                .full_text = .{ .match = .{ .field = "body", .text = "harbor beacon" } },
+                .filter_query_json = filter,
+                .authorization_filter_query_json = authorization,
+            });
+            defer lexical.deinit();
+            var dense = try db.searchDenseProfiled(a, .{
+                .index_name = "dv",
+                .primary_text_index_name = text_index,
+                .limit = 16,
+                .include_stored = false,
+                .filter_query_json = filter,
+                .authorization_filter_query_json = authorization,
+            }, .{ .vector = &.{ 1, 0 }, .k = 16 });
+            defer dense.result.deinit();
+            errdefer std.debug.print(
+                "evolved={} field={s} value={d} lexical={d} dense={d} dense_route={s} reason={s}\n",
+                .{ evolved, case.field, case.value, lexical.hits.len, dense.result.hits.len, dense.profile.search_route, dense.profile.route_reason },
+            );
+            try std.testing.expectEqual(expected, dense.profile.native_filter_candidate_count);
+            if (expected != 0) {
+                try std.testing.expectEqual(expected, lexical.sort_profile.?.candidate_count);
+                try std.testing.expectEqual(@as(u32, 1), lexical.sort_profile.?.text_ranking_passes);
+                try std.testing.expectEqualStrings("exact_native_filter", dense.profile.search_route);
+            } else {
+                try std.testing.expectEqualStrings("native_filter", lexical.sort_profile.?.candidate_source);
+                try std.testing.expectEqualStrings("empty_native_filter", dense.profile.route_reason);
+            }
+            for ([_][]const types.SearchHit{ lexical.hits, dense.result.hits }) |hits| {
+                try std.testing.expectEqual(expected, hits.len);
+                if (case.bucket) |bucket| {
+                    for (0..16) |group| {
+                        const key = writes[group * 40 + bucket * 4].key;
+                        try std.testing.expect(for (hits) |hit| {
+                            if (std.mem.eql(u8, hit.id, key)) break true;
+                        } else false);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "optional numeric range freshness follows the selected text replay frontier" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("range-projection-frontier");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try std.testing.expect(try DB.rangeProjectionCurrentCallback(&db, a, "ft"));
+
+    const unrelated = db.core.reserveDerivedAppendSequence();
+    const graph = try change_journal_mod.encodeRecord(a, .{ .sequence = unrelated, .target_hints = &.{.graph} });
+    defer a.free(graph);
+    try db.core.store.appendReplayOpaque(a, unrelated, graph);
+    try std.testing.expect(try DB.rangeProjectionCurrentCallback(&db, a, "ft"));
+
+    const relevant = db.core.reserveDerivedAppendSequence();
+    const text = try change_journal_mod.encodeRecord(a, .{ .sequence = relevant, .changed_doc_keys = &.{"row"}, .target_hints = &.{.full_text} });
+    defer a.free(text);
+    try db.core.store.appendReplayOpaque(a, relevant, text);
+    try std.testing.expect(!try DB.rangeProjectionCurrentCallback(&db, a, "ft"));
+}
+
+test "optional numeric range reconciles witnessed text coverage with primary identities" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("range-primary-coverage");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{});
+    defer db.close();
+    try db.setSchema(.{
+        .default_type = "doc",
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        } }},
+        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true } }},
+    });
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "partial_ft", .kind = .full_text, .config_json = "{\"field\":\"title\"}" });
+    try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
+    try db.batch(.{ .sync_level = .full_index, .writes = &.{
+        .{ .key = "a", .value = "{\"body\":\"beacon\",\"rank\":2,\"_embeddings\":{\"dv\":[1,0]}}" },
+        .{ .key = "b", .value = "{\"body\":\"relay\",\"rank\":1,\"_embeddings\":{\"dv\":[0.9,0.1]}}" },
+        .{ .key = "c", .value = "{\"body\":\"legacy\",\"rank\":0,\"_embeddings\":{\"dv\":[0,1]}}" },
+    } });
+    const entry = db.core.index_manager.textIndex("ft").?;
+    const deletions = try entry.deleteByIdsTracked(&.{ "a", "c" });
+    defer entry.freeDeleteInfos(deletions);
+    try std.testing.expect(deletions.len != 0);
+    const snapshot = entry.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+    for (snapshot.segments) |segment| {
+        if (segment.liveDocCount() != 0) try std.testing.expect((try segment.reader.numericRangeCoverage("rank")) == .populated);
+    }
+
+    const legacy_ordinal = ordinal: {
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        break :ordinal (try doc_identity.lookupOrdinalTxn(a, &read, "c")).?;
+    };
+    const legacy = (try mapper.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "c", .doc_ordinal = legacy_ordinal, .value = "{\"body\":\"legacy\",\"rank\":0}" },
+    }, .{}, null)).?;
+    defer a.free(legacy);
+    try entry.indexSegment(legacy);
+
+    const range = "{\"range\":{\"rank\":{\"gte\":2}}}";
+    const mixed = "{\"conjuncts\":[{\"doc_id\":[\"a\"]},{\"disjuncts\":[{\"match\":{\"field\":\"body\",\"text\":\"beacon\"}}," ++ range ++ "]}]}";
+    for ([_]struct { include: []const u8 = "", exclude: []const u8 = "", ids: []const []const u8 = &.{}, expected: []const u8 }{
+        .{ .include = range, .expected = "a" },
+        .{ .include = range, .ids = &.{ "a", "b" }, .expected = "a" },
+        .{ .exclude = range, .expected = "b" },
+        .{ .include = mixed, .expected = "a" },
+    }) |case| {
+        var result = try db.searchDenseProfiled(a, .{
+            .index_name = "dv",
+            .primary_text_index_name = "ft",
+            .limit = 1,
+            .include_stored = false,
+            .filter_doc_ids = case.ids,
+            .filter_query_json = case.include,
+            .exclusion_query_json = case.exclude,
+        }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+        defer result.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.result.hits.len);
+        try std.testing.expectEqualStrings(case.expected, result.result.hits[0].id);
+    }
+    const empty_posting = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"disjuncts\":[{\"match\":{\"field\":\"missing_field\",\"text\":\"beacon\"}}," ++ range ++ "]}",
+    }, &.{ "a", "b", "c" });
+    defer a.free(empty_posting);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false }, empty_posting);
+    try std.testing.expectError(error.InvalidArgument, db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"range\":{\"rank\":{\"gte\":1,\"lt\":\"abc\"}}}",
+    }, &.{"b"}));
+
+    const graph = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = range }, &.{ "a", "b", "c" });
+    defer a.free(graph);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false }, graph);
+
+    if (getenv("ANTFLY_BENCH_OPTIONAL_NUMERIC_RANGE") != null) {
+        var bench_arena = std.heap.ArenaAllocator.init(a);
+        defer bench_arena.deinit();
+        const scratch = bench_arena.allocator();
+        const bench_rows = try scratch.alloc(types.BatchWrite, 512);
+        for (bench_rows, 0..) |*row, index| {
+            row.* = .{
+                .key = try std.fmt.allocPrint(scratch, "range-bench:{d}", .{index}),
+                .value = "{\"body\":\"archive\",\"rank\":0}",
+            };
+        }
+        try db.batch(.{ .sync_level = .full_index, .writes = bench_rows });
+        for ([_][]const []const u8{ &.{}, &.{ "a", "b" } }) |ids| {
+            const start = platform_time.monotonicNs();
+            var first_ns: u64 = 0;
+            for (0..12) |iteration| {
+                const filter = if (iteration % 2 == 0) range else "{\"range\":{\"rank\":{\"gte\":1}}}";
+                var measured = try db.searchDenseProfiled(a, .{
+                    .index_name = "dv",
+                    .primary_text_index_name = "ft",
+                    .limit = 1,
+                    .include_stored = false,
+                    .filter_doc_ids = ids,
+                    .filter_query_json = filter,
+                }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+                defer measured.result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), measured.result.hits.len);
+                if (iteration == 0) first_ns = platform_time.monotonicNs() - start;
+            }
+            std.debug.print("structured standard range mixed-generation rows={d} ids={d} first_ns={d} subsequent_mean_ns={d}\n", .{
+                bench_rows.len + 3, ids.len, first_ns, (platform_time.monotonicNs() - start - first_ns) / 11,
+            });
+        }
+    }
+
+    const relay_ordinal = blk: {
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        break :blk (try doc_identity.lookupOrdinalTxn(a, &read, "b")).?;
+    };
+    const forward = try internal_keys.identityDocToOrdinalKeyAlloc(a, "b");
+    defer a.free(forward);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(forward);
+        try txn.commit();
+    }
+    const relay = "{\"match\":{\"field\":\"body\",\"text\":\"relay\"}}";
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.filterGraphKeysAlloc(a, .{
+        .index_name = "partial_ft",
+        .exclusion_query_json = relay,
+    }, &.{"b"}));
+    const legacy_key = try encodeStoreLookupKeyAlloc(&db, a, "prior-legacy");
+    defer a.free(legacy_key);
+    try db.core.store.put(legacy_key, "{\"body\":\"legacy\"}");
+    const mixed_prior = doc_set.ResolvedDocFilter{ .exclude = .{ .doc_keys = &.{ "prior-legacy", "b" } } };
+    const prior_mask = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = relay,
+        .resolved_doc_filter = &mixed_prior,
+    }, &.{"b"});
+    defer a.free(prior_mask);
+    try std.testing.expectEqualSlices(bool, &.{false}, prior_mask);
+    const relay_range = "{\"conjuncts\":[" ++ relay ++ ",{\"range\":{\"rank\":{\"gte\":1}}}]}";
+    var admission = try db.filterGraphKeysWithOrdinalsAlloc(a, .{
+        .index_name = "ft",
+        .include_stored = true,
+        .filter_query_json = relay_range,
+    }, &.{ "a", "b", "c", "missing" });
+    defer admission.deinit(a);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false }, admission.allowed);
+    try std.testing.expect(admission.ordinals[1] == null);
+    try std.testing.expect(admission.stored_data.?[1] != null);
+
+    const prior = doc_set.ResolvedDocFilter{ .exclude = .{ .ordinals = &.{relay_ordinal} } };
+    const denied = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = relay_range,
+        .resolved_doc_filter = &prior,
+    }, &.{"b"});
+    defer a.free(denied);
+    try std.testing.expectEqualSlices(bool, &.{false}, denied);
+
+    const without_relay = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = relay_range,
+        .exclusion_query_json = relay_range,
+    }, &.{ "a", "b", "c" });
+    defer a.free(without_relay);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false }, without_relay);
+
+    var excluded = try db.searchDenseProfiled(a, .{
+        .index_name = "dv",
+        .primary_text_index_name = "ft",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"bool\":{\"must\":[{\"match\":{\"field\":\"body\",\"text\":\"relay\"}},{\"range\":{\"rank\":{\"gte\":1}}}],\"must_not\":[{\"doc_id\":[\"b\"]}]}}",
+    }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+    defer excluded.result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), excluded.result.hits.len);
+}
+
+test "optional numeric range prefilters dense search without a text index" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("dense-primary-range");
+    defer tmp.cleanup();
+    const PendingDenseMigration = struct {
+        fn authorityPermitted(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var db = try DB.open(a, tmp.path(), .{
+        .index_backends = .{ .dense_native_migration_policy_source = .{
+            .ptr = &tmp,
+            .authority_permitted = PendingDenseMigration.authorityPermitted,
+        } },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
+    try db.addIndex(.{ .name = "dv_two", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
+    try db.batch(.{ .sync_level = .full_index, .writes = &.{
+        .{ .key = "a", .value = "{\"rank\":9007199254740992,\"_embeddings\":{\"dv\":[1,0],\"dv_two\":[1,0]}}" },
+        .{ .key = "b", .value = "{\"rank\":9007199254740993,\"_embeddings\":{\"dv\":[0.9,0.1],\"dv_two\":[0.9,0.1]}}" },
+    } });
+
+    // Keep the physical row and its vector while removing one primary
+    // identity mapping, as on legacy stores with incomplete coverage.
+    const identity_key = try internal_keys.identityDocToOrdinalKeyAlloc(a, "a");
+    defer a.free(identity_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(identity_key);
+        try txn.commit();
+    }
+    var scope = (try DB.primaryResidualScopeCallback(&db, a, null, .{})).?;
+    defer scope.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 2), scope.rows.estimatedCardinality());
+    try std.testing.expect(scope.legacy == .none);
+    const live_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(a, "a");
+    defer a.free(live_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(live_key);
+        try txn.commit();
+    }
+    var legacy_scope = (try DB.primaryResidualScopeCallback(&db, a, null, .{})).?;
+    defer legacy_scope.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 1), legacy_scope.rows.estimatedCardinality());
+    try std.testing.expectEqualStrings("a", legacy_scope.legacy.doc_keys[0]);
+
+    const all_range = "{\"range\":{\"rank\":{\"gte\":9007199254740992}}}";
+    var shared = (try DB.resolveStructuredDocFilterForComposedCallback(&db, a, .{
+        .filter_query_json = all_range,
+    })).?;
+    defer shared.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 1), shared.include.estimatedCardinality());
+    try std.testing.expectEqualStrings("a", shared.legacy_include.doc_keys[0]);
+
+    var shared_dense = try db.searchDenseProfiled(a, .{
+        .index_name = "dv",
+        .limit = 2,
+        .include_stored = false,
+        .resolved_doc_filter = &shared,
+    }, .{ .vector = &.{ 1, 0 }, .k = 2 });
+    defer shared_dense.result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), shared_dense.result.hits.len);
+
+    var composed = try db.search(a, .{
+        .limit = 2,
+        .include_stored = false,
+        .filter_query_json = all_range,
+        .dense_queries = &.{
+            .{ .name = "first", .index_name = "dv", .query = .{ .vector = &.{ 1, 0 }, .k = 2 } },
+            .{ .name = "second", .index_name = "dv_two", .query = .{ .vector = &.{ 1, 0 }, .k = 2 } },
+        },
+    });
+    defer composed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), composed.hits.len);
+    try std.testing.expect(!std.mem.eql(u8, composed.hits[0].id, composed.hits[1].id));
+
+    var sorted = try db.search(a, .{
+        .limit = 2,
+        .include_stored = false,
+        .filter_query_json = all_range,
+        .order_by = &.{.{ .field = "_id" }},
+    });
+    defer sorted.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
+    try std.testing.expectEqualStrings("a", sorted.hits[0].id);
+    try std.testing.expectEqualStrings("b", sorted.hits[1].id);
+
+    var previous = try db.search(a, .{
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = all_range,
+        .order_by = &.{.{ .field = "_id" }},
+        .search_before = &.{.{ .string = "b" }},
+    });
+    defer previous.deinit();
+    try std.testing.expectEqual(@as(usize, 1), previous.hits.len);
+    try std.testing.expectEqualStrings("a", previous.hits[0].id);
+
+    for ([_]struct { exclusion: []const u8, count: usize }{
+        .{ .exclusion = "", .count = 2 },
+        .{ .exclusion = all_range, .count = 0 },
+    }) |case| {
+        var primary = try db.search(a, .{
+            .limit = 2,
+            .include_stored = false,
+            .filter_query_json = all_range,
+            .exclusion_query_json = case.exclusion,
+        });
+        defer primary.deinit();
+        try std.testing.expectEqual(case.count, primary.hits.len);
+        var mixed = try db.searchDenseProfiled(a, .{
+            .index_name = "dv",
+            .limit = 2,
+            .include_stored = false,
+            .filter_query_json = all_range,
+            .exclusion_query_json = case.exclusion,
+        }, .{ .vector = &.{ 1, 0 }, .k = 2 });
+        defer mixed.result.deinit();
+        try std.testing.expectEqual(case.count, mixed.result.hits.len);
+    }
+
+    for ([_][]const []const u8{ &.{}, &.{ "a", "b" } }) |ids| {
+        var result = try db.searchDenseProfiled(a, .{
+            .index_name = "dv",
+            .limit = 1,
+            .include_stored = false,
+            .filter_doc_ids = ids,
+            .filter_query_json = "{\"range\":{\"rank\":{\"gt\":9007199254740992.5}}}",
+        }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+        defer result.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.result.hits.len);
+        try std.testing.expectEqualStrings("b", result.result.hits[0].id);
+        try std.testing.expectEqual(@as(u64, 1), result.profile.native_filter_candidate_count);
+    }
+}
+
+test "optional numeric range cold relational scope and ordered cursor prefix handoff" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("range-relational-ordered-prefix");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{
+        .version = 1,
+        .storage_mode = .relational,
+        .ttl_duration_ns = std.time.ns_per_day,
+        .relational_columns = &.{.{ .name = "rank", .path = "rank", .column_type = .integer }},
+    });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var writes: [80]types.BatchWrite = undefined;
+    for (&writes, 0..) |*write, i| write.* = .{
+        .key = try std.fmt.allocPrint(scratch, "k{d:0>3}", .{i}),
+        .value = try std.fmt.allocPrint(scratch, "{{\"rank\":{d}}}", .{i}),
+    };
+    try db.batch(.{ .writes = &writes });
+    var endpoints: [2]doc_set.DocOrdinal = undefined;
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const key = writes[0].key;
+        try std.testing.expect(!try txn.contains(try internal_keys.documentKeyAlloc(scratch, key)));
+        try std.testing.expect(try txn.contains(try internal_keys.relationalRowKeyAlloc(scratch, key)));
+        endpoints = .{
+            (try doc_identity.lookupOrdinalTxn(scratch, &txn, writes[1].key)).?,
+            (try doc_identity.lookupOrdinalTxn(scratch, &txn, writes[78].key)).?,
+        };
+    }
+    const generation = try db.currentIdentityReadGeneration();
+    for (0..2) |_| {
+        var population = (try DB.primaryResidualScopeCallback(&db, a, generation, .{})).?;
+        defer population.deinit(a);
+        try std.testing.expectEqual(@as(?usize, writes.len), population.rows.estimatedCardinality());
+    }
+    var counted = try db_query_search.searchMatchAll(a, .{
+        .limit = 0,
+        .include_stored = false,
+        .identity_read_generation = generation,
+        .filter_query_json = "{\"range\":{\"rank\":{\"gte\":73}}}",
+    }, db.matchAllExecutor());
+    defer counted.deinit();
+    try std.testing.expectEqual(@as(u32, 7), counted.total_hits);
+
+    {
+        // The speculative scan encounters this unrelated row in either
+        // direction. The ordered scope can answer from valid identities.
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for ([_]usize{ 2, 77 }) |i| {
+            const key = try internal_keys.identityDocToOrdinalKeyAlloc(scratch, writes[i].key);
+            try txn.put(key, "malformed");
+        }
+        try txn.commit();
+    }
+
+    // Exercise batch recovery with mixed error classes and overlapping
+    // legacy and ordinal membership. An absent live reverse key is ambiguous.
+    {
+        const scan_req: types.SearchRequest = .{ .identity_read_generation = generation };
+        var scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = scan_req, .alloc = a };
+        const options: db_query_search.MatchAllCandidateCollectOptions = .{
+            .constraints = &.{
+                .positive_filter = true,
+                .filter_doc_nums = &endpoints,
+                .legacy_filter = .{ .doc_keys = &.{writes[1].key} },
+            },
+        };
+        const failed_keys = [_][]const u8{ writes[1].key, writes[2].key, writes[3].key, writes[78].key };
+        const failures = [_]?anyerror{ error.InvalidDocIdentity, error.InvalidDocIdentity, error.StorageReadTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable };
+        var visible = [_]bool{ true, true, true, true };
+        var resolved: [4]?doc_set.DocOrdinal = @splat(null);
+        var recovery: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer recovery.deinit();
+        try scan.recoverScopedSourceBatch(options, &recovery, a, &failed_keys, &failures, &visible, &resolved);
+        try std.testing.expectEqual([4]bool{ true, false, false, true }, visible);
+        try std.testing.expectEqual([4]?doc_set.DocOrdinal{ endpoints[0], null, null, endpoints[1] }, resolved);
+        const loaded_ordinals = recovery.offset;
+        visible[0] = false;
+        resolved[0] = null;
+        var cached_scan: DB.PrimaryMatchAllIdentityScan = .{ .db = undefined, .req = scan.req, .alloc = a };
+        try cached_scan.recoverScopedSourceBatch(options, &recovery, a, &.{writes[78].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(visible[0]);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, endpoints[1]), resolved[0]);
+        try std.testing.expectEqual(loaded_ordinals, recovery.offset);
+
+        // A legacy key backed by a future ordinal has a conclusive
+        // negative result even if its forward mapping cannot be decoded.
+        var historical_scan: DB.PrimaryMatchAllIdentityScan = .{ .db = &db, .req = .{ .identity_read_generation = 0 }, .alloc = a };
+        var historical: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer historical.deinit();
+        for (0..2) |_| {
+            try historical_scan.recoverScopedSourceBatch(options, &historical, a, &.{writes[1].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+            try std.testing.expect(!visible[0]);
+            try std.testing.expect(historical.reverse.get(writes[1].key).?.visible == false);
+            historical_scan.db = undefined;
+        }
+
+        var interrupted: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{
+            .arena = std.heap.ArenaAllocator.init(a),
+            .initialized = true,
+            .exhausted = true,
+            .proof_failure = error.StorageReadTemporarilyUnavailable,
+        };
+        defer interrupted.deinit();
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, cached_scan.recoverScopedSourceBatch(
+            options,
+            &interrupted,
+            a,
+            &.{writes[2].key},
+            &.{error.NotFound},
+            visible[0..1],
+            resolved[0..1],
+        ));
+        try interrupted.reverse.put(interrupted.arena.allocator(), writes[1].key, .{ .ordinal = endpoints[0], .visible = true });
+        try cached_scan.recoverScopedSourceBatch(options, &interrupted, a, &.{writes[1].key}, &.{error.NotFound}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(visible[0]);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, endpoints[0]), resolved[0]);
+
+        // Stop inside the first bitmap page, then resume across later pages.
+        var bitmap_scope = @import("../../encoding/roaring.zig").RoaringBitmap.init(a);
+        defer bitmap_scope.deinit();
+        try bitmap_scope.add(endpoints[0]);
+        try bitmap_scope.addRange(1024, 1536);
+        const bitmap_options: db_query_search.MatchAllCandidateCollectOptions = .{
+            .constraints = &.{
+                .positive_filter = true,
+                .primary_include_compact = true,
+                .primary_include = .{ .ordinal_bitmap = bitmap_scope },
+                .legacy_filter = .{ .doc_keys = &.{writes[3].key} },
+            },
+        };
+        var bitmap_recovery: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer bitmap_recovery.deinit();
+        try scan.recoverScopedSourceBatch(bitmap_options, &bitmap_recovery, a, &.{writes[1].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(visible[0] and !bitmap_recovery.exhausted);
+        try std.testing.expect(bitmap_recovery.bitmap.?.bitmap == &bitmap_options.constraints.?.primary_include.ordinal_bitmap);
+        try scan.recoverScopedSourceBatch(bitmap_options, &bitmap_recovery, a, &.{writes[2].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(!visible[0] and bitmap_recovery.exhausted);
+        const explicit_keys = bitmap_recovery.explicit_keys.?.count();
+        try std.testing.expectEqual(@as(usize, 1), explicit_keys);
+        try std.testing.expectError(error.InvalidDocIdentity, scan.recoverScopedSourceBatch(
+            bitmap_options,
+            &bitmap_recovery,
+            a,
+            &.{writes[3].key},
+            &.{error.InvalidDocIdentity},
+            visible[0..1],
+            resolved[0..1],
+        ));
+        try std.testing.expectEqual(explicit_keys, bitmap_recovery.explicit_keys.?.count());
+
+        var denied_allocator: std.testing.FailingAllocator = .init(a, .{ .fail_index = 0 });
+        var denied: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(denied_allocator.allocator()) };
+        defer denied.deinit();
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, scan.recoverScopedSourceBatch(
+            options,
+            &denied,
+            a,
+            &.{writes[2].key},
+            &.{error.StorageReadTemporarilyUnavailable},
+            visible[0..1],
+            resolved[0..1],
+        ));
+
+        const missing_key = internal_keys.identityOrdinalToDocKey(endpoints[0]);
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.delete(&missing_key);
+            try txn.commit();
+        }
+        var incomplete: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer incomplete.deinit();
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, scan.recoverScopedSourceBatch(
+            options,
+            &incomplete,
+            a,
+            &.{writes[2].key},
+            &.{error.StorageReadTemporarilyUnavailable},
+            visible[0..1],
+            resolved[0..1],
+        ));
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(&missing_key, writes[1].key);
+            try txn.commit();
+        }
+    }
+
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for ([_]usize{ 1, 78 }) |slot| {
+            const id = writes[slot].key;
+            try txn.delete(try internal_keys.identityDocToOrdinalKeyAlloc(scratch, id));
+            try txn.delete(try internal_keys.identityLiveDocToOrdinalKeyAlloc(scratch, id));
+        }
+        try txn.commit();
+
+        var resolved: [4]?[]const u8 = undefined;
+        try DB.resolvePrimaryOrdinalKeysCallback(&db, scratch, &.{ endpoints[1], std.math.maxInt(u32), endpoints[0], endpoints[1] }, generation, &resolved);
+        try std.testing.expectEqualStrings(writes[78].key, resolved[0].?);
+        try std.testing.expect(resolved[1] == null);
+        try std.testing.expectEqualStrings(writes[1].key, resolved[2].?);
+        try std.testing.expectEqualStrings(writes[78].key, resolved[3].?);
+    }
+
+    const Record = struct {
+        expected: []const u8,
+        ordinal: doc_set.DocOrdinal,
+        seen: usize = 0,
+
+        fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!std.mem.eql(u8, self.expected, id)) return .@"continue";
+            try std.testing.expectEqual(@as(?doc_set.DocOrdinal, self.ordinal), ordinal);
+            self.seen += 1;
+            return .stop;
+        }
+
+        fn consume(raw: ?*anyopaque, candidate: *db_query_search.MatchAllCandidate) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqualStrings(self.expected, candidate.id);
+            self.seen += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |reverse| {
+        for ([_]bool{ false, true }) |near| {
+            const endpoint = @intFromBool(reverse != near);
+            var ordinals: [1024]u32 = undefined;
+            ordinals[0] = endpoints[endpoint];
+            for (ordinals[1..], 0..) |*ordinal, i| ordinal.* = std.math.maxInt(u32) - 1024 + @as(u32, @intCast(i));
+            var record = Record{ .expected = writes[if (endpoint == 0) 1 else 78].key, .ordinal = endpoints[endpoint] };
+            const options: db_query_search.MatchAllCandidateCollectOptions = .{
+                .constraints = &.{ .positive_filter = true, .filter_doc_nums = &ordinals },
+                .require_complete_primary_population = true,
+                .primary_key_start_after = if (reverse) null else writes[0].key,
+                .primary_key_stop_before = if (reverse) writes[79].key else null,
+                .primary_key_reverse = reverse,
+                .stop_after_accepted = 1,
+                .scan_batch_size = 1,
+            };
+            _ = try DB.streamSearchMatchAllCandidatesCallback(&db, a, .{}, options, &record, Record.consume);
+            try std.testing.expectEqual(@as(usize, 1), record.seen);
+            record.seen = 0;
+            var no_spill = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .ordered_spill_enabled = false };
+            try DB.PrimaryMatchAllIdentityScan.scan(&no_spill, a, options, &record, Record.visit);
+            try std.testing.expectEqual(@as(usize, 1), record.seen);
+        }
+    }
+}
+
+test "optional numeric range keeps mixed primary matches for native field sorting" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("range-mixed-primary-sort");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{});
+    defer db.close();
+    const schema: schema_mod.TableSchema = .{
+        .default_type = "doc",
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        } }},
+        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true, .sortable = true } }},
+        .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+    };
+    try db.setSchema(schema);
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .sync_level = .full_index, .writes = &.{
+        .{ .key = "legacy", .value = "{\"body\":\"beacon\",\"rank\":1}" },
+        .{ .key = "mapped", .value = "{\"body\":\"beacon\",\"rank\":2}" },
+    } });
+    const text = db.core.index_manager.textIndex("ft").?;
+    {
+        const legacy_ordinal = ordinal: {
+            var read = try db.core.store.beginProbeTxn();
+            defer read.abort();
+            break :ordinal (try doc_identity.lookupOrdinalTxn(a, &read, "legacy")).?;
+        };
+        const deleted = try text.deleteByIdsTracked(&.{ "legacy", "mapped" });
+        defer text.freeDeleteInfos(deleted);
+        const mixed = (try mapper.buildTextSegmentFromDocuments(a, &.{
+            .{ .key = "legacy", .doc_ordinal = legacy_ordinal, .value = "{\"body\":\"beacon\",\"rank\":1}" },
+            .{ .key = "mapped", .value = "{\"body\":\"beacon\",\"rank\":2}" },
+        }, .{}, schema)).?;
+        defer a.free(mixed);
+        try text.indexSegment(mixed);
+        try std.testing.expect(try text.snapshot().hasDocOrdinalCoverage());
+        const NoPrimaryScan = struct {
+            fn collect(
+                _: ?*anyopaque,
+                _: Allocator,
+                _: types.SearchRequest,
+                _: db_query_search.MatchAllCandidateCollectOptions,
+                _: ?*anyopaque,
+                _: db_query_search.MatchAllCandidateConsumer,
+            ) anyerror!db_query_search.MatchAllCandidateStreamStats {
+                return error.UnexpectedPrimaryScan;
+            }
+        };
+        var executor = db.matchAllExecutor();
+        executor.collect_candidates_stream = NoPrimaryScan.collect;
+        var sorted = try db_query_search.searchMatchAll(a, .{
+            .index_name = "ft",
+            .limit = 2,
+            .filter_doc_ids = &.{"mapped"},
+            .include_stored = false,
+            .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+        }, executor);
+        defer sorted.deinit();
+        try std.testing.expectEqual(@as(usize, 1), sorted.hits.len);
+        try std.testing.expectEqualStrings("mapped", sorted.hits[0].id);
+
+        const mapped_ordinal = ordinal: {
+            var read = try db.core.store.beginProbeTxn();
+            defer read.abort();
+            break :ordinal (try doc_identity.lookupOrdinalTxn(a, &read, "mapped")).?;
+        };
+        var scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &.{ mapped_ordinal, std.math.maxInt(u32) }) };
+        defer scope.deinit(a);
+        executor.live_filter_doc_set = null;
+        executor.nonvisible_doc_set = null;
+        const Predicate = struct {
+            fn deny(_: *anyopaque, _: []const u8) anyerror!bool {
+                return false;
+            }
+        };
+        var argument: u8 = 0;
+        for ([_]u32{ 2, 0 }) |limit| {
+            var count_executor = executor;
+            if (limit == 0) count_executor.collect_candidates_stream = db.matchAllExecutor().collect_candidates_stream;
+            var rejected = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = limit,
+                .include_stored = false,
+                .resolved_doc_filter = &scope,
+                .native_key_predicate = .{ .ptr = &argument, .allows = Predicate.deny },
+                .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+            }, count_executor);
+            defer rejected.deinit();
+            try std.testing.expectEqual(@as(usize, 0), rejected.hits.len);
+            try std.testing.expectEqual(@as(u32, 0), rejected.total_hits);
+        }
+
+        // This row still has a text ordinal and source bytes, but the primary
+        // state lookup cannot vouch for the ordinal. Its key remains authoritative.
+        const state_key = internal_keys.identityOrdinalStateKey(legacy_ordinal);
+        const old_state = state: {
+            var read = try db.core.store.beginProbeTxn();
+            defer read.abort();
+            break :state try a.dupe(u8, try read.get(&state_key));
+        };
+        defer a.free(old_state);
+        {
+            var write = try db.core.store.beginWriteTxn();
+            errdefer write.abort();
+            try write.delete(&state_key);
+            try write.commit();
+        }
+        {
+            // The missing state is a valid compatibility key. The mapped row
+            // exists physically but was created after this read generation.
+            const VisitHistorical = struct {
+                fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
+                    const visited: *usize = @ptrCast(@alignCast(raw.?));
+                    try std.testing.expectEqualStrings("legacy", id);
+                    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, null), ordinal);
+                    visited.* += 1;
+                    return .@"continue";
+                }
+            };
+            const key_options = db_query_search.MatchAllCandidateCollectOptions{ .constraints = &.{
+                .positive_filter = true,
+                .legacy_filter = .{ .doc_keys = &.{ "legacy", "mapped" } },
+            } };
+            var visited: usize = 0;
+            var historical = DB.PrimaryMatchAllIdentityScan{
+                .db = &db,
+                .req = .{ .identity_read_generation = 0 },
+                .alloc = a,
+                .visitor_ctx = &visited,
+                .visitor = VisitHistorical.visit,
+            };
+            try std.testing.expect(try historical.scanSmallOrderedScope(key_options));
+            try std.testing.expectEqual(@as(usize, 1), visited);
+            var started = false;
+            try std.testing.expect(try historical.scanLargeOrderedScopeWithSpill(key_options, &started));
+            try std.testing.expect(started);
+            try std.testing.expectEqual(@as(usize, 2), visited);
+            try historical.scanSourcePopulation(key_options);
+            try std.testing.expectEqual(@as(usize, 3), visited);
+        }
+
+        var mixed_scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &.{mapped_ordinal}) };
+        defer mixed_scope.deinit(a);
+        mixed_scope.legacy_include = try doc_set.cloneDocKeysAlloc(a, &.{"legacy"});
+        var mixed_page = try db_query_search.searchMatchAll(a, .{
+            .index_name = "ft",
+            .limit = 2,
+            .include_stored = false,
+            .resolved_doc_filter = &mixed_scope,
+            .exclude_doc_ids = &.{"missing"},
+            .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+        }, db.matchAllExecutor());
+        defer mixed_page.deinit();
+        try std.testing.expectEqual(@as(usize, 2), mixed_page.hits.len);
+        try std.testing.expectEqualStrings("legacy", mixed_page.hits[1].id);
+        for ([_]bool{ false, true }) |with_cursor| {
+            var broad = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = 0,
+                .include_stored = false,
+                .search_after = if (with_cursor) mixed_page.hits[0].sort_values else &.{},
+                .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+            }, db.matchAllExecutor());
+            defer broad.deinit();
+            try std.testing.expectEqual(@as(u32, if (with_cursor) 1 else 2), broad.total_hits);
+        }
+        var unordered_executor = db.matchAllExecutor();
+        unordered_executor.bounded_unordered_page = true;
+        var unordered = try db_query_search.searchMatchAll(a, .{
+            .limit = 0,
+            .include_stored = false,
+        }, unordered_executor);
+        defer unordered.deinit();
+        try std.testing.expectEqual(@as(u32, 2), unordered.total_hits);
+
+        const mapped_live_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(a, "mapped");
+        defer a.free(mapped_live_key);
+        const mapped_live_value = value: {
+            var txn = try db.core.store.beginProbeTxn();
+            defer txn.abort();
+            break :value try a.dupe(u8, try txn.get(mapped_live_key));
+        };
+        defer a.free(mapped_live_value);
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.delete(mapped_live_key);
+            try txn.commit();
+        }
+        var mapped_scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &.{mapped_ordinal}) };
+        defer mapped_scope.deinit(a);
+        for ([_][]const types.SortField{ &.{}, &.{.{ .field = "_id" }} }) |order| {
+            var scoped = try db_query_search.searchMatchAll(a, .{
+                .limit = 1,
+                .include_stored = false,
+                .resolved_doc_filter = &mapped_scope,
+                .order_by = order,
+            }, unordered_executor);
+            defer scoped.deinit();
+            try std.testing.expectEqual(@as(usize, 1), scoped.hits.len);
+            try std.testing.expectEqualStrings("mapped", scoped.hits[0].id);
+        }
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(mapped_live_key, mapped_live_value);
+            try txn.commit();
+        }
+
+        var wide_ordinals: [257]doc_set.DocOrdinal = undefined;
+        wide_ordinals[0] = mapped_ordinal;
+        for (wide_ordinals[1..], 0..) |*ordinal, i| ordinal.* = std.math.maxInt(u32) - @as(u32, @intCast(i));
+        var wide_scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &wide_ordinals) };
+        defer wide_scope.deinit(a);
+        var wide_executor = unordered_executor;
+        wide_executor.live_filter_doc_set = null;
+        wide_executor.nonvisible_doc_set = null;
+        var wide = try db_query_search.searchMatchAll(a, .{
+            .limit = 1,
+            .include_stored = false,
+            .resolved_doc_filter = &wide_scope,
+            .order_by = &.{.{ .field = "_id" }},
+        }, wide_executor);
+        defer wide.deinit();
+        try std.testing.expectEqual(@as(usize, 1), wide.hits.len);
+        try std.testing.expectEqualStrings("mapped", wide.hits[0].id);
+
+        const StopAfterOne = struct {
+            fn visit(raw: ?*anyopaque, _: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
+                const visited: *usize = @ptrCast(@alignCast(raw.?));
+                visited.* += 1;
+                return .stop;
+            }
+        };
+        for ([_]bool{ false, true }) |reverse| {
+            var examined: usize = 0;
+            var visited: usize = 0;
+            var source_scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .observed_rows = &examined };
+            try DB.PrimaryMatchAllIdentityScan.scan(&source_scan, a, .{
+                .require_complete_primary_population = true,
+                .primary_key_reverse = reverse,
+                .scan_batch_size = 1,
+            }, &visited, StopAfterOne.visit);
+            try std.testing.expectEqual(@as(usize, 1), examined);
+            try std.testing.expectEqual(@as(usize, 1), visited);
+        }
+
+        var finite_count = try db_query_search.searchMatchAll(a, .{
+            .index_name = "ft",
+            .limit = 0,
+            .include_stored = false,
+            .resolved_doc_filter = &mixed_scope,
+            .search_after = mixed_page.hits[0].sort_values,
+            .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+        }, db.matchAllExecutor());
+        defer finite_count.deinit();
+        try std.testing.expectEqual(@as(u32, 1), finite_count.total_hits);
+
+        for ([_]bool{ false, true }) |reverse| {
+            const cursor: []const std.json.Value = &.{.{ .string = if (reverse) "mapped" else "legacy" }};
+            for ([_]u32{ 1, 0 }) |limit| {
+                var id_result = try db_query_search.searchMatchAll(a, .{
+                    .limit = limit,
+                    .include_stored = false,
+                    .search_after = if (reverse) &.{} else cursor,
+                    .search_before = if (reverse) cursor else &.{},
+                    .order_by = &.{.{ .field = "_id" }},
+                }, db.matchAllExecutor());
+                defer id_result.deinit();
+                try std.testing.expectEqual(@as(u32, 1), id_result.total_hits);
+                try std.testing.expectEqual(@as(usize, limit), id_result.hits.len);
+                if (limit != 0) try std.testing.expectEqualStrings(if (reverse) "legacy" else "mapped", id_result.hits[0].id);
+            }
+        }
+        {
+            const c = struct {
+                extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+                extern fn unsetenv(name: [*:0]const u8) c_int;
+            };
+            const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+            const old_budget = if (@import("antfly_platform").env.getenv(budget_env)) |value| try a.dupeSentinel(u8, value, 0) else null;
+            defer if (old_budget) |value| a.free(value);
+            try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "2", 1));
+            defer if (old_budget) |value| {
+                _ = c.setenv(budget_env, value, 1);
+            } else {
+                _ = c.unsetenv(budget_env);
+            };
+            var oversized_scope = doc_set.ResolvedDocFilter{
+                .include = try doc_set.fromOrdinalsAlloc(a, &.{ mapped_ordinal, std.math.maxInt(u32) }),
+            };
+            defer oversized_scope.deinit(a);
+            oversized_scope.legacy_include = try doc_set.cloneDocKeysAlloc(a, &.{"legacy"});
+            var bounded_executor = db.matchAllExecutor();
+            bounded_executor.live_filter_doc_set = null;
+            bounded_executor.nonvisible_doc_set = null;
+            var top = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = 1,
+                .include_stored = false,
+                .resolved_doc_filter = &oversized_scope,
+                .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+            }, bounded_executor);
+            defer top.deinit();
+            try std.testing.expectEqual(@as(u32, 2), top.total_hits);
+            try std.testing.expectEqual(@as(usize, 1), top.hits.len);
+            try std.testing.expectEqualStrings("mapped", top.hits[0].id);
+        }
+
+        {
+            var write = try db.core.store.beginWriteTxn();
+            errdefer write.abort();
+            try write.put(&state_key, old_state);
+            try write.commit();
+        }
+    }
+    const forward = try internal_keys.identityDocToOrdinalKeyAlloc(a, "legacy");
+    defer a.free(forward);
+    const live = try internal_keys.identityLiveDocToOrdinalKeyAlloc(a, "legacy");
+    defer a.free(live);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(forward);
+        try txn.delete(live);
+        try txn.commit();
+    }
+    for ([_]bool{ false, true }) |replace_segment| {
+        if (replace_segment) {
+            const deletions = try text.deleteByIdsTracked(&.{"legacy"});
+            defer text.freeDeleteInfos(deletions);
+            try std.testing.expect(deletions.len != 0);
+            const legacy = (try mapper.buildTextSegmentFromDocuments(a, &.{
+                .{ .key = "legacy", .value = "{\"body\":\"beacon\",\"rank\":1}" },
+            }, .{}, schema)).?;
+            defer a.free(legacy);
+            try text.indexSegment(legacy);
+            try std.testing.expect(!(try text.snapshot().hasDocOrdinalCoverage()));
+        }
+        var sorted = try db_query_search.searchMatchAll(a, .{
+            .index_name = "ft",
+            .limit = 2,
+            .include_stored = false,
+            .filter_query_json = "{\"range\":{\"rank\":{\"gte\":1}}}",
+            .order_by = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+        }, db.matchAllExecutor());
+        defer sorted.deinit();
+        try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
+        try std.testing.expectEqualStrings("legacy", sorted.hits[0].id);
+        try std.testing.expectEqualStrings("mapped", sorted.hits[1].id);
+        if (replace_segment) {
+            var exact = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = 2,
+                .exclude_doc_ids = &.{"legacy"},
+                .include_stored = false,
+                .filter_query_json = "{\"range\":{\"rank\":{\"gte\":1}}}",
+                .order_by = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+            }, db.matchAllExecutor());
+            defer exact.deinit();
+            try std.testing.expectEqual(@as(usize, 1), exact.hits.len);
+            try std.testing.expectEqualStrings("mapped", exact.hits[0].id);
+
+            var key_only = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = 2,
+                .filter_doc_ids = &.{"legacy"},
+                .include_stored = false,
+                .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+            }, db.matchAllExecutor());
+            defer key_only.deinit();
+            try std.testing.expectEqual(@as(usize, 1), key_only.hits.len);
+            try std.testing.expectEqualStrings("legacy", key_only.hits[0].id);
+
+            const mapped_deletions = try text.deleteByIdsTracked(&.{"mapped"});
+            defer text.freeDeleteInfos(mapped_deletions);
+            const mapped_without_text_ordinal = (try mapper.buildTextSegmentFromDocuments(a, &.{
+                .{ .key = "mapped", .value = "{\"body\":\"beacon\",\"rank\":2}" },
+            }, .{}, schema)).?;
+            defer a.free(mapped_without_text_ordinal);
+            try text.indexSegment(mapped_without_text_ordinal);
+            for ([_]bool{ false, true }) |descending| {
+                var mapped_only = try db_query_search.searchMatchAll(a, .{
+                    .index_name = "ft",
+                    .limit = 2,
+                    .filter_doc_ids = &.{"mapped"},
+                    .include_stored = false,
+                    .order_by = &.{ .{ .field = "rank", .desc = descending }, .{ .field = "_id" } },
+                }, db.matchAllExecutor());
+                defer mapped_only.deinit();
+                try std.testing.expectEqual(@as(usize, 1), mapped_only.hits.len);
+                try std.testing.expectEqualStrings("mapped", mapped_only.hits[0].id);
+                try std.testing.expect(mapped_only.hits[0].doc_ordinal != null);
+            }
+        }
+    }
+}
+
+test "optional numeric range graph admission preserves legacy indexed predicates" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-legacy-range");
+    defer tmp.cleanup();
+    const PendingDenseMigration = struct {
+        fn authorityPermitted(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var db = try DB.open(a, tmp.path(), .{
+        .index_backends = .{ .dense_native_migration_policy_source = .{
+            .ptr = &tmp,
+            .authority_permitted = PendingDenseMigration.authorityPermitted,
+        } },
+    });
+    defer db.close();
+    // Mapped numeric values are dense, but this generation predates source
+    // witnesses. A dynamic mapping builds that physical shape.
+    try db.setSchema(.{
+        .default_type = "doc",
+        .dynamic_templates = &.{.{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{ .field_type = .numeric, .doc_values = true },
+        }},
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        } }},
+    });
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
+    try db.batch(.{ .sync_level = .full_index, .writes = &.{
+        .{ .key = "a", .value = "{\"body\":\"beacon\",\"rank\":9007199254740992,\"_embeddings\":{\"dv\":[1,0]}}" },
+        .{ .key = "b", .value = "{\"body\":\"beacon\",\"rank\":9007199254740993,\"_embeddings\":{\"dv\":[1,0]}}" },
+        .{ .key = "c", .value = "{\"body\":\"mast\",\"rank\":9007199254740993,\"_embeddings\":{\"dv\":[1,0]}}" },
+    } });
+    const snapshot = db.core.index_manager.textIndex("ft").?.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(u32, 3), snapshot.liveDocCount());
+    for (snapshot.segments) |segment| {
+        try std.testing.expect((try segment.reader.numericRangeCoverage("rank")) == null);
+    }
+
+    const match = "{\"match\":{\"field\":\"body\",\"text\":\"beacon\"}}";
+    const range = "{\"range\":{\"rank\":{\"gt\":9007199254740992}}}";
+    const cases = [_]struct { json: []const u8, expected: []const bool }{
+        .{ .json = "{\"conjuncts\":[" ++ match ++ "," ++ range ++ "]}", .expected = &.{ false, true, false } },
+        .{ .json = "{\"disjuncts\":[" ++ match ++ "," ++ range ++ "]}", .expected = &.{ true, true, true } },
+        .{ .json = "{\"bool\":{\"should\":[" ++ match ++ "," ++ range ++ "],\"minimum_should_match\":2}}", .expected = &.{ false, true, false } },
+        .{ .json = "{\"bool\":{\"must\":[" ++ match ++ "],\"must_not\":[" ++ range ++ "]}}", .expected = &.{ true, false, false } },
+    };
+    for (cases) |case| {
+        const rows = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = case.json }, &.{ "a", "b", "c" });
+        defer a.free(rows);
+        try std.testing.expectEqualSlices(bool, case.expected, rows);
+    }
+
+    var standalone = try db.searchDenseProfiled(a, .{
+        .index_name = "dv",
+        .primary_text_index_name = "ft",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"range\":{\"rank\":{\"gt\":9007199254740992.5}}}",
+        .filter_doc_ids = &.{ "a", "b" },
+    }, .{ .vector = &.{ 1, 0 }, .k = 1 });
+    defer standalone.result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), standalone.result.hits.len);
+    try std.testing.expectEqualStrings("b", standalone.result.hits[0].id);
+    try std.testing.expectEqual(@as(u64, 1), standalone.profile.native_filter_candidate_count);
+
+    const disjunction = cases[1].json;
+    const conjunction = cases[0].json;
+    for ([_]struct { filter: []const u8, exclusion: []const u8, expected: []const u8 }{
+        .{ .filter = conjunction, .exclusion = "", .expected = "b" },
+        .{ .filter = "", .exclusion = conjunction, .expected = "a" },
+    }) |test_case| {
+        var lexical = try db.search(a, .{
+            .index_name = "ft",
+            .limit = 3,
+            .include_stored = false,
+            .full_text = .{ .match = .{ .field = "body", .text = "beacon" } },
+            .filter_query_json = test_case.filter,
+            .exclusion_query_json = test_case.exclusion,
+        });
+        defer lexical.deinit();
+        try std.testing.expectEqual(@as(usize, 1), lexical.hits.len);
+        try std.testing.expectEqualStrings(test_case.expected, lexical.hits[0].id);
+        var dense = try db.searchDenseProfiled(a, .{
+            .index_name = "dv",
+            .primary_text_index_name = "ft",
+            .limit = 3,
+            .include_stored = false,
+            .filter_query_json = test_case.filter,
+            .exclusion_query_json = test_case.exclusion,
+        }, .{ .vector = &.{ 1, 0 }, .k = 3 });
+        defer dense.result.deinit();
+        if (test_case.filter.len != 0) {
+            try std.testing.expectEqual(@as(usize, 1), dense.result.hits.len);
+            try std.testing.expectEqualStrings(test_case.expected, dense.result.hits[0].id);
+        } else {
+            try std.testing.expectEqual(@as(usize, 2), dense.result.hits.len);
+            for (dense.result.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "b"));
+        }
+    }
+
+    const match_mast = "{\"match\":{\"field\":\"body\",\"text\":\"mast\"}}";
+    const selective_should = "{\"bool\":{\"must\":[" ++ range ++ "],\"should\":[" ++ match_mast ++ "],\"minimum_should_match\":1}}";
+    var policy_result = try db.search(a, .{
+        .index_name = "ft",
+        .limit = 3,
+        .include_stored = false,
+        .full_text = .{ .match = .{ .field = "body", .text = "beacon" } },
+        .filter_query_json = conjunction,
+        .authorization_filter_query_json = range,
+        .filter_doc_ids = &.{ "missing", "b" },
+        .exclude_doc_ids = &.{"also-missing"},
+    });
+    defer policy_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), policy_result.hits.len);
+    try std.testing.expectEqualStrings("b", policy_result.hits[0].id);
+
+    var policy_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_scanned_anchors = 1 });
+    const denied = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"conjuncts\":[{\"conjuncts\":[" ++ match ++ ",{\"range\":{\"rank\":{\"gte\":9007199254740992}}}]}," ++ range ++ "]}",
+        .authorization_filter_query_json = range,
+        .graph_work_budget = &policy_budget,
+    }, &.{"a"});
+    defer a.free(denied);
+    try std.testing.expectEqualSlices(bool, &.{false}, denied);
+    try std.testing.expectEqual(@as(usize, 0), policy_budget.remaining_anchors);
+
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(a);
+    try wide.appendSlice(a, "{\"disjuncts\":[");
+    for (0..17) |_| try wide.appendSlice(a, "{\"match\":{\"field\":\"body\",\"text\":\"unmatched\"}},");
+    try wide.appendSlice(a, range ++ "]}");
+    var wide_gate = DB.GraphNodeAdmissionCache.init(&db, a, .{ .index_name = "ft", .filter_query_json = wide.items }, "ft", .{});
+    defer wide_gate.deinit();
+    const wide_one = try wide_gate.iface().filterKeysAlloc(a, &.{"b"}, false);
+    defer a.free(wide_one);
+    try std.testing.expect(wide_one[0]);
+    try std.testing.expectEqual(@as(usize, 17), wide_gate.clause_membership.entries.count());
+    const misses = snapshot.graph_predicates.misses;
+    const wide_two = try wide_gate.iface().filterKeysAlloc(a, &.{"c"}, false);
+    defer a.free(wide_two);
+    try std.testing.expect(wide_two[0]);
+    try std.testing.expectEqual(misses + 1, snapshot.graph_predicates.misses);
+
+    var budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_scanned_anchors = 1 });
+    var admission = DB.GraphNodeAdmissionCache.init(&db, a, .{
+        .index_name = "ft",
+        .filter_query_json = disjunction,
+        .graph_work_budget = &budget,
+    }, "ft", .{});
+    defer admission.deinit();
+    const first = try DB.GraphNodeAdmissionCache.filterMany(&admission, a, &.{.{ .key = "a" }});
+    defer a.free(first);
+    try std.testing.expectEqualSlices(bool, &.{true}, first);
+    try std.testing.expectEqual(@as(usize, 1), budget.remaining_anchors);
+    const second = try DB.GraphNodeAdmissionCache.filterMany(&admission, a, &.{.{ .key = "c" }});
+    defer a.free(second);
+    try std.testing.expectEqualSlices(bool, &.{true}, second);
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining_anchors);
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = conjunction,
+        .graph_work_budget = &budget,
+    }, &.{"b"}));
+
+    // Leave a posting and visible identity without a primary row. Predicates
+    // on the current frontier must ignore it when outside the requested or
+    // authorized keys, including when evaluating a negated range.
+    const stale_key = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(stale_key);
+    try db.core.store.delete(stale_key);
+    const excluded = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = conjunction,
+        .exclusion_query_json = "{\"doc_id\":[\"a\"]}",
+    }, &.{ "a", "b" });
+    defer a.free(excluded);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, excluded);
+
+    const decided = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"bool\":{\"should\":[" ++ range ++ "," ++ match ++ "," ++ match ++ "],\"minimum_should_match\":2}}",
+    }, &.{"a"});
+    defer a.free(decided);
+    try std.testing.expectEqualSlices(bool, &.{true}, decided);
+
+    var ordinary = try db.search(a, .{
+        .index_name = "ft",
+        .limit = 3,
+        .include_stored = false,
+        .full_text = .{ .match = .{ .field = "body", .text = "beacon" } },
+        .filter_query_json = conjunction,
+    });
+    defer ordinary.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ordinary.hits.len);
+    try std.testing.expectEqualStrings("b", ordinary.hits[0].id);
+
+    const should_pruned = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = selective_should }, &.{ "a", "c" });
+    defer a.free(should_pruned);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, should_pruned);
+
+    const bounded = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = conjunction }, &.{"b"});
+    defer a.free(bounded);
+    try std.testing.expectEqualSlices(bool, &.{true}, bounded);
+
+    const pruned = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"bool\":{\"must\":[" ++ range ++ "],\"must_not\":[" ++ match ++ "]}}",
+    }, &.{ "a", "c" });
+    defer a.free(pruned);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, pruned);
+
+    var policy = doc_set.ResolvedDocFilter{ .include = try doc_set.cloneDocKeysAlloc(a, &.{"b"}) };
+    defer policy.deinit(a);
+    var authorized = try db.filterGraphKeysWithOrdinalsAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = conjunction,
+        .resolved_doc_filter = &policy,
+    }, &.{ "a", "b" });
+    defer authorized.deinit(a);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, authorized.allowed);
+    try std.testing.expect(authorized.stored_data.?[0] == null);
+    try std.testing.expect(authorized.stored_data.?[1] != null);
+    const negated = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .exclusion_query_json = conjunction,
+        .exclude_doc_ids = &.{"a"},
+    }, &.{ "a", "b", "c" });
+    defer a.free(negated);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true }, negated);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = conjunction,
+    }, &.{"a"}));
 }

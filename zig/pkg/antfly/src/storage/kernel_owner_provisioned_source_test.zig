@@ -583,10 +583,13 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     const encoded_schema = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, schema);
     defer alloc.free(encoded_schema);
     const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 70, .shard_id = 7001, .range_id = 7001 }, .target_namespace = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .target_schema_digest = staging.digest(encoded_schema) };
-    const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = schema_json, .indexes_json = "{}", .byte_range = .{ .start = "a", .end = "m" } };
+    // The bootstrap retains the metadata epoch while the owner receives the
+    // canonical physical catalog with that control removed.
+    const indexes_json = "{\"_index_alias_epoch\":7}";
+    const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = schema_json, .indexes_json = indexes_json, .byte_range = .{ .start = "a", .end = "m" } };
     const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
     defer alloc.free(bootstrap_json);
-    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = table_reads.backend_current_root_generation, .identity = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .schema_json = schema_json, .indexes_json = "{}", .restore_bootstrap_json = bootstrap_json };
+    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = table_reads.backend_current_root_generation, .identity = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .schema_json = schema_json, .indexes_json = indexes_json, .restore_bootstrap_json = bootstrap_json };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -1903,7 +1906,9 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expect(lease_capture.count > lease_count_before_reopen);
 
-    const restore_source_location = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
+    const restore_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
+    defer alloc.free(restore_uri);
+    const restore_source_location = try @import("antfly_local_sources").api_local_backups.restorePublicationIdentityAlloc(alloc, 17, "00000000000000000000000000001234", restore_uri);
     defer alloc.free(restore_source_location);
     const PublicationHook = struct {
         publish_count: usize = 0,
@@ -2076,12 +2081,19 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         var reconcile_plan = restore_plan;
         reconcile_plan.reconcile_only = true;
         reconcile_plan.replace_existing = false;
+        // The receipt on the published generation is sufficient even when
+        // the original archive root can no longer be opened.
+        reconcile_plan.backup_root = "missing-repository-after-publication";
         try std.testing.expect((try write_source.source().restoreTable(
             alloc,
             "articles",
             reconcile_plan,
         )) != null);
         try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+        const other_publication = try @import("antfly_local_sources").api_local_backups.restorePublicationIdentityAlloc(alloc, 18, "00000000000000000000000000001234", restore_uri);
+        defer alloc.free(other_publication);
+        reconcile_plan.source_location = other_publication;
+        try std.testing.expectError(error.RestoreIdentityMismatch, write_source.source().restoreTable(alloc, "articles", reconcile_plan));
     }
 
     concurrent_maintenance.stop.store(true, .release);

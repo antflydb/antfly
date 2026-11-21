@@ -27,8 +27,8 @@ const Table = local.common_topology_records.TableRecord;
 const Request = local.api_operation.RequestContext;
 const Context = local.serverless_query_lake_read_context.Context;
 
-pub fn scope(table: Table, owner: admission.State) lifecycle.SourceScope {
-    return .{ .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .owner = owner.owner };
+pub fn scope(a: A, table: Table, owner: admission.State) !lifecycle.SourceScope {
+    return .{ .object_generation = table.object_storage_generation, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table), .owner = owner.owner };
 }
 fn sourceIdentity(binding: local.serverless_external_source_catalog_binding.Binding) [32]u8 {
     // Schema/index changes invalidate cuts through desiredFingerprint; they
@@ -91,9 +91,9 @@ fn acknowledge(raw: *anyopaque, table_id: u64, generation: u64, nonce: [16]u8, l
     if (generation != table.object_storage_generation or !std.mem.eql(u8, &nonce, &owner.owner)) return error.CatalogGenerationChanged;
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return error.MetadataSourceUnavailable;
     if (lsn) |accepted| {
-        try authority.apply(table_id, .{ .acknowledge_source = .{ .scope = scope(table, owner), .lsn = accepted } });
+        try authority.apply(table_id, .{ .acknowledge_source = .{ .scope = try scope(a, table, owner), .lsn = accepted } });
     } else {
-        authority.apply(table_id, .{ .invalidate_source = .{ .scope = scope(table, owner), .epoch = owner.epoch } }) catch |err| {
+        authority.apply(table_id, .{ .invalidate_source = .{ .scope = try scope(a, table, owner), .epoch = owner.epoch } }) catch |err| {
             const observed = try authority.readState(a, table_id);
             const newer = observed.source_owner orelse return err;
             // A native invalidation observed after the committed catalog write
@@ -148,7 +148,7 @@ pub fn activate(a: A, server: *server_api.ApiHttpServer, table: Table, request: 
         var owner: admission.State = .{ .kind = kind, .owner = undefined, .signing_key = undefined, .object_generation = table.object_storage_generation, .source = sourceIdentity(schema.binding) };
         try server.embedding_provider_runtime.io.randomSecure(&owner.owner);
         try server.embedding_provider_runtime.io.randomSecure(&owner.signing_key);
-        authority.apply(table.table_id, .{ .configure_source = .{ .scope = scope(table, owner), .state = owner } }) catch |err| switch (err) {
+        authority.apply(table.table_id, .{ .configure_source = .{ .scope = try scope(a, table, owner), .state = owner } }) catch |err| switch (err) {
             error.CatalogGenerationChanged => {},
             else => return err,
         };

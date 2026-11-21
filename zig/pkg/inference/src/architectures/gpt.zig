@@ -1306,7 +1306,37 @@ pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) ![]f32 {
-    const hidden_result = try forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
+    // This API owns only final-row logits: no consumer observes the other
+    // suffix rows. Gemma4 media embeds already carry their original PLE rows.
+    const prune_shared = cb.kind() == .cuda and !disableSharedKvDebug() and
+        @import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb) and
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_PREPARED_SHARED_KV_PREFILL", true) and
+        preparedSharedKvPrefillEligible(config, overrides, batch, seq_len, decode_context);
+    const hidden_result = if (prune_shared) pruned: {
+        // Qualification requires RoPE, so there are no additive positions to
+        // apply here. Preserve the trace callback and input transfer on error.
+        var owns_input = true;
+        errdefer if (owns_input) cb.free(hidden_input);
+        try cb.debugCudaTraceTensor("gpt.positioned_input", hidden_input);
+        owns_input = false;
+        std.log.info("cuda_shared_kv_prefill prepared=true query_rows={d} donor_layers={d} shared_layers={d} output=last", .{
+            decode_context.?.query_sequence_len, config.num_hidden_layers - config.num_kv_shared_layers, config.num_kv_shared_layers,
+        });
+        break :pruned try forwardFinalHiddenWithSharedKvOutput(
+            cb,
+            allocator,
+            config,
+            hidden_input,
+            overrides,
+            batch,
+            seq_len,
+            decode_context,
+            ple_vectors,
+            null,
+            null,
+            .last,
+        );
+    } else try forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
         cb,
         allocator,
         config,
@@ -1789,6 +1819,58 @@ pub fn cudaDecodeGraphReplayRequired() bool {
     return cudaDecodeGraphReplayMode() == .required;
 }
 
+/// Automatic request replay must reach the graph-aware forward before an
+/// eager fused shortcut. Its failure policy remains automatic, not required.
+pub fn cudaDecodeGraphReplayPrefersGraph(cb: *const ComputeBackend) bool {
+    return cudaDecodeGraphReplayRequired() or cb.debugCudaGraphReplayRequested();
+}
+
+fn cudaDecodeGraphReplayRequestedForBackend(cb: *const ComputeBackend) bool {
+    return cudaDecodeGraphReplayRequested() or cb.debugCudaGraphReplayRequested();
+}
+
+test "Gemma4 CUDA request replay reaches architecture capture without global flags" {
+    const Probe = struct {
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .cuda;
+        }
+        fn cpu(_: *anyopaque) ops.BackendKind {
+            return .native;
+        }
+        fn requested(ctx: *anyopaque) bool {
+            const active: *const bool = @ptrCast(@alignCast(ctx));
+            return active.*;
+        }
+    };
+    var active = true;
+    var table = native_compute_mod.vtable_impl;
+    table.backendKind = &Probe.kind;
+    table.debugCudaGraphReplayRequested = &Probe.requested;
+    var cb = ComputeBackend{ .ptr = &active, .vtable = &table };
+    const context: DecodeContext = .{ .total_sequence_len = 32, .query_sequence_len = 1, .kv_sequence_len = 32 };
+    try std.testing.expect(cb.debugCudaGraphReplayRequested());
+    try std.testing.expect(cudaDecodeGraphReplayPrefersGraph(&cb));
+    try std.testing.expect(cudaCaptureFinalHiddenProbeEnabled(&cb, 1, 32, &context));
+    try std.testing.expect(cudaCaptureGreedyTokenProbeEnabled(&cb, 1, 32, &context));
+    try std.testing.expect(!cudaCaptureFinalHiddenProbeEnabled(&cb, 2, 32, &context));
+    var prefill = context;
+    prefill.query_sequence_len = 2;
+    try std.testing.expect(!cudaCaptureFinalHiddenProbeEnabled(&cb, 1, 32, &prefill));
+    cb.execution_owner = 7;
+    try std.testing.expect(!cb.debugCudaGraphReplayRequested());
+    try std.testing.expectEqual(cudaDecodeGraphReplayRequested(), cudaDecodeGraphReplayRequestedForBackend(&cb));
+    cb.execution_owner = 0;
+    active = false;
+    try std.testing.expectEqual(cudaDecodeGraphReplayRequired(), cudaDecodeGraphReplayPrefersGraph(&cb));
+    table.debugCudaGraphReplayRequested = null;
+    try std.testing.expect(!cb.debugCudaGraphReplayRequested());
+    table.debugCudaGraphReplayRequested = &Probe.requested;
+    table.backendKind = &Probe.cpu;
+    active = true;
+    try std.testing.expect(!cb.debugCudaGraphReplayRequested());
+    try std.testing.expect(!cudaCaptureFinalHiddenProbeEnabled(&cb, 1, 32, &context));
+}
+
 test "cuda decode graph replay mode parsing requires replay for unknown values" {
     try std.testing.expectEqual(CudaDecodeGraphReplayMode.off, cudaDecodeGraphReplayModeFromValue(null));
     try std.testing.expectEqual(CudaDecodeGraphReplayMode.required, cudaDecodeGraphReplayModeFromValue("unknown"));
@@ -1810,7 +1892,7 @@ fn cudaCaptureFinalHiddenProbeEnabled(
     decode_context: ?*const DecodeContext,
 ) bool {
     if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false) and
-        !cudaDecodeGraphReplayRequested()) return false;
+        !cudaDecodeGraphReplayRequestedForBackend(cb)) return false;
     if (cb.kind() != .cuda) return false;
     if (batch != 1) return false;
     return actualQuerySeqLen(seq_len, decode_context) == 1;
@@ -1824,7 +1906,7 @@ fn cudaCaptureGreedyTokenProbeEnabled(
 ) bool {
     if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) return false;
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN", false) or
-        cudaDecodeGraphReplayRequested();
+        cudaDecodeGraphReplayRequestedForBackend(cb);
 }
 
 fn forwardGreedyLastTokenTensorFromEmbeddingsWithLayer0Overrides(
@@ -2810,7 +2892,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
 const SharedKvPrefillOutput = enum { all, last, kv_only };
 
 fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
-    // Keep this initial route specific to the measured text E4B geometry.
+    // Keep this route specific to the measured E4B decoder geometry.
     // Query collection needs every consumer's queries, including shared layers.
     if (config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
         config.num_kv_shared_layers != 18 or config.num_attention_heads != 8 or
@@ -2832,6 +2914,58 @@ fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
             config.layerUsesSlidingAttention(donor) != config.layerUsesSlidingAttention(layer)) return null;
     }
     return boundary;
+}
+
+fn preparedSharedKvPrefillEligible(config: Config, overrides: Layer0DecoderOverrides, batch: usize, seq_len: usize, context: ?*const DecodeContext) bool {
+    if (batch != 1 or !layer0DecoderOverridesEmpty(overrides)) return false;
+    const dc = context orelse return false;
+    if (dc.total_sequence_len != seq_len) return false;
+    return sharedKvPrefillBoundary(config, dc.*) != null;
+}
+
+test "E4B shared KV prefill prepared rows preserve context and decline other consumers" {
+    const config: Config = .{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_kv_shared_layers = 18,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+    };
+    const dc: DecodeContext = .{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 278,
+        .query_sequence_len = 278,
+        .kv_sequence_len = 278,
+        .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 18, .tail_tokens = 6 },
+    };
+    try std.testing.expect(preparedSharedKvPrefillEligible(config, .{}, 1, 278, &dc));
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 2, 278, &dc));
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 279, &dc));
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, null));
+    var other = dc;
+    other.attn_or_mask = &.{0};
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, &other));
+    other = dc;
+    other.kv_batch = &.{};
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, &other));
+    other = dc;
+    other.mrope_positions = &.{};
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, .{}, 1, 278, &other));
+    var override = Layer0DecoderOverrides{};
+    override.attn_norm_slots[0] = 1;
+    try std.testing.expect(!preparedSharedKvPrefillEligible(config, override, 1, 278, &dc));
+    var model = config;
+    model.position_encoding = .absolute;
+    try std.testing.expect(!preparedSharedKvPrefillEligible(model, .{}, 1, 278, &dc));
+    model = config;
+    model.num_kv_shared_layers = 0;
+    try std.testing.expect(!preparedSharedKvPrefillEligible(model, .{}, 1, 278, &dc));
 }
 
 fn sharedKvLastRowContext(dc: DecodeContext) DecodeContext {
@@ -2942,7 +3076,7 @@ pub fn tryCudaSharedKvPrefill(
     dc: *const DecodeContext,
     want_last_logits: bool,
 ) !?SharedKvPrefillResult {
-    if (cb.kind() != .cuda or disableSharedKvDebug() or !getenvBool("ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL")) return null;
+    if (cb.kind() != .cuda or disableSharedKvDebug() or !@import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb)) return null;
     _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
     if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;
     const embed_w = try getEmbeddingWeight(cb, config);
@@ -13159,7 +13293,7 @@ fn computePleVectorsFromTokenEmbeddingTensorPath(
 
     const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
     const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
-    if (try cb.rmsNormAddWeightedEmbeddingTensor(model_proj_raw, proj_norm_w, token_w, input_token, total, num_layers, ple_dim, config.norm_eps, embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
+    if (try cb.rmsNormAddWeightedEmbeddingTensor(model_proj_raw, proj_norm_w, token_w, input_token, total, num_layers, ple_dim, config.pleProjectionNormEps(), embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
         cb.free(model_proj_raw);
         return fused;
     }
@@ -13168,7 +13302,7 @@ fn computePleVectorsFromTokenEmbeddingTensorPath(
         defer cb.free(model_proj_raw);
         defer cb.free(reshaped);
 
-        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.norm_eps);
+        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.pleProjectionNormEps());
         defer cb.free(normed_flat);
 
         const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse
@@ -13220,7 +13354,7 @@ fn computePleVectorsFromTokenPath(
         defer cb.free(model_proj_raw);
         defer cb.free(reshaped);
 
-        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.norm_eps);
+        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.pleProjectionNormEps());
         defer cb.free(normed_flat);
 
         const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse
@@ -13228,7 +13362,8 @@ fn computePleVectorsFromTokenPath(
         defer cb.free(normed_proj);
 
         // HF: (RMSNorm(proj) + embed * sqrt(ple_dim)) * (1/sqrt(2))
-        // RMSNorm is scale-invariant so 1/sqrt(hidden) pre-norm factor washes out.
+        // Fold the pre-norm scale into epsilon: RMSNorm(x/sqrt(H), eps)
+        // equals RMSNorm(x, H*eps), including low-variance projection rows.
         const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
         const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
         if (try cb.addWeightedScalars(token_embd_raw, normed_proj, embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
@@ -13255,7 +13390,7 @@ fn computePleVectorsFromTokenPath(
 
     // CPU fallback (native path): rmsNorm handles chunked dim natively.
     defer cb.free(model_proj_raw);
-    const normed_proj = try cb.rmsNorm(model_proj_raw, proj_norm_w, ple_dim, config.norm_eps);
+    const normed_proj = try cb.rmsNorm(model_proj_raw, proj_norm_w, ple_dim, config.pleProjectionNormEps());
     defer cb.free(normed_proj);
 
     const token_data = try cb.toFloat32(token_embd_raw, allocator);
@@ -13457,6 +13592,48 @@ fn applyReluSquared(cb: *const ComputeBackend, input: CT) !CT {
 }
 
 // --- Embedding weight helper ---
+
+test "Gemma4 PLE context normalization preserves projection scale with nonzero epsilon" {
+    const a = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    var compute = native_compute_mod.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const matrix = [_]f32{ 0.01, 0, 0, 0, 0, 0.02, 0, 0, 0, 0, 0.03, 0, 0, 0, 0, 0.04 };
+    const tokens = [_]f32{ 0.2, -0.3, 0.4, -0.5, -0.1, 0.2, -0.3, 0.4 };
+    const norm_weight = [_]f32{ 1.25, 0.75 };
+    try putDeepSeekV4TestWeight(a, &store, "model.embed_tokens_per_layer.weight", &.{ 2, 4 }, &tokens);
+    try putDeepSeekV4TestWeight(a, &store, "model.per_layer_model_projection.weight", &.{ 4, 4 }, &matrix);
+    try putDeepSeekV4TestWeight(a, &store, "model.per_layer_projection_norm.weight", &.{2}, &norm_weight);
+    const hidden_values = [_]f32{ 0.5, -0.25, 0.125, -0.0625, 0.125, 0.25, -0.5, 0.0625 };
+    const hidden = try cb.fromFloat32Shape(&hidden_values, &.{ 2, 4 });
+    defer cb.free(hidden);
+    for ([_]f32{ 0, 1e-6, 1e-3 }) |epsilon| {
+        const cfg = Config{ .family = .gemma, .hidden_size = 4, .num_hidden_layers = 2, .ple_hidden_size = 2, .norm_eps = epsilon };
+        const output = (try computePleVectors(&cb, a, cfg, &.{ 0, 1 }, hidden, 2)).?;
+        defer cb.free(output);
+        const values = try cb.toFloat32(output, a);
+        defer a.free(values);
+        // Independent literal reference: scale the projection before RMSNorm,
+        // rather than using the production epsilon transformation.
+        for (0..2) |row| for (0..2) |layer| {
+            var scaled: [2]f32 = undefined;
+            for (0..2) |d| {
+                const col = layer * 2 + d;
+                var dot: f32 = 0;
+                for (0..4) |k| dot += hidden_values[row * 4 + k] * matrix[col * 4 + k];
+                scaled[d] = dot / @sqrt(@as(f32, 4));
+            }
+            const inv = 1.0 / @sqrt((scaled[0] * scaled[0] + scaled[1] * scaled[1]) / 2 + epsilon);
+            for (0..2) |d| {
+                const i = row * 4 + layer * 2 + d;
+                const expected = (scaled[d] * inv * norm_weight[d] + tokens[i] * @sqrt(@as(f32, 2))) / @sqrt(@as(f32, 2));
+                try std.testing.expectApproxEqAbs(expected, values[i], 2e-6);
+            }
+        };
+    }
+}
 
 test "gemma4 q attention scale is not duplicated for rope attention" {
     try std.testing.expect(attentionQueryRopeScale(0, 256) == null);

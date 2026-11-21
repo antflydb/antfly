@@ -130,6 +130,7 @@ pub fn encodeWithStorageOwnerDescriptor(
 ) ![]u8 {
     if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(alloc, req)) |required| if (protocol_version < required)
         return error.UnsupportedRaftBatchProtocolVersion;
+    if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) return error.InvalidBatchRequest;
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
 
@@ -338,6 +339,22 @@ fn consumerTests() type {
             const received = try batch_api.completionPrepareInput(alloc, decoded.batch.batch.req);
             defer alloc.free(received);
             try std.testing.expectEqualStrings(frozen, received);
+
+            var gated = request;
+            gated.commit_requires = .direct_enrichments;
+            const gated_input = try batch_api.completionPrepareInput(alloc, gated);
+            defer alloc.free(gated_input);
+            gated.prepared_enrichments_json = "{}";
+            const gated_entry = try encode(alloc, "docs", gated);
+            defer alloc.free(gated_entry);
+            var gated_decoded = try decodeForApply(alloc, gated_entry);
+            defer gated_decoded.deinit(alloc);
+            const gated_replay = gated_decoded.batch.batch.req;
+            try std.testing.expectEqualStrings("{}", gated_replay.prepared_enrichments_json.?);
+            try std.testing.expectEqual(.revision_v1, gated_replay.document_version_scheme);
+            const gated_received = try batch_api.completionPrepareInput(alloc, gated_replay);
+            defer alloc.free(gated_received);
+            try std.testing.expectEqualStrings(gated_input, gated_received);
         }
 
         test "ordered artifact merge adoption uses private raft batch encoding" {

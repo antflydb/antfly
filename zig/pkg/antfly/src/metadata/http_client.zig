@@ -1313,7 +1313,7 @@ pub const MetadataHttpClient = struct {
             // Older peers reject an unknown private Call tag before dispatch.
             // Only this exact response permits the authoritative legacy read;
             // permission, identity and ordinary validation failures stay errors.
-            400 => if (input == .lake_source_owner_read and std.mem.eql(u8, response.body, "invalid catalog request"))
+            400 => if ((input == .lake_source_owner_read or input == .policy_definition_read or (input == .resolve_many and input.resolve_many.include_source_epoch)) and std.mem.eql(u8, response.body, "invalid catalog request"))
                 error.UnsupportedOperation
             else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
@@ -1418,7 +1418,10 @@ pub const MetadataHttpClient = struct {
                 error.StoreRootEnrollmentChanged
             else
                 error.CatalogGenerationChanged,
-            413 => error.CatalogCommandTooLarge,
+            413 => if (input == .policy_definition_mutate and std.mem.eql(u8, response.body, "RowPolicyLimitExceeded"))
+                error.RowPolicyLimitExceeded
+            else
+                error.CatalogCommandTooLarge,
             426 => error.TableTopologyProtocolUpgradeRequired,
             503 => error.NotLeader,
             else => error.MetadataMutationOutcomeUnknown,
@@ -2264,6 +2267,12 @@ pub const MetadataHttpClient = struct {
 
     fn mapResponseStatus(resp: http_common.HttpResponse, bad_request_err: ?anyerror, not_found_err: ?anyerror, conflict_err: ?anyerror) !void {
         if (resp.status == 409) {
+            // Domain rejections are definite, not optimistic CAS races. In
+            // particular a privacy caller must not retry the same alias fence
+            // eight times and erase the actionable identity on its public API.
+            inline for (.{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict, error.PrivacyManagedGraph, error.PrivacyUnknownArtifactSource }) |err| {
+                if (std.mem.eql(u8, resp.body, @errorName(err))) return err;
+            }
             for (resp.headers) |header| {
                 if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.table_mutation_error_header) and
                     std.mem.eql(u8, header.value, routes.Routes.table_mutation_error_artifact_dependency))
@@ -5178,4 +5187,26 @@ test "metadata pg publication transport validates confirmed writes without retry
     defer a.free(stale);
     executor.body = stale;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessPgPublication("http://metadata.invalid", input, .{}));
+}
+
+test "index alias definition conflicts remain definite across metadata forwarding" {
+    const Executor = struct {
+        calls: usize = 0,
+        body: []const u8 = "IndexReferencedByAlias",
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .status = 409, .body = try a.dupe(u8, self.body) };
+        }
+    };
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    for ([_][]const u8{ "IndexReferencedByAlias", "IndexAliasGraphConflict" }) |body| {
+        executor.body = body;
+        const before = executor.calls;
+        const expected: anyerror = if (std.mem.eql(u8, body, "IndexReferencedByAlias")) error.IndexReferencedByAlias else error.IndexAliasGraphConflict;
+        try std.testing.expectError(expected, client.replaceTableDefinition("http://metadata.invalid", "docs", "{}"));
+        try std.testing.expectError(expected, client.replaceTableDefinitionStamped("http://metadata.invalid", "docs", "{}"));
+        try std.testing.expectEqual(before + 2, executor.calls);
+    }
 }

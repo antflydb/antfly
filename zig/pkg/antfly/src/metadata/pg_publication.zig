@@ -18,7 +18,7 @@ const std = @import("std");
 const feed = @import("changefeed_control.zig");
 const Identity = @import("../pgwire/pgoutput.zig").Identity;
 const A = std.mem.Allocator;
-pub const protocol_version: u16 = 110;
+pub const protocol_version: u16 = 121;
 pub const max_wire_bytes = 256 * 1024;
 
 pub const Member = struct {

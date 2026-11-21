@@ -251,9 +251,18 @@ pub const Coordinator = struct {
             // Every owner, complete payload, and quota reservation size has
             // been checked before the first mutation. Unknown results leave
             // retained recovery ownership; no phase is retried in this pass.
-            for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .begin, context) catch return error.CommitDecisionUnknown;
-            for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .prepare, context) catch return error.CommitDecisionUnknown;
-            self.recovery.participants.submit(a, plan, prepared.coordinator_index, coordinator.fence, .{ .resolve = .{ .status = .committed, .commit_version = commit_version } }, context) catch return error.CommitDecisionUnknown;
+            for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .begin, context) catch |err| {
+                std.log.debug("retained transaction begin failed group={d} err={s}", .{ item.owner.group_id, @errorName(err) });
+                return error.CommitDecisionUnknown;
+            };
+            for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .prepare, context) catch |err| {
+                std.log.debug("retained transaction prepare failed group={d} err={s}", .{ item.owner.group_id, @errorName(err) });
+                return error.CommitDecisionUnknown;
+            };
+            self.recovery.participants.submit(a, plan, prepared.coordinator_index, coordinator.fence, .{ .resolve = .{ .status = .committed, .commit_version = commit_version } }, context) catch |err| {
+                std.log.debug("retained transaction decision failed group={d} err={s}", .{ coordinator.owner.group_id, @errorName(err) });
+                return error.CommitDecisionUnknown;
+            };
         }
         const wants_visibility = switch (sync_level) {
             .full_text, .enrichments, .full_index => true,

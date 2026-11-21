@@ -254,6 +254,9 @@ pub const SessionManager = struct {
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     kernel_jit: kernel_jit_mod.Config = .{},
     kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
+    /// Construction-only move slot. CUDA consumes the independent pinned-host
+    /// lease before upload; sessions never retain a pointer to this stack slot.
+    cuda_host_weight_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease = null,
     /// Load-time A4B policy. It is copied into the created session and is
     /// never consulted as mutable process-global state during inference.
     a4b_inference_request: ?backend_contracts.A4bInferenceRequest = null,
@@ -560,7 +563,12 @@ pub const SessionManager = struct {
     }
 
     fn createDirectSession(self: *SessionManager, source: ModelSource, backend: BackendType) !Session {
-        if (source.manifest) |manifest| return session_factory.createSessionFromManifest(self.allocator, source.path, manifest, backend, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request, self.gliner_cuda_precision, if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false);
+        if (source.manifest) |manifest| return session_factory.createSessionFromManifestWithHostLease(self.allocator, source.path, manifest, backend, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request, self.gliner_cuda_precision, if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false, if (backend == .cuda) self.cuda_host_weight_lease else null);
+        // A discounted managed load must use the selected manifest constructor
+        // that moves its pinned-host lease before any physical allocation.
+        if (backend == .cuda) if (self.cuda_host_weight_lease) |slot| {
+            if (slot.* != null) return error.InvalidCudaState;
+        };
         return switch (backend) {
             .native => session_factory.createNativeSession(self.allocator, source.path),
             .metal => session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request),
@@ -1338,4 +1346,19 @@ test "backend names parse canonical values aliases and optional auto" {
     try std.testing.expect(try BackendType.parseOptional(null) == null);
     try std.testing.expect(try BackendType.parseOptional("auto") == null);
     try std.testing.expectError(error.InvalidArguments, BackendType.parseOptional("unknown"));
+}
+
+test "Gemma4 CUDA host PLE discounted loads cannot bypass manifest lease transfer" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    var pinned: ?memory.AdmissionLease = try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 64 }, false);
+    defer if (pinned) |*lease| lease.release();
+    var manager = SessionManager{
+        .allocator = std.testing.allocator,
+        .preferred_backends = &.{.cuda},
+        .cuda_host_weight_lease = &pinned,
+    };
+    try std.testing.expectError(error.InvalidCudaState, manager.createDirectSession(.{ .path = "/never-opened.gguf", .kind = .gguf }, .cuda));
+    try std.testing.expect(pinned != null);
+    try std.testing.expectEqual(@as(usize, 64), controller.snapshot().host_weight_bytes);
 }

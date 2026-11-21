@@ -29,21 +29,49 @@ pub const Store = struct {
     scope: []u8,
     provider: record.KeyProvider,
     prefix: [namespace.len + 64 + 1]u8,
+    /// §9.7c (ReadView): every catalog read below goes straight through
+    /// `self.docs.file.*CatalogRecordAlloc`, never through a `Txn`, so
+    /// none of the protection `Txn.openReadWithPrefix`'s own
+    /// `store.read_only` short-circuit gives a `ReadView` ever covers this
+    /// adapter. For a read-only `docs` (a frozen snapshot handle, not the
+    /// live writer -- `nativeStore()` already refuses writes on exactly
+    /// this condition) that matters: without a pin, a concurrent
+    /// same-process writer's own background-maintenance fold
+    /// (`checkpointRedoLog`) is free to reclaim an overlay-only version
+    /// this adapter's own open-time snapshot still needs, between `init`
+    /// and whenever a caller actually reads -- a fully committed secret
+    /// revision silently reading back as revision 0 instead of the value
+    /// this handle observed when it opened (confirmed live: "lite secrets
+    /// preserve index commits made during wrapping and reject stale
+    /// read-only snapshots" racing the redo-log fold). Pinned once in
+    /// `init`, for this adapter's whole lifetime, released once in
+    /// `deinit`; `docs` is the caller's own, already-stably-addressed
+    /// pointer (see this struct's own doc comment below), never this
+    /// struct itself, so the pin's internal `*NativeFile` stays valid
+    /// regardless of where this `Store` -- itself returned by value --
+    /// ends up.
+    read_view: ?native.ReadView = null,
 
     /// Both docs and provider must outlive this adapter and its borrowed interfaces.
     /// Keep the adapter at a stable address after obtaining source/nativeStore.
     pub fn init(allocator: Allocator, docs: *docstore.Store, scope: []const u8, provider: record.KeyProvider) !Store {
         try contract.validateName(scope);
-        return .{
+        var result: Store = .{
             .allocator = allocator,
             .docs = docs,
             .scope = try allocator.dupe(u8, scope),
             .provider = provider,
             .prefix = namespace.* ++ digest(scope) ++ "/".*,
         };
+        if (docs.read_only and !docs.file.externally_locked) {
+            errdefer allocator.free(result.scope);
+            result.read_view = try native.ReadView.open(&docs.file, docs.file.runtime());
+        }
+        return result;
     }
 
     pub fn deinit(self: *Store) void {
+        if (self.read_view) |*view| view.release(self.docs.file.runtime());
         self.allocator.free(self.scope);
         self.* = undefined;
     }
@@ -296,9 +324,23 @@ test "lite secrets admission failure rolls back without fencing readers" {
     defer tmp.cleanup();
     const path = try testPath(a, tmp);
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = native.NativeFile.minimumOwnerStorageBytes(true) } });
+    // §9.7a: redo-log is on by default now, and `createWithOptions`
+    // reserves its log capacity (floored at 64 KiB for a budget this
+    // tight) out of the same `max_storage_bytes` admission check that
+    // guards store creation itself -- the bare `minimumOwnerStorageBytes`
+    // this test wants for its *write* budget leaves no room for that
+    // reservation and makes creation itself fail with
+    // `LiteStorageBudgetExceeded`, before ever reaching the admission
+    // failure this test exists to exercise. Create unbounded (so the
+    // default-sized log reserves freely) and apply the tight budget
+    // afterward, exactly like this test already does at the end to lift
+    // it again -- `refreshAdmissionAssumeLocked` reads
+    // `maintenance_policy.options.max_storage_bytes` on every commit, not
+    // just at creation.
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .reclamation = .{ .enabled = false } });
     defer docs.close();
     docs.maintenance_start_suppressed = true;
+    docs.maintenance_policy.options.max_storage_bytes = native.NativeFile.minimumOwnerStorageBytes(true);
     var provider = TestProvider{};
     var secrets = try Store.init(a, &docs, "scope", provider.provider());
     defer secrets.deinit();
@@ -563,6 +605,19 @@ test "lite secrets reject tampering mismatched indexes and revision exhaustion" 
     var store = try Store.init(alloc, &docs, "scope", provider.provider());
     defer store.deinit();
     _ = try store.nativeStore().?.writer.put("scope", "key", "value", .absent);
+    // §9.3a: the put above lands only in the redo-log overlay (committed,
+    // not yet checkpointed); every read already prefers the overlay over
+    // the physical tree. The tampering below goes in through
+    // `putCatalogRecord`'s bare-commit path, which writes the real tree
+    // directly and never diverts (`publishBareCommit`'s own doc comment:
+    // "a bare commit never diverts... so it always logs its own
+    // ride-along record... regardless"), so without folding first the
+    // tamper lands somewhere no read path this test exercises would ever
+    // see -- the clean overlay entry keeps winning and the corruption is
+    // silently invisible. Fold once so the key's only copy is the
+    // physical tree record the bare-commit tampering below actually
+    // reaches, matching what on-disk tampering means for a real file.
+    try docs.file.checkpointRedoLog();
     const key = store.entryKey("key");
     const bytes = (try docs.file.getCatalogRecordAlloc(alloc, &key)).?;
     defer alloc.free(bytes);
@@ -594,9 +649,14 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = SyncFault.fileSync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    for (1..7) |scenario| {
-        const fail_sync = (scenario - 1) % 3 + 1;
-        const removing = scenario > 3;
+    // A small durable commit now costs exactly one `syncData` (WS1's
+    // single-fsync commit): the manifest page and the slot are written
+    // together, so there is only one sync point left to fail, and it
+    // always leaves durability unknown -- `checkpoint_publication_uncertain`
+    // is set before that write, so failing it is never a plain, cleanly
+    // rolled-back I/O error.
+    for (1..3) |scenario| {
+        const removing = scenario > 1;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp);
@@ -611,22 +671,16 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
             var other = try Store.init(alloc, &docs, "scope", provider.provider());
             defer other.deinit();
             _ = try store.nativeStore().?.writer.put("scope", "key", "before", .absent);
-            SyncFault.remaining = fail_sync;
+            SyncFault.remaining = 1;
             defer SyncFault.remaining = 0;
             const writer = store.nativeStore().?.writer;
             const mutation = if (removing) writer.removeOverride("scope", "key", .{ .exact = 1 }) else writer.put("scope", "key", "after", .{ .exact = 1 });
-            try std.testing.expectError(if (fail_sync == 1) error.InputOutput else error.OutcomeUnknown, mutation);
+            try std.testing.expectError(error.OutcomeUnknown, mutation);
             try std.testing.expectEqual(@as(usize, 0), SyncFault.remaining);
-            if (fail_sync == 1) {
-                try expectValue(&other, "key", "before", 1);
-                try std.testing.expect(!docs.secret_store_uncertain);
-                try std.testing.expect((try docs.checkWithCancel(null)).valid);
-            } else {
-                try std.testing.expectError(error.OutcomeUnknown, other.source().resolve(alloc, "scope", "key", .{}));
-                try std.testing.expectError(error.OutcomeUnknown, other.source().listMetadata(alloc, "scope", .{}));
-                try std.testing.expectError(error.OutcomeUnknown, other.source().refresh("scope"));
-                try std.testing.expectError(error.OutcomeUnknown, other.nativeStore().?.writer.removeOverride("scope", "key", .any));
-            }
+            try std.testing.expectError(error.OutcomeUnknown, other.source().resolve(alloc, "scope", "key", .{}));
+            try std.testing.expectError(error.OutcomeUnknown, other.source().listMetadata(alloc, "scope", .{}));
+            try std.testing.expectError(error.OutcomeUnknown, other.source().refresh("scope"));
+            try std.testing.expectError(error.OutcomeUnknown, other.nativeStore().?.writer.removeOverride("scope", "key", .any));
         }
         var docs = try docstore.Store.open(alloc, path, false);
         defer docs.close();

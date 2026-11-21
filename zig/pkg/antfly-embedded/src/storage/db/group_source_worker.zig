@@ -352,3 +352,72 @@ test "group worker consumes a new lease before yielding a slow namespace round" 
     try std.testing.expectEqual(@as(usize, 2), fixture.claims);
     try std.testing.expect(fixture.done);
 }
+
+// `groupStep` re-verifies its first `fan_in_fn` snapshot with a second call
+// whenever the filtered unit stream's own first ordinal starts later than
+// the pending cursor (a row at the pending ordinal was excluded, e.g. by a
+// group source's `filter`). A concurrent writer or owner turn landing
+// between those two reads legitimately changes what the second call
+// observes; `groupStep` must surface that as `EnrichmentSourceChanged` --
+// not raw, inconsistent data -- so callers that already treat the error as
+// a benign "retry me" signal (see `storage/db/db.zig`'s
+// `waitForGroupSourcesThrough`, which must not let it escalate a
+// `sync_level: .enrichments` write into a permanent `ANTFLY_STALLED`
+// failure) see exactly that, consistently, every time this path fires.
+test "group worker's second fan-in re-check disagreeing with the first is EnrichmentSourceChanged, not corruption" {
+    const Fixture = struct {
+        lease: ?state.Lease = null,
+        fan_in_calls: usize = 0,
+        fn query_(ptr: *anyopaque, a: A, _: []const u8, raw: []const u8) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const request = try std.json.parseFromSliceLeaky(contract.Query, a, raw, .{});
+            const group = state.Group{ .definition = request.definition, .key = "thread" };
+            // The pending cursor names ordinal 1 (e.g. a "tool" row excluded
+            // by the group source's own filter), but the member actually
+            // produced by the filtered stream starts at ordinal 4 -- forcing
+            // `groupStep`'s own re-verification fan-in below.
+            const pending = state.Pending{ .partition = .{ .group = "thread", .segment = "turn", .cell = 0 }, .revision = 1, .ordinal = 1, .source_changed = true };
+            if (request.action == .status) return std.json.Stringify.valueAlloc(a, Status{ .owner = .{ .namespace = @splat(1), .incarnation = 1 }, .namespace = @splat(1), .lease = self.lease, .snapshot = null }, .{});
+            if (request.group.len != 0) return std.json.Stringify.valueAlloc(a, @as(?state.Pending, pending), .{});
+            const pointer = reads.Pointer{ .key_base64 = "pending", .value_base64 = try reads.encode(a, try std.json.Stringify.valueAlloc(a, group, .{})) };
+            return std.json.Stringify.valueAlloc(a, reads.PointerPage{ .rows = &.{pointer}, .cursor = "", .done = true }, .{});
+        }
+        fn submit(ptr: *anyopaque, command: contract.Command) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (command.action) {
+                .claim => {
+                    const claim = command.claim.?;
+                    self.lease = .{ .owner = claim.owner, .token = 1, .revision = claim.pending.revision, .partition = groups.digest("partition"), .expires_ms = claim.now_ms + claim.ttl_ms };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        fn fanIn(ptr: *anyopaque, a: A, definition: Definition, _: index.Partition, _: i64) !FanIn {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fan_in_calls += 1;
+            const member = groups.Member{ .document = "doc-one", .version = 1, .ordinal = 4, .segment = "turn", .text = "hi" };
+            // First call (at the pending partition, no ordinal floor):
+            // topology_epoch 0. A write committed by another owner between
+            // this call and `groupStep`'s own re-check below bumps it to 1 --
+            // the same shape as a concurrent primary write advancing a
+            // group's topology mid-turn.
+            const epoch: u64 = if (self.fan_in_calls == 1) 0 else 1;
+            return .{ .members = try a.dupe(groups.Member, &.{member}), .sources = try a.dupe(contract.SourceCut, &.{.{ .owner = definition.source_owner, .revision = 1 }}), .topology_epoch = epoch };
+        }
+        fn settled(_: *anyopaque, _: u64, _: []const []const u8) !bool {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    const definition: Definition = .{ .artifact = "turns", .definition = .{ .table_incarnation = 9, .configuration = groups.digest("config") }, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" }, .namespace = @splat(1), .source_owner = .{ .namespace = @splat(1), .incarnation = 1 }, .route = .{ .value = "" } };
+    const ports: Ports = .{ .ptr = &fixture, .query_fn = Fixture.query_, .submit_fn = Fixture.submit, .fan_in_fn = Fixture.fanIn, .settled_fn = Fixture.settled };
+    var worker: Worker = .{ .allocator = std.testing.allocator, .identity = groups.digest("worker") };
+    defer worker.deinit();
+    // `needs_claim` re-queries status and proceeds within this same bounded
+    // turn (no live lease to respect), straight through to both fan-in calls.
+    try std.testing.expectError(error.EnrichmentSourceChanged, worker.groupStep(a, ports, definition, 100));
+    try std.testing.expectEqual(@as(usize, 2), fixture.fan_in_calls);
+}

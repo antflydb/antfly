@@ -164,6 +164,8 @@ pub fn applyReplicatedTransactionMutationInternal(
                 .completion_source_scope = prepare.source_scope,
                 .completion_source_checkpoint = prepare.source_checkpoint,
                 .completion_input_digest = completion.preparedInputDigest(namespace, encoded_input),
+                .commit_requires = req.commit_requires,
+                .prepared_enrichments_json = req.prepared_enrichments_json,
                 .document_version_scheme = req.document_version_scheme,
                 .row_policy_principal_proof = req.row_policy_principal_proof,
                 .row_policy_database = req.row_policy_database,

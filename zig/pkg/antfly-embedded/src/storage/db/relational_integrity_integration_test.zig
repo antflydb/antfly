@@ -1214,8 +1214,8 @@ test "relational integrity accepted generation survives restart and bounded two-
         var successor = old;
         successor.constraint_generation = @splat(5);
         try std.testing.expect(!(try retirement.isRetired(&read, successor)));
-        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
-        try std.testing.expectError(error.ForeignKeyReferenced, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "p" } } }}));
+        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}, null));
+        try std.testing.expectError(error.ForeignKeyReferenced, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "p" } } }}, null));
         // The public parent-action cursor must not revive retired references.
         // With a one-record physical page, the first page is empty but still
         // advances; the live successor appears on the next page.
@@ -1273,7 +1273,7 @@ test "relational integrity accepted generation survives restart and bounded two-
         try std.testing.expectEqualDeep(@import("retirement_set_summary.zig").emptySummary(), try retirement.authenticatedSummary(&read));
         _ = try integrity.Reference.decode(&live_key, try read.get(&live_key));
         try std.testing.expect(try retirement.isRetired(&read, old));
-        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
+        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}, null));
         read.deinit();
         read_open = false;
         // A coherent native seed carries both the durable retired-generation
@@ -1300,7 +1300,7 @@ test "relational integrity accepted generation survives restart and bounded two-
         const seeded_scope = (try @import("relational_integrity_generation_admission.zig").load(&seeded_read, old.child_table, old.constraint_name)).?;
         try std.testing.expectEqual(@as(integrity.Generation, @splat(5)), seeded_scope.active_generation.?);
         try retirement.requireActivationAcknowledged(&seeded_read);
-        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &seeded_read, &.{.{ .address = address, .operation = .{ .attach = old } }}));
+        try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &seeded_read, &.{.{ .address = address, .operation = .{ .attach = old } }}, null));
     }
 }
 
@@ -1370,7 +1370,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
                     // Model the last physical projection watermark being
                     // lost at the crash cut while the primary Raft/HA receipt
                     // remains durable. Replay must restore this local proof.
-                    try @import("derived/apply_state.zig").clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, target.core.store, target.core.applied_sequence_checkpoint_path, "text");
+                    try @import("derived/apply_state.zig").clearAppliedSequence(target.core.store, "text");
                     // Import replay is intentionally idempotent; its durable
                     // receipt cannot falsely imply projections caught up.
                     const debt = try target.listDerivedReplayDebt(alloc);
@@ -1534,6 +1534,36 @@ test "relational integrity topology durable backup seal survives restart and lat
         try std.testing.expect(try db.exportBackupCohort(handle, "export", .none) > 0);
         try std.testing.expect(try db.exportBackupCohort(handle, "export", .none) > 0);
         seal.test_export_hook = null;
+        {
+            // An ordinary historical restore may detach this backup-only fence
+            // after proving that the sealed image contains no constraint authority.
+            const target_path = try std.fmt.allocPrint(alloc, "{s}-historical", .{path});
+            defer alloc.free(target_path);
+            const snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/export", .{path});
+            defer alloc.free(snapshot_path);
+            var transition = try @import("generation_lifecycle.zig").beginProcessExclusiveWithRuntime(target_path, null);
+            defer transition.deinit();
+            var staged = try transition.beginStaging();
+            defer staged.deinit();
+            var staged_options = options;
+            staged_options.staged_generation = &staged;
+            try db_mod.DB.restoreSnapshotToDeferredRuntimeRepairWithIo(&staged, alloc, std.testing.io, snapshot_path, staged.path(), staged_options, .{
+                .backup_id = "export",
+                .location = snapshot_path,
+                .artifact_sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+                .snapshot_path = snapshot_path,
+                .group_id = 701,
+            });
+            var restored = try db_mod.DB.open(alloc, staged.path(), staged_options);
+            defer restored.close();
+            try std.testing.expectError(error.NotFound, restored.core.store.get(alloc, @import("relational_integrity_topology.zig").fence_key));
+            const restored_before_key = try @import("../internal_keys.zig").documentKeyAlloc(alloc, "before");
+            defer alloc.free(restored_before_key);
+            const restored_before = try restored.core.store.get(alloc, restored_before_key);
+            defer alloc.free(restored_before);
+            try std.testing.expectEqualStrings("{\"v\":1}", restored_before);
+            try restored.batch(.{ .writes = &.{.{ .key = "restored-write", .value = "{\"v\":5}" }} });
+        }
         const exported_primary = try std.fmt.allocPrint(alloc, "{s}.snapshots/export/primary-lsm", .{path});
         defer alloc.free(exported_primary);
         const lsm = @import("../lsm_backend.zig");
@@ -2446,6 +2476,10 @@ test "relational integrity historical restore stays fenced while coherent HA see
         );
         try std.testing.expectError(error.CoordinatedConstraintTopologyUnsupported, source.split(.{ .start = "", .end = "" }, "m", "", target_path, true));
         try std.testing.expectError(error.CoordinatedConstraintTopologyUnsupported, source.finalizeSplit(.{ .start = "", .end = "m" }));
+        // A backup-only fence does not authorize detaching a UNIQUE catalogue.
+        const identity = try source.relationalTopologyIdentity();
+        const fence: @import("relational_integrity_topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 901, .attempt = 1, .peer_group_id = namespace.shard_id, .owner_group_id = namespace.shard_id, .admission_epoch = identity.next_epoch, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
+        try source.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
         _ = try source.snapshot("seed");
     }
     var transition = try lifecycle.beginProcessExclusiveWithRuntime(target_path, null);

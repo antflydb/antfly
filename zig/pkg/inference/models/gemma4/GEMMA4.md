@@ -3,6 +3,49 @@
 This note tracks Antfly inference's Gemma 4 generation support, especially Google's
 Gemma 4 Multi-Token Prediction (MTP) assistant models.
 
+## Qualified E4B CUDA profile on NVIDIA L4
+
+For Gemma 4 E4B QAT Q4_0 with F16 KV, source the opt-in profile in a fresh
+process environment before starting inference:
+
+```sh
+source zig/pkg/inference/scripts/gemma4/gemma4_e4b_qat_l4_qualified.env
+```
+
+This profile enables the qualified projector, resident audio, and SM89 small
+decode paths. It differs from the earlier HTTP profile in the same directory.
+Qualification used an 8192-token context, greedy decoding, and eight text,
+image, audio, and video cases. All cases passed first-step logit gates against
+unmodified Transformers (cosine >= 0.9999, relative L2 <= 0.02, identical
+argmax), and all 585 reference decisions through EOS or the output budget
+matched. These gates apply to the explicit profile, not bare process defaults.
+
+Three rotated comparison rounds put the seven text/image/audio cases within
+1.9% of llama.cpp median latency; video was 15.4% faster. Image and 1-second
+audio remained 1.3% and 1.9% slower. The native core measurement excludes HTTP
+and cold loading, and does not replace the published Circus protocol. After
+priming all modalities, GPU memory peaked at about 15.0 GiB native versus
+6.6 GiB for llama.cpp. Other devices and Metal hardware were not qualified.
+
+The native `bench-gemma4-core-build` target supports offline generation and
+first-step logit capture. The small decode kernels also have a standalone
+bitwise regression checker (requires Python, NumPy, the `gguf` package, and
+an idle CUDA device):
+
+```sh
+python zig/pkg/inference/scripts/gemma4/qualify_small_decode.py \
+  --gguf /path/to/gemma-4-E4B_q4_0-it.gguf \
+  --baseline-cubin /path/to/pre-change.cubin \
+  --candidate-cubin zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin \
+  --out /path/to/new-result.json
+```
+
+The checker compares 72 outputs across four kernels using identical prepared
+Q8 inputs; it does not replace the Transformers model gates. The baseline
+module must export the existing FFN/PLE kernels. The candidate may also be the
+checked-in fatbin. The tiny NV12/RGB fixtures under `src/testdata/video` retain
+the independent PyAV reference used by the CUDA video regression test.
+
 ## Current Status
 
 Antfly inference supports Gemma 4 as a native decoder family through the shared GPT

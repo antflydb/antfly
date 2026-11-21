@@ -20,6 +20,21 @@ const keys = @import("internal_keys.zig");
 const publication = @import("db/artifact_publication.zig");
 const authority = @import("source_authority.zig");
 
+// Repeated outputs from one stream share a marker; avoid staging the same
+// write for every member of a producer batch.
+fn stageReplayFrontier(txn: anytype, key: []const u8, sequence: ?u64) !void {
+    const previous = txn.get(key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (sequence) |value| {
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, value, .big);
+        if (previous) |raw| if (std.mem.eql(u8, raw, &encoded)) return;
+        try txn.put(key, &encoded);
+    } else if (previous != null) try txn.delete(key);
+}
+
 pub const Capture = struct {
     /// Borrowed only for this physical writer attempt. Set by trusted ingress,
     /// never inferred from stored artifact flags or imported metadata.
@@ -38,6 +53,21 @@ pub const Capture = struct {
     staging: bool = false,
     staged: bool = false,
     poisoned: bool = false,
+    /// Set by `writeReplayEntries` immediately before its one `txn.put` of
+    /// `replay_meta_next_sequence_key` per commit, to the pre-write value it
+    /// already read for its own monotonicity check. Outer `null` means "no
+    /// hint, read it yourself" (every caller other than that one `put` call
+    /// leaves this unset); `Some(inner)` means the hint was taken, with
+    /// inner `null` for "key not found" and `Some(bytes)` for the 8-byte
+    /// value found. `touch`'s identical check below for that same key
+    /// reuses an outer-`Some` hint instead of issuing a second `txn.get`
+    /// for the same key's same pre-write value -- safe because nothing
+    /// writes `replay_meta_next_sequence_key` between the two reads (one
+    /// transaction, no interleaving writers under the single-writer
+    /// model). `touch` clears this unconditionally on every call (not just
+    /// the branch that consumes it), so a hint can never survive to be
+    /// (mis)read by a later, unrelated `touch` call.
+    replay_meta_previous_hint: ??[8]u8 = null,
 
     pub fn attach(self: *Capture, participant: @import("commit_participant.zig").Participant) !void {
         if (self.participant != null or self.allocator != null or self.checked or self.staged or self.poisoned) return error.InvalidBatch;
@@ -65,6 +95,13 @@ pub const Capture = struct {
     }
 
     pub fn touch(self: *Capture, alloc: std.mem.Allocator, txn: anytype, key: []const u8, value: ?[]const u8) !void {
+        // Consumed (and cleared) exactly once per call, regardless of which
+        // branch below returns early, so a hint meant for this call can
+        // never leak into a later, unrelated one. See the field doc.
+        const replay_meta_previous_hint = self.replay_meta_previous_hint;
+        self.replay_meta_previous_hint = null;
+        errdefer self.poisoned = true;
+        if (self.participant) |participant| if (participant.charge) |charge| try charge(participant.ptr, key, value);
         if (self.staging) return;
         if (self.participant) |participant| participant.observe(participant.ptr, key, value);
         self.allocator = alloc;
@@ -85,9 +122,23 @@ pub const Capture = struct {
                     self.replay_sequence = sequence;
                 } else if (value.?.len == 8) {
                     const next = std.mem.readInt(u64, value.?[0..8], .little);
-                    const previous = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+                    var previous_ambiguous = false;
+                    var previous_value: ?u64 = null;
+                    if (replay_meta_previous_hint) |hint| {
+                        // The hint is only ever set from the exact 8-byte
+                        // value `writeReplayEntries` already validated
+                        // before this `put`, so it is never the
+                        // wrong-length case a direct `txn.get` must still
+                        // check for below.
+                        if (hint) |bytes| previous_value = std.mem.readInt(u64, &bytes, .little);
+                    } else {
+                        const previous = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+                        if (previous) |raw| {
+                            if (raw.len != 8) previous_ambiguous = true else previous_value = std.mem.readInt(u64, raw[0..8], .little);
+                        }
+                    }
                     if (next <= 1 or (self.replay_next != null and self.replay_next.? != next) or
-                        (if (previous) |raw| raw.len != 8 or next <= std.mem.readInt(u64, raw[0..8], .little) else false)) self.replay_ambiguous = true;
+                        previous_ambiguous or (if (previous_value) |value_u64| next <= value_u64 else false)) self.replay_ambiguous = true;
                     self.replay_next = next;
                 } else self.replay_ambiguous = true;
             } else {
@@ -120,7 +171,6 @@ pub const Capture = struct {
             self.selected = try publication.authority(txn);
             self.checked = true;
         }
-        if (self.selected == null) return;
         if (artifact) {
             if (self.artifacts.contains(key)) return;
             const document = try @import("db/artifact_publication_owner.zig").documentAlloc(alloc, key);
@@ -128,6 +178,7 @@ pub const Capture = struct {
             defer if (owned) alloc.free(document);
             const owner = try self.artifact_owners.getOrPut(alloc, document);
             if (!owner.found_existing) owned = false;
+            if (self.selected == null) return;
             // Chunk reconstruction pages fence an entire root/unit stream,
             // including insertions and deletions beyond their current cursor.
             // The manifest need not exist: its revision is a prefix witness,
@@ -156,6 +207,7 @@ pub const Capture = struct {
             try self.rememberArtifact(alloc, key);
             return;
         }
+        if (self.selected == null) return;
         const document = (try keys.decodeDocumentComponentAlloc(alloc, key)) orelse return error.InvalidBatchRequest;
         errdefer alloc.free(document);
         const result = try self.documents.getOrPut(alloc, document);
@@ -167,7 +219,51 @@ pub const Capture = struct {
     /// while this helper stages only the revision sidecars and native clock.
     pub fn stage(self: *Capture, txn: anytype, retained_advanced: bool) !void {
         if (self.poisoned) return error.RetainedEffectsTransactionFailed;
-        if (self.staged or (self.documents.count() == 0 and self.artifacts.count() == 0)) return;
+        if (self.staged) return;
+        // Prepared primary writers freeze the retirement footprint too.
+        // Background producers may not expand the old postimage after a yes
+        // vote. Resolution removes its own intent locks in this same writer,
+        // so its source and artifact effects remain one atomic transition.
+        if (self.artifact_owners.count() != 0) {
+            var guard = @import("transactions.zig").IntentReadGuard.init(self.allocator orelse return error.ArtifactCatalogCorrupt, null);
+            defer guard.deinit();
+            var affected = self.artifact_owners.keyIterator();
+            while (affected.next()) |document| try guard.check(txn, document.*);
+        }
+        if (self.documents.count() == 0 and self.artifacts.count() == 0) {
+            // Nothing for this capture's OWN bookkeeping to do: no document
+            // or artifact revision was touched in this transaction, which
+            // is the ordinary case for every write with no active
+            // online-source replication authority (standalone Lite's
+            // default). That bookkeeping -- below -- genuinely needs a
+            // live `self.selected`/authority to stamp revision keys, so it
+            // must stay skipped here.
+            //
+            // An attached `commit_participant`, however, is not that
+            // bookkeeping: WS4 phase 2's inline text/dense/sparse/graph
+            // publication (`InlineTextPublication.stage` and siblings)
+            // reuses this same attachment slot purely to get "run once,
+            // inside this transaction, before commit" -- it ignores the
+            // position bytes entirely and has nothing to do with
+            // replication. Skipping it here (as this function used to,
+            // unconditionally, whenever no document/artifact was touched)
+            // silently dropped every inline index-catalog/progress mutation
+            // a participant staged: the write still acknowledged
+            // successfully (its in-memory projection was installed
+            // regardless), but nothing durable ever reached the native
+            // transaction, so the effect vanished on the next reopen. A
+            // participant that DOES need authority (e.g.
+            // `artifact_authored_acceptance`'s `Prepared.participant`) is
+            // only ever attached by its own caller when authority is
+            // already known to be active, so it is safe to always invoke
+            // whatever is attached here.
+            self.staged = true;
+            if (self.participant) |participant| {
+                var view_txn = txn;
+                try participant.stage(participant.ptr, @import("commit_participant.zig").View.from(&view_txn), &.{});
+            }
+            return;
+        }
         errdefer self.poisoned = true;
         const expected = self.selected orelse return error.ArtifactCatalogCorrupt;
         const current = (try publication.authority(txn)) orelse return error.RetainedEffectsFenceMismatch;
@@ -197,6 +293,11 @@ pub const Capture = struct {
             self.replay_sequence.? != std.math.maxInt(u64) and self.replay_next.? == self.replay_sequence.? + 1) self.replay_sequence else null;
         if (replay_sequence == null) try @import("db/artifact_source_gap.zig").record(txn);
         const materialization = try (publication.Materialization{ .position = position, .replay_sequence = replay_sequence }).encode();
+        // Capture sees every physical source mutation, including ordered
+        // publications and TTL/transaction writes that bypass DB append
+        // helpers. Keep projection frontiers in this same writer transaction.
+        // An unsequenced mutation invalidates the shortcut conservatively.
+        if (self.documents.count() != 0) try stageReplayFrontier(txn, &keys.primary_source_revision_key, replay_sequence);
         var iter = self.documents.keyIterator();
         while (iter.next()) |document| {
             try txn.put(&publication.inputRevisionKey(expected.namespace, document.*), &encoded);
@@ -205,6 +306,23 @@ pub const Capture = struct {
         }
         var artifacts = self.artifacts.keyIterator();
         while (artifacts.next()) |artifact| try txn.put(&publication.artifactRevisionKey(expected.namespace, artifact.*), &encoded);
+        // A producer's closed result is invalidated by changes to that stream,
+        // not by unrelated siblings publishing against the same primary row.
+        var scope_keys: std.AutoHashMapUnmanaged(publication.ProducerScopeRevisionKey, void) = .empty;
+        const scope_alloc = self.allocator orelse return error.ArtifactCatalogCorrupt;
+        defer scope_keys.deinit(scope_alloc);
+        var scope_artifacts = self.artifacts.keyIterator();
+        while (scope_artifacts.next()) |artifact| {
+            const stream = (try keys.artifactNameAlloc(scope_alloc, artifact.*)) orelse continue;
+            defer scope_alloc.free(stream);
+            const frontier_key = try keys.artifactSourceRevisionKeyAlloc(scope_alloc, stream);
+            defer scope_alloc.free(frontier_key);
+            try stageReplayFrontier(txn, frontier_key, replay_sequence);
+            const document = try @import("db/artifact_publication_owner.zig").documentAlloc(scope_alloc, artifact.*);
+            defer scope_alloc.free(document);
+            const key = publication.producerScopeRevisionKey(expected.namespace, document, stream);
+            if (!(try scope_keys.getOrPut(scope_alloc, key)).found_existing) try txn.put(&key, &encoded);
+        }
         if (self.participant) |participant| {
             var view_txn = txn;
             try participant.stage(participant.ptr, @import("commit_participant.zig").View.from(&view_txn), &encoded);
@@ -349,6 +467,11 @@ test "ordered artifact inventory input capture requires same transaction authori
         }
         try chunk_capture.stage(&txn, false);
         try std.testing.expectEqual(@as(?u64, 41), (try publication.materializationState(&txn, namespace, "doc")).?.replay_sequence);
+        const chunks_frontier = try keys.artifactSourceRevisionKeyAlloc(alloc, "chunks");
+        defer alloc.free(chunks_frontier);
+        try std.testing.expectEqual(@as(u64, 41), std.mem.readInt(u64, (try txn.get(chunks_frontier))[0..8], .big));
+        // Artifact publication cannot impersonate a primary write.
+        try std.testing.expectError(error.NotFound, txn.get(&keys.primary_source_revision_key));
         const reopened_work = (try obligations.lookupWork(alloc, &txn, active, "doc")).?;
         try std.testing.expectEqualDeep(original_work.position, reopened_work.position);
         try std.testing.expectEqual(original_work.revision + 1, reopened_work.revision);
@@ -418,5 +541,129 @@ test "ordered artifact inventory input capture requires same transaction authori
         try nested.touch(alloc, &txn, resolution, null);
         try std.testing.expect(nested.artifact_owners.contains("doc"));
         try std.testing.expect(!nested.artifact_owners.contains(unit_zero));
+
+        // A direct physical primary deletion, outside a DB append helper,
+        // still fences consumers at its exact replay sequence.
+        var deletion: Capture = .{};
+        defer deletion.deinit(alloc);
+        std.mem.writeInt(u64, &replay_next, 44, .little);
+        const deletion_replay = keys.replayEntryKey(keys.replay_all_kind, 43);
+        try deletion.touch(alloc, &txn, &keys.replay_meta_next_sequence_key, &replay_next);
+        try deletion.touch(alloc, &txn, &deletion_replay, "journal");
+        try deletion.touch(alloc, &txn, document, null);
+        try txn.delete(document);
+        if (kind == .raft) {
+            var marker: [16]u8 = undefined;
+            std.mem.writeInt(u64, marker[0..8], 2, .little);
+            std.mem.writeInt(u64, marker[8..16], 13, .little);
+            try deletion.touch(alloc, &txn, &keys.ordered_document_applied_entry_key, &marker);
+        }
+        try deletion.stage(&txn, false);
+        try std.testing.expectEqual(@as(u64, 43), std.mem.readInt(u64, (try txn.get(&keys.primary_source_revision_key))[0..8], .big));
+        // The earlier unsequenced write to the same stream revoked its
+        // marker; a later primary event cannot manufacture that proof.
+        try std.testing.expectError(error.NotFound, txn.get(chunks_frontier));
+
+        // An unsequenced replacement must revoke the scoped shortcut.
+        var replacement: Capture = .{};
+        defer replacement.deinit(alloc);
+        try replacement.touch(alloc, &txn, document, "replacement");
+        try txn.put(document, "replacement");
+        if (kind == .raft) {
+            var marker: [16]u8 = undefined;
+            std.mem.writeInt(u64, marker[0..8], 2, .little);
+            std.mem.writeInt(u64, marker[8..16], 14, .little);
+            try replacement.touch(alloc, &txn, &keys.ordered_document_applied_entry_key, &marker);
+        }
+        try replacement.stage(&txn, false);
+        try std.testing.expectError(error.NotFound, txn.get(&keys.primary_source_revision_key));
     }
+}
+
+// Regression for `writeReplayEntries` handing `touch` its already-read
+// pre-write value of `replay_meta_next_sequence_key` (`replay_meta_previous_hint`)
+// instead of letting `touch` read that same key a second time. A hint that
+// disagreed with the real stored bytes, or that leaked into some later,
+// unhinted call, would silently change which commits get an ambiguous
+// replay sequence -- exactly the kind of cache bug the design review asked
+// for a test on.
+test "artifact input capture's replay-meta previous hint matches a direct txn.get, and is cleared after one touch" {
+    const Fake = struct {
+        values: std.StringHashMap([]u8),
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            if (self.values.fetchRemove(key)) |entry| {
+                std.testing.allocator.free(entry.key);
+                std.testing.allocator.free(entry.value);
+            }
+        }
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            return self.values.get(key) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            const owned = try std.testing.allocator.dupe(u8, value);
+            errdefer std.testing.allocator.free(owned);
+            if (self.values.getPtr(key)) |old| {
+                std.testing.allocator.free(old.*);
+                old.* = owned;
+            } else {
+                const owned_key = try std.testing.allocator.dupe(u8, key);
+                errdefer std.testing.allocator.free(owned_key);
+                try self.values.put(owned_key, owned);
+            }
+        }
+        pub fn deinit(self: *@This()) void {
+            var iter = self.values.iterator();
+            while (iter.next()) |entry| {
+                std.testing.allocator.free(entry.key_ptr.*);
+                std.testing.allocator.free(entry.value_ptr.*);
+            }
+            self.values.deinit();
+        }
+    };
+    const alloc = std.testing.allocator;
+    const namespace: [24]u8 = @splat(3);
+    const activation: publication.Command = .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    var txn: Fake = .{ .values = std.StringHashMap([]u8).init(alloc) };
+    defer txn.deinit();
+    try authority.bind(&txn, .native, namespace);
+    try publication.stageAuthority(&txn, activation);
+
+    var stored: [8]u8 = undefined;
+    std.mem.writeInt(u64, &stored, 5, .little);
+    try txn.put(&keys.replay_meta_next_sequence_key, &stored);
+
+    var next_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &next_bytes, 6, .little);
+
+    // Baseline: no hint, so `touch` reads the key itself -- today's
+    // behavior, unchanged.
+    var without_hint: Capture = .{};
+    defer without_hint.deinit(alloc);
+    try without_hint.touch(alloc, &txn, &keys.replay_meta_next_sequence_key, &next_bytes);
+    try std.testing.expect(!without_hint.replay_ambiguous);
+    try std.testing.expectEqual(@as(?u64, 6), without_hint.replay_next);
+
+    // Hinted with the exact pre-write bytes `writeReplayEntries` would have
+    // stashed (the real stored value): identical outcome, no `txn.get`
+    // needed, and the hint is gone afterward so it can never be reused by
+    // a later, unrelated `touch` call on the same `Capture`.
+    var with_hint: Capture = .{};
+    defer with_hint.deinit(alloc);
+    with_hint.replay_meta_previous_hint = @as(?[8]u8, stored);
+    try with_hint.touch(alloc, &txn, &keys.replay_meta_next_sequence_key, &next_bytes);
+    try std.testing.expect(!with_hint.replay_ambiguous);
+    try std.testing.expectEqual(@as(?u64, 6), with_hint.replay_next);
+    try std.testing.expect(with_hint.replay_meta_previous_hint == null);
+
+    // A hint reporting a *different* previous value than what is actually
+    // stored changes the ambiguity verdict exactly the way a direct
+    // `txn.get` returning that same (different) value would -- proving the
+    // hint's bytes are what drive the check, not a fixed true/false.
+    var disagreeing: Capture = .{};
+    defer disagreeing.deinit(alloc);
+    var higher_previous: [8]u8 = undefined;
+    std.mem.writeInt(u64, &higher_previous, 99, .little);
+    disagreeing.replay_meta_previous_hint = @as(?[8]u8, higher_previous);
+    try disagreeing.touch(alloc, &txn, &keys.replay_meta_next_sequence_key, &next_bytes);
+    try std.testing.expect(disagreeing.replay_ambiguous);
 }

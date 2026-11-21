@@ -1451,6 +1451,10 @@ pub const BackupInfo = struct {
     timestamp: []const u8,
     /// Tables included in the backup
     tables: []const []const u8,
+    /// Exact restore selectors paired with display names, in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names.
+    table_selectors: ?[]const std.json.Value = null,
+    /// True when the listing returned only backup metadata because table details exceeded the page size.
+    table_details_omitted: ?bool = null,
     /// Storage location of the backup
     location: []const u8,
     /// Antfly version that created the backup
@@ -1463,6 +1467,8 @@ pub const BackupInfo = struct {
         .{ "backup_id", "backup_id", false },
         .{ "timestamp", "timestamp", false },
         .{ "tables", "tables", false },
+        .{ "table_selectors", "table_selectors", true },
+        .{ "table_details_omitted", "table_details_omitted", true },
         .{ "location", "location", false },
         .{ "antfly_version", "antfly_version", true },
         .{ "format", "format", true },
@@ -1484,6 +1490,14 @@ pub const BackupInfo = struct {
         try jw.write(self.timestamp);
         try jw.objectField("tables");
         try jw.write(self.tables);
+        if (self.table_selectors) |value| {
+            try jw.objectField("table_selectors");
+            try jw.write(value);
+        }
+        if (self.table_details_omitted) |value| {
+            try jw.objectField("table_details_omitted");
+            try jw.write(value);
+        }
         try jw.objectField("location");
         try jw.write(self.location);
         if (self.antfly_version) |value| {
@@ -1645,7 +1659,7 @@ pub const BackupOutcomeAmbiguousConflict = struct {
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: an absolute `file:///path/inside/connection/root` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
     /// ID of a configured `external_io` connection. Required for every network API backup and restore. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
     connection: []const u8,
@@ -1735,6 +1749,7 @@ pub const BatchRequest = struct {
     deletes: ?[]const []const u8 = null,
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
+    commit_requires: ?CommitRequires = null,
     sync_level: ?SyncLevel = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1742,6 +1757,7 @@ pub const BatchRequest = struct {
         .{ "inserts", "inserts", true },
         .{ "deletes", "deletes", true },
         .{ "transforms", "transforms", true },
+        .{ "commit_requires", "commit_requires", true },
         .{ "sync_level", "sync_level", true },
     };
 
@@ -1765,6 +1781,10 @@ pub const BatchRequest = struct {
         }
         if (self.transforms) |value| {
             try jw.objectField("transforms");
+            try jw.write(value);
+        }
+        if (self.commit_requires) |value| {
+            try jw.objectField("commit_requires");
             try jw.write(value);
         }
         if (self.sync_level) |value| {
@@ -2134,7 +2154,7 @@ pub const ChatGPTOutcome = struct {
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: an absolute `file:///path/inside/connection/root` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
     /// Required configured `external_io` connection with the `backup.write` capability.
     connection: []const u8,
@@ -2864,6 +2884,32 @@ pub const ClusterTopology = struct {
         try jw.objectField("data");
         try jw.write(self.data);
         try jw.endObject();
+    }
+};
+
+/// Admission prerequisite independent of sync_level. Explicit none commits the source without precomputing enrichments. direct_enrichments requires eligible document-local producers to succeed, committing their outputs and coverage atomically with the source; producer failure rejects the whole batch. Artifact-source stages, committed graph/neighbor context, grouped producers, protected producers and PDF page-image embeddings remain asynchronous. Configured producers with no eligible request reject the requirement. Direct admission has an 8 MiB and 16384-row budget for the complete mutation, including source keys/values, artifact effects, deletions, coverage, revisions, counters and replay payload. Both the submitted source envelope and final physical effect set must fit; this is not an artifact-only allowance. Supported by embedded batches, server/Raft writes and distributed transactions. Raft prepares on the leader and replays immutable effects without inference. Transactions reserve the complete envelope before voting prepared; their conservative reservation can reject a batch below the final physical limit. Serverless supports source-local pipeline stages through conditional atomic WAL batches (at most 1024 mutations and 8 MiB including WAL framing). Backends without that capability reject before source admission. Omission retains legacy embedded precomputation for enrichments/full_index during the compatibility window; other surfaces retain their existing waits.
+pub const CommitRequires = enum {
+    none,
+    direct_enrichments,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .none => "none",
+            .direct_enrichments => "direct_enrichments",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "none", .none },
+            .{ "direct_enrichments", .direct_enrichments },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -4684,7 +4730,7 @@ pub const ForeignSource = struct {
     dsn: []const u8,
     /// Name of the table or view in the foreign PostgreSQL database to query.
     postgres_table: []const u8,
-    /// Optional column definitions for the foreign table. If omitted, columns are auto-discovered from `information_schema.columns` on first query.
+    /// Optional column definitions for the foreign table. If omitted, columns are auto-discovered from the PostgreSQL catalog (`pg_attribute`) on first query.
     columns: ?[]const ForeignColumn = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -4798,7 +4844,7 @@ pub const GlobalStatefulQueryRequest = struct {
     pruner: ?antfly_indexes_openapi.Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, filter_prefix, field selection, order_by, limit/offset, joins (including nested joins and joins between two foreign tables), and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422. **Not supported when the foreign table drives the query:** full_text_search, semantic_search, graph_queries, reranker, search_after. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Legacy operation names remain opaque and byte-for-byte compatible; canonical GraphIdentifier rules apply only to `graph_queries`. The request-wide limit of 64 operations also applies here to bound execution work during the compatibility window.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.LegacyGraphQuery) = null,
@@ -5494,6 +5540,8 @@ pub const GraphQueryRequest = struct {
 };
 
 pub const GraphQueryResult = struct {
+    /// Concrete graph index names selected from the statement catalog cut.
+    resolved_indexes: ?[]const []const u8 = null,
     wire_version: i64,
     columns: []const []const u8,
     rows: []const []const GraphWireValue,
@@ -5508,6 +5556,7 @@ pub const GraphQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "wire_version", "wire_version", false },
         .{ "columns", "columns", false },
         .{ "rows", "rows", false },
@@ -5530,6 +5579,10 @@ pub const GraphQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         try jw.objectField("wire_version");
         try jw.write(self.wire_version);
         try jw.objectField("columns");
@@ -7904,12 +7957,15 @@ pub const MetadataLeaderUnavailableError = struct {
 
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
 pub const MultiBatchRequest = struct {
+    /// Default admission prerequisite for tables without an explicit commit_requires. A table-level value overrides this default. Staged transaction statements retain the strongest prerequisite selected for each table.
+    commit_requires: ?std.json.Value = null,
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
     tables: std.json.ArrayHashMap(BatchRequest),
     sync_level: ?SyncLevel = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "commit_requires", "commit_requires", true },
         .{ "tables", "tables", false },
         .{ "sync_level", "sync_level", true },
     };
@@ -7924,6 +7980,10 @@ pub const MultiBatchRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.commit_requires) |value| {
+            try jw.objectField("commit_requires");
+            try jw.write(value);
+        }
         try jw.objectField("tables");
         try jw.write(self.tables);
         if (self.sync_level) |value| {
@@ -9083,7 +9143,7 @@ pub const QueryRequest = struct {
     pruner: ?antfly_indexes_openapi.Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, filter_prefix, field selection, order_by, limit/offset, joins (including nested joins and joins between two foreign tables), and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422. **Not supported when the foreign table drives the query:** full_text_search, semantic_search, graph_queries, reranker, search_after. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -9366,6 +9426,8 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
+    /// Concrete index names selected for this query before embedding and execution.
+    resolved_indexes: ?[]const []const u8 = null,
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
@@ -9397,6 +9459,7 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -9424,6 +9487,10 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         if (self.source_ranking) |value| {
             try jw.objectField("source_ranking");
             try jw.write(value);
@@ -9489,6 +9556,8 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
+    /// Concrete index names selected for this query before embedding and execution.
+    resolved_indexes: ?[]const []const u8 = null,
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
@@ -9519,6 +9588,7 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -9545,6 +9615,10 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         if (self.source_ranking) |value| {
             try jw.objectField("source_ranking");
             try jw.write(value);
@@ -14101,6 +14175,8 @@ pub const SQLRequest = struct {
 
 /// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON. Array-typed columns contain SQLArrayValue envelopes, with their element descriptor in the corresponding SQLColumn. They are not JSON columns.
 pub const SQLResponse = struct {
+    /// Concrete graph index names selected from the statement catalog cut.
+    resolved_indexes: ?[]const []const u8 = null,
     columns: []const SQLColumn,
     rows: []const []const std.json.Value,
     /// Number of rows affected by a mutation, or zero for a read-only statement.
@@ -14119,6 +14195,7 @@ pub const SQLResponse = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "columns", "columns", false },
         .{ "rows", "rows", false },
         .{ "rows_affected", "rows_affected", false },
@@ -14141,6 +14218,10 @@ pub const SQLResponse = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         try jw.objectField("columns");
         try jw.write(self.columns);
         try jw.objectField("rows");
@@ -15222,7 +15303,7 @@ pub const StatefulQueryRequest = struct {
     pruner: ?antfly_indexes_openapi.Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, filter_prefix, field selection, order_by, limit/offset, joins (including nested joins and joins between two foreign tables), and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422. **Not supported when the foreign table drives the query:** full_text_search, semantic_search, graph_queries, reranker, search_after. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Legacy operation names remain opaque and byte-for-byte compatible; canonical GraphIdentifier rules apply only to `graph_queries`. The request-wide limit of 64 operations also applies here to bound execution work during the compatibility window.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.LegacyGraphQuery) = null,
@@ -15519,6 +15600,8 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
+    /// Concrete index names selected for this query before embedding and execution.
+    resolved_indexes: ?[]const []const u8 = null,
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
@@ -15550,6 +15633,7 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -15577,6 +15661,10 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         if (self.source_ranking) |value| {
             try jw.objectField("source_ranking");
             try jw.write(value);
@@ -15759,7 +15847,7 @@ pub const StoreRootEnrollmentRequest = struct {
     signature: []const u8,
 };
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for the write to be durably applied to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Precompute enrichments before committing the document. A synchronous producer failure rejects the write; post-commit worker failures retain the document and may return `committed_repair_required`. - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
 pub const SyncLevel = enum {
     propose,
     write,
@@ -16471,7 +16559,7 @@ pub const TableRepairJobStartRequest = struct {
     force: ?bool = null,
     /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
     limit: ?u32 = null,
-    /// When true, the server immediately attempts the first bounded repair pass before returning the job.
+    /// When true, the server starts the job and continues bounded passes automatically, including after restart. When false, each pass requires an explicit advance request.
     advance: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -16954,6 +17042,8 @@ pub const TransactionBeginResponse = struct {
 
 /// Stateless OCC (Optimistic Concurrency Control) transaction commit request. The client reads documents (capturing version tokens from the X-Antfly-Version response header on lookups), computes writes locally, then submits everything in this single commit request. The server validates that all read versions still match before executing writes atomically via 2PC. **No server-side state**: There is no "begin" endpoint. The client manages its own read set and submits the full transaction in one request.
 pub const TransactionCommitRequest = struct {
+    /// Default admission prerequisite for tables without an explicit commit_requires. A table-level value overrides this default. Staged transaction statements retain the strongest prerequisite selected for each table.
+    commit_requires: ?std.json.Value = null,
     /// Set of keys that were read during the transaction, with their observed versions. The server verifies these versions still match before committing writes.
     read_set: []const TransactionReadItem,
     /// Write set: map of table names to batch operations, same format as MultiBatchRequest.tables.
@@ -16962,6 +17052,7 @@ pub const TransactionCommitRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "commit_requires", "commit_requires", true },
         .{ "read_set", "read_set", false },
         .{ "tables", "tables", false },
         .{ "sync_level", "sync_level", true },
@@ -16977,6 +17068,10 @@ pub const TransactionCommitRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.commit_requires) |value| {
+            try jw.objectField("commit_requires");
+            try jw.write(value);
+        }
         try jw.objectField("read_set");
         try jw.write(self.read_set);
         try jw.objectField("tables");

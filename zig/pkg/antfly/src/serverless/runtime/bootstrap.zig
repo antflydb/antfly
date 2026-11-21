@@ -43,6 +43,10 @@ const object_store_support = @import("antfly_local_sources").serverless_object_s
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const common_config = @import("antfly_local_sources").common_config;
 
+const internal_queries = @import("../../api/internal_query_operations.zig");
+const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
+const cache_budget = @import("antfly_cache_budget");
+
 pub const BootstrapConfig = struct {
     pub const S3Options = object_store_support.S3Options;
     pub const GcsOptions = object_store_support.GcsOptions;
@@ -61,6 +65,9 @@ pub const BootstrapConfig = struct {
     wal_document_index: bool = false,
     wal_packed_pages: bool = false,
     wal_deferred_indexes: bool = false,
+    /// Explicit layout-v3 activation on a new/migrated prefix. All readers and
+    /// metadata writers must support catalog intents before this is selected.
+    wal_catalog_fences: bool = false,
     point_read_blocks: bool = false,
     /// Managed reader contract and physical collection, new WAL prefixes only.
     wal_gc: bool = false,
@@ -74,6 +81,10 @@ pub const BootstrapConfig = struct {
     /// Only the current wire is supported while serverless is unreleased.
     manifest_write_version: u16 = manifest_mod.codec.wire_version,
     embedding_indexes_json: ?[]const u8 = null,
+    embedding_cache: ?internal_queries.QueryEmbeddingCache = null,
+    query_embedding_runtime: ?*managed_embedder.ProviderRuntime = null,
+    inference_api_url: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
     sparse_embedding_index_name: []const u8 = search_sources.default_sparse_embedding_index_name,
     chunk_embedding_index_name: []const u8 = search_sources.default_chunk_embedding_index_name,
     chunk_embedding_dimensions: u32 = 8,
@@ -426,6 +437,8 @@ pub const OwnedStack = struct {
     resident_points_enabled: bool = false,
     point_index_enabled: bool = false,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
+    embedding_cache: query_embedding_cache.QueryEmbeddingCache,
+    embedding_cache_budget: cache_budget.CacheBudget,
     managed_query_embedder: ?managed_embedder.ManagedEmbedder = null,
     dense_query_index_name: ?[]u8 = null,
     sparse_query_index_name: []u8 = undefined,
@@ -440,6 +453,11 @@ pub const OwnedStack = struct {
         self.alloc = alloc;
         self.embedding_provider_runtime = managed_embedder.ProviderRuntime.init(alloc, io);
         errdefer self.embedding_provider_runtime.deinit();
+        const embedding_cache_config: query_embedding_cache.Config = .{};
+        self.embedding_cache_budget = cache_budget.CacheBudget.init(embedding_cache_config.max_bytes);
+        self.embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, io, embedding_cache_config);
+        errdefer self.embedding_cache.deinit(&self.embedding_cache_budget);
+        const query_embedding_runtime = cfg.query_embedding_runtime orelse &self.embedding_provider_runtime;
         self.s3_client_pool = try S3ClientPool.init(alloc);
         errdefer self.s3_client_pool.deinit();
         self.gcs_client_pool = GcsClientPool.init(alloc, self.s3_client_pool.io_impl.io());
@@ -516,7 +534,7 @@ pub const OwnedStack = struct {
         } else try wal_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.wal_uri, cfg.s3_options[2]);
         self.wal = self.wal_impl.walStore();
         // Establish unwind ownership before configuration can perform I/O.
-        if (cfg.indexed_wal) self.wal_impl.enableIndexed(.{ .read_state = cfg.native_read_state, .document_index = cfg.wal_document_index, .packed_pages = cfg.wal_packed_pages, .deferred_indexes = cfg.wal_deferred_indexes, .managed_collection = cfg.wal_gc }) catch |err| {
+        if (cfg.indexed_wal) self.wal_impl.enableIndexed(.{ .catalog_fences = cfg.wal_catalog_fences, .read_state = cfg.native_read_state, .document_index = cfg.wal_document_index, .packed_pages = cfg.wal_packed_pages, .deferred_indexes = cfg.wal_deferred_indexes, .managed_collection = cfg.wal_gc }) catch |err| {
             self.wal.deinit();
             return err;
         };
@@ -654,7 +672,10 @@ pub const OwnedStack = struct {
                 .bounded_http_request = true,
                 .secret_store = cfg.secret_store,
                 .remote_content = cfg.remote_content,
-                .provider_runtime = &self.embedding_provider_runtime,
+                .provider_runtime = query_embedding_runtime,
+                .remote_capability_cache = &query_embedding_runtime.remote_capability_cache,
+                .inference_api_url = cfg.inference_api_url,
+                .inference_api_key = cfg.inference_api_key,
             };
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
             defer parsed.deinit();
@@ -706,7 +727,11 @@ pub const OwnedStack = struct {
         } };
         try self.handler.setGraphExecutionLimits(cfg.graph_execution_limits);
         self.handler.setIo(io);
-        self.handler.setEmbeddingProviderRuntime(&self.embedding_provider_runtime);
+        self.handler.setEmbeddingProviderRuntime(query_embedding_runtime);
+        self.handler.embedding_cache = cfg.embedding_cache orelse .{ .cache = &self.embedding_cache, .budget = &self.embedding_cache_budget };
+        self.handler.inference_api_url = cfg.inference_api_url;
+        self.handler.inference_api_key = cfg.inference_api_key;
+        self.handler.embedding_secret_store = cfg.secret_store;
         self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
         self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
@@ -761,6 +786,7 @@ pub const OwnedStack = struct {
         self.runtime.deinit();
         if (self.wal_collector) |collector| self.alloc.destroy(collector);
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
+        self.embedding_cache.deinit(&self.embedding_cache_budget);
         self.embedding_provider_runtime.deinit();
         if (self.dense_query_index_name) |index_name| self.alloc.free(index_name);
         self.alloc.free(self.sparse_query_index_name);
@@ -794,7 +820,7 @@ fn workLeaseOwnerIdAlloc(alloc: Allocator, io: std.Io) ![]u8 {
 }
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
-    if ((cfg.resident_points or cfg.native_read_state or cfg.wal_document_index or cfg.wal_gc or cfg.wal_packed_pages or cfg.wal_deferred_indexes) and !cfg.indexed_wal) return error.IndexedWalRequired;
+    if ((cfg.resident_points or cfg.native_read_state or cfg.wal_document_index or cfg.wal_gc or cfg.wal_packed_pages or cfg.wal_deferred_indexes or cfg.wal_catalog_fences) and !cfg.indexed_wal) return error.IndexedWalRequired;
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;

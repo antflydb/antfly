@@ -56,6 +56,16 @@ It does not enable deletion or alteration of existing tables, native auth
 changes, backups or other surfaces still rejected by the mutation inventory.
 Those require their own replicated lifecycle contracts.
 
+Index alias PUT and DELETE are also admitted when both whole-instance catalog
+replication and synchronous RemoteApply are enabled. They use the durable
+binary metadata catalog-replacement records, including alias incarnation and
+idempotency receipts, under the same catalog mutation and authority gates.
+The standby applies the replacement before acknowledging it. Table-scoped
+streams reject alias mutations because they cannot replay catalog replacements.
+This exception does not admit index creation, schema alteration or table deletion.
+`e2e/antfly/test_index_alias_qualification.py` covers alias replication, standby
+restart, fenced promotion and rejection by the fenced primary.
+
 `e2e/antfly/test_standby_empty_bootstrap.py` exercises empty portable seed
 activation, two newly created tables, document writes, restart, fenced
 promotion, unavailable-standby rejection and recovery of a catalog snapshot

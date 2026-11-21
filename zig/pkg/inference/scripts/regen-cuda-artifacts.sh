@@ -200,6 +200,9 @@ tmp_symbols="$tmp_root/kernels.symbols"
 trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89" "$tmp_symbols"; rmdir "$tmp_root"' EXIT
 
 required_symbols=(
+  antfly_gemma4_vision_norm_rope_f32
+  antfly_gemma4_vision_attention_registers
+  antfly_linear_gemma4_q4_0_bf16_raw
   antfly_audio_logmel_f32
   antfly_audio_fft512_f32
   antfly_audio_conv_tiled_f32
@@ -234,6 +237,7 @@ required_symbols=(
   termite_embedding_gemma2_attention_bf16
   termite_embedding_gemma2_attention_local_flash_bf16
   termite_embedding_gemma2_attention_softmax_bf16
+  termite_embedding_gemma2_attention_normalized_softmax_bf16
   termite_embedding_gemma2_matmul_bf16
   termite_embedding_gemma2_gelu_mul_bf16
   termite_embedding_gemma2_gelu_mul_vjp_f32
@@ -475,6 +479,10 @@ required_symbols=(
   antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1
   antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1
   termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn
+  termite_gemma4_small_ffn_pair_q8_1_f32
+  termite_gemma4_small_ffn_down_q8_1_f32
+  termite_gemma4_small_ple_gate_q8_1_f32
+  termite_gemma4_small_ple_projection_q8_1_f32
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4

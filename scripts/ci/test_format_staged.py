@@ -60,6 +60,92 @@ class StagedFormattingTests(unittest.TestCase):
     def format(self, path, data):
         return data.replace(b"value=1", b"value = 1")
 
+    def test_waits_out_a_briefly_held_index_lock(self):
+        import threading
+
+        self.base()
+        self.write("example.py", b"value=1\n" + b"# context\n" * 12 + b"other = 0\n")
+        self.git("add", "--", "example.py")
+        lock = self.root / ".git" / "index.lock"
+        lock.write_bytes(b"")
+        release = threading.Timer(0.3, lock.unlink)
+        release.start()
+        try:
+            format_staged.format_staged(self.root, self.format)
+        finally:
+            release.join()
+        staged = self.git("show", ":example.py")
+        self.assertTrue(staged.startswith(b"value = 1\n"))
+
+    def test_index_update_os_error_rolls_back_worktree(self):
+        self.base()
+        unformatted = b"value=1\n" + b"# context\n" * 12 + b"other = 0\n"
+        self.write("example.py", unformatted)
+        self.git("add", "--", "example.py")
+
+        def failing_replace(src, dst):
+            raise PermissionError("index is read-only")
+
+        with patch.object(format_staged.os, "replace", failing_replace):
+            with self.assertRaisesRegex(format_staged.HookError, "read-only"):
+                format_staged.format_staged(self.root, self.format)
+        self.assertEqual((self.root / "example.py").read_bytes(), unformatted)
+        self.assertEqual(self.git("show", ":example.py"), unformatted)
+        self.assertFalse((self.root / ".git" / "index.lock").exists())
+
+    def test_edit_after_staging_is_never_overwritten(self):
+        # An editor saves over the formatted hunk after the hook staged it
+        # but before the worktree is formatted.
+        self.base()
+        unformatted = b"value=1\n" + b"# context\n" * 12 + b"other = 0\n"
+        self.write("example.py", unformatted)
+        self.git("add", "--", "example.py")
+        edited = b"value=2\n" + b"# context\n" * 12 + b"other = 9\n"
+        real_update = format_staged.update_index_under_lock
+
+        def update_then_edit(*args):
+            real_update(*args)
+            self.write("example.py", edited)
+
+        with patch.object(format_staged, "update_index_under_lock", update_then_edit):
+            format_staged.format_staged(self.root, self.format)
+        self.assertEqual((self.root / "example.py").read_bytes(), edited)
+        self.assertEqual(self.git("show", ":example.py"), self.format("", unformatted))
+
+    def test_edit_elsewhere_after_staging_keeps_both(self):
+        self.base()
+        unformatted = b"value=1\n" + b"# context\n" * 12 + b"other = 0\n"
+        self.write("example.py", unformatted)
+        self.git("add", "--", "example.py")
+        real_update = format_staged.update_index_under_lock
+
+        def update_then_edit(*args):
+            real_update(*args)
+            self.write("example.py", unformatted.replace(b"other = 0", b"other = 9"))
+
+        with patch.object(format_staged, "update_index_under_lock", update_then_edit):
+            format_staged.format_staged(self.root, self.format)
+        self.assertEqual(
+            (self.root / "example.py").read_bytes(),
+            self.format("", unformatted).replace(b"other = 0", b"other = 9"),
+        )
+
+    def test_index_changed_while_formatting_applies_nothing(self):
+        self.base()
+        self.write("example.py", b"value=1\n" + b"# context\n" * 12 + b"other = 0\n")
+        self.git("add", "--", "example.py")
+        staged_before = self.git("show", ":example.py")
+
+        def format_and_race(path, data):
+            # Another process stages a different file meanwhile.
+            self.write("other.py", b"x = 1\n")
+            self.git("add", "--", "other.py")
+            return self.format(path, data)
+
+        with self.assertRaises(format_staged.HookError):
+            format_staged.format_staged(self.root, format_and_race)
+        self.assertEqual(staged_before, self.git("show", ":example.py"))
+
     def test_partial_staging_preserves_unstaged_hunk(self):
         original = self.base()
         staged = original.replace(b"value = 0", b"value=1")

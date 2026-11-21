@@ -40,6 +40,7 @@ const retained_effects = @import("retained_effects.zig");
 pub const completion = @import("transaction_completion.zig");
 const source_scope = @import("source_scope.zig");
 const completion_admission_prefix = completion.admission_prefix;
+const wal_trace = @import("write_amplification_trace.zig");
 
 // ============================================================================
 // Key prefixes
@@ -339,6 +340,8 @@ pub const ResolutionExtraBatch = struct {
 /// Additional primary-store mutations that must commit atomically with a
 /// transaction metadata transition. Raft apply uses this to fence the exact log
 /// entry without a crash window between the transaction and its replay marker.
+const prepared_enrichments_prefix = "\x00\x00__txn_prepared_enrichments__:";
+
 pub const MutationExtraBatch = struct {
     /// Trusted native ingress only. Never inferred on a replay of an old BEGIN.
     ordinary_producer: bool = false,
@@ -351,6 +354,7 @@ pub const MutationExtraBatch = struct {
     /// Immutable source-command fingerprint installed with BEGIN and required
     /// by PREPARE. Ordinary sessions cannot adopt a source transaction ID.
     source_purpose: ?[32]u8 = null,
+    prepared_enrichments_json: ?[]const u8 = null,
     document_revisions: ?bool = null,
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
@@ -377,6 +381,20 @@ pub const SchemaBinding = struct {
 pub const ResolutionOutcome = struct {
     applied: bool,
     replay_sequence: u64,
+};
+
+/// `resolveIntentsWithExtraBatchStaged`'s result: the same `ResolutionOutcome`
+/// plus the durability ticket (if any) for whatever this resolution staged.
+/// `ticket` is `null` only when resolution wrote nothing (the no-op terminal-
+/// retry branch with no completion writes/deletes). See
+/// `docs/design/lite-performance/lite-single-commit-write-path.md` §3.2:
+/// callers release locks scoped to "a transaction is open" between getting
+/// this ticket and calling `wait()` on it, so this resolution's commit can
+/// share a group-commit fsync with concurrent writers instead of blocking
+/// them behind it.
+pub const StagedResolutionOutcome = struct {
+    outcome: ResolutionOutcome,
+    ticket: ?backend_erased.Ticket = null,
 };
 
 pub const IntentSnapshotValidation = struct {
@@ -406,6 +424,7 @@ pub const ReplayAppend = struct {
 pub const IntentBatch = struct {
     ordinary_producer: bool = false,
     legacy_producer: bool = false,
+    prepared_enrichments_json: ?[]u8 = null,
     document_revisions: bool = false,
     writes: []docstore.KVPair = &.{},
     deletes: [][]const u8 = &.{},
@@ -417,6 +436,7 @@ pub const IntentBatch = struct {
     owned_entries: ?[]backend_scan.OwnedKVPair = null,
 
     pub fn deinit(self: *IntentBatch, alloc: Allocator) void {
+        if (self.prepared_enrichments_json) |bytes| alloc.free(bytes);
         if (self.prepared_rows.len != 0) alloc.free(self.prepared_rows);
         if (self.owned_entries) |entries| {
             backend_scan.freeResults(alloc, entries);
@@ -730,6 +750,46 @@ pub const TxnManager = struct {
         retain_terminal: bool,
         extra_batch: MutationExtraBatch,
     ) !void {
+        // Attribution must wrap the wait too: the group-commit member this
+        // stages is only actually applied (and so only fsynced) once
+        // something drives/waits its group, inside `ticket.wait()` below,
+        // not at `commitStaged`/`enqueue` time -- pushing the tag only
+        // around the staged call would have it popped before the real I/O
+        // runs, misattributing this commit to `.other`.
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_txn_begin);
+        defer wal_trace_scope.end();
+        const ticket = try self.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatchStaged(
+            txn_id,
+            timestamp,
+            created_at,
+            participants,
+            coordinator,
+            retain_terminal,
+            extra_batch,
+        );
+        try ticket.wait();
+    }
+
+    /// Staged counterpart of `initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch`:
+    /// stages this transaction's begin record and returns a durability
+    /// ticket instead of blocking for the fsync, mirroring
+    /// `resolveIntentsWithExtraBatchStaged`'s split (lite-single-commit-
+    /// write-path.md §3.2/§3.2a). A caller that stages this across more
+    /// than one physical commit domain, or that needs to read this
+    /// transaction's record back before this ticket is durable, must not
+    /// defer `wait()`: a group-commit member is only applied -- and so only
+    /// readable -- once something drives/waits its group (see
+    /// `writeTransactionInternal`'s doc comment in `storage/db/db.zig`).
+    pub fn initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatchStaged(
+        self: *TxnManager,
+        txn_id: TxnId,
+        timestamp: u64,
+        created_at: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+        extra_batch: MutationExtraBatch,
+    ) !backend_erased.Ticket {
         if (try self.keyExists(@import("committed_history.zig").policy_key)) {
             const completion_key = makeSidecarKey(completion_admission_prefix, txn_id);
             var qualified = try self.keyExists(&completion_key);
@@ -787,11 +847,9 @@ pub const TxnManager = struct {
                 defer writes.deinit(self.alloc);
                 try writes.append(self.alloc, .{ .key = &key, .value = upgraded_value });
                 try writes.appendSlice(self.alloc, extra_batch.writes);
-                try self.applyBatch(writes.items, extra_batch.deletes, null);
-            } else {
-                try self.applyMutationExtraBatch(extra_batch);
+                return try self.applyBatchStaged(writes.items, extra_batch.deletes, null, null, null);
             }
-            return;
+            return try self.applyMutationExtraBatchStaged(extra_batch);
         }
         const record = TxnRecord{
             .ordinary_producer = extra_batch.ordinary_producer,
@@ -827,7 +885,7 @@ pub const TxnManager = struct {
             try deletes.appendSlice(self.alloc, &.{ &participant_key, &resolved_key });
         }
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
-        try self.applyBatch(writes.items, deletes.items, null);
+        const ticket = try self.applyBatchStaged(writes.items, deletes.items, null, null, null);
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
                 .name = "InitTransaction",
@@ -836,6 +894,7 @@ pub const TxnManager = struct {
                 .timestamp = timestamp,
             });
         }
+        return ticket;
     }
 
     /// Write intents for a transaction, checking version predicates first.
@@ -900,6 +959,32 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         extra_batch: MutationExtraBatch,
     ) !void {
+        // See `initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch`'s
+        // comment: the tag must wrap `wait()` too, since the actual apply/
+        // fsync happens there, not at `commitStaged`/`enqueue` time.
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_intent_write);
+        defer wal_trace_scope.end();
+        const ticket = try self.writeIntentsExtraBatchStaged(txn_id, intents, predicates, extra_batch);
+        try ticket.wait();
+    }
+
+    /// Staged counterpart of `writeIntentsExtraBatch`: stages this write's
+    /// intents (and their admission/reservation bookkeeping) and returns a
+    /// durability ticket instead of blocking for the fsync, mirroring
+    /// `resolveIntentsWithExtraBatchStaged`'s split (lite-single-commit-
+    /// write-path.md §3.2/§3.2a). This itself reads back the transaction
+    /// record an earlier `initTransaction*` call wrote, so a caller must
+    /// not defer that earlier call's `wait()` past this one: a group-commit
+    /// member is only applied -- and so only readable -- once something
+    /// drives/waits its group, not at `enqueue` time (see
+    /// `writeTransactionInternal`'s doc comment in `storage/db/db.zig`).
+    pub fn writeIntentsExtraBatchStaged(
+        self: *TxnManager,
+        txn_id: TxnId,
+        intents: []const WriteIntent,
+        predicates: []const VersionPredicate,
+        extra_batch: MutationExtraBatch,
+    ) !backend_erased.Ticket {
         if (extra_batch.index_span_digests.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
         for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
         var record = try self.loadTransactionRecord(txn_id);
@@ -930,6 +1015,12 @@ pub const TxnManager = struct {
             try @import("committed_history.zig").requireCompletionReservation(&probe, namespace[0..24].*, frozen.value.admission);
         } else if (extra_batch.completion_owner != null) return error.SourceTransactionIdentityConflict else if (try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
         const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
+        if (!first_prepare and extra_batch.prepared_enrichments_json == null) {
+            if (try self.loadPreparedEnrichments(self.alloc, txn_id)) |packet| {
+                self.alloc.free(packet);
+                return error.VersionConflict;
+            }
+        }
 
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var schema_lease_value: [5]u8 = @splat(0);
@@ -952,7 +1043,7 @@ pub const TxnManager = struct {
             if (extra_batch.document_revisions) |revisions| if (revisions != record.document_revisions) return error.SourcePayloadConflict;
             try self.requireSamePreparedSourceIntents(txn_id, intents);
             if (extra_batch.writes.len != 0 or extra_batch.deletes.len != 0) return error.SourcePayloadConflict;
-            return;
+            return backend_erased.Ticket.alreadyDurable();
         }
 
         // Emit CheckPredicates before checks: TLA+ spec models this as an
@@ -983,6 +1074,9 @@ pub const TxnManager = struct {
         };
         const previous_admission = try self.loadIntentAdmission(self.alloc, txn_id);
         var admission = previous_admission orelse IntentAdmission{};
+        if (first_prepare) if (extra_batch.prepared_enrichments_json) |packet| {
+            admission.bytes = std.math.add(u64, admission.bytes, packet.len + prepared_enrichments_prefix.len + 16) catch return error.TransactionTooLarge;
+        };
         var pending_costs = std.StringHashMapUnmanaged(IntentCost).empty;
         defer pending_costs.deinit(self.alloc);
         var last_intents = std.StringHashMapUnmanaged(usize).empty;
@@ -1166,11 +1260,23 @@ pub const TxnManager = struct {
         if (extra_batch.schema_binding != null)
             try writes.append(self.alloc, .{ .key = &schema_lease_key, .value = &schema_lease_value });
 
+        const prepared_key = makeSidecarKey(prepared_enrichments_prefix, txn_id);
+        if (extra_batch.prepared_enrichments_json) |packet| {
+            const previous = self.getAlloc(self.alloc, &prepared_key) catch |err| if (err == error.NotFound) null else return err;
+            defer if (previous) |bytes| self.alloc.free(bytes);
+            if (previous) |bytes| {
+                if (!std.mem.eql(u8, bytes, packet)) return error.VersionConflict;
+            } else {
+                if (!first_prepare) return error.InvalidTxnRecord;
+                try writes.append(self.alloc, .{ .key = &prepared_key, .value = packet });
+            }
+        }
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        try self.applyBatchWithReservation(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() });
+        const ticket = try self.applyBatchStaged(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() }, null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
+        return ticket;
     }
 
     /// Trusted ordered retirement after an independent qualified coordinator
@@ -1236,7 +1342,9 @@ pub const TxnManager = struct {
     pub fn resolveClosedLegacyTerminal(self: *TxnManager, proof: LegacyTerminalResolution, extra: ResolutionExtraBatch) !ResolutionOutcome {
         if (extra.source_retirement != null or extra.source_scope != null or extra.source_purpose != null) return error.InvalidSourceAdmission;
         const decision = try self.closedLegacyTerminalDecision(proof);
-        return self.resolveIntentsWithExtraBatchInternal(proof.transaction_id, decision.status, decision.timestamp, extra, proof);
+        const staged = try self.resolveIntentsWithExtraBatchStagedAndLegacy(proof.transaction_id, decision.status, decision.timestamp, extra, proof);
+        if (staged.ticket) |ticket| try ticket.wait();
+        return staged.outcome;
     }
 
     pub const LegacyTerminalDecision = struct { status: TxnStatus, timestamp: u64 };
@@ -1252,6 +1360,12 @@ pub const TxnManager = struct {
         return .{ .status = record.status, .timestamp = if (record.status == .committed) record.commit_version else record.finalized_at };
     }
 
+    /// Blocking convenience wrapper over `resolveIntentsWithExtraBatchStaged`:
+    /// identical behavior to before that split existed (every caller here
+    /// still gets a fully durable outcome before this returns). Callers on
+    /// the synchronous write ack path that need to release locks between
+    /// staging and durability (lite-single-commit-write-path.md §3.2/§3.2a)
+    /// should call the staged form directly instead.
     pub fn resolveIntentsWithExtraBatch(
         self: *TxnManager,
         txn_id: TxnId,
@@ -1259,17 +1373,43 @@ pub const TxnManager = struct {
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
     ) !ResolutionOutcome {
-        return self.resolveIntentsWithExtraBatchInternal(txn_id, status, timestamp, extra_batch, null);
+        // The tag must wrap `wait()` too: the actual apply/fsync happens
+        // there, not at `commitStaged`/`enqueue` time (see
+        // `initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch`'s
+        // comment above).
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_intent_resolve);
+        defer wal_trace_scope.end();
+        const staged = try self.resolveIntentsWithExtraBatchStaged(txn_id, status, timestamp, extra_batch);
+        if (staged.ticket) |ticket| try ticket.wait();
+        return staged.outcome;
     }
 
-    fn resolveIntentsWithExtraBatchInternal(
+    /// Staged counterpart: stages every durable effect of this resolution
+    /// attempt (the transaction record transition, applied intents, and any
+    /// completion writes) and returns a ticket instead of blocking for the
+    /// fsync, mirroring `docstore.zig`'s `Batch.commitStaged`/`StagedBatch`
+    /// split. `ticket` is `null` only when this call wrote nothing at all
+    /// (the no-op terminal-retry branch below with no completion writes or
+    /// deletes) -- there is then nothing to wait for.
+    pub fn resolveIntentsWithExtraBatchStaged(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+    ) !StagedResolutionOutcome {
+        return self.resolveIntentsWithExtraBatchStagedAndLegacy(txn_id, status, timestamp, extra_batch, null);
+    }
+
+    pub fn resolveIntentsWithExtraBatchStagedAndLegacy(
         self: *TxnManager,
         txn_id: TxnId,
         status: TxnStatus,
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
         legacy_terminal: ?LegacyTerminalResolution,
-    ) !ResolutionOutcome {
+    ) !StagedResolutionOutcome {
+        if (legacy_terminal != null and (extra_batch.source_retirement != null or extra_batch.source_scope != null or extra_batch.source_purpose != null)) return error.InvalidSourceAdmission;
         if (extra_batch.source_retirement) |ordered| {
             const proof = try ordered.command.proof();
             if (status != .aborted or !std.mem.eql(u8, &txn_id, &proof.slot.transaction_id) or !sameSourceScope(extra_batch.source_scope, proof.slot.reference) or !samePurpose(extra_batch.source_purpose, proof.slot.source_purpose) or extra_batch.completion_owner == null or !std.meta.eql(extra_batch.completion_owner.?, ordered.command.intent.owner) or extra_batch.source_scope_cut == null or !std.meta.eql(extra_batch.source_scope_cut.?, ordered.cut)) return error.SourceTransactionIdentityConflict;
@@ -1368,13 +1508,14 @@ pub const TxnManager = struct {
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
-            if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0 or extra_batch.source_retirement != null) {
-                try self.applyBatchWithParticipant(completion_writes.items, extra_batch.completion_deletes, null, null, null, null, extra_batch.source_retirement, legacy_terminal);
-            }
-            return .{
+            const ticket: ?backend_erased.Ticket = if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0 or extra_batch.source_retirement != null or legacy_terminal != null)
+                try self.applyBatchStagedWithHistory(completion_writes.items, extra_batch.completion_deletes, null, null, null, null, extra_batch.source_retirement, legacy_terminal)
+            else
+                null;
+            return .{ .outcome = .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
-            };
+            }, .ticket = ticket };
         }
 
         // Scan all intents for this txn
@@ -1396,6 +1537,7 @@ pub const TxnManager = struct {
             try self.loadIntentEntries(self.alloc, txn_id, scan_prefix);
         defer if (extra_batch.captured_intents == null) backend_scan.freeResults(self.alloc, intent_entries);
 
+        const prepared_key = makeSidecarKey(prepared_enrichments_prefix, txn_id);
         const read_prefix = makeSidecarKey(read_members_prefix, txn_id);
         const read_admission = try self.loadReadAdmission(txn_id);
         const read_entries: []backend_scan.OwnedKVPair = if (read_admission.count != 0) try self.scanPrefix(self.alloc, &read_prefix) else &.{};
@@ -1425,13 +1567,14 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &stale_manifest_key);
             try completion_deletes.append(self.alloc, &stale_admission_key);
             try completion_deletes.append(self.alloc, &schema_lease_key);
+            try completion_deletes.append(self.alloc, &prepared_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyBatchWithParticipant(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, extra_batch.source_scope_cut, extra_batch.source_retirement, legacy_terminal);
-            return .{
+            const ticket = try self.applyBatchStagedWithHistory(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, extra_batch.source_scope_cut, extra_batch.source_retirement, legacy_terminal);
+            return .{ .outcome = .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
-            };
+            }, .ticket = ticket };
         }
 
         if (extra_batch.skip_all_intent_application and extra_batch.skip_intent_keys.len != 0) {
@@ -1448,6 +1591,7 @@ pub const TxnManager = struct {
         defer writes.deinit(self.alloc);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
+        try deletes.append(self.alloc, &prepared_key);
         var owned_apply_keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (owned_apply_keys.items) |key| self.alloc.free(key);
@@ -1582,7 +1726,7 @@ pub const TxnManager = struct {
         }
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, extra_batch.source_scope_cut, extra_batch.source_retirement, legacy_terminal);
+        const ticket = try self.applyBatchStagedWithHistory(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, extra_batch.source_scope_cut, extra_batch.source_retirement, legacy_terminal);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -1598,10 +1742,10 @@ pub const TxnManager = struct {
                 .reason = if (status == .committed) "committed" else "aborted",
             });
         }
-        return .{
+        return .{ .outcome = .{
             .applied = true,
             .replay_sequence = record.replay_sequence,
-        };
+        }, .ticket = ticket };
     }
 
     pub fn collectIntentBatch(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !IntentBatch {
@@ -1610,6 +1754,9 @@ pub const TxnManager = struct {
         // the DB apply lock detects any prepare that raced with this snapshot.
         const record = try self.loadTransactionRecord(txn_id);
         const schema_binding = try self.loadSchemaBinding(alloc, txn_id);
+        const prepared_key = makeSidecarKey(prepared_enrichments_prefix, txn_id);
+        const prepared_json = self.getAlloc(alloc, &prepared_key) catch |err| if (err == error.NotFound) null else return err;
+        errdefer if (prepared_json) |bytes| alloc.free(bytes);
         var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
         @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
         @memcpy(intent_prefix_buf[intents_prefix.len..][0..16], &txn_id);
@@ -1644,7 +1791,12 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
-        return .{ .ordinary_producer = record.ordinary_producer, .legacy_producer = record.legacy_producer, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
+        return .{ .ordinary_producer = record.ordinary_producer, .legacy_producer = record.legacy_producer, .prepared_enrichments_json = prepared_json, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
+    }
+
+    pub fn loadPreparedEnrichments(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?[]u8 {
+        const selected = makeSidecarKey(prepared_enrichments_prefix, txn_id);
+        return self.getAlloc(alloc, &selected) catch |err| if (err == error.NotFound) null else err;
     }
 
     pub fn loadSchemaBinding(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?SchemaBinding {
@@ -2501,6 +2653,21 @@ pub const TxnManager = struct {
     /// linearizable with concurrent intent admission.
     pub fn checkOrdinaryWriteConflicts(self: *TxnManager, user_keys: []const []const u8) !void {
         if (user_keys.len == 0) return;
+        var probe = try self.store.beginProbe();
+        defer probe.abort();
+        try self.checkOrdinaryWriteConflictsWithProbe(user_keys, &probe);
+    }
+
+    /// Same as `checkOrdinaryWriteConflicts`, reading through an already-open
+    /// probe/read transaction instead of opening (and aborting) its own.
+    /// perf/lwa-write-overhead: lets a mutation's own prep phase share one
+    /// transaction across this and its other read-only checks instead of
+    /// paying a separate overlay pin/unpin for each. `probe` need only
+    /// support `getManySorted`/`get`, matching both `backend_erased.ProbeTxn`
+    /// (this function's own default) and `docstore.DocStore.Txn` (the
+    /// concrete type the DB layer's shared prep-phase probe uses).
+    pub fn checkOrdinaryWriteConflictsWithProbe(self: *TxnManager, user_keys: []const []const u8, probe: anytype) !void {
+        if (user_keys.len == 0) return;
 
         const lock_keys = try self.alloc.alloc([]u8, user_keys.len);
         var initialized: usize = 0;
@@ -2526,8 +2693,6 @@ pub const TxnManager = struct {
         @memset(owners, null);
 
         const have_readers = blk: {
-            var probe = try self.store.beginProbe();
-            defer probe.abort();
             try probe.getManySorted(key_refs, owners);
             for (owners) |maybe_owner| {
                 const owner = maybe_owner orelse continue;
@@ -3198,16 +3363,36 @@ pub const TxnManager = struct {
         try self.applyBatch(extra_batch.writes, extra_batch.deletes, null);
     }
 
+    fn applyMutationExtraBatchStaged(self: *TxnManager, extra_batch: MutationExtraBatch) !backend_erased.Ticket {
+        if (extra_batch.writes.len == 0 and extra_batch.deletes.len == 0) return backend_erased.Ticket.alreadyDurable();
+        return try self.applyBatchStaged(extra_batch.writes, extra_batch.deletes, null, null, null);
+    }
+
     fn applyBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
         return self.applyBatchWithReservation(writes, deletes, replay, null);
     }
 
     const ReservationChange = struct { previous: u64, next: u64 };
     fn applyBatchWithReservation(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange) !void {
-        return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null, null, null, null);
+        return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null);
     }
 
-    fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, scope_cut: ?source_scope.Cut, source_retirement: ?SourceRetirement, legacy_terminal: ?LegacyTerminalResolution) !void {
+    fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !void {
+        var ticket = try self.applyBatchStaged(writes, deletes, replay, reservation, participant);
+        try ticket.wait();
+    }
+
+    /// Staged counterpart of `applyBatchWithParticipant`: stages the batch
+    /// and returns a durability ticket instead of blocking for the fsync.
+    /// `backend_erased.Batch.commitStaged` is already backend-agnostic (see
+    /// its own doc comment): a backend without a staged commit path, e.g.
+    /// the hosted LSM backend, returns an already-durable ticket from the
+    /// ordinary blocking commit, so this never changes behavior there.
+    fn applyBatchStaged(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !backend_erased.Ticket {
+        return self.applyBatchStagedWithHistory(writes, deletes, replay, reservation, participant, null, null, null);
+    }
+
+    fn applyBatchStagedWithHistory(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, scope_cut: ?source_scope.Cut, source_retirement: ?SourceRetirement, legacy_terminal: ?LegacyTerminalResolution) !backend_erased.Ticket {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
@@ -3352,7 +3537,7 @@ pub const TxnManager = struct {
             try ordered_retirement.stage(scope_arena.allocator(), &batch, ordered.command, reply);
         }
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
-        try batch.commit();
+        return try batch.commitStaged();
     }
 
     fn traceWriteIntentSuccess(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate) void {
@@ -6908,9 +7093,9 @@ test "transaction source purpose closed legacy terminal recovery preserves origi
     const resolved_bytes = try manager.getAlloc(a, &makeRecordKey(commit.transaction_id));
     defer a.free(resolved_bytes);
     const metadata_marker = "\x00\x00__metadata__:legacy_terminal_atomic_test";
-    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.applyBatchWithParticipant(&.{.{ .key = metadata_marker, .value = "stale" }}, &.{}, null, null, null, null, null, commit));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.applyBatchStagedWithHistory(&.{.{ .key = metadata_marker, .value = "stale" }}, &.{}, null, null, null, null, null, commit));
     try std.testing.expectError(error.NotFound, manager.getAlloc(a, metadata_marker));
-    try std.testing.expectError(error.TxnNotFound, manager.applyBatchWithParticipant(&.{.{ .key = metadata_marker, .value = "absent" }}, &.{}, null, null, null, null, null, absent));
+    try std.testing.expectError(error.TxnNotFound, manager.applyBatchStagedWithHistory(&.{.{ .key = metadata_marker, .value = "absent" }}, &.{}, null, null, null, null, null, absent));
     try std.testing.expectError(error.NotFound, manager.getAlloc(a, metadata_marker));
     commit.record_digest = completion.bytesDigest(resolved_bytes);
     try manager.putValue(commit_key, "newer");

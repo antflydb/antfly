@@ -18,7 +18,7 @@
 const std = @import("std");
 pub const Owner = @import("antfly_local_sources").storage_transaction_completion.RoutedOwner;
 pub const Digest = [32]u8;
-pub const protocol_version: u16 = 103;
+pub const protocol_version: u16 = 114;
 pub const Spec = struct {
     binding: Digest,
     table_name: []const u8,

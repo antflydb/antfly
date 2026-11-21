@@ -635,6 +635,8 @@ pub const QueryResponseMeta = struct {
     took_ms: i64 = 0,
     /// Borrowed execution fence; response encoding copies it before return.
     remote_snapshot: ?[]const u8 = null,
+    /// Borrowed concrete execution sources; encoding copies and deduplicates.
+    resolved_indexes: ?[]const []const u8 = null,
     shard_count: u32 = 1,
     merged: bool = false,
     reranker: ?RerankerProfile = null,
@@ -2405,6 +2407,7 @@ pub const OwnedQueryRequest = struct {
     projection_plan: ?*field_projection.Plan = null,
     fields: [][]const u8 = &.{},
     req: db_mod.types.SearchRequest = .{},
+    alias_fences: ?std.json.Parsed([]const db_mod.types.IndexAliasFence) = null,
     native_cut: ?std.json.Parsed(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child) = null,
 
     /// Physical preparation for a consumer borrowing encoded native sources.
@@ -2424,6 +2427,7 @@ pub const OwnedQueryRequest = struct {
         }
         freeSearchRequest(alloc, &self.req);
         if (self.native_cut) |*cut| cut.deinit();
+        if (self.alias_fences) |*fences| fences.deinit();
         self.* = undefined;
     }
 };
@@ -2464,11 +2468,22 @@ const NamedVectorQueries = struct {
     }
 };
 
+pub const BoundIndexAliases = struct {
+    body: []u8,
+    indexes_json: ?[]u8 = null,
+    pub fn deinit(self: @This(), a: std.mem.Allocator) void {
+        a.free(self.body);
+        if (self.indexes_json) |bytes| a.free(bytes);
+    }
+};
+
 pub const SemanticResolver = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Coordinator-only catalog binding, before parsing or embedding.
+        bind_index_aliases: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!?BoundIndexAliases = null,
         resolve_dense_query: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2769,6 +2784,20 @@ fn freeClonedJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value
 }
 
 fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
+    // perf/lwa-search-overhead: this is checked on every public query
+    // (`queryExecutionDeadlineNsFromBody`'s only caller), but `timeout_ms`
+    // is an optional, rarely-set extension. A full `std.json.Value` parse
+    // of the whole body just to look for one key is wasted work on the
+    // overwhelmingly common case where the key is absent; mirror this
+    // file's own established idiom (`fastDensePublicQueryMayApply`, the
+    // `_native_cut`/`_response_live_read` checks in
+    // `parseQueryRequestWithDeadline`) of a cheap substring pre-check
+    // before paying for a parse. A JSON member name can be spelled with
+    // `\uXXXX` escapes (see "api query contract applies timeout_ms with
+    // an escaped member name"), so this must fall through to the real
+    // parse -- never conclude "absent" -- whenever the body has any
+    // backslash at all, exactly as those other checks do.
+    if (std.mem.indexOf(u8, body, "\"timeout_ms\"") == null and std.mem.indexOfScalar(u8, body, '\\') == null) return null;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -2951,7 +2980,43 @@ fn validateRawGraphWhereAlloc(
     }
 }
 
+const query_body_contract_fields_empty: QueryBodyContractFields = .{
+    .has_internal_shard_fields = false,
+    .has_embedding_limits = false,
+    .has_public_doc_filter_bindings = false,
+    .has_public_hierarchy_controls = false,
+    .has_query_timeout = false,
+    .has_graph_metric = false,
+};
+
 fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBodyContractFields {
+    // perf/lwa-search-overhead: this runs on every query admission (see
+    // `parseQueryRequestWithDeadlineCore`) and today always pays for a
+    // full `std.json.Value` parse plus a graph-query validation pass,
+    // even for the overwhelmingly common plain query that uses none of
+    // these extensions. If the body contains none of the literal key
+    // texts this function ever looks at or rejects on ("lake_read",
+    // "lake_visibility", "value_search_execution", "graph_queries",
+    // "with", "hierarchy", "timeout_ms", "graph_metric", and everything
+    // `isInternalShardFieldName` matches, which already covers
+    // "_embedding_limits"), none of them can be present as an object
+    // member, so every flag is exactly `false` and there is nothing for
+    // `validateRawGraphQueriesValueAlloc` to validate. Same "substring
+    // absent => skip the parse" idiom as `parseQueryTimeoutMs` and
+    // `queryBodyHasForbiddenPublicDocIdentityControlFields` above; a
+    // false positive on the check just falls through to the real parse.
+    // A `\uXXXX`-escaped member name (any backslash at all) also always
+    // falls through, never concluding "absent" from a substring miss.
+    only_fast_path: {
+        if (std.mem.indexOfScalar(u8, body, '\\') != null) break :only_fast_path;
+        inline for (.{ "lake_read", "lake_visibility", "value_search_execution", "graph_queries", "\"with\"", "\"hierarchy\"", "\"timeout_ms\"", "\"graph_metric\"" }) |needle| {
+            if (std.mem.indexOf(u8, body, needle) != null) break :only_fast_path;
+        }
+        inline for (internal_shard_field_names) |field| {
+            if (std.mem.indexOf(u8, body, field) != null) break :only_fast_path;
+        }
+        return query_body_contract_fields_empty;
+    }
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -3024,8 +3089,21 @@ pub fn parseQueryRequestWithDeadline(
     body: []const u8,
     execution_deadline_ns: ?u64,
 ) !OwnedQueryRequest {
-    var owned = try parseQueryRequestWithDeadlineCore(alloc, semantic_resolver, table_name, body, execution_deadline_ns);
+    const bound = if (semantic_resolver) |resolver| if (resolver.vtable.bind_index_aliases) |bind| try bind(resolver.ptr, alloc, table_name, body) else null else null;
+    defer if (bound) |value| value.deinit(alloc);
+    var owned = try parseQueryRequestWithDeadlineCore(alloc, semantic_resolver, table_name, if (bound) |value| value.body else body, execution_deadline_ns);
     errdefer owned.deinit(alloc);
+    const effective_body = if (bound) |value| value.body else body;
+    if (std.mem.indexOf(u8, effective_body, "_index_alias_fences") != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, effective_body, .{});
+        defer raw.deinit();
+        if (raw.value.object.get("_index_alias_fences")) |value| {
+            owned.alias_fences = try std.json.parseFromValue([]const db_mod.types.IndexAliasFence, alloc, value, .{ .allocate = .alloc_always });
+            if (owned.alias_fences.?.value.len > 64) return error.InvalidQueryRequest;
+            owned.req.index_alias_fences = owned.alias_fences.?.value;
+        }
+    }
+
     // Internal HTTP hops must retain the authenticated physical cut when the
     // generated public contract strips private shard fields. Public admission
     // rejects this control before entering the shared parser. Escaped member
@@ -4157,6 +4235,41 @@ fn preparedComputedOutput(a: std.mem.Allocator, req: db_mod.types.SearchRequest,
 fn hasNamedProjection(projection: ?*const field_projection.Plan) bool {
     return if (projection) |plan| plan.bindings.len != 0 else false;
 }
+pub fn resolvedIndexNames(a: std.mem.Allocator, req: db_mod.types.SearchRequest) !?[]const []const u8 {
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    if (req.index_name) |name| try appendUniqueOwnedString(a, &names, name);
+    if (req.primary_text_index_name) |name| try appendUniqueOwnedString(a, &names, name);
+    for (req.full_text_queries) |query| try appendUniqueOwnedString(a, &names, query.index_name);
+    for (req.dense_queries) |query| try appendUniqueOwnedString(a, &names, query.index_name);
+    for (req.sparse_queries) |query| try appendUniqueOwnedString(a, &names, query.index_name);
+    for (req.graph_queries) |query| try appendUniqueOwnedString(a, &names, query.query.index_name);
+    for (req.graph_metric_queries) |query| try appendUniqueOwnedString(a, &names, query.query.index_name);
+    if (req.graph_metric_rerank) |query| try appendUniqueOwnedString(a, &names, query.index_name);
+    if (names.items.len == 0) return null;
+    return try names.toOwnedSlice(a);
+}
+
+fn responseResolvedIndexNames(a: std.mem.Allocator, req: db_mod.types.SearchRequest, meta: QueryResponseMeta) !?[]const []const u8 {
+    const selected = meta.resolved_indexes orelse return resolvedIndexNames(a, req);
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    for (selected) |name| try appendUniqueOwnedString(a, &names, name);
+    if (names.items.len == 0) return null;
+    return try names.toOwnedSlice(a);
+}
+
+test "index alias response metadata reports concrete execution sources" {
+    const a = std.testing.allocator;
+    const selected = [_][]const u8{ "model_b", "model_b", "text" };
+    var response = try encodeQueryResponses(a, "docs", .{ .count_only = true, .index_name = "unused_request_target" }, .{ .resolved_indexes = &selected }, .{ .alloc = a, .hits = &.{}, .total_hits = 0 });
+    defer response.deinit(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+    defer parsed.deinit();
+    const names = parsed.value.object.get("responses").?.array.items[0].object.get("resolved_indexes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("model_b", names[0].string);
+    try std.testing.expectEqualStrings("text", names[1].string);
+}
+
 fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: *db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !metadata_openapi.QueryHit {
     const ready = try preparedComputedOutput(a, req, hit.*, projection);
     if (ready != null and (field_projection.storageEligible(req) or field_projection.hydrationEligible(req)) and hit.source_value == null and hit.column_source == null) {
@@ -4534,14 +4647,39 @@ pub fn encodeQueryResponses(
     return encodeQueryResponsesWithDelivery(alloc, table_name, req, meta, result, null);
 }
 
+test "api query contract response timing includes coordinator planning" {
+    const a = std.testing.allocator;
+    const start = platform_time.monotonicNs() -| (1500 * std.time.ns_per_ms);
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+    const req: db_mod.types.SearchRequest = .{ .public_query_started_ns = start };
+    const wire = try @import("query_execution_contract.zig").encodeStorageKernelQueryRequest(a, req);
+    defer a.free(wire);
+    var worker = try parseQueryRequest(a, null, "docs", wire);
+    defer worker.deinit(a);
+    try std.testing.expect(worker.req.public_query_started_ns == null);
+    const controls = @import("../storage/query_controls.zig");
+    controls.applyExecutionOptions(&worker.req, controls.executionOptions(req));
+    try std.testing.expectEqual(@as(?u64, start), worker.req.public_query_started_ns);
+
+    var encoded = try encodeQueryResponses(a, "docs", worker.req, .{ .took_ms = 1 }, result);
+    defer encoded.deinit(a);
+    const parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, a, encoded.json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.responses.?[0].took >= 1500);
+}
+
 pub fn encodeQueryResponsesWithDelivery(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
-    meta: QueryResponseMeta,
+    execution_meta: QueryResponseMeta,
     result: db_mod.types.SearchResult,
     delivery: ?@import("query_response.zig").Delivery,
 ) !QueryResponse {
+    var meta = execution_meta;
+    if (req.public_query_started_ns) |started| {
+        meta.took_ms = @intCast((platform_time.monotonicNs() -| started) / std.time.ns_per_ms);
+    }
     var delivered: ?usize = null;
     var graph_wire_failure: ?anyerror = null;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -4606,6 +4744,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
                 .live_read = if (req.response_live_read) true else null,
+                .resolved_indexes = try responseResolvedIndexNames(arena, req, meta),
             };
             if (graph_results == null and typed_delivery) if (delivery) |sink| if (sink.typed_result) |target| {
                 if (sink.hydrator != null) return error.InvalidArgument;
@@ -4646,6 +4785,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
                 .live_read = if (req.response_live_read) true else null,
+                .resolved_indexes = try responseResolvedIndexNames(arena, req, meta),
             };
             break :blk if (hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
                 alloc,
@@ -12735,6 +12875,18 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
 }
 
 fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+    // perf/lwa-search-overhead: same cheap substring pre-check idiom as
+    // `parseQueryTimeoutMs` above -- both fields are rare internal-only
+    // controls, absent from every ordinary public query, so the common
+    // case should not pay for a full `std.json.Value` parse just to learn
+    // neither key is present. A body lacking both literal key texts
+    // cannot contain either as an object member -- except through a
+    // `\uXXXX`-escaped member name, so any backslash at all also keeps
+    // this on the real-parse path, never concluding "absent" from a
+    // substring miss.
+    if (std.mem.indexOfScalar(u8, body, '\\') == null and
+        std.mem.indexOf(u8, body, "\"identity_read_generation\"") == null and
+        std.mem.indexOf(u8, body, "\"allow_doc_identity_reassignment\"") == null) return false;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -12742,7 +12894,32 @@ fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body:
         parsed.value.object.get("allow_doc_identity_reassignment") != null;
 }
 
+/// Cheap substring pre-check for `objectHasForbiddenPublicQueryField`'s
+/// three named fields plus every name `isInternalShardFieldName` matches:
+/// true only if none of their literal key texts could possibly be an
+/// object member of `body` (none of the substrings occur at all). A false
+/// positive (a name appearing only inside unrelated string content) just
+/// falls through to the real parse below, same as every other guard of
+/// this shape in this file -- never a false negative.
+fn bodyCouldHaveForbiddenPublicQueryField(body: []const u8) bool {
+    // A `\uXXXX`-escaped member name defeats every substring check below,
+    // so any backslash at all must answer "could have", never "absent".
+    if (std.mem.indexOfScalar(u8, body, '\\') != null) return true;
+    inline for (.{ "\"source_projection\"", "\"identity_read_generation\"", "\"allow_doc_identity_reassignment\"" }) |needle| {
+        if (std.mem.indexOf(u8, body, needle) != null) return true;
+    }
+    inline for (internal_shard_field_names) |field| {
+        if (std.mem.indexOfPos(u8, body, 0, field) != null) return true;
+    }
+    return false;
+}
+
 fn queryBodyHasForbiddenPublicDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+    // perf/lwa-search-overhead: every field this checks is a rare,
+    // internal-only or advanced control absent from an ordinary public
+    // query; skip the full `std.json.Value` parse when none of their
+    // literal key texts appear anywhere in the body at all.
+    if (!bodyCouldHaveForbiddenPublicQueryField(body)) return false;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -12794,30 +12971,32 @@ fn queryBodyForGeneratedContractAlloc(
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
+const internal_shard_field_names = [_][]const u8{
+    "_projection_source_fields",
+    "_distributed_text_stats",
+    "native_doc_id_constraints",
+    "_filter_query_json",
+    "_exclusion_query_json",
+    "_identity_read_generation",
+    "_native_cut",
+    "_index_alias_fences",
+    "_response_live_read",
+    "_document_authority",
+    "_privacy_policy_version",
+    "_index_name",
+    "_primary_text_index_name",
+    "_embedding_limits",
+    "_hierarchy_parent_admitted",
+    "_defer_hierarchy_child_hydration",
+    "_require_algebraic_filter_resolution",
+    db_mod.doc_filter_wire.field_name,
+    "_filter_doc_ids",
+    "_filter_doc_ids_positive",
+    "_exclude_doc_ids",
+};
+
 fn isInternalShardFieldName(name: []const u8) bool {
-    const internal_fields = [_][]const u8{
-        "_projection_source_fields",
-        "_distributed_text_stats",
-        "native_doc_id_constraints",
-        "_filter_query_json",
-        "_exclusion_query_json",
-        "_identity_read_generation",
-        "_native_cut",
-        "_response_live_read",
-        "_document_authority",
-        "_privacy_policy_version",
-        "_index_name",
-        "_primary_text_index_name",
-        "_embedding_limits",
-        "_hierarchy_parent_admitted",
-        "_defer_hierarchy_child_hydration",
-        "_require_algebraic_filter_resolution",
-        db_mod.doc_filter_wire.field_name,
-        "_filter_doc_ids",
-        "_filter_doc_ids_positive",
-        "_exclude_doc_ids",
-    };
-    inline for (internal_fields) |field| {
+    inline for (internal_shard_field_names) |field| {
         if (std.mem.eql(u8, name, field)) return true;
     }
     return false;
@@ -12840,6 +13019,14 @@ fn objectHasForbiddenPublicQueryField(object: std.json.ObjectMap) bool {
 
 const ProjectionSourceMask = struct { fields: []const []const u8, include_all: bool };
 fn parseProjectionSourceFields(a: std.mem.Allocator, body: []const u8) !?std.json.Parsed(ProjectionSourceMask) {
+    // perf/lwa-search-overhead: `_projection_source_fields` is an internal
+    // worker-wire extension, never present in an ordinary public query.
+    // Same cheap substring pre-check idiom as `parseQueryTimeoutMs` --
+    // skip the full parse when the literal key text cannot be an object
+    // member because it is nowhere in the body. Any backslash at all
+    // (a possible `\uXXXX`-escaped member name) still falls through to
+    // the real parse, never concluding "absent" from a substring miss.
+    if (std.mem.indexOf(u8, body, "\"_projection_source_fields\"") == null and std.mem.indexOfScalar(u8, body, '\\') == null) return null;
     var raw = try std.json.parseFromSlice(std.json.Value, a, body, .{});
     defer raw.deinit();
     const value = raw.value.object.get("_projection_source_fields") orelse return null;
@@ -13184,6 +13371,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_index_alias_fences",
         "_response_live_read",
         "_document_authority",
         "_privacy_policy_version",

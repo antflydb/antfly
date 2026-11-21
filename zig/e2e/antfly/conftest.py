@@ -343,6 +343,7 @@ def wait_for_server(
     allow_unauthorized: bool = False,
     processes: list[tuple[str, subprocess.Popen[Any]]] | None = None,
     listener_ready: Callable[[], bool] | None = None,
+    required_successes: int = 2,
 ) -> bool:
     deadline = time.monotonic() + timeout
     consecutive_successes = 0
@@ -359,11 +360,11 @@ def wait_for_server(
                 return False
             if resp.ok:
                 consecutive_successes += 1
-                if consecutive_successes >= 2:
+                if consecutive_successes >= required_successes:
                     return True
             elif allow_unauthorized and resp.status_code == 401:
                 consecutive_successes += 1
-                if consecutive_successes >= 2:
+                if consecutive_successes >= required_successes:
                     return True
             else:
                 consecutive_successes = 0
@@ -1489,6 +1490,7 @@ class StandaloneAntflyServer:
         config_path: Path | None = None,
         storage_engine: str | None = None,
         inference_host_budget_mb: int | None = None,
+        on_first_ready: Callable[["StandaloneAntflyServer"], None] | None = None,
         on_process_started: Callable[[subprocess.Popen], None] | None = None,
         on_startup_failed: Callable[["StandaloneAntflyServer"], None] | None = None,
     ):
@@ -1497,6 +1499,7 @@ class StandaloneAntflyServer:
         self.config_path = config_path
         self.storage_engine = storage_engine
         self.inference_host_budget_mb = inference_host_budget_mb
+        self.on_first_ready = on_first_ready
         self.on_process_started = on_process_started
         self.on_startup_failed = on_startup_failed
         with ExitStack() as setup:
@@ -1592,7 +1595,10 @@ class StandaloneAntflyServer:
             self.api_url,
             allow_unauthorized=self.pgwire_port is not None,
             processes=[("server", self.proc)],
-            listener_ready=lambda: _log_contains_since(
+            required_successes=1 if self.on_first_ready else 2,
+            listener_ready=None
+            if self.on_first_ready
+            else lambda: _log_contains_since(
                 self.log_path,
                 log_start,
                 f"standalone public api listening on {self.url}",
@@ -1602,6 +1608,8 @@ class StandaloneAntflyServer:
             raise RuntimeError(
                 f"Standalone API server failed to start at {self.api_url}\n{out}"
             )
+        if self.on_first_ready:
+            self.on_first_ready(self)
         self.metadata_admin_url = self._poll_metadata_admin_url()
 
     def _poll_metadata_admin_url(self) -> str:

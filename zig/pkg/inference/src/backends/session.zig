@@ -710,6 +710,8 @@ pub const ExecutionCapabilities = struct {
     boundary_batch_padded_tokens: usize = 0,
     boundary_batch_collection_wait_us: u64 = 0,
     cooperative_steps: bool = false,
+    /// F16 shared prefix storage is protected by the model execution scope and KV lock.
+    cooperative_prompt_cache: bool = false,
     max_active_requests: usize = 1,
     max_batch_rows: usize = 1,
     /// Mixed prefill/decode padding is excluded unless explicitly qualified.
@@ -992,7 +994,7 @@ pub const Session = struct {
         if (other) |peer| {
             if (peer == base or peer.session.ptr != self.ptr or peer.session.vtable != self.vtable or peer.execution_yielded) return error.InvalidAdmissionLeaseReduction;
             if (peer.lease) |credit| {
-                if (credit.controller != admission.controller or credit.retain_backend_class != admission.backend_class or (credit.external_lease != null and credit.external_lease == lease.external_lease)) return error.InvalidAdmissionLeaseReduction;
+                if (credit.controller != admission.controller or credit.retain_backend_class != admission.backend_class or credit.sharesExternalReceipt(&lease)) return error.InvalidAdmissionLeaseReduction;
                 owned = try owned.merge(credit.amounts);
             }
         }
@@ -2458,4 +2460,30 @@ test "prepared postprocessing output residency deduplicates shared owners" {
     outputs[0].deinit();
     first_live = false;
     try std.testing.expectEqual(controller.snapshot().hostTotalBytes(), try session.outputHostResidency(outputs[1..]));
+}
+
+test "Gemma4 CUDA host PLE split receipts cannot become duplicate run credit" {
+    const Mock = struct {
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+        fn reserve(_: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            return 17;
+        }
+        fn retain(_: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+    };
+    var marker: u8 = 0;
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    try controller.configureResourceBudget(.{ .context = &marker, .try_reserve = Mock.reserve, .retain = Mock.retain, .release = Mock.release });
+    const session = Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = Mock.info, .outputInfo = Mock.info, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var base = try session.admit(.{ .workspace_bytes = 100, .output_bytes = 0 });
+    defer base.deinit();
+    const borrowed_before_split = base;
+    var peer = RunPermit{ .session = session, .lease = try base.lease.?.split(.{ .backend_scratch_bytes = 40 }) };
+    defer peer.deinit();
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, session.admitSupplementPair(&base, &peer, .{ .backend_scratch_bytes = 120 }));
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, session.admitSupplementPair(&base, &borrowed_before_split, .{ .backend_scratch_bytes = 120 }));
+    try std.testing.expectEqual(@as(usize, 100), controller.snapshot().backend_scratch_bytes);
 }

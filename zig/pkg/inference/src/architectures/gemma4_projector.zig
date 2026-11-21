@@ -279,7 +279,17 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
             const self: *@This() = @ptrCast(@alignCast(user_data));
             const display = try frame.displaySize();
             const g = targetGeometry(self.cfg, display[0], display[1]);
-            const patches = try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
+            const gpu_compute: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+            const patches = if (gpu_compute.ctx.info.compute_major >= 8 and self.cfg.patch_size == 16 and
+                std.mem.eql(f32, &self.cfg.image_mean, &.{ 0, 0, 0 }) and
+                std.mem.eql(f32, &self.cfg.image_std, &.{ 1, 1, 1 }) and
+                platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC", true))
+            bicubic: {
+                const raster = frame.rasterSize();
+                const rgb = try self.preprocess.rgb8Gemma4(gpu_compute, frame);
+                defer self.cb.free(rgb);
+                break :bicubic try gpu_compute.preprocessGemma4ResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height));
+            } else try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
             defer self.cb.free(patches);
             const projected = try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
             defer self.cb.free(projected.embeddings);
@@ -545,6 +555,8 @@ fn encodeResidentPatches(cb: *const ComputeBackend, a: std.mem.Allocator, store:
     return encodeVisionHiddenResident(cb, a, store, cfg, hidden, g, 1);
 }
 
+var next_projector_cache_identity = std.atomic.Value(u64).init(1);
+
 /// A projector file kept open for a model's loaded lifetime. Parsing the
 /// GGUF header (hundreds of tensors) and re-reading the small `a.*` tensors
 /// was a visible share of every audio request, so the model manager opens
@@ -553,6 +565,8 @@ fn encodeResidentPatches(cb: *const ComputeBackend, a: std.mem.Allocator, store:
 /// bounds resolved on first use share a small mutex. Allocations come from
 /// the owner's allocator, never from a request.
 pub const ProjectorStore = struct {
+    /// Distinguishes reopened stores even when their path or mmap address repeats.
+    cache_identity: u64 = 0,
     allocator: std.mem.Allocator,
     path: []u8,
     gguf: *tensor_store_mod.GgufStore,
@@ -566,7 +580,7 @@ pub const ProjectorStore = struct {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
         const gguf = try tensor_store_mod.GgufStore.initAbsolute(allocator, path);
-        self.* = .{ .allocator = allocator, .path = owned_path, .gguf = gguf };
+        self.* = .{ .allocator = allocator, .path = owned_path, .gguf = gguf, .cache_identity = next_projector_cache_identity.fetchAdd(1, .monotonic) };
         return self;
     }
 
@@ -627,7 +641,27 @@ const ProjectorWeights = struct {
         return .{ .cb = cb, .allocator = allocator, .gguf = null, .owner = null, .huggingface = true };
     }
 
+    fn cudaCachedWeight(self: *ProjectorWeights, name: []const u8, linear_shape: ?[2]usize) !?CT {
+        if (comptime !@import("build_options").enable_cuda) return null;
+        if (self.cb.kind() != .cuda) return null;
+        const owner = self.owner orelse return null;
+        const gguf = self.gguf orelse return null;
+        const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+        if (!compute.gemma4_projector_cache_enabled or owner.cache_identity == 0) return null;
+        var key_buffer: [384]u8 = undefined;
+        const dims = linear_shape orelse .{ 0, 0 };
+        const key = std.fmt.bufPrint(&key_buffer, "projector:{d}:{d}:{d}:{s}", .{ owner.cache_identity, dims[0], dims[1], name }) catch return null;
+        if (try compute.borrowGemma4ProjectorWeight(key)) |weight| return weight;
+        const weight = if (linear_shape) |shape|
+            try loadLinearWeightCt(self.cb, self.allocator, gguf, name, shape[0], shape[1])
+        else
+            try loadWeightCt(self.cb, self.allocator, gguf, name);
+        compute.retainGemma4ProjectorWeight(key, weight);
+        return weight;
+    }
+
     fn weightCt(self: *ProjectorWeights, tensor_name: []const u8) !CT {
+        if (try self.cudaCachedWeight(tensor_name, null)) |weight| return weight;
         if (self.gguf) |gguf| return loadWeightCt(self.cb, self.allocator, gguf, tensor_name);
         const mapped = try @import("embedding_gemma2_media_weights.zig").name(self.allocator, tensor_name);
         defer self.allocator.free(mapped);
@@ -651,6 +685,7 @@ const ProjectorWeights = struct {
     }
 
     fn linearCt(self: *ProjectorWeights, tensor_name: []const u8, in_dim: usize, out_dim: usize) !CT {
+        if (try self.cudaCachedWeight(tensor_name, .{ in_dim, out_dim })) |weight| return weight;
         if (self.gguf) |gguf| return loadLinearWeightCt(self.cb, self.allocator, gguf, tensor_name, in_dim, out_dim);
         const tensor = try self.weightCt(tensor_name);
         errdefer self.cb.free(tensor);
@@ -2696,7 +2731,14 @@ fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWei
         cfg.image_mean,
         cfg.image_std,
         1.0 / 255.0,
-        if (store.gguf == null) .torchvision_bicubic else .bilinear,
+        // The upstream Gemma 4 image processor resizes RGB8 with antialiased
+        // bicubic interpolation, just like its video processor. Retain the old
+        // GGUF route for other backends/geometries and explicit rollback.
+        if (store.gguf == null or (store.cb.kind() == .cuda and cfg.patch_size == 16 and !cfg.direct_unified and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC", false)))
+            .torchvision_bicubic
+        else
+            .bilinear,
     );
     return .{ .allocator = allocator, .pixels = pixel_values, .geometry = geometry };
 }
@@ -6194,6 +6236,19 @@ pub fn loadWeightCt(
     }
     var tensor = try loadTensorF32(store, name);
     defer tensor.deinit();
+    if (comptime @import("build_options").enable_cuda) {
+        if (cb.kind() == .cuda and tensor.converted == null) {
+            const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+            if (compute.gemma4_e4b_sm89_qualified) if (tensor.weight) |*weight| {
+                const result = try compute.uploadProjectorWeight(&weight.tensor);
+                // The completed upload released our mapped pages. Keep the OS
+                // file cache warm for the next request; model unload owns its
+                // eventual eviction, not this request-local tensor wrapper.
+                tensor.store = null;
+                return result;
+            };
+        }
+    }
     const shape = try shapeI32(allocator, tensor.shape);
     defer allocator.free(shape);
     return cb.fromFloat32Shape(tensor.data, shape);
@@ -6460,11 +6515,27 @@ pub fn loadLinearWeightCt(
             defer tensor_ref.deinit(allocator);
             var loaded = try gguf.tensorStore().loadTensorRef(&tensor_ref);
             defer loaded.deinit();
-            if ((loaded.tensor.dtype == .f16 or loaded.tensor.dtype == .bf16) and loaded.tensor.shape.len == 2) {
-                const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+            const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+            if (compute.gemma4_e4b_sm89_qualified and loaded.tensor.dtype == .f32 and loaded.tensor.shape.len == 2) {
                 const rows = loaded.tensor.shape[0];
                 const cols = loaded.tensor.shape[1];
-                if (rows == out_dim and cols == in_dim) return compute.upload16BitAsF32(&loaded.tensor);
+                if (rows == out_dim and cols == in_dim) return compute.uploadProjectorWeight(&loaded.tensor);
+                if (rows == in_dim and cols == out_dim) {
+                    const uploaded = try compute.uploadProjectorWeight(&loaded.tensor);
+                    defer cb.free(uploaded);
+                    return cb.primTranspose(uploaded, &.{ 1, 0 }, loaded.tensor.shape);
+                }
+                return error.InvalidTensorShape;
+            }
+            if ((loaded.tensor.dtype == .f16 or loaded.tensor.dtype == .bf16) and loaded.tensor.shape.len == 2) {
+                const rows = loaded.tensor.shape[0];
+                const cols = loaded.tensor.shape[1];
+                if (rows == out_dim and cols == in_dim) {
+                    if (compute.gemma4_e4b_sm89_qualified and
+                        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_COMPACT", true))
+                        return compute.uploadProjectorWeight(&loaded.tensor);
+                    return compute.upload16BitAsF32(&loaded.tensor);
+                }
                 if (rows == in_dim and cols == out_dim) {
                     const uploaded = try compute.upload16BitAsF32(&loaded.tensor);
                     defer cb.free(uploaded);
@@ -7385,6 +7456,43 @@ test "gemma4 prepared audio rejects empty subsampled masks and preserves the fir
     };
     try Runner.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "Gemma4 CUDA mapped F32 projector linear preserves orientation and repeated loads" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const compat = @import("../io/compat.zig");
+    var compute = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a);
+    defer compute.deinit();
+    compute.gemma4_e4b_sm89_qualified = true;
+    const cb = compute.computeBackend();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projector.gguf", .{tmp.sub_path});
+    defer a.free(path);
+    try writeVideoTestProjector(a, path, false);
+    const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
+    defer a.free(absolute);
+    const projector = try ProjectorStore.open(a, absolute);
+    defer projector.close();
+    const name = "v.blk.0.ffn_down.weight";
+    var source = try loadTensorF32(projector.gguf, name);
+    defer source.deinit();
+    for (0..2) |_| {
+        for ([_]bool{ false, true }) |transpose| {
+            const in_dim: usize = if (transpose) 16 else 32;
+            const out_dim: usize = if (transpose) 32 else 16;
+            const weight = try loadLinearWeightCt(&cb, a, projector.gguf, name, in_dim, out_dim);
+            defer cb.free(weight);
+            const actual = try cb.toFloat32(weight, a);
+            defer a.free(actual);
+            for (0..out_dim) |row| for (0..in_dim) |col| {
+                const expected = source.data[if (transpose) col * 32 + row else row * 32 + col];
+                try std.testing.expectEqual(expected, actual[row * in_dim + col]);
+            };
+        }
+        try std.testing.expectError(error.InvalidTensorShape, loadLinearWeightCt(&cb, a, projector.gguf, name, 17, 32));
+    }
 }
 
 fn writeVideoTestProjector(a: std.mem.Allocator, path: []const u8, unified: bool) !void {
@@ -9620,4 +9728,68 @@ test "gemma4 decoded PCM frontend matches encoded audio without codec work" {
     defer a.free(pcm_frames);
     try std.testing.expectEqualSlices(f32, encoded_frames, pcm_frames);
     try std.testing.expectEqualSlices(f32, encoded.samples, decoded.samples);
+}
+test "Gemma4 CUDA projector request caches share weights only within one store identity" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const compat = @import("../io/compat.zig");
+    var compute = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .gemma4;
+    compute.gemma4_e4b_sm89_qualified = true;
+    compute.gemma4_projector_cache_enabled = true;
+    const cb = compute.computeBackend();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projector.gguf", .{tmp.sub_path});
+    defer a.free(path);
+    try writeVideoTestProjector(a, path, false);
+    const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
+    defer a.free(absolute);
+    const first = try ProjectorStore.open(a, absolute);
+    defer first.close();
+    const second = try ProjectorStore.open(a, absolute);
+    defer second.close();
+    try std.testing.expect(first.cache_identity != second.cache_identity);
+    for (0..2) |iteration| {
+        const uploads_before = compute.stats.h2d_bytes;
+        var request = ProjectorWeights.init(&cb, a, first.gguf, first);
+        defer request.deinit();
+        const weight = try request.linearCt("v.blk.0.ffn_down.weight", 32, 16);
+        defer cb.free(weight);
+        const transposed = try request.linearCt("v.blk.0.ffn_down.weight", 16, 32);
+        defer cb.free(transposed);
+        const actual = try cb.toFloat32(weight, a);
+        defer a.free(actual);
+        const actual_t = try cb.toFloat32(transposed, a);
+        defer a.free(actual_t);
+        for (0..16) |r| for (0..32) |c| try std.testing.expectEqual(actual[r * 32 + c], actual_t[c * 16 + r]);
+        try std.testing.expectEqual(@as(usize, 2), compute.gemma4_projector_weight_count);
+        if (iteration == 1) try std.testing.expectEqual(uploads_before, compute.stats.h2d_bytes);
+    }
+    var other = ProjectorWeights.init(&cb, a, second.gguf, second);
+    defer other.deinit();
+    const weight = try other.linearCt("v.blk.0.ffn_down.weight", 32, 16);
+    defer cb.free(weight);
+    try std.testing.expectEqual(@as(usize, 3), compute.gemma4_projector_weight_count);
+}
+
+test "Gemma4 CUDA fused audio frontend preserves FFT oracle and masked mel rows" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const a = std.testing.allocator;
+    const name = "ANTFLY_INFERENCE_CUDA_GEMMA4_AUDIO_LOGMEL_FUSED";
+    const setting = try AudioTestEnv.set(name, "1");
+    defer setting.deinit();
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    try compute.configureGemma4Dense(true, true);
+    const cb = compute.computeBackend();
+    try std.testing.expect(cb.supportsAudioLogMel());
+    try checkGemma4AudioFeaturesResidency(cb, cb);
+    try std.testing.expect(compute.embedding_gemma2 != null);
+    try std.testing.expect(compute.embedding_gemma2.?.stats_.audio_frontend_fused_launches > 0);
+    const rollback = try AudioTestEnv.set(name, "0");
+    defer rollback.deinit();
+    try std.testing.expect(!cb.supportsAudioLogMel());
 }

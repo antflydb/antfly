@@ -31,21 +31,23 @@ Each entry carries a `compatibility` field with one of the three states below.
 
 ## Start Here
 
-| Role | Use this | Verified alternates |
-|---|---|---|
-| Text and image embedding (default) | [`google/embeddinggemma-2:bf16-safetensors-bundle-v1`](/docs/guides/models/embeddinggemma2) | `Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1` for a smaller text-only GGUF |
-| Fast text embedding | `BAAI/bge-small-en-v1.5` | `sentence-transformers/all-MiniLM-L6-v2` |
-| Higher-quality embedding | `BAAI/bge-large-en-v1.5` | `BAAI/bge-base-en-v1.5`, `mixedbread-ai/mxbai-embed-large-v1` |
-| Multilingual dense embedding | `BAAI/bge-m3` | Qualified dense checkpoint; see below |
-| Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | |
-| Text reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` | `mixedbread-ai/mxbai-rerank-base-v1`, `cross-encoder/ms-marco-MiniLM-L6-v2` |
-| Multimodal (text + image + audio) | `antflydb/clipclap` | |
-| Chunking | `fixed_bert` (built in) | `mirth/chonky_mmbert_small_multilingual_1` |
-| Entity, relation, and structured extraction | `fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d` (qualified FP32 native/Metal/CUDA profiles) | `antflydb/gliner2-base-v1` |
-| Typed decisions (choice, score, predicate) | [`fastino/GLiDE-0.4B`](/docs/guides/models/glide) on Metal | `fastino/GLiDE-0.8B`, `fastino/GLiDE-2B` |
-| Document reading and OCR | [`lightonai/LightOnOCR-3-0.8B`](/docs/guides/models/lightonocr3) | `lightonai/LightOnOCR-3-4B` for harder pages; `antflydb/Florence-2-base` or `monkt/paddleocr-onnx` for small CPU footprints; [Apple Vision](/docs/guides/providers/apple) on macOS; any vision-capable generator |
-| Transcription | `openai/whisper-tiny` | |
-| Local multimodal generation | `ggml-org/gemma-4-E4B-it-GGUF` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
+Each role names a small model that runs well on a laptop and, where one is verified, a larger model for quality.
+
+| Role | Start with | For quality | Other verified alternates |
+|---|---|---|---|
+| Text, image, audio, and video embedding (default) | [`google/embeddinggemma-2:bf16-safetensors-bundle-v1`](/docs/guides/models/embeddinggemma2) | | `Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1` for a smaller text-only GGUF |
+| Fast text embedding | `BAAI/bge-small-en-v1.5` | | `sentence-transformers/all-MiniLM-L6-v2` |
+| Higher-quality embedding | `BAAI/bge-large-en-v1.5` | | `BAAI/bge-base-en-v1.5`, `mixedbread-ai/mxbai-embed-large-v1` |
+| Multilingual dense embedding | `BAAI/bge-m3` | | Qualified dense checkpoint; see below |
+| Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | | |
+| Text reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` | | `mixedbread-ai/mxbai-rerank-base-v1`, `cross-encoder/ms-marco-MiniLM-L6-v2` |
+| Chunking | `fixed_bert` (built in) | | `fixed_bpe` (built in) |
+| Entity, relation, and structured extraction | `fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d` (qualified FP32 native/Metal/CUDA profiles) | | `antflydb/gliner2-base-v1` |
+| Classification | `fastino/gliner2.5-base-v1` | `fastino/GLiNER2.5-Decide` | |
+| Typed decisions (choice, score, predicate) | [`fastino/GLiDE-0.4B`](/docs/guides/models/glide) on Metal | | `fastino/GLiDE-0.8B`, `fastino/GLiDE-2B` |
+| Document reading and OCR | [`lightonai/LightOnOCR-3-0.8B`](/docs/guides/models/lightonocr3) | `lightonai/LightOnOCR-3-4B` | `antflydb/Florence-2-base` or `monkt/paddleocr-onnx` for small CPU footprints; [Apple Vision](/docs/guides/providers/apple) on macOS; any vision-capable generator |
+| Transcription | `openai/whisper-tiny` | `antflydb/whisper-large-v3-turbo:gguf:Q8_0` | |
+| Local multimodal generation | `ggml-org/gemma-4-E4B-it-GGUF` | `google/gemma-4-E4B-it-qat-q4_0-gguf` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
 
 Pull models by their full `owner/name` reference:
 
@@ -57,14 +59,22 @@ antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671b
 antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
-Alternates pull the same way:
+The quality options pull the same way:
+
+```bash
+antfly inference pull fastino/GLiNER2.5-Decide --tasks extract
+antfly inference pull lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a
+antfly inference pull antflydb/whisper-large-v3-turbo:gguf:Q8_0 --tasks transcribe
+antfly inference pull hf:google/gemma-4-E4B-it-qat-q4_0-gguf:gguf --tasks generate --projector auto
+```
+
+So do the other alternates:
 
 ```bash
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
 antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed
 antfly inference pull hf:nomic-ai/nomic-embed-text-v1.5 --tasks embed
 antfly inference pull hf:BAAI/bge-m3 --tasks embed
-antfly inference pull antflydb/clipclap:gguf:Q4_K --tasks embed
 antfly inference pull antflydb/gliner2-base-v1 --tasks extract
 ```
 
@@ -136,7 +146,7 @@ selection and the supported checkpoint format.
 | Family | Verified with |
 |---|---|
 | Gemma 3 | `unsloth/gemma-3-4b-it-GGUF` |
-| Gemma 4 | Dense `ggml-org/gemma-4-E4B-it-GGUF` Q4_0; exact 26B-A4B Q4_0 on Metal and CUDA SM89 |
+| Gemma 4 | Dense `ggml-org/gemma-4-E4B-it-GGUF` Q4_0; `google/gemma-4-E4B-it-qat-q4_0-gguf`; exact 26B-A4B Q4_0 on Metal and CUDA SM89 |
 | Llama 3.x | `unsloth/Llama-3.2-1B-Instruct-GGUF` |
 | Qwen3 (dense) | `unsloth/Qwen3-1.7B-GGUF` |
 
@@ -150,8 +160,8 @@ Rejected with HTTP 400 before any load. Some of these do not merely fail; they w
 
 | Model or family | Why |
 |---|---|
-| Standalone CLIP (`Xenova/clip-vit-base-patch32`) | Image embedding allocates without bound, about 800 MB/s to 31 GB for one 64×64 image, until the process is killed. Use `antflydb/clipclap`. |
-| Standalone CLAP (`Xenova/clap-htsat-unfused`) | `ShapeMismatch` converting the audio encoder. Use `antflydb/clipclap`. |
+| Standalone CLIP (`Xenova/clip-vit-base-patch32`) | Image embedding allocates without bound, about 800 MB/s to 31 GB for one 64×64 image, until the process is killed. Use [EmbeddingGemma 2](/docs/guides/models/embeddinggemma2). |
+| Standalone CLAP (`Xenova/clap-htsat-unfused`) | `ShapeMismatch` converting the audio encoder. Use [EmbeddingGemma 2](/docs/guides/models/embeddinggemma2). |
 | TrOCR-style readers (`Xenova/trocr-base-printed`) | ONNX encoder/decoder readers exhaust memory the same way as CLIP. Use [LightOnOCR-3](/docs/guides/models/lightonocr3). |
 | Seq2seq rewriters (`/rewrite`) | Importing an ONNX encoder/decoder graph panics on a rank assertion. No rewriter model currently works. |
 | `Babelscape/rebel-large` | Uses the same unsafe BART encoder-decoder graph-import path. Its relation parser has unit coverage, but the real model is not release-safe. It is also CC-BY-NC-SA. |
@@ -177,7 +187,7 @@ Rejected with HTTP 400 before any load. Some of these do not merely fail; they w
 
 **Gemma 4 quants.** `ggml-org/gemma-4-E4B-it-GGUF` publishes BF16, Q4_0, and Q8_0 weights but no Q4_K_M, so pull the Q4_0 variant shown above. Quants that use `IQ4_XS` run on the native backend, not Metal.
 
-**Mixed-variant model directories.** Pulling a second variant into a directory that already holds another leaves both in place, and different parts of a model can then resolve to different variants. ClipClap in particular fails this way. Keep one variant per directory; if in doubt, delete and re-pull.
+**Mixed-variant model directories.** Pulling a second variant into a directory that already holds another leaves both in place, and different parts of a model can then resolve to different variants. Keep one variant per directory; if in doubt, delete and re-pull.
 
 **Chunk overlap.** `/chunk` returns `InvalidChunkOverlap` when `target_tokens` is not larger than `overlap_tokens`; equal values fail too. Set both together when using small chunks.
 

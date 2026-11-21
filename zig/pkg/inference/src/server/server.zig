@@ -1420,7 +1420,7 @@ pub const CooperativeExecutionConfig = struct {
 
     pub fn enabledForRequest(self: @This(), capabilities: @import("../backends/session.zig").ExecutionCapabilities, graph: bool, draft: bool, cache: bool, media: bool) bool {
         return self.mode == .on and capabilities.cooperative_steps and capabilities.max_active_requests >= self.max_active_requests and
-            !graph and !draft and !cache and !media and
+            !graph and !draft and (!cache or capabilities.cooperative_prompt_cache) and !media and
             !platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING") and
             !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET") and
             !cudaDecodeGraphReplayRequested(platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"));
@@ -2918,11 +2918,13 @@ fn collectOnnxDependenciesForPath(
     maybe_path: ?[]const u8,
     primary: bool,
     logical_path: ?[]const u8,
+    control: InferenceExecutionControl,
 ) !void {
+    try control.check();
     const path = maybe_path orelse return;
     if (!primary and !std.mem.endsWith(u8, path, ".onnx")) return;
-    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSetWithBase(allocator, path, if (logical_path) |logical| std.fs.path.dirname(logical) else null) catch |err| {
-        if (err == error.OutOfMemory) return err;
+    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSetWithControl(allocator, path, if (logical_path) |logical| std.fs.path.dirname(logical) else null, null, control) catch |err| {
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Cancelled or err == error.Canceled) return err;
         dependencies.valid = false;
         return;
     };
@@ -2936,6 +2938,10 @@ fn collectCompatibilityOnnxDependencies(
     allocator: std.mem.Allocator,
     man: *const manifest_mod.ModelManifest,
 ) !OnnxDependencies {
+    return collectCompatibilityOnnxDependenciesWithControl(allocator, man, .{});
+}
+
+fn collectCompatibilityOnnxDependenciesWithControl(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest, control: InferenceExecutionControl) !OnnxDependencies {
     var dependencies = OnnxDependencies{};
     errdefer dependencies.deinit(allocator);
     const paths = [_]?[]const u8{
@@ -2946,7 +2952,7 @@ fn collectCompatibilityOnnxDependencies(
         man.visual_projection_path,
         man.audio_projection_path,
     };
-    for (paths, 0..) |path, index| try collectOnnxDependenciesForPath(allocator, &dependencies, path, index == 0, if (index == 0) man.onnx_logical_path else null);
+    for (paths, 0..) |path, index| try collectOnnxDependenciesForPath(allocator, &dependencies, path, index == 0, if (index == 0) man.onnx_logical_path else null, control);
     return dependencies;
 }
 
@@ -2979,17 +2985,21 @@ fn addShardedArtifactStatsToSignature(
     io: std.Io,
     signature: *std.crypto.hash.sha2.Sha256,
     index_path: ?[]const u8,
+    control: InferenceExecutionControl,
 ) !void {
+    try control.check();
     const path = index_path orelse return;
-    const bytes = try c_file.readFile(allocator, path);
+    const bytes = try c_file.readFileWithControl(allocator, io, path, control);
     defer allocator.free(bytes);
     var index = try safetensors_mod.ShardedIndex.load(allocator, bytes);
     defer index.deinit();
+    try control.check();
     const model_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(allocator);
     var it = index.weight_map.iterator();
     while (it.next()) |entry| {
+        try control.check();
         const shard = entry.value_ptr.*;
         if (seen.contains(shard)) continue;
         try seen.put(allocator, shard, {});
@@ -3037,6 +3047,19 @@ fn computeCompatibilitySignatureWithDependencies(
     external_paths: []const []const u8,
     external_paths_valid: bool,
 ) !CompatibilitySignature {
+    return computeCompatibilitySignatureWithControl(allocator, io, model_path, man, external_paths, external_paths_valid, .{});
+}
+
+fn computeCompatibilitySignatureWithControl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    external_paths: []const []const u8,
+    external_paths_valid: bool,
+    control: InferenceExecutionControl,
+) !CompatibilitySignature {
+    try control.check();
     var signature = std.crypto.hash.sha2.Sha256.init(.{});
     addCompatibilityManifestFacts(&signature, man);
 
@@ -3044,6 +3067,7 @@ fn computeCompatibilitySignatureWithDependencies(
     // hashing avoids stale policy decisions when deployment tools preserve
     // size and timestamps during an in-place replacement.
     for (manifest_mod.listing_compatibility_sidecars) |sidecar_name| {
+        try control.check();
         try addModelSidecarToSignature(
             allocator,
             io,
@@ -3065,8 +3089,9 @@ fn computeCompatibilitySignatureWithDependencies(
         io,
         &signature,
         man.safetensors_index_path,
+        control,
     ) catch |err| {
-        if (err == error.OutOfMemory) return err;
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
         signature.update("invalid-sharded-index");
     };
     try addOnnxArtifactToSignature(allocator, io, &signature, man.onnx_path);
@@ -3083,6 +3108,7 @@ fn computeCompatibilitySignatureWithDependencies(
     try addArtifactIdentityToSignature(allocator, io, &signature, man.processor_config_path, true);
     if (!external_paths_valid) signature.update("invalid-onnx-artifact-set");
     for (external_paths) |external_path| {
+        try control.check();
         try addArtifactIdentityToSignature(
             allocator,
             io,
@@ -3254,6 +3280,15 @@ fn rejectDisallowedModel(
     ctx: *httpx.Context,
     model_path: []const u8,
 ) !?httpx.Response {
+    return rejectDisallowedModelWithAssessment(self, ctx, model_path, null);
+}
+
+fn rejectDisallowedModelWithAssessment(
+    self: *Node,
+    ctx: *httpx.Context,
+    model_path: []const u8,
+    completed_assessment: ?*bool,
+) !?httpx.Response {
     const summary = self.compatibilitySummaryForDir(ctx.allocator, model_path) catch {
         if (self.config.allow_unknown_models) return null;
         return try ctx.status(400).json(.{
@@ -3261,6 +3296,7 @@ fn rejectDisallowedModel(
             .message = "model compatibility could not be determined; restart with --allow-unknown-models to opt in",
         });
     };
+    if (completed_assessment) |complete| complete.* = true;
     switch (summary.level) {
         .compatible => return null,
         .unknown => {
@@ -3325,6 +3361,12 @@ fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
 }
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (@import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(err)) |message| return ctx.status(400).json(.{
+        .@"error" = "INVALID_MODEL",
+        .reason = @errorName(err),
+        .message = message,
+        .retryable = false,
+    });
     if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
@@ -4004,6 +4046,26 @@ fn classifyExtractionResolutionFailure(err: anyerror) ExtractionResolutionFailur
         error.OutOfMemory => .resource_exhausted,
         else => .internal,
     };
+}
+
+// Compatibility summaries are specific to the candidate backend set, as well
+// as the inspected artifact generation. A policy change cannot reuse an
+// assessment that succeeded only on a different backend.
+fn compatibilitySignatureForBackends(artifact: CompatibilitySignature, candidates: []const backends_mod.BackendType) CompatibilitySignature {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-compatibility-backends-v1");
+    hash.update(&artifact);
+    for (candidates) |backend| {
+        const tag: u32 = @backingInt(backend);
+        var encoded: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded, tag, .little);
+        hash.update(&encoded);
+    }
+    return hash.finalResult();
+}
+
+fn cudaCompatibilityAlreadyAssessed(candidates: []const backends_mod.BackendType, requested: native_backend_choice.Choice, completed_assessment: bool) bool {
+    return completed_assessment and requested == .cuda and candidates.len == 1 and candidates[0] == .cuda;
 }
 
 fn compatibilityBackendsForSessionManager(
@@ -4851,6 +4913,11 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !CompatibilitySummary {
+        return self.compatibilitySummaryForDirWithControl(allocator, model_path, .{});
+    }
+
+    fn compatibilitySummaryForDirWithControl(self: *Node, allocator: std.mem.Allocator, model_path: []const u8, control: InferenceExecutionControl) !CompatibilitySummary {
+        try control.check();
         var required_backend_scratch: [1]backends_mod.BackendType = undefined;
         const compatibility_backends = try compatibilityBackendsForSessionManager(
             &self.session_manager,
@@ -4858,7 +4925,7 @@ pub const Node = struct {
         );
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*threaded| threaded.deinit();
-        const io = self.inferenceIo(allocator, null, &owned_io);
+        const io = self.inferenceIo(allocator, control.io, &owned_io);
 
         // A deployment can replace several sidecars and artifacts without an
         // atomic directory snapshot. Derive and validate the manifest twice so
@@ -4867,6 +4934,7 @@ pub const Node = struct {
         const max_snapshot_attempts = 3;
         var attempt: usize = 0;
         while (attempt < max_snapshot_attempts) : (attempt += 1) {
+            try control.check();
             var man = try manifest_mod.loadListingFromDir(allocator, model_path);
             defer man.deinit();
 
@@ -4875,43 +4943,48 @@ pub const Node = struct {
             if (cached) |entry| entry.retain();
             self.compatibility_cache_lock.unlock();
             if (cached) |entry| {
-                const cached_signature = computeCompatibilitySignatureWithDependencies(
+                const cached_signature = computeCompatibilitySignatureWithControl(
                     allocator,
                     io,
                     model_path,
                     &man,
                     entry.external_paths,
                     entry.external_paths_valid,
+                    control,
                 ) catch |err| {
                     entry.release();
                     return err;
                 };
+                const bound_cached_signature = compatibilitySignatureForBackends(cached_signature, compatibility_backends);
                 const cache_hit = std.mem.eql(
                     u8,
                     entry.signature[0..],
-                    cached_signature[0..],
+                    bound_cached_signature[0..],
                 );
                 const cached_summary = entry.summary;
                 entry.release();
                 if (cache_hit) return cached_summary;
             }
 
-            var dependencies = try collectCompatibilityOnnxDependencies(allocator, &man);
+            var dependencies = try collectCompatibilityOnnxDependenciesWithControl(allocator, &man, control);
             defer dependencies.deinit(allocator);
-            const artifact_signature = try computeCompatibilitySignatureWithDependencies(
+            const raw_artifact_signature = try computeCompatibilitySignatureWithControl(
                 allocator,
                 io,
                 model_path,
                 &man,
                 dependencies.paths.items,
                 dependencies.valid,
+                control,
             );
+            const artifact_signature = compatibilitySignatureForBackends(raw_artifact_signature, compatibility_backends);
 
-            const summary = try model_manager_mod.compatibilitySummaryForBackends(
+            const summary = try model_manager_mod.compatibilitySummaryForBackendsWithControl(
                 allocator,
                 model_path,
                 &man,
                 compatibility_backends,
+                control,
             );
 
             var verification_manifest = try manifest_mod.loadListingFromDir(
@@ -4919,19 +4992,22 @@ pub const Node = struct {
                 model_path,
             );
             defer verification_manifest.deinit();
-            var verification_dependencies = try collectCompatibilityOnnxDependencies(
+            var verification_dependencies = try collectCompatibilityOnnxDependenciesWithControl(
                 allocator,
                 &verification_manifest,
+                control,
             );
             defer verification_dependencies.deinit(allocator);
-            const verification_signature = try computeCompatibilitySignatureWithDependencies(
+            const raw_verification_signature = try computeCompatibilitySignatureWithControl(
                 allocator,
                 io,
                 model_path,
                 &verification_manifest,
                 verification_dependencies.paths.items,
                 verification_dependencies.valid,
+                control,
             );
+            const verification_signature = compatibilitySignatureForBackends(raw_verification_signature, compatibility_backends);
             if (!std.mem.eql(
                 u8,
                 artifact_signature[0..],
@@ -5427,6 +5503,17 @@ pub const Node = struct {
         texts: []const []const u8,
         supplied_control: InferenceExecutionControl,
     ) ![]DirectSparseEmbedding {
+        return self.embedSparseTextsDirectWithControlAndRevision(allocator, model_name, texts, supplied_control, null);
+    }
+
+    pub fn embedSparseTextsDirectWithControlAndRevision(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        texts: []const []const u8,
+        supplied_control: InferenceExecutionControl,
+        expected_revision: ?[32]u8,
+    ) ![]DirectSparseEmbedding {
         var control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
@@ -5455,9 +5542,11 @@ pub const Node = struct {
             control: InferenceExecutionControl,
             vectors: ?[]DirectSparseEmbedding = null,
             node: *Node,
+            expected_revision: ?[32]u8,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
                 if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 const input_tokens = try maxTokenizerTextTokens(
                     attempt.allocator,
@@ -5496,6 +5585,7 @@ pub const Node = struct {
             .executor_contract = executor_contract,
             .control = control,
             .node = self,
+            .expected_revision = expected_revision,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -12927,7 +13017,9 @@ pub const Node = struct {
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
         if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
-            options.classification_batch_items = gliner_decide_qualification.cuda_batch_items;
+            const policy = gliner_decide_qualification.executionBatchPolicy(qualified_identity.?, .cuda) orelse return error.UnsupportedGlinerDecisionArtifact;
+            options.classification_batch_items = policy.batch_items;
+            options.classification_batch_tokens = policy.padded_batch_tokens;
             options.max_sequences_per_item = 1;
         } else if (backend == .metal and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
             const policy = gliner_decide_qualification.metalExecutionPolicy(qualified_identity.?) orelse return error.UnsupportedGlinerDecisionArtifact;
@@ -13706,6 +13798,10 @@ pub const Node = struct {
     }
 
     fn requestModelResolutionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        switch (err) {
+            error.Timeout, error.Canceled, error.Cancelled => return inferenceFailureResponse(ctx, err),
+            else => {},
+        }
         if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
         return switch (requestModelResolutionErrorKind(err)) {
             .invalid => ctx.status(400).json(.{
@@ -16393,11 +16489,14 @@ pub const Node = struct {
         execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
         const manifest_started: ?i96 = if (admission_started != null) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
-        // The default route can inspect its resident generation without parsing
-        // GGUF tokenizer arrays on every request. Explicit backend requests keep
-        // artifact preflight until their selected publication is acquired below.
+        // Reuse immutable warm metadata without parsing GGUF tokenizer arrays
+        // per request. Explicit eager CUDA lookup uses execution's backend and
+        // load-policy keys; cold and compiled requests retain artifact preflight.
         const cached_manifest = if (body.backend == null)
             self.model_manager.copyCachedGenerationManifestWithControl(ctx.allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
+                return modelLoadFailureResponse(ctx, err)
+        else if (body.backend == .cuda and body.mode == null and body.compiled_target == null)
+            self.model_manager.copyCachedGenerationManifestForBackendWithControl(ctx.allocator, model_path, .cuda, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
                 return modelLoadFailureResponse(ctx, err)
         else
             null;
@@ -16458,6 +16557,9 @@ pub const Node = struct {
             return remoteContentErrorResponse(ctx, err);
         };
         defer owned_messages.deinit();
+        if (admission_started) |started| {
+            std.debug.print("native_request_timing_ms: after_parse_messages={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
+        }
 
         if (owned_messages.decoded_images.len > 0) {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
@@ -16493,7 +16595,8 @@ pub const Node = struct {
             });
         };
 
-        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+        var completed_compatibility_assessment = false;
+        if (try rejectDisallowedModelWithAssessment(self, ctx, model_path, &completed_compatibility_assessment)) |response| return response;
 
         // Tool prompting can mutate the message list; media ownership remains
         // with OwnedGenerateMessages while this list owns message text.
@@ -16742,7 +16845,7 @@ pub const Node = struct {
             .cache_dtype = body.cache_dtype orelse (if (native_transfer != null) "f16" else null),
             .cache_compaction_ratio = body.cache_compaction_ratio,
             .kv_cache_mode = if (selected_kv) .select_v1 else .exact_hybrid,
-            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
+            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null,
             .prompt_cache_key = prompt_cache_key,
         };
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
@@ -16764,13 +16867,24 @@ pub const Node = struct {
                 .message = "prompt caching requires eager generation; omit mode or set mode=eager",
             });
         };
-        if (try rejectExplicitBackendIncompatibility(
-            ctx,
-            model_path,
-            backend_selection.native_choice,
-            self.config.allow_unknown_models,
-        )) |response|
-            return response;
+        // rejectDisallowedModel already assessed the current artifacts under
+        // the node's default candidate set. An exact CUDA-only assessment also
+        // covers explicit CUDA placement; aggregate CPU/GPU assessments cannot
+        // establish that and retain the independent explicit inspection.
+        var assessed_backend_scratch: [1]backends_mod.BackendType = undefined;
+        const assessed_backends: []const backends_mod.BackendType = compatibilityBackendsForSessionManager(&self.session_manager, &assessed_backend_scratch) catch &.{};
+        if (!cudaCompatibilityAlreadyAssessed(assessed_backends, backend_selection.native_choice, completed_compatibility_assessment)) {
+            if (try rejectExplicitBackendIncompatibility(
+                ctx,
+                model_path,
+                backend_selection.native_choice,
+                self.config.allow_unknown_models,
+            )) |response| return response;
+        }
+
+        if (admission_started) |started| {
+            std.debug.print("native_request_timing_ms: after_compatibility={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
+        }
 
         if (body.response_format) |rf| {
             if (std.mem.eql(u8, rf.type, "json_object")) {
@@ -16879,6 +16993,10 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
+        if (admission_started) |started| {
+            std.debug.print("native_request_timing_ms: after_acquire_model={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
+        }
+
         // A cached metadata copy does not pin the execution generation. A model
         // can retire between admission and acquisition, so enforce the actual
         // publication's contract before context processing or accelerator work.
@@ -17091,25 +17209,32 @@ pub const Node = struct {
             gpt_config,
             self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
         );
-        const cooperative_cuda = native_transfer == null and !selected_kv and self.config.cooperative_execution.enabledForRequest(
-            model.session.executionCapabilities(),
-            backend_selection.graph_mode_requested or graphModeEnabled() or effective_compiled_partition_backend != null,
-            effective_draft_model_name != null or auto_draft_sibling != null or config.speculation_requested,
-            config.prompt_cache_enabled,
-            generateMessagesHaveMedia(effective_messages),
-        );
+        const cooperative_cuda = native_transfer == null and !selected_kv and
+            (!config.prompt_cache_enabled or (kv_dtype == .f16 and config.cache_compaction_ratio == null)) and
+            self.config.cooperative_execution.enabledForRequest(
+                model.session.executionCapabilities(),
+                backend_selection.graph_mode_requested or graphModeEnabled() or effective_compiled_partition_backend != null,
+                effective_draft_model_name != null or auto_draft_sibling != null or config.speculation_requested,
+                config.prompt_cache_enabled,
+                generateMessagesHaveMedia(effective_messages),
+            );
         if (cooperative_cuda and self.config.generation_batching.mode == .on and self.config.generation_batching.max_step_items > model.session.executionCapabilities().max_batch_rows)
             return ctx.status(400).json(.{ .@"error" = "UNQUALIFIED_COOPERATIVE_BATCH", .message = "Requested row count exceeds the backend cooperative decode-batching capability" });
         const native_isolated = native_transfer == null and canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, effective_draft_model_name != null or auto_draft_sibling != null, config.prompt_cache_enabled, want_stream);
         // Queued callers own neither scheduler work nor device KV/scratch.
         // Exclusive requests fence the shared backend's cache/graph lifetime.
-        const generation_slot = model.generation_admission.acquire(
+        const queued_cached_tokens = if (config.prompt_cache_enabled and prompt_estimate != null and config.prompt_cache_key != null and !generateMessagesHaveMedia(effective_messages) and prompt_tokens <= prompt_estimate.?.encoded.ids.len)
+            model.prompt_prefix_cache.peekLongestPrefixForPool(config.prompt_cache_key.?, prompt_estimate.?.encoded.ids[0..prompt_tokens], prompt_tokens -| 16, generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced()))
+        else
+            0;
+        const generation_slot = model.generation_admission.acquireWithWork(
             execution_control,
             !cooperative_cuda and !native_isolated,
             runtime.scheduler.generation_admission.Limits.forRequests(
                 self.config.max_concurrent_requests,
                 if (cooperative_cuda) self.config.cooperative_execution.max_active_requests else null,
             ),
+            .{ .prefill_tokens = prompt_tokens - queued_cached_tokens, .decode_tokens = @intCast(configured_max_tokens) },
         ) catch |err| {
             if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
             return inferenceFailureResponse(ctx, err);
@@ -17806,6 +17931,10 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
         var decode_state = generation.NativeDecodeState.initPaged(execution_allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        // Prefix-cache metadata and every attached sequence share one KV lock.
+        // GPU writes, cache lookup/publication and cleanup additionally own the
+        // model execution scope: lock order is model execution, then cache KV.
+        if (prompt_cache) |cache| decode_state.kv_lock = &cache.mutex;
         if (cooperative_cuda) {
             decode_state.execution_backend = cb;
             decode_state.execution_control = execution_control;
@@ -26283,6 +26412,68 @@ pub const Node = struct {
         return try instances.toOwnedSlice(allocator);
     }
 
+    /// Internal worker scheduling protocol, versioned independently of public
+    /// inference schemas. It pins only an already loaded generation, tokenizes
+    /// on the CPU and reads cache metadata; it never loads weights or creates KV.
+    pub fn estimateGeneratePlacement(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const control = httpInferenceExecutionControl(self, ctx);
+        try control.check();
+        const bytes = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "missing_body" });
+        if (bytes.len > 2 * 1024 * 1024) return ctx.status(413).json(.{ .@"error" = "PLACEMENT_REQUEST_TOO_LARGE" });
+        var parsed = std.json.parseFromSlice(api.GenerateRequest, ctx.allocator, bytes, .{ .ignore_unknown_fields = true }) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST" });
+        defer parsed.deinit();
+        const body = parsed.value;
+        if (body.backend) |backend| if (backend != .cuda)
+            return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        // Keep unsupported transformations on ordinary routing. A partial
+        // estimate must never claim to describe the eventual rendered prompt.
+        if (body.messages.len == 0 or generateRequestHasNonTextContentParts(body) or body.tools != null or body.tool_choice != null or body.context_management != null or body.response_format != null or body.grammar != null or body.draft_model != null or body.kv_cache != null)
+            return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        if (try self.acquireSlotUnits(ctx, 1)) |response| return response;
+        defer self.releaseSlotUnits(1);
+        const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, if (body.model.len > 0) body.model else null, "generators") catch |err| return requestModelResolutionError(ctx, err);
+        const path = selected.path;
+        defer ctx.allocator.free(path);
+        if (try rejectDisallowedModel(self, ctx, path)) |response| return response;
+        var handle = (self.model_manager.acquireCachedObservationFromDirWithControl(path, self.bindModelSelection(selected, control)) catch |err|
+            return modelLoadFailureResponse(ctx, err)) orelse return ctx.status(409).json(.{ .@"error" = "MODEL_NOT_LOADED" });
+        defer handle.release();
+        const model = handle.get();
+        if (!model.session.executionCapabilities().cooperative_steps) return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        const cfg = session_factory.getGptConfig(model.session) orelse return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
+        const numeric = parseGenerateNumericOptions(body.max_tokens, null) catch |err| return contextRequestFailure(ctx, err);
+        var owned = self.parseGenerateMessages(ctx.allocator, body) catch |err| return contextRequestFailure(ctx, err);
+        defer owned.deinit();
+        var estimate: ?NativePromptEstimate = null;
+        defer if (estimate) |*value| value.deinit();
+        const tokens = try self.estimateNativePromptTokens(ctx.allocator, path, model, cfg, owned.messages, numeric.max_tokens, 0, if (body.chat_template_kwargs) |kwargs| kwargs.enable_thinking else null, false, &estimate);
+        try control.check();
+        const dtype = if (body.cache_dtype) |name| runtime.kv.pool.parseKvDType(name) orelse return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" }) else session_factory.recommendedKvDTypeForSession(model.session, .cuda);
+        const cached = if (self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and body.prompt_cache_key != null and body.prompt_cache_key.?.len > 0)
+            model.prompt_prefix_cache.peekLongestPrefixForPool(body.prompt_cache_key.?, estimate.?.encoded.ids[0..tokens], tokens -| 16, generation.kvPoolConfig(.cuda, dtype, cfg, generationKvSlidingTrimForced()))
+        else
+            0;
+        const admission = model.generation_admission.snapshot();
+        const scheduled = if (model.native_generate_coordinator) |coordinator| coordinator.snapshot() else runtime.scheduler.native_generate.Snapshot{ .waiting_requests = 0, .prefill_requests = 0, .decode_requests = 0, .active_units = 0 };
+        return ctx.json(.{
+            .version = @as(u32, 1),
+            .model = body.model,
+            .instance_id = try std.fmt.allocPrint(ctx.allocator, "{x:0>32}", .{model.runtime_id}),
+            .requested_decode_tokens = numeric.max_tokens,
+            .prompt_tokens = tokens,
+            .cached_tokens = cached,
+            .uncached_prompt_tokens = tokens - cached,
+            .active_requests = admission.active,
+            .queued_requests = admission.waiting,
+            .queued_prefill_tokens = admission.queued_work.prefill_tokens,
+            .queued_decode_tokens = admission.queued_work.decode_tokens,
+            .active_decode_tokens = admission.active_work.decode_tokens,
+            .pending_prefill_tokens = scheduled.prefill_tokens,
+            .decode_context_tokens = scheduled.decode_context_tokens,
+        });
+    }
+
     pub fn listModelInstances(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
@@ -26390,38 +26581,165 @@ pub const Node = struct {
         };
     }
 
+    fn validateChunkOutputManifest(self: *Node, kind: lib_chunker.outputs.Kind, manifest: *const manifest_mod.ModelManifest) !?@import("../models/media_classifier_profile.zig").Profile {
+        if (kind == .transcribe) {
+            const contract = try resolvedInferenceExecutorContract(self, "transcribe", manifest);
+            try validateInferenceExecutorInvocation(contract, .{ .has_audio = true, .item_count = 1, .media_parts_per_item = 1 });
+            return null;
+        }
+        std.debug.assert(kind == .classify);
+        const profile = manifest.media_classifier orelse return error.UnsupportedMediaClassifier;
+        try profile.validate();
+        if (manifest.model_type != .classifier or !manifest.hasCapability("classification") or !manifest.hasTask("classify") or manifest.id2label == null) return error.UnsupportedMediaClassifier;
+        return profile;
+    }
+
+    const catalog_publication = @import("../registry/catalog_publication.zig");
+
+    fn chunkCatalogResponse(self: *Node, ctx: *httpx.Context, observed: catalog_publication.Generation, failure: ?[]const u8) !httpx.Response {
+        catalog_publication.require(ctx.allocator, ctx.io, self.config.models_dir, observed) catch |err| return modelLoadFailureResponse(ctx, err);
+        if (observed.kind != .legacy) {
+            const hex = std.fmt.bytesToHex(observed.digest, .lower);
+            try ctx.setHeader("X-Antfly-Catalog-Publication", try ctx.allocator.dupe(u8, &hex));
+        }
+        if (failure) |code| return ctx.status(404).json(.{ .@"error" = code });
+        try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");
+        return ctx.status(204).text("");
+    }
+
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const catalog_publication = @import("../registry/catalog_publication.zig");
+        ctx.application_deadline_ns = @import("inference_deadline.zig").establish(ctx.application_deadline_ns, ctx.request.headers.iterator(), platform.time.monotonicNs()) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_INFERENCE_TIMEOUT", .retryable = false });
+        const catalog_control = httpInferenceExecutionControl(self, ctx);
+        catalog_control.check() catch |err| return inferenceFailureResponse(ctx, err);
+        try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
         const catalog_generation = catalog_publication.read(ctx.allocator, ctx.io, self.config.models_dir) catch |err| return requestModelResolutionError(ctx, err);
-        const json_body = self.listModelsJsonAlloc(ctx.allocator, ctx.io) catch |err| {
+        if (ctx.header("X-Antfly-Inference-Chunk-Requirements")) |requirements| {
+            if (requirements.len > 128 * 1024) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+            const parsed = std.json.parseFromSlice([]const []const u8, ctx.allocator, requirements, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" }),
+            };
+            defer parsed.deinit();
+            if (parsed.value.len == 0 or parsed.value.len > 34) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+            for (parsed.value) |requirement| {
+                const colon = std.mem.indexOfScalar(u8, requirement, ':') orelse return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                const selector = requirement[0..colon];
+                const at = std.mem.indexOfScalar(u8, selector, '@') orelse selector.len;
+                const task = selector[0..at];
+                const pin = if (at == selector.len) null else selector[at + 1 ..];
+                if (pin) |expected| {
+                    if (expected.len != 64) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                    for (expected) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f'))
+                        return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                }
+                const name = requirement[colon + 1 ..];
+                if (name.len == 0 or name.len > 4096) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                if (std.mem.eql(u8, task, "diarize")) {
+                    const path = self.resolveChunkSpeakerPath(ctx.allocator, name) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return self.chunkCatalogResponse(ctx, catalog_generation, "SpeakerModelUnavailable"),
+                    };
+                    defer ctx.allocator.free(path);
+                    if (pin) |expected| {
+                        const identity = self.chunkSpeakerRevision(path, ctx.io, catalog_control) catch |err| return requestModelResolutionError(ctx, err);
+                        if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
+                    }
+                } else {
+                    const kind: lib_chunker.outputs.Kind = if (std.mem.eql(u8, task, "embed")) .embedding else if (std.mem.eql(u8, task, "transcribe")) .transcribe else if (std.mem.eql(u8, task, "classify")) .classify else return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                    const category = switch (kind) {
+                        .embedding => "embedders",
+                        .transcribe => "transcribers",
+                        .classify => "classifiers",
+                        .diarize => unreachable,
+                    };
+                    const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| {
+                        if (requestModelResolutionErrorKind(err) == .missing)
+                            return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkOutputModelUnavailable");
+                        return requestModelResolutionError(ctx, err);
+                    };
+                    defer ctx.allocator.free(selected.path);
+                    const control = selected.bind(catalog_control);
+                    if (kind == .embedding) {
+                        if (pin) |expected| {
+                            const identity = self.model_manager.chunkPlanningIdentityForDiscovery(selected.path, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err);
+                            if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
+                        }
+                    } else {
+                        var manifest = self.loadBoundManifest(ctx.allocator, selected.path, false, control) catch |err| return requestModelResolutionError(ctx, err);
+                        defer manifest.deinit();
+                        _ = self.validateChunkOutputManifest(kind, &manifest) catch |err| {
+                            if (err == error.OutOfMemory or isModelPublicationError(err)) return requestModelResolutionError(ctx, err);
+                            return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkOutputModelUnsupported");
+                        };
+                        if (pin) |expected| {
+                            const identity = std.fmt.bytesToHex(self.model_manager.modelIdentityForManifestWithControl(selected.path, manifest, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                            if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
+                        }
+                    }
+                }
+            }
+            try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");
+            if (std.mem.eql(u8, ctx.query("chunk_boundary_probe") orelse "", "1"))
+                return self.chunkCatalogResponse(ctx, catalog_generation, null);
+        } else if (ctx.header("X-Antfly-Inference-Chunk-Boundary")) |boundary| {
+            if (std.mem.startsWith(u8, boundary, "diarize:")) {
+                const name = boundary["diarize:".len..];
+                const path = self.resolveChunkSpeakerPath(ctx.allocator, name) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return self.chunkCatalogResponse(ctx, catalog_generation, "SpeakerModelUnavailable"),
+                };
+                ctx.allocator.free(path);
+                try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");
+                if (std.mem.eql(u8, ctx.query("chunk_boundary_probe") orelse "", "1"))
+                    return self.chunkCatalogResponse(ctx, catalog_generation, null);
+            }
+        }
+        const model = try ctx.queryDecoded("model");
+        const task = ctx.query("task");
+        const scope: ?CatalogListingScope = if (model) |name| scope: {
+            const operation = task orelse break :scope null;
+            if (std.mem.eql(u8, operation, "embed")) break :scope .{ .name = name, .category = "embedders" };
+            if (std.mem.eql(u8, operation, "generate")) break :scope .{ .name = name, .category = "generators" };
+            break :scope null;
+        } else null;
+        const publication = if (catalog_generation.kind == .legacy) null else std.fmt.bytesToHex(catalog_generation.digest, .lower);
+        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, scope, if (publication) |*hex| hex else null, catalog_control) catch |err| {
+            if (err == error.Timeout or err == error.Canceled or err == error.Cancelled) return inferenceFailureResponse(ctx, err);
             if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
             return err;
         };
         defer ctx.allocator.free(json_body);
         // Scoped discovery pins one embedding or generator generation without
         // loading weights. Avoid fingerprinting every model in an unscoped catalog.
-        if (try ctx.queryDecoded("model")) |name| if (ctx.query("task")) |task| if (std.mem.eql(u8, task, "embed") or std.mem.eql(u8, task, "generate")) {
-            const category: []const u8 = if (std.mem.eql(u8, task, "embed")) "embedders" else "generators";
+        if (model) |name| if (task) |operation| if (std.mem.eql(u8, operation, "embed") or std.mem.eql(u8, operation, "generate")) {
+            const category: []const u8 = if (std.mem.eql(u8, operation, "embed")) "embedders" else "generators";
             var catalog = try std.json.parseFromSlice(std.json.Value, ctx.allocator, json_body, .{});
             defer catalog.deinit();
             if (catalog.value == .object) if (catalog.value.object.getPtr(category)) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
                 const path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| return requestModelResolutionError(ctx, err);
                 const path = path_selection.path;
                 defer ctx.allocator.free(path);
-                var manifest = self.loadBoundManifest(ctx.allocator, path, false, self.bindModelSelection(path_selection, null)) catch |err| return modelLoadFailureResponse(ctx, err);
+                const control = path_selection.bind(catalog_control);
+                var manifest = self.loadBoundManifest(ctx.allocator, path, false, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer manifest.deinit();
                 var dense_output = manifest.denseEmbeddingOutput();
-                const revision = if (try self.model_manager.acquireLoadedModelWithControl(path, self.bindModelSelection(path_selection, null))) |cached| loaded: {
+                const revision = if (self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return requestModelResolutionError(ctx, err)) |cached| loaded: {
                     var handle = cached;
                     defer handle.release();
                     // Geometry and revision must describe the same serving generation.
                     dense_output = handle.get().manifest.denseEmbeddingOutput();
-                    break :loaded handle.get().resolution_revision orelse if (std.mem.eql(u8, task, "embed")) return error.InvalidEmbeddingIdentity else try self.model_manager.modelIdentityForManifest(path, manifest);
-                } else try self.model_manager.modelIdentityForManifest(path, manifest);
-                const hex = std.fmt.bytesToHex(revision, .lower);
+                    if (handle.get().resolution_revision) |loaded_revision| break :loaded loaded_revision;
+                    if (std.mem.eql(u8, operation, "embed")) return error.InvalidEmbeddingIdentity;
+                    break :loaded null;
+                } else null;
+                const hex = std.fmt.bytesToHex(revision orelse
+                    self.model_manager.modelIdentityForManifestWithControl(path, manifest, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                control.check() catch |err| return inferenceFailureResponse(ctx, err);
+
                 const catalog_allocator = catalog.arena.allocator();
                 try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
-                if (std.mem.eql(u8, task, "generate")) {
+                if (std.mem.eql(u8, operation, "generate")) {
                     catalog_publication.require(ctx.allocator, ctx.io, self.config.models_dir, catalog_generation) catch |err| return modelLoadFailureResponse(ctx, err);
                     return ctx.json(catalog.value);
                 }
@@ -26453,6 +26771,13 @@ pub const Node = struct {
     /// (e.g. the antfly server's /connections endpoint) can list the embedded
     /// node's models without going through HTTP. Caller owns the result.
     pub fn listModelsJsonAlloc(self: *Node, a: std.mem.Allocator, io: std.Io) ![]u8 {
+        return self.listModelsJsonAllocScoped(a, io, null, null, .{});
+    }
+
+    const CatalogListingScope = struct { name: []const u8, category: []const u8 };
+
+    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, listing_scope: ?CatalogListingScope, publication: ?[]const u8, control: InferenceExecutionControl) ![]u8 {
+        try control.check();
         var buf = std.ArrayListUnmanaged(u8).empty;
         defer buf.deinit(a);
         var body = std.ArrayListUnmanaged(u8).empty;
@@ -26464,24 +26789,34 @@ pub const Node = struct {
         var openai_data_count: usize = 0;
         const list_created = completionCreatedTimestamp();
 
-        var inventory = if (self.selector_cache) |cache|
-            try cache.snapshot(a, io, self.config.models_dir)
+        const borrowed = if (self.selector_cache) |cache|
+            try cache.borrowInventory(io, self.config.models_dir, control)
         else
-            try selection_mod.Inventory.loadStable(a, io, self.config.models_dir);
-        defer inventory.deinit();
+            null;
+        defer if (borrowed) |lease| lease.release();
+        var owned = if (borrowed == null)
+            try selection_mod.Inventory.loadStableWithControl(a, io, self.config.models_dir, control)
+        else
+            null;
+        defer if (owned) |*inventory| inventory.deinit();
+        const inventory = if (borrowed) |lease| lease.inventory() else &owned.?;
+        try control.check();
         const discovered = inventory.discovered;
+        const selected_path = if (listing_scope) |name| inventory.lookup(name.name, name.category) catch null else null;
 
         var discovered_listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
         defer {
             for (discovered_listings.items) |*listing| listing.deinit();
             discovered_listings.deinit(a);
         }
-        try discovered_listings.ensureTotalCapacity(a, discovered.len);
+        try discovered_listings.ensureTotalCapacity(a, if (listing_scope == null) discovered.len else 1);
         // Candidates whose manifest cannot be read stay visible with their
         // error, so one malformed directory never hides a model silently.
         var rejected_listings = std.ArrayListUnmanaged(RejectedModelListing).empty;
         defer rejected_listings.deinit(a);
         for (discovered, 0..) |entry, entry_index| {
+            try control.check();
+            if (listing_scope != null and (selected_path == null or !std.mem.eql(u8, selected_path.?, entry.path))) continue;
             // A directory spelling is not proof of a format or immutable pin.
             // Unmanaged installations may advertise only literal legacy names.
             if (inventory.names[entry_index].len == 0) continue;
@@ -26500,12 +26835,15 @@ pub const Node = struct {
             const model_kind = @tagName(manifest.model_type);
             const qwen3vl_reader = isGenerativeReadModel(&manifest);
             const reader_candidate = manifestMatchesModelListingTask("readers", model_kind, &manifest);
-            const compatibility_summary = self.compatibilitySummaryForDir(a, entry.path) catch CompatibilitySummary{
-                .level = .unknown,
-                .code = .artifact_unreadable,
-                .message = "model compatibility could not be determined",
+            const compatibility_summary = self.compatibilitySummaryForDirWithControl(a, entry.path, control) catch |err| switch (err) {
+                error.Timeout, error.Cancelled, error.Canceled => return err,
+                else => CompatibilitySummary{
+                    .level = .unknown,
+                    .code = .artifact_unreadable,
+                    .message = "model compatibility could not be determined",
+                },
             };
-            discovered_listings.appendAssumeCapacity(.{
+            try discovered_listings.append(a, .{
                 .entry_index = entry_index,
                 .manifest = manifest,
                 .reader_supported = reader_candidate and
@@ -26544,7 +26882,9 @@ pub const Node = struct {
             canonical_discovered_dirs.deinit(a);
         }
 
-        for (discovered) |entry| {
+        const scan_loaded = listing_scope == null or selected_path == null;
+        for (if (scan_loaded) discovered else &.{}) |entry| {
+            try control.check();
             const canonical_path = realPathExistingAlloc(a, io, entry.path) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -26559,7 +26899,7 @@ pub const Node = struct {
             };
         }
 
-        const canonical_models_dir: ?[]u8 = realPathExistingAlloc(a, io, self.config.models_dir) catch |err| blk: {
+        const canonical_models_dir: ?[]u8 = if (!scan_loaded) null else realPathExistingAlloc(a, io, self.config.models_dir) catch |err| blk: {
             if (err == error.OutOfMemory) return err;
             break :blk null;
         };
@@ -26590,6 +26930,11 @@ pub const Node = struct {
                     a.free(canonical_model_dir);
                     continue;
                 };
+                if (listing_scope) |name| if (!std.mem.eql(u8, name.name, identifier)) {
+                    a.free(identifier);
+                    a.free(canonical_model_dir);
+                    continue;
+                };
                 if (stringSliceContains(selected_loaded_dirs.items, canonical_model_dir)) {
                     a.free(identifier);
                     a.free(canonical_model_dir);
@@ -26615,11 +26960,16 @@ pub const Node = struct {
         }
 
         for (task_names, 0..) |task, task_idx| {
+            try control.check();
             if (task_idx > 0) try body.append(a, ',');
             try body.append(a, '"');
             try body.appendSlice(a, task);
             try body.appendSlice(a, "\":{");
 
+            if (listing_scope != null and !std.mem.eql(u8, task, listing_scope.?.category)) {
+                try body.append(a, '}');
+                continue;
+            }
             var model_count: usize = 0;
             var listed_model_names = std.StringHashMapUnmanaged(void).empty;
             defer listed_model_names.deinit(a);
@@ -26658,6 +27008,7 @@ pub const Node = struct {
 
             // Add discovered models matching this task
             for (discovered_listings.items) |*listing| {
+                try control.check();
                 // The public chunk executor currently implements only the
                 // built-in fixed multimodal chunker above. A manifest task is
                 // not proof that a model-backed chunk execution path exists.
@@ -26725,6 +27076,7 @@ pub const Node = struct {
             // Unreadable candidates appear under the task their path implies,
             // marked incompatible with the reason the manifest was rejected.
             for (rejected_listings.items) |rejected| {
+                try control.check();
                 const entry = discovered[rejected.entry_index];
                 if (!std.mem.eql(u8, rejectedListingTask(entry), task)) continue;
                 const listed = try listed_model_names.getOrPut(a, entry.path);
@@ -26733,7 +27085,9 @@ pub const Node = struct {
                 try jsonEncodeString(&body, a, entry.path);
                 try body.appendSlice(a, ":{\"compatibility\":\"incompatible\",\"error\":{\"code\":");
                 try jsonEncodeString(&body, a, @errorName(rejected.err));
-                try body.appendSlice(a, ",\"message\":\"the model directory could not be read; repair or re-pull it\"}}");
+                try body.appendSlice(a, ",\"message\":");
+                try jsonEncodeString(&body, a, @import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(rejected.err) orelse "the model directory could not be read; repair or re-pull it");
+                try body.appendSlice(a, "}}");
                 model_count += 1;
             }
 
@@ -26741,6 +27095,7 @@ pub const Node = struct {
             // snapshot keeps them alive, and each listing has already been
             // canonicalized to a safe request identifier outside the lock.
             for (loaded_listings.items) |listing| {
+                try control.check();
                 if (std.mem.eql(u8, task, "chunkers")) continue;
                 const model = listing.model;
                 const model_task = @tagName(model.manifest.model_type);
@@ -26751,10 +27106,13 @@ pub const Node = struct {
                 if (model_count > 0) try body.append(a, ',');
                 try jsonEncodeString(&body, a, listing.identifier);
                 try body.append(a, ':');
-                const loaded_compatibility = self.compatibilitySummaryForDir(a, listing.canonical_model_dir) catch CompatibilitySummary{
-                    .level = .unknown,
-                    .code = .artifact_unreadable,
-                    .message = "model compatibility could not be determined",
+                const loaded_compatibility = self.compatibilitySummaryForDirWithControl(a, listing.canonical_model_dir, control) catch |err| switch (err) {
+                    error.Timeout, error.Cancelled, error.Canceled => return err,
+                    else => CompatibilitySummary{
+                        .level = .unknown,
+                        .code = .artifact_unreadable,
+                        .message = "model compatibility could not be determined",
+                    },
                 };
                 try appendModelInfo(
                     &body,
@@ -26798,7 +27156,13 @@ pub const Node = struct {
 
             try body.append(a, '}');
         }
-        try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
+        try buf.append(a, '{');
+        if (publication) |token| {
+            try buf.appendSlice(a, "\"catalog_publication\":");
+            try jsonEncodeString(&buf, a, token);
+            try buf.append(a, ',');
+        }
+        try buf.appendSlice(a, "\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
         try buf.appendSlice(a, if (build_options.allow_downloads) "],\"allow_downloads\":true," else "],\"allow_downloads\":false,");
         try buf.appendSlice(a, "\"backends\":{");
@@ -26810,23 +27174,25 @@ pub const Node = struct {
         try buf.appendSlice(a, body.items);
         // Keep ML schemas in their own group while allowing task-aware pool
         // discovery to find predictors through the same bounded catalog.
-        _ = tabular_mod.discovery.discover(io, a, &self.tabular_registry, self.config.ml_dir) catch {};
-        const predictors = try self.tabular_registry.list(a);
-        defer a.free(predictors);
         try buf.appendSlice(a, ",\"predictors\":{");
-        for (predictors, 0..) |info, index| {
-            if (index > 0) try buf.append(a, ',');
-            try jsonEncodeString(&buf, a, info.name);
-            try buf.append(a, ':');
-            const encoded = try std.json.Stringify.valueAlloc(a, api.PredictorInfo{
-                .task = predictorTaskFromTabular(info.task),
-                .num_features = @intCast(info.num_features),
-                .num_outputs = @intCast(info.num_outputs),
-                .feature_names = if (info.feature_names.len > 0) info.feature_names else null,
-                .source_framework = if (info.source_framework.len > 0) info.source_framework else null,
-            }, .{});
-            defer a.free(encoded);
-            try buf.appendSlice(a, encoded);
+        if (listing_scope == null) {
+            _ = tabular_mod.discovery.discover(io, a, &self.tabular_registry, self.config.ml_dir) catch {};
+            const predictors = try self.tabular_registry.list(a);
+            defer a.free(predictors);
+            for (predictors, 0..) |info, index| {
+                if (index > 0) try buf.append(a, ',');
+                try jsonEncodeString(&buf, a, info.name);
+                try buf.append(a, ':');
+                const encoded = try std.json.Stringify.valueAlloc(a, api.PredictorInfo{
+                    .task = predictorTaskFromTabular(info.task),
+                    .num_features = @intCast(info.num_features),
+                    .num_outputs = @intCast(info.num_outputs),
+                    .feature_names = if (info.feature_names.len > 0) info.feature_names else null,
+                    .source_framework = if (info.source_framework.len > 0) info.source_framework else null,
+                }, .{});
+                defer a.free(encoded);
+                try buf.appendSlice(a, encoded);
+            }
         }
         try buf.appendSlice(a, "}}");
 
@@ -26842,35 +27208,40 @@ pub const Node = struct {
         // Composite discovery reads only bounded declarative metadata. It
         // never loads model weights or exposes private provider bindings.
         const ca = catalog.arena.allocator();
-        const native_info = try self.documentCatalogInfo(ca, null, "read");
-        try catalog.value.object.getPtr("readers").?.object.put(ca, "antfly/native-document", native_info);
-        for (discovered) |entry| {
-            // Resolve each advertised operation independently; never let one
-            // same-named registration overwrite another task's definition.
-            for ([_]document_contract.Operation{ .read, .extract }) |operation| {
-                const definition_bytes = self.documentDefinition(ca, entry.name, operation) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    continue;
-                } orelse continue;
-                const parsed = document_contract.Definition.parse(ca, definition_bytes) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    continue;
-                };
-                const definition = parsed.value;
-                const is_read = operation == .read;
-                if ((is_read and definition.read == null) or (!is_read and definition.extract == null)) continue;
-                const scope = if (is_read) "readers" else "extractors";
-                const task = if (is_read) "read" else "extract";
-                try catalog.value.object.getPtr(scope).?.object.put(ca, entry.path, try self.documentCatalogInfo(ca, definition, task));
+        if (listing_scope == null) {
+            const native_info = try self.documentCatalogInfo(ca, null, "read");
+            try catalog.value.object.getPtr("readers").?.object.put(ca, "antfly/native-document", native_info);
+            for (discovered) |entry| {
+                // Resolve each advertised operation independently; never let one
+                // same-named registration overwrite another task's definition.
+                for ([_]document_contract.Operation{ .read, .extract }) |operation| {
+                    const definition_bytes = self.documentDefinition(ca, entry.name, operation) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        continue;
+                    } orelse continue;
+                    const parsed = document_contract.Definition.parse(ca, definition_bytes) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        continue;
+                    };
+                    const definition = parsed.value;
+                    const is_read = operation == .read;
+                    if ((is_read and definition.read == null) or (!is_read and definition.extract == null)) continue;
+                    const scope = if (is_read) "readers" else "extractors";
+                    const task = if (is_read) "read" else "extract";
+                    try catalog.value.object.getPtr(scope).?.object.put(ca, entry.path, try self.documentCatalogInfo(ca, definition, task));
+                }
             }
         }
         // Descriptors retain installation identity until ownership is finalized.
         // A same-named installation in another scope cannot supply its contract.
         for (task_names) |task| {
+            try control.check();
             const models = catalog.value.object.getPtr(task).?;
             for (discovered, inventory.names) |entry, names| {
+                try control.check();
                 const descriptor = models.object.get(entry.path) orelse continue;
                 for (names) |selector| {
+                    if (listing_scope) |name| if (!std.mem.eql(u8, name.name, selector)) continue;
                     const owner = (inventory.lookup(selector, task) catch continue) orelse continue;
                     if (std.mem.eql(u8, owner, entry.path)) try models.object.put(ca, selector, descriptor);
                 }
@@ -26886,7 +27257,7 @@ pub const Node = struct {
             }
         }
         filterOpenAiCatalogSelectors(&catalog.value);
-        try inventory.requireCurrentGeneration(io);
+        try inventory.requireCurrentGenerationWithControl(io, control);
         return std.json.Stringify.valueAlloc(a, catalog.value, .{});
     }
 
@@ -27055,6 +27426,8 @@ pub const Node = struct {
         // The AI prefix retains the host's inference authentication and permissions.
         try prefixed.get("/_antfarm/readers", httpx.Handler.bind(self, antfarmReaders));
         try prefixed.post("/_antfarm/readers/apple", httpx.Handler.bind(self, antfarmAppleOcr));
+        // Private worker scheduling metadata, under inference authentication.
+        try prefixed.post("/_placement/generate", httpx.Handler.bind(self, estimateGeneratePlacement));
         // Keep the retired endpoint deterministic when inference routes share
         // the standalone public server. Without an explicit tombstone, httpx
         // reports 405 because nearby generated routes match the path shape,
@@ -28157,6 +28530,8 @@ fn extractionV2FailureResponse(ctx: *httpx.Context, err: anyerror, failure: extr
 }
 
 fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (@import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(err) != null)
+        return modelLoadFailureResponse(ctx, err);
     if (err == error.UnsupportedConstrainedProbabilities) return generationErrorResponse(ctx, err);
     if (isInferenceExecutorContractError(err))
         return inferenceExecutorContractFailureResponse(ctx, err);
@@ -30312,7 +30687,7 @@ fn appendResolvedInferenceCapabilities(
     try buf.appendSlice(allocator, ",\"generation_token_logprobs_v1\":");
     try buf.appendSlice(allocator, if (executor_kind == .native_generation) "true" else "false");
     try buf.appendSlice(allocator, ",\"model_aware_chunking_v1\":");
-    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed")) "true" else "false");
+    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or std.mem.eql(u8, resolved_task, "chunk")) "true" else "false");
     try buf.appendSlice(allocator, ",\"numeric_responses_v1\":");
     try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
     // `/rerank` accepts `documents` (strings or content parts). Older servers
@@ -31486,12 +31861,43 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
 }
 
 fn inferenceExecutorContractFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    // Resolving capabilities first reads the manifest. Preserve load/config
+    // failures instead of treating every failure as a request size violation.
+    if (!isInferenceExecutorContractError(err) and err != error.UnsupportedGlinerBoundaryRuntime)
+        return modelLoadFailureResponse(ctx, err);
     const failure = generateExecutorContractError(err);
     return ctx.status(failure.status).json(.{
         .@"error" = failure.batch.code,
         .message = failure.batch.message,
         .retryable = failure.batch.retryable,
     });
+}
+
+test "executor contract failures preserve configuration load and resource identities" {
+    const a = std.testing.allocator;
+    const Case = struct { err: anyerror, status: u16, code: []const u8 };
+    for ([_]Case{
+        .{ .err = error.MissingGlinerSpanEncoderConfig, .status = 400, .code = "INVALID_MODEL" },
+        .{ .err = error.InvalidGlinerSpanEncoderConfig, .status = 400, .code = "INVALID_MODEL" },
+        .{ .err = error.InferenceBatchTooLarge, .status = 413, .code = "BATCH_TOO_LARGE" },
+        .{ .err = error.InferenceInputTokensExceeded, .status = 413, .code = "INPUT_TOKEN_LIMIT_EXCEEDED" },
+        .{ .err = error.InvalidInferenceCapabilities, .status = 500, .code = "INVALID_MODEL_CAPABILITIES" },
+        .{ .err = error.UnsupportedGlinerBoundaryRuntime, .status = 400, .code = "MODEL_NOT_QUALIFIED" },
+        .{ .err = error.ResourceLimitExceeded, .status = 400, .code = "MODEL_RESOURCE_LIMIT" },
+        .{ .err = error.ResourceTemporarilyUnavailable, .status = 503, .code = "MODEL_RESOURCE_BUSY" },
+        .{ .err = error.Timeout, .status = 504, .code = "INFERENCE_TIMEOUT" },
+    }) |case| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try inferenceExecutorContractFailureResponse(&ctx, case.err);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.code, parsed.value.object.get("error").?.string);
+    }
 }
 
 fn isInferenceExecutorContractError(err: anyerror) bool {
@@ -32064,6 +32470,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/generate/batch") or
             std.mem.eql(u8, path, "/models/instances") or
             std.mem.eql(u8, path, "/_antfarm/readers/apple") or
+            std.mem.eql(u8, path, "/_placement/generate") or
             std.mem.eql(u8, path, "/predict") or
             std.mem.eql(u8, path, "/read") or
             std.mem.eql(u8, path, "/read/execute") or
@@ -37144,15 +37551,48 @@ test "model listing reports an unreadable model per entry and keeps the others" 
     var node = try Node.init(allocator, .{ .models_dir = models_path });
     defer node.deinit();
 
-    const body = try node.listModelsJsonAlloc(allocator, io);
-    defer allocator.free(body);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    try std.testing.expect(root.get("generators").?.object.get("acme/demo") != null);
-    const broken = root.get("extractors").?.object.get("acme/broken-gliner").?.object;
-    try std.testing.expectEqualStrings("incompatible", broken.get("compatibility").?.string);
-    try std.testing.expectEqualStrings("MissingGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
+    // Exercise discovery and both HTTP versions with missing and malformed
+    // sidecars. A fresh inventory read must preserve each specific diagnosis.
+    for ([_]?[]const u8{ null, "{not valid JSON", "{}" }) |encoder_config| {
+        if (encoder_config) |bytes| {
+            try tmp.dir.createDirPath(io, "extractors/acme/broken-gliner/encoder_config");
+            try tmp.dir.writeFile(io, .{ .sub_path = "extractors/acme/broken-gliner/encoder_config/config.json", .data = bytes });
+        }
+        const body = try node.listModelsJsonAlloc(allocator, io);
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expect(root.get("generators").?.object.get("acme/demo") != null);
+        const broken = root.get("extractors").?.object.get("acme/broken-gliner").?.object;
+        try std.testing.expectEqualStrings("incompatible", broken.get("compatibility").?.string);
+        try std.testing.expectEqualStrings(if (encoder_config == null) "MissingGlinerSpanEncoderConfig" else "InvalidGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
+
+        // Both the legacy request from #1678 and explicit v2 must preserve the
+        // discovery diagnosis rather than inventing a request resource limit.
+        const diagnostic = broken.get("error").?.object;
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.get("message").?.string, "encoder_config/config.json") != null);
+        for ([_][]const u8{
+            "{\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+            "{\"schema_version\":2,\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+        }) |json| {
+            var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+            defer request.deinit();
+            request.body = json;
+            var ctx = httpx.Context.init(allocator, io, &request);
+            defer ctx.deinit();
+            var response = try node.extractJSON(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 400), response.status.code);
+            var payload = try std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+            defer payload.deinit();
+            const failure = payload.value.object;
+            try std.testing.expectEqualStrings("INVALID_MODEL", failure.get("error").?.string);
+            try std.testing.expectEqualStrings(diagnostic.get("code").?.string, failure.get("reason").?.string);
+            try std.testing.expectEqualStrings(diagnostic.get("message").?.string, failure.get("message").?.string);
+            try std.testing.expect(!failure.get("retryable").?.bool);
+        }
+    }
 
     // Readiness counts the usable model instead of collapsing to zero.
     try node.refreshReadinessInventory(io);
@@ -37437,6 +37877,10 @@ test "generation cooperative execution is independent of row batching and fences
     try std.testing.expect(!enabled.enabledForRequest(safe, true, false, false, false));
     try std.testing.expect(!enabled.enabledForRequest(safe, false, true, false, false));
     try std.testing.expect(!enabled.enabledForRequest(safe, false, false, true, false));
+    var cached = safe;
+    cached.cooperative_prompt_cache = true;
+    try std.testing.expect(enabled.enabledForRequest(cached, false, false, true, false));
+    try std.testing.expect(!enabled.enabledForRequest(cached, true, false, true, false));
     try std.testing.expect(!enabled.enabledForRequest(safe, false, false, false, true));
     try std.testing.expectError(error.InvalidCooperativeExecutionConfig, (CooperativeExecutionConfig{ .max_active_requests = 3 }).validate());
 }
@@ -37746,6 +38190,86 @@ test "ambiguous model resolution returns an actionable conflict response" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, ambiguous_model_error_message) != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "owner/name:variant") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_RESOLUTION_FAILED") == null);
+}
+
+test "catalog model resolution preserves timeout and cancellation responses" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    const cases = [_]struct { anyerror, u16 }{
+        .{ error.Timeout, 504 },
+        .{ error.Canceled, 408 },
+        .{ error.Cancelled, 408 },
+    };
+    for (cases) |entry| {
+        var response = try Node.requestModelResolutionError(&ctx, entry[0]);
+        defer response.deinit();
+        try std.testing.expectEqual(entry[1], response.status.code);
+    }
+}
+
+test "catalog model resolution preserves timeout during managed checksums" {
+    const receipts = @import("../registry/managed_receipt.zig");
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const filename = "payload.bin";
+    try tmp.dir.writeFile(io, .{ .sub_path = filename, .data = "payload" });
+    const path = try tmp.dir.realPathFileAlloc(io, filename, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const Cancel = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const remaining: *usize = @ptrCast(@alignCast(raw.?));
+            if (remaining.* == 0) return error.Timeout;
+            remaining.* -= 1;
+        }
+    };
+    var checkpoints: usize = 3;
+    try std.testing.expectError(error.Timeout, receipts.verifyValidatedArtifactSha256AndStampWithControl(
+        io,
+        &.{ .path = filename, .canonical_path = path, .size = 7, .sha256 = null },
+        "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+        (InferenceExecutionControl{}).withCheckpoint(&checkpoints, Cancel.check),
+    ));
+}
+
+test "catalog model resolution preserves timeout and scopes generation listing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tensor_header = "{\"probe\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    const header_size = comptime std.mem.alignForward(usize, tensor_header.len, 8);
+    var weights: [8 + header_size + 4]u8 = @splat(0);
+    std.mem.writeInt(u64, weights[0..8], header_size, .little);
+    @memset(weights[8..][0..header_size], ' ');
+    @memcpy(weights[8..][0..tensor_header.len], tensor_header);
+    inline for (.{ "selected", "other" }) |name| {
+        try tmp.dir.createDirPath(io, "generators/" ++ name);
+        try tmp.dir.writeFile(io, .{ .sub_path = "generators/" ++ name ++ "/config.json", .data = "{\"model_type\":\"llama\"}" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "generators/" ++ name ++ "/model.safetensors", .data = &weights });
+    }
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true });
+    defer node.deinit();
+    try node.attachIo(io);
+    var request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=selected&task=generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.listModels(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    const generators = parsed.value.object.get("generators").?.object;
+    try std.testing.expectEqual(@as(usize, 1), generators.count());
+    const selected = generators.get("selected") orelse return error.MissingGenerator;
+    try std.testing.expectEqual(@as(usize, 64), selected.object.get("model_revision").?.string.len);
 }
 
 test "decide maps model resolution errors to client responses" {
@@ -49509,13 +50033,7 @@ const MediaOutputExecution = struct {
         } else {
             var manifest = try self.node.loadBoundManifest(a, path, false, selected_control);
             defer manifest.deinit();
-            if (target.kind == .transcribe) {
-                const contract = try resolvedInferenceExecutorContract(self.node, "transcribe", &manifest);
-                try validateInferenceExecutorInvocation(contract, .{ .has_audio = true, .item_count = 1, .media_parts_per_item = 1 });
-            } else {
-                const profile = manifest.media_classifier orelse return error.UnsupportedMediaClassifier;
-                try profile.validate();
-                if (manifest.model_type != .classifier or !manifest.hasCapability("classification") or !manifest.hasTask("classify") or manifest.id2label == null) return error.UnsupportedMediaClassifier;
+            if (try self.node.validateChunkOutputManifest(target.kind, &manifest)) |profile| {
                 classifier_profile = profile;
                 max_audio_ns = profile.max_audio_ns;
                 uses_audio = profile.input == .waveform;
@@ -50177,6 +50695,15 @@ test "scoped model discovery resolves dense geometry without loading weights" {
         // Identity inspection may fingerprint this file, but loading it fails.
         .data = "metadata-only fixture",
     });
+    try tmp.dir.createDirPath(io, "embedders/acme/other");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "embedders/acme/other/config.json",
+        .data = @embedFile("../architectures/embedding_gemma2_config.json"),
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "embedders/acme/other/model.safetensors",
+        .data = "second metadata-only fixture",
+    });
     const models_path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(models_path);
     var node = try Node.init(a, .{ .models_dir = models_path });
@@ -50192,7 +50719,9 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
     defer parsed.deinit();
-    const model = parsed.value.object.get("embedders").?.object.get("acme/demo").?;
+    const embedders = parsed.value.object.get("embedders").?.object;
+    try std.testing.expectEqual(@as(usize, 1), embedders.count());
+    const model = embedders.get("acme/demo").?;
     const shape = model.object.get("dense_output") orelse return error.MissingDenseOutput;
     try std.testing.expectEqual(@as(i64, 768), shape.object.get("native_dimensions").?.integer);
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
@@ -51644,6 +52173,84 @@ test "standalone embedding HTTP revision parser and acknowledgements" {
         var invalid = try std.json.parseFromSlice(std.json.Value, a, invalid_body, .{});
         defer invalid.deinit();
         try std.testing.expectError(error.InvalidEmbeddingRevision, parseEmbedRequest(invalid.value));
+    }
+}
+
+test "generation placement empty request cannot activate model or reserve KV" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/_placement/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.estimateGeneratePlacement(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.inference, inferenceHttpRouteAdmission("POST", "/_placement/generate"));
+}
+
+test "generation placement empty model resolves the default generator without loading" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/generators/default");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/generators/default/config.json",
+        .data = "{\"model_type\":\"llama\"}",
+    });
+    const tensor_header = "{\"probe\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    const tensor_header_size = comptime std.mem.alignForward(usize, tensor_header.len, 8);
+    var weights: [8 + tensor_header_size + 4]u8 = @splat(0);
+    std.mem.writeInt(u64, weights[0..8], tensor_header_size, .little);
+    @memset(weights[8..][0..tensor_header_size], ' ');
+    @memcpy(weights[8..][0..tensor_header.len], tensor_header);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/generators/default/model.safetensors",
+        .data = &weights,
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true });
+    defer node.deinit();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/_placement/generate");
+    defer request.deinit();
+    request.body =
+        \\{"model":"","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.estimateGeneratePlacement(&ctx);
+    defer response.deinit();
+    if (response.status.code != 409) std.debug.print("unexpected placement response: {s}\n", .{response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    try std.testing.expectEqualStrings("{\"error\":\"MODEL_NOT_LOADED\"}", response.body.?);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.in_flight_loads.count());
+}
+
+test "generation placement rejects grammar before model resolution" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    for ([_][]const u8{
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":"json"}
+        ,
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":"root ::= \"ok\""}
+        ,
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":""}
+        ,
+    }) |body| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/_placement/generate");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.estimateGeneratePlacement(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 422), response.status.code);
+        try std.testing.expectEqualStrings("{\"error\":\"PLACEMENT_UNAVAILABLE\"}", response.body.?);
+        try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+        try std.testing.expectEqual(@as(usize, 0), node.model_manager.in_flight_loads.count());
     }
 }
 
@@ -53251,4 +53858,28 @@ test "reader direct generation entry point preserves pinned residency and cleans
         try std.testing.expectEqual(@as(usize, 0), slots_after.active);
         try std.testing.expectEqual(@as(usize, 1), model.active_handles);
     }
+}
+
+test "warm generator admission metadata reuses only exact CUDA compatibility assessments" {
+    try std.testing.expect(cudaCompatibilityAlreadyAssessed(&.{.cuda}, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{ .native, .cuda }, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.native}, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.metal}, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{}, .cuda, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.cuda}, .native, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.cuda}, .metal, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.cuda}, .auto, true));
+    try std.testing.expect(!cudaCompatibilityAlreadyAssessed(&.{.cuda}, .cuda, false));
+    const artifact: CompatibilitySignature = @splat(0x53);
+    const cuda = compatibilitySignatureForBackends(artifact, &.{.cuda});
+    const repeated = compatibilitySignatureForBackends(artifact, &.{.cuda});
+    try std.testing.expectEqualSlices(u8, &cuda, &repeated);
+    for ([_][]const backends_mod.BackendType{ &.{.native}, &.{.metal}, &.{ .native, .cuda }, &.{ .cuda, .native }, &.{} }) |candidates| {
+        const different = compatibilitySignatureForBackends(artifact, candidates);
+        try std.testing.expect(!std.mem.eql(u8, &cuda, &different));
+    }
+    var changed = artifact;
+    changed[0] ^= 1;
+    const changed_signature = compatibilitySignatureForBackends(changed, &.{.cuda});
+    try std.testing.expect(!std.mem.eql(u8, &cuda, &changed_signature));
 }

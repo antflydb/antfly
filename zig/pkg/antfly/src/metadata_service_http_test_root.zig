@@ -64,3 +64,8 @@ test "metadata changefeed state transport discovery" {
     _ = http_client;
     _ = http_server;
 }
+
+test "index alias metadata HTTP discovery" {
+    _ = http_server;
+    _ = http_client;
+}

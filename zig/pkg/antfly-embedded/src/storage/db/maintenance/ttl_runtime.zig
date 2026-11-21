@@ -281,6 +281,7 @@ const PlatformTtlRuntime = struct {
     pub fn runOnce(self: *TtlRuntime) !void {
         if (!self.config.enabled) return;
         if (workDeferred(self)) return;
+        if (!hasTtlDemand(self)) return;
         const now_ns = self.config.clock.nowRealtimeNs();
         if (!ensureLease(self, now_ns)) return;
         const summary = collectAndDelete(self, now_ns) catch |err| {
@@ -321,7 +322,7 @@ const ScanSummary = struct {
 
 fn workerStep(runtime: *TtlRuntime) ?u64 {
     if (isShutdown(runtime)) return null;
-    if (!workDeferred(runtime)) {
+    if (!workDeferred(runtime) and hasTtlDemand(runtime)) {
         const now_ns = runtime.config.clock.nowRealtimeNs();
         if (ensureLease(runtime, now_ns)) {
             const summary = collectAndDelete(runtime, now_ns) catch |err| {
@@ -339,6 +340,23 @@ fn workerStep(runtime: *TtlRuntime) ?u64 {
 fn workDeferred(runtime: *const TtlRuntime) bool {
     const flag = runtime.defer_flag orelse return false;
     return flag.load(.acquire);
+}
+
+/// Cheap pre-lease check: a local probe-transaction schema read (no lease,
+/// no cross-process I/O) for whether there is any TTL work this tick could
+/// possibly do, using the exact same conditions collectAndDelete already
+/// branches on (document TTL duration, or a wired graph-expiration
+/// callback). Lets workerStep/runOnce skip ensureLease's cross-process
+/// lease acquisition entirely when neither is configured, while leaving
+/// ensureLease itself — and therefore leader/owner-only semantics — exactly
+/// as before whenever real demand exists. On a transient read error this
+/// conservatively reports demand so the existing error-handling path below
+/// still runs instead of silently skipping real work.
+fn hasTtlDemand(runtime: *TtlRuntime) bool {
+    const loaded_schema = schema_mod.loadSchema(runtime.store, runtime.alloc) catch return true;
+    defer if (loaded_schema) |schema| schema_mod.freeSchema(runtime.alloc, schema);
+    if (loaded_schema) |schema| if (schema.ttl_duration_ns != 0) return true;
+    return runtime.graph_expire_fn != null;
 }
 
 fn ensureLease(runtime: *TtlRuntime, now_ns: u64) bool {

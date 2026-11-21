@@ -19,6 +19,7 @@ const types = @import("db/types.zig");
 pub fn executionOptions(req: types.SearchRequest) abi.LocalQueryExecutionOptions {
     return .{
         .enabled = 1,
+        .public_query_started_ns = req.public_query_started_ns orelse 0,
         .include_stored = @intFromBool(req.include_stored),
         .return_mode = switch (req.return_mode) {
             .parent => .parent,
@@ -35,6 +36,7 @@ pub fn executionOptions(req: types.SearchRequest) abi.LocalQueryExecutionOptions
 
 pub fn applyExecutionOptions(req: *types.SearchRequest, options: abi.LocalQueryExecutionOptions) void {
     if (options.enabled != 0) {
+        req.public_query_started_ns = if (options.public_query_started_ns == 0) null else options.public_query_started_ns;
         req.include_stored = options.include_stored != 0;
         req.return_mode = switch (options.return_mode) {
             .parent => .parent,

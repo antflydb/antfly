@@ -2611,8 +2611,10 @@ fn catchUpWindowWithOrdered(
     var seen_sequences = std.AutoHashMapUnmanaged(u64, void).empty;
     defer seen_sequences.deinit(gpa);
     ctx.seen_sequences = &seen_sequences;
-    _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
-    return ctx.max_seen;
+    const stats = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
+    // A batch bounded by scanned work can end on records without this hint;
+    // they need nothing, so progress covers them too.
+    return @max(ctx.max_seen, stats.last_sequence);
 }
 
 /// Erased shard store + ownership, shared with the promotion runtime so both
@@ -2636,15 +2638,20 @@ fn loadReresolveCursor(alloc: Allocator, store: *backend_erased.Store, key: []co
     return try alloc.dupe(u8, raw);
 }
 
+// §3.2a's "Catch-up progress" ride-along entry: as the ResolutionRuntime
+// doc comment below notes, crash recovery here is ordinary replay and the
+// stage is idempotent, so a reresolve cursor lost on crash just means a
+// larger (still correct) backfill window next time. Ride along instead of
+// paying a dedicated fsync.
 fn saveReresolveCursor(store: *backend_erased.Store, cursor_key: []const u8, value: []const u8) !void {
-    var txn = try store.beginWrite();
+    var txn = try store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     try txn.put(cursor_key, value);
     try txn.commit();
 }
 
 fn clearReresolveCursor(store: *backend_erased.Store, key: []const u8) !void {
-    var txn = try store.beginWrite();
+    var txn = try store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     txn.delete(key) catch |err| switch (err) {
         error.NotFound => {},
@@ -2724,6 +2731,11 @@ pub const ResolutionRuntime = struct {
     /// used to backfill mention name embeddings for cosine/ann blocking.
     embedder: ?embedder_mod.DenseEmbedder,
     applied_sequence: @import("antfly_platform").atomic.Value(u64),
+    /// The applied sequence last written durably. With no resolvers there
+    /// is nothing to replay, so the durable watermark only bounds journal
+    /// retention and may trail the in-memory one by a bounded window
+    /// instead of costing a commit on every catch-up.
+    persisted_applied: u64 = 0,
     target_sequence: @import("antfly_platform").atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
@@ -2770,6 +2782,7 @@ pub const ResolutionRuntime = struct {
             .candidate_source = candidate_source,
             .embedder = embedder,
             .applied_sequence = .init(applied),
+            .persisted_applied = applied,
             .replay_progress = try loadReplayProgress(alloc, &store_handle.store, applied),
             .target_sequence = .init(target),
             .shutdown_flag = .init(false),
@@ -2906,8 +2919,11 @@ pub const ResolutionRuntime = struct {
         self.pending_replay_record = null;
     }
 
+    // Within-window preparation progress, same ride-along category as
+    // saveReresolveCursor above (§3.2a): lost on crash, replay restarts the
+    // window from applied_sequence and redoing it is idempotent.
     fn saveReplayProgress(self: *ResolutionRuntime, progress: ?ReplayProgress) !void {
-        var write = try self.store_handle.store.beginWrite();
+        var write = try self.store_handle.store.beginBatchWithOptions(.{ .durability = .ride_along });
         errdefer write.abort();
         if (progress) |value| {
             const raw = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
@@ -2926,6 +2942,7 @@ pub const ResolutionRuntime = struct {
         // acknowledged by an earlier empty scan.
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
+        var scan: replay_source_mod.MatchingRecordStats = .{};
         if (self.pending_replay_record == null) {
             const Capture = struct {
                 fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
@@ -2937,10 +2954,20 @@ pub const ResolutionRuntime = struct {
                     runtime.pending_replay_record = .{ .sequence = sequence, .raw = raw, .decoded = decoded };
                 }
             };
-            _ = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
+            scan = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
         }
         const record = if (self.pending_replay_record) |*value| value else {
             if (self.replay_progress != null) return error.InvalidResolutionReplayCursor;
+            // A scan that stopped at its entry cap examined only a prefix:
+            // advance through what it verified holds no resolution work, not
+            // to the target.
+            if (scan.scan_budget_exhausted) {
+                if (scan.last_sequence > applied) {
+                    try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, scan.last_sequence);
+                    self.applied_sequence.store(scan.last_sequence, .release);
+                }
+                return;
+            }
             try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
             self.applied_sequence.store(target, .release);
             return;
@@ -2996,6 +3023,8 @@ pub const ResolutionRuntime = struct {
         try processRecordKeys(self.alloc, resolvers, store, null, keys, self.write_ctx, self.write_fn, self.candidate_source, self.embedder);
     }
 
+    const no_resolver_persist_window: u64 = 1024;
+
     fn catchUpLocked(self: *ResolutionRuntime, single_window: bool, max_records: usize) !void {
         while (true) {
             const target = self.target_sequence.load(.acquire);
@@ -3019,8 +3048,14 @@ pub const ResolutionRuntime = struct {
                 self.alloc.free(resolvers);
             }
             if (resolvers.len == 0) {
-                // No resolver configured; advance so the hint does not rescan.
-                try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
+                // No resolver configured; advance so the hint does not
+                // rescan. Persist only once the durable watermark trails by
+                // a whole window: this would otherwise be a background
+                // commit on every primary write.
+                if (target -| self.persisted_applied >= no_resolver_persist_window) {
+                    try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
+                    self.persisted_applied = target;
+                }
                 self.applied_sequence.store(target, .release);
                 return;
             }
@@ -3048,10 +3083,12 @@ pub const ResolutionRuntime = struct {
             if (max_seen <= applied) {
                 // No matching records in (applied, target]; advance to target.
                 try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
+                self.persisted_applied = target;
                 self.applied_sequence.store(target, .release);
                 return;
             }
             try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, max_seen);
+            self.persisted_applied = max_seen;
             self.applied_sequence.store(max_seen, .release);
             if (single_window) return;
             // Loop to process the next window if max_seen is still below target.

@@ -465,6 +465,7 @@ pub const ProviderRuntime = struct {
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     google_credentials: google_auth.CredentialManager,
     bedrock_credentials: BedrockCredentialPool,
+    remote_capability_cache: remote_capabilities.Cache,
     http_mutex: std.atomic.Mutex = .unlocked,
     http_client: std.atomic.Value(?*httpx.Client) = .init(null),
     generation_http_client: std.atomic.Value(?*httpx.Client) = .init(null),
@@ -476,6 +477,7 @@ pub const ProviderRuntime = struct {
             .io = io,
             .google_credentials = google_auth.CredentialManager.init(alloc, io),
             .bedrock_credentials = BedrockCredentialPool.init(alloc, io),
+            .remote_capability_cache = remote_capabilities.Cache.init(alloc, io),
         };
     }
 
@@ -532,6 +534,7 @@ pub const ProviderRuntime = struct {
     }
 
     pub fn deinit(self: *ProviderRuntime) void {
+        self.remote_capability_cache.deinit();
         inline for (.{ &self.asset_http_client, &self.generation_http_client, &self.http_client }) |slot| if (slot.swap(null, .acq_rel)) |client| {
             client.deinit();
             self.alloc.destroy(client);
@@ -563,6 +566,8 @@ pub const InitOptions = struct {
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
     source_table: []const u8 = "",
+    /// Borrowed until the constructed ManagedEmbedder is deinitialized.
+    request_id: []const u8 = "",
     /// Borrowed for the lifetime of the constructed ManagedEmbedder. Services
     /// should supply their runtime; standalone embedders retain an owned
     /// fallback for compatibility.
@@ -650,6 +655,7 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
+    discovery_context: ?RequestContext = null,
     bounded_http_request: bool = false,
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
@@ -698,6 +704,10 @@ pub const ManagedEmbeddingEntry = struct {
     /// TLS state without moving client synchronization objects.
     shared_http_client: ?*httpx.Client = null,
     provider_runtime: ?*ProviderRuntime = null,
+    request_id: []const u8 = "",
+    remote_query_workload: bool = false,
+    retry_after_ms: ?*u64 = null,
+    retry_not_before_ns: ?*u64 = null,
     dimensions: u32,
     sparse: bool = false,
     /// Configured `inputs`: replaces the model's discovered input types, for
@@ -1320,6 +1330,7 @@ pub const ManagedEmbedder = struct {
         retained_options.deadline_ns = null;
         retained_options.cancellation = null;
         retained_options.progress = null;
+        retained_options.request_id = "";
         retained_options.source_table = try options_arena.allocator().dupe(u8, supplied_options.source_table);
         if (supplied_options.inference_api_url) |value| retained_options.inference_api_url = try options_arena.allocator().dupe(u8, value);
         if (supplied_options.inference_api_key) |value| retained_options.inference_api_key = try options_arena.allocator().dupe(u8, value);
@@ -1410,6 +1421,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_part_items_with_context_fn = embedDensePartItemsWithContext,
             .dense_embed_part_items_planned_fn = embedDensePartItemsPlanned,
             .resolve_part_lease_fn = resolveDensePartLease,
+            .resolve_media_part_lease_fn = resolveDenseMediaPartLease,
             .part_batch_limit_fn = densePartBatchLimit,
             .capabilities_with_context_fn = denseCapabilitiesWithContext,
             .dense_embed_raster_items_with_context_fn = embedDenseRasterItemsWithContext,
@@ -1436,10 +1448,13 @@ pub const ManagedEmbedder = struct {
             .sparse_embed_batch_fn = embedSparseBatch,
             .sparse_embed_with_context_fn = embedSparseWithContext,
             .sparse_embed_batch_with_context_fn = embedSparseBatchWithContext,
+            .resolve_generation_fn = resolveSparseGeneration,
+            .sparse_embed_batch_planned_fn = embedSparseBatchPlanned,
             .deinit_fn = deinitSparseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
             .set_progress_fn = setEmbedderProgress,
             .cache_revision_fn = sparseCacheRevision,
+            .cache_revision_with_context_fn = sparseCacheRevisionWithContext,
             .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.sparseForegroundBounded(),
         };
@@ -1565,6 +1580,105 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntryForTask(alloc, &request_entry, text, request_entry.dimensions, .retrieval_query);
     }
 
+    pub fn prepareQueryEmbedding(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        deadline_ns: u64,
+        cancellation: ?CancellationToken,
+        request_id: []const u8,
+        retry_not_before_ns: ?*u64,
+    ) !PreparedQueryEmbedding {
+        return self.prepareQueryEmbeddingWithPlacement(alloc, index_name, deadline_ns, cancellation, request_id, retry_not_before_ns, .generic);
+    }
+
+    pub fn prepareQueryEmbeddingForInvocation(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        deadline_ns: u64,
+        cancellation: ?CancellationToken,
+        request_id: []const u8,
+        retry_not_before_ns: ?*u64,
+        uses_template: bool,
+    ) !PreparedQueryEmbedding {
+        return self.prepareQueryEmbeddingWithPlacement(alloc, index_name, deadline_ns, cancellation, request_id, retry_not_before_ns, if (uses_template) .after_render else .text);
+    }
+
+    fn prepareQueryEmbeddingWithPlacement(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        deadline_ns: u64,
+        cancellation: ?CancellationToken,
+        request_id: []const u8,
+        retry_not_before_ns: ?*u64,
+        placement: enum { generic, text, after_render },
+    ) !PreparedQueryEmbedding {
+        const configured = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        var entry = configured.requestOverlay(alloc);
+        errdefer entry.auth_header_cache.deinit(alloc);
+        entry.deadline_ns = deadline_ns;
+        if (cancellation) |token| entry.cancellation = token;
+        entry.request_id = request_id;
+        entry.retry_not_before_ns = retry_not_before_ns;
+        entry.remote_query_workload = isAntflyProvider(entry.provider) and entry.antfly_provider == null;
+        // A template may produce media. Its invocation chooses placement after
+        // rendering, and its result is not published in the text query cache.
+        if (placement != .after_render) {
+            const shape: ?remote_capabilities.DiscoveryShape = if (placement == .text) .{ .items = 1, .modalities = .{ .text = true }, .output_tokens = 0 } else null;
+            if (try prepareRemoteQueryEmbedding(alloc, &entry, shape)) |lease| entry.planned_embedding_lease = lease;
+        }
+        return .{ .entry = entry };
+    }
+
+    pub const PreparedQueryEmbedding = struct {
+        entry: ManagedEmbeddingEntry,
+
+        pub fn deinit(self: *PreparedQueryEmbedding, alloc: std.mem.Allocator) void {
+            self.entry.auth_header_cache.deinit(alloc);
+        }
+
+        pub fn cacheHasFixedExpiration(self: *const PreparedQueryEmbedding) bool {
+            if (!self.entry.remote_query_workload) return false;
+            const lease = self.entry.planned_embedding_lease orelse return true;
+            const caps = lease.capabilities orelse return true;
+            return !caps.model_revision_pinning or caps.model_revision == null;
+        }
+
+        pub fn cacheKey(self: *const PreparedQueryEmbedding, domain: QueryCacheSecurityDomain, scope: []const u8, text: []const u8) ![32]u8 {
+            const base = try queryCacheKeyForEntry(&self.entry, domain, scope, text);
+            if (!self.entry.remote_query_workload) return base;
+            const lease = self.entry.planned_embedding_lease orelse return error.QueryEmbeddingNotCacheable;
+            const caps = lease.capabilities orelse return error.QueryEmbeddingNotCacheable;
+            const routing_scope = lease.scope_digest orelse return error.QueryEmbeddingNotCacheable;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update(&base);
+            // An alias without a published revision uses the same bounded
+            // cache contract as an unversioned embedding endpoint. Keep that
+            // namespace distinct from every advertised physical revision.
+            hash.update(&routing_scope);
+            if (!self.cacheHasFixedExpiration()) {
+                hash.update(&.{1});
+                hash.update(&caps.model_revision.?);
+            } else {
+                hash.update(&.{0});
+                if (lease.descriptor_revision) |descriptor| hash.update(descriptor.slice());
+            }
+            return hash.finalResult();
+        }
+
+        pub fn embed(self: *const PreparedQueryEmbedding, alloc: std.mem.Allocator, text: []const u8, embedding_template: ?[]const u8) ![]f32 {
+            if (embedding_template) |value| return embedQueryTemplateForEntry(alloc, &self.entry, text, value);
+            return embedWithEntryForTask(alloc, &self.entry, text, self.entry.dimensions, .retrieval_query);
+        }
+        pub fn embedWithRetryHint(self: *const PreparedQueryEmbedding, alloc: std.mem.Allocator, text: []const u8, embedding_template: ?[]const u8, retry_not_before_ns: ?*u64) ![]f32 {
+            var prepared = self.*;
+            prepared.entry.retry_not_before_ns = retry_not_before_ns;
+            return prepared.embed(alloc, text, embedding_template);
+        }
+    };
+
     /// Digest the effective dense-text embedding operation. Table and index
     /// names are intentionally excluded so equivalent configurations share
     /// results; the server-derived scope prevents cross-principal reuse.
@@ -1576,6 +1690,10 @@ pub const ManagedEmbedder = struct {
         text: []const u8,
     ) ![32]u8 {
         const entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        return queryCacheKeyForEntry(entry, security_domain, security_scope, text);
+    }
+
+    fn queryCacheKeyForEntry(entry: *const ManagedEmbeddingEntry, security_domain: QueryCacheSecurityDomain, security_scope: []const u8, text: []const u8) ![32]u8 {
         if (entry.sparse or entry.declaresMedia()) return error.QueryEmbeddingNotCacheable;
         const endpoint = managedEmbeddingEndpointIdentity(entry);
         // Only effective file-backed credentials depend on this store. Other
@@ -1619,6 +1737,10 @@ pub const ManagedEmbedder = struct {
         embedding_template: []const u8,
     ) ![]f32 {
         const entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        return embedQueryTemplateForEntry(alloc, entry, text, embedding_template);
+    }
+
+    fn embedQueryTemplateForEntry(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, text: []const u8, embedding_template: []const u8) ![]f32 {
         const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, entry);
         defer alloc.free(rendered);
         try ensureEntryDeadline(entry);
@@ -1640,13 +1762,7 @@ pub const ManagedEmbedder = struct {
         var request_entry = configured_entry.requestOverlay(alloc);
         defer request_entry.auth_header_cache.deinit(alloc);
         request_entry.cancellation = cancellation;
-        const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, &request_entry);
-        defer alloc.free(rendered);
-        try ensureEntryDeadline(&request_entry);
-        try validateRenderedTemplate(alloc, rendered);
-        const parts = try template_mod.textToParts(alloc, rendered);
-        defer template_mod.freeContentParts(alloc, parts);
-        return embedWithEntryPartsForTask(alloc, &request_entry, parts, request_entry.dimensions, .retrieval_query) catch |err| return err;
+        return embedQueryTemplateForEntry(alloc, &request_entry, text, embedding_template);
     }
 
     fn findQueryEntry(self: *const ManagedEmbedder, index_name: []const u8) ?*const ManagedEmbeddingEntry {
@@ -1737,6 +1853,28 @@ pub const ManagedEmbedder = struct {
             entry.dimensions,
             EmbeddingTaskType.retrieval_document.canonical(),
         });
+    }
+
+    fn sparseCacheRevisionWithContext(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, context: RequestContext) !?[32]u8 {
+        try context.check();
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var entry = configured.requestOverlay(a);
+        defer entry.auth_header_cache.deinit(a);
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        applyRequestContext(&entry, context, &cancellation);
+        const control = entry.discovery_context.?;
+        const local = entry.antfly_provider orelse return null;
+        const resolve = local.model_capabilities_with_context orelse {
+            if (local.model_capabilities != null) return error.UncancellableInferenceProvider;
+            return null;
+        };
+        const capabilities = try AntflyProviderBoundary.call("model_capabilities_with_context", local.boundary_dispatch, resolve, .{ local.ptr, a, entry.model, inference_work.Task.embed, control });
+        try control.check();
+        try capabilities.validate();
+        if (capabilities.task != .embed) return error.InvalidInferenceCapabilities;
+        return capabilities.model_revision;
     }
 
     fn sparseCacheRevision(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?[32]u8 {
@@ -2204,6 +2342,21 @@ pub const ManagedEmbedder = struct {
     }
 
     fn resolveDensePartLease(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, context: ?RequestContext) !inference_work.CapabilityLease {
+        return resolveDensePartLeaseForShape(ptr, alloc, name, context, null);
+    }
+
+    fn resolveDenseMediaPartLease(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, context: ?RequestContext, items: usize) !inference_work.CapabilityLease {
+        var count = @max(items, 1);
+        while (true) {
+            return resolveDensePartLeaseForShape(ptr, alloc, name, context, count) catch |err| {
+                if (err != error.InferenceDiscoveryTooManyItems or count == 1) return err;
+                count /= 2;
+                continue;
+            };
+        }
+    }
+
+    fn resolveDensePartLeaseForShape(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, context: ?RequestContext, media_items: ?usize) !inference_work.CapabilityLease {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
         var entry = configured.requestOverlay(alloc);
@@ -2213,18 +2366,34 @@ pub const ManagedEmbedder = struct {
             try value.check();
             applyRequestContext(&entry, value, &cancellation);
         }
-        return densePartLeaseForEntry(&entry, alloc);
+        if (media_items == null) return densePartLeaseForEntry(&entry, alloc);
+        var lease = try discoveredEmbeddingLeaseForShape(&entry, alloc, media_items);
+        if (entry.declared_inputs) |inputs| if (lease.capabilities) |*caps| applyDeclaredInputs(caps, inputs);
+        return lease;
     }
 
     fn densePartLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
-        var lease = try discoveredDensePartLeaseForEntry(entry, alloc);
+        if (entry.sparse) return error.UnsupportedEmbeddingProvider;
+        var lease = try discoveredEmbeddingLeaseForEntry(entry, alloc);
         if (entry.declared_inputs) |inputs| if (lease.capabilities) |*capabilities| applyDeclaredInputs(capabilities, inputs);
         return lease;
     }
 
-    fn discoveredDensePartLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
-        if (entry.sparse) return error.UnsupportedEmbeddingProvider;
+    fn discoveredEmbeddingLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
+        return discoveredEmbeddingLeaseForShape(entry, alloc, null);
+    }
+
+    fn discoveredEmbeddingLeaseForShape(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator, media_items: ?usize) !inference_work.CapabilityLease {
         if (entry.antfly_provider) |local| {
+            if (entry.discovery_context) |context| {
+                try context.check();
+                const resolve = local.model_capabilities_with_context orelse return error.UncancellableInferenceProvider;
+                const result = try AntflyProviderBoundary.call("model_capabilities_with_context", local.boundary_dispatch, resolve, .{ local.ptr, alloc, entry.model, inference_work.Task.embed, context });
+                try context.check();
+                try result.validate();
+                if (result.task != .embed) return error.InvalidInferenceCapabilities;
+                return .{ .capabilities = result };
+            }
             if (local.model_capabilities) |resolve| {
                 const result = try AntflyProviderBoundary.call(
                     "model_capabilities",
@@ -2243,29 +2412,36 @@ pub const ManagedEmbedder = struct {
             const http = try entry.httpClient(alloc, &fallback_http);
             var auth_header: ?[]u8 = null;
             defer if (auth_header) |value| alloc.free(value);
-            var header_storage: [2][2][]const u8 = undefined;
-            var header_count: usize = 0;
-            if (entry.api_key) |*api_key_ref| {
+            if (entry.api_key) |*api_key_ref|
                 auth_header = try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref);
-                if (auth_header) |value| {
-                    header_storage[header_count] = .{ "Authorization", value };
-                    header_count += 1;
+            var storage: [4][2][]const u8 = undefined;
+            const headers = remoteEmbeddingHeaders(entry, auth_header, &storage);
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            var selected_items = media_items;
+            var lease = while (true) {
+                const discovery_headers = if (selected_items) |count| try placement.withShape(headers, .{ .items = count, .modalities = .{ .image = true }, .output_tokens = 0 }) else headers;
+                break discoverRemoteEmbeddingLease(entry, http, discovery_headers) catch |err| switch (err) {
+                    error.QueryEmbeddingOverloaded => return error.QueueFull,
+                    error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilitySelectorAbsent, error.InferenceCapabilitiesStale => return error.InferenceCapacityUnavailable,
+                    error.InferenceDiscoveryTooManyItems => {
+                        const count = selected_items orelse return err;
+                        if (count <= 1) return err;
+                        selected_items = count / 2;
+                        continue;
+                    },
+                    else => return err,
+                };
+            };
+            if (lease.capabilities != null) {
+                if (selected_items) |count| {
+                    lease.media_placement_items = count;
+                    const caps = &lease.capabilities.?;
+                    caps.batch.max_items = @min(caps.batch.max_items, count);
+                    caps.batch.preferred_items = @min(caps.batch.preferred_items, caps.batch.max_items);
                 }
+                lease.scope_digest = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers);
+                return lease;
             }
-            if (entry.source_table.len > 0) {
-                header_storage[header_count] = .{ "X-Antfly-Source-Table", entry.source_table };
-                header_count += 1;
-            }
-            const headers = header_storage[0..header_count];
-            const discovered: ?remote_capabilities.CapabilityLease = discoverRemoteEmbeddingLease(entry, http, headers) catch |err| switch (err) {
-                error.OutOfMemory, error.Canceled, error.Timeout => return err,
-                else => null,
-            };
-            if (discovered) |lease| if (lease.capabilities != null) {
-                var owned = lease;
-                owned.scope_digest = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers);
-                return owned;
-            };
         }
         if (entry.provider != .antfly and !entry.declaresMedia()) {
             // These are adapter contracts, not remote capability guesses.
@@ -2317,6 +2493,37 @@ pub const ManagedEmbedder = struct {
         const owner_alloc = self.alloc;
         self.deinit();
         owner_alloc.destroy(self);
+    }
+
+    fn resolveSparseGeneration(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, context: ?RequestContext) !db_embedder.SparseEmbedder.Generation {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        if (configured.antfly_provider) |local| if (local.model_capabilities == null and local.model_capabilities_with_context == null) return .{};
+        var entry = configured.requestOverlay(a);
+        defer entry.auth_header_cache.deinit(a);
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&entry, value, &cancellation);
+        }
+        const lease = try discoveredEmbeddingLeaseForEntry(&entry, a);
+        return .{ .revision = if (lease.capabilities) |caps| caps.model_revision else null, .lease = lease };
+    }
+
+    fn embedSparseBatchPlanned(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, texts: []const []const u8, context: ?RequestContext, generation: db_embedder.SparseEmbedder.Generation) ![]db_embedder.SparseEmbedding {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var entry = configured.requestOverlay(a);
+        defer entry.auth_header_cache.deinit(a);
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&entry, value, &cancellation);
+        }
+        entry.planned_embedding_lease = generation.lease;
+        return embedSparseBatchWithEntry(a, &entry, texts);
     }
 
     fn embedSparse(ptr: *anyopaque, alloc: std.mem.Allocator, embedding_name: []const u8, text: []const u8) !db_embedder.SparseEmbedding {
@@ -2417,6 +2624,11 @@ fn applyRequestContext(
         context.deadline_ns;
     entry.cancellation = cancellation.token();
     if (context.progress) |progress| entry.progress = progress;
+    var discovery = context;
+    discovery.deadline_ns = entry.deadline_ns;
+    discovery.cancellation = entry.cancellation;
+    discovery.progress = entry.progress;
+    entry.discovery_context = discovery;
 }
 
 pub const QueryCacheSecurityDomain = enum {
@@ -2595,6 +2807,9 @@ fn applyAntflyEmbeddingRequestControls(
     if (provider.model_identity != null) provider.numeric_dense_dimensions = null;
     provider.setRequestCancellation(entry.cancellation);
     provider.setRequestTimeoutMs(timeout_ms);
+    provider.request_id = entry.request_id;
+    provider.embedding_workload = remoteEmbeddingWorkload(entry);
+    provider.retry_after_ms = entry.retry_after_ms;
     provider.setMaxResponseBytes(remote_embedding_max_response_bytes);
 }
 /// Replace discovered input types with configured `inputs`. Transport and
@@ -3174,6 +3389,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
             defer out.deinit(alloc);
             try out.appendSlice(alloc, "{\"field\":");
             try appendJsonString(alloc, &out, source_field);
+            try out.appendSlice(alloc, ",\"external\":true");
             try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
             try appendExecutionObjectIfPresent(alloc, &out, root);
             try out.append(alloc, '}');
@@ -5417,6 +5633,7 @@ fn buildManagedEmbeddingEntry(
         .base_url = base_url,
         .gateway_id = gateway_id,
         .source_table = source_table,
+        .request_id = options.request_id,
         .region = provider_region,
         .project_id = project_id,
         .location = location,
@@ -5805,6 +6022,7 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
         error.ConnectionTimedOut,
+        error.TlsTransportReadFailed,
         error.Timeout,
         error.NetworkUnreachable,
         error.HostLacksNetworkAddresses,
@@ -5818,6 +6036,7 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
         // errors. Dimension probing must preserve that operational class when
         // `validation: defer_probe` is selected.
         error.RemoteCapabilityDiscoveryTransient,
+        error.RemoteCapabilitySelectorAbsent,
         // Executor admission is transport capacity, not a malformed index
         // definition. Surface it through the retryable probe-unavailable
         // contract so clients do not turn transient saturation into a
@@ -6231,10 +6450,14 @@ fn normalizeLocalEmbeddingError(err: anyerror) anyerror {
     };
 }
 
+fn remoteEmbeddingWorkload(entry: *const ManagedEmbeddingEntry) antfly_provider_mod.EmbeddingWorkload {
+    return if (entry.remote_query_workload) .query else .document;
+}
+
 fn remoteEmbeddingHeaders(
     entry: *const ManagedEmbeddingEntry,
     authorization_header: ?[]const u8,
-    storage: *[2][2][]const u8,
+    storage: *[4][2][]const u8,
 ) []const [2][]const u8 {
     var count: usize = 0;
     if (authorization_header) |value| {
@@ -6245,7 +6468,42 @@ fn remoteEmbeddingHeaders(
         storage[count] = .{ "X-Antfly-Source-Table", entry.source_table };
         count += 1;
     }
+    storage[count] = .{ "X-Antfly-Inference-Workload-Type", remoteEmbeddingWorkload(entry).headerValue() };
+    count += 1;
+    if (entry.request_id.len > 0) {
+        storage[count] = .{ remote_capabilities.parent_request_id_header, entry.request_id };
+        count += 1;
+    }
     return storage[0..count];
+}
+
+fn embeddingPlacementHeaders(placement: *remote_capabilities.DiscoveryHeaders, base: []const [2][]const u8, items: usize, media: bool) ![]const [2][]const u8 {
+    return placement.withShape(base, .{ .items = @max(items, 1), .media = media, .modalities = .{ .text = !media }, .output_tokens = 0 });
+}
+
+fn hasEmbeddingMedia(parts: []const template_mod.ContentPart) bool {
+    for (parts) |part| {
+        if (part != .text) return true;
+    }
+    return false;
+}
+
+fn embeddingPartsDiscoveryShape(parts: []const template_mod.ContentPart, items: usize) remote_capabilities.DiscoveryShape {
+    var modalities: inference_work.Modalities = .{};
+    for (parts) |part| switch (part) {
+        .text => modalities.text = true,
+        .media_url => modalities.image = true,
+        .binary => |media| if (inference_work.modalityForMimeType(media.mime_type)) |required| {
+            mergeModalities(&modalities, required);
+        },
+    };
+    const media = hasEmbeddingMedia(parts);
+    return .{
+        .items = @max(items, 1),
+        .media = media,
+        .modalities = modalities,
+        .output_tokens = 0,
+    };
 }
 
 fn textEmbeddingInvocationShape(texts: []const []const u8) !inference_work.InvocationShape {
@@ -6372,14 +6630,10 @@ fn bindRemoteEmbeddingLease(
     http: *httpx.Client,
     provider: *antfly_provider_mod.Provider,
     headers: []const [2][]const u8,
+    placement_headers: []const [2][]const u8,
     shape: inference_work.InvocationShape,
 ) !remote_capabilities.CapabilityLease {
-    const lease = try acquireRemoteEmbeddingLease(
-        entry,
-        http,
-        provider,
-        headers,
-    );
+    const lease = try acquireRemoteEmbeddingLease(entry, http, provider, headers, placement_headers, null);
     if (lease.capabilities) |capabilities| try capabilities.validateInvocation(.embed, shape);
     return lease;
 }
@@ -6391,7 +6645,10 @@ fn discoverRemoteEmbeddingLease(entry: *const ManagedEmbeddingEntry, http: *http
     const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     var lease = try cache.getOrDiscoverLeaseWithContext(http, entry.base_url, entry.model, .embed, headers, .{
         .deadline_ns = entry.deadline_ns,
+        .retry_not_before_ns = entry.retry_not_before_ns,
         .cancellation = entry.cancellation orelse .none,
+        .refresh_in_background = entry.remote_query_workload and entry.shared_http_client == null and
+            (if (entry.provider_runtime) |runtime| cache == &runtime.remote_capability_cache else false),
     });
     // Older catalogs expose an observed identity without promising that their
     // executor can pin it. Keep those routes usable, but never stamp their
@@ -6402,29 +6659,56 @@ fn discoverRemoteEmbeddingLease(entry: *const ManagedEmbeddingEntry, http: *http
     return lease;
 }
 
+fn resolvePlannedRemoteEmbeddingLease(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    http: *httpx.Client,
+    headers: []const [2][]const u8,
+    placement_headers: []const [2][]const u8,
+    planned: remote_capabilities.CapabilityLease,
+    media_items: ?usize,
+) !remote_capabilities.CapabilityLease {
+    const scope = planned.scope_digest orelse return planned;
+    const shaped_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, placement_headers);
+    if (std.mem.eql(u8, &scope, &shaped_scope)) return planned;
+    const base_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers);
+    if (!std.mem.eql(u8, &scope, &base_scope)) return error.InferenceCapabilitiesStale;
+    if (planned.routing_token == null) return planned;
+    if (planned.media_placement_items) |limit| {
+        if (media_items) |count| if (count <= limit) return planned;
+    }
+
+    const revision = planned.descriptor_revision orelse return error.InferenceCapabilitiesStale;
+    var execution = try discoverRemoteEmbeddingLease(entry, http, placement_headers);
+    const discovered_revision = execution.descriptor_revision orelse return error.InferenceCapabilitiesStale;
+    if (execution.routing_token == null or !std.mem.eql(u8, revision.slice(), discovered_revision.slice())) {
+        // The caller records the generation it planned before dispatch.
+        return error.InferenceCapabilitiesStale;
+    }
+    if (entry.declared_inputs) |inputs| if (execution.capabilities) |*caps| applyDeclaredInputs(caps, inputs);
+    execution.scope_digest = shaped_scope;
+    execution.planning_only = planned.planning_only;
+    return execution;
+}
+
 fn acquireRemoteEmbeddingLease(
     entry: *const ManagedEmbeddingEntry,
     http: *httpx.Client,
     provider: *antfly_provider_mod.Provider,
     headers: []const [2][]const u8,
+    placement_headers: []const [2][]const u8,
+    media_items: ?usize,
 ) !remote_capabilities.CapabilityLease {
     if (entry.planned_embedding_lease) |planned| {
-        if (planned.scope_digest) |scope| {
-            const actual = try remote_capabilities.scopeDigest(provider.allocator, entry.base_url, entry.model, .embed, headers);
-            if (!std.mem.eql(u8, &scope, &actual)) return error.InferenceCapabilitiesStale;
-        }
-        // Keep the coordinator's route and descriptor through every retry.
-        // Discovering another lease here could stamp its vectors with the old
-        // generation captured before execution.
-        provider.model_revision = if (planned.capabilities) |caps| caps.model_revision else null;
-        var execution = planned;
+        var execution = try resolvePlannedRemoteEmbeddingLease(provider.allocator, entry, http, headers, placement_headers, planned, media_items);
+        provider.model_revision = if (execution.capabilities) |caps| caps.model_revision else null;
         if (execution.planning_only) execution.capabilities = null;
         provider.setFramedAttachments(if (execution.capabilities) |caps| caps.framed_attachments else false);
-        if (planned.routing_token) |token| try provider.setCapabilityToken(token.slice());
-        if (planned.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
+        if (execution.routing_token) |token| try provider.setCapabilityToken(token.slice());
+        if (execution.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
         return execution;
     }
-    const lease = try discoverRemoteEmbeddingLease(entry, http, headers);
+    const lease = try discoverRemoteEmbeddingLease(entry, http, placement_headers);
     provider.model_revision = if (lease.capabilities) |caps| caps.model_revision else null;
     // Providers are reused across invocations, but transport support belongs
     // to this concrete lease. Reset first so a legacy or downgraded route can
@@ -6444,6 +6728,7 @@ fn bindRemoteEmbeddingPartsLease(
     http: *httpx.Client,
     provider: *antfly_provider_mod.Provider,
     headers: []const [2][]const u8,
+    placement_headers: []const [2][]const u8,
     parts: []const template_mod.ContentPart,
     independently_addressable: bool,
 ) !remote_capabilities.CapabilityLease {
@@ -6452,6 +6737,8 @@ fn bindRemoteEmbeddingPartsLease(
         http,
         provider,
         headers,
+        placement_headers,
+        if (hasEmbeddingMedia(parts)) (if (independently_addressable) parts.len else 1) else null,
     );
     if (lease.capabilities) |capabilities| {
         const transport: inference_work.AttachmentTransport = if (capabilities.framed_attachments)
@@ -6474,9 +6761,23 @@ fn bindRemoteEmbeddingPartsLease(
 fn invalidateRemoteEmbeddingLease(
     entry: *const ManagedEmbeddingEntry,
     headers: []const [2][]const u8,
+    lease: remote_capabilities.CapabilityLease,
 ) !void {
     const cache = entry.capabilityCache() orelse return;
-    try cache.invalidate(entry.base_url, entry.model, .embed, headers);
+    const rejected: remote_capabilities.LeaseIdentity = .{
+        .routing_token = lease.routing_token,
+        .descriptor_revision = lease.descriptor_revision,
+    };
+    try cache.invalidateLease(entry.base_url, entry.model, .embed, headers, rejected);
+    if (headers.len > 0 and std.ascii.eqlIgnoreCase(headers[headers.len - 1][0], remote_capabilities.discovery_shape_header)) {
+        const base = headers[0 .. headers.len - 1];
+        try cache.invalidateLease(entry.base_url, entry.model, .embed, base, rejected);
+        if (lease.media_placement_items) |count| {
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            const planned_headers = try placement.withShape(base, .{ .items = count, .modalities = .{ .image = true }, .output_tokens = 0 });
+            try cache.invalidateLease(entry.base_url, entry.model, .embed, planned_headers, rejected);
+        }
+    }
 }
 
 fn embedWithEntryParts(
@@ -6495,7 +6796,7 @@ fn embedWithEntryPartsForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]f32 {
-    return withQueryEmbeddingRetry([]f32, alloc, entry, embedWithEntryPartsForTaskOnce, .{ parts, dims, task_type }, task_type);
+    return withQueryEmbeddingRetry([]f32, alloc, entry, embedWithEntryPartsForTaskOnce, .{ parts, dims, task_type }, task_type, embeddingPartsDiscoveryShape(parts, 1));
 }
 
 fn embedWithEntryPartsForTaskOnce(
@@ -6583,14 +6884,17 @@ fn embedWithEntryPartsForTaskOnce(
                 try provider.setAuthorizationHeader(auth_header);
             }
         }
-        var capability_header_storage: [2][2][]const u8 = undefined;
+        var capability_header_storage: [4][2][]const u8 = undefined;
         const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
-        _ = try bindRemoteEmbeddingPartsLease(
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        const placement_headers = try placement.withShape(capability_headers, embeddingPartsDiscoveryShape(parts, 1));
+        const lease = try bindRemoteEmbeddingPartsLease(
             alloc,
             entry,
             http,
             &provider,
             capability_headers,
+            placement_headers,
             parts,
             false,
         );
@@ -6606,7 +6910,7 @@ fn embedWithEntryPartsForTaskOnce(
         ) catch |err| switch (err) {
             error.EmptyResponse => return error.EmptyEmbeddingResponse,
             error.InferenceCapabilitiesStale => {
-                try invalidateRemoteEmbeddingLease(entry, capability_headers);
+                try invalidateRemoteEmbeddingLease(entry, placement_headers, lease);
                 return err;
             },
             else => return err,
@@ -7068,44 +7372,31 @@ fn embedPartItemsWithEntry(
     try provider.setSourceTable(entry.source_table);
     var auth_header_owned: ?[]u8 = null;
     defer if (auth_header_owned) |value| alloc.free(value);
-    var capability_header_storage: [2][2][]const u8 = undefined;
-    var capability_header_count: usize = 0;
     if (entry.api_key) |*api_key_ref| {
         if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
             auth_header_owned = auth_header;
             try provider.setAuthorizationHeader(auth_header);
-            capability_header_storage[capability_header_count] = .{ "Authorization", auth_header };
-            capability_header_count += 1;
         }
     }
-    if (entry.source_table.len > 0) {
-        capability_header_storage[capability_header_count] = .{ "X-Antfly-Source-Table", entry.source_table };
-        capability_header_count += 1;
-    }
-    const capability_headers = capability_header_storage[0..capability_header_count];
-    const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
+    var capability_header_storage: [4][2][]const u8 = undefined;
+    const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
+    var placement: remote_capabilities.DiscoveryHeaders = .{};
+    const placement_headers = try placement.withShape(capability_headers, embeddingPartsDiscoveryShape(items, items.len));
     const planned_capabilities = planned_lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
-    if (planned_lease.scope_digest) |scope| {
-        const current_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, capability_headers);
-        if (!std.mem.eql(u8, &scope, &current_scope)) return error.InferenceCapabilitiesStale;
-        const lease = planned_lease;
+    const execution_lease = if (planned_lease.scope_digest != null) lease: {
+        const lease = try resolvePlannedRemoteEmbeddingLease(alloc, entry, http, capability_headers, placement_headers, planned_lease, if (hasEmbeddingMedia(items)) items.len else null);
         const live = lease.capabilities orelse return error.InferenceCapabilitiesStale;
         try validateDensePartItemInvocation(alloc, live, if (live.framed_attachments) .segmented_framed_binary else .base64_payload, items);
+        provider.model_revision = live.model_revision;
         provider.setFramedAttachments(live.framed_attachments);
         if (lease.routing_token) |token| try provider.setCapabilityToken(token.slice());
         if (lease.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
         if (live.numeric_responses_v1 and dims != 0) provider.numeric_dense_dimensions = dims;
-    } else if (planned_capabilities.numeric_responses_v1 and dims != 0) {
-        return error.InferenceCapabilitiesStale;
-    } else _ = try bindRemoteEmbeddingPartsLease(
-        alloc,
-        entry,
-        http,
-        &provider,
-        capability_headers,
-        items,
-        true,
-    );
+        break :lease lease;
+    } else if (planned_capabilities.numeric_responses_v1 and dims != 0)
+        return error.InferenceCapabilitiesStale
+    else
+        try bindRemoteEmbeddingPartsLease(alloc, entry, http, &provider, capability_headers, placement_headers, items, true);
     const operation_deadline_ns = embeddingOperationDeadline(entry);
     try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
     if (provider.numeric_dense_dimensions != null) provider.setMaxResponseBytes(try numericDenseResponseLimit(items.len, dims));
@@ -7113,7 +7404,7 @@ fn embedPartItemsWithEntry(
     var result = provider.embedParts(alloc, entry.model, items) catch |err| switch (err) {
         error.EmptyResponse => return error.EmptyEmbeddingResponse,
         error.InferenceCapabilitiesStale => {
-            try capability_cache.invalidate(entry.base_url, entry.model, .embed, capability_headers);
+            try invalidateRemoteEmbeddingLease(entry, placement_headers, execution_lease);
             return err;
         },
         else => return err,
@@ -7158,6 +7449,7 @@ fn embedSparseBatchWithEntry(
                 try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, .retrieval_document);
                 try context.check();
+                if ((context.model_revision != null or context.model_identity != null) and local.embed_sparse_texts_with_context == null) return error.InvalidEmbeddingIdentity;
                 const embeddings = (if (local.embed_sparse_texts_with_context) |embed_with_context|
                     AntflyProviderBoundary.call("embed_sparse_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
                 else
@@ -7186,13 +7478,16 @@ fn embedSparseBatchWithEntry(
                     try provider.setAuthorizationHeader(auth_header);
                 }
             }
-            var capability_header_storage: [2][2][]const u8 = undefined;
+            var capability_header_storage: [4][2][]const u8 = undefined;
             const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
-            _ = try bindRemoteEmbeddingLease(
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, texts.len, false);
+            const lease = try bindRemoteEmbeddingLease(
                 entry,
                 http,
                 &provider,
                 capability_headers,
+                placement_headers,
                 try textEmbeddingInvocationShape(texts),
             );
             const operation_deadline_ns = embeddingOperationDeadline(entry);
@@ -7200,7 +7495,7 @@ fn embedSparseBatchWithEntry(
 
             var result = provider.embedSparse(alloc, entry.model, texts) catch |err| {
                 if (err == error.InferenceCapabilitiesStale)
-                    try invalidateRemoteEmbeddingLease(entry, capability_headers);
+                    try invalidateRemoteEmbeddingLease(entry, placement_headers, lease);
                 return err;
             };
             defer result.deinit();
@@ -7568,63 +7863,238 @@ fn embedBatchWithEntryForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    return withQueryEmbeddingRetry([]const []const f32, alloc, entry, embedBatchWithEntryForTaskOnce, .{ texts, dims, task_type }, task_type);
+    return embedTextWindow(alloc, entry, texts, dims, task_type) catch |err| {
+        if (err != error.InferenceDiscoveryTooManyItems or texts.len <= 1 or
+            !isAntflyProvider(entry.provider) or entry.antfly_provider != null) return err;
+        return embedSmallerTextWindows(alloc, entry, texts, dims, task_type);
+    };
+}
+
+fn embedTextWindow(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType) ![]const []const f32 {
+    return withQueryEmbeddingRetry([]const []const f32, alloc, entry, embedBatchWithEntryForTaskOnce, .{ texts, dims, task_type }, task_type, textWindowPlacement(texts.len));
+}
+
+fn textWindowPlacement(count: usize) remote_capabilities.DiscoveryShape {
+    return .{ .items = @max(count, 1), .modalities = .{ .text = true }, .output_tokens = 0 };
+}
+
+fn sameTextWindowContract(prior: remote_capabilities.CapabilityLease, current: remote_capabilities.CapabilityLease) bool {
+    const old_caps = prior.capabilities;
+    const new_caps = current.capabilities;
+    const old_model = if (old_caps) |caps| caps.model_revision else null;
+    const new_model = if (new_caps) |caps| caps.model_revision else null;
+    if (!std.meta.eql(old_model, new_model)) return false;
+    if (old_model != null and old_caps.?.model_revision_pinning and new_caps.?.model_revision_pinning) {
+        return old_caps.?.output == new_caps.?.output and
+            old_caps.?.result_cardinality == new_caps.?.result_cardinality and
+            std.meta.eql(old_caps.?.dense_output, new_caps.?.dense_output);
+    }
+    if (prior.descriptor_revision) |expected| {
+        const actual = current.descriptor_revision orelse return false;
+        return std.mem.eql(u8, expected.slice(), actual.slice());
+    }
+    return current.descriptor_revision == null;
+}
+
+test "split text windows compare pinned output identity across placement contracts" {
+    const prior: remote_capabilities.CapabilityLease = .{
+        .descriptor_revision = try remote_capabilities.CapabilityRevision.init("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .capabilities = .{
+            .task = .embed,
+            .input_modalities = .{ .text = true },
+            .input_granularity = .chunk,
+            .output = .embedding,
+            .model_revision = @splat(1),
+            .model_revision_pinning = true,
+            .dense_output = .{ .native_dimensions = 3, .minimum_dimensions = 3 },
+        },
+    };
+    var current = prior;
+    current.descriptor_revision = try remote_capabilities.CapabilityRevision.init("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    current.capabilities.?.numeric_responses_v1 = true;
+    try std.testing.expect(sameTextWindowContract(prior, current));
+    current.capabilities.?.dense_output.?.native_dimensions = 4;
+    try std.testing.expect(!sameTextWindowContract(prior, current));
+    current.capabilities = prior.capabilities;
+    current.capabilities.?.model_revision = @splat(2);
+    try std.testing.expect(!sameTextWindowContract(prior, current));
+    current.capabilities = prior.capabilities;
+    current.capabilities.?.model_revision_pinning = false;
+    try std.testing.expect(!sameTextWindowContract(prior, current));
+}
+
+fn embedSmallerTextWindows(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType) ![]const []const f32 {
+    var bounded = entry.requestOverlay(alloc);
+    defer bounded.auth_header_cache.deinit(alloc);
+    bounded.deadline_ns = embeddingOperationDeadline(entry);
+    if (task_type == .retrieval_query and entry.planned_embedding_lease == null) bounded.remote_query_workload = true;
+
+    var witness = entry.planned_embedding_lease;
+    var limit = texts.len / 2;
+    const results = try alloc.alloc([]const f32, texts.len);
+    var filled: usize = 0;
+    errdefer {
+        for (results[0..filled]) |vector| alloc.free(vector);
+        alloc.free(results);
+    }
+    var placement_refreshes: usize = 0;
+    while (filled < texts.len) {
+        const count = @min(limit, texts.len - filled);
+        bounded.planned_embedding_lease = null;
+        const placement = (prepareRemoteQueryEmbedding(alloc, &bounded, textWindowPlacement(count)) catch |err| {
+            if (err != error.InferenceDiscoveryTooManyItems or count <= 1) return err;
+            limit = count / 2;
+            continue;
+        }) orelse return error.InferenceCapabilitiesUnavailable;
+        if (witness) |prior| {
+            if (!sameTextWindowContract(prior, placement))
+                return error.InferenceCapabilitiesStale;
+        } else witness = placement;
+        bounded.planned_embedding_lease = placement;
+        const vectors = embedTextWindow(alloc, &bounded, texts[filled..][0..count], dims, task_type) catch |err| {
+            if (err != error.InferenceCapabilitiesStale or placement_refreshes >= 3) return err;
+            placement_refreshes += 1;
+            try ensureEntryDeadline(&bounded);
+            continue;
+        };
+        placement_refreshes = 0;
+        if (vectors.len != count) {
+            db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+            return error.InvalidEmbeddingResponse;
+        }
+        @memcpy(results[filled..][0..count], vectors);
+        filled += count;
+        alloc.free(vectors);
+    }
+    return results;
+}
+
+// Request-ID sampling keeps all stages of a sampled search correlatable.
+fn logRemoteQueryEmbeddingStage(entry: *const ManagedEmbeddingEntry, stage: []const u8, started_ns: u64, attempts: usize, failure: ?anyerror) void {
+    const took_ms = (monotonicNowNs() -| started_ns) / std.time.ns_per_ms;
+    const outcome = if (failure) |err| @errorName(err) else "ok";
+    const fmt = "remote query embedding stage={s} model={s} request_id={s} took_ms={d} attempts={d} outcome={s}";
+    const args = .{ stage, entry.model, entry.request_id, took_ms, attempts, outcome };
+    if (entry.request_id.len != 0 and std.hash.Wyhash.hash(0, entry.request_id) % 128 == 0) {
+        std.log.info(fmt, args);
+    } else {
+        std.log.debug(fmt, args);
+    }
 }
 
 // A query retry budget covers inference, not scale-from-zero preparation.
 // Reuse the normal capability cache before establishing the default query clock.
-fn prepareRemoteQueryEmbedding(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) !void {
-    if (!isAntflyProvider(entry.provider) or entry.antfly_provider != null or entry.planned_embedding_lease != null) return;
+fn prepareRemoteQueryEmbedding(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, shape: ?remote_capabilities.DiscoveryShape) !?remote_capabilities.CapabilityLease {
+    if (!isAntflyProvider(entry.provider) or entry.antfly_provider != null or entry.planned_embedding_lease != null) return null;
     var fallback_http: ?httpx.Client = null;
     defer if (fallback_http) |*client| client.deinit();
     const http = try entry.httpClient(alloc, &fallback_http);
     var auth: ?[]u8 = null;
     defer if (auth) |value| alloc.free(value);
     if (entry.api_key) |*key| auth = try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, key);
-    var storage: [2][2][]const u8 = undefined;
+    var storage: [4][2][]const u8 = undefined;
     const headers = remoteEmbeddingHeaders(entry, auth, &storage);
-    _ = try discoverRemoteEmbeddingLease(entry, http, headers);
+    var placement: remote_capabilities.DiscoveryHeaders = .{};
+    const discovery_headers = if (shape) |value|
+        try placement.withShape(headers, value)
+    else
+        headers;
+    const started = monotonicNowNs();
+    var failure: ?anyerror = null;
+    defer logRemoteQueryEmbeddingStage(entry, "discovery", started, 1, failure);
+    var lease = discoverRemoteEmbeddingLease(entry, http, discovery_headers) catch |err| {
+        failure = err;
+        return err;
+    };
+    lease.scope_digest = remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, discovery_headers) catch |err| {
+        failure = err;
+        return err;
+    };
+    return lease;
 }
 
-fn withQueryEmbeddingRetry(comptime Result: type, alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, comptime invoke: anytype, args: anytype, task_type: EmbeddingTaskType) !Result {
+fn withQueryEmbeddingRetry(comptime Result: type, alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, comptime invoke: anytype, args: anytype, task_type: EmbeddingTaskType, shape: ?remote_capabilities.DiscoveryShape) !Result {
     if (task_type != .retrieval_query) return @call(.auto, invoke, .{ alloc, entry } ++ args);
     // A foreground query shares inference capacity with backfill. Keep one
     // deadline across retries, and yield the executor during bounded waits.
-    var attempt: usize = 0;
-    try prepareRemoteQueryEmbedding(alloc, entry);
-    const deadline = embeddingOperationDeadline(entry);
+    const remote = isAntflyProvider(entry.provider) and entry.antfly_provider == null;
     var bounded = entry.requestOverlay(alloc);
-    bounded.deadline_ns = deadline;
     defer bounded.auth_header_cache.deinit(alloc);
-    while (true) : (attempt += 1) {
-        try ensureEntryDeadline(&bounded);
-        return @call(.auto, invoke, .{ alloc, &bounded } ++ args) catch |err| {
-            // An interactive query does not care whether the local provider
-            // never ran the request (EmbedAdmissionRefused) or a provider
-            // failed outright (EmbedTransientFailure): either retries the
-            // same way here. Only the document enrichment retry-budget
-            // accounting needs the finer-grained identity, so collapse it
-            // back once this retry gives up, keeping every caller outside
-            // this loop seeing the one query-path unavailable error it saw
-            // before that distinction existed.
-            const admission_refused = err == error.EmbedAdmissionRefused;
-            const retryable = err == error.EmbedTransientFailure or admission_refused;
-            if (!retryable or attempt >= 3) return if (admission_refused) error.EmbedTransientFailure else err;
-            try waitQueryEmbeddingRetry(&bounded, deadline);
+    // A caller-owned plan carries its original routing scope.
+    bounded.remote_query_workload = remote and (entry.remote_query_workload or entry.planned_embedding_lease == null);
+    if (try prepareRemoteQueryEmbedding(alloc, &bounded, shape)) |lease| bounded.planned_embedding_lease = lease;
+    const deadline = embeddingOperationDeadline(entry);
+    bounded.deadline_ns = deadline;
+    const started = monotonicNowNs();
+    var attempts: usize = 0;
+    var retry_after_ms: u64 = 0;
+    var upstream_retry_not_before: u64 = 0;
+    bounded.retry_after_ms = &retry_after_ms;
+    bounded.retry_not_before_ns = &upstream_retry_not_before;
+    var failure: ?anyerror = null;
+    defer {
+        if (remote) logRemoteQueryEmbeddingStage(entry, "inference", started, attempts, failure);
+        if (entry.retry_not_before_ns) |hint| hint.* = if (failure != null) upstream_retry_not_before else 0;
+    }
+    while (true) {
+        ensureEntryDeadline(&bounded) catch |err| {
+            failure = err;
+            return err;
+        };
+        attempts += 1;
+        retry_after_ms = 0;
+        upstream_retry_not_before = 0;
+        const result = @call(.auto, invoke, .{ alloc, &bounded } ++ args) catch |err| {
+            const admission_refused = err == error.EmbedAdmissionRefused or err == error.QueueFull or err == error.InferenceCapacityUnavailable;
+            if (retry_after_ms != 0)
+                upstream_retry_not_before = @max(upstream_retry_not_before, monotonicNowNs() +| (retry_after_ms *| std.time.ns_per_ms));
+            const stale = err == error.InferenceCapabilitiesStale and entry.planned_embedding_lease == null;
+            // A socket read failure underneath TLS can lose an embedding
+            // response. Recompute under the query's existing deadline.
+            const transient = err == error.EmbedTransientFailure or err == error.TlsTransportReadFailed or
+                (err == error.EmbedRateLimited and retry_after_ms != 0);
+            if ((!admission_refused and !stale and !transient) or attempts >= 4) {
+                failure = err;
+                return if (admission_refused) error.EmbedTransientFailure else err;
+            }
+            std.log.debug("query embedding retry model={s} request_id={s} attempt={d} err={s}", .{
+                entry.model, entry.request_id, attempts, @errorName(err),
+            });
+            if (stale) {
+                bounded.planned_embedding_lease = null;
+            } else {
+                const waited = waitQueryEmbeddingRetry(&bounded, deadline, attempts, retry_after_ms) catch |wait_err| {
+                    failure = wait_err;
+                    return wait_err;
+                };
+                if (!waited) {
+                    failure = err;
+                    return if (admission_refused) error.EmbedTransientFailure else err;
+                }
+            }
             continue;
         };
+        return result;
     }
 }
 
-fn waitQueryEmbeddingRetry(entry: *const ManagedEmbeddingEntry, deadline: u64) !void {
-    const wake = @min(deadline, monotonicNowNs() +| std.time.ns_per_s);
+fn waitQueryEmbeddingRetry(entry: *const ManagedEmbeddingEntry, deadline: u64, attempts: usize, retry_after_ms: u64) !bool {
+    try ensureEntryDeadline(entry);
+    const io = embeddingIo(entry);
+    var random: [2]u8 = undefined;
+    io.random(&random);
+    const backoff_ms = @as(u64, 250) << @as(u6, @intCast(@min(attempts - 1, 3)));
+    const jitter_ms = std.mem.readInt(u16, &random, .little) % (backoff_ms + 1);
+    const wait_ms = if (retry_after_ms != 0) retry_after_ms +| jitter_ms else backoff_ms + jitter_ms;
+    const wake = monotonicNowNs() +| (wait_ms *| std.time.ns_per_ms);
+    if (wake >= deadline) return false;
     while (monotonicNowNs() < wake) {
         try ensureEntryDeadline(entry);
         const remaining = wake -| monotonicNowNs();
         embeddingIo(entry).sleep(.fromNanoseconds(@intCast(@min(remaining, 50 * std.time.ns_per_ms))), .awake) catch return error.Cancelled;
     }
     try ensureEntryDeadline(entry);
-    if (monotonicNowNs() >= deadline) return error.Timeout;
+    return true;
 }
 
 fn embedBatchWithEntryForTaskOnce(
@@ -7710,13 +8180,16 @@ fn embedBatchWithEntryForTaskOnce(
                     try provider.setAuthorizationHeader(auth_header);
                 }
             }
-            var capability_header_storage: [2][2][]const u8 = undefined;
+            var capability_header_storage: [4][2][]const u8 = undefined;
             const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
-            _ = try bindRemoteEmbeddingLease(
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, texts.len, false);
+            const lease = try bindRemoteEmbeddingLease(
                 entry,
                 http,
                 &provider,
                 capability_headers,
+                placement_headers,
                 try textEmbeddingInvocationShape(texts),
             );
             const operation_deadline_ns = embeddingOperationDeadline(entry);
@@ -7730,7 +8203,7 @@ fn embedBatchWithEntryForTaskOnce(
                 effectiveInstruction(entry, task_type),
             ) catch |err| {
                 if (err == error.InferenceCapabilitiesStale)
-                    try invalidateRemoteEmbeddingLease(entry, capability_headers);
+                    try invalidateRemoteEmbeddingLease(entry, placement_headers, lease);
                 return err;
             };
             errdefer result.deinit();
@@ -8494,6 +8967,8 @@ test "managed embedder owned numeric lease executes without cache residency and 
         .shared_remote_capability_cache = &cache,
     }};
     var managed = ManagedEmbedder{ .alloc = alloc, .entries = &entries };
+    var placement: remote_capabilities.DiscoveryHeaders = .{};
+    const shaped_headers = try placement.withShape(&.{.{ "X-Antfly-Inference-Workload-Type", "write-heavy" }}, .{ .items = 1, .modalities = .{ .image = true }, .output_tokens = 0 });
     const lease = inference_work.CapabilityLease{
         .capabilities = .{
             .task = .embed,
@@ -8507,7 +8982,7 @@ test "managed embedder owned numeric lease executes without cache residency and 
         },
         .routing_token = try remote_capabilities.RoutingToken.init("owned-route"),
         .descriptor_revision = try remote_capabilities.CapabilityRevision.init("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-        .scope_digest = try remote_capabilities.scopeDigest(alloc, url, "clipclap", .embed, &.{}),
+        .scope_digest = try remote_capabilities.scopeDigest(alloc, url, "clipclap", .embed, shaped_headers),
     };
     const planned = managed.denseInterface().withPartLease(lease);
     const items = [_]template_mod.ContentPart{.{ .binary = .{
@@ -8517,9 +8992,15 @@ test "managed embedder owned numeric lease executes without cache residency and 
     const vectors = try planned.embedDensePartItems(alloc, "visual", &items, 2);
     defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, vectors[0]);
+    var media_window = lease;
+    media_window.scope_digest = try remote_capabilities.scopeDigest(alloc, url, "clipclap", .embed, &.{.{ "X-Antfly-Inference-Workload-Type", "write-heavy" }});
+    media_window.media_placement_items = 4;
+    const page_vectors = try managed.denseInterface().withPartLease(media_window).embedDensePartItems(alloc, "visual", &items, 2);
+    defer db_embedder.freeDenseEmbeddingBatch(alloc, page_vectors);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, page_vectors[0]);
     entries[0].source_table = @constCast("rotated-scope");
     try std.testing.expectError(error.InferenceCapabilitiesStale, planned.embedDensePartItems(alloc, "visual", &items, 2));
-    try std.testing.expectEqual(@as(usize, 1), app.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), app.calls.load(.acquire));
 }
 
 test "managed embedder media planning is pure and typed results avoid JSON reservations" {
@@ -9573,7 +10054,7 @@ test "managed embedder translates external sparse embeddings config" {
     const config_json = try translateEmbeddingsIndexConfigJson(std.testing.allocator, "semantic_idx", parsed.value);
     defer std.testing.allocator.free(config_json);
 
-    try std.testing.expectEqualStrings("{\"field\":\"embedding\"}", config_json);
+    try std.testing.expectEqualStrings("{\"field\":\"embedding\",\"external\":true}", config_json);
 }
 
 test "managed embedder translates chunker config into db generator config" {
@@ -10236,11 +10717,13 @@ test "managed embedder retries query model capacity and keeps cancellation and d
     try std.testing.expectEqual(@as(usize, 2), app.calls.load(.acquire));
     var entry = managed.entries[0].requestOverlay(alloc);
     entry.deadline_ns = monotonicNowNs();
-    try std.testing.expectError(error.Timeout, waitQueryEmbeddingRetry(&entry, entry.deadline_ns.?));
+    try std.testing.expectError(error.Timeout, waitQueryEmbeddingRetry(&entry, entry.deadline_ns.?, 1, 0));
     var canceled = std.atomic.Value(bool).init(true);
     entry.deadline_ns = null;
     entry.cancellation = CancellationToken.fromAtomic(&canceled);
-    try std.testing.expectError(error.Cancelled, waitQueryEmbeddingRetry(&entry, monotonicNowNs() + std.time.ns_per_s));
+    try std.testing.expectError(error.Cancelled, waitQueryEmbeddingRetry(&entry, monotonicNowNs() + std.time.ns_per_s, 1, 0));
+    entry.cancellation = null;
+    try std.testing.expect(!try waitQueryEmbeddingRetry(&entry, monotonicNowNs() + std.time.ns_per_s, 1, 3000));
 }
 
 test "managed embedder paces repeated openai compatible requests" {
@@ -11186,7 +11669,7 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
     const sparse_entry = managed.findEntry("sparse_idx").?;
     const multimodal_entry = managed.findEntry("multimodal_idx").?;
 
-    try std.testing.expectError(error.QueueFull, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
     try std.testing.expectError(error.QueueFull, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
     try std.testing.expectError(error.QueueFull, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 
@@ -11935,6 +12418,24 @@ pub fn testSparseCacheRevision() !void {
         fn sparse(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
             return a.alloc(db_embedder.SparseEmbedding, 0);
         }
+        fn controlledSparse(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: EmbeddingRequestContext) ![]db_embedder.SparseEmbedding {
+            try context.check();
+            try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), context.model_revision);
+            try std.testing.expectEqual(@as(usize, 1), texts.len);
+            const calls: *u8 = @ptrCast(@alignCast(ptr));
+            calls.* += 1;
+            const out = try a.alloc(db_embedder.SparseEmbedding, 1);
+            errdefer a.free(out);
+            const indices = try a.dupe(u32, &.{7});
+            errdefer a.free(indices);
+            out[0] = .{ .indices = indices, .values = try a.dupe(f32, &.{7}) };
+            return out;
+        }
+        fn controlledCapabilities(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, task: inference_work.Task, context: RequestContext) !inference_work.InferenceCapabilities {
+            try context.check();
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), context.deadline_ns);
+            return capabilities(ptr, a, name, task);
+        }
         fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: inference_work.Task) anyerror!inference_work.InferenceCapabilities {
             return .{ .task = task, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .item, .output = .embedding, .model_revision = @as([32]u8, @splat(7)) };
         }
@@ -11969,6 +12470,17 @@ pub fn testSparseCacheRevision() !void {
     try std.testing.expectEqual(@as([32]u8, @splat(7)), revision);
     const dense = managed.denseInterface();
     try std.testing.expect((try dense.cache_revision_fn.?(dense.ptr, std.testing.allocator, "semantic_idx")) == null);
+    const control: RequestContext = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) };
+    managed.entries[0].antfly_provider.?.model_capabilities_with_context = Local.controlledCapabilities;
+    const controlled_sparse = managed.sparseInterface().withRequestContext(control);
+    try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), try controlled_sparse.captureRevision(std.testing.allocator, "semantic_idx"));
+    managed.entries[0].antfly_provider.?.embed_sparse_texts_with_context = Local.controlledSparse;
+    const generation = try controlled_sparse.captureGeneration(std.testing.allocator, "semantic_idx");
+    const vectors = try controlled_sparse.withGeneration(generation).embedSparseBatch(std.testing.allocator, "semantic_idx", &.{ "first", "second" });
+    defer db_embedder.freeSparseEmbeddingBatch(std.testing.allocator, vectors);
+    try std.testing.expectEqual(@as(u8, 2), context);
+    managed.entries[0].antfly_provider.?.model_capabilities_with_context = null;
+    try std.testing.expectError(error.UncancellableInferenceProvider, controlled_sparse.captureRevision(std.testing.allocator, "semantic_idx"));
 }
 
 test "managed embedder endpoint access denial survives HTTP probing and runtime transport" {
@@ -12310,6 +12822,213 @@ test "Google canonical Vertex artifact identities retain their pinned execution 
     }
 }
 
+test "managed embedder retries TLS transport reads within the query budget" {
+    const Probe = struct {
+        calls: usize = 0,
+        failure: anyerror,
+
+        fn embed(_: std.mem.Allocator, _: *const ManagedEmbeddingEntry, probe: *@This()) !usize {
+            probe.calls += 1;
+            if (probe.calls == 1) return probe.failure;
+            return probe.calls;
+        }
+    };
+    const a = std.testing.allocator;
+    const entry: ManagedEmbeddingEntry = .{
+        .alloc = a,
+        .index_name = @constCast("semantic"),
+        .provider = .openai,
+        .model = @constCast("remote"),
+        .base_url = @constCast("https://example.invalid"),
+        .dimensions = 3,
+        .io = std.testing.io,
+        .deadline_ns = monotonicNowNs() + 5 * std.time.ns_per_s,
+    };
+    var transport = Probe{ .failure = error.TlsTransportReadFailed };
+    const attempts = try withQueryEmbeddingRetry(usize, a, &entry, Probe.embed, .{&transport}, .retrieval_query, null);
+    try std.testing.expectEqual(@as(usize, 2), attempts);
+
+    var invalid_record = Probe{ .failure = error.TlsBadRecordMac };
+    try std.testing.expectError(error.TlsBadRecordMac, withQueryEmbeddingRetry(usize, a, &entry, Probe.embed, .{&invalid_record}, .retrieval_query, null));
+    try std.testing.expectEqual(@as(usize, 1), invalid_record.calls);
+}
+
+test "managed embedder capability refresh serves stale while one passive refresh runs" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = httpx.TestServer.start(a, io, &.{
+        .{ .method = .GET, .path = "/ai/v1/models", .max_uses = 1, .respond = .{
+            .body = "{\"embedders\":{\"remote\":{\"inputs\":[\"text\"]}}}",
+        } },
+        .{ .method = .GET, .path = "/ai/v1/models", .max_uses = 1, .respond = .{
+            .status = 503,
+            .headers = &.{.{ .name = remote_capabilities.model_activation_header, .value = "supported" }},
+        } },
+    }) catch |err| switch (err) {
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    defer http.deinit();
+    var cache = remote_capabilities.Cache.init(a, io);
+    defer cache.deinit();
+
+    const Prime = struct {
+        fn run(c: *remote_capabilities.Cache, h: *httpx.Client, url: []const u8) !void {
+            const lease = try c.getOrDiscoverLease(h, url, "remote", .embed, &.{});
+            try std.testing.expect(lease.capabilities != null);
+        }
+    };
+    var prime = try io.concurrent(Prime.run, .{ &cache, &http, server.baseUrl() });
+    try server.handleOne();
+    try prime.await(io);
+    var entries = cache.entries.iterator();
+    entries.next().?.value_ptr.expires_at_ns = 0;
+
+    const context: remote_capabilities.WaitContext = .{ .refresh_in_background = true };
+    for (0..3) |_| {
+        const lease = try cache.getOrDiscoverLeaseWithContext(&http, server.baseUrl(), "remote", .embed, &.{}, context);
+        try std.testing.expect(lease.capabilities.?.input_modalities.text);
+    }
+    try server.handleOne();
+    try cache.refreshes.await(io);
+    entries = cache.entries.iterator();
+    try std.testing.expect(entries.next().?.value_ptr.refresh_not_before_ns > monotonicNowNs());
+}
+
+test "managed embedder stops document publication on discovery failure" {
+    const a = std.testing.allocator;
+    const Service = struct {
+        attempts: std.atomic.Value(usize) = .init(0),
+
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(http_common.Method.GET, request.method);
+            try std.testing.expectEqualStrings("write-heavy", request.header("X-Antfly-Inference-Workload-Type") orelse "");
+            _ = self.attempts.fetchAdd(1, .monotonic);
+            return .{ .status = 502 };
+        }
+    };
+    var service = Service{};
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &service, .vtable = &.{ .execute = Service.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const url = try listener.baseUri(a);
+    defer a.free(url);
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        a,
+        "{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"remote\"}}}",
+        .{ .io = std.testing.io, .inference_api_url = url },
+    );
+    defer managed.deinit();
+    try std.testing.expectError(error.InferenceCapacityUnavailable, managed.denseInterface().captureTextGeneration(a, "semantic"));
+    try std.testing.expect(service.attempts.load(.monotonic) > 0);
+}
+
+test "managed embedder reuses query discovery across requests and retries hosted capacity" {
+    const a = std.testing.allocator;
+    const Service = struct {
+        discoveries: std.atomic.Value(u32) = .init(0),
+        embeds: std.atomic.Value(u32) = .init(0),
+
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const request_id = request.header(remote_capabilities.parent_request_id_header) orelse return error.MissingRequestID;
+            const document = std.mem.eql(u8, "document", request_id);
+            try std.testing.expectEqualStrings(if (document) "write-heavy" else "read-heavy", request.header("X-Antfly-Inference-Workload-Type") orelse "");
+            if (request.method == .GET) {
+                try std.testing.expectEqualStrings(if (document) "document" else "first", request_id);
+                try std.testing.expect(std.mem.endsWith(u8, request.uri, "/models?model=remote&task=embed&operation=embed"));
+                _ = self.discoveries.fetchAdd(1, .monotonic);
+                return .{ .status = 200, .body = try alloc.dupe(u8, "{\"embedders\":{\"remote\":{\"inputs\":[\"text\"]}}}") };
+            }
+
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/embed"));
+            try std.testing.expect(std.mem.indexOf(u8, request.body, if (document) "RETRIEVAL_DOCUMENT" else "RETRIEVAL_QUERY") != null);
+            const attempt = self.embeds.fetchAdd(1, .monotonic);
+            try std.testing.expectEqualStrings(if (document) "document" else if (attempt < 2) "first" else "second", request_id);
+            if (attempt == 0) return .{ .status = 503, .body = try alloc.dupe(u8, "{\"reason\":\"inference_capacity\",\"retryable\":true}") };
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{\"model\":\"remote\",\"data\":[{\"embedding\":[1,0,0]}]}") };
+        }
+    };
+
+    var service = Service{};
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &service, .vtable = &.{ .execute = Service.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const address = try listener.baseUri(a);
+    defer a.free(address);
+    const url = try std.fmt.allocPrint(a, "{s}/ai/v1", .{address});
+    defer a.free(url);
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var runtime = ProviderRuntime.init(a, threaded.io());
+    defer runtime.deinit();
+
+    const indexes = "{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"remote\"}}}";
+    for ([_][]const u8{ "first", "second", "document" }) |request_id| {
+        var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, .{
+            .io = threaded.io(),
+            .inference_api_url = url,
+            .provider_runtime = &runtime,
+            .remote_capability_cache = &runtime.remote_capability_cache,
+            .request_id = request_id,
+        });
+        defer managed.deinit();
+        const entry = managed.findQueryEntry("semantic").?;
+        const vector = if (std.mem.eql(u8, request_id, "document"))
+            try embedWithEntryForTask(a, entry, request_id, entry.dimensions, .retrieval_document)
+        else
+            try managed.embedQuery(a, "semantic", request_id);
+        defer a.free(vector);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, vector);
+    }
+    try std.testing.expectEqual(@as(u32, 2), service.discoveries.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 4), service.embeds.load(.monotonic));
+}
+
+test "managed embedder query cache keys follow the pinned remote generation and routing scope" {
+    const a = std.testing.allocator;
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        a,
+        "{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"mutable-alias\"}}}",
+        .{ .inference_api_url = "https://inference.example" },
+    );
+    defer managed.deinit();
+    var prepared: ManagedEmbedder.PreparedQueryEmbedding = .{ .entry = managed.findQueryEntry("semantic").?.requestOverlay(a) };
+    defer prepared.deinit(a);
+    prepared.entry.remote_query_workload = true;
+    try std.testing.expectError(error.QueryEmbeddingNotCacheable, prepared.cacheKey(.principal, "alice", "same text"));
+    prepared.entry.planned_embedding_lease = .{
+        .scope_digest = @splat(1),
+        .capabilities = .{
+            .task = .embed,
+            .input_modalities = .{ .text = true },
+            .input_granularity = .chunk,
+            .output = .embedding,
+            .model_revision = @splat(2),
+            .model_revision_pinning = true,
+        },
+    };
+    const original = try prepared.cacheKey(.principal, "alice", "same text");
+    prepared.entry.request_id = "different request";
+    try std.testing.expectEqual(original, try prepared.cacheKey(.principal, "alice", "same text"));
+    prepared.entry.planned_embedding_lease.?.capabilities.?.model_revision = @splat(3);
+    const updated = try prepared.cacheKey(.principal, "alice", "same text");
+    try std.testing.expect(!std.mem.eql(u8, &original, &updated));
+    prepared.entry.planned_embedding_lease.?.scope_digest = @splat(4);
+    const rerouted = try prepared.cacheKey(.principal, "alice", "same text");
+    try std.testing.expect(!std.mem.eql(u8, &updated, &rerouted));
+    prepared.entry.planned_embedding_lease.?.capabilities.?.model_revision = null;
+    prepared.entry.planned_embedding_lease.?.capabilities.?.model_revision_pinning = false;
+    const alias = try prepared.cacheKey(.principal, "alice", "same text");
+    try std.testing.expect(!std.mem.eql(u8, &rerouted, &alias));
+    try std.testing.expectEqual(alias, try prepared.cacheKey(.principal, "alice", "same text"));
+}
+
 test "managed embedder cold activation precedes default probe and query inference budgets" {
     const a = std.testing.allocator;
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -12560,6 +13279,10 @@ test "managed embedder grouped queries preserve ordered parts task and single ou
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{ .task = .embed, .input_modalities = .{ .text = true, .image = true }, .accepted_mime_types = .{ .text_plain = true, .image_png = true }, .input_granularity = .page, .output = .embedding, .batch = .{ .mode = .serial_compatibility, .max_items = 1 }, .model_revision = @as([32]u8, @splat(self.revision)) };
         }
+        fn controlledCapabilities(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, task: inference_work.Task, context: RequestContext) !inference_work.InferenceCapabilities {
+            try context.check();
+            return capabilities(ptr, alloc, model, task);
+        }
         fn texts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
             return error.UnexpectedTextCall;
         }
@@ -12605,7 +13328,7 @@ test "managed embedder grouped queries preserve ordered parts task and single ou
     };
     const a = std.testing.allocator;
     var p = P{};
-    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &p, .owns_invocation_admission = true, .embed_dense_texts = P.texts, .embed_sparse_texts = P.sparse, .embed_dense_parts = P.items, .embed_dense_parts_with_context = P.itemWithContext, .embed_dense_group_with_context = P.group, .model_capabilities = P.capabilities } }};
+    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &p, .owns_invocation_admission = true, .embed_dense_texts = P.texts, .embed_sparse_texts = P.sparse, .embed_dense_parts = P.items, .embed_dense_parts_with_context = P.itemWithContext, .embed_dense_group_with_context = P.group, .model_capabilities = P.capabilities, .model_capabilities_with_context = P.controlledCapabilities } }};
     var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
     const vector = try managed.embedQueryWithTemplate(a, "visual", "data:image/png;base64,AA==", "astronaut {{media url=this}}");
     defer a.free(vector);
@@ -12734,6 +13457,10 @@ test "managed embedder legacy parts reject revision bound groups and independent
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{ .task = .embed, .input_modalities = .{ .text = true, .image = true }, .accepted_mime_types = .{ .text_plain = true, .image_png = true }, .input_granularity = .page, .output = .embedding, .batch = .{ .mode = .serial_compatibility, .max_items = 1 }, .model_revision = @as([32]u8, @splat(self.revision)) };
         }
+        fn controlledCapabilities(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, task: inference_work.Task, context: RequestContext) !inference_work.InferenceCapabilities {
+            try context.check();
+            return capabilities(ptr, alloc, model, task);
+        }
         fn texts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
             return error.TestUnexpectedResult;
         }
@@ -12748,7 +13475,7 @@ test "managed embedder legacy parts reject revision bound groups and independent
     };
     const a = std.testing.allocator;
     var local = Local{};
-    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.texts, .embed_sparse_texts = Local.sparse, .embed_dense_parts = Local.parts, .model_capabilities = Local.capabilities } }};
+    var entries = [_]ManagedEmbeddingEntry{.{ .alloc = a, .index_name = @constCast("visual"), .provider = .antfly, .model = @constCast("model"), .base_url = @constCast("antfly:embedded"), .dimensions = 2, .io = std.testing.io, .declared_inputs = .{ .text = true, .image = true }, .antfly_provider = .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.texts, .embed_sparse_texts = Local.sparse, .embed_dense_parts = Local.parts, .model_capabilities = Local.capabilities, .model_capabilities_with_context = Local.controlledCapabilities } }};
     var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
     const dense = managed.denseInterface();
     const context = RequestContext{ .io = std.testing.io, .deadline_ns = null };
@@ -12865,7 +13592,7 @@ test "managed embedder HTTP revision pins fence text grouped framed and numeric 
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, legacy_rows[0]);
     // Once an upgraded endpoint advertises execution pinning, discovery must
     // retain its revision and propagate it automatically through real calls.
-    try invalidateRemoteEmbeddingLease(&entries[0], &.{});
+    try cache.invalidate(entries[0].base_url, entries[0].model, .embed, &.{.{ "X-Antfly-Inference-Workload-Type", "write-heavy" }});
     app.mode.store(4, .release);
     const upgraded = try managed.denseInterface().captureTextGeneration(a, "visual");
     try std.testing.expectEqual(@as([32]u8, @splat(0x11)), upgraded.revision.?);
@@ -12913,4 +13640,8 @@ test "offline lake build configuration validates algorithms metrics and corpus a
             return error.TestExpectedError;
         } else |_| {}
     }
+}
+
+test "managed embedder commit requirements sparse discovery carries caller context" {
+    try testSparseCacheRevision();
 }

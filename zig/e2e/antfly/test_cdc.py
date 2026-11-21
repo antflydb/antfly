@@ -3018,3 +3018,59 @@ def test_public_changefeed_retains_ttl_tombstone():
             _changefeed_call(client, "DELETE", feed)
     finally:
         server.stop()
+
+
+def test_public_changefeed_retains_direct_enrichment_transaction():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            tables = ["changefeed_direct_primary", "changefeed_direct_audit"]
+            feeds = f"{server.api_url}/changefeeds"
+            for name in tables:
+                _changefeed_call(
+                    client,
+                    "POST",
+                    f"{server.api_url}/tables/{name}",
+                    json={"num_shards": 1},
+                )
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": tables[0]},
+                json={"tables": tables, "include": "rows"},
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            reply = client.post(
+                f"{server.api_url}/batch",
+                timeout=30,
+                json={
+                    "commit_requires": "direct_enrichments",
+                    "tables": {
+                        name: {"inserts": {"row": {"value": name}}} for name in tables
+                    },
+                },
+            )
+            assert reply.ok, (reply.text, server.debug_logs())
+            committed = reply.json()
+            assert all(committed["tables"][name]["inserted"] == 1 for name in tables)
+            cursor = created["cursor"]
+            events = []
+            deadline = time.monotonic() + 30
+            while len(events) < 2 and time.monotonic() < deadline:
+                page = _changefeed_call(
+                    client, "GET", f"{feed}/events", params={"after": cursor}
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                observed = page.json()["events"]
+                events.extend(observed)
+                if not observed:
+                    time.sleep(0.2)
+            assert sorted(event["after"]["value"] for event in events) == sorted(tables)
+            assert all(event["operation"] == "insert" for event in events)
+            _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()

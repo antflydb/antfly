@@ -783,6 +783,15 @@ pub const HandleAccess = enum {
 /// need exclusive access to their session/cursor registries.
 pub const StorageIntent = enum { read_only, mutation };
 
+/// WS3 test-only instrumentation: called synchronously from
+/// `HandleGuard.releaseWriterLaneBeforeWait`, right after it has dropped the
+/// connection-level locks and before the caller waits on the write's
+/// durability ticket. A test can block here (its callback returns only once
+/// told to) to get a deterministic window in which to assert the locks are
+/// actually free, instead of racing real fsync timing.
+pub const WriterLaneReleaseTestHook = struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void };
+pub var test_writer_lane_release_hook: if (builtin.is_test) ?WriterLaneReleaseTestHook else void = if (builtin.is_test) null else {};
+
 /// Held for the duration of one export call; see `enterHandle`.
 pub const HandleGuard = struct {
     handle: *Handle,
@@ -799,6 +808,33 @@ pub const HandleGuard = struct {
     entry_sequence: u64 = 0,
     pinned_store_readonly: ?bool = null,
     suspended_query_root: ?*Handle = null,
+    /// WS3: set by `releaseWriterLaneBeforeWait` while this guard's write is
+    /// waiting on its durability ticket outside the capi locks. `leave`
+    /// reacquires both before doing its normal connection bookkeeping.
+    writer_lane_released: bool = false,
+    /// True once this guard's entry was admitted through
+    /// `lite_connection.WriterLane.checkout` instead of the ordinary
+    /// `connection.acquire()`/`PathGate` dance: `path_lease` stays null
+    /// (the lane, not this guard, owns the lease) and both
+    /// `releaseWriterLaneBeforeWait` and `leaveWithRegistry` dispatch to
+    /// `WriterLane.checkin` instead of the per-call retain/handoff logic.
+    /// Set only on a successful mutation-intent entry to a writer-mode
+    /// connection; never set on a failed or pinned/read entry.
+    lane_managed: bool = false,
+    /// lite-writer-authority.md W6: a plain read admitted without the writer
+    /// lease (`Connection.admitRead`); holds the gate and the lane's reader
+    /// slot instead.
+    read_slot: bool = false,
+    /// The root `WriterLane.checkout` pinned (`Handle.lane_pins`) for this
+    /// guard, set alongside `lane_managed`. Unpinned exactly once in
+    /// `leaveWithRegistry`, after this call's own durability wait has
+    /// resolved -- not at `releaseWriterLaneBeforeWait`/checkin time,
+    /// which runs *before* that wait, since the pin's whole purpose is to
+    /// keep this generation alive for as long as this call might still
+    /// touch it, including while its own ticket is still outstanding.
+    /// Tracked separately from `guard.handle` because that field can be
+    /// reassigned to a child table handle later in the same entry.
+    lane_pinned_root: ?*Handle = null,
     /// Busy-wait budget left for this export call. The busy timeout bounds
     /// total admission waiting across every re-entry of one call (for
     /// example after inference), not each admission separately. Null means
@@ -845,6 +881,29 @@ pub const HandleGuard = struct {
         const root = connection.current.?;
         root.query_borrows += 1;
         self.suspended_query_root = root;
+        // A lane-managed guard (see `lane_managed`) never holds `path_lease`
+        // or `connection.gate.mutex` itself -- `WriterLane.checkout` already
+        // released the gate right after establishing/refreshing the lease,
+        // keeping it parked on the lane instead, so unconditionally
+        // unlocking the gate mutex below would release a mutex this guard
+        // never locked. Give the lease up via `checkinForSuspend`, not
+        // plain `checkin`: this suspend's duration is unbounded (an inline
+        // provider call, issue1015/issue1431), unlike the bounded
+        // durability wait `checkin`'s own fairness-quantum grace period is
+        // sized for, so a foreign waiter must never be stuck behind a
+        // lease this process is not even using while suspended. Resuming
+        // (`resumeQuery`/`resumeAccess`) re-enters fresh, which correctly
+        // re-contends for the lease like a cold start. Nothing to notify
+        // here either: a lane-managed suspend always happens before this
+        // call's own commit, so there is no newly-durable write to
+        // publish yet.
+        if (self.lane_managed) {
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            connection.owner.writer_lane.checkinForSuspend(connection, store);
+            self.connection_gate_held = false;
+            connection.mutex.unlock(handleLockIo());
+            return;
+        }
         // Owned memory plans can release after catalog provisioning. Publish
         // those already-committed primary changes before dropping the lease.
         if (self.path_lease != null and root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != self.entry_sequence) connection.notifyMutation();
@@ -854,9 +913,95 @@ pub const HandleGuard = struct {
             owned.close();
         }
         self.path_lease = null;
+        if (self.read_slot) {
+            connection.owner.writer_lane.endRead();
+            self.read_slot = false;
+        }
         self.connection_gate_held = false;
         connection.gate.mutex.unlock(handleLockIo());
         connection.mutex.unlock(handleLockIo());
+    }
+
+    /// WS3 in-process writer lane: release the connection-level locks (the
+    /// path gate's lease and the per-connection call-serializing mutex)
+    /// around a durability wait, instead of holding them across the fsync.
+    /// Call exactly once, after the DB apply lock has already released and
+    /// before waiting on the write's ticket; `leave` reacquires both
+    /// afterward to finish its normal bookkeeping.
+    ///
+    /// The lease itself is handed to a same-process waiter only if one is
+    /// already queued for it (`QueuedMutex.retainForWaiter`): that waiter's
+    /// own write still funnels through this process's single native-file
+    /// commit queue, so the handoff is safe regardless of whether this
+    /// call's write is durable yet. If nobody is queued, the lease is kept
+    /// open (never closed here): closing it would let a cross-process
+    /// waiter run against the file before this write's own fsync, handing
+    /// off an undurable tip. Only `leave`'s reacquire (which runs after the
+    /// ticket this guard is shielding has resolved) may close or hand off
+    /// the lease to someone else, exactly as it always has.
+    pub fn releaseWriterLaneBeforeWait(self: *HandleGuard) void {
+        const connection = self.connection orelse return;
+        if (!self.connection_gate_held or self.writer_lane_released) return;
+        const io = handleLockIo();
+        // `connection.mutex` only gates entry into this Connection, not
+        // possession of anything another thread needs released to make
+        // its own progress, so dropping it early is always safe: it just
+        // lets the next same-process caller advance as far as it can on
+        // its own (through to attempting the gate/lease next).
+        connection.mutex.unlock(io);
+        self.writer_lane_released = true;
+        // A lane-managed guard (see `lane_managed`) never holds
+        // `connection.gate.mutex` or a per-call `path_lease` of its own --
+        // `WriterLane.checkout` already released the gate right after
+        // establishing/refreshing the lease, keeping it parked on the
+        // lane instead. Handing the parked lease to the next writer (or
+        // deciding it is time to sync and give it up for a remote waiter)
+        // is exactly what `checkin` does; none of the retain/handoff logic
+        // below (which assumes this guard itself holds the gate) applies.
+        if (self.lane_managed) {
+            const store = connection.current.?.owned_lite_backend.?.native_docstore.?;
+            connection.owner.writer_lane.checkin(connection, store);
+            self.connection_gate_held = false;
+            if (comptime builtin.is_test) if (test_writer_lane_release_hook) |hook| hook.notify(hook.ptr);
+            return;
+        }
+        // `connection.gate.mutex`, in contrast, is a ticket queue guarding
+        // the kernel-level path lease: unlocking it tells the next ticket
+        // holder "the lease is available for you now". That is only true
+        // if we are handing the lease to a same-process waiter already
+        // registered for it (`retainForWaiter`): its own write still
+        // funnels through this process's single native-file commit queue,
+        // so the handoff is safe regardless of whether this call's write
+        // is durable yet. If nobody is registered, we still hold the
+        // kernel lease ourselves, so unlocking the gate mutex here would
+        // let some *other*, unrelated queued ticket holder (if any) believe
+        // the lease is free and block waiting on the kernel futex we have
+        // not released -- a priority inversion (we could then queue behind
+        // it for the very mutex we need back to finish and release the
+        // lease). So: keep the gate mutex held too in that case, exactly as
+        // before this guard started releasing anything early; `leave`'s
+        // reacquire below only needs to take `connection.mutex` back.
+        if (self.path_lease) |lease| {
+            var owned = lease;
+            if (connection.gate.mutex.retainForWaiter(io, &owned, connection.storeIdentity())) {
+                // Handing the lease to another same-process caller also
+                // hands it the right to call `refresh`/`pin` -> `attach` on
+                // this shared `Connection`, which asserts nothing is
+                // already attached. This guard's own call is not finished
+                // (it still has replication/visibility bookkeeping ahead
+                // of it), but it reads `guard.handle`/the `*DB` it already
+                // captured from here on, not `connection.current` again, so
+                // detaching now is safe -- and `detach`/`collectRetired`
+                // are themselves idempotent no-ops if called again from
+                // `leave`'s normal tail once this guard's call truly ends.
+                connection.detach();
+                connection.collectRetired();
+                self.path_lease = null;
+                connection.gate.mutex.unlock(io);
+                self.connection_gate_held = false;
+            }
+        }
+        if (comptime builtin.is_test) if (test_writer_lane_release_hook) |hook| hook.notify(hook.ptr);
     }
 
     pub fn resumeQuery(self: *HandleGuard, ptr: ?*anyopaque) bool {
@@ -896,14 +1041,15 @@ pub const HandleGuard = struct {
     }
 
     fn leaveWithRegistry(self: HandleGuard, comptime release_registry: bool) void {
+        var guard = self;
         defer if (release_registry) {
-            if (self.parent_slot) |slot| HandleRegistry.leave(slot);
-            HandleRegistry.leave(self.slot);
+            if (guard.parent_slot) |slot| HandleRegistry.leave(slot);
+            HandleRegistry.leave(guard.slot);
         };
-        if (!self.access_held) return;
+        if (!guard.access_held) return;
         const io = handleLockIo();
-        if (self.suspended_query_root) |root| {
-            const connection = self.connection.?;
+        if (guard.suspended_query_root) |root| {
+            const connection = guard.connection.?;
             connection.gate.mutex.lockUncancelable(io);
             root.query_borrows -= 1;
             var owned = self;
@@ -912,45 +1058,141 @@ pub const HandleGuard = struct {
             connection.gate.mutex.unlock(io);
             return;
         }
-        if (self.connection) |connection| {
-            if (self.pinned_store_readonly) |was_readonly| {
+        if (guard.connection) |connection| {
+            if (guard.lane_managed) {
+                // This guard never held `connection.gate.mutex` or a
+                // per-call `path_lease` of its own -- `WriterLane.checkout`
+                // /`checkin` own the kernel lease's lifetime instead (see
+                // `lane_managed`'s doc comment), so none of the retain/
+                // handoff bookkeeping below (which assumes this guard
+                // itself holds the gate) applies. All that is left here:
+                // finish the lane handoff if this call never released
+                // early (no hook called `releaseWriterLaneBeforeWait` --
+                // a non-hook write, or one that failed before staging),
+                // the same notifyMutation bookkeeping every write does,
+                // and `connection.mutex`, already dropped if release did run.
+                if (!guard.writer_lane_released) {
+                    const store = connection.current.?.owned_lite_backend.?.native_docstore.?;
+                    connection.owner.writer_lane.checkin(connection, store);
+                }
+                if (guard.entry_error == null) {
+                    if (connection.current) |root| {
+                        if (root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != guard.entry_sequence) connection.notifyMutation();
+                    }
+                }
+                if (!guard.writer_lane_released) connection.mutex.unlock(io);
+                // Unpin last: this call's own durability wait (if any) has
+                // already resolved by the time `leave`/`leaveWithRegistry`
+                // runs, so the generation this guard's write may still have
+                // been touching (through `wait()`, not just `checkout`) no
+                // longer needs to be kept alive on its behalf.
+                if (guard.lane_pinned_root) |pinned| _ = pinned.lane_pins.fetchSub(1, .release);
+                return;
+            }
+            // WS3: once `releaseWriterLaneBeforeWait` has run,
+            // `connection.mutex` is already unlocked -- this call must not
+            // unlock it again below, and critically must not try to lock it
+            // back: `connection.mutex` and `connection.gate.mutex` are
+            // independent locks with no required acquisition order between
+            // them for *this* path, and trying to take `connection.mutex`
+            // here before releasing/reacquiring the gate mutex below
+            // deadlocks against another same-process thread that is itself
+            // holding `connection.mutex` (having been admitted past it once
+            // this guard released it) while waiting on `connection.gate.mutex`
+            // (which this guard may still hold, in the no-handoff case) --
+            // each waits on what the other holds. `connection.acquire` below
+            // only ever touches the gate mutex, never `connection.mutex`.
+            const writer_lane_owes_connection_mutex_release = !guard.writer_lane_released;
+            if (guard.writer_lane_released and guard.path_lease == null) {
+                // The lease was handed off during release (see
+                // `releaseWriterLaneBeforeWait`); that wait has now resolved
+                // (we are past `batchInternal` in the caller), so take back
+                // whatever is now available for the gate -- ours again via
+                // a retained handoff, or a fresh kernel-level acquire.
+                // `connection.acquire` takes the gate mutex itself; on
+                // failure it has already released it (its own `errdefer`),
+                // so `connection_gate_held` must stay false in that case.
+                // Best-effort: if re-admission fails, bookkeeping below is
+                // skipped (not fatal -- detach, the retirement sweep and
+                // the mutation notification are all advisory/idempotent).
+                if (connection.acquire()) |lease| {
+                    guard.path_lease = lease;
+                    guard.connection_gate_held = true;
+                } else |_| {
+                    guard.connection_gate_held = false;
+                }
+            }
+            // In the no-handoff case, `connection_gate_held` is already
+            // true and accurate: this guard never let go of the gate mutex
+            // or the lease in the first place.
+            guard.writer_lane_released = false;
+            if (guard.pinned_store_readonly) |was_readonly| {
                 const store = connection.current.?.owned_lite_backend.?.native_docstore.?;
                 store.read_only = was_readonly;
                 store.file.read_only = was_readonly;
             }
-            if (self.entry_error == null and self.path_lease != null) {
+            if (guard.entry_error == null and guard.path_lease != null) {
                 if (connection.current) |root| {
-                    if (root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != self.entry_sequence) connection.notifyMutation();
+                    if (root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != guard.entry_sequence) connection.notifyMutation();
                 }
             }
-            if (self.connection_gate_held) {
+            if (guard.connection_gate_held) {
                 connection.detach();
                 connection.collectRetired();
             }
-            if (self.path_lease) |lease| {
+            if (guard.path_lease) |lease| {
                 var owned = lease;
                 // A thread of this process queued for the gate takes the
                 // lease as is, unless another process is waiting for it.
-                if (!(self.connection_gate_held and connection.gate.mutex.retainForWaiter(io, &owned))) owned.close();
+                if (!(guard.connection_gate_held and connection.gate.mutex.retainForWaiter(io, &owned, connection.storeIdentity()))) {
+                    // Commits staged under this lease (a ride-along group
+                    // nobody waits on) must finish before it goes: the
+                    // store's own flush loop only drives them while the
+                    // writer lane holds the lease, and this one never did.
+                    // This call's own durability wait is already over.
+                    if (connection.current) |root| if (root.owned_lite_backend) |*backend| if (backend.native_docstore) |store| store.ensureDurableForReuse();
+                    owned.close();
+                }
             }
-            if (self.connection_gate_held) connection.gate.mutex.unlock(io);
-            connection.mutex.unlock(io);
+            // W6: this read staged nothing (the sequence may still move: a
+            // writer drives its own group after checking the lane in).
+            if (guard.read_slot) connection.owner.writer_lane.endRead();
+            if (guard.connection_gate_held) connection.gate.mutex.unlock(io);
+            if (writer_lane_owes_connection_mutex_release) connection.mutex.unlock(io);
             return;
         }
-        switch (self.access) {
-            .read => self.lock_handle.api_lock.unlockShared(io),
+        switch (guard.access) {
+            .read => guard.lock_handle.api_lock.unlockShared(io),
             .write => {
-                self.lock_handle.write_mutex.unlock(io);
-                self.lock_handle.api_lock.unlockShared(io);
+                guard.lock_handle.write_mutex.unlock(io);
+                guard.lock_handle.api_lock.unlockShared(io);
             },
             .maintain => {
-                self.lock_handle.maintenance_mutex.unlock(io);
-                self.lock_handle.api_lock.unlockShared(io);
+                guard.lock_handle.maintenance_mutex.unlock(io);
+                guard.lock_handle.api_lock.unlockShared(io);
             },
-            .exclusive, .catalog => self.lock_handle.api_lock.unlock(io),
+            .exclusive, .catalog => guard.lock_handle.api_lock.unlock(io),
         }
     }
 };
+
+/// WS3: wrap `guard.releaseWriterLaneBeforeWait` as a
+/// `storage/db/execution_resources.WriterLaneReleaseHook` for a capi write
+/// export to pass down through `trackedBatchWithWriterLaneHook`/
+/// `batchInternalWithWriterLaneHook`. `guard` must outlive the call this
+/// hook is threaded into -- true for every export, since the whole write
+/// runs synchronously on `guard`'s own stack frame.
+pub fn writerLaneHookFromGuard(guard: *HandleGuard) @import("../storage/db/execution_resources.zig").WriterLaneReleaseHook {
+    return .{
+        .ptr = guard,
+        .release = struct {
+            fn run(ptr: *anyopaque) void {
+                const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
+                typed.releaseWriterLaneBeforeWait();
+            }
+        }.run,
+    };
+}
 
 pub fn requireEmbeddedCatalogOwnership(handle: *Handle) !void {
     const root = handle.parent_handle orelse handle;
@@ -1123,17 +1365,53 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
         // proving the allocator. Its first lease try must still be allowed;
         // only contention waits consult the deadline. The retry loop checks
         // expiry before starting a new attempt after backoff.
-        if (!pinned) {
-            guard.path_lease = (if (access == .maintain) connection.acquireForMaintenance() else connection.acquire()) catch |err| {
+        //
+        // WS3 writer lane: a non-pinned, mutation-intent entry to a
+        // writer-mode connection funnels through `WriterLane.checkout`
+        // instead of `connection.acquire()`/`PathGate` directly, so
+        // back-to-back same-Store writers (even across different
+        // Connections -- see `Owner.writer_lane`) share the kernel lease
+        // instead of each re-acquiring and re-queueing for it. Everything
+        // else (pinned access, reads, and non-writer-mode connections)
+        // keeps the original per-call gate/lease.
+        const lane_eligible = !pinned and access != .maintain and intent == .mutation and liteOpenModeCanWrite(connection.options.open_mode);
+        var root: *Handle = undefined;
+        if (lane_eligible) {
+            root = connection.owner.writer_lane.checkout(connection, intent) catch |err| {
                 guard.entry_error = capi.mapError(err);
                 return guard;
             };
-        } else connection.gate.mutex.lockUncancelable(handleLockIo());
-        guard.connection_gate_held = true;
-        const root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease, intent)) catch |err| {
-            guard.entry_error = capi.mapError(err);
-            return guard;
-        };
+            guard.lane_managed = true;
+            guard.lane_pinned_root = root;
+            guard.connection_gate_held = true;
+        } else admit: {
+            // lite-writer-authority.md W6: a plain read on a writer-mode
+            // connection uses the lane's reader slot, not the writer lease,
+            // whenever the current root can serve it.
+            if (!pinned and access == .read and intent == .read_only and liteOpenModeCanWrite(connection.options.open_mode)) {
+                const served = connection.admitRead() catch |err| {
+                    guard.entry_error = capi.mapError(err);
+                    return guard;
+                };
+                if (served) |read_root| {
+                    root = read_root;
+                    guard.read_slot = true;
+                    guard.connection_gate_held = true;
+                    break :admit;
+                }
+            }
+            if (!pinned) {
+                guard.path_lease = (if (access == .maintain) connection.acquireForMaintenance() else connection.acquire()) catch |err| {
+                    guard.entry_error = capi.mapError(err);
+                    return guard;
+                };
+            } else connection.gate.mutex.lockUncancelable(handleLockIo());
+            guard.connection_gate_held = true;
+            root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease, intent, false)) catch |err| {
+                guard.entry_error = capi.mapError(err);
+                return guard;
+            };
+        }
         guard.handle = root;
         if (pinned) {
             // Fetch/close may release the final segment reader and invoke its
@@ -1284,6 +1562,20 @@ pub fn batchInternal(
     sync_level: u8,
     primary_committed: *bool,
 ) !void {
+    return batchInternalWithWriterLaneHook(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level, primary_committed, null);
+}
+
+pub fn batchInternalWithWriterLaneHook(
+    handle: *Handle,
+    writes_ptr: ?[*]const capi.WriteIntent,
+    write_count: usize,
+    predicates_ptr: ?[*]const capi.VersionPredicate,
+    predicate_count: usize,
+    timestamp_ns: u64,
+    sync_level: u8,
+    primary_committed: *bool,
+    writer_lane_release_before_wait: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook,
+) !void {
     primary_committed.* = false;
     var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
     defer writes.deinit(handle.alloc);
@@ -1316,13 +1608,13 @@ pub fn batchInternal(
         else => return error.InvalidArgument,
     };
 
-    try trackedBatch(handle.database(), .{
+    try trackedBatchWithWriterLaneHook(handle.database(), .{
         .writes = writes.items,
         .deletes = deletes.items,
         .predicates = predicates,
         .timestamp_ns = timestamp_ns,
         .sync_level = level,
-    }, primary_committed, handle.selected_table_name);
+    }, primary_committed, handle.selected_table_name, writer_lane_release_before_wait);
 }
 
 /// A tracked exported batch. When this thread runs an exported write (see
@@ -1332,14 +1624,30 @@ pub fn batchInternal(
 /// `table_name` names the SQL table whose database `database` is (null for
 /// the handle's root database), so its receipt finds the marker.
 pub fn trackedBatch(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8) anyerror!void {
+    return trackedBatchWithWriterLaneHook(database, req, primary_committed, table_name, null);
+}
+
+/// `trackedBatch` plus the WS3 in-process writer lane hook: pass a
+/// `HandleGuard`'s `releaseWriterLaneBeforeWait` (wrapped as a
+/// `WriterLaneReleaseHook`) so the connection's locks drop across this
+/// write's durability wait too, not just the DB apply lock. Every capi
+/// write export should populate this; everything else (internal bookkeeping
+/// writes with no `HandleGuard` in scope) keeps using plain `trackedBatch`.
+pub fn trackedBatchWithWriterLaneHook(
+    database: *db_mod.DB,
+    req: db_mod.types.BatchRequest,
+    primary_committed: *bool,
+    table_name: ?[]const u8,
+    writer_lane_release_before_wait: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook,
+) anyerror!void {
     if ((req.source_producer != .unlabelled and req.source_producer != .ordinary) or req.transaction != null or req.online_source != null) return error.SourceTransactionIdentityConflict;
     var ordinary = req;
     ordinary.source_producer = .ordinary;
     const receipts = @import("outcome_receipts.zig");
-    const writer = receipts.activeWriter() orelse return database.batchTracked(ordinary, primary_committed);
+    const writer = receipts.activeWriter() orelse return database.batchTrackedWithMarkerAndWriterLaneHook(ordinary, primary_committed, null, writer_lane_release_before_wait);
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
     const marker = writer.next(named);
-    database.batchTrackedWithMarker(ordinary, primary_committed, marker) catch |err| {
+    database.batchTrackedWithMarkerAndWriterLaneHook(ordinary, primary_committed, marker, writer_lane_release_before_wait) catch |err| {
         if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err))
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
@@ -1582,6 +1890,8 @@ pub const JsonDBIndexStats = struct {
     catch_up_phase: []const u8,
     doc_count: u64,
     term_count: u64,
+    // Full-text segments this index currently serves (merge backlog).
+    text_active_segments: u64,
     edge_count: u64,
     graph_counts_pending: bool,
     node_count: u64,
@@ -2880,6 +3190,10 @@ pub const LiteResolvedOpenOptions = struct {
     profile: lite_backend.Profile = .native,
     map_size: ?usize = null,
     no_sync: bool = false,
+    /// See `storage/lite/docstore.zig`'s `Store.ride_along_idle_ns` doc
+    /// comment. Threaded through for tests of the idle-flush barrier
+    /// itself; never meant to tune write-amplification numbers.
+    ride_along_idle_ns: ?u64 = null,
     ttl_cleanup: ?db_mod.ttl_runtime.Config = null,
     inference: lite_backend.InferenceOpenOptions = .{},
     generated_enrichment_replay: bool = false,
@@ -2892,6 +3206,14 @@ pub const LiteResolvedOpenOptions = struct {
     allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
     /// Exclusive temporary verifier; consumes its cache before DB.open.
     allocator_state_donor: ?*lite_backend.native.NativeFile = null,
+    /// See `docstore.Store.CreateOptions.use_redo_log`'s own doc comment.
+    /// Meaningless on `open` (only `create` reaches it).
+    use_redo_log: ?bool = null,
+    /// `null` keeps the existing default (`reclamation.Options.page_reuse
+    /// = true`). Combines with `use_redo_log = true` without restriction
+    /// (see `use_redo_log`'s own doc comment). Meaningless on `open`
+    /// (only `create` reaches it).
+    page_reuse: ?bool = null,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -3070,6 +3392,14 @@ pub const HostLiteOpenOptions = struct {
     read_only: bool = false,
     hosted: bool = true,
     no_sync: bool = false,
+    /// See `LiteResolvedOpenOptions.ride_along_idle_ns`.
+    ride_along_idle_ns: ?u64 = null,
+    /// See `docstore.Store.CreateOptions.use_redo_log`'s own doc comment.
+    /// Meaningless unless `create` is set.
+    use_redo_log: ?bool = null,
+    /// See `LiteResolvedOpenOptions.page_reuse`. Meaningless unless
+    /// `create` is set.
+    page_reuse: ?bool = null,
 };
 
 pub fn openLiteHandleWithRuntime(
@@ -3083,6 +3413,9 @@ pub fn openLiteHandleWithRuntime(
         .open_mode = if (options.read_only) .query_readonly else .writer,
         .profile = if (options.hosted) .hosted else .native,
         .no_sync = options.no_sync,
+        .ride_along_idle_ns = options.ride_along_idle_ns,
+        .use_redo_log = options.use_redo_log,
+        .page_reuse = options.page_reuse,
     }, options.create, io, backend_runtime));
 }
 
@@ -3127,6 +3460,9 @@ pub fn openLiteHandleAllocWithSharedInference(
             .exclusive = true,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
+            .ride_along_idle_ns = resolved.ride_along_idle_ns,
+            .use_redo_log = resolved.use_redo_log,
+            .reclamation = .{ .page_reuse = resolved.page_reuse orelse true },
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
@@ -3134,6 +3470,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
+            .ride_along_idle_ns = resolved.ride_along_idle_ns,
         });
     errdefer if (!handle_owns_resources) backend.deinit();
     if (resolved.allocator_verification_owner) |verified| {
@@ -3155,7 +3492,6 @@ pub fn openLiteHandleAllocWithSharedInference(
 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
-        .external_derived_checkpoints = false,
         .backend_runtime = if (owned_runtime) |runtime| runtime.runtime else backend_runtime,
         .online_source_authority = .native,
     };
@@ -3260,9 +3596,9 @@ pub fn openLiteHandleAllocWithSharedInference(
 }
 
 pub fn dbOpenOptionsFromResolved(resolved: LiteResolvedOpenOptions, lite: bool) db_mod.OpenOptions {
+    _ = lite;
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
-        .external_derived_checkpoints = !lite,
         .online_source_authority = .native,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
@@ -3967,7 +4303,7 @@ pub fn restorePortableBackupToDirectory(
     var staged = try transition.beginStaging();
     defer staged.deinit();
     {
-        var db = try db_mod.DB.open(alloc, staged.path(), .{ .staged_generation = &staged, .identity_namespace = try @import("database_backup.zig").rootIdentity(alloc, backup), .external_derived_checkpoints = false });
+        var db = try db_mod.DB.open(alloc, staged.path(), .{ .staged_generation = &staged, .identity_namespace = try @import("database_backup.zig").rootIdentity(alloc, backup) });
         defer db.close();
         try @import("database_backup.zig").populate(alloc, &db, null, staged.path(), backup);
     }
@@ -4041,7 +4377,6 @@ pub fn restorePortableSourceToLiteFile(
 
         var opts = db_mod.OpenOptions{
             .open_mode = .writer,
-            .external_derived_checkpoints = false,
             .backend_runtime = backend_runtime,
             .identity_namespace = try @import("database_backup.zig").rootIdentity(alloc, context),
             .prefer_existing_identity_namespace = false,
@@ -4967,7 +5302,7 @@ pub fn antfly_db_batch(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_batch), .{ .name = "antfly_db_batch" }), .{ handle_ptr, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    var guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4978,7 +5313,7 @@ pub fn antfly_db_batch(
     const receipt_scope = beginOutcomeReceipts(guard.lock_handle);
     defer receipt_scope.end();
     var primary_committed = false;
-    batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level, &primary_committed) catch |err| return batchFailureCode(err, primary_committed);
+    batchInternalWithWriterLaneHook(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level, &primary_committed, writerLaneHookFromGuard(&guard)) catch |err| return batchFailureCode(err, primary_committed);
     return .ok;
 }
 
@@ -5011,7 +5346,7 @@ pub fn antfly_db_batch_json(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_batch_json), .{ .name = "antfly_db_batch_json" }), .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    var guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5025,7 +5360,7 @@ pub fn antfly_db_batch_json(
     defer receipt_scope.end();
     var primary_committed = false;
     // A table handle commits to its table's database, which holds the marker.
-    trackedBatch(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name) catch |err| return batchFailureCode(err, primary_committed);
+    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| return batchFailureCode(err, primary_committed);
     // Committed: a response failure must not read as a failed batch.
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
         return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
@@ -5034,6 +5369,67 @@ pub fn antfly_db_batch_json(
         .len = response.len,
     };
     return .ok;
+}
+
+/// Binary counterpart to `antfly_db_batch_json`: `request_buf` is the
+/// length-prefixed wire encoding documented in `capi/batch_wire.zig` and the
+/// public header, instead of a JSON object. Parsing is zero-copy (every write
+/// key/value and delete key borrows directly from `request_buf`, which the
+/// `antfly_slice` contract already requires stay valid for the call) and does
+/// no per-field allocation, unlike the JSON path's `std.json` tree plus one
+/// `dupe` per field. Transforms and graph writes/deletes are JSON-only; this
+/// entry point only carries writes, deletes, and the sync-level option.
+pub fn antfly_db_batch_wire(
+    handle_ptr: ?*anyopaque,
+    request_buf: capi.Slice,
+    out_buf: *capi.Buffer,
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_batch_wire), .{ .name = "antfly_db_batch_wire" }), .{ handle_ptr, request_buf, out_buf });
+    capi.clearLastError();
+    var guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    const handle = guard.handle;
+    const batch_wire = @import("batch_wire.zig");
+    var decoded = batch_wire.decodeBatchRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
+    defer decoded.deinit(handle.alloc);
+
+    const receipt_scope = beginOutcomeReceipts(guard.lock_handle);
+    defer receipt_scope.end();
+    var primary_committed = false;
+    const req = decoded.asRequest();
+    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| return batchFailureCode(err, primary_committed);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, .{
+        .inserted = @as(u32, @intCast(decoded.writes.len)),
+        .deleted = @as(u32, @intCast(decoded.deletes.len)),
+    }) catch
+        return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
+    return .ok;
+}
+
+/// `antfly_db_batch_wire` that also returns the outcome receipt in the same
+/// call, like `antfly_db_batch_json_with_receipt`. `receipt_out` is filled
+/// only on ANTFLY_OUTCOME_UNKNOWN with a receipt; the caller frees it.
+pub fn antfly_db_batch_wire_with_receipt(
+    handle_ptr: ?*anyopaque,
+    request_buf: capi.Slice,
+    out_buf: *capi.Buffer,
+    receipt_out: ?*capi.Buffer,
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_batch_wire_with_receipt), .{ .name = "antfly_db_batch_wire_with_receipt" }), .{ handle_ptr, request_buf, out_buf, receipt_out });
+    if (receipt_out) |out| out.* = .{};
+    const code = antfly_db_batch_wire(handle_ptr, request_buf, out_buf);
+    copyLastReceipt(code, receipt_out);
+    return code;
 }
 
 pub fn antfly_db_resolve_intents(
@@ -5081,7 +5477,22 @@ pub fn antfly_db_get_transaction_status(
     out.* = 0;
     const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
-    const status = handle.database().*.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
+    const database = handle.database();
+    const status = database.*.getTransactionStatus(txn_id.*) catch |err| switch (err) {
+        // lite-single-commit-write-path.md §3.3c: not a two-phase decision
+        // id -- check whether it is a fused `commitCoordinatedLocal`
+        // ambiguous-outcome marker id instead. `guard.lock_handle` is
+        // already the root (never a table handle's own non-root catalog),
+        // matching this id's own resolution contract: the caller must use
+        // the same handle/table context the original ambiguous commit
+        // did, exactly as for an ordinary two-phase `TxnId`.
+        error.TxnNotFound => blk: {
+            const connection = guard.lock_handle.lite_connection orelse return capi.mapError(err);
+            const expected = connection.owner.last_ambiguous_fused_marker orelse return capi.mapError(err);
+            break :blk database.*.outcomeMarkerFallbackStatus(txn_id.*, expected) catch |fallback_err| return capi.mapError(fallback_err);
+        },
+        else => return capi.mapError(err),
+    };
     out.* = @backingInt(status);
     return .ok;
 }
@@ -5296,6 +5707,27 @@ pub fn antfly_db_set_schema_json(
     const handle = guard.handle;
     @import("sql_ddl.zig").invalidate(handle);
     handle.database().*.setSchemaJson(handle.alloc, schema_json.bytes()) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+/// Test/internal support only -- deliberately not in `exports.zig`'s
+/// publish list, so it is not part of the public C ABI. Forces the
+/// underlying native store's durability barrier (`backend_erased.Store.
+/// sync(true)`, which for Lite reaches `docstore.Store.sync()`:
+/// `forceDrainDurable()` then `syncIndexContents()`), draining and
+/// fsyncing any ride-along work still pending -- the same barrier a
+/// cross-process path-lease handoff or `Store.close()` already relies
+/// on, just reachable directly for a test that wants to flush without
+/// closing the handle.
+pub fn antfly_db_force_sync_for_test(handle_ptr: ?*anyopaque) callconv(.c) capi.ErrorCode {
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    guard.handle.database().core.store.sync(true) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -6001,6 +6433,7 @@ pub fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats
             .catch_up_phase = @tagName(item.catch_up_phase),
             .doc_count = item.doc_count,
             .term_count = item.term_count,
+            .text_active_segments = item.text_merge.active_segments,
             .edge_count = item.edge_count,
             .graph_counts_pending = item.graph_counts_pending,
             .node_count = item.node_count,
@@ -6258,7 +6691,7 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
         (if (@import("sql.zig").statementMayMutate(value.compiled.statement)) .mutation else .read_only)
     else |_|
         .read_only;
-    const guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
+    var guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
     defer guard.leaveAccess();
     if (guard.entry_error) |code| {
         return capi.ensureError(code, @src().fn_name);
@@ -6269,8 +6702,12 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
     defer receipt_scope.end();
     // Managed owners require Raft routing and credentials supplied by API SQL.
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return capi.recordError(.unsupported, @src().fn_name ++ ": storage owner binding is already configured");
+    // WS3: thread this call's own `HandleGuard` into the single-table SQL
+    // mutate path (see `sql.zig`'s `Adapter.writer_lane_hook`) so a write
+    // issued through `antfly_db_sql_json` releases the connection-level locks
+    // across its durability wait too, like every other capi write export.
     const result = if (prepared) |*value|
-        executePreparedEmbeddedSql(handle, "default", request_json.bytes(), &budget, value, out_buf)
+        executePreparedEmbeddedSql(handle, "default", request_json.bytes(), &budget, value, out_buf, writerLaneHookFromGuard(&guard))
     else |err|
         embeddedSqlPreparationFailure(handle, request_json.bytes(), err);
     result catch |err| {
@@ -6343,10 +6780,20 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     var budget = EmbeddedSqlBudget{ .backing = handle.alloc, .limit = @import("sql.zig").runtime.resource_limits.preparation_bytes };
     var prepared = PreparedEmbeddedSql.init(&budget, request_json) catch |err| return embeddedSqlPreparationFailure(handle, request_json, err);
     defer prepared.deinit();
-    return executePreparedEmbeddedSql(handle, table_name, request_json, &budget, &prepared, out_buf);
+    // No `HandleGuard` in scope at this table-scoped entry point (unlike
+    // `antfly_db_sql_json`): keep pre-WS3 behavior rather than fabricate one.
+    return executePreparedEmbeddedSql(handle, table_name, request_json, &budget, &prepared, out_buf, null);
 }
 
-fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []const u8, budget: *EmbeddedSqlBudget, prepared: *PreparedEmbeddedSql, out_buf: *capi.Buffer) !void {
+fn executePreparedEmbeddedSql(
+    handle: *Handle,
+    table_name: []const u8,
+    request_json: []const u8,
+    budget: *EmbeddedSqlBudget,
+    prepared: *PreparedEmbeddedSql,
+    out_buf: *capi.Buffer,
+    writer_lane_hook: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook,
+) !void {
     const session = try @import("sql_session.zig").requestSession(handle, request_json);
     errdefer if (session) |value| {
         if (value.active) value.failed = true;
@@ -6391,7 +6838,7 @@ fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_j
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    var adapter = sql.Adapter(antfly){ .graph_parameters = parsed.value.parameters, .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    var adapter = sql.Adapter(antfly){ .graph_parameters = parsed.value.parameters, .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false), .writer_lane_hook = writer_lane_hook };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
         if (err == error.SqlNotNullViolation or err == error.SqlUntranslatableCharacter) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });
@@ -10086,12 +10533,16 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
                 const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k:{d}:{d}\":{{\"search_text\":\"raft snapshot number {d}\"}}}},\"sync_level\":\"write\"}}", .{ self.ordinal, i, i });
                 var output: capi.Buffer = .{};
                 defer antfly_buffer_free(&output);
-                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output));
+                const write_code = antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output);
+                if (write_code != .ok) std.debug.print("issue1015 worker {d} write {d} failed: {s}\n", .{ self.ordinal, i, std.mem.span(antfly_last_error_detail()) });
+                try std.testing.expectEqual(capi.ErrorCode.ok, write_code);
                 if (i % 50 == 0) {
                     const query = "{\"full_text_search\":{\"match\":{\"field\":\"search_text\",\"text\":\"raft\"}},\"limit\":5}";
                     var hits: capi.Buffer = .{};
                     defer antfly_buffer_free(&hits);
-                    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(handle, .{ .ptr = query.ptr, .len = query.len }, &hits));
+                    const search_code = antfly_db_search_json(handle, .{ .ptr = query.ptr, .len = query.len }, &hits);
+                    if (search_code != .ok) std.debug.print("issue1015 worker {d} search {d} failed: {s}\n", .{ self.ordinal, i, std.mem.span(antfly_last_error_detail()) });
+                    try std.testing.expectEqual(capi.ErrorCode.ok, search_code);
                 }
             }
             // Primary availability alone is insufficient: every secondary must
@@ -10121,6 +10572,435 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
     spawned = 0;
     defer for (workers[0..joined]) |worker| alloc.free(worker.path);
     for (workers[0..joined]) |worker| if (worker.failure) |err| return err;
+}
+
+/// WS3: a single-document write's `sync_level: "write"` batch, through the
+/// same public C ABI entry point an embedder's threads share.
+fn ws3WriterLaneProbeWrite(handle: ?*anyopaque, ordinal: usize, index: usize) !void {
+    var request_buffer: [160]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k:{d}:{d}\":{{\"v\":\"writer lane probe\"}}}},\"sync_level\":\"write\"}}", .{ ordinal, index });
+    var output: capi.Buffer = .{};
+    defer antfly_buffer_free(&output);
+    const code = antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output);
+    if (code != .ok) std.debug.print("writer {d} write {d} failed: {s}\n", .{ ordinal, index, std.mem.span(antfly_last_error_detail()) });
+    try std.testing.expectEqual(capi.ErrorCode.ok, code);
+}
+
+/// This used to read `connection.owner.current`'s live `NativeFile.
+/// test_sync_calls` directly. That counter resets to zero every time
+/// `Owner.refresh`'s slow path replaces `owner.current` with a fresh
+/// `NativeFile` (a vacuum/compaction-triggered reopen, or any of `refresh`'s
+/// other slow-path reasons) -- which measurably happens even within one of
+/// this test's short 64-write runs (confirmed empirically: before this fix,
+/// a plain saturating subtraction across such a swap silently read as "0
+/// syncs" for the shared-handle scenario -- the new file's barely-
+/// incremented counter minus the old file's much larger one, floored at 0
+/// instead of underflowing -- a measurement artifact that looked like
+/// perfect fsync sharing rather than an invalid sample spanning two
+/// generations). `Owner.test_cumulative_sync_calls` (lite_connection.zig)
+/// carries every outgoing generation's final count forward across such a
+/// swap, so `that + the live generation's own counter` is a true running
+/// total regardless of how many swaps happened in between two reads.
+fn ws3WriterLaneTestSyncCalls(handle_ptr: ?*anyopaque) u64 {
+    const entry = HandleEntry.capture(handle_ptr).?;
+    defer entry.release();
+    const connection = entry.lock_handle.lite_connection.?;
+    // `owner.current`/`owner.test_cumulative_sync_calls`, not
+    // `connection.current`: all connections to the same path share one
+    // `Owner`, so this stays correct even if a different connection's
+    // refresh moved the owner's current generation since this handle last
+    // looked.
+    const owner = connection.owner;
+    return owner.test_cumulative_sync_calls.load(.monotonic) +
+        owner.current.?.owned_lite_backend.?.native_docstore.?.file.test_sync_calls.load(.monotonic);
+}
+
+/// Group-commit counters (`Store.test_groups_total`/`test_group_members_total`)
+/// as running totals across `Owner.refresh` generation swaps, bridged the
+/// same way as `ws3WriterLaneTestSyncCalls`.
+fn ws3WriterLaneTestGroups(handle_ptr: ?*anyopaque) struct { groups: u64, members: u64 } {
+    const entry = HandleEntry.capture(handle_ptr).?;
+    defer entry.release();
+    const owner = entry.lock_handle.lite_connection.?.owner;
+    const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+    return .{
+        .groups = owner.test_cumulative_groups.load(.monotonic) + store.test_groups_total.load(.acquire),
+        .members = owner.test_cumulative_group_members.load(.monotonic) + store.test_group_members_total.load(.acquire),
+    };
+}
+
+// WS3 acceptance test (lite-single-commit-write-path.md §6 test 9's shape,
+// adapted to the capi layer): concurrent single-doc writers through the
+// public C API, sharing one handle and then separate handles to the same
+// path, group-commit their fsyncs instead of serializing behind the DB
+// apply lock and the capi connection gate across the whole call.
+test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const writes_per_run = 64;
+    const writer_count = 8;
+    const create_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .busy_timeout_ms = 60000 };
+
+    const Worker = struct {
+        handle: ?*anyopaque,
+        ordinal: usize,
+        count: usize,
+        start: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..self.count) |i| ws3WriterLaneProbeWrite(self.handle, self.ordinal, i) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+
+    const Scenario = struct {
+        fn run(dir_name: []const u8, writer_handles: []const ?*anyopaque) !struct { syncs: u64, writes: usize } {
+            const before = ws3WriterLaneTestSyncCalls(writer_handles[0]);
+            var start = std.atomic.Value(bool).init(false);
+            var workers: [writer_count]Worker = undefined;
+            var threads: [writer_count]std.Thread = undefined;
+            // `writer_count` threads are spawned below regardless of how
+            // many distinct handles back them (1 for "shared", writer_count
+            // for "separate"), so the total write volume this scenario
+            // issues scales with `writer_count`, not `writer_handles.len`.
+            // Dividing by `writer_handles.len` here (as this used to) only
+            // happened to be correct for "separate" (where the two are
+            // equal); for "shared" it silently ran `writer_count`x the
+            // intended total writes (512 instead of 64 for this test's
+            // numbers) while still reporting the smaller, intended total --
+            // undercounting `.writes` by exactly `writer_count` and making
+            // the shared-handle scenario look `writer_count`x worse per
+            // write than it actually was. Confirmed empirically: before this
+            // fix, the shared-handle case measured 1024 real syncs over 512
+            // real writes (2.000/write, identical to solo) but reported
+            // 1024/64 = 16.000/write.
+            const per_writer = writes_per_run / writer_count;
+            for (&workers, &threads, 0..) |*worker, *thread, ordinal| {
+                worker.* = .{ .handle = writer_handles[ordinal % writer_handles.len], .ordinal = ordinal, .count = per_writer, .start = &start };
+                thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+            }
+            start.store(true, .release);
+            for (threads) |thread| thread.join();
+            for (workers) |worker| if (worker.failure) |err| return err;
+            const after = ws3WriterLaneTestSyncCalls(writer_handles[0]);
+            _ = dir_name;
+            // Plain subtraction is safe now: `ws3WriterLaneTestSyncCalls`
+            // returns a running total stable across any `Owner.refresh`
+            // generation swap in between (see its doc comment).
+            return .{ .syncs = after - before, .writes = per_writer * writer_count };
+        }
+    };
+
+    // Baseline: one writer, one handle -- nothing to share a group with.
+    var solo_dir = try TestDirectory.init("ws3-writer-lane-solo");
+    defer solo_dir.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, solo_dir.path());
+    const solo_path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{solo_dir.path()}, 0);
+    defer alloc.free(solo_path);
+    var solo_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(solo_path, &create_options, &solo_handle));
+    defer antfly_db_close(solo_handle);
+    const solo_before = ws3WriterLaneTestSyncCalls(solo_handle);
+    for (0..writes_per_run) |i| try ws3WriterLaneProbeWrite(solo_handle, 0, i);
+    const solo_after = ws3WriterLaneTestSyncCalls(solo_handle);
+    const solo_syncs = solo_after - solo_before;
+    const solo_per_write: f64 = @as(f64, @floatFromInt(solo_syncs)) / @as(f64, @floatFromInt(writes_per_run));
+
+    // Eight writer threads sharing one handle (one Connection, one QueuedMutex
+    // and gate): each write stages under the DB apply lock, then (WS3)
+    // releases the capi connection lock before waiting on its own ticket, so
+    // whichever thread leads a group's fsync can cover every member staged
+    // while it ran.
+    var shared_dir = try TestDirectory.init("ws3-writer-lane-shared-handle");
+    defer shared_dir.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, shared_dir.path());
+    const shared_path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{shared_dir.path()}, 0);
+    defer alloc.free(shared_path);
+    var shared_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(shared_path, &create_options, &shared_handle));
+    defer antfly_db_close(shared_handle);
+    const shared_result = try Scenario.run("shared", &.{shared_handle});
+    const shared_per_write: f64 = @as(f64, @floatFromInt(shared_result.syncs)) / @as(f64, @floatFromInt(shared_result.writes));
+
+    // Eight writer threads, eight separate handles opened to the same path:
+    // the lane's lease-handoff (`QueuedMutex.retainForWaiter`/`takeRetained`
+    // on the path gate, shared process-wide by path) is what lets these
+    // also group-commit, since there is no shared `Connection` here.
+    var separate_dir = try TestDirectory.init("ws3-writer-lane-separate-handles");
+    defer separate_dir.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, separate_dir.path());
+    const separate_path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{separate_dir.path()}, 0);
+    defer alloc.free(separate_path);
+    var separate_handles: [writer_count]?*anyopaque = undefined;
+    var opened: usize = 0;
+    defer for (separate_handles[0..opened]) |handle| antfly_db_close(handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(separate_path, &create_options, &separate_handles[0]));
+    opened = 1;
+    const open_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .busy_timeout_ms = 60000 };
+    for (separate_handles[1..]) |*slot| {
+        // Separate `*anyopaque` handles, separate `Connection`s, but the same
+        // path's `PathGate` (process-wide by path): this is where the lane's
+        // lease-handoff, not any per-Connection mutex, has to do the work.
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(separate_path, &open_options, slot));
+        opened += 1;
+    }
+    const separate_result = try Scenario.run("separate", &separate_handles);
+    const separate_per_write: f64 = @as(f64, @floatFromInt(separate_result.syncs)) / @as(f64, @floatFromInt(separate_result.writes));
+
+    std.debug.print(
+        "WS3 writer lane: solo {d}/{d} writes ({d:.3}/write); {d} writers shared handle {d}/{d} ({d:.3}/write); {d} writers separate handles {d}/{d} ({d:.3}/write)\n",
+        .{ solo_syncs, writes_per_run, solo_per_write, writer_count, shared_result.syncs, shared_result.writes, shared_per_write, writer_count, separate_result.syncs, separate_result.writes, separate_per_write },
+    );
+
+    // Directional, not an exact ceiling: the design doc's ~0.25 target
+    // assumes an otherwise idle machine, and this suite can run alongside
+    // other heavy concurrent builds on a shared box. The invariant that
+    // must always hold is that concurrent writers group-commit at least as
+    // well as one writer alone, never worse (each write still costs exactly
+    // one fsync in the worst case of zero sharing).
+    try std.testing.expect(shared_per_write <= solo_per_write + 0.01);
+    try std.testing.expect(separate_per_write <= solo_per_write + 0.01);
+    // Writers on separate handles must actually share syncs: the leader
+    // waits (bounded by one sync) for a writer still staging under the
+    // lane. Measured about 0.5x solo in Debug; 0.9x leaves room for load.
+    try std.testing.expect(separate_per_write <= solo_per_write * 0.9);
+}
+
+/// `connection.owner.current`'s live `Store` (docstore.zig), for the WS3
+/// tests' simulated fsync latency: `NativeFile.test_sync_delay_ns` (set this; an
+/// `Owner.refresh` generation swap carries it to the replacement file).
+/// Read the group counters through `ws3WriterLaneTestGroups`, which bridges
+/// those swaps.
+const Ws3NativeStore = std.meta.Child(std.meta.Child(@FieldType(std.meta.Child(@FieldType(Handle, "owned_lite_backend")), "native_docstore")));
+fn ws3WriterLaneStore(handle_ptr: ?*anyopaque) *Ws3NativeStore {
+    const entry = HandleEntry.capture(handle_ptr).?;
+    defer entry.release();
+    const connection = entry.lock_handle.lite_connection.?;
+    return connection.owner.current.?.owned_lite_backend.?.native_docstore.?;
+}
+
+// WS3 fsync-latency acceptance test: the writer lane only ever gets a
+// *chance* to share a group if the group leader's fsync is slow enough
+// for a concurrent writer's own admission and staging to land behind it
+// first. An artificially slow fsync (`NativeFile.test_sync_delay_ns`)
+// removes any doubt about whether real NVMe-speed fsyncs on this
+// particular machine simply finish before an 8-thread race can ever
+// produce two members in the same `commit_head`/`commit_tail` queue at
+// once: with a 5ms fsync, 8 concurrent writers through the public C API
+// must form groups of more than one member, or something upstream of the
+// fsync (lane checkout, the DB apply lock, connection.mutex, the Store
+// writer slot, or `enqueue` itself) is still serializing them.
+test "WS3 writer lane: a slow fsync forces concurrent writers to share groups" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    // Small enough that even zero sharing (64 * 5ms serialized) stays a
+    // fraction of a second; large enough (double the solo/no-delay test's
+    // sample) that the mean-group-size ratio is a stable average over many
+    // groups rather than noise from one lucky/unlucky pair -- a 32-write
+    // run occasionally landed just under the 2.0/0.5 thresholds when this
+    // test ran back-to-back with the other two in one process on a loaded
+    // machine; 64 did not reproduce that in repeated chained runs.
+    const writes_per_run = 64;
+    const writer_count = 8;
+    const sync_delay_ns: u64 = 5 * std.time.ns_per_ms;
+    const create_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .busy_timeout_ms = 60000 };
+
+    const Worker = struct {
+        handle: ?*anyopaque,
+        ordinal: usize,
+        count: usize,
+        start: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..self.count) |i| ws3WriterLaneProbeWrite(self.handle, self.ordinal, i) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+
+    const Scenario = struct {
+        fn run(writer_handles: []const ?*anyopaque) !struct { syncs: u64, writes: usize, groups: u64, members: u64 } {
+            const sync_before = ws3WriterLaneTestSyncCalls(writer_handles[0]);
+            const groups_before = ws3WriterLaneTestGroups(writer_handles[0]);
+            var start = std.atomic.Value(bool).init(false);
+            var workers: [writer_count]Worker = undefined;
+            var threads: [writer_count]std.Thread = undefined;
+            const per_writer = writes_per_run / writer_count;
+            for (&workers, &threads, 0..) |*worker, *thread, ordinal| {
+                worker.* = .{ .handle = writer_handles[ordinal % writer_handles.len], .ordinal = ordinal, .count = per_writer, .start = &start };
+                thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+            }
+            start.store(true, .release);
+            for (threads) |thread| thread.join();
+            for (workers) |worker| if (worker.failure) |err| return err;
+            const sync_after = ws3WriterLaneTestSyncCalls(writer_handles[0]);
+            const groups_after = ws3WriterLaneTestGroups(writer_handles[0]);
+            return .{
+                .syncs = sync_after - sync_before,
+                .writes = per_writer * writer_count,
+                .groups = groups_after.groups - groups_before.groups,
+                .members = groups_after.members - groups_before.members,
+            };
+        }
+    };
+
+    // Eight writer threads sharing one handle.
+    var shared_dir = try TestDirectory.init("ws3-writer-lane-slow-sync-shared-handle");
+    defer shared_dir.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, shared_dir.path());
+    const shared_path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{shared_dir.path()}, 0);
+    defer alloc.free(shared_path);
+    var shared_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(shared_path, &create_options, &shared_handle));
+    defer antfly_db_close(shared_handle);
+    ws3WriterLaneStore(shared_handle).file.test_sync_delay_ns.store(sync_delay_ns, .release);
+    const shared_result = try Scenario.run(&.{shared_handle});
+    const shared_per_write: f64 = @as(f64, @floatFromInt(shared_result.syncs)) / @as(f64, @floatFromInt(shared_result.writes));
+    const shared_mean_group: f64 = if (shared_result.groups == 0) 0 else @as(f64, @floatFromInt(shared_result.members)) / @as(f64, @floatFromInt(shared_result.groups));
+
+    // Eight writer threads, eight separate handles opened to the same path.
+    var separate_dir = try TestDirectory.init("ws3-writer-lane-slow-sync-separate-handles");
+    defer separate_dir.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, separate_dir.path());
+    const separate_path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{separate_dir.path()}, 0);
+    defer alloc.free(separate_path);
+    var separate_handles: [writer_count]?*anyopaque = undefined;
+    var opened: usize = 0;
+    defer for (separate_handles[0..opened]) |handle| antfly_db_close(handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(separate_path, &create_options, &separate_handles[0]));
+    opened = 1;
+    ws3WriterLaneStore(separate_handles[0]).file.test_sync_delay_ns.store(sync_delay_ns, .release);
+    const open_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .busy_timeout_ms = 60000 };
+    for (separate_handles[1..]) |*slot| {
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(separate_path, &open_options, slot));
+        opened += 1;
+    }
+    const separate_result = try Scenario.run(&separate_handles);
+    const separate_per_write: f64 = @as(f64, @floatFromInt(separate_result.syncs)) / @as(f64, @floatFromInt(separate_result.writes));
+    const separate_mean_group: f64 = if (separate_result.groups == 0) 0 else @as(f64, @floatFromInt(separate_result.members)) / @as(f64, @floatFromInt(separate_result.groups));
+
+    std.debug.print(
+        "WS3 writer lane (5ms fsync): {d} writers shared handle {d}/{d} ({d:.3}/write, mean group {d:.2}); {d} writers separate handles {d}/{d} ({d:.3}/write, mean group {d:.2})\n",
+        .{ writer_count, shared_result.syncs, shared_result.writes, shared_per_write, shared_mean_group, writer_count, separate_result.syncs, separate_result.writes, separate_per_write, separate_mean_group },
+    );
+
+    try std.testing.expect(shared_mean_group >= 2.0);
+    try std.testing.expect(shared_per_write <= 0.5);
+    try std.testing.expect(separate_mean_group >= 2.0);
+    try std.testing.expect(separate_per_write <= 0.5);
+}
+
+// WS3's "apply lock not held during fsync" test hook, at the capi layer:
+// `test_writer_lane_release_hook` fires from `HandleGuard.
+// releaseWriterLaneBeforeWait` right after it drops `connection.mutex` and
+// `connection.gate.mutex`, and parks the writer there until this test lets
+// it continue -- a deterministic window to assert both are actually free,
+// instead of racing real fsync timing.
+test "WS3 writer lane: capi connection locks are free during the primary write's durability wait" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("ws3-writer-lane-lock-free-wait");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    defer alloc.free(path);
+    var handle: ?*anyopaque = null;
+    const create_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &create_options, &handle));
+    defer antfly_db_close(handle);
+
+    const entry = HandleEntry.capture(handle).?;
+    defer entry.release();
+    const connection = entry.lock_handle.lite_connection.?;
+    // Park the owner's background worker for this test. A maintenance turn
+    // that wants the writer lease takes `gate.mutex` and waits for the
+    // lease the lane has parked, and the writer below stays parked inside
+    // its durability wait until this test lets it go. This test is about
+    // the writer's own locks, not a worker queued behind it.
+    {
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(handleLockIo());
+        if (owner.worker) |worker| worker.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+    }
+
+    const Probe = struct {
+        released: std.Io.Event = .unset,
+        proceed: std.Io.Event = .unset,
+        fn notify(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.released.set(handleLockIo());
+            self.proceed.waitUncancelable(handleLockIo());
+        }
+    };
+    var probe: Probe = .{};
+    test_writer_lane_release_hook = .{ .ptr = &probe, .notify = Probe.notify };
+    defer test_writer_lane_release_hook = null;
+
+    const Writer = struct {
+        handle: ?*anyopaque,
+        code: capi.ErrorCode = .invalid_argument,
+        fn run(self: *@This()) void {
+            var request_buffer: [128]u8 = undefined;
+            const request = std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k\":{{\"v\":\"probe\"}}}},\"sync_level\":\"write\"}}", .{}) catch unreachable;
+            var output: capi.Buffer = .{};
+            defer antfly_buffer_free(&output);
+            self.code = antfly_db_batch_json(self.handle, .{ .ptr = request.ptr, .len = request.len }, &output);
+        }
+    };
+    var writer: Writer = .{ .handle = handle };
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+
+    probe.released.waitUncancelable(handleLockIo());
+    // The write is staged, the DB apply lock has released, and WS3's capi
+    // hook has just dropped `connection.mutex` too -- the writer thread is
+    // parked here, not yet waiting on its durability ticket. That mutex
+    // must be immediately acquirable from this thread right now: nothing
+    // else in this process is queued for the connection, so another
+    // same-process caller could enter immediately.
+    //
+    // The writer stays parked until `probe.proceed`, so a lock it still
+    // held would never come free. Retry for a bounded window instead of a
+    // single `tryLock`: the owner's background maintenance turn takes these
+    // mutexes briefly on its own schedule, which is not what this checks.
+    const LockProbe = struct {
+        fn acquirable(mutex: anytype) bool {
+            for (0..1000) |_| {
+                if (mutex.tryLock()) {
+                    mutex.unlock(handleLockIo());
+                    return true;
+                }
+                handleLockIo().sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            return false;
+        }
+    };
+    const connection_mutex_free = LockProbe.acquirable(&connection.mutex);
+    // The path gate's lease mutex is also free here, unlike before the
+    // writer lane existed: `WriterLane.checkout` already released
+    // `connection.gate.mutex` right after establishing/refreshing the
+    // kernel lease, well before this call ever reached
+    // `releaseWriterLaneBeforeWait` -- the lane, not this one call, owns
+    // the lease from then on, so there is nothing left on `PathGate` for
+    // this guard to hold across the durability wait at all. A same-Store
+    // writer that arrives while this one is parked here never touches
+    // `PathGate` either (it polls the lane directly), so gate.mutex being
+    // free carries no priority-inversion risk the way it would have under
+    // the old per-call retain/handoff design.
+    const gate_mutex_free = LockProbe.acquirable(&connection.gate.mutex);
+    probe.proceed.set(handleLockIo());
+    thread.join();
+
+    try std.testing.expect(connection_mutex_free);
+    try std.testing.expect(gate_mutex_free);
+    try std.testing.expectEqual(capi.ErrorCode.ok, writer.code);
 }
 
 test "capi SQL preparation shares live bytes across queued connections and close" {
@@ -10507,6 +11387,8 @@ comptime {
         "antfly_db_write_transaction",
         "antfly_db_batch",
         "antfly_db_batch_json",
+        "antfly_db_batch_wire",
+        "antfly_db_batch_wire_with_receipt",
         "antfly_db_resolve_intents",
         "antfly_db_get_transaction_status",
         "antfly_db_get_commit_version",

@@ -227,7 +227,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const batch_contract_tests = b.addTest(.{
         .name = "storage-batch-contract-tests",
         .root_module = batch_contract_mod,
-        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector", "privacy ordered artifact tombstone", "privacy base vectors", "privacy local source audit", "privacy base vector source updates", "privacy publication callback", "privacy independent roots", "privacy ID scans", "privacy discovery", "public graph metric borrowed wire document scan" }),
+        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector", "ordered artifact inventory input capture", "materialized chunk embeddings", "db quarantined dense bootstrap", "db templated dense backfill", "db sequential managed dense backfills", "db online vector publication", "db online vector repair", "privacy progress cannot replace", "privacy scoped readiness", "privacy ordered artifact tombstone", "privacy base vectors", "privacy local source audit", "privacy base vector source updates", "privacy publication callback", "privacy independent roots", "privacy ID scans", "privacy discovery", "public graph metric borrowed wire document scan" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("storage-batch-contract-test", "Verify collector OOM ownership and bounded provider batches without HTTP discovery")
@@ -260,14 +260,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const admission_api_tests = b.addTest(.{
         .root_module = admission_api_root,
         .filters = &.{
+            "commit requirements",
+            "http handler honors public serverless sync levels",
             "public table create index preserves permanent inference budget",
             "public artifact enrichment preserves permanent inference budget",
             "PDF embedding input public contract",
             "public table query returns hierarchy validation pointers",
             "embedding validation failures share",
+            "api http query parsing preserves operational embedding failures",
             "hierarchy validation body survives",
             "serverless create index normalization resolves and persists",
             "serverless aggregation errors preserve invalid and unsupported classes",
+            "serverless public table query adapter preserves structured error content type",
+            "serverless fallback semantic query reuses embeddings",
             "time series public aggregation failures retain client and operational classes",
         },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
@@ -631,6 +636,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-store-observer-test", "Run store report admission, fencing, and ownership regressions").dependOn(&b.addRunArtifact(store_observer_tests).step);
 
+    // Committed alias tests use the metadata persistence owner, including its
+    // kernel-owned WAL; the lean coordinator target has no such provider.
+    const alias_raft_filters: []const []const u8 = &.{ "metadata alias", "index alias Raft admission", "index alias lifecycle presence" };
+    const alias_raft_tests = b.addTest(.{
+        .name = "index-alias-raft-tests",
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = alias_raft_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-raft-test", "Verify committed alias rejection and durable store-admission indexes")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_raft_tests, alias_raft_filters).step);
+    const alias_metadata_http_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"index alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-metadata-http-test", "Verify alias preflight conflicts across metadata HTTP routes and forwarding")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_metadata_http_tests, &.{"index alias"}).step);
     const system_catalog_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
@@ -653,6 +676,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
     });
+    const alias_receipt_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"standalone metadata HA preserves incremental jobs outbox recovery and full checkpoint authority"},
+    });
+    b.step("antfly-index-alias-receipt-test", "Verify nonwaiting receipt reconciliation preserves durable publication authority")
+        .dependOn(&b.addRunArtifact(alias_receipt_tests).step);
     const graph_authority_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"system catalog graph authority probes"} });
     b.step("antfly-graph-authority-probe-test", "Verify bounded graph binding authority across catalog replacement")
         .dependOn(&b.addRunArtifact(graph_authority_tests).step);
@@ -739,7 +768,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
-    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL policy DDL", "SQL pgwire", "SQL rewrite response" } });
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
         .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
     const sql_native_cells_tests = b.addTest(.{
@@ -948,6 +977,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http client encodes table name for repair cancel callback",
             "public api routes compile",
             "table repair job records bounded pass and continuation",
+            "table repair job continues bounded passes across restart",
+            "table repair job verifies earlier pending shards before success",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -974,7 +1005,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     restore_source_imports.configure(b, restore_owner_test_mod, true, true);
     const restore_owner_tests = b.addTest(.{
         .root_module = restore_owner_test_mod,
-        .filters = &.{ "restore owner verified decoder", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "mapped restore admission" },
+        .filters = &.{ "restore owner verified decoder", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "relational integrity topology durable backup seal survives restart and later writes", "relational integrity historical restore stays fenced while coherent HA seed preserves namespace", "relational integrity accepted generation survives restart and bounded two-phase GC", "mapped restore admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-restore-owner-test", "Run authenticated source cache and replicated owner control integration").dependOn(&addFilteredTestRunArtifact(b, restore_owner_tests).step);
@@ -1070,6 +1101,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const index_document_producer_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/asset_producer_runtime.zig"), .target = target, .optimize = optimize });
     test_imports.configure(b, index_document_producer_mod, true, true);
     index_document_producer_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const reader_discovery_tests = b.addTest(.{
+        .root_module = index_document_producer_mod,
+        .filters = &.{ "asset producer runtime preserves remote reader", "asset producer runtime preserves framed remote reader" },
+        .max_rss = 4 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-reader-discovery-test", "Verify reader discovery, transport, identity and native batching").dependOn(&b.addRunArtifact(reader_discovery_tests).step);
     const transcriber_credential_tests = b.addTest(.{ .root_module = index_document_producer_mod, .filters = &.{"transcriber"}, .max_rss = 4 * 1024 * 1024 * 1024 });
     b.step("antfly-transcriber-credentials-test", "Verify native STT credentials, source ownership and batching").dependOn(&b.addRunArtifact(transcriber_credential_tests).step);
     const index_document_producer_tests = b.addTest(.{ .root_module = index_document_producer_mod, .filters = &.{"index document checkpoint producer"} });
@@ -1144,6 +1181,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "portable backup native resolver authority",
             "portable backup refuses retained retirement and topology authority without a catalog",
             "portable accepted-generation proof requires a sealed v3 reader and canonical unique scope",
+            "portable standalone import detaches informational cohort without granting authority",
+            "public catalog translation preserves runtime config and incarnation",
+            "native backup receipt envelope",
             "portable accepted-generation proof page reads only canonical sealed decoder metadata",
             "portable restore validates historical rows with their public schema epoch",
             "portable archive accepts long history with a bounded decoded working set",
@@ -1245,7 +1285,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     // One fixed artifact owns the common/provider/CLI-parser domains. Public
     // steps keep their existing runtime selections and environment policies.
-    const common_config_filters = &.{"common.config.test."};
+    const common_config_filters = &.{ "common.config.test.", "serverless http client ingestion rejects private publication kinds" };
     const preload_filters = &.{
         "preload model spec parser categorizes registry variants and backends",
         "inference runtime preload parser preserves registry variants and explicit backends",
@@ -1761,6 +1801,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "managed embedder deadlines bound provider pacing and transport",
         "remote capability invalidation fences active discovery",
         "managed embedder dimension probe validation modes",
+        "split text windows compare pinned output identity across placement contracts",
         "managed embedding request overlays borrow capability cache synchronization",
         "managed embedder rejects malformed provider vectors",
         "managed embedder rejects unsupported execution namespaces",
@@ -1781,6 +1822,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "capability lease HTTP fields own storage",
         "asset producer runtime rejects empty borrowed media",
         "asset producer runtime derives coherent logical and wire result ceilings",
+        "reader split windows share",
         "asset producer runtime applies result ceilings to non-model producers",
         "remote chunk runtime services do not require a local callback provider",
         "asset producer media invocation memory fails closed",
@@ -2357,6 +2399,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "backup cohort admission waits for producer drain",
+        "backup preparation preserves interruption errors",
+        "external lake read refresh hints coalesce",
         "admission routing",
         "native memory",
         "httpx internal control routes call typed operations directly",
@@ -2721,6 +2766,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     query_embedding_cache_test_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
     query_embedding_cache_test_mod.addImport("antfly_platform", platform_mod);
+    query_embedding_cache_test_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
     query_embedding_cache_test_mod.addImport("vopr", vopr_mod);
     const query_embedding_cache_tests = b.addTest(.{ .root_module = query_embedding_cache_test_mod });
     const run_query_embedding_cache_tests = b.addRunArtifact(query_embedding_cache_tests);
@@ -3638,6 +3684,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
         .dependOn(&addFilteredTestRunArtifact(b, text_frontier_tests).step);
+    const native_source_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_native_source_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, native_source_mod, true, true);
+    const native_source_filters = selectTestFilters(b, &.{"external lake execution"});
+    const native_source_tests = b.addTest(.{
+        .root_module = native_source_mod,
+        .filters = native_source_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-native-source-test", "Verify native source memory bounds, immutable receipts and reopen")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, native_source_tests, native_source_filters).step);
     const recent_native_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_recent_native_test_root.zig"),
         .target = target,
@@ -3880,6 +3940,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table provisioner restores local shard data from metadata restore intent",
         "table provisioner restore rejects mismatched doc identity namespace",
         "table provisioner replaces embedding index when metadata incarnation changes",
+        "table provisioner preserves vector incarnations across JSON formatting",
         "table provisioner can admit resolver backfill without draining corpus work",
         "runtime schema progress requires every hosted range",
         "table provisioner accepts target schema index when retained read index has inflated doc count",
@@ -4046,6 +4107,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
+
+    if (target.result.os.tag == .linux or (antfly_imports.platform_link_libc and target.result.os.tag == .macos)) {
+        var modules: [2]*std.Build.Module = undefined;
+        for (&modules) |*module| {
+            module.* = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly-embedded/src/storage_fd_cache_link_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = antfly_imports.platform_link_libc,
+            });
+            module.*.addImport("antfly_platform", platform_mod);
+            module.*.addImport("antfly_hash", hash_mod);
+            antfly_imports.configureRuntimeContracts(module.*);
+        }
+        const provider = b.addLibrary(.{ .name = "descriptor-admission-test-provider", .root_module = modules[0] });
+        modules[1].linkLibrary(provider);
+        const linked = b.addTest(.{
+            .name = "descriptor-admission-link-tests",
+            .root_module = modules[1],
+            .filters = &.{"native fd admission is visible across separately compiled archives"},
+        });
+        const run = b.addRunArtifact(linked);
+        b.step("storage-fd-admission-link-test", "Verify native descriptor accounting across archives").dependOn(&run.step);
+        lsm_backend_test_step.dependOn(&run.step);
+    }
 
     const lsm_checkpoint_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -4601,8 +4687,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("transaction-runtime-regression-test", "Check transaction identity, recovery clocks, and safe stateless retries").dependOn(&addCuratedTestRunArtifact(b, transaction_runtime_regressions, transaction_runtime_filters).step);
+    // This whole "full cluster"/"production cluster" VOPR family boots the
+    // real metadata and data-plane harness, which reaches the production
+    // storage owner through storage.kernel_owner_client the same way the
+    // server does; VoprIo only swaps the simulated transport underneath it.
+    // Give the family its own clone of antfly_test_mod (not the shared
+    // module every other unit test compiles against) so only these compiles
+    // pull in the storage-kernel/enrichment-compute/inference provider
+    // archives as a link prerequisite. The clone must be recursive (not just
+    // the top-level module): antfly_test_mod reaches usermgr_storage_test_mod,
+    // which imports antfly_test_mod back as "antfly_root", so a shallow clone
+    // would make pkg/antfly/src/root.zig the root of two live modules at once.
+    var full_cluster_vopr_consumer_mod_copies: std.AutoHashMap(*std.Build.Module, *std.Build.Module) = .init(b.allocator);
+    const full_cluster_vopr_consumer_mod = @import("../../../build_support/antfly/test_partitions.zig").cloneModule(b, antfly_test_mod, &full_cluster_vopr_consumer_mod_copies);
+    @import("../../../build_support/embedded/source_owner.zig").adopt(full_cluster_vopr_consumer_mod);
     const vopr_runtime_regression_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{
             "metadata VOPR distributed data survives split partition node restart and modeled storage crash",
             "metadata VOPR split runtime preserves source identity namespace",
@@ -4640,7 +4740,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("vopr-runtime-regression-test", "Run VOPR runtime ownership, clock, snapshot, and replay regressions").dependOn(&run_vopr_runtime_regressions.step);
 
     const standby_production_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"production standby owners"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4648,7 +4748,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("standby-production-vopr-test", "Exercise production standby public writes, standby reads, and promotion on VoprIo").dependOn(&run_standby_production_vopr_tests.step);
 
     const standby_scaling_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"production standby scaling VOPR exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4657,7 +4757,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("standby-scaling-vopr-test", "Replay production standby promotion with automatic split/merge and replica scale-out/drain").dependOn(&run_standby_scaling_vopr_tests.step);
 
     const full_cluster_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{
             "full cluster VOPR exact replays",
             "full cluster graph inflight restart cutoff drains parked hooks",
@@ -4676,21 +4776,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     full_cluster_vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
 
     const full_cluster_graph_replay_soak_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster VOPR graph inflight restart repeated exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     b.step("full-cluster-graph-replay-soak-test", "Repeat the graph restart recorded history and exact replay")
         .dependOn(&b.addRunArtifact(full_cluster_graph_replay_soak_tests).step);
     const full_cluster_graph_cutoff_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster graph inflight restart cutoff drains parked hooks"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     b.step("full-cluster-graph-cutoff-test", "Verify graph restart hooks drain at a bounded replay cutoff")
         .dependOn(&b.addRunArtifact(full_cluster_graph_cutoff_tests).step);
     const full_cluster_node_replacement_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{
             "failed node replacement leaves a drainable empty slot",
             "metadata wrapper rejects empty node startup and restores external ownership after retry",
@@ -4701,7 +4801,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(full_cluster_node_replacement_tests).step);
 
     const extension_lifecycle_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{ "extension lifecycle", "wasmtime v45" },
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4709,7 +4809,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(extension_lifecycle_tests).step);
 
     const resource_pressure_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster VOPR exact replays resource pressure recovery"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4717,7 +4817,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(resource_pressure_vopr_tests).step);
 
     const production_cluster_service_rate_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production service rates compose heal and exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4729,7 +4829,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_service_rate_vopr_test_step.dependOn(&run_production_cluster_service_rate_vopr_tests.step);
 
     const production_cluster_query_cache_service_rate_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production query embedding cache deadline owner restart and exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4741,7 +4841,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_query_cache_service_rate_vopr_test_step.dependOn(&run_production_cluster_query_cache_service_rate_vopr_tests.step);
 
     const production_cluster_serverless_fencing_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production generation progress conflict exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4753,7 +4853,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_serverless_fencing_vopr_test_step.dependOn(&run_production_cluster_serverless_fencing_vopr_tests.step);
 
     const production_cluster_authenticated_tenant_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production authenticated tenant isolation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4765,7 +4865,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_authenticated_tenant_vopr_test_step.dependOn(&run_production_cluster_authenticated_tenant_vopr_tests.step);
 
     const production_cluster_disk_capacity_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production disk capacity pressure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4777,7 +4877,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_disk_capacity_vopr_test_step.dependOn(&run_production_cluster_disk_capacity_vopr_tests.step);
 
     const production_cluster_managed_index_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production managed index publication bounded lifecycle exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4789,7 +4889,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_managed_index_vopr_test_step.dependOn(&run_production_cluster_managed_index_vopr_tests.step);
 
     const production_cluster_replication_backfill_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication backfill crosses public data raft and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4801,7 +4901,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_backfill_vopr_test_step.dependOn(&run_production_cluster_replication_backfill_vopr_tests.step);
 
     const production_cluster_replication_schema_change_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication schema change resumes through public data raft and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4813,7 +4913,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_schema_change_vopr_test_step.dependOn(&run_production_cluster_replication_schema_change_vopr_tests.step);
 
     const production_cluster_replication_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication target owner restarts resumes and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4825,7 +4925,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_owner_restart_vopr_test_step.dependOn(&run_production_cluster_replication_owner_restart_vopr_tests.step);
 
     const production_cluster_replication_source_crash_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication source session crashes resumes and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4837,7 +4937,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_source_crash_vopr_test_step.dependOn(&run_production_cluster_replication_source_crash_vopr_tests.step);
 
     const production_cluster_replication_cancellation_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication durable cancellation resumes and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4849,7 +4949,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_cancellation_vopr_test_step.dependOn(&run_production_cluster_replication_cancellation_vopr_tests.step);
 
     const production_cluster_replication_stale_owner_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication stale owner replays undurable batch and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4861,7 +4961,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_stale_owner_vopr_test_step.dependOn(&run_production_cluster_replication_stale_owner_vopr_tests.step);
 
     const production_cluster_replication_topology_change_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production replication metadata topology rotates cutover authority and exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4873,7 +4973,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_replication_topology_change_vopr_test_step.dependOn(&run_production_cluster_replication_topology_change_vopr_tests.step);
 
     const production_cluster_graph_hydration_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph hydration exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4885,7 +4985,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_hydration_vopr_test_step.dependOn(&run_production_cluster_graph_hydration_vopr_tests.step);
 
     const production_cluster_graph_cancellation_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph cancellation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4897,7 +4997,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_cancellation_vopr_test_step.dependOn(&run_production_cluster_graph_cancellation_vopr_tests.step);
 
     const production_cluster_graph_cancellation_transport_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph cancellation under transport fault exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4909,7 +5009,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_cancellation_transport_vopr_test_step.dependOn(&run_production_cluster_graph_cancellation_transport_vopr_tests.step);
 
     const production_cluster_graph_inflight_authorization_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph inflight authorization revocation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4921,7 +5021,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_inflight_authorization_vopr_test_step.dependOn(&run_production_cluster_graph_inflight_authorization_vopr_tests.step);
 
     const production_cluster_graph_stale_snapshot_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public graph stale snapshot retry exhaustion exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4933,7 +5033,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_graph_stale_snapshot_vopr_test_step.dependOn(&run_production_cluster_graph_stale_snapshot_vopr_tests.step);
 
     const production_cluster_global_query_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4945,7 +5045,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_vopr_test_step.dependOn(&run_production_cluster_global_query_vopr_tests.step);
 
     const production_cluster_global_query_cancellation_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query cancellation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4957,7 +5057,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_cancellation_vopr_test_step.dependOn(&run_production_cluster_global_query_cancellation_vopr_tests.step);
 
     const production_cluster_global_query_authorization_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query inflight authorization revocation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4969,7 +5069,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_authorization_vopr_test_step.dependOn(&run_production_cluster_global_query_authorization_vopr_tests.step);
 
     const production_cluster_global_query_transport_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query transport failure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4981,7 +5081,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_transport_vopr_test_step.dependOn(&run_production_cluster_global_query_transport_vopr_tests.step);
 
     const production_cluster_global_query_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production public global query owner restart exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -4993,14 +5093,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     production_cluster_global_query_owner_restart_vopr_test_step.dependOn(&run_production_cluster_global_query_owner_restart_vopr_tests.step);
 
     const production_cluster_baseline_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_baseline_vopr_tests = b.addRunArtifact(production_cluster_baseline_vopr_tests);
     b.step("production-cluster-baseline-vopr-test", "Exact-replay the production DataServer baseline").dependOn(&run_production_cluster_baseline_vopr_tests.step);
     const production_cluster_bounded_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane VOPR bounded cutoff exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -5010,49 +5110,49 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // running the two fresh-world replay processes serially.
     run_production_cluster_bounded_vopr_tests.step.dependOn(&run_production_cluster_baseline_vopr_tests.step);
     const production_cluster_deep_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane VOPR active split exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_deep_vopr_tests = b.addRunArtifact(production_cluster_deep_vopr_tests);
     const production_cluster_graph_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_vopr_tests = b.addRunArtifact(production_cluster_graph_vopr_tests);
     const production_cluster_graph_split_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_vopr_tests = b.addRunArtifact(production_cluster_graph_split_vopr_tests);
     const production_cluster_graph_split_transport_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split transport failure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_transport_vopr_tests = b.addRunArtifact(production_cluster_graph_split_transport_vopr_tests);
     const production_cluster_graph_split_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split owner restart exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_graph_split_owner_restart_vopr_tests);
     const production_cluster_graph_split_partial_write_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split partial write exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_partial_write_vopr_tests = b.addRunArtifact(production_cluster_graph_split_partial_write_vopr_tests);
     const production_cluster_graph_split_resource_pressure_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split resource pressure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_resource_pressure_vopr_tests = b.addRunArtifact(production_cluster_graph_split_resource_pressure_vopr_tests);
     const production_cluster_join_split_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{
             "full cluster production data plane distributed join active split exact replay",
             "production distributed join oracle accepts broadcast without a shuffle ledger",
@@ -5061,55 +5161,55 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_production_cluster_join_split_vopr_tests = b.addRunArtifact(production_cluster_join_split_vopr_tests);
     const production_cluster_durable_join_takeover_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane durable shuffle join finalizer takeover exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_takeover_vopr_tests = b.addRunArtifact(production_cluster_durable_join_takeover_vopr_tests);
     const production_cluster_durable_join_cancellation_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle join cancellation exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_cancellation_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_vopr_tests);
     const production_cluster_durable_join_worker_retry_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle partition worker failover exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_worker_retry_vopr_tests = b.addRunArtifact(production_cluster_durable_join_worker_retry_vopr_tests);
     const production_cluster_durable_join_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle partition owner reconstruction exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_durable_join_owner_restart_vopr_tests);
     const production_cluster_durable_join_retry_exhaustion_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle overlapping fault retry exhaustion exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_retry_exhaustion_vopr_tests = b.addRunArtifact(production_cluster_durable_join_retry_exhaustion_vopr_tests);
     const production_cluster_durable_join_cancellation_overlap_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle cancellation under overlapping faults exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_cancellation_overlap_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_overlap_vopr_tests);
     const production_cluster_durable_join_cancellation_owner_restart_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production durable shuffle cancellation with owner reconstruction exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_cancellation_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_owner_restart_vopr_tests);
     const production_cluster_graph_split_overlapping_faults_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split overlapping link resource faults exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_overlapping_faults_vopr_tests = b.addRunArtifact(production_cluster_graph_split_overlapping_faults_vopr_tests);
     const production_cluster_graph_split_socket_pressure_vopr_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = full_cluster_vopr_consumer_mod,
         .filters = &.{"full cluster production data plane graph active split socket pressure exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
@@ -5818,6 +5918,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     memory_metadata_step.dependOn(&b.addRunArtifact(memory_standalone_tests).step);
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
+    const standalone_alias_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"index alias standalone"},
+    });
+    b.step("antfly-index-alias-catalog-test", "Verify index alias CAS, deletion guards, rollback and restart").dependOn(&b.addRunArtifact(standalone_alias_tests).step);
     const standalone_ddl_tests = b.addTest(.{
         .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"system catalog standalone relation coordinator"},
@@ -5867,6 +5972,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
+            "index alias standalone",
             "privacy standalone progress retains routing and join planning generations",
             "privacy standalone compact bindings refresh on policy publication and survive progress",
             "standalone metadata admission observes cancellation",
@@ -6078,6 +6184,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const inference_host_tests = b.addTest(.{
         .root_module = test_imports.runtime.inference_host,
         .filters = &.{
+            "commit requirements sparse host operation preserves execution revision",
             "local generate message conversion preserves tool history and admission",
             "local generate message conversion gives video its own field and rejects mixed media",
             "local generate video reaches a Gemma 4 model through the linked provider",
@@ -6248,6 +6355,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&run_redirect_tests.step);
     shared_inference_contract_step.dependOn(&run_redirect_tests.step);
     unit_test_step.dependOn(&run_redirect_tests.step);
+
+    const capability_discovery_tests = b.addTest(.{ .root_module = antfly_imports.inference_remote_capabilities });
+    const run_capability_discovery_tests = b.addRunArtifact(capability_discovery_tests);
+    b.step("antfly-inference-capability-discovery-test", "Run remote capability discovery and activation contracts").dependOn(&run_capability_discovery_tests.step);
+    shared_inference_contract_step.dependOn(&run_capability_discovery_tests.step);
+    unit_test_step.dependOn(&run_capability_discovery_tests.step);
 
     inline for (.{ antfly_imports.cache_budget, antfly_imports.inference_types, antfly_imports.inference_work, antfly_imports.inference_local, antfly_imports.inference_vertex }) |mod| {
         const tests = b.addTest(.{ .root_module = mod });
@@ -7271,6 +7384,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("lite-query-reader-test", "Verify native query reader reuse, exact sorting, and filtered text statistics")
         .dependOn(&addFilteredTestRunArtifact(b, lite_query_reader_tests).step);
 
+    const cleanup_job_owner_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"cleanup job owner"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cleanup-job-owner-test", "Verify bounded cleanup drain/retry/give-up liveness")
+        .dependOn(&addFilteredTestRunArtifact(b, cleanup_job_owner_tests).step);
+
     const lite_merge_publication_runtime_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions", "db manual text producers merge capacity without optional workers", "db bulk ingest keeps full text merge maintenance live", "db text merge structural pause rejects manual turns", "db text merge stop does not deadlock against a producer's assisted fallback", "text merge publication handoff releases index lease before global contention", "db delete full text index drains active merge before closing generation", "db close stops text admission before joining derived publishers", "db structural mutation autonomously retries transient maintenance restart failures" },
@@ -7320,6 +7441,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
+    const producer_recovery_tests = b.addTest(.{
+        .name = "producer-recovery-tests",
+        .root_module = db_test_mod,
+        .filters = &.{ "db pending producer replay", "db replay retires deleted parent", "db writer open resumes generated enrichment replay from journal" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-producer-recovery-test", "Verify pending producer recovery preserves publication debt and retires deleted inputs")
+        .dependOn(&addFilteredTestRunArtifact(b, producer_recovery_tests).step);
+    const protected_backfill_tests = b.addTest(.{
+        .name = "protected-backfill-tests",
+        // These are physical DB regressions, not HTTP integration tests.
+        // Reuse the focused storage root to avoid compiling unrelated API owners.
+        .root_module = batch_contract_mod,
+        .filters = selectTestFilters(b, &.{"privacy protected model migration"}),
+        .max_rss = 12 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-protected-backfill-test", "Verify protected model migration batching without model inference")
+        .dependOn(&addFilteredTestRunArtifact(b, protected_backfill_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const inference_evaluation_tests = b.addTest(.{
         .name = "inference-evaluation-storage-tests",
@@ -7347,6 +7487,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "model aware media fused reuse rejects a changed provider generation with the same alias",
             "model aware media retained named text permits a changed embedding generation",
             "model aware media vocabulary inference rejects a producing generation change hidden by rollback",
+            "PDF page publication fences stale windows",
+            "source grouping trusts a whole document embedding",
             "shared PDF page embedding checkpoints successful siblings before retry",
             "cached content authority fences legacy writes",
             "backfill skips cached bodies and publishes metadata only",
@@ -7375,7 +7517,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const repair_publication_tests = b.addTest(.{
         .name = "artifact-repair-publication-tests",
         .root_module = db_test_mod,
-        .filters = &.{ "successful forced document reprocess", "successful asset publication clears terminal debt", "public artifact reprocess accepts durable work", "managed index repair observes terminal replay failure", "metadata replay progress", "document extraction manifest inspection and reprocess API", "document quality policy reprocess retires", "OCR sampling byte fingerprints", "managed index repair keeps failed OCR manifests as debt", "managed index repair queues providers outside the request guard and survives reopen" },
+        .filters = &.{ "successful forced document reprocess", "successful asset publication clears terminal debt", "public artifact reprocess accepts durable work", "managed index repair observes terminal replay failure", "metadata replay progress", "document extraction manifest inspection and reprocess API", "document quality policy reprocess retires", "OCR sampling byte fingerprints", "shared repair completion reprocesses consumer with terminal coverage", "managed index repair keeps failed OCR manifests as debt", "managed index repair queues providers outside the request guard and survives reopen" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         // This focused Safe owner measured 13.9 GB peak with extraction
         // inspection included. Reserve at least 25% headroom, not the full
@@ -7432,7 +7574,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const relational_index_lifecycle_step = b.step("antfly-relational-index-lifecycle-test", "Run relational index dependency and retirement admission tests");
     relational_index_lifecycle_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_lifecycle_tests).step);
 
-    const generated_vector_contract_filters = &.{ "ordered artifact inventory publication projects every shared consumer", "embedding input kind generated selectors" };
+    const generated_vector_contract_filters = &.{ "ordered artifact inventory publication projects every shared consumer", "ordered artifact inventory compact proof preserves output CAS history", "embedding input kind generated selectors" };
     const generated_vector_contract_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = generated_vector_contract_filters,
@@ -7789,6 +7931,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_merge_cutover_step = b.step("antfly-storage-db-merge-cutover-test", "Run the merge cutover enrichment reopen DB test");
     db_merge_cutover_step.dependOn(&run_db_merge_cutover_tests.step);
 
+    const alias_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"index alias storage fences"} });
+    b.step("antfly-index-alias-storage-test", "Verify alias generation assertions under real storage read leases").dependOn(&addFilteredTestRunArtifact(b, alias_storage_tests).step);
     const index_document_native_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"index document checkpoint native storage"} });
     b.step("antfly-index-document-native-test", "Verify indexed document source guards, cleanup and native lease takeover").dependOn(&addFilteredTestRunArtifact(b, index_document_native_tests).step);
     const db_shared_embedding_tests = b.addTest(.{
@@ -7917,6 +8061,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_graph_publication.",
             "storage.db.artifact_inventory.",
             "storage.db.artifact_native_stream.",
+            "storage.db.prepared_producer_acceptance.",
             "storage.db.artifact_producer_context.",
             "storage.db.artifact_producer_dispatch.",
             "storage.db.artifact_producer_input.",
@@ -7974,6 +8119,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_field_plan.",
             "storage.db.owned_keys.",
             "storage.db.read_projection.",
+            "storage.db.privacy_read.",
             "storage.db.replay_vector_collectors.",
             "storage.db.publication_recovery_owner.",
             "storage.db.artifact_publication_transport_codec.",
@@ -8128,6 +8274,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.row_policy_gate.",
             "storage.db.authority_invalidation.",
             "storage.db.row_policy_bundle.",
+            "storage.db.execution_resources.",
             "storage.db.restore_staging.",
             "storage.db.restore_staging_contract.",
             "storage.db.restore_generation_admissions.",
@@ -8150,6 +8297,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.text_memory_stats.",
             "storage.db.transform.",
             "storage.db.mutation_commit_disposition_test.",
+            "storage.db.commit_requirements.",
             "storage.db.mutation_plan.",
             "storage.db.transform_read_plan.",
             "storage.db.typed_doc_values_coverage.",
@@ -8193,6 +8341,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.typed_json.",
             "storage.vector_payload_store.",
             "storage.vector_wal_view.",
+            "storage.write_amplification_trace.",
             "storage.backend_conformance_test.",
             "storage.backend_erased.",
             "storage.backend_types.",
@@ -8232,6 +8381,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.maintenance.",
             "storage.mem_backend.",
             "storage.mem_ordered.",
+            "storage.native_catalog_backend.",
+            "storage.commit_participant.",
             "storage.object_storage.",
             "storage.persistent.",
             "storage.persistent_vopr.",
@@ -8318,7 +8469,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
-    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig", "local_query_abi.zig" }) |source| {
+    // The C API crash sweep and the write-amplification benchmarks run
+    // through capi-contract-test, whose module graph carries the capi
+    // wiring the storage test roots do not (both benchmarks open their DB
+    // through the real capi.openLiteHandleWithRuntime seam, same reason as
+    // the crash sweep).
+    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig", "lite/crash_consistency_capi_test.zig", "lite/write_amplification_bench_test.zig", "lite/write_amplification_cpu_bench_test.zig", "local_query_abi.zig" }) |source| {
         unit_storage_shard_audit.addArg("--local-dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly-embedded/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
@@ -8920,7 +9076,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .storage_test_step = lib_storage_test_step,
         // Runtime/restore and VOPR CLI/meta/registry slices each share a root.
         // Register both roots once to link their production ABI providers.
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, standalone_restore_tests, system_catalog_standalone_tests, vopr_cli } }) catch @panic("OOM"),
+        // The full-cluster/production-cluster VOPR family (vopr_runtime_regression_tests
+        // onward) shares one clone of antfly_test_mod, full_cluster_vopr_consumer_mod;
+        // registering any one of its compiles here links the storage-kernel,
+        // enrichment-compute, and inference provider archives onto that whole family.
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, standalone_restore_tests, system_catalog_standalone_tests, vopr_cli, vopr_runtime_regression_tests } }) catch @panic("OOM"),
     };
 }
 

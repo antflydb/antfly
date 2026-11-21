@@ -1500,6 +1500,11 @@ const RaftTableApplyStateMachine = struct {
                     if (err == @field(@import("../api/relational_row_errors.zig").PolicyError, field)) return null;
                 }
             };
+            if (req.prepared_enrichments_json != null) switch (err) {
+                error.CommitRequirementTooLarge => return .transaction_too_large,
+                error.EnrichmentSourceChanged, error.ArtifactCatalogDrift => return .version_conflict,
+                else => {},
+            };
             return fromError(err);
         }
     };
@@ -2053,7 +2058,7 @@ const RaftTableApplyStateMachine = struct {
                     clock,
                 );
             } else {
-                try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+                try owner_source.applyPreparedReplicatedBatchClassified(
                     self.alloc,
                     group_id,
                     table_name,
@@ -2061,6 +2066,11 @@ const RaftTableApplyStateMachine = struct {
                     req,
                     entry.term,
                     entry.index,
+                    struct {
+                        fn isTerminal(err: anyerror, batch: antfly.db.types.BatchRequest) bool {
+                            return ExpectedApplyFailure.forRequest(err, batch) != null;
+                        }
+                    }.isTerminal,
                 );
             }
             // The descriptor-pinned owner call intentionally bypasses the
@@ -8024,6 +8034,14 @@ pub const DataServer = struct {
     /// visible catalog record is already in this log frontier. Reuse the normal
     /// RemoteApply wait rather than treating a primary-local lookup as proof.
     pub fn acknowledgeHotStandbyExistingCatalog(self: *DataServer) !void {
+        return self.observeHotStandbyExistingCatalog(true);
+    }
+
+    pub fn pollHotStandbyExistingCatalog(self: *DataServer) !void {
+        return self.observeHotStandbyExistingCatalog(false);
+    }
+
+    fn observeHotStandbyExistingCatalog(self: *DataServer, wait_for_apply: bool) !void {
         const commit: HotStandbyCatalogCommit = blk: {
             platform_sync.lockYielding(&self.hot_standby_state_mutex);
             defer self.hot_standby_state_mutex.unlock();
@@ -8034,18 +8052,22 @@ pub const DataServer = struct {
                 return error.HACatalogRequiresWholeInstance;
             break :blk .{ .mirror = mirror, .generation = generation, .lsn = (try hot_standby_publisher_adapter.runtimePrimary(mirror)).lastLsn() };
         };
-        try self.acknowledgeHotStandbyCatalogCreate(commit);
+        try self.observeHotStandbyCatalogCreate(commit, wait_for_apply);
     }
 
     /// Local catalog publication has completed. A remote timeout leaves an
     /// uncertain client outcome, but must not undo committed catalog state or
     /// require a process restart when the standby becomes available again.
     pub fn acknowledgeHotStandbyCatalogCreate(self: *DataServer, commit: HotStandbyCatalogCommit) !void {
+        return self.observeHotStandbyCatalogCreate(commit, true);
+    }
+
+    fn observeHotStandbyCatalogCreate(self: *DataServer, commit: HotStandbyCatalogCommit, wait_for_apply: bool) !void {
         const mirror = commit.mirror;
         // Do not hold the transition mutex while waiting for receiver acks.
-        if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| {
+        if (wait_for_apply) if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| {
             try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, commit.lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
-        }
+        };
         platform_sync.lockYielding(&self.hot_standby_state_mutex);
         defer self.hot_standby_state_mutex.unlock();
         try self.hot_standby_public_gate_state.checkWrite(commit.generation);
@@ -13145,8 +13167,10 @@ pub const DataServer = struct {
         return proposal;
     }
 
-    fn requiredRaftBatchProtocolVersion(alloc: std.mem.Allocator, req: antfly.db.types.BatchRequest) !u16 {
+    pub fn requiredRaftBatchProtocolVersion(alloc: std.mem.Allocator, req: antfly.db.types.BatchRequest) !u16 {
         if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(alloc, req)) |required| return required;
+        if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
+            return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
@@ -14638,10 +14662,13 @@ pub const DataServer = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        req: antfly.db.types.BatchRequest,
+        incoming_req: antfly.db.types.BatchRequest,
         route: DataRaftBatchRoute,
         leader_wait_ns: u64,
     ) !void {
+        var req = incoming_req;
+        var prepared_json: ?[]u8 = null;
+        defer if (prepared_json) |bytes| alloc.free(bytes);
         try @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, req);
         try @import("antfly_local_sources").storage_db_artifact_publication_transport.validateBatchRequest(req);
         // Do not allow a private/direct batch route to bypass the metadata
@@ -14811,6 +14838,33 @@ pub const DataServer = struct {
                 if (self.dataRaftMonotonicNs() >= deadline_ns) {
                     std.log.warn("data raft pre-admission failed group_id={} phase=protocol_preflight err=Timeout", .{group_id});
                     return error.LeaderUnavailable;
+                }
+                // Inference runs only on the preflighted leader, outside the
+                // Raft proposal lock. Receiver-owned source/catalog fences are
+                // rechecked atomically at ordered apply on every replica.
+                if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) {
+                    // Protocol 30 includes revision-v1 document semantics. Bind
+                    // that admitted scheme before sealing the retry digest.
+                    if (batchMutatesDocuments(req)) req.document_version_scheme = .revision_v1;
+                    const activation = protocol_activation_entry.?;
+                    if (activation.protocol_version.load(.acquire) < minimum_protocol_version and
+                        protocol_preflight.activatable_version < minimum_protocol_version and
+                        activation.pending_version.load(.acquire) < minimum_protocol_version) return error.RaftBatchMergeProtocolUnavailable;
+                    if (protocol_activation_lock_owned) {
+                        protocol_activation_entry.?.activation_mutex.unlock();
+                        protocol_activation_lock_owned = false;
+                    }
+                    if (comptime linked_storage) {
+                        const remaining_ns = deadline_ns -| self.dataRaftMonotonicNs();
+                        if (remaining_ns == 0) return error.LeaderUnavailable;
+                        // Kernel preparation and inference use the platform
+                        // clock, which need not share the Raft I/O clock epoch.
+                        const native_deadline_ns = platform_time.monotonicNs() +| remaining_ns;
+                        prepared_json = try (try self.ensureKernelOwnerSource()).prepareEnrichments(alloc, group_id, table_name, req, native_deadline_ns, if (route.cancellation) |signal| signal.token() else route.visibility_cancellation);
+                        req.prepared_enrichments_json = prepared_json;
+                    } else return error.CommitRequirementUnavailable;
+                    try ensureDataRaftBatchRouteActive(route);
+                    if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 }
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 if (req.restore_staging_scope) |scope| {
@@ -27118,6 +27172,7 @@ const RemoteMetadataSource = struct {
     cached_routing_snapshot: ?*RoutingSnapshotCacheEntry = null,
     cached_routing_snapshot_at_ms: u64 = 0,
     authoritative_routing_generation: ?*antfly.public_api.table_catalog.RoutingGeneration = null,
+    table_routing_slots: [16]TableRoutingSlot = @splat(.{}),
     snapshot_refresh_mutex: std.atomic.Mutex = .unlocked,
     routing_refresh_mutex: std.atomic.Mutex = .unlocked,
     // Incremented only by authoritative replacement or invalidation. An
@@ -27140,6 +27195,28 @@ const RemoteMetadataSource = struct {
     setting_authority_secret: ?[]const u8 = null,
     setting_authority_issuer: ?[]const u8 = null,
     test_faults: TestFaults = .{},
+
+    const TableRoutingSlot = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        version: u64 = 0,
+        entry: ?TableRepairRoutes = null,
+    };
+
+    const TableRepairRoutes = struct {
+        name: []u8,
+        token: antfly.metadata_api.CatalogRoutingChangeToken,
+        fence: u64,
+        groups: std.AutoHashMapUnmanaged(u64, void),
+
+        fn deinit(self: *TableRepairRoutes, alloc: std.mem.Allocator) void {
+            self.groups.deinit(alloc);
+            alloc.free(self.name);
+        }
+
+        fn route(self: *const TableRepairRoutes, group_id: ?u64) antfly.public_api.table_catalog.RepairRoute {
+            return .{ .fence = self.fence, .group_present = if (group_id) |id| self.groups.contains(id) else false };
+        }
+    };
 
     const ValidationSlot = struct {
         mutex: std.atomic.Mutex = .unlocked,
@@ -27234,6 +27311,9 @@ const RemoteMetadataSource = struct {
 
     pub fn deinit(self: *RemoteMetadataSource) void {
         for (&self.validation_slots) |*slot| slot.clear(self.alloc);
+        for (&self.table_routing_slots) |*slot| {
+            if (slot.entry) |*entry| entry.deinit(self.alloc);
+        }
         for (self.http_executors) |*executor| executor.deinit();
         if (self.http_executors.len > 0) self.alloc.free(self.http_executors);
         if (self.request_executors.len > 0) self.alloc.free(self.request_executors);
@@ -28035,6 +28115,7 @@ const RemoteMetadataSource = struct {
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .catalog_identity = remoteCatalogIdentity,
                 .acquire_routing_generation = remoteAcquireRoutingGeneration,
+                .repair_route = remoteRepairRoute,
                 .routing_snapshot = remoteRoutingSnapshot,
                 .table_routing_snapshot = remoteTableRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
@@ -29000,8 +29081,12 @@ const RemoteMetadataSource = struct {
     }
 
     /// A fresh read barrier licenses an exact immutable authority/revision.
-    /// Unsupported peers use the existing full-snapshot path, never cache age.
     fn confirmRoutingGeneration(self: *RemoteMetadataSource, generation: *antfly.public_api.table_catalog.RoutingGeneration, routing_budget: antfly.public_api.table_catalog.RoutingBudget) !bool {
+        const token = (try self.fetchAuthoritativeRoutingToken(routing_budget)) orelse return false;
+        return token.eql(generation.indexed.snapshot.value.change_token);
+    }
+
+    fn fetchAuthoritativeRoutingToken(self: *RemoteMetadataSource, routing_budget: antfly.public_api.table_catalog.RoutingBudget) !?antfly.metadata_api.CatalogRoutingChangeToken {
         var signal = antfly.common.http.http_common.RequestCancellation.fromToken(routing_budget.cancellation);
         const end = routing_budget.deadline_ns orelse (self.awakeNs() +| remote_metadata_snapshot_timeout_ns);
         const first_index = try self.metadataReadApiIndexForAttemptWithBudget(0, .{ .deadline_ns = end, .io = self.io, .cancellation = &signal });
@@ -29024,7 +29109,7 @@ const RemoteMetadataSource = struct {
             defer parsed.deinit();
             const token = parsed.value;
             // Default/legacy tokens cannot prove a coherent generation.
-            if (token.metadata_group_id == 0 or token.metadata_incarnation == null or token.revision == 0) return false;
+            if (token.metadata_group_id == 0 or token.metadata_incarnation == null or token.revision == 0) return null;
             self.acceptMetadataIdentityWithBudget(token.metadata_group_id, token.metadata_incarnation, budget) catch |err| {
                 if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
                 last_err = err;
@@ -29033,9 +29118,9 @@ const RemoteMetadataSource = struct {
             try routing_budget.checkpoint();
             ensureBudgetActive(budget) catch |err| return normalizeCatalogRoutingSnapshotError(err);
             self.noteMetadataReadSuccessWithBudget(index, budget) catch |err| return normalizeCatalogRoutingSnapshotError(err);
-            return token.eql(generation.indexed.snapshot.value.change_token);
+            return token;
         }
-        if (unsupported) return false;
+        if (unsupported) return null;
         return last_err;
     }
 
@@ -29095,6 +29180,111 @@ const RemoteMetadataSource = struct {
         self.cache_mutex.unlock();
         if (previous) |generation| generation.release();
         return next;
+    }
+
+    fn remoteRepairRoute(
+        ptr: *anyopaque,
+        table_name: []const u8,
+        group_id: ?u64,
+        input_budget: antfly.public_api.table_catalog.RoutingBudget,
+    ) !?antfly.public_api.table_catalog.RepairRoute {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const catalog = antfly.public_api.table_catalog;
+        var budget = self.catalogSource().budget(null);
+        const deadline = budget.deadlineFrom(input_budget) orelse (self.awakeNs() +| remote_metadata_snapshot_timeout_ns);
+        budget.deadline_ns = deadline;
+        budget.cancellation = input_budget.cancellation;
+        const slot = &self.table_routing_slots[std.hash.Wyhash.hash(0, table_name) % self.table_routing_slots.len];
+
+        try self.lockRoutingBudget(&slot.mutex, budget);
+        const version = slot.version;
+        const has_scoped = if (slot.entry) |entry| std.mem.eql(u8, table_name, entry.name) else false;
+        slot.mutex.unlock();
+
+        const global = try self.cachedAuthoritativeRoutingGeneration(budget);
+        defer if (global) |generation| generation.release();
+        if (has_scoped or global != null) {
+            const now = self.awakeNs();
+            var probe_budget = budget;
+            // Validation is optional. Reserve most of the deadline for the
+            // authoritative table read, even if every token endpoint stalls.
+            probe_budget.deadline_ns = now +| @min(250 * std.time.ns_per_ms, (deadline -| now) / 4);
+            const token = self.fetchAuthoritativeRoutingToken(probe_budget) catch |err| switch (err) {
+                error.Canceled, error.OutOfMemory => return err,
+                else => null,
+            };
+            if (token) |current| {
+                {
+                    try self.lockRoutingBudget(&slot.mutex, budget);
+                    defer slot.mutex.unlock();
+                    if (slot.entry) |*entry| {
+                        if (current.eql(entry.token) and std.mem.eql(u8, table_name, entry.name)) return entry.route(group_id);
+                    }
+                }
+                if (global) |generation| {
+                    if (current.eql(generation.indexed.snapshot.value.change_token)) {
+                        if (try generation.indexed.repairRoute(table_name, group_id, budget)) |route| return route;
+                    }
+                }
+            }
+        }
+
+        // The route plan carries topology and groups, without physical-owner
+        // descriptors or execution-index materialization.
+        try budget.checkpoint();
+        var result = try self.awaitRemoteRoute(self.alloc, table_name, .all_ranges, deadline, 10 * std.time.ns_per_ms, .linearizable);
+        defer result.deinit(self.alloc);
+        try budget.checkpoint();
+        const plan = switch (result) {
+            .found => |plan| plan,
+            .publication_not_observed => return null,
+            .timed_out => return error.CatalogRoutingSnapshotTimeout,
+        };
+        var digest = catalog.repairFenceDigest(plan.topology_epoch, plan.table_id);
+        var present = false;
+        for (plan.groups, 0..) |group, index| {
+            try budget.checkpointIndex(index);
+            digest.update(std.mem.asBytes(&group.group_id));
+            present = present or (group_id == group.group_id);
+        }
+        const fence = digest.final();
+        const route: catalog.RepairRoute = .{ .fence = fence, .group_present = present };
+        if (plan.metadata_group_id == 0 or plan.catalog_revision == 0 or plan.metadata_incarnation == null) return route;
+
+        var entry: TableRepairRoutes = .{
+            .name = try self.alloc.dupe(u8, table_name),
+            .token = .{
+                .metadata_group_id = plan.metadata_group_id,
+                .metadata_incarnation = plan.metadata_incarnation,
+                .revision = plan.catalog_revision,
+            },
+            .fence = fence,
+            .groups = .empty,
+        };
+        defer entry.deinit(self.alloc);
+        try entry.groups.ensureTotalCapacity(self.alloc, @intCast(plan.groups.len));
+        for (plan.groups, 0..) |group, index| {
+            try budget.checkpointIndex(index);
+            entry.groups.putAssumeCapacity(group.group_id, {});
+        }
+
+        // Publish only if the slot was not replaced while this read was in
+        // flight. Concurrent cold reads may finish in either order.
+        try self.lockRoutingBudget(&slot.mutex, budget);
+        const replaced = if (slot.version == version) blk: {
+            const previous = slot.entry;
+            slot.entry = entry;
+            entry.name = &.{};
+            entry.groups = .empty;
+            slot.version +%= 1;
+            break :blk previous;
+        } else null;
+        slot.mutex.unlock();
+        if (replaced) |previous| {
+            var retired = previous;
+            retired.deinit(self.alloc);
+        }
+        return route;
     }
 
     fn remoteRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
@@ -29848,6 +30038,18 @@ const RemoteMetadataSource = struct {
         probe_interval_ns: u64,
     ) !antfly.public_api.table_catalog.AwaitRouteResult {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return self.awaitRemoteRoute(alloc, table_name, query, deadline_ns, probe_interval_ns, .eventual_positive);
+    }
+
+    fn awaitRemoteRoute(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        query: antfly.public_api.table_catalog.RouteQuery,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+        legacy_consistency: enum { eventual_positive, linearizable },
+    ) !antfly.public_api.table_catalog.AwaitRouteResult {
         const request = antfly.metadata_api.CatalogRouteResolveRequest{ .query = routeQueryForWire(table_name, query) };
         var legacy_count: usize = 0;
         var incompatible_count: usize = 0;
@@ -29911,7 +30113,10 @@ const RemoteMetadataSource = struct {
                 },
             }
         }
-        if (legacy_count > 0) return try self.remoteLegacyAwaitRoute(alloc, table_name, query, deadline_ns, probe_interval_ns);
+        if (legacy_count > 0) return switch (legacy_consistency) {
+            .eventual_positive => self.remoteLegacyAwaitRoute(alloc, table_name, query, deadline_ns, probe_interval_ns),
+            .linearizable => self.remoteLinearizableRoute(alloc, table_name, query, deadline_ns),
+        };
         if (incompatible_count == self.base_uris.len) return error.MetadataRoutingProtocolIncompatible;
         return .timed_out;
     }
@@ -29956,6 +30161,16 @@ const RemoteMetadataSource = struct {
             const wait_ns = @min(optimistic_deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
             try self.io.sleep(.fromNanoseconds(wait_ns), .awake);
         }
+        return self.remoteLinearizableRoute(alloc, table_name, query, deadline_ns);
+    }
+
+    fn remoteLinearizableRoute(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        query: antfly.public_api.table_catalog.RouteQuery,
+        deadline_ns: u64,
+    ) !antfly.public_api.table_catalog.AwaitRouteResult {
         if (self.awakeNs() >= deadline_ns) return .timed_out;
         var authoritative = self.remoteRoutingSnapshotWithMode(deadline_ns, true) catch |err| switch (err) {
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return .timed_out,
@@ -50940,6 +51155,182 @@ fn consumerTests() type {
                 try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(expected)));
             }
             try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(&source.http_executors[0])));
+        }
+
+        test "remote repair routing refreshes only the requested table" {
+            const a = std.testing.allocator;
+            const catalog = antfly.public_api.table_catalog;
+            const Clock = @import("vopr").vopr_io.VoprIo;
+            const Stub = struct {
+                clock: *Clock,
+                source: ?*RemoteMetadataSource = null,
+                revision: u64 = 9,
+                group_id: u64 = 7001,
+                stall_token: bool = false,
+                tokens: usize = 0,
+                scoped_reads: usize = 0,
+                unexpected_reads: usize = 0,
+
+                fn token(self: *@This()) antfly.metadata_api.CatalogRoutingChangeToken {
+                    return .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .revision = self.revision };
+                }
+
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const slots = &self.source.?.table_routing_slots;
+                    const slot = &slots[std.hash.Wyhash.hash(0, "docs") % slots.len];
+                    try std.testing.expect(slot.mutex.tryLock());
+                    slot.mutex.unlock();
+                    if (std.mem.endsWith(u8, request.uri, "/routing-token")) {
+                        self.tokens += 1;
+                        if (self.stall_token) {
+                            const allowed_ms = try std.fmt.parseUnsigned(u64, request.header("X-Antfly-Routing-Remaining-Ms").?, 10);
+                            try std.testing.expect(allowed_ms <= 250);
+                            self.clock.monotonic_ns += allowed_ms * std.time.ns_per_ms;
+                            return error.Timeout;
+                        }
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, self.token(), .{}) };
+                    }
+                    if (std.mem.endsWith(u8, request.uri, "/capabilities"))
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataCapabilities{}, .{}) };
+                    if (!std.mem.endsWith(u8, request.uri, "/await-route")) {
+                        self.unexpected_reads += 1;
+                        return error.TestUnexpectedResult;
+                    }
+                    self.scoped_reads += 1;
+                    var query = try std.json.parseFromSlice(antfly.metadata_api.CatalogRouteResolveRequest, alloc, request.body, .{});
+                    defer query.deinit();
+                    try std.testing.expectEqualStrings("docs", query.value.query.table_name);
+                    try std.testing.expectEqual(.all_ranges, query.value.query.selector);
+                    var tables = [_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+                    var ranges = [_]antfly.metadata.table_manager.RangeRecord{.{ .table_id = 7, .group_id = self.group_id, .start_key = "" }};
+                    var plan = (try catalog.routePlanFromSnapshot(alloc, .{
+                        .metadata_group_id = 1,
+                        .metadata_incarnation = @splat('1'),
+                        .catalog_revision = self.revision,
+                        .tables = &tables,
+                        .ranges = &ranges,
+                    }, "docs", .all_ranges)).?;
+                    defer plan.deinit(alloc);
+                    const result: antfly.metadata_api.CatalogRouteResolveResult = .{
+                        .disposition = .found,
+                        .token = self.token(),
+                        .plan = .{
+                            .metadata_group_id = plan.metadata_group_id,
+                            .metadata_incarnation = plan.metadata_incarnation,
+                            .catalog_revision = plan.catalog_revision,
+                            .table_id = plan.table_id,
+                            .topology_epoch = plan.topology_epoch,
+                            .groups = plan.groups,
+                        },
+                    };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, result, .{}) };
+                }
+            };
+            var clock = try Clock.init(.{});
+            defer clock.deinit();
+            var stub: Stub = .{ .clock = &clock };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.test"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, clock.io());
+            defer source.deinit();
+            stub.source = &source;
+            const resolve = source.catalogSource().vtable.repair_route.?;
+            const first = (try resolve(&source, "docs", 7001, .{})).?;
+            try std.testing.expect(first.group_present);
+            try std.testing.expect(source.authoritative_routing_generation == null);
+            try std.testing.expectEqual(@as(usize, 1), stub.scoped_reads);
+            const warm = (try resolve(&source, "docs", 7002, .{})).?;
+            try std.testing.expectEqual(first.fence, warm.fence);
+            try std.testing.expect(!warm.group_present);
+            try std.testing.expectEqual(@as(usize, 1), stub.tokens);
+            try std.testing.expectEqual(@as(usize, 1), stub.scoped_reads);
+
+            stub.revision += 1;
+            const refreshed = (try resolve(&source, "docs", null, .{})).?;
+            try std.testing.expectEqual(first.fence, refreshed.fence);
+            try std.testing.expectEqual(@as(usize, 2), stub.scoped_reads);
+
+            stub.stall_token = true;
+            const budget = source.catalogSource().budget(source.awakeNs() + std.time.ns_per_s);
+            const fallback = (try resolve(&source, "docs", 7001, budget)).?;
+            try std.testing.expectEqual(first, fallback);
+            try std.testing.expectEqual(@as(usize, 3), stub.scoped_reads);
+            stub.stall_token = false;
+
+            stub.revision += 1;
+            stub.group_id = 7002;
+            var tables = [_]antfly.metadata.table_manager.TableRecord{
+                .{ .table_id = 7, .name = "docs" },
+                .{ .table_id = 8, .name = "other" },
+            };
+            var ranges = [_]antfly.metadata.table_manager.RangeRecord{
+                .{ .table_id = 7, .group_id = 7002, .start_key = "" },
+                .{ .table_id = 8, .group_id = 8001, .start_key = "" },
+            };
+            source.authoritative_routing_generation = try catalog.RoutingGeneration.create(a, .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = @splat('1'),
+                .catalog_revision = stub.revision,
+                .change_token = stub.token(),
+                .tables = &tables,
+                .ranges = &ranges,
+            }, .{});
+            const reused = (try resolve(&source, "docs", 7002, .{})).?;
+            try std.testing.expect(reused.group_present);
+            try std.testing.expect(first.fence != reused.fence);
+            try std.testing.expect(!(try resolve(&source, "docs", 7001, .{})).?.group_present);
+            try std.testing.expectEqual(@as(usize, 3), stub.scoped_reads);
+            try std.testing.expectEqual(@as(usize, 0), stub.unexpected_reads);
+        }
+
+        test "remote repair routing rejects stale legacy positives" {
+            const alloc = std.testing.allocator;
+            const Stub = struct {
+                legacy_eventual_reads: usize = 0,
+                legacy_authoritative_reads: usize = 0,
+                split_published: bool = false,
+
+                fn execute(raw: *anyopaque, response_alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (std.mem.endsWith(u8, request.uri, "/capabilities")) return .{ .status = 404 };
+                    const linearizable = std.mem.endsWith(u8, request.uri, "/linearizable-snapshot");
+                    if (linearizable) {
+                        self.legacy_authoritative_reads += 1;
+                    } else if (std.mem.endsWith(u8, request.uri, "/snapshot")) {
+                        self.legacy_eventual_reads += 1;
+                    } else return error.TestUnexpectedResult;
+                    var tables = [_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+                    var ranges = [_]antfly.metadata.table_manager.RangeRecord{
+                        .{ .table_id = 7, .group_id = 7001, .start_key = "" },
+                        .{ .table_id = 7, .group_id = 7002, .start_key = "m" },
+                    };
+                    const split_visible = linearizable and self.split_published;
+                    if (split_visible) ranges[0].end_key = "m";
+                    const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                        .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .metrics = .{} },
+                        .tables = &tables,
+                        .ranges = ranges[0..if (split_visible) 2 else 1],
+                        .stores = &.{},
+                        .placement_intents = &.{},
+                        .split_transitions = &.{},
+                        .merge_transitions = &.{},
+                    };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(response_alloc, snapshot, .{}) };
+                }
+            };
+            var stub: Stub = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://legacy.test"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer source.deinit();
+            const catalog = source.catalogSource();
+            const resolve = catalog.vtable.repair_route.?;
+            const dispatched = (try resolve(catalog.ptr, "docs", 7001, .{})).?;
+            try std.testing.expect(dispatched.group_present);
+            stub.split_published = true;
+            const verified = (try resolve(catalog.ptr, "docs", null, .{})).?;
+            try std.testing.expect(dispatched.fence != verified.fence);
+            const new_shard = (try resolve(catalog.ptr, "docs", 7002, .{})).?;
+            try std.testing.expect(new_shard.group_present);
+            try std.testing.expectEqual(@as(usize, 0), stub.legacy_eventual_reads);
+            try std.testing.expectEqual(@as(usize, 3), stub.legacy_authoritative_reads);
         }
 
         test "remote graph routing reuses fenced generations and refreshes changed revisions" {

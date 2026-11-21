@@ -116,6 +116,25 @@ pub fn reconcileDbIndexesWithOptions(
     };
 }
 
+fn collectArtifactReferences(value: std.json.Value, required: *std.StringHashMap(void)) !void {
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const name = entry.key_ptr.*;
+                if (entry.value_ptr.* == .string and
+                    (std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_name") or std.mem.eql(u8, name, "embedding_name") or std.mem.eql(u8, name, "source_artifact_name")))
+                    try required.put(entry.value_ptr.string, {});
+                try collectArtifactReferences(entry.value_ptr.*, required);
+            }
+        },
+        .array => |array| for (array.items) |item| {
+            try collectArtifactReferences(item, required);
+        },
+        else => {},
+    }
+}
+
 /// Reconcile one catalog index without applying sibling index, resolver, or
 /// table-schema changes carried by the same metadata snapshot.
 /// This is the storage boundary used by online index DDL after its foreground
@@ -180,6 +199,29 @@ pub fn reconcileDbIndexTargetWithOptions(
 
     if (target_value) |value| {
         try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(alloc, value, options.embedding_options, &target_enrichments);
+        // Root producers are shared declarations, but activation owns only the
+        // transitive dependency closure of its target. The desired list is
+        // already in topological order, so append selected nodes in that order.
+        var required = std.StringHashMap(void).init(alloc);
+        defer required.deinit();
+        try collectArtifactReferences(value, &required);
+        for (target_enrichments.items) |cfg| {
+            try required.put(cfg.name, {});
+            if (cfg.source_artifact_name.len != 0) try required.put(cfg.source_artifact_name, {});
+        }
+        var cursor = desired_enrichments.items.len;
+        while (cursor > 0) {
+            cursor -= 1;
+            const cfg = desired_enrichments.items[cursor];
+            if (required.contains(cfg.name) and cfg.source_artifact_name.len != 0)
+                try required.put(cfg.source_artifact_name, {});
+        }
+        for (desired_enrichments.items) |cfg| {
+            if (!required.contains(cfg.name)) continue;
+            var owned = try db_mod.types.EnrichmentConfig.clone(alloc, cfg);
+            errdefer owned.deinit(alloc);
+            try target_enrichments.append(alloc, owned);
+        }
         dedupeDesiredEnrichments(alloc, &target_enrichments);
         try indexes_api.sortArtifactEnrichmentsByDependency(alloc, target_enrichments.items);
     }
@@ -373,14 +415,13 @@ pub fn ensureIndexDefinition(
     };
     const existing = findIndexConfig(current, name);
     if (existing) |existing_cfg| {
-        if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) {
-            if (kind == .graph or
-                (existing_cfg.coverage_generation == desired.coverage_generation and
-                    try indexConfigsEqual(alloc, existing_cfg, desired))) return;
-        }
-    }
-    if (existing) |existing_cfg| {
-        if (try indexConfigsEqual(alloc, existing_cfg, desired)) {
+        if (existing_cfg.kind == .graph and kind == .graph) return;
+        // Only public external definitions identify the legacy lowering.
+        // Raw storage configs may use the same field as a direct vector input.
+        const public_external = !storage_config and config_value == .object and
+            if (config_value.object.get("external")) |marker| marker == .bool and marker.bool else false;
+        if (try indexConfigsEqualWithLegacySparse(alloc, existing_cfg, desired, public_external)) {
+            if (indexKindConfigReconcileDeferred(kind)) return;
             if (db_mod.DB.indexKindSupportsManagedGenerationRepair(desired.kind)) {
                 if (try db.materializeManagedIndexAdmission(alloc, desired.name) != null) {
                     summary.pending += 1;
@@ -459,12 +500,58 @@ pub fn findIndexConfig(configs: []const db_mod.types.IndexConfig, name: []const 
 }
 
 pub fn indexConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.IndexConfig, b: db_mod.types.IndexConfig) !bool {
+    return indexConfigsEqualWithLegacySparse(alloc, a, b, false);
+}
+
+fn indexConfigsEqualWithLegacySparse(alloc: std.mem.Allocator, a: db_mod.types.IndexConfig, b: db_mod.types.IndexConfig, public_external: bool) !bool {
     if (a.kind != b.kind) return false;
+    const vector = a.kind == .dense_vector or a.kind == .sparse_vector;
+    if (vector and a.coverage_generation != b.coverage_generation) return false;
+    if (std.mem.eql(u8, a.config_json, b.config_json)) return true;
     if (a.kind == .full_text) return fullTextIndexConfigsEqual(alloc, a.config_json, b.config_json);
+    // Native catalogs and public lowering may serialize the same configuration
+    // differently. Formatting must never retire an unchanged vector producer:
+    // retirement also removes its authoritative embedding artifacts.
+    if (vector) return vectorIndexConfigsEqual(alloc, a.name, a.config_json, b.config_json, public_external and a.kind == .sparse_vector);
     if (a.kind == .algebraic) return algebraicIndexConfigsEqual(alloc, a.config_json, b.config_json);
-    if ((a.kind == .dense_vector or a.kind == .sparse_vector) and
-        a.coverage_generation != b.coverage_generation) return false;
-    return std.mem.eql(u8, a.config_json, b.config_json);
+    return false;
+}
+
+fn vectorIndexConfigsEqual(alloc: std.mem.Allocator, index_name: []const u8, a_json: []const u8, b_json: []const u8, legacy_sparse: bool) !bool {
+    var a = try std.json.parseFromSlice(std.json.Value, alloc, a_json, .{});
+    defer a.deinit();
+    var b = try std.json.parseFromSlice(std.json.Value, alloc, b_json, .{});
+    defer b.deinit();
+    if (legacy_sparse) {
+        // Released public sparse lowering omitted this marker for its implicit
+        // embedding field. Preserve that producer's artifacts when its public
+        // definition is lowered by a current server. Explicit direct fields
+        // and explicit external:false keep distinct configuration semantics.
+        try normalizeLegacySparseExternalConfig(a.arena.allocator(), &a.value);
+    }
+    normalizeExternalVectorSelfReference(&a.value, index_name);
+    normalizeExternalVectorSelfReference(&b.value, index_name);
+    return jsonValuesEqualIgnoringTopLevelEnrichments(a.value, b.value, false);
+}
+
+fn normalizeExternalVectorSelfReference(value: *std.json.Value, index_name: []const u8) void {
+    if (value.* != .object or value.object.contains("sources")) return;
+    const external = value.object.get("external") orelse return;
+    if (external != .bool or !external.bool) return;
+    const name = value.object.get("embedding_name") orelse return;
+    // The native primary-vector backend writes the index's own name explicitly;
+    // public external definitions use that same name implicitly.
+    if (name == .string and std.mem.eql(u8, name.string, index_name))
+        _ = value.object.orderedRemove("embedding_name");
+}
+
+fn normalizeLegacySparseExternalConfig(alloc: std.mem.Allocator, value: *std.json.Value) !void {
+    if (value.* != .object or value.object.contains("external") or
+        value.object.contains("generator") or value.object.contains("embedder") or
+        value.object.contains("embedding_name") or value.object.contains("sources")) return;
+    const field = value.object.get("field") orelse return;
+    if (field == .string and std.mem.eql(u8, field.string, "embedding"))
+        try value.object.put(alloc, "external", .{ .bool = true });
 }
 
 pub fn indexKindConfigReconcileDeferred(kind: db_mod.types.IndexKind) bool {

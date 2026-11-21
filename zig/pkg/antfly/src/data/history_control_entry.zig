@@ -43,7 +43,15 @@ pub const Entry = struct {
     history_control: struct { version: u8 = 1, command: control.Command },
 
     pub fn validate(self: Entry) !void {
-        if (self.batch != null or self.protocol != requiredProtocol(self.history_control.command) or self.history_control.version != 1) return error.UnsupportedRaftBatchProtocolVersion;
+        return self.validateReplay(false);
+    }
+
+    fn validateReplay(self: Entry, allow_legacy: bool) !void {
+        const required = requiredProtocol(self.history_control.command);
+        // Existing entries had a dedicated v30 tag. Main also uses v30 for
+        // prepared row batches, so new history proposals must activate v31.
+        const legacy = allow_legacy and self.protocol == 30 and required == required_protocol_version;
+        if (self.batch != null or (self.protocol != required and !legacy) or self.history_control.version != 1) return error.UnsupportedRaftBatchProtocolVersion;
         if (self.table.len == 0 or self.table.len > 1024 or !std.unicode.utf8ValidateSlice(self.table) or std.mem.indexOfScalar(u8, self.table, 0) != null) return error.InvalidReplicatedBatch;
         const owner = self.storage_owner;
         if (owner.identity.table_id == 0 or owner.identity.shard_id == 0 or owner.identity.range_id == 0 or owner.schema_json.len > max_catalog_bytes or owner.indexes_json.len > max_catalog_bytes) return error.InvalidReplicatedBatch;
@@ -90,7 +98,7 @@ pub fn decodeValue(a: std.mem.Allocator, value: std.json.Value) !Owned {
     for ([_][]const u8{ "lsm_root_generation", "identity", "schema_json", "indexes_json", "initial_range", "table_storage" }) |name| if (!owner_value.object.contains(name)) return error.InvalidReplicatedBatch;
     var parsed = try std.json.parseFromValue(Entry, a, value, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     errdefer parsed.deinit();
-    try parsed.value.validate();
+    try parsed.value.validateReplay(true);
     return .{ .parsed = parsed };
 }
 
@@ -104,6 +112,14 @@ test "history control entry binds bounded immutable owner data and requires acti
     try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, entry, required_protocol_version - 1));
     const bytes = try encode(a, entry, required_protocol_version);
     defer a.free(bytes);
+    var legacy = entry;
+    legacy.protocol = 30;
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, legacy, required_protocol_version));
+    const legacy_bytes = try std.json.Stringify.valueAlloc(a, legacy, .{ .emit_null_optional_fields = true });
+    defer a.free(legacy_bytes);
+    var legacy_decoded = try decode(a, legacy_bytes);
+    defer legacy_decoded.deinit();
+    try std.testing.expectEqualDeep(legacy, legacy_decoded.value());
     var owned = try decode(a, bytes);
     defer owned.deinit();
     try std.testing.expectEqualDeep(entry, owned.value());

@@ -51,7 +51,11 @@ pub const QueryDefinition = struct {
     }
 
     pub fn fromTable(table: anytype) @This() {
-        return .{ .storage_engine = table.storage.engine, .table_id = table.table_id, .object_storage_generation = table.object_storage_generation, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
+        const T = switch (@typeInfo(@TypeOf(table))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(table),
+        };
+        return .{ .storage_engine = table.storage.engine, .table_id = table.table_id, .object_storage_generation = table.object_storage_generation, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = if (@hasField(T, "query_indexes_json")) (if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json) else table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
     }
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
         const schema = try alloc.dupe(u8, self.schema_json);
@@ -321,14 +325,19 @@ pub const Mutation = struct {
     location_json: []const u8 = "null",
     source_json: []const u8 = "null",
     expected_graph_revision: ?u64 = null,
+    /// Bound destructive SQL DDL. Zero attests absence for IF EXISTS.
+    expected_resource_id: ?u64 = null,
+    expected_incarnation: ?[16]u8 = null,
+    expected_parent_id: ?u64 = null,
+    expected_tablespace_id: ?u64 = null,
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
     storage_name: []const u8 = "",
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "expected_graph_revision")) {
-                if (self.expected_graph_revision) |revision| {
+            if (comptime std.mem.eql(u8, name, "expected_incarnation") or std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_resource_id") or std.mem.eql(u8, name, "expected_parent_id") or std.mem.eql(u8, name, "expected_tablespace_id")) {
+                if (@field(self, name)) |revision| {
                     try jw.objectField(name);
                     try jw.write(revision);
                 }
@@ -338,6 +347,20 @@ pub const Mutation = struct {
             }
         }
         try jw.endObject();
+    }
+};
+
+pub const PolicyRead = struct {
+    table_id: u64,
+    name: []const u8,
+    id: ?u64 = null,
+
+    pub fn select(self: @This(), state: State) State {
+        const records = for (state.policies, 0..) |record, i| {
+            if (record.table_id == self.table_id and std.ascii.eqlIgnoreCase(record.name, self.name) and (self.id == null or self.id.? == record.id))
+                break state.policies[i..][0..1];
+        } else state.policies[0..0];
+        return .{ .revision = state.revision, .next_id = state.next_id, .policies = records };
     }
 };
 
@@ -399,6 +422,7 @@ pub const StateIndex = struct {
     storage_names: std.StringHashMapUnmanaged(Resource) = .empty,
     tablespace_users: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     child_positions: std.AutoHashMapUnmanaged(Id, usize) = .empty,
+    graph_users: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(Resource)) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, state: State) !StateIndex {
         var self: StateIndex = .{};
@@ -413,6 +437,8 @@ pub const StateIndex = struct {
             if (id.found_existing) return error.InvalidCatalogRecord;
             id.value_ptr.* = r;
             try self.appendChild(alloc, r);
+            try self.reserveGraphUsers(alloc, &.{r});
+            self.insertGraphUser(r);
             if (r.kind == .table) {
                 const storage = try self.storage_names.getOrPut(alloc, r.storage_name);
                 if (storage.found_existing) return error.InvalidCatalogRecord;
@@ -427,6 +453,27 @@ pub const StateIndex = struct {
         if (!self.ids.contains(.{ .kind = .namespace, .id = default_namespace_id })) try self.appendChild(alloc, default_namespace);
         return self;
     }
+    fn firstGraphTable(r: Resource, ordinal: usize) bool {
+        if (r.kind != .graph) return false;
+        for (r.graph_tables[0..ordinal]) |prior| if (prior.table_id == r.graph_tables[ordinal].table_id) return false;
+        return true;
+    }
+    fn reserveGraphUsers(self: *StateIndex, alloc: std.mem.Allocator, resources: []const Resource) !void {
+        for (resources) |r| for (r.graph_tables, 0..) |table, i| {
+            if (!firstGraphTable(r, i)) continue;
+            const entry = try self.graph_users.getOrPut(alloc, table.table_id);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.ensureUnusedCapacity(alloc, resources.len);
+        };
+    }
+    fn insertGraphUser(self: *StateIndex, r: Resource) void {
+        for (r.graph_tables, 0..) |table, i| {
+            if (firstGraphTable(r, i)) self.graph_users.getPtr(table.table_id).?.appendAssumeCapacity(r);
+        }
+    }
+    pub fn graphsForTable(self: *const StateIndex, table_id: u64) []const Resource {
+        return if (self.graph_users.get(table_id)) |users| users.items else &.{};
+    }
     fn appendChild(self: *StateIndex, alloc: std.mem.Allocator, resource: Resource) !void {
         const entry = try self.children.getOrPut(alloc, .{ .kind = resource.kind, .parent = resource.parent_id });
         if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -437,6 +484,7 @@ pub const StateIndex = struct {
     /// prepared delta subsequently allocates nothing.
     fn reserve(self: *StateIndex, alloc: std.mem.Allocator, resources: []const Resource) !void {
         errdefer self.pruneEmptyParents(alloc, resources);
+        try self.reserveGraphUsers(alloc, resources);
         const n: u32 = @intCast(resources.len);
         try self.names.ensureUnusedCapacity(alloc, n);
         try self.ids.ensureUnusedCapacity(alloc, n);
@@ -454,6 +502,14 @@ pub const StateIndex = struct {
     // Called only after commit/undo, never while rollback may need capacity.
     fn pruneEmptyParents(self: *StateIndex, alloc: std.mem.Allocator, resources: []const Resource) void {
         for (resources) |r| {
+            for (r.graph_tables, 0..) |table, i| {
+                if (!firstGraphTable(r, i)) continue;
+                const users = self.graph_users.getPtr(table.table_id) orelse continue;
+                if (users.items.len == 0) {
+                    users.deinit(alloc);
+                    _ = self.graph_users.remove(table.table_id);
+                }
+            }
             const key: Parent = .{ .kind = r.kind, .parent = r.parent_id };
             const children = self.children.getPtr(key) orelse continue;
             if (children.items.len != 0) continue;
@@ -462,6 +518,14 @@ pub const StateIndex = struct {
         }
     }
     fn remove(self: *StateIndex, r: Resource) void {
+        for (r.graph_tables, 0..) |table, i| {
+            if (!firstGraphTable(r, i)) continue;
+            const users = self.graph_users.getPtr(table.table_id).?;
+            for (users.items, 0..) |user, position| if (user.id == r.id) {
+                _ = users.swapRemove(position);
+                break;
+            };
+        }
         _ = self.names.remove(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
         _ = self.ids.remove(.{ .kind = r.kind, .id = r.id });
         if (r.kind == .table) _ = self.storage_names.remove(r.storage_name);
@@ -479,6 +543,7 @@ pub const StateIndex = struct {
         }
     }
     fn insert(self: *StateIndex, r: Resource) void {
+        self.insertGraphUser(r);
         self.names.putAssumeCapacity(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name }, r);
         self.ids.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, r);
         if (r.kind == .table) self.storage_names.putAssumeCapacity(r.storage_name, r);
@@ -498,6 +563,9 @@ pub const StateIndex = struct {
         var children = self.children.valueIterator();
         while (children.next()) |value| value.deinit(alloc);
         self.children.deinit(alloc);
+        var graph_users = self.graph_users.valueIterator();
+        while (graph_users.next()) |users| users.deinit(alloc);
+        self.graph_users.deinit(alloc);
         self.storage_names.deinit(alloc);
         self.tablespace_users.deinit(alloc);
         self.child_positions.deinit(alloc);
@@ -571,7 +639,7 @@ pub const MutableState = struct {
     }
 
     pub fn clonePolicies(alloc: std.mem.Allocator, records: []const @import("policies.zig").Record) !OwnedPolicies {
-        if (records.len > 1024) return error.RowPolicyLimitExceeded;
+        if (records.len > @import("policies.zig").max_stored_definitions) return error.RowPolicyLimitExceeded;
         const bytes = try std.json.Stringify.valueAlloc(alloc, records, .{});
         defer alloc.free(bytes);
         var owned = try std.json.parseFromSlice([]const @import("policies.zig").Record, alloc, bytes, .{ .allocate = .alloc_always });
@@ -666,14 +734,17 @@ pub const MutableState = struct {
         next_id: u64,
         pub fn finish(self: *Change, state: *MutableState, committed: bool) void {
             if (!committed) {
-                for (self.inserted.items) |r| if (state.take(r.kind, r.id)) |removed| freeResource(state.alloc, removed);
+                for (self.inserted.items) |r| _ = state.take(r.kind, r.id);
                 for (self.previous.items) |r| state.put(r);
                 state.value.revision = self.revision;
                 state.value.next_id = self.next_id;
             }
             state.index.pruneEmptyParents(state.alloc, self.previous.items);
             state.index.pruneEmptyParents(state.alloc, self.inserted.items);
-            if (committed) for (self.previous.items) |r| freeResource(state.alloc, r);
+            // Reverse-index cleanup borrows binding arrays from both sides.
+            // Release the discarded side only after every prune has completed.
+            const discarded = if (committed) self.previous.items else self.inserted.items;
+            for (discarded) |r| freeResource(state.alloc, r);
             self.previous.deinit(state.alloc);
             self.inserted.deinit(state.alloc);
             self.* = undefined;
@@ -772,7 +843,7 @@ pub const PhysicalTable = struct {
     name: []const u8,
     /// Test/algorithm reader inventory. Production resolves these lazily from
     /// the same committed transaction through graphIndexIdentity.
-    graph_indexes: []const struct { name: []const u8, identity: @import("cypher").catalog.IndexIdentity } = &.{},
+    graph_indexes: []const struct { name: []const u8, concrete_name: ?[]const u8 = null, identity: @import("cypher").catalog.IndexIdentity } = &.{},
 };
 
 /// Planning uses a transaction-pinned reader. Point mutations touch only their
@@ -817,12 +888,22 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
         .table => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
+    if (request.expected_parent_id) |expected| {
+        if (request.action != .create or (request.kind != .table and request.kind != .namespace)) return error.InvalidCatalogMutation;
+        if (parent_id != expected) return error.CatalogGenerationChanged;
+    }
     var found = try reader.lookup(request.kind, parent_id, request.name);
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
         if (try reader.physicalByName(request.name)) |table| if (try reader.byId(.table, table.id) == null) {
             found = .{ .kind = .table, .id = table.id, .parent_id = default_namespace_id, .name = table.name, .storage_name = table.name };
         };
     }
+    if (request.expected_resource_id) |expected| {
+        if (request.action == .create) return error.InvalidCatalogMutation;
+        if ((if (found) |resource| resource.id else 0) != expected) return error.CatalogGenerationChanged;
+    }
+    if (request.expected_tablespace_id != null and (request.tablespace == null or
+        (request.action != .create and (request.action != .set_tablespace or request.expected_resource_id == null)))) return error.InvalidCatalogMutation;
     var upserts = std.ArrayListUnmanaged(Resource).empty;
     defer upserts.deinit(alloc);
     var removes = std.ArrayListUnmanaged(Resource).empty;
@@ -841,7 +922,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 if (existing.graph_revision != request.expected_graph_revision.?) return error.CatalogGenerationChanged;
             }
             if (request.new_name != null) return error.InvalidCatalogMutation;
-            const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
+            const binding = if (request.tablespace) |name| blk: {
+                const space = try reader.lookup(.tablespace, 0, name);
+                if (request.expected_tablespace_id) |id| if ((if (space) |destination| destination.id else 0) != id) return error.CatalogGenerationChanged;
+                break :blk (space orelse return error.TablespaceNotFound).id;
+            } else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
             var resource: Resource = if (replacing) found.? else .{ .native_service = request.native_service, .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
             if (replacing) {
@@ -883,6 +968,17 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                     out.* = .{ .mapping_index = @intCast(i), .identity = identity };
                 }
                 resource.graph_indexes = graph_indexes;
+                var validation_arena = std.heap.ArenaAllocator.init(alloc);
+                defer validation_arena.deinit();
+                const validation_alloc = validation_arena.allocator();
+                var executable = try graphForExecution(validation_alloc, resource);
+                const mappings = try validation_alloc.dupe(@TypeOf(executable.relationships[0]), executable.relationships);
+                executable.relationships = mappings;
+                for (mappings) |*mapping| {
+                    const label = executable.label(mapping.source_label) orelse return error.InvalidCatalogRecord;
+                    mapping.index = try reader.graphIndexName(label.table_id, mapping.index);
+                }
+                executable.validate() catch return error.InvalidCatalogMutation;
             }
             if (request.kind == .table) {
                 if (request.table_id == 0 or request.storage_name.len == 0) return error.InvalidCatalogMutation;
@@ -907,7 +1003,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             if (request.action == .set_tablespace) {
                 if (existing.kind == .tablespace or request.new_name != null) return error.InvalidCatalogMutation;
                 var updated = existing;
-                updated.tablespace_id = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
+                updated.tablespace_id = if (request.tablespace) |name| blk: {
+                    const destination = try reader.lookup(.tablespace, 0, name);
+                    if (request.expected_tablespace_id) |id| if ((if (destination) |space| space.id else 0) != id) return error.CatalogGenerationChanged;
+                    break :blk (destination orelse return error.TablespaceNotFound).id;
+                } else 0;
                 try upserts.append(alloc, updated);
             } else {
                 if ((existing.kind == .database and existing.id == default_database_id) or (existing.kind == .namespace and existing.id == default_namespace_id)) return error.ProtectedCatalogResource;
@@ -992,6 +1092,11 @@ pub const MemoryReader = struct {
     pub fn physicalById(self: @This(), id: u64) !?PhysicalTable {
         for (self.tables) |table| if (id == table.id) return table;
         return null;
+    }
+    pub fn graphIndexName(self: @This(), table_id: u64, index_name: []const u8) ![]const u8 {
+        const table = (try self.physicalById(table_id)) orelse return error.TableNotFound;
+        for (table.graph_indexes) |index| if (std.mem.eql(u8, index.name, index_name)) return index.concrete_name orelse index.name;
+        return error.IndexNotFound;
     }
     pub fn graphIndexIdentity(self: @This(), table_id: u64, index_name: []const u8) !?@import("cypher").catalog.IndexIdentity {
         const table = (try self.physicalById(table_id)) orelse return null;
@@ -1101,11 +1206,27 @@ pub const RelationMutationGuard = struct {
     owner: @import("relation_names.zig").Owner,
     incarnation: [16]u8,
 
+    /// Check the logical table binding directly; schema-owned index names
+    /// continue to require their published registry claim.
+    qualified_table: bool = false,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (!std.mem.eql(u8, name, "qualified_table") or self.qualified_table) {
+                try jw.objectField(name);
+                try jw.write(@field(self, name));
+            }
+        }
+        try jw.endObject();
+    }
+
     pub fn validate(self: @This()) !void {
         try self.target.validate();
         try (Target{ .database = self.target.database, .namespace = self.target.namespace, .table = self.logical_table }).validate();
         try self.owner.validate();
-        if (self.owner.phase != .active or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidCatalogMutation;
+        if (self.qualified_table and (self.owner.kind != .table or !std.mem.eql(u8, self.target.name, self.logical_table))) return error.InvalidCatalogMutation;
+        if (self.owner.phase != .active or (!self.qualified_table and std.mem.allEqual(u8, &self.incarnation, 0))) return error.InvalidCatalogMutation;
     }
 
     pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1124,17 +1245,48 @@ pub const RelationMutationGuard = struct {
         errdefer alloc.free(namespace);
         const name = try alloc.dupe(u8, self.target.name);
         errdefer alloc.free(name);
-        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation };
+        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation, .qualified_table = self.qualified_table };
     }
 };
 
+/// Identity observed by the SQL binder. A null target denotes a named graph.
+pub const CursorBinding = struct {
+    target: ?Target = null,
+    physical: []const u8,
+    id: u64,
+    version: u64,
+};
+
+pub const CursorPolicies = struct {
+    digest: [32]u8,
+    protected: bool,
+
+    pub fn observe(hash: *std.crypto.hash.Blake3, protected: *bool, binding: CursorBinding, stamp: ?@import("policies.zig").PublicationStamp) !void {
+        var encoded: [16]u8 = @splat(0);
+        if (stamp) |value| {
+            if (value.table_id != binding.id or value.schema_version != binding.version) return error.RowPolicyCatalogChanged;
+            if (try value.servingAuthority()) |serving| {
+                std.mem.writeInt(u64, encoded[0..8], serving.generation, .little);
+                std.mem.writeInt(u64, encoded[8..16], serving.catalog_epoch, .little);
+                protected.* = true;
+            }
+        }
+        hash.update(&encoded);
+    }
+};
+pub const CursorCatalogCut = struct { revision: u64, epoch: @import("relation_reconciliation.zig").Epoch };
 pub const ResolveMany = struct {
+    cursor_catalog_cut: ?CursorCatalogCut = null,
+    cursor_bindings: []const CursorBinding = &.{},
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.
     /// Captured with forward bindings in the same immutable catalog read.
     storage_names: []const []const u8 = &.{},
     include_query_definitions: bool = false,
     publication_database: ?[]const u8 = null,
+    /// Request the tracked physical relation source cut alongside the logical
+    /// revision. A missing epoch cannot validate a cached binding.
+    include_source_epoch: bool = false,
     expected_revision: ?u64 = null,
     relations: []const RelationTarget = &.{},
     /// Name allocation may use an authoritative metadata cut without a
@@ -1143,8 +1295,12 @@ pub const ResolveMany = struct {
     expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        if (self.publication_database != null) {
-            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .publication_database = self.publication_database });
+        if (self.cursor_bindings.len != 0) {
+            try jw.write(.{ .cursor_bindings = self.cursor_bindings, .cursor_catalog_cut = self.cursor_catalog_cut, .include_source_epoch = true, .expected_revision = self.expected_revision });
+        } else if (self.publication_database != null) {
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .publication_database = self.publication_database, .include_source_epoch = self.include_source_epoch });
+        } else if (self.include_source_epoch) {
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .include_source_epoch = true, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
         } else if (self.relations.len != 0 or self.expected_relation_epoch != null) {
             try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
         } else {
@@ -1163,10 +1319,13 @@ pub const PublicationCatalogCut = struct {
 };
 
 pub const ResolvedMany = struct {
+    cursor_policies: ?CursorPolicies = null,
     revision: u64,
     tables: []const ?ResolvedTable,
     publication_cut: ?PublicationCatalogCut = null,
     logical_names: []const ?[]const u8 = &.{},
+    /// Source observation for descriptor invalidation, independent of publication.
+    source_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
     /// Null means the receiver did not attest authoritative relation resolution.
     /// A missing field from an older peer must never prove name absence.
     relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
@@ -1176,7 +1335,11 @@ pub const ResolvedMany = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         if (self.publication_cut != null) {
-            try jw.write(.{ .revision = self.revision, .tables = self.tables, .publication_cut = self.publication_cut });
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .publication_cut = self.publication_cut, .logical_names = self.logical_names, .source_epoch = self.source_epoch, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .cursor_policies = self.cursor_policies });
+        } else if (self.cursor_policies != null) {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .source_epoch = self.source_epoch, .cursor_policies = self.cursor_policies });
+        } else if (self.source_epoch != null) {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .source_epoch = self.source_epoch, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
         } else if (self.relation_epoch != null or self.relations.len != 0) {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
         } else {

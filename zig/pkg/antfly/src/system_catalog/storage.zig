@@ -67,6 +67,18 @@ fn policyPublicationWorkKeyAlloc(alloc: std.mem.Allocator, group_id: u64, table_
     return key;
 }
 
+/// The work index and serving stamp are committed in the same transaction.
+pub fn hasPolicyPublicationWork(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
+    const key = try policyPublicationWorkKeyAlloc(alloc, group_id, table_id);
+    defer alloc.free(key);
+    const value = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, value, &.{1})) return error.InvalidRowPolicyPublication;
+    return true;
+}
+
 pub fn policyPublicationNeedsWork(publication: policies.Publication) bool {
     return switch (publication.phase) {
         .active => false,
@@ -239,6 +251,83 @@ pub fn loadPolicyPublications(alloc: std.mem.Allocator, txn: *docstore.DocStore.
     return out;
 }
 
+fn policyNameKeyAlloc(a: std.mem.Allocator, group: u64, table: u64, name: []const u8) ![]u8 {
+    const key = try std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:policy:{d}:{s}", .{ group, table, name });
+    for (key[key.len - name.len ..]) |*byte| byte.* = std.ascii.toLower(byte.*);
+    return key;
+}
+
+fn writePolicyName(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: policies.Record) !void {
+    const key = try policyNameKeyAlloc(a, group, record.table_id, record.name);
+    defer a.free(key);
+    var id: [8]u8 = undefined;
+    std.mem.writeInt(u64, &id, record.id, .little);
+    try txn.put(key, &id);
+}
+
+fn lookupPolicyName(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: u64, name: []const u8) !?u64 {
+    const key = try policyNameKeyAlloc(a, group, table, name);
+    defer a.free(key);
+    const raw = txn.get(key) catch |err| return if (err == error.NotFound) null else err;
+    if (raw.len != 8) return error.InvalidRowPolicyRecord;
+    return std.mem.readInt(u64, raw[0..8], .little);
+}
+
+fn policyById(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, id: u64) !?policies.Record {
+    const raw = txn.get(try policyKeyAlloc(a, group, id)) catch |err| return if (err == error.NotFound) null else err;
+    const record = try std.json.parseFromSliceLeaky(policies.Record, a, raw, .{ .allocate = .alloc_always });
+    try record.validateShape();
+    if (record.id != id) return error.InvalidRowPolicyRecord;
+    return record;
+}
+
+fn policyCountKey(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:system_catalog_name:{d}:policy_count", .{group});
+}
+
+fn policyCount(txn: *docstore.DocStore.Txn, group: u64) !u32 {
+    var buf: [128]u8 = undefined;
+    const raw = txn.get(try policyCountKey(&buf, group)) catch |err| return if (err == error.NotFound) 0 else err;
+    if (raw.len != 4) return error.InvalidRowPolicyRecord;
+    return std.mem.readInt(u32, raw[0..4], .little);
+}
+
+pub fn policyCreateHasCapacity(txn: *docstore.DocStore.Txn, group: u64) !bool {
+    return try policyCount(txn, group) < policies.max_definitions;
+}
+
+fn putPolicyCount(txn: *docstore.DocStore.Txn, group: u64, count: usize) !void {
+    if (count > policies.max_stored_definitions) return error.RowPolicyLimitExceeded;
+    var buf: [128]u8 = undefined;
+    const key = try policyCountKey(&buf, group);
+    if (count == 0) {
+        _ = txn.get(key) catch |err| return if (err == error.NotFound) {} else err;
+        return txn.delete(key);
+    }
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, @intCast(count), .little);
+    try txn.put(key, &value);
+}
+
+pub fn readPolicyDefinition(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: domain.PolicyRead) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const meta = try readMeta(scratch, txn, group);
+    var state: domain.State = .{ .revision = meta.revision, .next_id = meta.next_id };
+    const id = request.id orelse (try lookupPolicyName(scratch, txn, group, request.table_id, request.name)) orelse return std.json.Stringify.valueAlloc(a, state, .{});
+    const record = (try policyById(scratch, txn, group, id)) orelse {
+        if (request.id == null) return error.InvalidRowPolicyRecord;
+        return std.json.Stringify.valueAlloc(a, state, .{});
+    };
+    if (record.table_id == request.table_id and std.ascii.eqlIgnoreCase(record.name, request.name)) {
+        state.policies = &.{record};
+        return std.json.Stringify.valueAlloc(a, state, .{});
+    }
+    if (request.id == null) return error.InvalidRowPolicyRecord;
+    return std.json.Stringify.valueAlloc(a, state, .{});
+}
+
 pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const policies.Record {
     const prefix = try keyAlloc(alloc, group_id, "policy:");
     defer alloc.free(prefix);
@@ -250,7 +339,7 @@ pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         }
         alloc.free(kvs);
     }
-    if (kvs.len > 1024) return error.RowPolicyLimitExceeded;
+    if (kvs.len > policies.max_stored_definitions) return error.RowPolicyLimitExceeded;
     const records = try alloc.alloc(policies.Record, kvs.len);
     for (kvs, records, 0..) |kv, *record, i| {
         record.* = try std.json.parseFromSliceLeaky(policies.Record, alloc, kv.value, .{ .allocate = .alloc_always });
@@ -266,14 +355,13 @@ pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
 /// Only trusted admin admission may propose this internal transition. The
 /// deterministic apply path checks revision and table identity again; it does
 /// not activate policy enforcement merely by storing a definition.
-pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.Command, command_hash: [32]u8) !void {
-    if (command.version != 1) return error.InvalidRowPolicyRecord;
+pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.Command, command_hash: [32]u8, on_full: enum { reject, skip }) !void {
+    if (command.version != 1 and command.version != policies.capacity_checked_version) return error.InvalidRowPolicyRecord;
     const meta = try readMeta(alloc, txn, group_id);
     if (meta.revision != command.expected_revision) return;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const records = try loadPolicies(a, txn, group_id);
     var next_id = meta.next_id;
     switch (command.change) {
         .put => |record| {
@@ -286,17 +374,25 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
             if (publication != null and (publication.?.value.phase == .pending_install or publication.?.value.phase == .serving_install or publication.?.value.phase == .pending_disable or publication.?.value.phase == .serving_disable)) return error.RowPolicyCatalogChanged;
             const table = (try getById(a, txn, group_id, .table, record.table_id)) orelse return error.TableNotFound;
             defer table.deinit();
-            var existing: ?policies.Record = null;
-            for (records) |prior| {
-                if (prior.id == record.id) existing = prior;
-                if (prior.table_id == record.table_id and std.ascii.eqlIgnoreCase(prior.name, record.name) and prior.id != record.id) return error.InvalidRowPolicyRecord;
-            }
-            if (existing) |prior| {
+            const owner = try lookupPolicyName(a, txn, group_id, record.table_id, record.name);
+            if (owner != null and owner.? != record.id) return error.InvalidRowPolicyRecord;
+            if (try policyById(a, txn, group_id, record.id)) |prior| {
+                if (owner == null) return error.InvalidRowPolicyRecord;
                 if (prior.table_id != record.table_id or !std.mem.eql(u8, prior.name, record.name) or record.generation != try std.math.add(u64, prior.generation, 1)) return error.RowPolicyCatalogChanged;
             } else {
+                if (owner != null) return error.InvalidRowPolicyRecord;
                 if (record.id != meta.next_id or record.generation != 1) return error.RowPolicyCatalogChanged;
+                const count = try policyCount(txn, group_id);
+                if (count >= policies.max_definitions) {
+                    if (on_full == .reject) return error.RowPolicyLimitExceeded;
+                    // A predecessor could commit exactly one extra definition.
+                    // Preserve its applied revision and command receipt on replay.
+                    if (command.version >= policies.capacity_checked_version or count >= policies.max_stored_definitions) return;
+                }
+                try putPolicyCount(txn, group_id, count + 1);
                 next_id = try std.math.add(u64, next_id, 1);
             }
+            try writePolicyName(a, txn, group_id, record);
             const key = try policyKeyAlloc(a, group_id, record.id);
             const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
             try txn.put(key, encoded);
@@ -305,10 +401,10 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
             var publication = try loadPolicyPublication(a, txn, group_id, identity.table_id);
             defer if (publication) |*value| value.deinit();
             if (publication != null and (publication.?.value.phase == .pending_install or publication.?.value.phase == .serving_install or publication.?.value.phase == .pending_disable or publication.?.value.phase == .serving_disable)) return error.RowPolicyCatalogChanged;
-            const prior = for (records) |record| {
-                if (record.id == identity.id) break record;
-            } else return error.RowPolicyCatalogChanged;
+            const prior = (try policyById(a, txn, group_id, identity.id)) orelse return error.RowPolicyCatalogChanged;
             if (prior.generation != identity.generation or prior.table_id != identity.table_id) return error.RowPolicyCatalogChanged;
+            try putPolicyCount(txn, group_id, std.math.sub(u32, try policyCount(txn, group_id), 1) catch return error.InvalidRowPolicyRecord);
+            try txn.delete(try policyNameKeyAlloc(a, group_id, prior.table_id, prior.name));
             const key = try policyKeyAlloc(a, group_id, identity.id);
             try txn.delete(key);
         },
@@ -611,6 +707,27 @@ pub fn findIdentity(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
     return id;
 }
 
+/// Project just the graph identity header. Large graph definitions are skipped
+/// in place when checking a retained cursor across unrelated catalog changes.
+pub fn graphRevisionMatches(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, binding: domain.CursorBinding) !bool {
+    const name_key = try nameKeyAlloc(alloc, group_id, .graph, 0, binding.physical);
+    defer alloc.free(name_key);
+    const id = txn.get(name_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (id.len != 8) return error.InvalidCatalogRecord;
+    if (std.mem.readInt(u64, id[0..8], .little) != binding.id) return false;
+    const key = try recordKeyAlloc(alloc, group_id, .graph, binding.id);
+    defer alloc.free(key);
+    const Header = struct { kind: domain.Kind, parent_id: u64 = 0, name: []const u8, id: u64, graph_revision: u64 = 1 };
+    var header = try std.json.parseFromSlice(Header, alloc, try txn.get(key), .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    const row = header.value;
+    if (row.kind != .graph or row.parent_id != 0 or row.id != binding.id or !std.mem.eql(u8, row.name, binding.physical)) return error.InvalidCatalogRecord;
+    return row.graph_revision == binding.version;
+}
+
 pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) !?std.json.Parsed(domain.Resource) {
     const key = try nameKeyAlloc(alloc, group_id, kind, parent, name);
     defer alloc.free(key);
@@ -744,6 +861,8 @@ pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
         alloc.free(rows);
     }
     for (rows) |row| try txn.delete(row.key);
+    try putPolicyCount(txn, group_id, state.value.policies.len);
+    for (state.value.policies) |record| try writePolicyName(alloc, txn, group_id, record);
     for (state.value.resources) |resource| {
         const key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
         defer alloc.free(key);
@@ -759,6 +878,10 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
     defer state.deinit();
     var index = try domain.StateIndex.init(alloc, state.value);
     defer index.deinit(alloc);
+    if (try policyCount(txn, group_id) != state.value.policies.len) return error.InvalidCatalogRecord;
+    for (state.value.policies) |record| {
+        if ((try lookupPolicyName(alloc, txn, group_id, record.table_id, record.name)) != record.id) return error.InvalidCatalogRecord;
+    }
     for (state.value.resources) |resource| {
         var found = (try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
         defer found.deinit();
@@ -793,12 +916,39 @@ fn tablespaceUseKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource)
 fn childKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:{s}", .{ group_id, @tagName(r.kind), r.parent_id, r.name });
 }
+fn graphTablePrefix(a: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:graph_table:{d}:", .{ group_id, table_id });
+}
+fn graphTableKey(a: std.mem.Allocator, group_id: u64, table_id: u64, graph_id: u64) ![]u8 {
+    const prefix = try graphTablePrefix(a, group_id, table_id);
+    defer a.free(prefix);
+    return std.fmt.allocPrint(a, "{s}{d}", .{ prefix, graph_id });
+}
+pub fn graphsForTable(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) ![]const domain.Resource {
+    const prefix = try graphTablePrefix(a, group_id, table_id);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
+    var entry = try cursor.seekAtOrAfter(prefix);
+    while (entry) |kv| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+        const record = try std.json.parseFromSliceLeaky(domain.Resource, a, kv.value, .{ .allocate = .alloc_always });
+        if (record.kind != .graph or !std.mem.eql(u8, kv.key, try graphTableKey(a, group_id, table_id, record.id))) return error.InvalidCatalogRecord;
+        try out.append(a, record);
+    }
+    return out.items;
+}
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
     const child_key = try childKey(alloc, group_id, r);
     defer alloc.free(child_key);
     const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
     defer alloc.free(child_json);
     try txn.put(child_key, child_json);
+    if (r.kind == .graph) for (r.graph_tables) |table| {
+        const key = try graphTableKey(alloc, group_id, table.table_id, r.id);
+        defer alloc.free(key);
+        try txn.put(key, child_json);
+    };
     if (r.kind == .table) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);
         defer alloc.free(key);
@@ -818,6 +968,20 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     }
 }
 fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    if (r.kind == .graph) for (r.graph_tables, 0..) |table, ordinal| {
+        var repeated = false;
+        for (r.graph_tables[0..ordinal]) |prior| if (prior.table_id == table.table_id) {
+            repeated = true;
+            break;
+        };
+        if (repeated) continue;
+        const key = try graphTableKey(alloc, group_id, table.table_id, r.id);
+        defer alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    };
     const child_key = try childKey(alloc, group_id, r);
     defer alloc.free(child_key);
     txn.delete(child_key) catch |err| switch (err) {
@@ -898,10 +1062,13 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
         defer arena.deinit();
         const a = arena.allocator();
         const policy_records = try loadPolicies(a, txn, group_id);
+        var remaining = policy_records.len;
         for (delta.removes) |resource| if (resource.kind == .table) {
             for (policy_records) |record| if (record.table_id == resource.id) {
                 const policy_key = try policyKeyAlloc(a, group_id, record.id);
                 try txn.delete(policy_key);
+                try txn.delete(try policyNameKeyAlloc(a, group_id, record.table_id, record.name));
+                remaining -= 1;
             };
             const publication_key = try policyPublicationKeyAlloc(a, group_id, resource.id);
             try txn.delete(publication_key);
@@ -910,6 +1077,7 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
             const work_key = try policyPublicationWorkKeyAlloc(a, group_id, resource.id);
             try txn.delete(work_key);
         };
+        if (remaining != policy_records.len) try putPolicyCount(txn, group_id, remaining);
     }
     for (delta.removes) |resource| try removeResource(alloc, txn, group_id, resource);
     for (delta.upserts) |resource| try writeResource(alloc, txn, group_id, resource);
@@ -939,6 +1107,7 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         defer alloc.free(encoded);
         try txn.put(setting_key, encoded);
     }
+    try putPolicyCount(txn, group_id, state.policies.len);
     for (state.policies, 0..) |record, i| {
         try record.validateShape();
         if (record.id >= state.next_id) return error.InvalidRowPolicyRecord;
@@ -954,6 +1123,7 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
         defer alloc.free(encoded);
         try txn.put(policy_key, encoded);
+        try writePolicyName(alloc, txn, group_id, record);
     }
     for (state.policy_publications, 0..) |publication, index| {
         try publication.validateShape();

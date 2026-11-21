@@ -15,6 +15,7 @@
 
 //! Data-only transaction envelope used by the runtime callback boundary.
 
+const std = @import("std");
 const db_types = @import("../storage/db/types.zig");
 
 /// A pre-decision participant may be tried at another replica only when the
@@ -58,15 +59,14 @@ pub const TxnStatusRequest = struct {
 };
 
 pub const TableCommitRequest = struct {
-    /// Keep older canonical execution-plan bytes stable when no origin was
-    /// supplied. Explicit labels remain part of the retained plan identity.
-    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-        return @import("std").mem.eql(u8, name, "source_producer") and self.source_producer == .unlabelled;
-    }
-
     /// Explicit trusted transaction origin. Older callers remain unlabelled.
     source_producer: @FieldType(db_types.BatchRequest, "source_producer") = .unlabelled,
     source_admission: ?@import("../storage/source_admission.zig").Command = null,
+    bound_catalog_incarnation: ?[16]u8 = null,
+    commit_requires: ?db_types.CommitRequires = null,
+    /// Coordinator planning context, retained until cascade expansion finishes.
+    /// A participant's explicit prerequisite always overrides this default.
+    default_commit_requires: ?db_types.CommitRequires = null,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
@@ -90,6 +90,10 @@ pub const TableCommitRequest = struct {
     relational_activation: ?@import("../storage/db/relational_integrity_activation_contract.zig").Command = null,
     relational_retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("../storage/db/relational_index_maintenance_contract.zig").Command = null,
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return (std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null) or
+            (std.mem.eql(u8, field, "source_producer") and self.source_producer == .unlabelled);
+    }
 };
 
 /// One transaction has one origin, including read-only and empty participants.

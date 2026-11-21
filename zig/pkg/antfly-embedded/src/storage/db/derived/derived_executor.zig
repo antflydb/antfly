@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const replay_source_mod = @import("replay_source.zig");
 const derived_types = @import("derived_types.zig");
+const wal_trace = @import("../../write_amplification_trace.zig");
 const backlog_tracker_mod = @import("backlog_tracker.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const runtime_backend = @import("../../runtime_backend.zig");
@@ -33,6 +34,8 @@ const io_threaded_runtime_mod = @import("io_threaded_runtime.zig");
 
 pub const ApplyFn = runtime_types.ApplyFn;
 pub const PersistFn = runtime_types.PersistFn;
+pub const PersistBatchFn = runtime_types.PersistBatchFn;
+pub const PersistSnapshotArg = runtime_types.PersistSnapshotArg;
 pub const TruncateFn = runtime_types.TruncateFn;
 pub const BeginCatchUpFn = runtime_types.BeginCatchUpFn;
 pub const FinishCatchUpFn = runtime_types.FinishCatchUpFn;
@@ -63,7 +66,10 @@ pub const Executor = struct {
         resume_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         remove_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         applied_sequence: *const fn (ptr: *anyopaque, name: []const u8) ?u64,
+        advance_applied_sequence_if_contiguous: *const fn (ptr: *anyopaque, name: []const u8, sequence: u64) bool,
         snapshot_stats: *const fn (ptr: *anyopaque) types.DerivedWorkerStats,
+        request_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
+        request_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
         notify_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
         notify_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
         notify_except_kind: *const fn (ptr: *anyopaque, sequence: u64, excluded_kind: types.IndexKind) void,
@@ -130,8 +136,26 @@ pub const Executor = struct {
         return self.vtable.applied_sequence(self.ptr, name);
     }
 
+    /// WS4 phase 2: fast-forward a worker's in-memory applied sequence to
+    /// `sequence` without a journal scan, when an inline publication has
+    /// just durably installed `name`'s effects for `sequence` in the
+    /// primary write's own native transaction. Returns `false` (safe
+    /// no-op) whenever there is no worker for `name`, or the worker is
+    /// not exactly caught up to `sequence - 1`, in which case its own
+    /// catch-up path remains the only way forward for the gap.
+    pub fn advanceAppliedSequenceIfContiguous(self: *Executor, name: []const u8, sequence: u64) bool {
+        return self.vtable.advance_applied_sequence_if_contiguous(self.ptr, name, sequence);
+    }
+
     pub fn snapshotStats(self: *Executor) types.DerivedWorkerStats {
         return self.vtable.snapshot_stats(self.ptr);
+    }
+
+    pub fn requestSequence(self: *Executor, sequence: u64) void {
+        self.vtable.request_sequence(self.ptr, sequence);
+    }
+    pub fn requestIndexes(self: *Executor, sequence: u64, names: []const []const u8) void {
+        self.vtable.request_indexes(self.ptr, sequence, names);
     }
 
     pub fn notifySequence(self: *Executor, sequence: u64) void {
@@ -201,11 +225,12 @@ pub fn init(
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    persist_batch_fn: ?runtime_types.PersistBatchFn,
 ) !Executor {
     try runtime_backend.ensureExecutorBackendAvailable(config.backend);
     return switch (config.backend) {
-        .manual => try initManual(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager),
-        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, backend_runtime),
+        .manual => try initManual(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, persist_batch_fn),
+        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, backend_runtime, persist_batch_fn),
     };
 }
 
@@ -291,6 +316,19 @@ const ManualRuntime = struct {
         return null;
     }
 
+    /// See `DerivedRuntime.advanceAppliedSequenceIfContiguous` (io_threaded_runtime.zig)
+    /// for the safety argument; this manual backend mirrors it exactly.
+    fn advanceAppliedSequenceIfContiguous(self: *ManualRuntime, name: []const u8, sequence: u64) bool {
+        for (self.workers.items) |*worker| {
+            if (!std.mem.eql(u8, worker.name, name)) continue;
+            if (worker.applied_sequence + 1 != sequence) return false;
+            worker.applied_sequence = sequence;
+            worker.target_sequence = @max(worker.target_sequence, sequence);
+            return true;
+        }
+        return false;
+    }
+
     fn snapshotStats(self: *ManualRuntime) types.DerivedWorkerStats {
         var stats = types.DerivedWorkerStats{
             .workers = @intCast(self.workers.items.len),
@@ -360,6 +398,7 @@ const ManualRuntime = struct {
     };
 
     fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker) !CatchUpResult {
+        wal_trace.recordOp(.derived_worker_turn);
         const token = if (self.begin_catch_up_fn) |begin_catch_up|
             try begin_catch_up(self.ctx, worker.kind)
         else
@@ -522,7 +561,14 @@ fn initManual(
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    persist_batch_fn: ?runtime_types.PersistBatchFn,
 ) !Executor {
+    // ManualRuntime interleaves each worker's own persist call with that
+    // worker's catch-up work (see `waitForIndexes`/`waitForAll` above), so
+    // there is no "collect every consumer, then flush once" point to hook
+    // a batch variant into the way `io_threaded_runtime.zig`'s wait loops
+    // have -- unused here on purpose.
+    _ = persist_batch_fn;
     const runtime = try alloc.create(ManualRuntime);
     errdefer alloc.destroy(runtime);
     runtime.* = .{
@@ -554,7 +600,10 @@ const manual_vtable = Executor.VTable{
     .resume_worker = manualResumeWorker,
     .remove_worker = manualRemoveWorker,
     .applied_sequence = manualAppliedSequence,
+    .advance_applied_sequence_if_contiguous = manualAdvanceAppliedSequenceIfContiguous,
     .snapshot_stats = manualSnapshotStats,
+    .request_sequence = manualNotifySequence,
+    .request_indexes = manualNotifyIndexes,
     .notify_sequence = manualNotifySequence,
     .notify_indexes = manualNotifyIndexes,
     .notify_except_kind = manualNotifyExceptKind,
@@ -609,6 +658,11 @@ fn manualRemoveWorker(ptr: *anyopaque, name: []const u8) void {
 fn manualAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     return runtime.appliedSequence(name);
+}
+
+fn manualAdvanceAppliedSequenceIfContiguous(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.advanceAppliedSequenceIfContiguous(name, sequence);
 }
 
 fn manualSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {
@@ -684,6 +738,7 @@ fn initIoThreaded(
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    persist_batch_fn: ?runtime_types.PersistBatchFn,
 ) !Executor {
     if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
 
@@ -691,10 +746,10 @@ fn initIoThreaded(
     errdefer alloc.destroy(runtime);
     if (backend_runtime) |bg| {
         const io_impl = bg.io_impl orelse return error.MissingBackendRuntimeIo;
-        runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
+        runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, persist_batch_fn);
         runtime.scheduler = try bg.maintenanceScheduler();
     } else {
-        runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
+        runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, persist_batch_fn);
     }
     return .{
         .ptr = runtime,
@@ -712,7 +767,10 @@ const io_threaded_vtable = Executor.VTable{
     .resume_worker = ioThreadedResumeWorker,
     .remove_worker = ioThreadedRemoveWorker,
     .applied_sequence = ioThreadedAppliedSequence,
+    .advance_applied_sequence_if_contiguous = ioThreadedAdvanceAppliedSequenceIfContiguous,
     .snapshot_stats = ioThreadedSnapshotStats,
+    .request_sequence = ioThreadedRequestSequence,
+    .request_indexes = ioThreadedRequestIndexes,
     .notify_sequence = ioThreadedNotifySequence,
     .notify_indexes = ioThreadedNotifyIndexes,
     .notify_except_kind = ioThreadedNotifyExceptKind,
@@ -772,9 +830,23 @@ fn ioThreadedAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     return runtime.appliedSequence(name);
 }
 
+fn ioThreadedAdvanceAppliedSequenceIfContiguous(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.advanceAppliedSequenceIfContiguous(name, sequence);
+}
+
 fn ioThreadedSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return runtime.snapshotStats();
+}
+
+fn ioThreadedRequestSequence(ptr: *anyopaque, sequence: u64) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.requestSequence(sequence);
+}
+fn ioThreadedRequestIndexes(ptr: *anyopaque, sequence: u64, names: []const []const u8) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.requestIndexes(sequence, names);
 }
 
 fn ioThreadedNotifySequence(ptr: *anyopaque, sequence: u64) void {

@@ -216,7 +216,6 @@ pub const AsyncContext = struct {
     store: *docstore_mod.DocStore,
     relational_base_rows: bool = false,
     snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
-    applied_sequence_checkpoint_path: ?[]const u8 = null,
     index_repair_checkpoint: ?index_repair_state.Location = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
@@ -251,6 +250,17 @@ pub const AsyncContext = struct {
     index_repair_scheduler: IndexRepairSchedulerDirectory = .{},
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
+    /// Serializes the drain-then-commit applied-sequence flush as a whole
+    /// (flushPendingAppliedSequencesLocked / flushFinishedDenseAppliedSequenceLocked),
+    /// including the durable commit they run, which can yield through Io for
+    /// a WAL group-commit wait. applied_sequence_mutex above protects only
+    /// the coalescer's pending map itself (note/drain), a brief critical
+    /// section that never yields -- it must not be held across that commit.
+    /// std.Io.Mutex is safe to hold across a cooperative yield: a contending
+    /// caller parks through the DB's Io instead of busy-waiting the OS
+    /// thread the lock holder needs to run again to finish and release it.
+    /// See DETERMINISM_AUDIT.md.
+    applied_sequence_flush_mutex: std.Io.Mutex = .init,
     dense_admission: @import("dense_publication_admission.zig").Owner = .{},
     native_projection_owner: @import("native_projection_owner.zig").Owner = .{},
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
@@ -686,7 +696,6 @@ pub const BatchExecutionContext = struct {
     ordered_artifact_publication_required: bool = false,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     index_repair_checkpoint: ?index_repair_state.Location = null,
     shard_manager: *shard_mod.ShardManager,
     change_journal: *change_journal_mod.Journal,
@@ -1069,6 +1078,18 @@ pub const BatchVisibilityCompletion = struct {
     }
 };
 
+/// WS3: lets a capi caller drop its own connection-level locks (the path
+/// gate's lease and the per-connection call-serializing mutex) across the
+/// primary write's durability wait, not just the DB apply lock. Invoked
+/// exactly once, from `mutation_commit.zig`'s `batchInternalPreparedOwned`,
+/// right after the apply lock releases and before the ticket is waited on;
+/// never invoked when there is no ticket to shield (the transaction-
+/// resolution commit path, which does not stage through this hook).
+pub const WriterLaneReleaseHook = struct {
+    ptr: *anyopaque,
+    release: *const fn (ptr: *anyopaque) void,
+};
+
 /// One synchronous prepared attempt's irreversible disposition. It is separate
 /// from the caller's cumulative progress marker: optimistic preparation may
 /// retry, while a committed attempt must propagate every later error unchanged.
@@ -1085,7 +1106,15 @@ pub const PreparedCommitDisposition = struct {
     }
 };
 
+pub const PreparationCapture = struct {
+    request_digest: [32]u8 = @splat(0),
+    alloc: Allocator,
+    json: ?[]u8 = null,
+};
+
 pub const BatchExecutionOptions = struct {
+    preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
+    preparation_capture: ?*PreparationCapture = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
     /// Native-only completion observation; never encoded in a replicated command.
@@ -1111,6 +1140,13 @@ pub const BatchExecutionOptions = struct {
     /// Internal progress marker; set only after the primary store accepts the
     /// write. Visibility admission errors must not invite replay of transforms.
     primary_committed: ?*bool = null,
+    /// Regression-B test hook: when set, the primary write's own ticket
+    /// (`mutation_commit.zig`'s `primary_ticket`) is waited on via
+    /// `waitSequence` instead of `wait`, and the resulting commit sequence
+    /// (0 on a backend with no such concept) is written here. See
+    /// `db.zig`'s `DB.batchWithCommittedSequence` and `lite/docstore.zig`'s
+    /// `Store.Ticket.waitSequence`.
+    committed_sequence_out: ?*u64 = null,
     /// Attempt-local borrow installed by batchInternalWithPreparationAllocator. Never
     /// retained by asynchronous publication or shared across retries.
     prepared_commit_disposition: ?*PreparedCommitDisposition = null,
@@ -1138,9 +1174,39 @@ pub const BatchExecutionOptions = struct {
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
+    /// lite-single-commit-write-path.md §3.3c. `.none` (default): a
+    /// coordinated-constraint table's ordinary writes are refused on this
+    /// plain batch path (`error.ForeignKeyCoordinationRequired`) and the
+    /// integrity namespace stays protected -- the durable 3-commit
+    /// `beginTransaction`/`writeTransaction`/`commitTransaction` sequence
+    /// is the only way to write such a table. `.local_decision`: this call
+    /// is the first and only decider for `req.integrity_commands` (set
+    /// only by `capi/sql.zig`'s `commitCoordinated` single-call fast
+    /// path, never by a multi-statement SQL session spanning calls) --
+    /// `mutation_commit.zig`'s `prepareLocalIntegrityDecision` validates
+    /// and folds the resulting UNIQUE-claim writes into this same native
+    /// commit. Unlike replaying an already-decided remote write
+    /// (`live_replication_apply`/`scoped_restore_replication_apply`,
+    /// structural re-validation only), `.local_decision` still runs the
+    /// full `checkVersionPredicates`/`relational_integrity.prepare`/
+    /// `validatePreparedEffects` sequence, inside the same apply-exclusive
+    /// section as the commit, so two concurrent `.local_decision` writers
+    /// racing the same UNIQUE value can never both win.
+    integrity_authority: enum { none, local_decision } = .none,
+    /// lite-single-commit-write-path.md §7.6: only meaningful alongside
+    /// `.local_decision`. Lets `prepareLocalIntegrityDecision`'s own
+    /// RESTRICT check (`relational_integrity.requireEmpty`) tell a
+    /// genuinely live Reference apart from a dangling one left by the
+    /// fused FK multi-table coordinator's own non-atomic ride-along
+    /// `.attach` write, self-healing it (queuing its deletion in this
+    /// same commit) instead of refusing the parent change forever. `null`
+    /// preserves exact today's-behavior: any live Reference blocks.
+    relational_child_existence_check: ?@import("relational_integrity.zig").ChildExistenceCheck = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,
+    /// WS3 in-process writer lane; see `WriterLaneReleaseHook`.
+    writer_lane_release_before_wait: ?WriterLaneReleaseHook = null,
 };
 
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
@@ -1360,6 +1426,7 @@ pub const DocumentExtractionChunkView = struct {
 };
 
 pub const DocumentExtractionCatalogView = struct {
+    children_pending: bool = false,
     chunks: []DocumentExtractionChunkView = &.{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -1724,18 +1791,25 @@ pub const PrecomputedCoverageOutcome = struct {
     }
 };
 
+/// Definitions and document keys borrow the preparation's pinned catalog and
+/// source envelope. Only the filtered consumer slice outlives its window plan.
 pub const PrecomputedCoverageCandidate = struct {
     request: enrichment_types.GeneratedEnrichmentRequest,
     produced: bool,
 
     pub fn deinit(self: @This(), alloc: Allocator) void {
-        enrichment_types.freeGeneratedRequest(alloc, self.request);
+        alloc.free(self.request.consumer_indexes);
     }
 };
 
 pub const GeneratedBatchWritePlan = struct {
     alloc: Allocator,
+    // Borrowed from the request's pinned write-plan lease. Direct preparation
+    // expands only one window, never the full document/producer cross product.
+    catalog: ?index_manager_mod.IndexManager.WritePlanSnapshot = null,
     rows: []index_manager_mod.IndexManager.WritePlanSnapshot.BorrowedGeneratedRowPlan,
+    /// Admission capability captured from the same pinned catalog as the rows.
+    direct_gate_supported: bool = true,
     initialized: usize = 0,
 
     pub fn deinit(self: *GeneratedBatchWritePlan) void {
@@ -1770,10 +1844,11 @@ pub const GeneratedEmbeddingMemo = struct {
 
     alloc: Allocator,
     reuse_stored_artifacts: bool = false,
+    context: ?@import("antfly_inference_execution_context").RequestContext = null,
     dense: std.AutoHashMapUnmanaged(Key, []f32) = .empty,
     generations: std.StringHashMapUnmanaged(embedder_mod.DenseEmbedder.TextGeneration) = .empty,
     sparse: std.AutoHashMapUnmanaged(Key, SparseValue) = .empty,
-    sparse_revisions: std.StringHashMapUnmanaged(?[32]u8) = .empty,
+    sparse_generations: std.StringHashMapUnmanaged(embedder_mod.SparseEmbedder.Generation) = .empty,
 
     pub fn init(alloc: Allocator) GeneratedEmbeddingMemo {
         return .{ .alloc = alloc };
@@ -1783,9 +1858,9 @@ pub const GeneratedEmbeddingMemo = struct {
         var names = self.generations.keyIterator();
         while (names.next()) |name| self.alloc.free(name.*);
         self.generations.deinit(self.alloc);
-        var sparse_names = self.sparse_revisions.keyIterator();
+        var sparse_names = self.sparse_generations.keyIterator();
         while (sparse_names.next()) |name| self.alloc.free(name.*);
-        self.sparse_revisions.deinit(self.alloc);
+        self.sparse_generations.deinit(self.alloc);
         var dense_values = self.dense.valueIterator();
         while (dense_values.next()) |vector| self.alloc.free(vector.*);
         self.dense.deinit(self.alloc);
@@ -1864,20 +1939,24 @@ pub const GeneratedEmbeddingMemo = struct {
     /// One immutable provider lease per model per synchronous preparation.
     pub fn generation(self: *@This(), provider: embedder_mod.DenseEmbedder, name: []const u8) !embedder_mod.DenseEmbedder.TextGeneration {
         if (self.generations.get(name)) |captured| return captured;
-        const captured = try provider.captureTextGeneration(self.alloc, name);
+        const captured = try provider.withRequestContext(self.context).captureTextGeneration(self.alloc, name);
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
         try self.generations.put(self.alloc, owned, captured);
         return captured;
     }
 
-    pub fn sparseRevision(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !?[32]u8 {
-        if (self.sparse_revisions.get(name)) |revision| return revision;
-        const revision = try provider.captureRevision(self.alloc, name);
+    pub fn sparseGeneration(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !embedder_mod.SparseEmbedder.Generation {
+        if (self.sparse_generations.get(name)) |captured| return captured;
+        const captured = try provider.withRequestContext(self.context).captureGeneration(self.alloc, name);
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
-        try self.sparse_revisions.put(self.alloc, owned, revision);
-        return revision;
+        try self.sparse_generations.put(self.alloc, owned, captured);
+        return captured;
+    }
+
+    pub fn sparseRevision(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !?[32]u8 {
+        return (try self.sparseGeneration(provider, name)).revision;
     }
 
     /// One final check after every producer has finished, before preparation
@@ -1887,12 +1966,12 @@ pub const GeneratedEmbeddingMemo = struct {
         var dense_generations = self.generations.iterator();
         while (dense_generations.next()) |entry| {
             const provider = dense_provider orelse return error.MissingDenseEmbedder;
-            try provider.requireTextGeneration(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+            try provider.withRequestContext(self.context).requireTextGeneration(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
         }
-        var sparse_generations = self.sparse_revisions.iterator();
+        var sparse_generations = self.sparse_generations.iterator();
         while (sparse_generations.next()) |entry| {
             const provider = sparse_provider orelse return error.MissingSparseEmbedder;
-            try provider.requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+            try provider.withRequestContext(self.context).requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.revision);
         }
     }
 
@@ -1952,9 +2031,145 @@ pub const GeneratedEmbeddingMemo = struct {
 pub const GeneratedPrecomputeMode = enum {
     none,
     all,
+    direct,
+};
+
+/// Owns prepared artifact bytes and reserves durable output before retaining
+/// each row. The budget is shared with deletion accounting and survives flushes.
+pub const PreparedArtifactWrites = struct {
+    context: ?@import("antfly_inference_execution_context").RequestContext = null,
+    list: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    items: []types.BatchWrite = &.{},
+    budget: ?*@import("commit_requirements.zig").OutputBudget = null,
+
+    pub fn append(self: *@This(), alloc: Allocator, write: types.BatchWrite) !void {
+        const before = if (self.budget) |budget| budget.* else null;
+        errdefer if (self.budget) |budget| if (before) |value| {
+            budget.* = value;
+        };
+        if (self.budget) |budget| {
+            try budget.reserve(write.key.len, 1);
+            try budget.reserve(write.value.len, 0);
+        }
+        try self.list.append(alloc, write);
+        self.items = self.list.items;
+        if (self.budget) |budget| budget.writes_seen = self.items.len;
+    }
+
+    pub fn toOwnedSlice(self: *@This(), alloc: Allocator) ![]types.BatchWrite {
+        const result = try self.list.toOwnedSlice(alloc);
+        self.items = self.list.items;
+        return result;
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.list.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedArtifactDeletes = struct {
+    list: std.ArrayListUnmanaged([]const u8) = .empty,
+    items: [][]const u8 = &.{},
+    budget: ?*@import("commit_requirements.zig").OutputBudget = null,
+
+    pub fn append(self: *@This(), alloc: Allocator, key: []const u8) !void {
+        const before = if (self.budget) |budget| budget.* else null;
+        errdefer if (self.budget) |budget| if (before) |value| {
+            budget.* = value;
+        };
+        if (self.budget) |budget| try budget.reserve(key.len, 1);
+        try self.list.append(alloc, key);
+        self.items = self.list.items;
+        if (self.budget) |budget| budget.deletes_seen = self.items.len;
+    }
+
+    pub fn toOwnedSlice(self: *@This(), alloc: Allocator) ![][]const u8 {
+        const result = try self.list.toOwnedSlice(alloc);
+        self.items = self.list.items;
+        return result;
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.list.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedProducer = enrichment_types.PreparedProducer;
+
+/// Native effect language, independent of model runtimes and local write-plan
+/// generation numbers. Arrays/bytes use the binary-safe private JSON writer.
+pub const PreparedEnrichments = struct {
+    request_digest: [32]u8,
+    version: u16 = 1,
+    catalog_digest: [32]u8,
+    schema_version: ?u32 = null,
+    authority: ?@import("artifact_publication.zig").Authority = null,
+    writes: []const types.BatchWrite,
+    deletes: []const []const u8,
+    graph_writes: []const types.GraphEdgeWrite = &.{},
+    graph_deletes: []const types.GraphEdgeDelete = &.{},
+    guards: []const Guard,
+    artifact_writes: []const types.BatchWrite,
+    artifact_deletes: []const []const u8,
+    pending: []const enrichment_types.GeneratedEnrichmentRef,
+    coverage: []const PrecomputedCoverageOutcome,
+    producers: []const PreparedProducer,
+    pending_children: bool = false,
+
+    pub fn requestDigest(a: Allocator, req: types.BatchRequest) ![32]u8 {
+        const value = .{
+            .writes = req.writes,
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
+            .predicates = req.predicates,
+            .range_guards = req.range_guards,
+            .document_version_scheme = req.document_version_scheme,
+            .integrity = req.integrity,
+            .integrity_commands = req.integrity_commands,
+            .schema_version = req.schema_version,
+            .relational_schema_version = req.relational_schema_version,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
+            .relational_activation = req.relational_activation,
+            .relational_retirement = req.relational_retirement,
+            .relational_index_maintenance = req.relational_index_maintenance,
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+            .relational_repair = req.relational_repair,
+            .normalized_graph_rows = req.normalized_graph_rows,
+        };
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+        try @import("relational_integrity_json.zig").writeCompact(value, &stream);
+        const bytes = try output.toOwnedSlice();
+        defer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return digest;
+    }
+
+    pub const Guard = struct {
+        document: []const u8,
+        key: []const u8,
+        value_digest: ?[32]u8,
+        position: ?@import("artifact_publication.zig").Position,
+        artifact_position: ?@import("artifact_publication.zig").Position = null,
+        local_revision: ?u64 = null,
+    };
+
+    pub fn jsonStringify(self: @This(), stream: anytype) !void {
+        return @import("relational_integrity_json.zig").writeCompact(self, stream);
+    }
 };
 
 pub const PrecomputedGeneratedBatch = struct {
+    pending_catalog_work: bool = false,
+    pending_child_work: bool = false,
+    prepared_producers: []const PreparedProducer = &.{},
     artifact_writes: []types.BatchWrite = &.{},
     artifact_delete_keys: []const []const u8 = &.{},
     documents: []const derived_types.DerivedDocument = &.{},
@@ -1967,6 +2182,8 @@ pub const PrecomputedGeneratedBatch = struct {
     // allocation walks out of those exits; each batch pays one call while LLVM
     // optimizes one cleanup body instead of copies throughout the commit CFG.
     pub noinline fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
+        for (self.prepared_producers) |request| alloc.free(request.doc_key);
+        if (self.prepared_producers.len != 0) alloc.free(self.prepared_producers);
         for (self.artifact_writes) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));
@@ -2514,3 +2731,59 @@ pub const NoProgressDiagnostic = struct {
         self.* = undefined;
     }
 };
+
+test "a mutex held across a cooperative yield does not deadlock a single-worker Io scheduler" {
+    // Regression for the full-cluster VOPR hang this field's doc comment
+    // describes: flushPendingAppliedSequencesLocked holds
+    // applied_sequence_flush_mutex across the durable commit it runs,
+    // which can yield through Io for the WAL group-commit wait. VOPR's
+    // deterministic scenario runs on a single logical worker, the same
+    // shape `.async_limit = .nothing` forces here. Task A acquires the
+    // mutex, then cooperatively yields (io.sleep) while still holding it
+    // -- exactly `flushPendingAppliedSequencesLocked`'s shape -- before
+    // releasing. Task B starts after A has the lock and contends for it.
+    // A raw std.atomic.Mutex-style spin-then-real-`nanosleep` backoff
+    // (`lockAtomicWithBackoff`, used for every *other* mutex in this
+    // file) would deadlock here: that backoff's `nanosleep` blocks the
+    // only OS thread available to run task A forward to its own
+    // `io.sleep` wakeup and release, so task B would spin forever
+    // waiting for a lock whose holder can never run again. This test
+    // hangs (and the surrounding build step times out) if
+    // `std.Io.Mutex.lockUncancelable` regresses to anything that blocks
+    // the underlying OS thread instead of cooperatively parking.
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var mutex: std.Io.Mutex = .init;
+    var a_released = false;
+    var b_observed_a_released = false;
+
+    const TaskA = struct {
+        fn run(m: *std.Io.Mutex, task_io: std.Io, released: *bool) void {
+            m.lockUncancelable(task_io);
+            task_io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+            released.* = true;
+            m.unlock(task_io);
+        }
+    };
+    const TaskB = struct {
+        fn run(m: *std.Io.Mutex, task_io: std.Io, released: *const bool, observed: *bool) void {
+            // Give task A a chance to acquire the mutex first; this task
+            // must then block on the mutex itself, not on this sleep.
+            task_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            m.lockUncancelable(task_io);
+            observed.* = released.*;
+            m.unlock(task_io);
+        }
+    };
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, TaskA.run, .{ &mutex, io, &a_released });
+    try group.concurrent(io, TaskB.run, .{ &mutex, io, &a_released, &b_observed_a_released });
+    try group.await(io);
+
+    try std.testing.expect(a_released);
+    try std.testing.expect(b_observed_a_released);
+}

@@ -83,7 +83,10 @@ pub const Progress = struct {
     }
 };
 
-fn optional(txn: *docstore.DocStore.Txn, key: []const u8) !?[]const u8 {
+/// Generic over `DocStore.Txn` and `DocStore.Batch` (`Page.commit` below
+/// reads back through a ride-along `Batch`; `prepare`/`status` use an
+/// ordinary read `Txn`). Both expose the same `.get`.
+fn optional(txn: anytype, key: []const u8) !?[]const u8 {
     return txn.get(key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -223,7 +226,10 @@ pub const Page = struct {
         if (self.consumed) return error.ConstraintPageConsumed;
         self.consumed = true;
         if (core.schemaNamespaceGeneration() != self.namespace_generation or !core.schema_registry.isCurrent(self.view)) return error.PreparedGenerationChanged;
-        var txn = try core.store.beginWriteTxn();
+        // §3.2a ride-along: redoing a lost CHECK-validation page just rescans
+        // from the last durable cursor; never force its own fsync for an
+        // owner-only background sweep.
+        var txn = try core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer txn.abort();
         if (!std.mem.eql(u8, &self.next.owner, &(try jobs.ownership(&txn)))) return error.PreparedGenerationChanged;
         const actual = try optional(&txn, progress_key);

@@ -41,12 +41,14 @@ const platform_sync = @import("antfly_platform").sync;
 const projection_seal = @import("projection_seal.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const wal_trace = @import("write_amplification_trace.zig");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const native_artifact_sink = @import("native_artifact_sink.zig");
 const mem_backend = @import("mem_backend.zig");
+const native_catalog_backend = @import("native_catalog_backend.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const storage_io = lsm_backend.storage_io;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
@@ -127,11 +129,26 @@ pub const PersistentIndexOptions = struct {
     wal_clock: storage_sim.Clock = storage_sim.real_clock,
     wal_commit_scheduler: storage_sim.CompletionScheduler = storage_sim.real_completion_scheduler,
     model_wal_commit_backend_completions: bool = false,
+    /// Required when `main_backend == .native_catalog`. See
+    /// `native_catalog_backend.Sink`.
+    main_native_catalog_sink: ?NativeCatalogSink = null,
+    /// A real host directory for bounded staging spill when this index has
+    /// no `SegmentFileStore` (always true for `.native_catalog`, which
+    /// publishes segments inline through the catalog sink instead of
+    /// file-backed artifacts). Borrowed: the caller (Lite's `Handle`) must
+    /// outlive this index. See `privateScratchDirectory`.
+    scratch_dir: ?[]const u8 = null,
 
     pub fn resolvedWalBackend(self: PersistentIndexOptions) wal_mod.StorageBackend {
         return self.wal_backend orelse switch (self.main_backend) {
             .lsm_memory, .mem => .lsm_memory,
             .lsm => .lsm,
+            // A `.native_catalog` publication (segment + metadata) is
+            // already one atomic native transaction (see
+            // `native_catalog_backend.zig`'s commit-through-sink design),
+            // so there is no intermediate state for a separate recovery WAL
+            // to protect. An in-memory WAL costs nothing and is never read.
+            .native_catalog => .lsm_memory,
         };
     }
 };
@@ -209,7 +226,16 @@ pub const MainBackend = enum {
     mem,
     lsm_memory,
     lsm,
+    /// Lite-only: the main backend (segment ranges, active segment set,
+    /// generation metadata) is a view onto native `.aflite` index-catalog
+    /// records (see `native_catalog_backend.zig`), committed as one native
+    /// transaction per `MainTxn.commit()`, instead of an embedded LSM
+    /// instance stored through a virtual filesystem. Requires
+    /// `PersistentIndexOptions.main_native_catalog_sink`.
+    native_catalog,
 };
+
+pub const NativeCatalogSink = native_catalog_backend.Sink;
 
 pub const PersistentIndexStats = struct {
     wal: wal_mod.WalStats,
@@ -599,6 +625,8 @@ const RetiredSegmentFileDeleter = struct {
             return;
         };
         defer self.allocator.free(path);
+        const wal_trace_scope = wal_trace.scope(.artifact_cleanup);
+        defer wal_trace_scope.end();
         self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => {
@@ -966,6 +994,7 @@ fn runtimeNamespace(keyspace: MainKeyspace) backend_types.Namespace {
 const MainStoreOwner = union(enum) {
     mem: *mem_backend.Backend,
     lsm: lsm_backend.BackendHandle,
+    native_catalog: *native_catalog_backend.Backend,
 
     fn close(self: *MainStoreOwner, alloc: Allocator) void {
         switch (self.*) {
@@ -974,6 +1003,10 @@ const MainStoreOwner = union(enum) {
                 alloc.destroy(backend);
             },
             .lsm => |*handle| handle.close(),
+            .native_catalog => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
         }
         self.* = undefined;
     }
@@ -985,83 +1018,91 @@ const MainStoreOwner = union(enum) {
                 alloc.destroy(backend);
             },
             .lsm => |*handle| handle.abandonAfterCrash(),
+            .native_catalog => |backend| {
+                // Every `.native_catalog` commit is already durable before
+                // this backend's in-memory mirror is published (see
+                // `native_catalog_backend.zig`'s `NamespaceTxn.commit`), so
+                // there is nothing to roll back here beyond an ordinary close.
+                backend.close();
+                alloc.destroy(backend);
+            },
         }
         self.* = undefined;
     }
 
     fn sync(self: *MainStoreOwner, force: bool) !void {
         switch (self.*) {
-            .mem => {},
+            .mem, .native_catalog => {},
             .lsm => |*handle| try handle.backend.sync(force),
         }
     }
 
     fn lsmMaintenanceScore(self: *const MainStoreOwner) u64 {
         return switch (self.*) {
-            .mem => 0,
+            .mem, .native_catalog => 0,
             .lsm => |handle| handle.backend.maintenanceScore(),
         };
     }
 
     fn snapshotLsmMaintenanceStats(self: *const MainStoreOwner) ?lsm_backend.Backend.MaintenanceStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
         };
     }
 
     fn snapshotLsmWriteStats(self: *const MainStoreOwner) ?lsm_backend.Backend.WriteStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.snapshotWriteStats(),
         };
     }
 
     fn snapshotLsmOpenStats(self: *const MainStoreOwner) ?lsm_backend.Backend.OpenStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.snapshotOpenStats(),
         };
     }
 
     fn checkpointLsmWalAfterDurableBoundary(self: *MainStoreOwner) !void {
         switch (self.*) {
-            .mem => {},
+            .mem, .native_catalog => {},
             .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
         }
     }
 
     fn pinNativeCheckpoint(self: *MainStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.*) {
-            .mem => error.Unsupported,
+            .mem, .native_catalog => error.Unsupported,
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
         };
     }
 
     fn snapshotLsmNativeStorageStats(self: *const MainStoreOwner) ?lsm_backend.NativeStorageStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
         };
     }
 
     fn runLsmMaintenanceStep(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .mem => false,
+            .mem, .native_catalog => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStep(),
         };
     }
 
     fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .mem => false,
+            .mem, .native_catalog => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffort(),
         };
     }
 
     fn commitStatsSnapshot(self: *MainStoreOwner) ?CommitStats {
         return switch (self.*) {
-            .mem, .lsm => null,
+            .mem, .lsm, .native_catalog => null,
         };
     }
 };
@@ -1082,6 +1123,9 @@ pub const PersistentIndex = struct {
     main_store: backend_erased.NamespaceStore,
     main_store_owner: MainStoreOwner,
     segment_files: ?SegmentFileStore,
+    /// Set only when `segment_files == null` (the `.native_catalog` case).
+    /// See `PersistentIndexOptions.scratch_dir` and `privateScratchDirectory`.
+    scratch_dir: ?[]const u8 = null,
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     retirement_reconcile_pending: bool = false,
     active_rebuild_page: ?*RebuildPage = null,
@@ -1176,7 +1220,7 @@ pub const PersistentIndex = struct {
 
     pub fn privateScratchDirectory(self: *const PersistentIndex, fallback: []const u8) ?[]const u8 {
         if (self.segment_files) |store| return store.storage.privateScratchDirectory(fallback);
-        return fallback;
+        return self.scratch_dir orelse fallback;
     }
 
     pub fn supportsFileBackedSegmentArtifacts(self: *const PersistentIndex) bool {
@@ -1225,11 +1269,35 @@ pub const PersistentIndex = struct {
 
         pub fn commit(self: *MainTxn) !void {
             if (self.write) |*txn| {
+                // `scopeDefault`, not `scope`: this is the generic/shared
+                // fallback tag for every non-inline full-text/dense/sparse/
+                // graph publication's own commit. A caller that already
+                // pushed a more specific tag before reaching here (e.g.
+                // `db.zig`'s `.text_merge_drain` around
+                // `drainScheduledTextMerges`) must keep its own
+                // attribution instead of having it shadowed by this push --
+                // see `write_amplification_trace.zig`'s `scopeDefault` doc
+                // comment and its own regression test.
+                const wal_trace_scope = wal_trace.scopeDefault(.main_txn_commit);
+                defer wal_trace_scope.end();
                 try txn.commit();
                 self.write = null;
                 return;
             }
             return error.ReadOnly;
+        }
+
+        /// Marks this (still-open) write transaction as a background/
+        /// ride-along publication ahead of `commit()`: safe only for work
+        /// a caller can afford to redo after a crash (segment merge,
+        /// retirement cleanup, async-consumer catch-up), never for a
+        /// publication a caller is waiting on to be durably acknowledged.
+        /// A no-op on backends with no such distinction (`.lsm`/`.mem`
+        /// always commit durably); real on `.native_catalog` (see
+        /// `native_catalog_backend.zig`'s `NamespaceTxn.setDurable`). This
+        /// is the helper WS2's `Store.stageRideAlong` is meant to replace.
+        pub fn setDurable(self: *MainTxn, durable: bool) void {
+            if (self.write) |*txn| txn.setDurableHint(durable);
         }
 
         pub fn get(self: *MainTxn, keyspace: MainKeyspace, key: []const u8) ![]const u8 {
@@ -1357,6 +1425,8 @@ pub const PersistentIndex = struct {
     /// The owner must serialize this with its per-index replay/apply lane.
     pub fn publishProjectionSeal(self: *PersistentIndex, seal: projection_seal.Seal) !void {
         if (self.read_only) return error.ReadOnly;
+        const wal_trace_scope = wal_trace.scope(.status_snapshot);
+        defer wal_trace_scope.end();
         _ = try seal.encode();
         var next = seal;
         self.lockStorage();
@@ -1385,6 +1455,54 @@ pub const PersistentIndex = struct {
         try txn.put(.meta, projection_seal.metadata_key, &try next.encode());
         try txn.commit();
         try self.main_store_owner.sync(true);
+    }
+
+    /// WS4 phase 2: one merged, encoded seal record ready for an externally
+    /// owned native transaction. `mutation()`'s returned `Mutation` borrows
+    /// `self.encoded`; keep this value alive until that mutation has been
+    /// handed to `commit_participant.View.putIndexCatalog`.
+    pub const SealPublication = struct {
+        encoded: projection_seal.Seal.Encoded,
+
+        pub fn mutation(self: *const SealPublication) native_catalog_backend.Mutation {
+            return .{ .namespace = "meta", .key = projection_seal.metadata_key, .value = &self.encoded };
+        }
+    };
+
+    /// A Txn-free variant of `publishProjectionSeal`'s "read the previous
+    /// seal, merge baseline/applied_sequence" step, for a `.native_catalog`
+    /// index. Returns the merged, encoded seal as one more mutation for the
+    /// caller to fold into an externally-owned native transaction, or
+    /// `null` if the merge is identical to what is already durable
+    /// (nothing to write -- mirrors `publishProjectionSeal`'s
+    /// `already_covered` early return). Does not commit, sync, or install
+    /// anything: `loadProjectionSeal` always reads through the main store,
+    /// so once the returned mutation is durable there is nothing further
+    /// to install, unlike `installInlineSegmentPublication`'s in-memory
+    /// writer snapshot.
+    ///
+    /// Caller must serialize this with any other seal publication for the
+    /// same index (the same per-index apply lane `publishProjectionSeal`'s
+    /// own doc comment requires) -- this reads the previous seal without
+    /// taking `lockStorage`, so a concurrent writer could otherwise race
+    /// the merge.
+    pub fn prepareInlineProjectionSealMutation(self: *PersistentIndex, seal: projection_seal.Seal) !?SealPublication {
+        if (self.read_only) return error.ReadOnly;
+        if (self.main_backend != .native_catalog) return error.NotNativeCatalogBackend;
+        var next = seal;
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        const previous = read.get(.meta, projection_seal.metadata_key) catch |err| if (err == error.NotFound) null else return err;
+        if (previous) |raw| {
+            const old = try projection_seal.Seal.decode(raw);
+            if (!old.sameIdentity(seal)) return error.ProjectionSealIdentityChanged;
+            // Incremental replay preserves the completed baseline of this
+            // physical generation. Reset/removal deletes the entire seal.
+            if (next.baseline == null) next.baseline = old.baseline;
+            next.applied_sequence = @max(next.applied_sequence, old.applied_sequence);
+            if (std.meta.eql(old, next)) return null;
+        }
+        return .{ .encoded = try next.encode() };
     }
 
     /// Physical segments, including fully-deleted segments, are projection
@@ -1432,6 +1550,24 @@ pub const PersistentIndex = struct {
                     .owner = .{ .lsm = handle },
                 };
             },
+            .native_catalog => {
+                const sink = opts.main_native_catalog_sink orelse return error.MissingNativeCatalogSink;
+                const backend = try alloc.create(native_catalog_backend.Backend);
+                errdefer alloc.destroy(backend);
+                backend.* = try native_catalog_backend.Backend.init(alloc, .{
+                    .sink = sink,
+                    .scope = index_path,
+                    .backend = .{ .read_only = opts.read_only },
+                });
+                errdefer backend.close();
+
+                var store = try backend.runtimeNamespaceStore(alloc);
+                errdefer store.deinit();
+                return .{
+                    .store = store,
+                    .owner = .{ .native_catalog = backend },
+                };
+            },
         }
     }
 
@@ -1466,7 +1602,14 @@ pub const PersistentIndex = struct {
         defer alloc.free(wal_path);
 
         var segment_files: ?SegmentFileStore = null;
-        if (builtin.os.tag != .freestanding or opts.main_lsm_storage != null) {
+        // `.native_catalog` publishes small segments inline, as index-catalog
+        // records in the same native transaction as their metadata (see
+        // `indexSegmentOwned`'s `segment_files == null` branch and
+        // `native_catalog_backend.zig`); it never needs a file-backed
+        // SegmentFileStore or the artifact leases that come with one. Large
+        // segments falling back to bounded unlinked staging is follow-up
+        // work (see the design doc's WS4 §3.3 "Artifacts" note).
+        if (opts.main_backend != .native_catalog and (builtin.os.tag != .freestanding or opts.main_lsm_storage != null)) {
             var segments_buf: [512]u8 = undefined;
             const segments_path = std.fmt.bufPrint(&segments_buf, "{s}/segments", .{path_span}) catch return error.PathTooLong;
             segment_files = try SegmentFileStore.open(
@@ -1539,7 +1682,7 @@ pub const PersistentIndex = struct {
                     error.NotFound => null,
                     else => return err,
                 };
-                var segment_data: ?index_mod.SegmentData = if (seg_bytes) |bytes| blk: {
+                const segment_data: index_mod.SegmentData = if (seg_bytes) |bytes| blk: {
                     break :blk if (segment_files) |*store|
                         try store.publishExisting(seg_id, bytes)
                     else
@@ -1550,7 +1693,7 @@ pub const PersistentIndex = struct {
                     if (comptime builtin.os.tag != .freestanding) {
                         if (store.storage_owner != null) {
                             break :blk index_mod.SegmentData.fromMapped(store.mapFile(segment_path) catch |err| switch (err) {
-                                error.FileNotFound => {
+                                error.FileNotFound, error.EmptySegment => {
                                     try stale_active_ids.append(alloc, seg_id);
                                     continue;
                                 },
@@ -1560,7 +1703,7 @@ pub const PersistentIndex = struct {
                     }
                     if (store.storage.vtable.open_leased_immutable_source != null) {
                         const source = store.storage.openLeasedImmutableSource(alloc, segment_path) catch |err| switch (err) {
-                            error.FileNotFound => {
+                            error.FileNotFound, error.EmptySegment => {
                                 try stale_active_ids.append(alloc, seg_id);
                                 continue;
                             },
@@ -1568,15 +1711,20 @@ pub const PersistentIndex = struct {
                         };
                         break :blk index_mod.SegmentData.fromNative(source);
                     }
-                    if (store.storage.vtable.map_immutable_artifact != null) {
-                        const artifact = store.storage.mapImmutableArtifact(alloc, segment_path) catch |err| switch (err) {
-                            error.FileNotFound => {
+                    if (store.storage.vtable.map_fresh_immutable_artifact != null or store.storage.vtable.map_immutable_artifact != null) {
+                        // The active ID has no content fingerprint to
+                        // distinguish an old, valid inode from its replacement.
+                        const artifact = (if (store.storage.vtable.map_fresh_immutable_artifact != null)
+                            store.storage.mapFreshImmutableArtifact(alloc, segment_path, .preserve_cached)
+                        else
+                            store.storage.mapImmutableArtifact(alloc, segment_path)) catch |err| switch (err) {
+                            error.FileNotFound, error.EmptySegment => {
                                 try stale_active_ids.append(alloc, seg_id);
                                 continue;
                             },
                             // Read-only filesystems still support the existing
                             // heap-backed reader when no private view is possible.
-                            error.MappedArtifactUnavailable => null,
+                            error.MappedArtifactUnavailable, error.MappedArtifactUnsupported => null,
                             else => return err,
                         };
                         if (artifact) |view| break :blk index_mod.SegmentData.fromMappedArtifact(view);
@@ -1593,25 +1741,23 @@ pub const PersistentIndex = struct {
                     try stale_active_ids.append(alloc, seg_id);
                     continue;
                 };
-                segment_data.?.madviseAccessPattern();
-                errdefer if (segment_data) |*data| data.deinit(alloc);
-                writer.addSegmentWithIdData(seg_id, segment_data.?) catch |err| {
+                segment_data.madviseAccessPattern();
+                writer.addSegmentWithIdData(seg_id, segment_data) catch |err| {
                     if (isStaleActiveSegmentDataError(err)) {
-                        segment_data.?.deinit(alloc);
-                        segment_data = null;
                         try stale_active_ids.append(alloc, seg_id);
                         continue;
                     }
                     return err;
                 };
-                segment_data = null;
 
                 const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
                 if (deletion_bytes) |bytes| {
-                    var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
+                    const segments = writer.snapshot().segments;
+                    const doc_count = segments[segments.len - 1].reader.doc_count;
+                    var bitmap = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes, doc_count);
                     if (!bitmap.isEmpty()) {
                         writer.setDeletionBitmap(seg_id, bitmap);
                     } else {
@@ -1649,6 +1795,7 @@ pub const PersistentIndex = struct {
             .main_store = opened_main.store,
             .main_store_owner = opened_main.owner,
             .segment_files = segment_files,
+            .scratch_dir = if (segment_files == null) opts.scratch_dir else null,
             .wal = wal,
             .committed_lsn = committed_lsn,
             .main_backend = opts.main_backend,
@@ -1940,21 +2087,21 @@ pub const PersistentIndex = struct {
 
     pub fn lsmMaintenanceDebtHint(self: *const PersistentIndex) u64 {
         return switch (self.main_store_owner) {
-            .mem => 0,
+            .mem, .native_catalog => 0,
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
         };
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
         return switch (self.main_store_owner) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
     }
 
     pub fn refreshLsmMaintenanceDebtHint(self: *PersistentIndex) void {
         switch (self.main_store_owner) {
-            .mem => {},
+            .mem, .native_catalog => {},
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),
         }
     }
@@ -2076,6 +2223,8 @@ pub const PersistentIndex = struct {
     /// The caller keeps mutation admission fenced only for this bounded
     /// manifest/run-reference operation; materialization happens later.
     pub fn pinNativeCheckpoints(self: *PersistentIndex) !NativeCheckpoints {
+        const wal_trace_scope = wal_trace.scope(.artifact_pin);
+        defer wal_trace_scope.end();
         self.lockStorage();
         defer self.unlockStorage();
         const segments = if (self.segment_files != null)
@@ -2109,6 +2258,149 @@ pub const PersistentIndex = struct {
     pub fn indexSegment(self: *PersistentIndex, segment_bytes: []const u8) !void {
         const owned = try self.alloc.dupe(u8, segment_bytes);
         try self.indexSegmentOwned(owned);
+    }
+
+    /// WS4 phase 2: this index's own catalog scope string -- the same
+    /// value `openMainStore` passed as `native_catalog_backend.Options.
+    /// scope` -- when `main_backend == .native_catalog`, else `null`. A
+    /// caller building `commit_participant.IndexCatalogMutation`s for this
+    /// index's segment/range/active-set records must scope them exactly
+    /// the same way `native_catalog_sink.zig`'s `Sink.submit` does, or
+    /// they will not be found by this index's own reads.
+    pub fn nativeCatalogScope(self: *const PersistentIndex) ?[]const u8 {
+        return switch (self.main_store_owner) {
+            .native_catalog => |backend| backend.scope,
+            .mem, .lsm => null,
+        };
+    }
+
+    /// WS4 phase 2: syncs this index's `.native_catalog` backend's own
+    /// in-memory read mirror with mutations an external transaction
+    /// already committed durably (see `native_catalog_backend.zig`'s
+    /// `Backend.applyExternallyCommittedMutations`, which this forwards
+    /// to) -- the step a caller using `commit_participant.View.
+    /// putIndexCatalog` instead of this index's own `MainTxn` must run
+    /// after that commit succeeds, so this index's own reads (segment
+    /// ranges, the active set, the seal) see it. A no-op, not an error,
+    /// on every other backend.
+    pub fn applyExternallyCommittedMutationsIfNativeCatalog(self: *PersistentIndex, mutations: []const native_catalog_backend.Mutation) !void {
+        switch (self.main_store_owner) {
+            .native_catalog => |backend| try backend.applyExternallyCommittedMutations(mutations),
+            .mem, .lsm => {},
+        }
+    }
+
+    /// A small ("inline") segment publication prepared for a
+    /// `.native_catalog` index, built OUTSIDE any lock and without
+    /// committing anything: `prepareInlineSegmentPublication` below
+    /// reserves a segment id, computes the key range, and stages every
+    /// mutation `persistSegment`/`updateActiveSegments` would otherwise
+    /// write through its own `MainTxn` -- as a plain, backend-agnostic
+    /// `native_catalog_backend.Mutation` list a caller folds into an
+    /// externally-owned native transaction via `commit_participant.View.
+    /// putIndexCatalog`, instead of this index opening and committing its
+    /// own. Exactly one of `installInlineSegmentPublication` (the
+    /// mutations committed durably) or `abort` (they did not) must run
+    /// exactly once for every value this returns.
+    pub const InlineSegmentPublication = struct {
+        seg_id: u64,
+        segment_bytes: []u8,
+        range_value: []u8,
+        seg_key: [8]u8,
+        range_key: [meta_segment_range_prefix.len + 8]u8,
+        active_key: [meta_active_segment_prefix.len + 8]u8,
+        /// Staged (fallible) before any commit; `.publish()` is the only
+        /// infallible step left once the mutations below are durable --
+        /// see `indexSegmentOwned`'s identical staged/infallible split.
+        writer_publication: index_mod.IndexWriter.PreparedSegmentReplacement,
+
+        /// Valid only while `self` stays at this address: every mutation's
+        /// `key`/`value` slice points back into one of `self`'s own
+        /// fields. Callers must consume the result before `self` is moved,
+        /// which holds naturally for the immediate
+        /// `view.putIndexCatalog(scope, &publication.mutations())` use.
+        pub fn mutations(self: *const InlineSegmentPublication) [4]native_catalog_backend.Mutation {
+            return .{
+                .{ .namespace = "segments", .key = &self.seg_key, .value = self.segment_bytes },
+                .{ .namespace = "meta", .key = &self.range_key, .value = self.range_value },
+                .{ .namespace = "meta", .key = &self.active_key, .value = &.{1} },
+                // Mirrors `updateActiveSegments`'s own cache invalidation:
+                // drop any previously cached decoded active-segment list.
+                .{ .namespace = "meta", .key = meta_active_segments, .is_delete = true },
+            };
+        }
+
+        /// Discards a publication whose mutations were never committed
+        /// durably (or whose commit failed): nothing becomes visible to
+        /// either this index's readers or its own in-memory writer.
+        pub fn abort(self: *InlineSegmentPublication, alloc: Allocator) void {
+            self.writer_publication.abort();
+            alloc.free(self.segment_bytes);
+            alloc.free(self.range_value);
+            self.* = undefined;
+        }
+    };
+
+    /// Builds `segment_bytes`'s `InlineSegmentPublication`. Takes ownership
+    /// of `segment_bytes` on success (freed by `abort`, or transferred into
+    /// the writer snapshot by `installInlineSegmentPublication`); on
+    /// failure the caller still owns it. Requires `main_backend ==
+    /// .native_catalog` (`segment_files == null` is that backend's own
+    /// invariant -- see `open`'s "publishes small segments inline" note --
+    /// so this never needs the file-backed artifact path
+    /// `indexSegmentFromSinkBuilder` uses).
+    pub fn prepareInlineSegmentPublication(self: *PersistentIndex, segment_bytes: []u8) !InlineSegmentPublication {
+        if (self.read_only) return error.ReadOnly;
+        if (self.main_backend != .native_catalog) return error.NotNativeCatalogBackend;
+        std.debug.assert(self.segment_files == null);
+
+        var key_range = try extractSegmentKeyRange(self.alloc, segment_bytes);
+        defer key_range.deinit(self.alloc);
+
+        self.writer.lockMutex();
+        const seg_id = self.writer.next_segment_id;
+        self.writer.next_segment_id += 1;
+        self.writer.mu.unlock();
+
+        const range_value = try self.alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
+        errdefer self.alloc.free(range_value);
+        range_value[0..4].* = @bitCast(@as(u32, @intCast(key_range.min_doc_key.len)));
+        @memcpy(range_value[4..][0..key_range.min_doc_key.len], key_range.min_doc_key);
+        const max_off = 4 + key_range.min_doc_key.len;
+        range_value[max_off..][0..4].* = @bitCast(@as(u32, @intCast(key_range.max_doc_key.len)));
+        @memcpy(range_value[max_off + 4 ..][0..key_range.max_doc_key.len], key_range.max_doc_key);
+
+        // Every fallible snapshot allocation is staged here, before this
+        // publication's mutations ever reach an external commit -- see
+        // `indexSegmentOwned`'s identical ordering and its "publication is
+        // now infallible" note.
+        const segment_data = index_mod.SegmentData.fromOwnedHeap(segment_bytes);
+        var replacement = [_]index_mod.ReplacementSegmentData{.{ .id = seg_id, .data = segment_data }};
+        var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
+        errdefer writer_publication.abort();
+
+        return .{
+            .seg_id = seg_id,
+            .segment_bytes = segment_bytes,
+            .range_value = range_value,
+            .seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id)),
+            .range_key = segmentRangeMetaKey(seg_id),
+            .active_key = activeSegmentMetaKey(seg_id),
+            .writer_publication = writer_publication,
+        };
+    }
+
+    /// Runs only after `publication`'s mutations (`publication.mutations()`)
+    /// are already durable in an externally-owned native transaction's
+    /// commit. Installs the in-memory writer snapshot so this index's own
+    /// reads see the new segment -- the step after which a synchronous
+    /// `full_text` write's ack may return. `publication.segment_bytes`'
+    /// ownership transfers into the writer snapshot; `range_value` is
+    /// freed here, its job done once the mutation above was committed.
+    pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) void {
+        publication.writer_publication.publish();
+        self.alloc.free(publication.range_value);
+        publication.* = undefined;
     }
 
     /// Like indexSegment(), but takes ownership of segment_bytes.
@@ -2156,7 +2448,10 @@ pub const PersistentIndex = struct {
         // recover from metadata alone and orphan pre-commit files are harmless.
         const lsn = if (uses_segment_wal) blk: {
             const wal_append_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            const wal_trace_scope = wal_trace.scope(.lsm_wal);
+            defer wal_trace_scope.end();
             const appended_lsn = try self.wal.append(owned.?);
+            wal_trace.recordCommit();
             if (profile_enabled) wal_append_ns = platform_time.monotonicNs() - wal_append_start_ns;
             break :blk appended_lsn;
         } else self.committed_lsn;
@@ -2173,6 +2468,8 @@ pub const PersistentIndex = struct {
         var segment_data: ?index_mod.SegmentData = null;
         if (self.segment_files != null) {
             const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            const wal_trace_scope = wal_trace.scope(.artifact_stage);
+            defer wal_trace_scope.end();
             segment_data = try self.materializeSegmentData(seg_id, owned.?);
             segment_data.?.madviseAccessPattern();
             if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
@@ -2197,7 +2494,11 @@ pub const PersistentIndex = struct {
 
         // 4. Persist metadata.
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
+        {
+            const wal_trace_scope = wal_trace.scope(.artifact_link);
+            defer wal_trace_scope.end();
+            try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
+        }
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
         // 5. Every fallible snapshot allocation was staged before catalog
@@ -2211,6 +2512,8 @@ pub const PersistentIndex = struct {
         // 6. Truncate WAL
         if (uses_segment_wal) {
             const wal_truncate_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            const wal_trace_scope = wal_trace.scope(.replay_retirement);
+            defer wal_trace_scope.end();
             try self.wal.truncate(lsn);
             if (profile_enabled) wal_truncate_ns = platform_time.monotonicNs() - wal_truncate_start_ns;
         }
@@ -2632,25 +2935,34 @@ pub const PersistentIndex = struct {
                 else => return err,
             };
 
-            if (collect_doc_keys) {
+            const already_copied = existing_dest.contains(entry.seg_id);
+            const doc_count = if (collect_doc_keys or (!already_copied and deletion_bytes != null)) count: {
                 var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
                 defer reader.deinit();
-                for (0..reader.doc_count) |doc_idx| {
+                if (collect_doc_keys) for (0..reader.doc_count) |doc_idx| {
                     const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
                     try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
-                }
-            }
+                };
+                break :count reader.doc_count;
+            } else null;
 
-            if (existing_dest.contains(entry.seg_id)) continue;
+            if (already_copied) continue;
 
             if (deletion_bytes) |bytes| {
-                var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
+                const decoded = try roaring.RoaringBitmap.fromPersistedDeletionBytesWithLayout(alloc, bytes, doc_count.?);
+                var bitmap = decoded.bitmap;
+                defer bitmap.deinit();
+                if (decoded.legacy) {
+                    const canonical = try bitmap.toBytes(alloc);
+                    defer alloc.free(canonical);
+                    try dest_txn.put(.deletions, &seg_key, canonical);
+                } else {
+                    try dest_txn.put(.deletions, &seg_key, bytes);
+                }
                 if (!bitmap.isEmpty()) {
                     replacement_deleted[replacements_initialized] = bitmap;
-                } else {
-                    bitmap.deinit();
+                    bitmap = roaring.RoaringBitmap.init(alloc);
                 }
-                try dest_txn.put(.deletions, &seg_key, bytes);
             }
 
             replacements[replacements_initialized] = .{
@@ -2727,6 +3039,71 @@ pub const PersistentIndex = struct {
 
     pub fn freeDeleteInfos(self: *PersistentIndex, delete_infos: []index_mod.IndexWriter.DeleteInfo) void {
         index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
+    }
+
+    /// WS4 phase 2: `deleteByIdsTracked`'s own in-memory lookup
+    /// (`writer.deleteAllByIdsTracked`), split from its commit. Common case
+    /// for a batch of brand-new document keys: no matching postings exist
+    /// anywhere yet, so `delete_infos.len == 0` and there is nothing to
+    /// write at all -- the caller's inline fast path can proceed with no
+    /// `.deletions` mutation. When postings DO exist (an update or delete
+    /// of a previously-indexed document), `mutationsAlloc` builds the same
+    /// per-segment bitmap mutations `deleteByIdsTracked`'s own commit loop
+    /// would have written, for the caller to fold into an externally-owned
+    /// native transaction. Exactly one of `installInlineDeleteByIdsTracked`
+    /// (mutations committed durably) or `abortInlineDeleteByIdsTracked`
+    /// (they did not, or the caller fell back to another path) must run
+    /// exactly once -- mirrors `deleteByIdsTracked`'s own persisted/
+    /// rollback split.
+    pub const PreparedDeleteByIds = struct {
+        delete_infos: []index_mod.IndexWriter.DeleteInfo,
+        seg_keys: [][8]u8,
+
+        pub fn isEmpty(self: *const PreparedDeleteByIds) bool {
+            return self.delete_infos.len == 0;
+        }
+
+        pub fn mutationsAlloc(self: *const PreparedDeleteByIds, alloc: Allocator) ![]native_catalog_backend.Mutation {
+            const out = try alloc.alloc(native_catalog_backend.Mutation, self.delete_infos.len);
+            for (self.delete_infos, self.seg_keys, out) |info, *seg_key, *mutation| {
+                mutation.* = .{ .namespace = "deletions", .key = seg_key, .value = info.bitmap_bytes };
+            }
+            return out;
+        }
+    };
+
+    pub fn prepareInlineDeleteByIdsTracked(self: *PersistentIndex, alloc: Allocator, doc_ids: []const []const u8) !PreparedDeleteByIds {
+        if (self.main_backend != .native_catalog) return error.NotNativeCatalogBackend;
+        if (doc_ids.len == 0) return .{ .delete_infos = &.{}, .seg_keys = &.{} };
+        self.lockStorage();
+        defer self.unlockStorage();
+        const delete_infos = try self.writer.deleteAllByIdsTracked(self.alloc, doc_ids);
+        errdefer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
+        if (delete_infos.len == 0) return .{ .delete_infos = delete_infos, .seg_keys = &.{} };
+        const seg_keys = try alloc.alloc([8]u8, delete_infos.len);
+        for (delete_infos, seg_keys) |info, *seg_key| seg_key.* = std.mem.toBytes(std.mem.nativeToBig(u64, info.seg_id));
+        return .{ .delete_infos = delete_infos, .seg_keys = seg_keys };
+    }
+
+    /// Runs only after `prepared`'s mutations are already durable in an
+    /// externally-owned transaction's commit: the in-memory writer
+    /// tracking state was already updated synchronously by
+    /// `deleteAllByIdsTracked` inside `prepareInlineDeleteByIdsTracked`, so
+    /// there is nothing left to "install" -- just release the bookkeeping.
+    pub fn installInlineDeleteByIdsTracked(self: *PersistentIndex, alloc: Allocator, prepared: *PreparedDeleteByIds) void {
+        if (prepared.seg_keys.len > 0) alloc.free(prepared.seg_keys);
+        index_mod.IndexWriter.freeDeleteInfos(self.alloc, prepared.delete_infos);
+        prepared.* = undefined;
+    }
+
+    /// The mutations were never committed (or the caller fell back to
+    /// another path before reaching a commit at all): undo the in-memory
+    /// writer tracking change `deleteAllByIdsTracked` already made.
+    pub fn abortInlineDeleteByIdsTracked(self: *PersistentIndex, alloc: Allocator, prepared: *PreparedDeleteByIds) void {
+        self.writer.rollbackDeleteInfos(prepared.delete_infos);
+        if (prepared.seg_keys.len > 0) alloc.free(prepared.seg_keys);
+        index_mod.IndexWriter.freeDeleteInfos(self.alloc, prepared.delete_infos);
+        prepared.* = undefined;
     }
 
     /// Tombstone a batch and return the exact newly-deleted local document IDs
@@ -3098,6 +3475,10 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Same as `replaceSegmentsWithReservedIdOwned`: the pre-merge
+        // segments stay active until this commits, so a lost merge is
+        // redone after a crash and never needs its own durable sync.
+        txn.setDurable(false);
 
         const active_ids = try self.loadActiveSegmentIds(&txn, scratch_alloc);
         defer scratch_alloc.free(active_ids);
@@ -3258,6 +3639,13 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Self-healing repair of a stale catalog reference (open/replay
+        // recovery, or a missing range/data discovery during a read), never
+        // a synchronous client ack: safe to redo from the same discovery on
+        // the next open or read, so this rides along on the next real
+        // durable boundary instead of its own sync. See MainTxn.setDurable
+        // and replaceSegmentsWithReservedIdOwned's identical comment.
+        txn.setDurable(false);
 
         for (stale_seg_ids) |seg_id| {
             const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
@@ -3296,6 +3684,11 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Merge/compaction: safe to redo after a crash (the pre-merge
+        // segments stay active until this commits), so this never needs its
+        // own durable sync -- it rides along on the next real durable
+        // boundary. See MainTxn.setDurable.
+        txn.setDurable(false);
 
         if (require_active) {
             const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);
@@ -3437,6 +3830,12 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Multi-segment merge/compaction publication: the same "safe to
+        // redo after a crash" reasoning as the single-segment
+        // replaceSegmentsWithReservedIdOwned above (the pre-merge segments
+        // stay active until this commits), so this never needs its own
+        // durable sync either. See MainTxn.setDurable.
+        txn.setDurable(false);
 
         if (require_active) {
             const active_ids = try self.loadActiveSegmentIds(&txn, scratch_alloc);
@@ -3503,6 +3902,13 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Background structural removal (a merge that produced no surviving
+        // segment, or a split with no remainder) -- the same "safe to redo
+        // after a crash" ride-along as replaceSegmentsWithReservedIdOwned's
+        // merge publication: the old segments simply stay active until this
+        // commits, so a lost attempt just means removal is retried on the
+        // next pass. See MainTxn.setDurable.
+        txn.setDurable(false);
         var writer_publication = try self.writer.prepareSegmentsManyData(old_seg_ids, &.{});
         defer writer_publication.abort();
         // Unlike compaction replacement, structural removal is not a proof
@@ -4761,50 +5167,342 @@ test "persistent merge replacement carries deletion bitmap across reopen" {
     }
 }
 
-test "persistent index open prunes stale active segment references" {
+const InlinePublicationTestSink = struct {
+    entries: std.ArrayListUnmanaged(native_catalog_backend.Entry) = .empty,
+    allocator: Allocator,
+
+    fn findIndex(self: *@This(), namespace: ?[]const u8, key: []const u8) ?usize {
+        for (self.entries.items, 0..) |e, i| {
+            const ns_match = (e.namespace == null and namespace == null) or
+                (e.namespace != null and namespace != null and std.mem.eql(u8, e.namespace.?, namespace.?));
+            if (ns_match and std.mem.eql(u8, e.key, key)) return i;
+        }
+        return null;
+    }
+
+    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
+        _ = scope;
+        _ = durable;
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (mutations) |m| {
+            if (m.is_delete) {
+                if (self.findIndex(m.namespace, m.key)) |i| {
+                    const removed = self.entries.swapRemove(i);
+                    if (removed.namespace) |n| self.allocator.free(n);
+                    self.allocator.free(removed.key);
+                    self.allocator.free(removed.value);
+                }
+                continue;
+            }
+            if (self.findIndex(m.namespace, m.key)) |i| {
+                self.allocator.free(self.entries.items[i].value);
+                self.entries.items[i].value = try self.allocator.dupe(u8, m.value);
+                continue;
+            }
+            try self.entries.append(self.allocator, .{
+                .namespace = if (m.namespace) |n| try self.allocator.dupe(u8, n) else null,
+                .key = try self.allocator.dupe(u8, m.key),
+                .value = try self.allocator.dupe(u8, m.value),
+            });
+        }
+    }
+
+    fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        _ = scope;
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try allocator.dupe(native_catalog_backend.Entry, self.entries.items);
+    }
+
+    fn sink(self: *@This()) NativeCatalogSink {
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
+    }
+
+    fn deinit(self: *@This(), allocator: Allocator) void {
+        for (self.entries.items) |e| {
+            if (e.namespace) |n| allocator.free(n);
+            allocator.free(e.key);
+            allocator.free(e.value);
+        }
+        self.entries.deinit(allocator);
+    }
+};
+
+test "persistent index prepares an inline segment publication, applies it through an external commit, and installs it" {
+    // WS4 phase 2: proves `prepareInlineSegmentPublication` /
+    // `installInlineSegmentPublication` in isolation, standing in for the
+    // externally-owned native transaction (here: a direct call to
+    // `applyExternallyCommittedMutations`, exactly what
+    // `lite/docstore.zig`'s `Txn.putIndexCatalogBatch` + `commit()` does
+    // for real once the commit returns) that a caller would otherwise
+    // drive via `commit_participant.View.putIndexCatalog`.
     const alloc = std.testing.allocator;
+
+    var test_sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer test_sink.deinit(alloc);
+
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
     defer cleanupPersistDir(path);
 
+    var pi = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer pi.close();
+
+    const scope = pi.nativeCatalogScope() orelse return error.TestUnexpectedResult;
+
+    const seg = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    var publication = try pi.prepareInlineSegmentPublication(seg);
+    // Not committed yet: this index's own reads must not see it.
     {
-        var pi = try PersistentIndex.open(alloc, .{ .path = path });
-        defer pi.close();
-
-        const seg = try buildSimpleSegment(alloc, "doc:a", "alpha");
-        defer alloc.free(seg);
-        try pi.indexSegment(seg);
-
-        var txn = try pi.beginWriteMainTxn();
-        errdefer txn.abort();
-
-        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
-        txn.delete(.segments, &seg_key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
-        try pi.deleteSegmentRange(&txn, 1);
-        try txn.commit();
-        pi.deleteSegmentFile(1);
-    }
-
-    {
-        var pi = try PersistentIndex.open(alloc, .{ .path = path });
-        defer pi.close();
-
-        const ranges = try pi.activeSegmentRanges(alloc);
-        defer {
-            for (ranges) |*range| range.deinit(alloc);
-            alloc.free(ranges);
-        }
-        try std.testing.expectEqual(@as(usize, 0), ranges.len);
-
         var txn = try pi.beginReadMainTxn();
         defer txn.abort();
         const active_ids = try pi.loadActiveSegmentIds(&txn, alloc);
         defer alloc.free(active_ids);
         try std.testing.expectEqual(@as(usize, 0), active_ids.len);
     }
+    try std.testing.expectEqual(@as(usize, 0), test_sink.entries.items.len);
+
+    const mutations = publication.mutations();
+    switch (pi.main_store_owner) {
+        .native_catalog => |backend| try backend.applyExternallyCommittedMutations(&mutations),
+        else => return error.TestUnexpectedResult,
+    }
+    // The sink itself was never called: these mutations were "already
+    // committed" by an external transaction this test stands in for.
+    try std.testing.expectEqual(@as(usize, 0), test_sink.entries.items.len);
+    pi.installInlineSegmentPublication(&publication);
+
+    var txn = try pi.beginReadMainTxn();
+    defer txn.abort();
+    const active_ids = try pi.loadActiveSegmentIds(&txn, alloc);
+    defer alloc.free(active_ids);
+    try std.testing.expectEqual(@as(usize, 1), active_ids.len);
+
+    const ranges = try pi.activeSegmentRanges(alloc);
+    defer {
+        for (ranges) |*range| range.deinit(alloc);
+        alloc.free(ranges);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+
+    // WS4 phase 2: deleting a key with no matching posting anywhere (the
+    // common brand-new-document case) needs no commit at all -- confirmed
+    // directly by isEmpty(), and aborting an empty one is a safe no-op.
+    var empty_delete = try pi.prepareInlineDeleteByIdsTracked(alloc, &.{"doc:never-indexed"});
+    try std.testing.expect(empty_delete.isEmpty());
+    pi.abortInlineDeleteByIdsTracked(alloc, &empty_delete);
+
+    // Deleting the key just published above DOES find a posting and needs
+    // a `.deletions` mutation, committed the same way as everything else.
+    var real_delete = try pi.prepareInlineDeleteByIdsTracked(alloc, &.{"doc:a"});
+    try std.testing.expect(!real_delete.isEmpty());
+    const delete_mutations = try real_delete.mutationsAlloc(alloc);
+    defer alloc.free(delete_mutations);
+    switch (pi.main_store_owner) {
+        .native_catalog => |backend| try backend.applyExternallyCommittedMutations(delete_mutations),
+        else => return error.TestUnexpectedResult,
+    }
+    pi.installInlineDeleteByIdsTracked(alloc, &real_delete);
+
+    _ = scope;
+}
+
+test "persistent index prepares a merged seal mutation without committing, and returns null once already covered" {
+    const alloc = std.testing.allocator;
+
+    var test_sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer test_sink.deinit(alloc);
+
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    var pi = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer pi.close();
+
+    const first: projection_seal.Seal = .{ .root = 1, .namespace = @splat(1), .generation = 1, .config_hash = 1, .applied_sequence = 5 };
+    var publication = (try pi.prepareInlineProjectionSealMutation(first)) orelse return error.TestUnexpectedResult;
+    const mutation = publication.mutation();
+    try std.testing.expectEqualStrings(projection_seal.metadata_key, mutation.key);
+    try std.testing.expect((try projection_seal.Seal.decode(mutation.value)).applied_sequence == 5);
+    // Not committed yet: this index's own read must not see it.
+    try std.testing.expect((try pi.loadProjectionSeal(alloc)) == null);
+
+    switch (pi.main_store_owner) {
+        .native_catalog => |backend| try backend.applyExternallyCommittedMutations(&.{mutation}),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const loaded = (try pi.loadProjectionSeal(alloc)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 5), loaded.applied_sequence);
+
+    // A second publication with an older applied_sequence merges forward
+    // (never backward) and is reported as already covered.
+    const second: projection_seal.Seal = .{ .root = 1, .namespace = @splat(1), .generation = 1, .config_hash = 1, .applied_sequence = 3 };
+    try std.testing.expect((try pi.prepareInlineProjectionSealMutation(second)) == null);
+
+    // A different identity is refused.
+    const mismatched: projection_seal.Seal = .{ .root = 2, .namespace = @splat(1), .generation = 1, .config_hash = 1, .applied_sequence = 9 };
+    try std.testing.expectError(error.ProjectionSealIdentityChanged, pi.prepareInlineProjectionSealMutation(mismatched));
+}
+
+test "persistent index open prunes stale active segment references" {
+    const alloc = std.testing.allocator;
+    for ([_]enum { missing, empty_owned, empty_supplied }{ .missing, .empty_owned, .empty_supplied }) |fixture| {
+        var path_buf: [256]u8 = undefined;
+        const path = persistTmpPath(&path_buf);
+        defer cleanupPersistDir(path);
+
+        {
+            var pi = try PersistentIndex.open(alloc, .{ .path = path });
+            defer pi.close();
+
+            const seg = try buildSimpleSegment(alloc, "doc:a", "alpha");
+            defer alloc.free(seg);
+            try pi.indexSegment(seg);
+
+            var txn = try pi.beginWriteMainTxn();
+            errdefer txn.abort();
+
+            const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+            txn.delete(.segments, &seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            try pi.deleteSegmentRange(&txn, 1);
+            try txn.commit();
+            if (fixture == .missing) {
+                pi.deleteSegmentFile(1);
+            } else {
+                const files = &pi.segment_files.?;
+                const segment_path = try files.pathAlloc(1);
+                defer alloc.free(segment_path);
+                try files.storage.writeFileAbsolute(segment_path, "");
+            }
+        }
+
+        {
+            var native = if (fixture == .empty_supplied) try storage_io.NativeStorage.init(alloc, .threaded) else null;
+            defer if (native) |*storage| storage.deinit();
+            var pi = try PersistentIndex.open(alloc, .{
+                .path = path,
+                .main_lsm_storage = if (native) |*storage| storage.storage() else null,
+            });
+            defer pi.close();
+            try std.testing.expectEqual(@as(usize, 0), pi.snapshot().segments.len);
+
+            const ranges = try pi.activeSegmentRanges(alloc);
+            defer {
+                for (ranges) |*range| range.deinit(alloc);
+                alloc.free(ranges);
+            }
+            try std.testing.expectEqual(@as(usize, 0), ranges.len);
+
+            var txn = try pi.beginReadMainTxn();
+            defer txn.abort();
+            const active_ids = try pi.loadActiveSegmentIds(&txn, alloc);
+            defer alloc.free(active_ids);
+            try std.testing.expectEqual(@as(usize, 0), active_ids.len);
+        }
+    }
+}
+
+test "persistent index writable open maps the current active segment pathname" {
+    if (builtin.os.tag != .linux and (builtin.os.tag != .macos or !builtin.link_libc)) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    const bytes = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(bytes);
+    {
+        var index = try PersistentIndex.open(alloc, .{ .path = path });
+        defer index.close();
+        try index.indexSegment(bytes);
+        try index.syncMain(true);
+    }
+
+    var reader_storage = try storage_io.NativeStorage.init(alloc, .threaded);
+    defer reader_storage.deinit();
+    var publisher_storage = try storage_io.NativeStorage.init(alloc, .threaded);
+    defer publisher_storage.deinit();
+    const segment_path = try std.fmt.allocPrint(alloc, "{s}/segments/1.seg", .{path});
+    defer alloc.free(segment_path);
+    const replacement_path = try std.fmt.allocPrint(alloc, "{s}.replacement", .{segment_path});
+    defer alloc.free(replacement_path);
+
+    const publisher = publisher_storage.storage();
+    try publisher.renameAbsolute(segment_path, replacement_path);
+    try publisher.writeFileAbsolute(segment_path, "stale");
+    const reader = reader_storage.storage();
+    _ = try reader.fileSize(segment_path);
+    try publisher.renameAbsolute(replacement_path, segment_path);
+    {
+        var stale = try reader.mapImmutableArtifact(alloc, segment_path);
+        defer stale.deinit();
+        try std.testing.expectEqualStrings("stale", stale.bytes);
+    }
+
+    var index = try PersistentIndex.open(alloc, .{ .path = path, .main_lsm_storage = reader });
+    defer index.close();
+    try std.testing.expectEqual(@as(usize, 1), index.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(alloc, index.snapshot(), "alpha"));
+    var txn = try index.beginReadMainTxn();
+    defer txn.abort();
+    const ids = try index.loadActiveSegmentIds(&txn, alloc);
+    defer alloc.free(ids);
+    try std.testing.expectEqualSlices(u64, &.{1}, ids);
+}
+
+test "persistent index open releases a rejected segment mapping exactly once" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const Fault = struct {
+        var closes: usize = 0;
+
+        fn map(_: *anyopaque, _: Allocator, path: []const u8, _: storage_io.Storage.FreshMappingCachePolicy) !@import("../segment_source.zig").MappedArtifact {
+            return .{ .bytes = try mapSegmentFile(path), .context = &closes, .release = close };
+        }
+
+        fn close(raw: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(raw));
+            count.* += 1;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    {
+        var index = try PersistentIndex.open(alloc, .{ .path = path });
+        defer index.close();
+        const bytes = try buildSimpleSegment(alloc, "doc:a", "alpha");
+        defer alloc.free(bytes);
+        try index.indexSegment(bytes);
+        try index.syncMain(true);
+    }
+
+    var native = try storage_io.NativeStorage.init(alloc, .threaded);
+    defer native.deinit();
+    var storage = native.storage();
+    const segment_path = try std.fmt.allocPrint(alloc, "{s}/segments/1.seg", .{path});
+    defer alloc.free(segment_path);
+    try storage.writeFileAbsolute(segment_path, "corrupt segment");
+    var vtable = storage.vtable.*;
+    vtable.map_fresh_immutable_artifact = Fault.map;
+    storage.vtable = &vtable;
+    Fault.closes = 0;
+    var index = try PersistentIndex.open(alloc, .{ .path = path, .main_lsm_storage = storage, .read_only = true });
+    defer index.close();
+    try std.testing.expectEqual(@as(usize, 0), index.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 1), Fault.closes);
 }
 
 test "persistent index open keeps recovered segment ownership on later catalog error" {
@@ -4824,10 +5522,55 @@ test "persistent index open keeps recovered segment ownership on later catalog e
         var txn = try pi.beginWriteMainTxn();
         errdefer txn.abort();
         const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
-        try txn.put(.deletions, &seg_key, "\x01\x00");
+        try txn.put(.deletions, &seg_key, "\x01");
         try txn.commit();
     }
 
+    try std.testing.expectError(error.InvalidRoaringBitmap, PersistentIndex.open(alloc, .{ .path = path }));
+}
+
+test "persistent index reopens legacy low-cardinality dense deletion records" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+        const segment = try buildMultiDocSegment(alloc, &.{
+            .{ .doc_id = "doc:a", .term = "alpha" },
+            .{ .doc_id = "doc:b", .term = "beta" },
+        });
+        defer alloc.free(segment);
+        try pi.indexSegment(segment);
+        var legacy: [6 + 8192]u8 = @splat(0);
+        legacy[0] = 1;
+        legacy[6] = 2;
+
+        var txn = try pi.beginWriteMainTxn();
+        errdefer txn.abort();
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+        try txn.put(.deletions, &seg_key, &legacy);
+        try txn.commit();
+    }
+
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+        const deleted = pi.snapshot().segments[0].shared.deleted.?;
+        try std.testing.expectEqual(@as(usize, 1), deleted.cardinality());
+        try std.testing.expect(!deleted.contains(0));
+        try std.testing.expect(deleted.contains(1));
+
+        // A canonical bitmap is still invalid for a two-document segment
+        // if its deletion ordinal points past the last document.
+        var txn = try pi.beginWriteMainTxn();
+        errdefer txn.abort();
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+        try txn.put(.deletions, &seg_key, &.{ 1, 0, 0, 0, 0, 0, 2, 0 });
+        try txn.commit();
+    }
     try std.testing.expectError(error.InvalidRoaringBitmap, PersistentIndex.open(alloc, .{ .path = path }));
 }
 
@@ -4939,6 +5682,18 @@ test "persistent index hands off right-only segments to child index" {
     try src.indexSegment(right_seg);
     try std.testing.expect(try src.deleteById("doc:z"));
 
+    const right_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 2)));
+    {
+        // Simulate a deletion mask written before canonical serialization.
+        var legacy: [6 + 8192]u8 = @splat(0);
+        legacy[0] = 1;
+        legacy[6] = 2;
+        var txn = try src.beginWriteMainTxn();
+        errdefer txn.abort();
+        try txn.put(.deletions, &right_key, &legacy);
+        try txn.commit();
+    }
+
     const mixed_seg = try buildMultiDocSegment(alloc, &.{
         .{ .doc_id = "doc:f", .term = "foxtrot" },
         .{ .doc_id = "doc:t", .term = "tango" },
@@ -4967,6 +5722,16 @@ test "persistent index hands off right-only segments to child index" {
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
     try std.testing.expectEqualStrings("doc:m", ranges[0].min_doc_key);
     try std.testing.expectEqualStrings("doc:z", ranges[0].max_doc_key);
+
+    {
+        var txn = try dest.beginReadMainTxn();
+        defer txn.abort();
+        const mask = try txn.get(.deletions, &right_key);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 1, 0 }, mask);
+        var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, mask);
+        defer bitmap.deinit();
+        try std.testing.expect(bitmap.contains(1));
+    }
 
     const snap = dest.snapshot();
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());

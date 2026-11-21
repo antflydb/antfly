@@ -24,6 +24,65 @@ const platform_time = @import("antfly_platform").time;
 
 pub const TargetHint = change_journal_mod.TargetHint;
 
+/// Exact projection frontier for artifact-backed consumers. Missing markers
+/// require the legacy kind-wide fallback, including stores predating the
+/// primary watermark. Primary mutations fence deletes/replacements even when
+/// no replacement artifact has been produced yet. Reads share one snapshot.
+pub fn artifactTargetAtCut(alloc: Allocator, read: anytype, names: []const []const u8, applied: u64, budget: ?*@import("../artifact_scan_budget.zig").Budget) !?u64 {
+    if (names.len == 0) return null;
+    if (budget) |b| try b.consume(internal_keys.primary_source_revision_key.len + @sizeOf(u64));
+    const primary = read.get(&internal_keys.primary_source_revision_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (primary.len != @sizeOf(u64)) return error.InvalidArtifactSourceRevision;
+    var target = @max(applied, std.mem.readInt(u64, primary[0..8], .big));
+    for (names) |name| {
+        const key = try internal_keys.artifactSourceRevisionKeyAlloc(alloc, name);
+        defer alloc.free(key);
+        if (budget) |b| try b.consume(key.len + @sizeOf(u64));
+        const raw = read.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (raw.len != @sizeOf(u64)) return error.InvalidArtifactSourceRevision;
+        target = @max(target, std.mem.readInt(u64, raw[0..8], .big));
+    }
+    return target;
+}
+
+test "privacy scoped readiness requires primary and artifact replay markers" {
+    const a = std.testing.allocator;
+    const source_key = try internal_keys.artifactSourceRevisionKeyAlloc(a, "A");
+    defer a.free(source_key);
+    const Read = struct {
+        key: []const u8,
+        primary: ?[]const u8 = null,
+        source: ?[]const u8 = null,
+        fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key, &internal_keys.primary_source_revision_key)) return self.primary orelse error.NotFound;
+            if (std.mem.eql(u8, key, self.key)) return self.source orelse error.NotFound;
+            return error.NotFound;
+        }
+    };
+    var read: Read = .{ .key = source_key };
+    try std.testing.expectEqual(@as(?u64, null), try artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+    var primary: [8]u8 = undefined;
+    var source: [8]u8 = undefined;
+    std.mem.writeInt(u64, &primary, 20, .big);
+    std.mem.writeInt(u64, &source, 40, .big);
+    read.primary = &primary;
+    try std.testing.expectEqual(@as(?u64, null), try artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+    read.source = &source;
+    try std.testing.expectEqual(@as(?u64, 40), try artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+    std.mem.writeInt(u64, &primary, 70, .big);
+    try std.testing.expectEqual(@as(?u64, 70), try artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+    try std.testing.expectEqual(@as(?u64, 80), try artifactTargetAtCut(a, &read, &.{"A"}, 80, null));
+    try std.testing.expectEqual(@as(?u64, null), try artifactTargetAtCut(a, &read, &.{ "A", "missing" }, 10, null));
+    read.source = source[0..7];
+    try std.testing.expectError(error.InvalidArtifactSourceRevision, artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+}
+
 pub const PendingDocumentGroup = struct {
     sequence: u64,
     doc_key: []const u8,
@@ -40,6 +99,11 @@ pub const MatchingRecordStats = struct {
     hint_filter_skips: usize = 0,
     scan_batches: usize = 0,
     last_sequence: u64 = 0,
+    /// The batch stopped at its scanned-entry cap, not at the end of the
+    /// journal: `last_sequence` is the last record scanned, and records
+    /// after it are unexamined. An empty batch with this set proves nothing
+    /// about the rest of the journal.
+    scan_budget_exhausted: bool = false,
 
     pub fn add(self: *MatchingRecordStats, other: MatchingRecordStats) void {
         self.matched_entries += other.matched_entries;
@@ -47,6 +111,7 @@ pub const MatchingRecordStats = struct {
         self.hint_filter_skips += other.hint_filter_skips;
         self.scan_batches += other.scan_batches;
         self.last_sequence = @max(self.last_sequence, other.last_sequence);
+        self.scan_budget_exhausted = self.scan_budget_exhausted or other.scan_budget_exhausted;
     }
 };
 
@@ -73,6 +138,15 @@ pub const MatchingCursor = struct {
             .primary_store => |*cursor| cursor.deinit(),
         }
         self.* = undefined;
+    }
+
+    /// Stops traversal before any record past `sequence`, ahead of hint
+    /// filtering, so a bounded probe never reads the unrelated suffix.
+    pub fn setUpperSequence(self: *MatchingCursor, sequence: u64) void {
+        switch (self.state) {
+            .journal => |*cursor| cursor.upper_sequence = sequence,
+            .primary_store => |*cursor| cursor.upper_sequence = sequence,
+        }
     }
 
     pub fn forEachNext(
@@ -129,6 +203,9 @@ pub const Source = struct {
         ) anyerror!u64,
         collect_enrichment_document_groups: *const fn (ptr: *anyopaque, alloc: Allocator, from_sequence: u64) anyerror![]PendingDocumentGroup,
         is_sequence_visible: *const fn (ptr: *anyopaque, sequence: u64) anyerror!bool,
+        /// Whether a record carrying `hint` lies in (from, through], or null
+        /// when the source cannot say without scanning.
+        hint_record_between: ?*const fn (ptr: *anyopaque, hint: TargetHint, from_sequence: u64, through: u64) anyerror!?bool = null,
     };
 
     pub fn fromJournal(journal: *change_journal_mod.Journal) Source {
@@ -165,6 +242,34 @@ pub const Source = struct {
             ctx,
             consume,
         );
+    }
+
+    /// Whether no record for `hint` lies in (`from_sequence`, `through`].
+    /// A batch capped by scanned work examines only a prefix, so the scan
+    /// continues until a match, the end of the journal, or past `through`:
+    /// a caller advancing a watermark on this answer never skips pending
+    /// work.
+    pub fn noMatchingRecordThrough(self: Source, alloc: Allocator, from_sequence: u64, hint: TargetHint, through: u64) !bool {
+        // The hint's own index settles it in one seek, however much other
+        // consumers' work lies in between.
+        if (self.vtable.hint_record_between) |record_between| if (try record_between(self.ptr, hint, from_sequence, through)) |found| return !found;
+        var cursor = try self.openMatchingCursor(alloc, from_sequence, hint);
+        defer cursor.deinit(alloc);
+        cursor.setUpperSequence(through);
+        const Probe = struct {
+            through: u64,
+            pending: bool = false,
+            fn consume(ptr: *anyopaque, at: u64, _: []const u8) !void {
+                const probe: *@This() = @ptrCast(@alignCast(ptr));
+                probe.pending = at <= probe.through;
+            }
+        };
+        var probe = Probe{ .through = through };
+        while (true) {
+            const scan = try cursor.forEachNext(1, &probe, Probe.consume);
+            if (scan.matched_entries != 0) return !probe.pending;
+            if (!scan.scan_budget_exhausted or scan.last_sequence >= through) return true;
+        }
     }
 
     pub fn openMatchingCursor(
@@ -256,13 +361,21 @@ const primary_store_vtable = Source.VTable{
     .latest_matching_sequence = primaryStoreLatestMatchingSequence,
     .collect_enrichment_document_groups = primaryStoreCollectEnrichmentDocumentGroups,
     .is_sequence_visible = primaryStoreIsSequenceVisible,
+    .hint_record_between = primaryStoreHintRecordBetween,
 };
+
+fn primaryStoreHintRecordBetween(ptr: *anyopaque, hint: TargetHint, from_sequence: u64, through: u64) anyerror!?bool {
+    const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
+    return try store.replayHintRecordBetween(hint, from_sequence, through);
+}
 
 const JournalMatchingCursor = struct {
     alloc: Allocator,
     journal: *change_journal_mod.Journal,
     next_sequence: u64,
     hint: TargetHint,
+    /// See `MatchingCursor.setUpperSequence`.
+    upper_sequence: u64 = std.math.maxInt(u64),
 };
 
 const PrimaryStoreMatchingCursor = struct {
@@ -276,6 +389,8 @@ const PrimaryStoreMatchingCursor = struct {
     entry: ?backend_erased.Entry = null,
     fallback_all: bool = false,
     hint_exhausted: bool = false,
+    /// See `MatchingCursor.setUpperSequence`.
+    upper_sequence: u64 = std.math.maxInt(u64),
 
     pub fn deinit(self: *@This()) void {
         if (self.cursor) |*cursor| cursor.close();
@@ -324,6 +439,7 @@ fn journalMatchingCursorForEachNext(
         stats: MatchingRecordStats = .{ .scan_batches = 1 },
 
         fn visit(self: *@This(), entry: log_mod.EntryView) !log_mod.ScanAction {
+            if (entry.sequence > self.cursor.upper_sequence) return .stop;
             if (!try change_journal_mod.encodedRecordHasHint(entry.payload, self.cursor.hint)) {
                 self.stats.scanned_entries += 1;
                 self.stats.hint_filter_skips += 1;
@@ -369,13 +485,18 @@ fn primaryStoreMatchingCursorForEachNext(
             cursor.entry = null;
             break;
         };
+        // Past the bound: keep this entry current for a later, wider call.
+        if (sequence > cursor.upper_sequence) return stats;
         if (cursor.fallback_all and !try change_journal_mod.encodedRecordHasHint(entry.value, cursor.hint)) {
             stats.scanned_entries += 1;
             stats.hint_filter_skips += 1;
             stats.last_sequence = sequence;
             cursor.next_sequence = sequence;
             cursor.entry = try cursor.cursor.?.next();
-            if (stats.scanned_entries >= max_scanned_entries) return stats;
+            if (stats.scanned_entries >= max_scanned_entries) {
+                stats.scan_budget_exhausted = cursor.entry != null;
+                return stats;
+            }
             continue;
         }
 
@@ -449,6 +570,9 @@ fn primaryStoreForEachMatchingRecordFallbackAll(
     callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
     callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);
     callback_ctx.stats.last_sequence = @max(callback_ctx.stats.last_sequence, replay_stats.last_sequence);
+    // The raw lane stops after `max_scanned_entries` entries whether or not
+    // more follow; treat reaching the cap as unexamined remainder.
+    callback_ctx.stats.scan_budget_exhausted = max_scanned_entries != 0 and replay_stats.scanned_entries >= max_scanned_entries;
     return callback_ctx.stats;
 }
 
@@ -493,6 +617,18 @@ fn primaryStoreOpenMatchingCursor(
         },
     };
     const cursor = &out.state.primary_store;
+    // A shared-lane journal's per-hint lane holds only rows from the layout
+    // before the upgrade (every one also in the shared lane), never the newer
+    // writes: read the shared lane, filtered, from the start.
+    if (store.sharedReplayLane() and kind_ordinal != internal_keys.replay_all_kind) {
+        cursor.fallback_all = true;
+        cursor.openLane(internal_keys.replay_all_kind) catch |err| switch (err) {
+            error.ReplayIndexUnavailable => cursor.hint_exhausted = true,
+            else => return err,
+        };
+        if (cursor.entry == null) cursor.hint_exhausted = true;
+        return out;
+    }
     cursor.openLane(kind_ordinal) catch |err| switch (err) {
         error.ReplayIndexUnavailable => {
             cursor.hint_exhausted = true;
@@ -613,7 +749,13 @@ fn primaryStoreForEachMatchingRecord(
         StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
         else => return err,
     };
-    if (replay_stats.matched_entries == 0) {
+    // A batch that ran out of scan budget before any match still made
+    // progress: report where it stopped instead of rescanning the same
+    // window through the fallback.
+    // A shared-lane backend's hint lane already is the shared lane,
+    // filtered: an empty batch is the answer, not a reason to scan the same
+    // journal range again.
+    if (replay_stats.matched_entries == 0 and !replay_stats.scan_budget_exhausted and !store.sharedReplayLane()) {
         return try primaryStoreForEachMatchingRecordFallbackAll(
             store,
             from_sequence,
@@ -628,6 +770,7 @@ fn primaryStoreForEachMatchingRecord(
     callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
     callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);
     callback_ctx.stats.last_sequence = @max(callback_ctx.stats.last_sequence, replay_stats.last_sequence);
+    callback_ctx.stats.scan_budget_exhausted = replay_stats.scan_budget_exhausted;
     return callback_ctx.stats;
 }
 
@@ -1413,14 +1556,115 @@ test "replay source primary fallback cursor is bounded across unrelated rows" {
     try std.testing.expectEqual(primary_store_fallback_scan_budget_min, first_stats.scanned_entries);
     try std.testing.expectEqual(@as(usize, primary_store_fallback_scan_budget_min), first_stats.hint_filter_skips);
     try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min), first_stats.last_sequence);
+    try std.testing.expect(first_stats.scan_budget_exhausted);
 
     var second = Context{};
     const second_stats = try cursor.forEachNext(1, &second, Context.consume);
+    try std.testing.expect(!second_stats.scan_budget_exhausted);
     try std.testing.expectEqual(@as(usize, 1), second.calls);
     try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min + 1), second.last_sequence);
     try std.testing.expectEqual(@as(usize, 1), second_stats.matched_entries);
     try std.testing.expectEqual(@as(usize, 1), second_stats.scanned_entries);
     try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min + 1), second_stats.last_sequence);
+}
+
+// A one-match scan capped by scanned work before its first match must say so:
+// a caller treating the empty batch as "reached the end" would skip the
+// record past the cap.
+test "replay source primary fallback reports an empty batch capped by scanned work" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    var sequence: u64 = 1;
+    while (sequence <= primary_store_fallback_scan_budget_min) : (sequence += 1) {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"doc:ft"},
+            .target_hints = &.{.full_text},
+        });
+        defer alloc.free(payload);
+        const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+        try batch.put(key[0..], payload);
+    }
+    const resolution_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = sequence,
+        .changed_doc_keys = &.{"doc:resolution"},
+        .target_hints = &.{.resolution},
+    });
+    defer alloc.free(resolution_payload);
+    const resolution_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+    try batch.put(resolution_key[0..], resolution_payload);
+    try batch.commit();
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence_value: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence_value;
+        }
+    };
+    const source = Source.fromPrimaryStore(&store, null, null);
+    var first = Context{};
+    const first_stats = try source.forEachMatchingRecord(alloc, 0, .resolution, 1, &first, Context.consume);
+    try std.testing.expectEqual(@as(usize, 0), first.calls);
+    try std.testing.expect(first_stats.scan_budget_exhausted);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min), first_stats.last_sequence);
+
+    var second = Context{};
+    const second_stats = try source.forEachMatchingRecord(alloc, first_stats.last_sequence, .resolution, 1, &second, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(sequence, second.last_sequence);
+    try std.testing.expect(!second_stats.scan_budget_exhausted);
+}
+
+// The watermark probe must see a record past the first capped scan window.
+test "replay source noMatchingRecordThrough looks past a capped empty window" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    var sequence: u64 = 1;
+    while (sequence <= primary_store_fallback_scan_budget_min) : (sequence += 1) {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"doc:ft"},
+            .target_hints = &.{.full_text},
+        });
+        defer alloc.free(payload);
+        const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+        try batch.put(key[0..], payload);
+    }
+    const enrichment_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = sequence,
+        .changed_doc_keys = &.{"doc:enrich"},
+        .target_hints = &.{.enrichment},
+    });
+    defer alloc.free(enrichment_payload);
+    const enrichment_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+    try batch.put(enrichment_key[0..], enrichment_payload);
+    try batch.commit();
+
+    const source = Source.fromPrimaryStore(&store, null, null);
+    try std.testing.expect(!try source.noMatchingRecordThrough(alloc, 0, .enrichment, sequence));
+    try std.testing.expect(try source.noMatchingRecordThrough(alloc, 0, .enrichment, sequence - 1));
 }
 
 test "replay source primary cursor resumes after stop chunk progress" {

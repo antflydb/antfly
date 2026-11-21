@@ -16,7 +16,9 @@
 const std = @import("std");
 
 // Version 2 additionally enforces managed privacy sources and read fences.
-pub const artifact_sources_protocol_version: u16 = 2;
+/// v1: artifact sources; v2: privacy serving; v3: opaque index alias catalog state;
+/// v4: lifecycle-scoped alias deletion validators.
+pub const artifact_sources_protocol_version: u16 = 4;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
@@ -103,7 +105,7 @@ pub fn validateObjectTableMutation(a: std.mem.Allocator, before: TableRecord, af
     defer replacement_schema.deinit();
     if (external != isExternalObjectSchema(replacement_schema.value)) return error.ObjectTableDefinitionConflict;
     if (after.min_ranges != 0 or after.desired_replica_count != 0 or after.storage.dense_embeddings != .primary_lsm or after.storage_migration != null) return error.ObjectTablePlacementUnsupported;
-    if (!external and (!std.mem.eql(u8, before.schema_json, after.schema_json) or !std.mem.eql(u8, before.read_schema_json, after.read_schema_json) or !std.mem.eql(u8, before.indexes_json, after.indexes_json))) return error.ObjectTableDefinitionConflict;
+    if (!external and (!std.mem.eql(u8, before.schema_json, after.schema_json) or !std.mem.eql(u8, before.read_schema_json, after.read_schema_json) or !try @import("antfly_local_sources").api_index_metadata.aliases.configurationEqual(a, before.indexes_json, after.indexes_json))) return error.ObjectTableDefinitionConflict;
 }
 
 fn isExternalObjectSchema(root: std.json.Value) bool {
@@ -405,6 +407,7 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256) and
         lhs.restore_native_manifest_size_bytes == rhs.restore_native_manifest_size_bytes and
         std.mem.eql(u8, lhs.restore_native_manifest_sha256, rhs.restore_native_manifest_sha256) and
+        std.mem.eql(u8, &lhs.restore_admission_fingerprint, &rhs.restore_admission_fingerprint) and
         std.mem.eql(
             u8,
             &lhs.completed_restore_fingerprint,
@@ -453,6 +456,7 @@ pub fn rangeMatchesRestorePublication(
         projected.doc_identity_shard_id == expected.doc_identity_shard_id and
         projected.doc_identity_range_id == expected.doc_identity_range_id and
         projected.split_attempt_epoch == expected.split_attempt_epoch and
+        std.mem.eql(u8, &projected.restore_admission_fingerprint, &expected.restore_admission_fingerprint) and
         rangeRestoreCompletionMatches(
             projected,
             expected.restore_backup_id,
@@ -469,7 +473,9 @@ pub const node_lifecycle_finalizing = "finalizing";
 /// native backup generation without discarding validated generated indexes.
 /// Persisting this per store lets metadata fence restore placement during a
 /// rolling data-plane upgrade instead of relying on the metadata codec level.
-pub const native_generation_restore_protocol_version: u16 = 1;
+// Version 2 accepts nonempty admission witnesses in staged plan range records.
+// Empty witnesses retain the v1 canonical wire representation and plan digest.
+pub const native_generation_restore_protocol_version: u16 = 2;
 
 pub fn nodeLifecycleActive(lifecycle: []const u8) bool {
     return std.mem.eql(u8, lifecycle, node_lifecycle_active);
@@ -944,6 +950,14 @@ pub fn artifactSourcesProtocolSupported(reporter_incarnation: u64, protocol_vers
 
 pub fn privacyProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
     return reporter_incarnation != 0 and protocol_version >= 2 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+}
+
+pub fn indexAliasesProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and protocol_version >= 3 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+}
+
+pub fn indexAliasLifecycleProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and protocol_version >= 4 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
 }
 
 pub fn denseNativeStorageProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
@@ -1468,8 +1482,21 @@ pub const TableManager = struct {
     }
 
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
+        if (try @import("antfly_local_sources").api_index_metadata.aliases.uses(self.alloc, record.indexes_json)) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, record.indexes_json, .{});
+            defer parsed.deinit();
+            try @import("antfly_local_sources").api_index_metadata.aliases.validateReferences(parsed.value);
+            if (record.schema_json.len != 0) {
+                var schema = try std.json.parseFromSlice(struct { relational_indexes: []const struct { name: []const u8 } = &.{} }, self.alloc, record.schema_json, .{ .ignore_unknown_fields = true });
+                defer schema.deinit();
+                if (parsed.value.object.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |aliases| {
+                    for (schema.value.relational_indexes) |index| if (aliases.object.contains(index.name)) return error.IndexAliasNameConflict;
+                }
+            }
+        }
         if (self.tables.get(record.table_id)) |existing| {
             try validateObjectTableMutation(self.alloc, existing, record);
+            try @import("antfly_local_sources").api_index_metadata.aliases.validateDependencyMutation(self.alloc, existing.indexes_json, record.indexes_json);
             if (existing.storage_migration != null and !tableDefinitionsEqual(existing, record))
                 return error.VectorMigrationActive;
         }
@@ -1497,7 +1524,7 @@ pub const TableManager = struct {
 
     fn upsertTableUnchecked(self: *TableManager, record: TableRecord) !void {
         if (self.table_names.get(record.name)) |id| if (id != record.table_id) return error.TableAlreadyExists;
-        const owned = try cloneTable(self.alloc, record);
+        const owned = try @import("antfly_local_sources").metadata_local_catalog.cloneTableForPublication(self.alloc, record);
         errdefer freeTable(self.alloc, owned);
         // Complete every allocation before changing either index or freeing a
         // borrowed name. Replacement/rollback cannot publish half an index.
@@ -1933,6 +1960,7 @@ pub const TableManager = struct {
         const identity_range_id = rangeDocIdentityRangeId(source);
         const table_id = source.table_id;
         const completion_fingerprint = source.completed_restore_fingerprint;
+        const admission_fingerprint = source.restore_admission_fingerprint;
 
         if (!source_already_narrowed) {
             try self.upsertRange(.{
@@ -1945,6 +1973,7 @@ pub const TableManager = struct {
                 .doc_identity_range_id = source.doc_identity_range_id,
                 .split_attempt_epoch = source.split_attempt_epoch,
                 .completed_restore_fingerprint = completion_fingerprint,
+                .restore_admission_fingerprint = admission_fingerprint,
             });
         }
 
@@ -1954,6 +1983,7 @@ pub const TableManager = struct {
                 !std.mem.eql(u8, destination.start_key, split_key) or
                 !optionalBytesEqual(destination.end_key, record.source_range_end) or
                 destination.split_attempt_epoch != 0 or
+                !std.mem.eql(u8, &destination.restore_admission_fingerprint, &admission_fingerprint) or
                 !rangeMatchesTransitionIdentity(
                     destination,
                     record.table_contract.target_identity,
@@ -1977,6 +2007,7 @@ pub const TableManager = struct {
                 .doc_identity_range_id = identity_range_id,
                 .split_attempt_epoch = 0,
                 .completed_restore_fingerprint = completion_fingerprint,
+                .restore_admission_fingerprint = admission_fingerprint,
             });
         }
     }
@@ -2021,6 +2052,10 @@ pub const TableManager = struct {
             receiver.completed_restore_fingerprint
         else
             empty_restore_completion_fingerprint;
+        const restore_admission_fingerprint = if (std.mem.eql(u8, &donor.restore_admission_fingerprint, &receiver.restore_admission_fingerprint))
+            receiver.restore_admission_fingerprint
+        else
+            empty_restore_completion_fingerprint;
         const receiver_already_merged =
             std.mem.eql(u8, receiver.start_key, merged_start) and
             optionalBytesEqual(receiver.end_key, merged_end);
@@ -2028,6 +2063,7 @@ pub const TableManager = struct {
             return error.TransitionTopologyConflict;
 
         if (receiver_already_merged) {
+            if (!std.mem.eql(u8, &receiver.restore_admission_fingerprint, &restore_admission_fingerprint)) return error.TransitionTopologyConflict;
             if (!std.mem.eql(
                 u8,
                 &receiver.completed_restore_fingerprint,
@@ -2045,6 +2081,7 @@ pub const TableManager = struct {
                 .doc_identity_shard_id = receiver.doc_identity_shard_id,
                 .doc_identity_range_id = receiver.doc_identity_range_id,
                 .completed_restore_fingerprint = completed_restore_fingerprint,
+                .restore_admission_fingerprint = restore_admission_fingerprint,
             });
         }
         _ = self.removeRange(donor.group_id);
@@ -2337,6 +2374,7 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
         .restore_native_manifest_size_bytes = record.restore_native_manifest_size_bytes,
         .restore_native_manifest_sha256 = restore_native_manifest_sha256,
         .completed_restore_fingerprint = record.completed_restore_fingerprint,
+        .restore_admission_fingerprint = record.restore_admission_fingerprint,
     };
 }
 

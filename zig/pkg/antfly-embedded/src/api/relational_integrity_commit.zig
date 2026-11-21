@@ -237,6 +237,7 @@ const Builder = struct {
     const Witness = struct { address: planner.storage.Address, key: []const u8 };
     const Witnesses = struct { required: bool, values: []const Witness };
     alloc: Allocator,
+    default_commit_requires: ?types.CommitRequires = null,
     scratch_alloc: ?Allocator = null,
     source: reads.TableReadSource,
     read_view: ?*reads.JoinReadView = null,
@@ -1008,7 +1009,7 @@ const Builder = struct {
             table.relational_integrity_generation_set = generation_set;
             return i;
         };
-        try self.output.append(self.alloc, .{ .table_name = table_name, .relational_schema_version = version, .relational_integrity_generation_set = generation_set });
+        try self.output.append(self.alloc, .{ .table_name = table_name, .commit_requires = self.default_commit_requires, .default_commit_requires = self.default_commit_requires, .relational_schema_version = version, .relational_integrity_generation_set = generation_set });
         try self.command_lists.append(self.alloc, .empty);
         try self.predicate_lists.append(self.alloc, .empty);
         return self.output.items.len - 1;
@@ -1066,7 +1067,11 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
     errdefer arena.deinit();
     var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_tables = repair_tables, .repair_admission = repair_admission, .statement = statement, .previous = previous, .constraint_timing = modes };
     defer builder.deinit();
+    for (requests) |request| builder.default_commit_requires = types.CommitRequires.strongest(builder.default_commit_requires, request.default_commit_requires);
     try builder.output.appendSlice(builder.alloc, requests);
+    for (builder.output.items) |*table| if (table.commit_requires == null) {
+        table.commit_requires = builder.default_commit_requires;
+    };
     for (requests) |request| {
         var commands: std.ArrayList(planner.storage.Command) = .empty;
         for (request.integrity_commands) |command| {
@@ -2442,7 +2447,7 @@ test "distributed txn deferred unique overlay permits repair and validates immed
         }
     };
     var empty: Empty = .{};
-    try std.testing.expectError(error.UniqueConstraintViolation, @import("../storage/db/relational_integrity.zig").prepare(alloc, &empty, final.tables[0].integrity_commands));
+    try std.testing.expectError(error.UniqueConstraintViolation, @import("../storage/db/relational_integrity.zig").prepare(alloc, &empty, final.tables[0].integrity_commands, null));
     // The first half of a two-statement swap collides with a live row. The
     // second statement repairs the complete overlay; no transient claim is
     // published, and COMMIT recomputes both releases from original rows.
@@ -2787,6 +2792,19 @@ test "distributed txn atomic cascade closure handles delete cycles update cycles
         try std.testing.expectEqual(@as(usize, 2), updated.tables.len);
         try std.testing.expectEqualStrings("{\"id\":2}", updated.tables[0].writes[0].value);
         try std.testing.expectEqualStrings("{\"id\":2}", updated.tables[1].writes[0].value);
+        // The request default also covers tables discovered by cascade closure.
+        for ([_]types.CommitRequires{ .none, .direct_enrichments }) |requirement| {
+            var gated = try prepare(alloc, source, &metadata, &.{.{ .table_name = "a", .commit_requires = requirement, .default_commit_requires = requirement, .writes = &.{.{ .key = "a", .value = "{\"id\":2}" }} }});
+            defer gated.deinit();
+            try std.testing.expectEqual(@as(usize, 2), gated.tables.len);
+            for (gated.tables) |table| try std.testing.expectEqual(requirement, table.commit_requires.?);
+        }
+        var overridden = try prepare(alloc, source, &metadata, &.{
+            .{ .table_name = "a", .commit_requires = .direct_enrichments, .default_commit_requires = .direct_enrichments, .writes = &.{.{ .key = "a", .value = "{\"id\":2}" }} },
+            .{ .table_name = "b", .commit_requires = .none, .default_commit_requires = .direct_enrichments },
+        });
+        defer overridden.deinit();
+        try std.testing.expectEqual(types.CommitRequires.none, overridden.tables[1].commit_requires.?);
     }
 }
 

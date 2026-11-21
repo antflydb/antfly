@@ -2293,6 +2293,8 @@ pub const StandbyStatusUpdateRequest = struct {
     applied_lsn: u64,
     /// Optional safe-read boundary. Defaults to applied_lsn.
     safe_read_lsn: ?u64 = null,
+    /// Highest restore job format the standby can recover.
+    restore_job_format: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2301,6 +2303,7 @@ pub const StandbyStatusUpdateRequest = struct {
         .{ "received_lsn", "received_lsn", false },
         .{ "applied_lsn", "applied_lsn", false },
         .{ "safe_read_lsn", "safe_read_lsn", true },
+        .{ "restore_job_format", "restore_job_format", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2323,6 +2326,10 @@ pub const StandbyStatusUpdateRequest = struct {
         try jw.write(self.applied_lsn);
         if (self.safe_read_lsn) |value| {
             try jw.objectField("safe_read_lsn");
+            try jw.write(value);
+        }
+        if (self.restore_job_format) |value| {
+            try jw.objectField("restore_job_format");
             try jw.write(value);
         }
         try jw.endObject();

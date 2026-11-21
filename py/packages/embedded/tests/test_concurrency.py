@@ -222,11 +222,19 @@ def test_readonly_snapshot_without_sidecar_in_readonly_directory(tmp_path: Path)
                     # the first reader still owns the fallback inode fence.
                     with antfly_embedded.open(snapshot, mode=antfly_embedded.OpenMode.READONLY) as second:
                         assert second.sql("SELECT name FROM items")["rows"] == [["before"]]
-                        # The lock sidecar is the lock authority and must not
-                        # appear. The writer's FIFO admission queue
-                        # (<sidecar>.q) only orders writers and may.
+                        # The old per-inode flock sidecar (`<db>.lock`) and
+                        # its writer FIFO ticket directory (`<sidecar>.q`)
+                        # are both replaced by the single shared lock
+                        # region (`<db>.aflite-lock`, design doc §8.1/§8.7);
+                        # neither of the old names is ever created anymore.
+                        # The writer's own open above made the directory
+                        # writable again, so it is this process -- not the
+                        # second reader -- that lazily creates the region
+                        # the moment it needs cross-process coordination;
+                        # that file is now the legitimate lock authority.
                         assert not (directory / f"{snapshot.name}.lock").exists()
-                        assert set(directory.iterdir()) <= {snapshot, directory / f"{snapshot.name}.lock.q"}
+                        assert not (directory / f"{snapshot.name}.lock.q").exists()
+                        assert set(directory.iterdir()) <= {snapshot, directory / f"{snapshot.name}.aflite-lock"}
                         with pytest.raises(antfly_embedded.BusyError):
                             writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
                     assert cursor.fetch(10)["result"]["rows"] == [["before"]]
@@ -574,6 +582,261 @@ def test_session_cannot_read_staged_rows_into_recreated_table(tmp_path: Path, st
                 assert session.execute("SELECT id, name FROM items")["rows"] == []
             finally:
                 session.close()
+
+
+def test_runtime_full_text_index_keeps_overwrites_through_background_merges(tmp_path: Path) -> None:
+    # Large values on a runtime-added index make the maintenance snapshot
+    # merge segments while this connection keeps indexing inline. Neither may
+    # publish over the other's index state: every live version stays
+    # searchable and no overwritten one comes back.
+    path = tmp_path / "merges.aflite"
+    writes, keys = 300, 128
+
+    def text(sequence: int) -> str:
+        return (f"tokx{sequence} common" + " filler alpha beta" * 60)[:1024]
+
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        assert db.delete_index("full_text_index_v0")
+        db.add_index({"name": "matched_text", "type": "full_text", "config_json": {"field": "text"}})
+        for sequence in range(writes):
+            db.batch_json({"inserts": {f"k{sequence % keys}": {"text": text(sequence)}}, "sync_level": "full_index"})
+    with antfly_embedded.open(path, no_sync=True, busy_timeout=30.0) as db:
+        wrong = []
+        for sequence in range(writes):
+            found = db.search({"full_text_search": {"match": {"field": "text", "text": f"tokx{sequence}"}}, "limit": 4})
+            hits = [hit["_id"] for hit in found["responses"][0]["hits"]["hits"]]
+            expected = [f"k{sequence % keys}"] if sequence >= writes - keys else []
+            if hits != expected:
+                wrong.append((sequence, hits))
+        assert wrong == []
+
+
+def test_unrelated_busy_index_does_not_starve_maintenance(tmp_path: Path) -> None:
+    # Maintenance fences publications per index: inline writes to one table's
+    # index must not keep rejecting another index's merges.
+    def text_merge(stats):
+        if isinstance(stats, dict):
+            if "text_merge" in stats:
+                return stats["text_merge"]
+            for value in stats.values():
+                found = text_merge(value)
+                if found is not None:
+                    return found
+        return None
+
+    path = tmp_path / "busy.aflite"
+    stop = threading.Event()
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        assert db.delete_index("full_text_index_v0")
+        db.add_index({"name": "quiet_text", "type": "full_text", "config_json": {"field": "b"}})
+        db.create_table("busy", {})
+        busy = db.open_table("busy")
+        busy.add_index({"name": "busy_text", "type": "full_text", "config_json": {"field": "a"}})
+        for i in range(30):
+            db.batch_json({"inserts": {f"b{i}": {"b": f"quietdoc{i} " + "w " * 200}}, "sync_level": "full_index"})
+        assert text_merge(db.stats())["active_segments"] == 30
+        writes = [0]
+
+        def write_busy() -> None:
+            while not stop.is_set():
+                busy.batch_json(
+                    {
+                        "inserts": {f"a{writes[0] % 4}": {"a": f"busydoc{writes[0]} " + "filler " * 120}},
+                        "sync_level": "full_index",
+                    }
+                )
+                writes[0] += 1
+
+        writer = threading.Thread(target=write_busy)
+        writer.start()
+        try:
+            deadline = time.monotonic() + 30
+            merged = text_merge(db.stats())
+            while time.monotonic() < deadline and merged["active_segments"] > 4:
+                time.sleep(0.1)
+                merged = text_merge(db.stats())
+            still_busy = writer.is_alive()
+        finally:
+            stop.set()
+            writer.join()
+    assert still_busy
+    assert merged["active_segments"] <= 4, (merged, writes[0])
+
+
+@pytest.mark.parametrize("same_table", [False, True], ids=["other-table", "same-table"])
+def test_busy_index_in_another_process_does_not_starve_maintenance(tmp_path: Path, same_table: bool) -> None:
+    # Another process's index commits reach this one by replay, and its large
+    # values fill the redo log, so its folds move the physical catalog root
+    # and maintenance admission rebases. Changes to the busy index, in this
+    # table or another, must not keep rejecting the quiet index's merges.
+    def quiet_segments(handle):
+        return next(i["text_active_segments"] for i in handle.stats()["indexes"] if i["name"] == "quiet_text")
+
+    def peer_progress():
+        writes, folds = (progress.read_text() if progress.exists() else "0 0").split()
+        return int(writes), int(folds)
+
+    path = tmp_path / "busy-peer.aflite"
+    stop = tmp_path / "stop"
+    progress = tmp_path / "progress"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        assert db.delete_index("full_text_index_v0")
+        db.add_index({"name": "quiet_text", "type": "full_text", "config_json": {"field": "b"}})
+        if not same_table:
+            db.create_table("busy", {})
+        busy = db if same_table else db.open_table("busy")
+        busy.add_index({"name": "busy_text", "type": "full_text", "config_json": {"field": "a"}})
+        # The peer reports the folds its own process published, so a fold
+        # it reports is the peer's, not this process's.
+        script = (
+            "import antfly_embedded as af, os, sys\n"
+            "db = af.open(sys.argv[1], no_sync=True, busy_timeout=30.0)\n"
+            + ("busy = db\n" if same_table else "busy = db.open_table('busy')\n")
+            + "n = folds = last = 0\n"
+            "while not os.path.exists(sys.argv[2]):\n"
+            "    busy.batch_json({'inserts': {f'a{n % 4}': {'a': f'busydoc{n} ' + 'filler ' * 4000}}, 'sync_level': 'full_index'}); n += 1\n"
+            # The counter belongs to the serving runtime and restarts when
+            # it is replaced; accumulate it into a monotonic total.
+            "    now = db.status()['storage']['reclamation']['allocator_work']['redo_checkpoint_folds']\n"
+            "    folds += now - last if now >= last else now; last = now\n"
+            "    open(sys.argv[3] + '.tmp', 'w').write(f'{n} {folds}'); os.replace(sys.argv[3] + '.tmp', sys.argv[3])\n"
+            "db.close()"
+        )
+        peer = subprocess.Popen(
+            [sys.executable, "-c", script, str(path), str(stop), str(progress)], env=_child_environment()
+        )
+        try:
+            started = time.monotonic() + 60
+            while time.monotonic() < started and peer_progress()[0] < 20:
+                time.sleep(0.05)
+            writes_before = peer_progress()[0]
+            # Sample while the backlog builds and drains. The peer's fold
+            # count is taken once the backlog is first seen pending, and must
+            # advance at a later sample where it still is.
+            backlog = 0
+            folds_at_backlog = None
+            overlapped = False
+
+            def sample():
+                nonlocal backlog, folds_at_backlog, overlapped
+                pending = quiet_segments(db)
+                folds = peer_progress()[1]
+                backlog = max(backlog, pending)
+                if pending > 4:
+                    if folds_at_backlog is None:
+                        folds_at_backlog = folds
+                    elif folds > folds_at_backlog:
+                        overlapped = True
+                return pending
+
+            for i in range(120):
+                db.batch_json({"inserts": {f"b{i}": {"b": f"quietdoc{i} " + "w " * 200}}, "sync_level": "full_index"})
+                sample()
+            deadline = time.monotonic() + 30
+            segments = sample()
+            while time.monotonic() < deadline and segments > 4:
+                time.sleep(0.05)
+                segments = sample()
+            # Taken before the stop request: the peer kept writing.
+            time.sleep(0.5)
+            writes_after = peer_progress()[0]
+            still_busy = peer.poll() is None
+        finally:
+            stop.touch()
+            peer.wait(timeout=60)
+    assert peer.returncode == 0
+    assert backlog > 4, backlog
+    assert overlapped, (backlog, folds_at_backlog, peer_progress())
+    assert still_busy and writes_after > writes_before >= 20, (writes_before, writes_after)
+    assert segments <= 4, (backlog, segments)
+
+
+def test_writes_proceed_while_a_peer_keeps_invalidating_allocator_proofs(tmp_path: Path) -> None:
+    # Each peer commit invalidates this process's page-reuse proof. Proving
+    # again before every write lost each proof to the next peer commit and
+    # ran out the busy timeout; writes now fall back to append-only.
+    path = tmp_path / "proof-churn.aflite"
+    stop = tmp_path / "stop"
+    progress = tmp_path / "progress"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        db.create_table("busy", {})
+        db.open_table("busy").add_index({"name": "busy_text", "type": "full_text", "config_json": {"field": "a"}})
+        # The peer runs no background maintenance, so this process's
+        # reclamation keeps a reusable pool for its proofs to cover.
+        script = (
+            "import antfly_embedded as af, os, sys\n"
+            "db = af.open_with_options(sys.argv[1], af.OpenOptions(profile=af.Profile.HOSTED, no_sync=True, busy_timeout=30.0))\n"
+            "busy = db.open_table('busy'); n = 0\n"
+            "while not os.path.exists(sys.argv[2]):\n"
+            "    busy.batch_json({'inserts': {f'a{n % 4}': {'a': f'busydoc{n} ' + 'filler ' * 1000}}, 'sync_level': 'full_index'}); n += 1\n"
+            "    open(sys.argv[3] + '.tmp', 'w').write(str(n)); os.replace(sys.argv[3] + '.tmp', sys.argv[3])\n"
+            "db.close()"
+        )
+        peer = subprocess.Popen(
+            [sys.executable, "-c", script, str(path), str(stop), str(progress)], env=_child_environment()
+        )
+        try:
+            started = time.monotonic() + 60
+            while time.monotonic() < started and int((progress.read_text() if progress.exists() else "") or 0) < 20:
+                time.sleep(0.05)
+            slowest = 0.0
+            for i in range(120):
+                began = time.monotonic()
+                db.batch_json({"inserts": {f"b{i}": {"b": f"doc{i} " + "w " * 200}}, "sync_level": "full_index"})
+                slowest = max(slowest, time.monotonic() - began)
+            still_busy = peer.poll() is None
+        finally:
+            stop.touch()
+            peer.wait(timeout=60)
+    assert peer.returncode == 0
+    assert still_busy
+    assert slowest < 10, slowest
+
+
+def test_cross_process_overwrites_keep_full_text_deletes(tmp_path: Path) -> None:
+    # Regression: overwrites from several processes, each waiting for
+    # full-text visibility, lost earlier deletes. A writer rewrote a
+    # segment's whole delete bitmap from a stale view: a maintenance commit
+    # forwarded without the writer lease, a refresh that kept a root whose
+    # indexes predated another process's change, or overlay versions older
+    # than another process's fold shadowing the folded tree.
+    path = tmp_path / "overwrites.aflite"
+    processes, writes, keys = 6, 80, 8
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=30.0) as db:
+        db.batch_json({"inserts": {"seed": {"text": "seed"}}, "sync_level": "full_index"})
+    script = """
+import antfly_embedded, sys
+worker, writes, keys = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+with antfly_embedded.open(sys.argv[1], no_sync=True, busy_timeout=30.0) as db:
+    for s in range(writes):
+        db.batch_json({'inserts': {f'k{s % keys}-{worker}': {'text': f'tok{worker}x{s} common'}}, 'sync_level': 'full_index'})
+"""
+    workers = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(path), str(w), str(writes), str(keys)], env=_child_environment()
+        )
+        for w in range(processes)
+    ]
+    try:
+        for worker in workers:
+            assert worker.wait(timeout=600) == 0
+    finally:
+        for worker in workers:
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+    with antfly_embedded.open(path, no_sync=True, busy_timeout=30.0) as db:
+        db.run_until_idle()
+        wrong = []
+        for w in range(processes):
+            for s in range(writes):
+                result = db.search(
+                    {"full_text_search": {"match": {"field": "text", "text": f"tok{w}x{s}"}}, "limit": 4}
+                )
+                hits = len(result["responses"][0]["hits"]["hits"])
+                if hits != (1 if s >= writes - keys else 0):
+                    wrong.append((w, s, hits))
+        assert wrong == []
 
 
 def test_cross_process_writers_do_not_lose_each_others_rows(tmp_path: Path) -> None:

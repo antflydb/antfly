@@ -39,7 +39,9 @@ const NodeProto = proto.NodeProto;
 const TensorProto = proto.TensorProto;
 const ValueInfoProto = proto.ValueInfoProto;
 
-pub const ConvertError = ops.ConvertError || error{
+pub const CheckpointError = error{ Timeout, Canceled, Cancelled };
+
+pub const ConvertError = ops.ConvertError || CheckpointError || error{
     OutputNotFound,
     NodeNotFound,
     InputNotProvided,
@@ -98,6 +100,10 @@ pub const Model = struct {
     base_dir: ?[]const u8 = null,
     /// Borrowed only for synchronous conversion and initializer loading.
     external_reader: ?tensor_mod.ExternalDataReader = null,
+    conversion_checkpoint: ?struct {
+        context: *const anyopaque,
+        check: *const fn (*const anyopaque) CheckpointError!void,
+    } = null,
 
     // Pre-built indexes (populated in init)
     output_to_node: std.StringHashMapUnmanaged(u32),
@@ -534,6 +540,7 @@ pub const Model = struct {
         onnx_graph: *const GraphProto,
         name: []const u8,
     ) ConvertError!NodeId {
+        if (self.conversion_checkpoint) |checkpoint| try checkpoint.check(checkpoint.context);
         // Already converted?
         if (converted.get(name)) |id| {
             if (id == null_node) {
@@ -625,6 +632,7 @@ pub const Model = struct {
                 onnx_graph,
                 input_name,
             ) catch |e| {
+                if (e == error.Timeout or e == error.Canceled or e == error.Cancelled) return e;
                 log.warn("{s} ({s}): failed to convert input '{s}': {}", .{
                     node.op_type, name, input_name, e,
                 });

@@ -18,7 +18,7 @@ test:
 
 test-e2e: start-antfly
 	@echo "Running e2e tests..."
-	@ANTFLY_TEST_URL=http://localhost:8080/api/v1/ cargo pgrx test pg18 2>&1; \
+	@ANTFLY_TEST_URL=http://localhost:8080/db/v1/ cargo pgrx test pg18 2>&1; \
 	status=$$?; \
 	$(MAKE) stop-antfly; \
 	exit $$status

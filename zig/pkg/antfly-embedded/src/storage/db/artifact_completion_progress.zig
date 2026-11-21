@@ -173,7 +173,7 @@ pub const StreamVerifier = struct {
         root: u128,
         requirement: publication.Digest,
         observation: Observation,
-        value: union(enum) { skipped: Skipped, native: @import("artifact_native_stream.zig").Closure, document: streams.DocumentClosure, extraction: streams.ExtractionClosure, chunks: streams.Closure, units: @import("artifact_unit_progress.zig").Closure, projection: @import("artifact_projection_certificate.zig").Closure, graph: @import("artifact_graph_completion.zig").Closure },
+        value: union(enum) { prepared: @import("prepared_producer_acceptance.zig").Closure, skipped: Skipped, native: @import("artifact_native_stream.zig").Closure, document: streams.DocumentClosure, extraction: streams.ExtractionClosure, chunks: streams.Closure, units: @import("artifact_unit_progress.zig").Closure, projection: @import("artifact_projection_certificate.zig").Closure, graph: @import("artifact_graph_completion.zig").Closure },
         pub fn deinit(self: *@This()) void {
             switch (self.value) {
                 inline else => |*value| value.deinit(),
@@ -243,6 +243,10 @@ pub const StreamVerifier = struct {
             return try skipped(alloc, txn, root, document, node);
         }
         if (node.kind == .native_effects and @import("group_source_identity.zig").isAnchor(document)) return try skipped(alloc, txn, root, document, node);
+        if (node.kind == .generated) {
+            if (try @import("prepared_producer_acceptance.zig").read(alloc, txn, root, document, node.id, if (node.embedding.len != 0) node.embedding else if (node.artifact.len != 0) node.artifact else node.name)) |closure|
+                return .{ .root = root, .requirement = node.id, .observation = closure.observation, .value = .{ .prepared = closure } };
+        }
         if (node.kind == .unit_children) {
             try node.requireValidIdentity();
             const completion = if (self.plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
@@ -590,8 +594,8 @@ pub fn discoverNextAction(alloc: std.mem.Allocator, txn: anytype, root: u128, do
 /// resume calculation prevents large catalogs from starving requirements past
 /// the first page. Cached coverage uses point probes; physical preparation
 /// shares one sidecar lease and never runs inside a primary write transaction.
-pub fn refreshProjections(alloc: std.mem.Allocator, store: anytype, manager: *@import("catalog/index_manager.zig").IndexManager, checkpoint_path: ?[]const u8, root: u128, document: []const u8, snapshot: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot, limits: Limits) !void {
-    return refreshProjectionsWithAdoption(alloc, store, manager, checkpoint_path, root, document, snapshot, limits, null);
+pub fn refreshProjections(alloc: std.mem.Allocator, store: anytype, manager: *@import("catalog/index_manager.zig").IndexManager, root: u128, document: []const u8, snapshot: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot, limits: Limits) !void {
+    return refreshProjectionsWithAdoption(alloc, store, manager, root, document, snapshot, limits, null);
 }
 
 /// Borrowed ordinals into the pinned plan. Admission happens after releasing
@@ -608,7 +612,7 @@ pub const AdoptionRequests = struct {
     }
 };
 
-pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, manager: *@import("catalog/index_manager.zig").IndexManager, checkpoint_path: ?[]const u8, root: u128, document: []const u8, snapshot: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot, limits: Limits, adoption: ?*AdoptionRequests) !void {
+pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, manager: *@import("catalog/index_manager.zig").IndexManager, root: u128, document: []const u8, snapshot: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot, limits: Limits, adoption: ?*AdoptionRequests) !void {
     if (adoption) |requests| {
         requests.count = 0;
         requests.authority = null;
@@ -665,7 +669,7 @@ pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, 
         }
     }
     if (count == 0) return;
-    var projection = (try @import("derived/apply_state.zig").tryAcquireProjectionSnapshot(alloc, manager.checkpointIo(), store, checkpoint_path)) orelse return;
+    var projection = (try @import("derived/apply_state.zig").tryAcquireProjectionSnapshot(alloc, store)) orelse return;
     defer projection.deinit();
     if (!std.meta.eql(projection.authority, authority)) return error.ArtifactCatalogDrift;
     const deadline = if (limits.time_budget_ns) |budget| @import("antfly_platform").time.monotonicNs() +| budget else std.math.maxInt(u64);
@@ -825,7 +829,7 @@ test "ordered artifact inventory projection completion reconstructs independent 
     try std.testing.expect(source.root_incarnation != target.root_incarnation);
     var pin = try source.core.index_manager.acquireWritePlanSnapshot();
     defer pin.release();
-    try refreshProjections(alloc, source.core.store, source.core.index_manager, source.core.applied_sequence_checkpoint_path, source.root_incarnation, "doc", pin.plan(), .{ .time_budget_ns = null });
+    try refreshProjections(alloc, source.core.store, source.core.index_manager, source.root_incarnation, "doc", pin.plan(), .{ .time_budget_ns = null });
     var prepared = blk: {
         var read = try source.core.store.beginReadTxn();
         defer read.abort();

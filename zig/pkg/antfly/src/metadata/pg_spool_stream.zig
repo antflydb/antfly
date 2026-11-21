@@ -108,30 +108,37 @@ pub const Owner = struct {
     pub fn open(svc: anytype, registry: anytype, policy: anytype, a: A, id: control.Id, name: []const u8, actor: control.Id, requested: u64, binding: slot_control.Binding, config: Config, request: anytype) !Owner {
         try config.validate();
         try binding.validate();
-        var before = try load(svc, a, id, request);
-        defer before.deinit();
-        const now = try active(policy, before.value, binding, request);
-        const slot = before.value.slot.?;
-        if (!std.mem.eql(u8, name, slot.name)) return error.ChangefeedConflict;
-        if (slot.binding) |old| {
-            if (!same(old.identity(), binding.identity())) return error.ChangefeedResynchronizationRequired;
-        } else if (slot.spool.next_id != 1 or slot.entries.len != 0) return error.ChangefeedCapabilityUnsupported;
-        _ = try slot.restartAt(requested);
-        try registry.qualify(before.value, config.require_shared, request);
-        const expires = @min(before.value.expires_at, now +| config.lease_seconds);
-        if (slot.session) |current_session| {
-            if (now < slot.session_expires_at and !same(current_session.actor, actor))
-                return error.ReplicationSlotActive;
+        // Only one owned metadata reply should occupy the connection
+        // budget at each step, even when a restarting slot has backlog.
+        {
+            var before = try load(svc, a, id, request);
+            defer before.deinit();
+            const now = try active(policy, before.value, binding, request);
+            const slot = before.value.slot.?;
+            if (!std.mem.eql(u8, name, slot.name)) return error.ChangefeedConflict;
+            if (slot.binding) |old| {
+                if (!same(old.identity(), binding.identity())) return error.ChangefeedResynchronizationRequired;
+            } else if (slot.spool.next_id != 1 or slot.entries.len != 0) return error.ChangefeedCapabilityUnsupported;
+            _ = try slot.restartAt(requested);
+            try registry.qualify(before.value, config.require_shared, request);
+            const expires = @min(before.value.expires_at, now +| config.lease_seconds);
+            if (slot.session) |current_session| {
+                if (now < slot.session_expires_at and !same(current_session.actor, actor))
+                    return error.ReplicationSlotActive;
+            }
+            try mutate(svc, a, before.value, .{ .acquire = .{ .actor = actor, .expected = slot.fence, .now = now, .expires = @max(slot.session_expires_at, expires) } }, request);
         }
-        try mutate(svc, a, before.value, .{ .acquire = .{ .actor = actor, .expected = slot.fence, .now = now, .expires = @max(slot.session_expires_at, expires) } }, request);
-        var acquired = try load(svc, a, id, request);
-        defer acquired.deinit();
-        const acquired_now = try active(policy, acquired.value, binding, request);
-        const session = acquired.value.slot.?.session orelse return error.ChangefeedConflict;
-        if (!same(session.actor, actor)) return error.ChangefeedConflict;
-        try acquired.value.slot.?.verifySession(session, acquired_now);
-        if (acquired.value.slot.?.binding == null)
-            try mutate(svc, a, acquired.value, .{ .bind = .{ .session = session, .now = acquired_now, .binding = binding } }, request);
+        const session = acquired_session: {
+            var acquired = try load(svc, a, id, request);
+            defer acquired.deinit();
+            const acquired_now = try active(policy, acquired.value, binding, request);
+            const current_session = acquired.value.slot.?.session orelse return error.ChangefeedConflict;
+            if (!same(current_session.actor, actor)) return error.ChangefeedConflict;
+            try acquired.value.slot.?.verifySession(current_session, acquired_now);
+            if (acquired.value.slot.?.binding == null)
+                try mutate(svc, a, acquired.value, .{ .bind = .{ .session = current_session, .now = acquired_now, .binding = binding } }, request);
+            break :acquired_session current_session;
+        };
         var observed = try load(svc, a, id, request);
         defer observed.deinit();
         const observed_now = try active(policy, observed.value, binding, request);

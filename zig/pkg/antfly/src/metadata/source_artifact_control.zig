@@ -18,7 +18,7 @@
 //! quota requires a fenced storage reclamation proof, not acceptance or ACK.
 const std = @import("std");
 pub const Digest = [32]u8;
-pub const protocol_version: u16 = 102;
+pub const protocol_version: u16 = 113;
 pub const max_payload_bytes: u64 = 80 * 1024 * 1024 + 4160;
 fn nz(value: anytype) bool {
     return !std.mem.allEqual(u8, &value, 0);

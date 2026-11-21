@@ -5618,8 +5618,10 @@ test "capi SQL recovery stays clean across row writes reads and cursors" {
     try std.testing.expectEqual(capi.ErrorCode.ok, CursorApi.antfly_db_sql_close_cursor(handle, cursor));
     const after = try sqlRecoveryScans(handle);
     try std.testing.expectEqual(before.ddl, after.ddl);
-    // One post-decision resolution per INSERT, no pre-statement record probes.
-    try std.testing.expectEqual(before.commit + 8, after.commit);
+    // Single-table INSERTs commit in one step without the cross-database
+    // coordinator (lite-single-commit-write-path.md §3.3c), so they leave
+    // no decision record to resolve, and reads never probe for one.
+    try std.testing.expectEqual(before.commit, after.commit);
     try sqlFkRecoveryStatement(handle, "ALTER TABLE t0 ADD CONSTRAINT positive CHECK(n>=0)");
     const changed = try sqlRecoveryScans(handle);
     try std.testing.expectEqual(after.ddl + 1, changed.ddl);
@@ -6357,7 +6359,12 @@ test "capi SQL maintenance advances every captured full text prefix during stead
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json.ptr.?[0..json.len], .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value.object.get("index_replay_debt").?.array.items.len != 0);
-        try std.testing.expect(parsed.value.object.get("background_publications").?.object.get("rebased").?.integer > 0);
+        // Publications reach the writer while the foreground keeps moving its
+        // tip. (Snapshots now adopt the writer's tip after each forwarded
+        // write instead of being rebased at admission, so `rebased` no
+        // longer measures this; lite-writer-authority.md §4.2.)
+        const publications = parsed.value.object.get("background_publications").?.object;
+        try std.testing.expect(publications.get("attempts").?.integer > publications.get("refused").?.integer);
     }
     try std.testing.expectEqual(@as(usize, 4), append.count);
 }

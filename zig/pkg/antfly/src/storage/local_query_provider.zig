@@ -60,7 +60,7 @@ fn executeIssued(context: ?*anyopaque, request: *const abi.LocalQueryRequest, ou
 fn executeForDb(live_db: *db_mod.DB, request: *const abi.LocalQueryRequest, out_response: *abi.QueryOwnedResponse, out_failure: *abi.FailureIdentity) abi.Status {
     out_response.* = .{};
     out_failure.* = .{};
-    if (request.version != abi.abi_version)
+    if (request.version != abi.query_request_version)
         return fail(error.InvalidAbiVersion, .validate_request, out_failure);
     const table_name = request.table_name.slice();
     if (table_name.len == 0 or request.request_json.len == 0)

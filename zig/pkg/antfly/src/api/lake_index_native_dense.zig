@@ -342,7 +342,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         errdefer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) {
             const owned_indexes = switch (index.env_owner) {
                 .lsm => |handle| handle.backend.run_index_cache.items.len,
-                .native => 0,
+                .native, .native_catalog => 0,
             };
             std.debug.print("PARQUET_BULK_FAILURE allocator_live={} allocator_peak={} owned_indexes={} commits={} cached_nodes={} node_limit={} pinned_nodes={} cached_quantized={}\n", .{ budget.live, budget.peak, owned_indexes, index.bulk_commit_rotation.commits, index.node_cache.count(), index.config.max_cached_nodes, index.pinned_node_cache.count(), index.quantized_cache.count() });
         };
@@ -541,7 +541,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const profile = index.getWriteProfile();
                 const report = try std.json.Stringify.valueAlloc(a, .{ .identity_census_verified = root.identities_verified, .identity_read_bytes = root.identity_read_bytes, .identity_written_bytes = root.identity_written_bytes, .identity_merge_inputs = root.identity_merge_inputs, .projection_cache_peak_bytes = if (projection_cache) |*value| value.snapshotStats().peak_used_bytes else 0, .owned_index_count = switch (index.env_owner) {
                     .lsm => |handle| handle.backend.run_index_cache.items.len,
-                    .native => 0,
+                    .native, .native_catalog => 0,
                 }, .partition_bytes = profile.bulk_spool_partition_bytes, .partition_read_bytes = profile.bulk_spool_partition_read_bytes, .compact_rows = profile.bulk_spool_compact_rows, .projection_commit_ns = profile.bulk_projection_commit_ns, .save_node_ns = profile.save_node_ns, .update_parent_ns = profile.update_parent_ns, .update_parent_calls = profile.update_parent_calls, .training_ns = profile.bulk_build_leaf_training_ns, .routing_ns = profile.bulk_build_leaf_route_ns, .allocator_peak_bytes = budget.peak }, .{});
                 defer a.free(report);
                 std.debug.print("PARQUET_BULK_WORK {s}\n", .{report});
@@ -909,13 +909,27 @@ test "external lake execution private source caps narrow SST entry counts across
         try backend.beginBulkIngestSession();
         var fresh = FreshVectors.init(budget.allocator());
         defer fresh.deinit();
-        for (0..count) |row| {
+        for (0..32) |row| {
             var key: [32]u8 = undefined;
             try fresh.append("exact_vectors", try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row}), encoded);
-            // Match the thousands of ingest runs in a corpus-scale source.
-            if (row % 32 == 31) try fresh.flush(&backend);
         }
         try fresh.flush(&backend);
+        {
+            // Retired metadata may be reclaimed while this immutable cut
+            // continues to own its first source run.
+            var pinned = try backend.beginRead();
+            defer pinned.abort();
+            for (32..count) |row| {
+                var key: [32]u8 = undefined;
+                try fresh.append("exact_vectors", try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row}), encoded);
+                // Match the thousands of ingest runs in a corpus-scale source.
+                if (row % 32 == 31) try fresh.flush(&backend);
+            }
+            try fresh.flush(&backend);
+            try std.testing.expectEqualSlices(u8, encoded, try pinned.get(.{ .name = "exact_vectors" }, "row-00000000"));
+            var last_key: [32]u8 = undefined;
+            try std.testing.expectError(error.NotFound, pinned.get(.{ .name = "exact_vectors" }, try std.fmt.bufPrint(&last_key, "row-{d:0>8}", .{count - 1})));
+        }
         try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
         try backend.checkpointRecoveryManifest();
         try std.testing.expect(backend.runs.count() >= 2);

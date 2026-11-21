@@ -349,7 +349,19 @@ pub fn advance(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan
             const selected = try a.dupe(u8, row.key);
             const revision = (try optionalRevision(&read, selected)).?;
             const witness = verifier.verify(a, &read, root, selected[prefix.len + 32 ..], node) catch |err| switch (err) {
-                error.ArtifactPublicationPending, error.EnrichmentSourceChanged => null,
+                // A missing coverage-validation baseline (no protocol-16
+                // authority activation has run `artifact_producer_validation.begin`
+                // yet, e.g. a lower-protocol row with no witness to
+                // discover) is the same "not yet ready" shape as a pending
+                // publication, not a corruption: every other witness-style
+                // catch in this subsystem already tolerates it alongside
+                // these two (artifact_completion_progress.zig's `verify`/
+                // `discover` callers, artifact_chunk_publication.zig's
+                // fence binds, enrichment_runtime.zig's readiness checks).
+                // This was the one witness-pending catch site missing it,
+                // which turned an ordinary pending census into a hard
+                // failure instead of backing off.
+                error.ArtifactPublicationPending, error.ArtifactCoverageBaselinePending, error.EnrichmentSourceChanged => null,
                 else => return err,
             };
             try items.append(a, .{ .key = selected, .revision = revision, .witness = witness });
@@ -410,49 +422,104 @@ fn settle(txn: anytype, authority: publication.Authority, root: u128, selected: 
 /// Dependency closure comes from the pinned completion plan. A graph failure
 /// cannot block text whose producer requirements have already settled.
 pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, artifact: []const u8, inputs_empty: bool) !bool {
+    return sourcesComplete(alloc, txn, plan, root, &.{artifact}, inputs_empty, null);
+}
+
+/// Conjunction of sourceComplete for every generated requirement. Global
+/// serving/inspection needs every producer, so no per-source dependency
+/// closure is necessary: validate the shared authority once and each counter
+/// once. Keep sourceComplete for consumers needing only one producer closure.
+pub fn allSourcesComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, inputs_empty: bool, budget: ?*@import("artifact_scan_budget.zig").Budget) !bool {
     const requirements = if (plan.completion_plan) |*value| value else return false;
-    var relevant: std.StringHashMapUnmanaged(void) = .empty;
-    defer relevant.deinit(alloc);
-    try relevant.put(alloc, artifact, {});
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (requirements.nodes) |node| if ((relevant.contains(node.artifact) or relevant.contains(node.embedding)) and node.upstream.len != 0 and !relevant.contains(node.upstream)) {
-            try relevant.put(alloc, node.upstream, {});
-            changed = true;
-        };
+    if (budget) |b| {
+        try b.check();
+        if (requirements.nodes.len > b.max_visits -| b.visits) return error.ResourceBudgetExceeded;
     }
     const state = try loadAt(alloc, txn, enrollment_key);
     defer if (state) |value| value.deinit(alloc);
-    // A new empty owner has no registry until its first primary mutation.
-    // The caller proves absence through this same pinned transaction; a
-    // missing registry on any populated/unknown owner remains incomplete.
     if (state == null and inputs_empty) return true;
+    var authority_checked = false;
     for (requirements.nodes) |node| {
-        if ((node.kind != .generated and node.kind != .unit_children) or (!relevant.contains(node.artifact) and !relevant.contains(node.embedding))) continue;
-        const current = state orelse {
-            std.log.debug("producer source readiness pending: registry not published", .{});
-            return false;
-        };
-        if (!current.baseline or current.root != root) {
-            std.log.debug("producer source readiness pending: baseline={} root_current={}", .{ current.baseline, current.root == root });
-            return false;
+        if (budget) |b| try b.consume(node.artifact.len +| node.embedding.len +| node.upstream.len +| @sizeOf(@TypeOf(node)));
+        if (node.kind != .generated and node.kind != .unit_children) continue;
+        if (node.artifact.len == 0 and node.embedding.len == 0) continue;
+        const current = state orelse return false;
+        if (!authority_checked) {
+            if (!current.baseline or current.root != root) return false;
+            if (!try matchesDurableCatalog(txn, plan, current.authority)) return false;
+            if (!std.meta.eql((try publication.authority(txn)), @as(?publication.Authority, current.authority))) return false;
+            authority_checked = true;
         }
-        if (!try matchesDurableCatalog(txn, plan, current.authority)) {
-            std.log.debug("producer source readiness pending: catalog differs", .{});
-            return false;
-        }
-        if (!std.meta.eql((try publication.authority(txn)), @as(?publication.Authority, current.authority))) {
-            std.log.debug("producer source readiness pending: authority differs", .{});
-            return false;
-        }
-        const remaining = try count(txn, &counterKey(current.authority, current.root, node.id));
-        if (remaining != 0) {
-            std.log.debug("producer source readiness pending: {d} generated inputs", .{remaining});
-            return false;
+        if (try count(txn, &counterKey(current.authority, current.root, node.id)) != 0) return false;
+    }
+    if (budget) |b| try b.check();
+    return true;
+}
+
+/// Build the union of requested producer dependencies in O(nodes + edges + roots).
+/// Borrowed names and map storage belong to the caller's scratch allocator.
+fn sourceClosure(scratch: std.mem.Allocator, requirements: *const @import("artifact_completion_plan.zig").Plan, artifacts: []const []const u8, budget: ?*@import("artifact_scan_budget.zig").Budget) !std.StringHashMapUnmanaged(void) {
+    const Link = struct { upstream: []const u8, next: ?usize };
+    var heads: std.StringHashMapUnmanaged(usize) = .empty;
+    var links: std.ArrayList(Link) = .empty;
+    for (requirements.nodes) |node| {
+        if (budget) |b| try b.consume(@sizeOf(@TypeOf(node)) +| node.artifact.len +| node.embedding.len +| node.upstream.len);
+        if (node.upstream.len == 0) continue;
+        for ([_][]const u8{ node.artifact, node.embedding }, 0..) |name, position| {
+            if (position == 1 and std.mem.eql(u8, name, node.artifact)) continue;
+            const head = try heads.getOrPut(scratch, name);
+            const previous: ?usize = if (head.found_existing) head.value_ptr.* else null;
+            try links.append(scratch, .{ .upstream = node.upstream, .next = previous });
+            head.value_ptr.* = links.items.len - 1;
         }
     }
-    return true; // Authored sources have no asynchronous producer dependency.
+    var relevant: std.StringHashMapUnmanaged(void) = .empty;
+    var work: std.ArrayList([]const u8) = .empty;
+    for (artifacts) |artifact| {
+        if (budget) |b| try b.consume(artifact.len);
+        const found = try relevant.getOrPut(scratch, artifact);
+        if (!found.found_existing) try work.append(scratch, artifact);
+    }
+    while (work.pop()) |name| {
+        var next = heads.get(name);
+        while (next) |position| {
+            const link = links.items[position];
+            if (budget) |b| try b.consume(link.upstream.len);
+            const found = try relevant.getOrPut(scratch, link.upstream);
+            if (!found.found_existing) try work.append(scratch, link.upstream);
+            next = link.next;
+        }
+    }
+    return relevant;
+}
+
+/// Check only the producer closure consumed by this read. Catalog, authority,
+/// baseline and root fences remain shared; sibling producer debt is irrelevant.
+pub fn sourcesComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, artifacts: []const []const u8, inputs_empty: bool, budget: ?*@import("artifact_scan_budget.zig").Budget) !bool {
+    const requirements = if (plan.completion_plan) |*value| value else return false;
+    if (budget) |b| try b.check();
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer arena.deinit();
+    const relevant = try sourceClosure(arena.allocator(), requirements, artifacts, budget);
+    const state = try loadAt(alloc, txn, enrollment_key);
+    defer if (state) |value| value.deinit(alloc);
+    if (state == null and inputs_empty) return true;
+    var authority_checked = false;
+    for (requirements.nodes) |node| {
+        if (budget) |b| try b.consume(node.id.len +| node.artifact.len +| node.embedding.len);
+        if (node.kind != .generated and node.kind != .unit_children) continue;
+        if (!relevant.contains(node.artifact) and !relevant.contains(node.embedding)) continue;
+        const current = state orelse return false;
+        if (!authority_checked) {
+            if (!current.baseline or current.root != root) return false;
+            if (!try matchesDurableCatalog(txn, plan, current.authority)) return false;
+            if (!std.meta.eql((try publication.authority(txn)), @as(?publication.Authority, current.authority))) return false;
+            authority_checked = true;
+        }
+        if (try count(txn, &counterKey(current.authority, current.root, node.id)) != 0) return false;
+    }
+    if (budget) |b| try b.check();
+    return true;
 }
 
 // Local producers use the existing generation-fenced outcome writer, but
@@ -478,6 +545,28 @@ pub fn localScopeAlloc(alloc: std.mem.Allocator, index: []const u8, artifact: []
     for (requirements.nodes) |node| {
         if ((node.kind == .generated or node.kind == .unit_children) and (relevant.contains(node.artifact) or relevant.contains(node.embedding))) hash.update(&node.id);
     }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return std.mem.concat(alloc, u8, &.{ index, "\x00producer-source:", artifact, "\x00", &digest });
+}
+
+/// Traverse each dependency edge once. Hash selected requirement IDs in their
+/// original plan order so existing v2 coverage receipts remain valid.
+pub fn localScopeAllocWithBudget(alloc: std.mem.Allocator, index: []const u8, artifact: []const u8, plan: *const Manager.WritePlanSnapshot, budget: ?*@import("artifact_scan_budget.zig").Budget) ![]u8 {
+    if (budget) |b| try b.consume(index.len +| artifact.len);
+    const requirements = if (plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
+    if (budget) |b| if (requirements.nodes.len > b.max_visits -| b.visits) return error.ResourceBudgetExceeded;
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const relevant = try sourceClosure(scratch, requirements, &.{artifact}, budget);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:local-source-completion:v2:");
+    for (requirements.nodes) |node| {
+        if (budget) |b| try b.consume(node.id.len +| node.artifact.len +| node.embedding.len);
+        if ((node.kind == .generated or node.kind == .unit_children) and (relevant.contains(node.artifact) or relevant.contains(node.embedding))) hash.update(&node.id);
+    }
+    if (budget) |b| try b.check();
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return std.mem.concat(alloc, u8, &.{ index, "\x00producer-source:", artifact, "\x00", &digest });
@@ -580,6 +669,25 @@ test "privacy ordered artifact inventory producer readiness isolates streams and
     var plan: Manager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{}, .artifact_catalogs = .{}, .catalog_empty = @splat(true), .completion_plan = .{ .arena = std.heap.ArenaAllocator.init(a), .catalog = authority.catalog_digest, .digest = authority.catalog_digest, .nodes = &nodes, .providers = &.{}, .definitions = .empty } };
     defer plan.completion_plan.?.deinit();
     try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text", false));
+    try std.testing.expect(try sourcesComplete(a, &memory, &plan, 1, &.{"text"}, false, null));
+    try std.testing.expect(!try sourcesComplete(a, &memory, &plan, 1, &.{ "text", "relations" }, false, null));
+    try std.testing.expect(!try sourcesComplete(a, &memory, &plan, 2, &.{"text"}, false, null));
+    var closure_limited: @import("artifact_scan_budget.zig").Budget = .{ .max_visits = 2, .max_bytes = 4096 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, sourcesComplete(a, &memory, &plan, 1, &.{"text"}, false, &closure_limited));
+    try std.testing.expect(!try allSourcesComplete(a, &memory, &plan, 1, false, null));
+    try std.testing.expect(try settle(&memory, authority, 1, graph, current));
+    try std.testing.expect(try allSourcesComplete(a, &memory, &plan, 1, false, null));
+    try std.testing.expect(!try allSourcesComplete(a, &memory, &plan, 2, false, null));
+    try publication.stageAuthority(&memory, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch + 1, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+    try std.testing.expect(!try allSourcesComplete(a, &memory, &plan, 1, false, null));
+    try publication.stageAuthority(&memory, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+    var expired: @import("artifact_scan_budget.zig").Budget = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, allSourcesComplete(a, &memory, &plan, 1, false, &expired));
+    var limited: @import("artifact_scan_budget.zig").Budget = .{ .max_visits = 1, .max_bytes = 4096 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, allSourcesComplete(a, &memory, &plan, 1, false, &limited));
+    // Restore sibling debt for the original source-isolation assertions.
+    try putNumber(&memory, &counterKey(authority, 1, ids[1]), 1);
+    try putNumber(&memory, graph, current);
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "relations", false));
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 2, "text", false));
     try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "authored", false));
@@ -599,6 +707,8 @@ test "privacy ordered artifact inventory producer readiness isolates streams and
     try memory.delete(enrollment_key);
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text", false));
     try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text", true));
+    try std.testing.expect(!try allSourcesComplete(a, &memory, &plan, 1, false, null));
+    try std.testing.expect(try allSourcesComplete(a, &memory, &plan, 1, true, null));
 }
 
 test "privacy producer readiness local source receipts exclude upstream and sibling graph outputs" {
@@ -683,4 +793,57 @@ test "privacy readiness enrollment leaves large checkpoints unchanged and status
     try memory.put(enrollment_key, before);
     try std.testing.expectError(error.ArtifactCatalogCorrupt, mark(a, &memory, authority, "doc"));
     try std.testing.expectEqual(@as(u64, 100), try count(&memory, &scopedPrefix(revision_prefix, authority, 1)));
+}
+
+test "privacy producer readiness budgeted scope is linear and preserves long chain receipt identity" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const length = 256;
+    const Node = @import("artifact_completion_plan.zig").Node;
+    const nodes = try scratch.alloc(Node, length);
+    const names = try scratch.alloc([]const u8, length);
+    for (names, 0..) |*name, i| name.* = try std.fmt.allocPrint(scratch, "source-{d}", .{i});
+    for (nodes, 0..) |*node, i| {
+        var id: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, id[0..8], i + 1, .little);
+        node.* = .{ .id = id, .kind = .generated, .scope = .document, .name = names[i], .artifact = names[i], .upstream = if (i == 0) "" else names[i - 1] };
+    }
+    // Starting at the final node takes one whole-plan pass per ancestor in
+    // the legacy fixed-point walk. The bounded path must finish in O(nodes).
+    var plan: Manager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{}, .completion_plan = .{ .arena = std.heap.ArenaAllocator.init(a), .catalog = @splat(2), .digest = @splat(3), .nodes = nodes, .providers = &.{}, .definitions = .empty } };
+    defer plan.completion_plan.?.deinit();
+    var budget: @import("artifact_scan_budget.zig").Budget = .{ .max_visits = 4 * length, .max_bytes = 1024 * 1024 };
+    const observed = try localScopeAllocWithBudget(a, "search", names[length - 1], &plan, &budget);
+    defer a.free(observed);
+    const legacy = try localScopeAlloc(a, "search", names[length - 1], &plan);
+    defer a.free(legacy);
+    try std.testing.expectEqualSlices(u8, legacy, observed);
+    try std.testing.expect(budget.visits <= 3 * length + 1);
+    var limited: @import("artifact_scan_budget.zig").Budget = .{ .max_visits = length + 2, .max_bytes = 1024 * 1024 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, localScopeAllocWithBudget(a, "search", names[length - 1], &plan, &limited));
+    var expired: @import("artifact_scan_budget.zig").Budget = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, localScopeAllocWithBudget(a, "search", names[length - 1], &plan, &expired));
+}
+
+test "privacy producer readiness budgeted scope preserves shared producer and embedding aliases" {
+    const a = std.testing.allocator;
+    const Node = @import("artifact_completion_plan.zig").Node;
+    const nodes = [_]Node{
+        .{ .id = @splat(1), .kind = .generated, .scope = .document, .name = "left", .artifact = "leaf", .upstream = "shared" },
+        .{ .id = @splat(2), .kind = .generated, .scope = .document, .name = "right", .artifact = "leaf", .embedding = "alias", .upstream = "other" },
+        .{ .id = @splat(3), .kind = .unit_children, .scope = .upstream_units, .name = "shared", .artifact = "shared", .upstream = "base" },
+        .{ .id = @splat(4), .kind = .generated, .scope = .document, .name = "other", .artifact = "other", .upstream = "base" },
+    };
+    var plan: Manager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{}, .completion_plan = .{ .arena = std.heap.ArenaAllocator.init(a), .catalog = @splat(2), .digest = @splat(3), .nodes = &nodes, .providers = &.{}, .definitions = .empty } };
+    defer plan.completion_plan.?.deinit();
+    for ([_][]const u8{ "leaf", "alias", "shared", "absent" }) |source| {
+        var budget: @import("artifact_scan_budget.zig").Budget = .{ .max_visits = 32, .max_bytes = 16384 };
+        const observed = try localScopeAllocWithBudget(a, "search", source, &plan, &budget);
+        defer a.free(observed);
+        const legacy = try localScopeAlloc(a, "search", source, &plan);
+        defer a.free(legacy);
+        try std.testing.expectEqualSlices(u8, legacy, observed);
+    }
 }

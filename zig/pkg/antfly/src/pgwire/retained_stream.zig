@@ -50,7 +50,7 @@ pub fn Bridge(comptime Host: type) type {
             const binding = try host.binding(a, start, request);
             const req = try host.request(request);
             errdefer host.failedOpen();
-            const owner = try retained.Owner.open(host.service, host.registry, host, a, host.id, start.slot, host.actor, @backingInt(start.position), binding, host.config, req);
+            const owner = try retained.Owner.open(host.service, host.registry, host, request.scratch_allocator orelse a, host.id, start.slot, host.actor, @backingInt(start.position), binding, host.config, req);
             self.* = .{ .allocator = a, .host = host, .owner = owner };
             return .{ .context = self, .initial_lsn = @fromBackingInt(owner.initial_lsn), .resume_lsn = @fromBackingInt(owner.resume_lsn), .initial_end_lsn = @fromBackingInt(owner.initial_end_lsn), .poll = poll, .feedback = feedback, .close = close };
         }

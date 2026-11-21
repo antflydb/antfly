@@ -50,11 +50,14 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
 }
 
 pub const Error = @import("source_transaction_errors.zig").Error || operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+    ResourceBudgetExceeded,
     RetainedEffectsFull,
     AuthoritativeLookupMissing,
     TopologyChanged,
     IdentityReadGenerationChanged,
     IndexGenerationMismatch,
+    IndexRebuilding,
+    IncompletePublishedSnapshot,
     GenerationTransitionActive,
     HierarchyCursorStale,
     DocumentArtifactPublicationFailed,
@@ -307,6 +310,8 @@ pub const Operations = struct {
             error.TopologyChanged => error.TopologyChanged,
             error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
             error.IndexGenerationMismatch => error.IndexGenerationMismatch,
+            error.IndexRebuilding => error.IndexRebuilding,
+            error.IncompletePublishedSnapshot => error.IncompletePublishedSnapshot,
             error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
             error.DocumentArtifactPublicationFailed => error.DocumentArtifactPublicationFailed,
@@ -720,9 +725,24 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            // All four are raised before any Raft proposal for this txn: a
+            // leader/term/incarnation check (NotLeader) or a stale/unavailable
+            // local catalog snapshot (CatalogRoutingSnapshotTimeout), same as
+            // the two below. Nothing was proposed, so GroupLeaderUnavailable's
+            // "definitely not proposed, safe to retry another candidate or
+            // wait" contract holds. Omitting NotLeader/CatalogRoutingSnapshotTimeout
+            // here previously fell through to the generic `error.Internal` ->
+            // HTTP 500 below, which a client cannot safely retry (a 500 does
+            // not prove nothing was applied) -- turning an ordinary transient
+            // "not currently the leader" or "catalog view not yet caught up"
+            // condition (e.g. right after a Raft leader election following a
+            // network partition) into a permanent failure for the whole
+            // cross-group transaction.
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.MetadataSnapshotUnavailable,
+            error.NotLeader,
+            error.CatalogRoutingSnapshotTimeout,
             => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
@@ -782,9 +802,15 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            // See the matching comment in txnBegin: NotLeader and
+            // CatalogRoutingSnapshotTimeout are both raised before this
+            // prepare is proposed and belong in the same "definitely not
+            // proposed" bucket as the three below.
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.MetadataSnapshotUnavailable,
+            error.NotLeader,
+            error.CatalogRoutingSnapshotTimeout,
             => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
@@ -1152,6 +1178,7 @@ pub const Operations = struct {
         return (reads.documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, .read_index, .{ .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
+                error.ResourceBudgetExceeded => error.ResourceBudgetExceeded,
                 error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,
                 else => error.Internal,
             };
@@ -1822,6 +1849,39 @@ fn consumerTests() type {
                 "docs",
                 .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
             ));
+
+            // NotLeader (a leader/term/incarnation check failing before any
+            // proposal) and CatalogRoutingSnapshotTimeout (a stale/unavailable
+            // local catalog snapshot, also checked before proposing) are both
+            // raised pre-decision, the same as LeaderUnavailable and
+            // MetadataSnapshotUnavailable above. A network partition that
+            // forces a Raft leader election, or otherwise disrupts catalog
+            // sync, routinely produces these on the node a client happens to
+            // have cached as "the leader." Regression for a prior gap where
+            // both fell through to the generic error.Internal (-> HTTP 500),
+            // which a client cannot safely retry against another candidate
+            // (a 500 does not prove nothing was applied) -- turning an
+            // ordinary transient condition into a permanent failure for the
+            // whole cross-group transaction instead of the "definitely not
+            // proposed, try the next candidate or wait" GroupLeaderUnavailable
+            // contract.
+            for ([_]anyerror{ error.NotLeader, error.CatalogRoutingSnapshotTimeout }) |failure| {
+                context_deadline_source.failure = failure;
+                try std.testing.expectError(error.GroupLeaderUnavailable, context_deadline_operations.txnBegin(
+                    std.testing.allocator,
+                    .{},
+                    7,
+                    "docs",
+                    .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+                ));
+                try std.testing.expectError(error.GroupLeaderUnavailable, context_deadline_operations.txnPrepare(
+                    std.testing.allocator,
+                    .{},
+                    7,
+                    "docs",
+                    .{ .txn_id = txn_id, .req = .{} },
+                ));
+            }
         }
 
         test "typed routed batch preserves forwarding cancellation and identity conflicts" {
@@ -2253,6 +2313,7 @@ fn consumerTests() type {
                 Operations.mapCommonReadError(error.CatalogRoutingUnavailable).?,
             );
             const FakeReads = struct {
+                artifact_error: anyerror = error.StorageReadTemporarilyUnavailable,
                 scan_error: anyerror = error.StorageReadTemporarilyUnavailable,
 
                 fn source(self: *@This()) table_reads.TableReadSource {
@@ -2267,6 +2328,7 @@ fn consumerTests() type {
                         .text_stats_group_local = auxiliary,
                         .algebraic_partials_group_local = auxiliary,
                         .document_artifact_manifest_group_local = artifact,
+                        .document_artifact_manifest_group_local_controlled = artifactControlled,
                         .document_artifact_manifests_group_local = artifacts,
                     } };
                 }
@@ -2288,12 +2350,14 @@ fn consumerTests() type {
                     return null;
                 }
 
-                fn groupQuery(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn groupQuery(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.scan_error;
                 }
 
-                fn groupPreflight(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?runtime_preflight.RuntimePreflightSummary {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn groupPreflight(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?runtime_preflight.RuntimePreflightSummary {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.scan_error;
                 }
 
                 fn groupScan(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
@@ -2313,8 +2377,13 @@ fn consumerTests() type {
                     return error.StorageReadTemporarilyUnavailable;
                 }
 
-                fn artifact(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn artifactControlled(raw: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, key: []const u8, name: []const u8, consistency: raft_mod.ReadConsistency, _: db_mod.types.LookupOptions) !?db_mod.types.DocumentArtifactManifest {
+                    return artifact(raw, allocator, group, table, key, name, consistency);
+                }
+
+                fn artifact(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.artifact_error;
                 }
 
                 fn artifacts(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
@@ -2331,6 +2400,8 @@ fn consumerTests() type {
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.algebraicPartials(alloc, .{}, 7, "docs", "{}"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "chunks"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifests(alloc, .{}, 7, "docs", "doc:a"));
+            fake.artifact_error = error.ResourceBudgetExceeded;
+            try std.testing.expectError(error.ResourceBudgetExceeded, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "dense"));
             try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.NotLeader));
             try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.UnknownGroup));
             try std.testing.expectEqual(
@@ -2338,6 +2409,11 @@ fn consumerTests() type {
                 mapLookupError(error.ResourceBudgetExceeded),
             );
             try std.testing.expectEqual(error.Internal, mapLookupError(error.CorruptInput));
+            for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |failure| {
+                fake.scan_error = failure;
+                try std.testing.expectError(failure, operations.query(alloc, .{}, 7, "docs", .{}));
+                try std.testing.expectError(failure, operations.queryPreflight(alloc, .{}, 7, "docs", .{}, 0));
+            }
             for (storage_descriptor_errors.failures) |failure| {
                 fake.scan_error = failure;
                 try std.testing.expectEqual(error.StorageReadTemporarilyUnavailable, Operations.mapCommonReadError(failure).?);

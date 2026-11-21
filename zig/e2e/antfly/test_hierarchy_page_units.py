@@ -181,3 +181,190 @@ def test_page_unit_cursor_survives_reopen_and_fences_source_changes(storage_engi
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+@pytest.mark.real_model
+@pytest.mark.e2e_resource("antfly_process")
+def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
+    binary = os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
+    server = harness.StandaloneAntflyServer(
+        binary, "127.0.0.1", 0, storage_engine="lite", inference_host_budget_mb=6144
+    )
+    failed = True
+    try:
+        root = server.api_url + "/tables/pages"
+
+        def api(method, path, body=None):
+            response = requests.request(method, root + path, json=body, timeout=180)
+            assert response.ok, response.text
+            return response.json()
+
+        api("POST", "", {"num_shards": 1})
+        api(
+            "POST",
+            "/indexes/images",
+            {
+                "type": "embeddings",
+                "dimension": 768,
+                "embedding_name": "visual",
+                "field": "url",
+                "embedder": {
+                    "provider": "antfly",
+                    "model": harness.EMBEDDINGGEMMA2_MODEL,
+                },
+                "enrichments": [
+                    {
+                        "name": "visual",
+                        "kind": "embedding",
+                        "field": "url",
+                        "embedding_input": "pdf_page_images",
+                        "expected_dims": 768,
+                    }
+                ],
+            },
+        )
+        api(
+            "POST",
+            "/indexes/image_sources",
+            {
+                "type": "embeddings",
+                "dimension": 768,
+                "sources": [{"artifact": "visual"}],
+            },
+        )
+        cardinality_change = requests.put(
+            root + "/artifacts/visual/enrichment",
+            json={
+                "kind": "embedding",
+                "field": "url",
+                "embedding_input": "text",
+                "expected_dims": 768,
+            },
+            timeout=30,
+        )
+        assert cardinality_change.status_code == 409, cardinality_change.text
+
+        indexes = ("images", "image_sources")
+
+        def published(expected):
+            for index in indexes:
+                status = api("GET", "/indexes/" + index)["status"]
+                if (
+                    not status.get("publication", {}).get("complete")
+                    or status.get("searchable_vectors", 0) != expected
+                ):
+                    return False
+            return True
+
+        fixtures = Path(__file__).resolve().parents[2] / "lib/pdf/testdata"
+        for filename, pages in (
+            ("simple_text_fixture.pdf", 1),
+            ("two_page_text_fixture.pdf", 2),
+            ("simple_text_fixture.pdf", 1),
+        ):
+            pdf = (fixtures / filename).read_bytes()
+            url = "data:application/pdf;base64," + base64.b64encode(pdf).decode()
+            api(
+                "POST",
+                "/batch",
+                {
+                    "inserts": {"one": {"url": url, "filename": filename}},
+                    "sync_level": "write",
+                },
+            )
+
+            assert wait_until(
+                lambda expected=pages: published(expected),
+                timeout_s=180,
+                interval_s=0.25,
+            ), server.debug_logs()
+            page_ids = {f"page:{page:06d}" for page in range(1, pages + 1)}
+            for extra in (
+                {},
+                {
+                    "hierarchy": {
+                        "ancestors": {
+                            "source": {"fields": ["filename"]},
+                            "unit": {"fields": ["unit_id"]},
+                        }
+                    }
+                },
+            ):
+                result = api(
+                    "POST",
+                    "/query",
+                    {
+                        "indexes": ["images"],
+                        "semantic_search": "brass lantern",
+                        "fields": [],
+                        "limit": pages,
+                        "profile": True,
+                        **extra,
+                    },
+                )["responses"][0]
+                assert result["status"] == 200, result
+                assert result["profile"]["dense_search"]["raw_hit_count"] == pages
+                hits = result["hits"]["hits"]
+                if extra:
+                    assert len(hits) == pages, result
+                    for hit in hits:
+                        ancestors = hit["hierarchy"]["ancestors"]
+                        assert ancestors["source"]["document"] == {"filename": filename}
+                        assert ancestors["unit"]["document"] == {
+                            "unit_id": hit["hierarchy"]["artifact"]["unit_id"]
+                        }
+                    assert {hit["hierarchy"]["parent_doc_key"] for hit in hits} == {
+                        "one"
+                    }
+                    assert {
+                        hit["hierarchy"]["artifact"]["unit_id"] for hit in hits
+                    } == page_ids
+                else:
+                    assert [hit["_id"] for hit in hits] == ["one"], result
+                    assert (
+                        hits[0]["hierarchy"]["matched_artifact"]["unit_id"] in page_ids
+                    )
+
+            for index in indexes:
+                grouped = api(
+                    "POST",
+                    "/query",
+                    {
+                        "indexes": [index],
+                        "embeddings": {index: [1.0] + [0.0] * 767},
+                        "limit": pages,
+                        "fields": ["unit_id", "provenance.page_number"],
+                        "hierarchy": {"group_by": {"level": "unit"}},
+                    },
+                )["responses"][0]
+                assert grouped["status"] == 200, grouped
+                documents = [hit["_source"] for hit in grouped["hits"]["hits"]]
+                assert {row["unit_id"] for row in documents} == page_ids, grouped
+                assert {row["provenance"]["page_number"] for row in documents} == set(
+                    range(1, pages + 1)
+                )
+
+        api(
+            "POST",
+            "/batch",
+            {"inserts": {"one": {"filename": "no-url"}}, "sync_level": "write"},
+        )
+
+        assert wait_until(lambda: published(0), timeout_s=90, interval_s=0.25), (
+            server.debug_logs()
+        )
+        for extra in ({}, {"hierarchy": {}}):
+            result = api(
+                "POST",
+                "/query",
+                {
+                    "indexes": ["images"],
+                    "semantic_search": "brass lantern",
+                    "fields": [],
+                    **extra,
+                },
+            )["responses"][0]
+            assert result["status"] == 200 and result["hits"]["hits"] == [], result
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

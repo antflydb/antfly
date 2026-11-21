@@ -149,7 +149,7 @@ pub fn supportsRangeGuards(server: *const http_server.ApiHttpServer) bool {
 fn rejectTransactionalDdl(statement: ast.Statement) !void {
     // Catalog and publication operations have their own durable commit
     // boundary; a surrounding SQL ROLLBACK cannot undo them.
-    if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.UnsupportedSqlExecution;
+    if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.SqlDdlInTransaction;
 }
 
 const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
@@ -172,6 +172,7 @@ pub const Adapter = struct {
     database: []const u8 = "default",
     namespace: []const u8 = "public",
     /// Borrowed from the pinned connection request, never retained by a plan.
+    ddl_guard: ?@import("sql_ddl_binding.zig").Guard = null,
     ddl_search_path: ?*const @import("../pgwire/search_path.zig").Path = null,
     decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
     /// Pgwire retains the original durable owner scope independently of its
@@ -180,6 +181,7 @@ pub const Adapter = struct {
     inherit_session_database: bool = false,
     inherit_session_namespace: bool = false,
     revision: ?u64 = null,
+    missing_target_epoch: ?@import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch = null,
     target: ?system_catalog.Target = null,
     outcome_transaction_id: ?[32]u8 = null,
     session_id: ?[]const u8 = null,
@@ -197,6 +199,7 @@ pub const Adapter = struct {
     dynamic_table: ?[]const u8 = null,
     ranges_staged: bool = false,
     inserting: bool = false,
+    index_attribution_sink: ?@import("cypher").backend.IndexObserver = null,
     prepared_bindings: ?[]const @import("sql_prepared.zig").Binding = null,
     setting_overlay: []const setting_catalog.OverlayEntry = &.{},
     /// Pgwire supplies its own connection-owned overlay. HTTP attached
@@ -208,6 +211,9 @@ pub const Adapter = struct {
     /// statement. Owner verification still fences every scan against the
     /// exact serving generation, including a publication changed mid-read.
     policy_proofs: ?std.AutoHashMapUnmanaged(u64, ?[]u8) = null,
+    /// All graph inputs of one SQL execution reuse the first catalog cut for
+    /// each immutable table ID. Owned separately from transient bind arenas.
+    statement_index_catalogs: ?std.AutoHashMapUnmanaged(u64, []u8) = null,
     graph_parameters: []const std.json.Value = &.{},
     graph_parameter_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null,
     /// Materialize only arguments actually crossing into a graph expression;
@@ -230,6 +236,10 @@ pub const Adapter = struct {
         return self.graph_parameters[index - 1];
     }
 
+    fn bindIndexAttribution(ptr: *anyopaque, sink: ?@import("cypher").backend.IndexObserver) void {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        self.index_attribution_sink = sink;
+    }
     pub fn decisionRuntime(self: *Adapter) !?@import("antfly_local_sources").functions_runtime.Runtime {
         if (self.server.cfg.node_config) |config| {
             if (config.registry.decider_configs.count() > 0) {
@@ -278,6 +288,9 @@ pub const Adapter = struct {
             zig017_return_error = error.InvalidSqlBackendResponse;
             break :zig017_failure error.InvalidSqlBackendResponse;
         };
+        if (self.statement_index_catalogs != null) return error.InvalidSqlBackendResponse;
+        self.statement_index_catalogs = .empty;
+        defer self.releaseIndexCatalogs();
         self.policy_proofs = .empty;
         defer {
             var proofs = &self.policy_proofs.?;
@@ -635,7 +648,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .distributed_join = self.server.cfg.distributed_sql_join, .distributed_context = self.context, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .index_attribution = .{ .ptr = self, .bind = bindIndexAttribution }, .distributed_join = self.server.cfg.distributed_sql_join, .distributed_context = self.context, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -695,7 +708,7 @@ pub const Adapter = struct {
 
     fn ddl(ptr: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        return @import("sql_catalog.zig").executeWithAllocators(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path);
+        return @import("sql_catalog.zig").executeBound(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path, self.ddl_guard);
     }
 
     fn checkpoint(ptr: *anyopaque) !void {
@@ -736,9 +749,12 @@ pub const Adapter = struct {
         if (!try http_server.resourcePermissionCurrentlyAllowed(self.identity.*, .graph, definition.name.table, .read)) return error.Forbidden;
         const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .read = .{ .kind = .graph, .name = definition.name.table } });
         const state = try std.json.parseFromSliceLeaky(system_catalog.State, alloc, bytes, .{ .allocate = .alloc_always });
+        // Resolve the label tables at the same logical cut as the mapping.
+        if (self.revision) |revision| if (revision != state.revision) return error.CatalogGenerationChanged;
+        self.revision = state.revision;
         const record = state.find(.graph, 0, definition.name.table) orelse return error.CatalogNotFound;
         const cypher = @import("cypher");
-        const graph = try system_catalog.graphForExecution(alloc, record);
+        var graph = try system_catalog.graphForExecution(alloc, record);
         const logical = try cypher.catalog.parseDefinition(alloc, record.name, graph.incarnation, graph.revision, record.source_json);
         var targets: std.ArrayList(system_catalog.Target) = .empty;
         const positions = try alloc.alloc(usize, logical.labels.len);
@@ -753,6 +769,8 @@ pub const Adapter = struct {
             };
         }
         const dependencies = try self.resolveMany(alloc, targets.items, .read);
+        const resolved_record = try @import("../system_catalog/graph_bindings.zig").resolveAliases(alloc, record, dependencies);
+        graph = try system_catalog.graphForExecution(alloc, resolved_record);
         for (@constCast(graph.labels), positions) |*physical, position| {
             const target = targets.items[position];
             const table = dependencies[position];
@@ -763,7 +781,7 @@ pub const Adapter = struct {
         }
         try cypher.binder.validate(alloc, graph, definition.query);
         const binding = try alloc.create(catalog.graph_relation.Binding);
-        binding.* = .{ .definition = definition, .graph = graph, .catalog_json = try std.json.Stringify.valueAlloc(alloc, record, .{}), .dependencies = dependencies };
+        binding.* = .{ .definition = definition, .graph = graph, .catalog_json = try std.json.Stringify.valueAlloc(alloc, resolved_record, .{}), .dependencies = dependencies };
         const table: catalog.Table = .{ .id = record.id, .physical_name = record.name, .schema_version = 1, .storage_mode = .document, .columns = try catalog.graph_relation.columns(alloc, binding.*), .scope = .{ .database = database, .namespace = namespace, .name = record.name, .revision = state.revision }, .graph = binding };
         try self.recordPreparedBinding(alloc, table);
         return table;
@@ -792,27 +810,63 @@ pub const Adapter = struct {
             }
         }
         if (!self.server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
-        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .expected_revision = self.revision } });
+        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .include_source_epoch = self.context.bound_catalog_incarnation != null, .expected_revision = self.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
+        try self.context.checkCatalogIncarnation(snapshot.source_epoch);
+        if (self.revision) |revision| if (revision != snapshot.revision) return error.CatalogGenerationChanged;
+        if (self.missing_target_epoch) |epoch| if (snapshot.source_epoch == null or !epoch.eql(snapshot.source_epoch.?)) return error.CatalogGenerationChanged;
         if (snapshot.tables.len != targets.len) return error.InvalidSqlBackendResponse;
+        // An absent higher-priority search-path candidate is part of this read cut.
+        self.revision = snapshot.revision;
         const bindings = try alloc.alloc(catalog.Table, targets.len);
-        for (targets, snapshot.tables, bindings) |target, resolved, *binding| binding.* = try self.bindResolved(alloc, target, resolved, snapshot.revision, action);
+        for (targets, snapshot.tables, bindings) |target, resolved, *binding| {
+            const table = resolved orelse {
+                // Legacy default.public physical tables can change without
+                // changing the logical namespace revision.
+                self.missing_target_epoch = snapshot.source_epoch;
+                return error.TableNotFound;
+            };
+            binding.* = try self.bindResolved(alloc, target, table, snapshot.revision, action);
+        }
         return bindings;
     }
 
-    fn bindResolved(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, resolved: ?system_catalog.ResolvedTable, revision: u64, action: catalog.Action) !catalog.Table {
+    fn releaseIndexCatalogs(self: *Adapter) void {
+        if (self.statement_index_catalogs) |*cuts| {
+            var values = cuts.valueIterator();
+            while (values.next()) |bytes| self.server.alloc.free(bytes.*);
+            cuts.deinit(self.server.alloc);
+            self.statement_index_catalogs = null;
+        }
+    }
+    fn bindIndexCatalog(self: *Adapter, out: std.mem.Allocator, table_id: u64, indexes_json: []const u8) ![]const u8 {
+        if (self.statement_index_catalogs) |*cuts| if (cuts.get(table_id)) |cut| return out.dupe(u8, cut);
+        const projected = if (std.mem.indexOf(u8, indexes_json, "_index_aliases") != null or std.mem.indexOfScalar(u8, indexes_json, '\\') != null)
+            try self.server.index_alias_cache.project(self.server.alloc, out, indexes_json)
+        else
+            try out.dupe(u8, "{}");
+        errdefer out.free(projected);
+        if (self.statement_index_catalogs) |*cuts| {
+            const owned = try self.server.alloc.dupe(u8, projected);
+            errdefer self.server.alloc.free(owned);
+            try cuts.put(self.server.alloc, table_id, owned);
+        }
+        return projected;
+    }
+
+    fn bindResolved(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, table: system_catalog.ResolvedTable, revision: u64, action: catalog.Action) !catalog.Table {
         const logical = try target.resourceNameAlloc(alloc);
-        const table = resolved orelse return error.TableNotFound;
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
+        binding.index_catalog_json = try self.bindIndexCatalog(alloc, table.table_id, definition.indexes_json);
         if (binding.external_base_source != null and action != .read and action != .admin) return error.ExternalLakeReadOnly;
         if (binding.external_base_source != null) binding.external_indexes = .{
             .catalog_json = definition.lake_index_catalog_json,
             .object_generation = definition.object_storage_generation,
             .indexes_json = definition.indexes_json,
             .schema_json = definition.schema_json,
-            .desired = @import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(.{
+            .desired = try @import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(alloc, .{
                 .table_id = table.table_id,
                 .name = table.name,
                 .schema_json = definition.schema_json,
@@ -821,7 +875,6 @@ pub const Adapter = struct {
             }),
         };
         binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = revision };
-        self.revision = revision;
         self.target = target;
         try self.recordPreparedBinding(alloc, binding);
         if (self.identity.*) |*identity| try http_server.projectCatalogIdentity(self.server.alloc, identity, logical, table.name);
@@ -851,22 +904,19 @@ pub const Adapter = struct {
             // One linearizable revision-fenced batch for every logical binding.
             // The revision fences schemas and policy publications as well as IDs.
             const targets = try a.alloc(system_catalog.Target, binding.dependencies.len);
-            var revision: ?u64 = null;
+            const revision = (table.scope orelse return error.InvalidSqlBackendResponse).revision;
             for (binding.dependencies, targets) |dependency, *target| {
                 const scope = dependency.scope orelse return error.InvalidSqlBackendResponse;
-                if (revision) |expected| {
-                    if (expected != scope.revision) return error.CatalogGenerationChanged;
-                } else revision = scope.revision;
+                if (revision != scope.revision) return error.CatalogGenerationChanged;
                 target.* = .{ .database = scope.database, .namespace = scope.namespace, .table = scope.name };
             }
-            if (revision) |expected| {
-                const bytes = try self.server.source.systemCatalog(a, self.context, .{ .resolve_many = .{ .targets = targets, .expected_revision = expected } });
-                const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
-                if (snapshot.revision != expected or snapshot.tables.len != binding.dependencies.len) return error.CatalogGenerationChanged;
-                for (snapshot.tables, binding.dependencies) |maybe_current, dependency| {
-                    const current = maybe_current orelse return error.CatalogGenerationChanged;
-                    if (current.table_id != dependency.id or !std.mem.eql(u8, current.name, dependency.physical_name)) return error.CatalogGenerationChanged;
-                }
+            const bytes = try self.server.source.systemCatalog(a, self.context, .{ .resolve_many = .{ .targets = targets, .expected_revision = revision, .include_source_epoch = self.context.bound_catalog_incarnation != null } });
+            const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
+            try self.context.checkCatalogIncarnation(snapshot.source_epoch);
+            if (snapshot.revision != revision or snapshot.tables.len != binding.dependencies.len) return error.CatalogGenerationChanged;
+            for (snapshot.tables, binding.dependencies) |maybe_current, dependency| {
+                const current = maybe_current orelse return error.CatalogGenerationChanged;
+                if (current.table_id != dependency.id or !std.mem.eql(u8, current.name, dependency.physical_name)) return error.CatalogGenerationChanged;
             }
             return;
         }
@@ -877,8 +927,9 @@ pub const Adapter = struct {
         // statement. The coordinator still applies its own durable auth fence.
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const target: system_catalog.Target = .{ .database = scope.database, .namespace = scope.namespace, .table = scope.name };
-        const bytes = try self.server.source.systemCatalog(temporary, self.context, .{ .resolve_many = .{ .targets = &.{target}, .expected_revision = scope.revision } });
+        const bytes = try self.server.source.systemCatalog(temporary, self.context, .{ .resolve_many = .{ .targets = &.{target}, .include_source_epoch = self.context.bound_catalog_incarnation != null, .expected_revision = scope.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, temporary, bytes, .{});
+        try self.context.checkCatalogIncarnation(snapshot.source_epoch);
         if (snapshot.revision != scope.revision or snapshot.tables.len != 1) return error.CatalogGenerationChanged;
         const current = snapshot.tables[0] orelse return error.CatalogGenerationChanged;
         if (current.table_id != table.id or !std.mem.eql(u8, current.name, table.physical_name)) return error.CatalogGenerationChanged;
@@ -2300,7 +2351,7 @@ pub const Adapter = struct {
         }
         owner.* = .{ .a = a, .adapter = self, .guard_tables = guard_tables.items, .arena = arena, .read = read, .cursors = try owned.alloc(catalog.Cursor, requests.len) };
         errdefer for (owner.cursors[0..owner.opened]) |cursor| cursor.close(cursor.ptr);
-        owner.authority = .{ .server = self.server, .identity = self.identity, .context = self.context, .name = graph.graph.name, .record_id = graph.graph.incarnation, .tables = inputs, .writes = false, .read = &owner.read, .role_revision = role_revision };
+        owner.authority = .{ .server = self.server, .identity = self.identity, .context = self.context, .name = graph.graph.name, .record_id = graph.graph.incarnation, .index_catalogs = tables.items, .attribution_sink = self.index_attribution_sink, .attribution_allocator = owned, .tables = inputs, .writes = false, .read = &owner.read, .role_revision = role_revision };
         owner.authority.catalog_guard = .{ .ptr = owner, .call = GraphStatement.validateCatalog };
         const authority = &owner.authority;
         var client: cypher.rpc.Client = .{ .channel = authority.rpcChannel(), .incarnation = graph.graph.incarnation, .revision = graph.graph.revision };
@@ -2620,7 +2671,7 @@ pub const Adapter = struct {
             defer if (tables[0].conflict_guards) |*owned| owned.deinit();
             if (guards) |value| try tables[0].mergeConflictGuards(alloc, value);
             var bindings = [_]txn.CatalogBinding{.{ .logical = logical, .physical = table.physical_name }};
-            const statement = txn.OwnedTransactionCommitRequest{ .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1, .pointer_stability = .{} } };
+            const statement = txn.OwnedTransactionCommitRequest{ .bound_catalog_incarnation = self.context.bound_catalog_incarnation, .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1, .pointer_stability = .{} } };
             if (!(try self.server.transactionRequestAuthorized(self.identity.*, statement))) return error.Forbidden;
             _ = (try self.server.txn_sessions.stageValidated(self.server.alloc, id, &statement, .{ .ptr = self, .validate = validateStaged })) orelse return error.SqlTransactionNotActive;
             self.ranges_staged = true;
@@ -2789,7 +2840,7 @@ test "SQL transaction rejects policy definition and publication DDL before dispa
     }) |sql| {
         var compiled = try @import("antfly_local_sources").sql_compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(error.UnsupportedSqlExecution, rejectTransactionalDdl(compiled.statement));
+        try std.testing.expectError(error.SqlDdlInTransaction, rejectTransactionalDdl(compiled.statement));
     }
 }
 
@@ -2803,6 +2854,32 @@ test "SQL point bound is half-open and excludes all byte-key descendants" {
         const descendant = [_]u8{ 'a', 0xff, @intCast(next) };
         try std.testing.expect(std.mem.order(u8, &descendant, upper) != .lt);
     }
+}
+
+test "SQL pgwire search path retains the catalog revision of a missing candidate" {
+    const Lookup = struct {
+        calls: usize = 0,
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const revision = call.resolve_many.expected_revision;
+            if (self.calls == 1) {
+                try std.testing.expect(revision == null);
+                return alloc.dupe(u8, "{\"revision\":7,\"tables\":[null]}");
+            }
+            try std.testing.expectEqual(@as(?u64, 7), revision);
+            return alloc.dupe(u8, "{\"revision\":8,\"tables\":[null]}");
+        }
+    };
+    var lookup: Lookup = .{};
+    var server: http_server.ApiHttpServer = undefined;
+    server.source = .{ .ptr = &lookup, .vtable = &.{ .status = undefined, .system_catalog = Lookup.resolve, .supports_query_definitions = true } };
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.TableNotFound, adapter.resolveMany(arena.allocator(), &.{.{ .database = "default", .namespace = "first", .table = "events" }}, .read));
+    try std.testing.expectError(error.CatalogGenerationChanged, adapter.resolveMany(arena.allocator(), &.{.{ .database = "default", .namespace = "second", .table = "events" }}, .read));
 }
 
 test "SQL require-index equality uses exact native bounds only inside a guarded statement" {
@@ -4606,6 +4683,41 @@ test "SQL receipt readiness shares one deadline across preflight and scan checks
     try std.testing.expectEqual(std.math.maxInt(u64), budget.deadline(std.math.maxInt(u64) - 1, 10));
 }
 
+test "SQL pgwire graph verification checks the bound catalog incarnation for empty and populated graphs" {
+    const Probe = struct {
+        incarnation: [16]u8 = @splat(1),
+        fn call(raw: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return switch (input) {
+                .graph_authority => a.dupe(u8, "{\"present\":true}"),
+                .resolve_many => |request| blk: {
+                    try std.testing.expect(request.include_source_epoch);
+                    try std.testing.expectEqual(@as(?u64, 7), request.expected_revision);
+                    const rows = [_]?system_catalog.ResolvedTable{.{ .table_id = 8, .name = "docs" }};
+                    break :blk std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .source_epoch = .{ .revision = 1, .incarnation = self.incarnation }, .tables = rows[0..request.targets.len] }, .{});
+                },
+                else => error.UnexpectedCatalogCall,
+            };
+        }
+    };
+    const a = std.testing.allocator;
+    var probe: Probe = .{};
+    var server = http_server.ApiHttpServer.init(a, .{}, .{ .ptr = &probe, .vtable = &.{ .status = undefined, .supports_graph_authority_probe = true, .system_catalog = Probe.call } }, null, null);
+    defer server.deinit();
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{ .bound_catalog_incarnation = @splat(1) } };
+    const deps = [_]catalog.Table{.{ .id = 8, .physical_name = "docs", .columns = &.{}, .schema_version = 1, .scope = .{ .database = "default", .namespace = "public", .name = "docs", .revision = 7 } }};
+    var binding: catalog.graph_relation.Binding = .{ .graph = .{ .name = "g", .incarnation = 9, .revision = 1, .labels = &.{}, .relationships = &.{} }, .catalog_json = "", .definition = undefined, .dependencies = &.{} };
+    const table: catalog.Table = .{ .id = 9, .physical_name = "g", .columns = &.{}, .schema_version = 1, .graph = &binding, .scope = .{ .database = "default", .namespace = "public", .name = "g", .revision = 7 } };
+    for (0..2) |count| {
+        binding.dependencies = deps[0..count];
+        probe.incarnation = @splat(1);
+        try adapter.verify(a, table);
+        probe.incarnation = @splat(2);
+        try std.testing.expectError(error.CatalogGenerationChanged, adapter.verify(a, table));
+    }
+}
+
 test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation" {
     const cypher = @import("cypher");
     const port = @import("antfly_local_sources").storage_statement_read_fence;
@@ -4962,4 +5074,40 @@ test "lake SQL GRAPH_TABLE shared graph joins reuse typed bindings and bounded s
     try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, different.query, &budget));
     budget.remaining = 0;
     try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, one.query, &budget));
+}
+
+test "index alias SQL statement retains one table catalog across graph binding arenas" {
+    const a = std.testing.allocator;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    var recipes = std.heap.ArenaAllocator.init(a);
+    defer recipes.deinit();
+    const r = recipes.allocator();
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, r, "{\"complete\":true}", .{});
+    const first = try aliases.put(r, "{\"a\":{\"type\":\"full_text\"},\"b\":{\"type\":\"full_text\"}}", "live", .{ .index = "a", .idempotency_key = "1" }, ready, 1);
+    const second = try aliases.put(r, first, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "2" }, ready, 2);
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = a;
+    server.index_alias_cache = .{};
+    defer server.index_alias_cache.deinit(a);
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{}, .statement_index_catalogs = .empty };
+    defer adapter.releaseIndexCatalogs();
+    {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const cut = try adapter.bindIndexCatalog(scratch.allocator(), 7, first);
+        const expected = try aliases.queryProjection(r, first);
+        try std.testing.expectEqualStrings(expected, cut);
+    }
+    const repeated = try adapter.bindIndexCatalog(a, 7, second);
+    defer a.free(repeated);
+    try std.testing.expectEqualStrings(try aliases.queryProjection(r, first), repeated);
+    const distinct = try adapter.bindIndexCatalog(a, 8, second);
+    defer a.free(distinct);
+    try std.testing.expectEqualStrings(try aliases.queryProjection(r, second), distinct);
+    adapter.releaseIndexCatalogs();
+    adapter.statement_index_catalogs = .empty;
+    const next_statement = try adapter.bindIndexCatalog(a, 7, second);
+    defer a.free(next_statement);
+    try std.testing.expectEqualStrings(distinct, next_statement);
 }

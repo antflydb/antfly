@@ -1,0 +1,304 @@
+{
+  "date": "2026-11-16",
+  "gpu": "NVIDIA L4, 23034 MiB, 580.159.03",
+  "source_base": "3682e4426baf3d7891a4b0ffbd34ca76bf7aef7e",
+  "binary_sha256": "f0d4457a5eedfb1d61c0659898652e9bc408649264d3472d47bc3eea6fedad31",
+  "suite_sha256": "63a6a8d9f2d8836dda2e89c07afcb364488ff9bcb57736625fbf1d54b9ad81c3",
+  "checkpoint": [
+    {
+      "bytes": 1488915288,
+      "sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+    }
+  ],
+  "source_sha256": {
+    "zig/pkg/inference/src/ops/cuda/embedding_gemma2_global.zig": "13ee4f99ec25b934cef8a3fe6d91c47f49b07fba4d074cd71f3d2e83411f4a14",
+    "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "da65fa7b2f38c465f1a42940264aab7fbf6af06640fa23c596cc3d741a5c8031",
+    "zig/pkg/inference/src/ops/cuda/embedding_gemma2.zig": "b17b67f4dd3f4aaa0041c81f07e3abc40b83bf4aba86942e8792b5bb99d6ffba",
+    "zig/pkg/inference/src/ops/cuda/kernels/embedding_gemma2.cuh": "de361bfcfe5de1bc4bbe9f82eb75faa92757ca71f71cfe5d350ab3291392e900",
+    "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.ptx": "8af43feabdac92a5bdba022d442346ef3ab147a51c56d9fa43051172b75cc7b2",
+    "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.fatbin": "73b367285f1b282614a12026b723b6a494c729d182d83dbe465d6f2aac6ad475",
+    "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin": "fdee6914993b5990ece559418c661869178c152e1192214771169e419010a67e"
+  },
+  "scope": "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback",
+  "native_rounds": 3,
+  "warmups": 4,
+  "native_samples_per_length_per_arm": 24,
+  "pjrt_samples_per_length": 8,
+  "policy": {
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_EXTENDED_FLASH": "1",
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_PACKED_PROJECTIONS": "1",
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_GRAPH_REPLAY": "1",
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_FUSED_BACKBONE": "1",
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_TUNED_GEMM": "0"
+  },
+  "dispatch": "opt-in; SM89 B1 Hq4 Hkv1 D512 global attention, encoder sequence 512..8192",
+  "tile": "256 query rows below 4096 tokens; 128 thereafter",
+  "max_qualified_scratch_bytes": 27262976,
+  "scratch_8192_bytes": 26214400,
+  "cases": [
+    {
+      "name": "text_128",
+      "tokens": 128,
+      "control_ms": 5.195387500000001,
+      "candidate_ms": 5.205683500000001,
+      "speedup": 0.9980221617391837,
+      "quality": [
+        {
+          "cosine": 1.0000000000000002,
+          "max_abs": 0.0
+        },
+        {
+          "cosine": 1.0000000000000002,
+          "max_abs": 0.0
+        },
+        {
+          "cosine": 1.0000000000000002,
+          "max_abs": 0.0
+        }
+      ],
+      "pjrt_ms": 3.7225315,
+      "cuda_speedup_vs_pjrt": 0.715089862839337
+    },
+    {
+      "name": "text_512",
+      "tokens": 512,
+      "control_ms": 15.4469425,
+      "candidate_ms": 13.603377,
+      "speedup": 1.1355226352985732,
+      "quality": [
+        {
+          "cosine": 0.9999546194998818,
+          "max_abs": 0.0011763758957386017
+        },
+        {
+          "cosine": 0.9999546194998818,
+          "max_abs": 0.0011763758957386017
+        },
+        {
+          "cosine": 0.9999546194998818,
+          "max_abs": 0.0011763758957386017
+        }
+      ],
+      "pjrt_ms": 6.8404745,
+      "cuda_speedup_vs_pjrt": 0.5028512037856482
+    },
+    {
+      "name": "text_2048",
+      "tokens": 2048,
+      "control_ms": 85.624509,
+      "candidate_ms": 59.587832500000005,
+      "speedup": 1.4369461919931388,
+      "quality": [
+        {
+          "cosine": 0.9999531102708714,
+          "max_abs": 0.0011334307491779327
+        },
+        {
+          "cosine": 0.9999531102708714,
+          "max_abs": 0.0011334307491779327
+        },
+        {
+          "cosine": 0.9999531102708714,
+          "max_abs": 0.0011334307491779327
+        }
+      ],
+      "pjrt_ms": 32.4213655,
+      "cuda_speedup_vs_pjrt": 0.5440937208112075
+    },
+    {
+      "name": "text_8192",
+      "tokens": 8192,
+      "control_ms": 632.282524,
+      "candidate_ms": 294.37747950000005,
+      "speedup": 2.1478630942622763,
+      "quality": [
+        {
+          "cosine": 0.9999161015244891,
+          "max_abs": 0.0017364248633384705
+        },
+        {
+          "cosine": 0.9999161015244891,
+          "max_abs": 0.0017364248633384705
+        },
+        {
+          "cosine": 0.9999161015244891,
+          "max_abs": 0.0017364248633384705
+        }
+      ],
+      "pjrt_ms": 329.25229,
+      "cuda_speedup_vs_pjrt": 1.1184696959809386
+    }
+  ],
+  "memory": {
+    "False": {
+      "peak_gpu_bytes": 2344615936,
+      "peak_footprint_bytes": 3649588224
+    },
+    "True": {
+      "peak_gpu_bytes": 2371878912,
+      "peak_footprint_bytes": 3651010560
+    },
+    "pjrt": {
+      "peak_gpu_bytes": 4538236928,
+      "peak_footprint_bytes": 5857209344
+    }
+  },
+  "validation": {
+    "full_model_min_cosine": 0.9999161015244891,
+    "holdout_min_cosine": 0.9999759564669036,
+    "holdout_max_abs": 0.0008168313652276993,
+    "replay_after_growth": [
+      {
+        "candidate": false,
+        "round": 0,
+        "bitwise_equal": true
+      },
+      {
+        "candidate": true,
+        "round": 0,
+        "bitwise_equal": true
+      }
+    ],
+    "vision_softmax": {
+      "cases": [
+        {
+          "sequence": 17,
+          "heads": 12,
+          "rows": 17,
+          "mask": "none",
+          "bitwise_equal": true
+        },
+        {
+          "sequence": 17,
+          "heads": 12,
+          "rows": 17,
+          "mask": "holes",
+          "bitwise_equal": true
+        },
+        {
+          "sequence": 17,
+          "heads": 12,
+          "rows": 17,
+          "mask": "all",
+          "bitwise_equal": true
+        },
+        {
+          "sequence": 513,
+          "heads": 12,
+          "rows": 37,
+          "mask": "none",
+          "bitwise_equal": true
+        },
+        {
+          "sequence": 513,
+          "heads": 12,
+          "rows": 37,
+          "mask": "holes",
+          "bitwise_equal": true
+        },
+        {
+          "sequence": 513,
+          "heads": 12,
+          "rows": 37,
+          "mask": "all",
+          "bitwise_equal": true
+        },
+        {
+          "sequence": 8192,
+          "heads": 12,
+          "rows": 37,
+          "mask": "none",
+          "bitwise_equal": true
+        },
+        {
+          "sequence": 8192,
+          "heads": 12,
+          "rows": 37,
+          "mask": "holes",
+          "bitwise_equal": true
+        },
+        {
+          "sequence": 8192,
+          "heads": 12,
+          "rows": 37,
+          "mask": "all",
+          "bitwise_equal": true
+        }
+      ],
+      "passed": true
+    },
+    "unit_tests_cuda": 9,
+    "unit_tests_cpu_only": 9,
+    "artifacts_reproduced": [
+      "portable PTX",
+      "fatbin",
+      "SM89 cubin"
+    ],
+    "projection_autotuning": "Disabled in both qualified arms. Earlier tuned campaign failed cosine>=0.9999; its results are not release qualification."
+  },
+  "operator": [
+    {
+      "sequence": 512,
+      "tile": 256,
+      "mask": "none",
+      "old_ms": 0.695,
+      "new_ms": 0.163,
+      "cosine": 0.9999957350162574,
+      "max_abs": 0.001953125,
+      "cpu_max_abs": 0.0007333697807227757,
+      "scratch_bytes": 5242880,
+      "workspace_bytes": 0,
+      "sha256": "891693f9ed500f8415d38c44bdedd1b7f9720230ca99c9521e4c1f95d8b45176",
+      "plan_hits": 70,
+      "plan_count": 2
+    },
+    {
+      "sequence": 2048,
+      "tile": 256,
+      "mask": "none",
+      "old_ms": 6.904,
+      "new_ms": 1.051,
+      "cosine": 0.9999954846439505,
+      "max_abs": 0.0009765625,
+      "cpu_max_abs": 0.00033091394420051157,
+      "scratch_bytes": 14680064,
+      "workspace_bytes": 0,
+      "sha256": "5605f05d02744cac30a55842d641625818d0051ce30859ef770b0e71be3f5db5",
+      "plan_hits": 286,
+      "plan_count": 2
+    },
+    {
+      "sequence": 8192,
+      "tile": 128,
+      "mask": "none",
+      "old_ms": 98.871,
+      "new_ms": 17.76,
+      "cosine": 0.999995356118422,
+      "max_abs": 0.0009765625,
+      "cpu_max_abs": 0.00023853198581073876,
+      "scratch_bytes": 26214400,
+      "workspace_bytes": 0,
+      "sha256": "f3b7e1162600ef7bcf92b84802ba1301fd1e353cf1a9015379fc789dd7fd4fec",
+      "plan_hits": 2302,
+      "plan_count": 2
+    }
+  ],
+  "profile_8192": {
+    "forwards": 5,
+    "median": {
+      "gpu_span_ms": 300.878327,
+      "gpu_activity_ms": 299.351896,
+      "gpu_gap_ms": 1.50678,
+      "gpu_activity_fraction": 0.9949267499084439,
+      "kernel_count": 1652
+    },
+    "global_attention_ms": 77.8089152,
+    "sliding_attention_ms": 144.0717744,
+    "interpretation": "GPU activity fraction measures time with a captured kernel or copy active, not SM occupancy, Tensor Core utilization or achieved bandwidth. Kernel and API durations overlap."
+  },
+  "limitations": [
+    "Prepared inputs, not HTTP throughput or tokenization.",
+    "Kernel concurrency validated; HTTP serving concurrency and representative retrieval rankings not qualified.",
+    "Native loads the full multimodal checkpoint; PJRT runs the exported text backbone. Memory covers the native process tree; the offline PJRT feeder is excluded."
+  ]
+}

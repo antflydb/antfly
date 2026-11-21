@@ -120,28 +120,66 @@ const std = @import("std");
 /// Version 86 admits authenticated demand locators in opening bundles.
 /// Version 87 admits bootstrap selectors in reader protocol 100 publications.
 /// Version 88 admits bounded inline map navigation in reader protocol 101.
-/// Version 90 adds source-control reservations and separate accepted/committed frontiers.
-/// Version 92 binds private provider continuations to outbound delivery/ACK cursors.
-/// Version 93 adds fenced logical-slot sessions and atomic LSN/feed confirmation.
-/// Version 94 retains fenced slot spool reservations and cleanup accounting.
-/// Version 95 persists slot spool cleanup checkpoints before capacity release.
-/// Version 96 freezes preflight wire identity and single-use spool build grants.
-/// Version 97 binds publication sets and atomically renews confirmed slot feedback.
-/// Version 98 retains exact pending root-control attempts and their receipts.
-/// Version 99 atomically settles accepted root controls with their metadata effects.
-/// Version 100 reconciles monotonic root effects without inventing command receipts.
-/// Version 101 records distinct retirement-fence attempts for unresolved controls.
-/// Version 102 reserves and seals quota for recoverable source-plan artifacts.
-/// Version 103 binds source checkpoint authority before reservation and retirement.
-/// Version 105 retains frozen source recovery manifests through reclamation.
-/// Version 106 persists the allocated initial position for logical slots.
-/// Version 107 atomically seals the feed cut and initializes its logical slot.
-/// Version 108 fences logical slot drop against an active stream lease.
-/// Version 109 advances empty slot projections without allocating LSNs.
-/// Version 110 coordinates durable PostgreSQL publication changes.
-/// Version 111 binds feed bootstrap completion to the acknowledged snapshot cut.
-/// Version 113 moves a qualified exported PostgreSQL slot to streaming.
-pub const current_version: u16 = 113;
+/// Version 90 admits table-scoped index aliases and durable retry receipts.
+/// Version 91 admits lifecycle-scoped alias deletion validators.
+/// Version 92 admits durable restore jobs with backup bindings.
+/// Version 93 separates immutable restore inputs from mutable checkpoints.
+/// Version 94 retains distributed restore admission ownership on ranges.
+pub const pinned_restore_job_version: u16 = 94;
+/// Catalog apply checks the physical identity captured by pgwire Bind.
+pub const bound_ddl_version: u16 = 95;
+/// Bound catalog and policy commands carry guards verified by every applying replica.
+pub const bound_catalog_incarnation_version: u16 = 96;
+/// Version 97 versions FK witness-schema reconstruction and fences policy publication begin.
+pub const guarded_publication_version: u16 = 97;
+/// Generation plans can bind a catalog incarnation and policy creates can enforce capacity at apply.
+pub const guarded_generation_admission_version: u16 = 98;
+/// Catalog CREATE can require the destination namespace or database observed at Bind.
+pub const bound_create_parent_version: u16 = 99;
+/// Every prospective metadata session owner can recover incarnation-bound staged work.
+pub const bound_session_version: u16 = 100;
+
+pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
+    const empty: [32]u8 = @splat(0);
+    for (ranges) |range| {
+        if (!std.mem.eql(u8, &range.restore_admission_fingerprint, &empty)) return pinned_restore_job_version;
+    }
+    return fallback;
+}
+
+pub const index_aliases_version: u16 = 90;
+pub const index_alias_lifecycle_version: u16 = 91;
+pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const required = if (envelope) try aliases.requiredEnvelopeStoreProtocol(a, bytes) else try aliases.requiredStoreProtocol(a, bytes);
+    return if (required >= 4) index_alias_lifecycle_version else if (required >= 3) index_aliases_version else 0;
+}
+pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
+    return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
+}
+
+/// Version 101 adds source-control reservations and separate accepted/committed frontiers.
+/// Version 103 binds private provider continuations to outbound delivery/ACK cursors.
+/// Version 104 adds fenced logical-slot sessions and atomic LSN/feed confirmation.
+/// Version 105 retains fenced slot spool reservations and cleanup accounting.
+/// Version 106 persists slot spool cleanup checkpoints before capacity release.
+/// Version 107 freezes preflight wire identity and single-use spool build grants.
+/// Version 108 binds publication sets and atomically renews confirmed slot feedback.
+/// Version 109 retains exact pending root-control attempts and their receipts.
+/// Version 110 atomically settles accepted root controls with their metadata effects.
+/// Version 111 reconciles monotonic root effects without inventing command receipts.
+/// Version 112 records distinct retirement-fence attempts for unresolved controls.
+/// Version 113 reserves and seals quota for recoverable source-plan artifacts.
+/// Version 114 binds source checkpoint authority before reservation and retirement.
+/// Version 116 retains frozen source recovery manifests through reclamation.
+/// Version 117 persists the allocated initial position for logical slots.
+/// Version 118 atomically seals the feed cut and initializes its logical slot.
+/// Version 119 fences logical slot drop against an active stream lease.
+/// Version 120 advances empty slot projections without allocating LSNs.
+/// Version 121 coordinates durable PostgreSQL publication changes.
+/// Version 122 binds feed bootstrap completion to the acknowledged snapshot cut.
+/// Version 124 moves a qualified exported PostgreSQL slot to streaming.
+pub const current_version: u16 = 124;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

@@ -31,7 +31,11 @@ const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
+const replay_chunks = @import("db/derived/replay_chunks.zig");
+const apply_state = @import("db/derived/apply_state.zig");
+const replay_reference = @import("db/derived/replay_reference.zig");
 const internal_keys = @import("internal_keys.zig");
+const replay_journal_format = @import("replay_journal_format.zig");
 const retained_effects = @import("retained_effects.zig");
 const committed_history = @import("committed_history.zig");
 const artifact_payload = @import("artifact_payload.zig");
@@ -188,23 +192,137 @@ fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload
     }
 }
 
+/// WS5: journal credit ledger helpers shared by the append path
+/// (`writeReplayEntries`) and the retirement path (`retireReplaySlice`).
+fn loadJournalCreditLedger(txn: anytype) !internal_keys.JournalCreditLedger {
+    const raw = txn.get(internal_keys.journal_credit_ledger_key[0..]) catch |err| switch (err) {
+        error.NotFound => return internal_keys.JournalCreditLedger{},
+        else => return err,
+    };
+    return internal_keys.JournalCreditLedger.decode(raw) orelse return error.CorruptReplayMetadata;
+}
+
+fn storeJournalCreditLedger(txn: anytype, ledger: internal_keys.JournalCreditLedger) !void {
+    const raw = ledger.encode();
+    try txn.put(internal_keys.journal_credit_ledger_key[0..], raw[0..]);
+}
+
+/// The credit ledger a scan of every lane entry reproduces: what the base
+/// revision's journal is charged when it is upgraded in place.
+fn scanReplayJournalLedger(txn: anytype) !internal_keys.JournalCreditLedger {
+    var ledger: internal_keys.JournalCreditLedger = .{};
+    const kinds = [_]u8{internal_keys.replay_all_kind} ++ comptime blk: {
+        var ordinals: [replay_hints.len]u8 = undefined;
+        for (replay_hints, 0..) |hint, i| ordinals[i] = replayHintOrdinal(hint);
+        break :blk ordinals;
+    };
+    for (kinds) |kind| {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(kind, 0);
+        const upper = internal_keys.replayRangeUpper(kind);
+        cursor.setUpperBound(&upper);
+        var entry = try cursor.seekAtOrAfter(&lower);
+        while (entry) |current| : (entry = try cursor.next()) {
+            // Bounded by key as well: not every cursor honors the upper bound.
+            if (current.key.len < 2 or current.key[0] != internal_keys.replay_namespace or current.key[1] != kind) break;
+            if (current.key.len != internal_keys.replay_key_len) continue;
+            ledger = ledger.charged(replay_journal_format.entryCharge(current.key.len, current.value.len), 1);
+        }
+    }
+    return ledger;
+}
+
+/// Brings a journal the base revision initialized up to the current format
+/// in `txn`; see `replay_journal_format`.
+const replay_hint_ordinals = blk: {
+    var ordinals: [replay_hints.len]u8 = undefined;
+    for (replay_hints, 0..) |hint, i| ordinals[i] = replayHintOrdinal(hint);
+    break :blk ordinals;
+};
+
+fn upgradeLegacyReplayJournal(txn: anytype, keep_base_layout: bool) !void {
+    try replay_journal_format.upgrade(txn, try scanReplayJournalLedger(txn), &replay_hint_ordinals, keep_base_layout);
+}
+
+/// Whether this store's appends keep the base revision's layout (every hint
+/// lane, the base `next_sequence` key): every backend whose readers use
+/// per-hint lanes, so the base binary still reads a journal this one wrote.
+fn keepsBaseReplayLayout(txn: anytype) bool {
+    const owner = txn.owner orelse return true;
+    return !owner.sharedReplayLane();
+}
+
 fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
     // DB writers reserve and commit under the apply lock. Failed reservations
     // may leave holes, but a late writer must never fill a hole below an
     // already published cut: replay consumers may have passed it. Consensus
     // duplicate detection happens before opening this mutation transaction.
     if (sequence == std.math.maxInt(u64)) return error.InvalidBatchRequest;
+    // A journal the base revision initialized is upgraded in this append's
+    // own transaction (open normally already did it), before its
+    // `next_sequence` is read from the current key; a fresh one is stamped.
+    const keep_base_layout = keepsBaseReplayLayout(txn);
+    const journal_state = try replay_journal_format.state(txn);
+    if (journal_state == .legacy) try upgradeLegacyReplayJournal(txn, keep_base_layout);
+    const already_initialized = journal_state != .absent;
+    if (!already_initialized) {
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_current);
+        try txn.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
+    }
     const previous = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
+    // Stashed as a fixed-size copy (not the borrowed slice -- several more
+    // `txn.get`/`txn.put` calls happen before it's used) so the `put` of
+    // this same key below can hand it to `artifact_inputs.touch` instead of
+    // that hook issuing its own second `txn.get` for the identical
+    // pre-write value. See `Capture.replay_meta_previous_hint`.
+    var previous_fixed: ?[8]u8 = null;
     if (previous) |raw| {
         if (raw.len != 8) return error.CorruptReplayMetadata;
+        previous_fixed = raw[0..8].*;
         if (sequence < std.mem.readInt(u64, raw[0..8], .little)) return error.InvalidBatchRequest;
     }
-    try txn.put(internal_keys.replay_meta_init_key[0..], "");
+
+    // WS5: this append is charged against the journal credit ledger in the
+    // same transaction that grows the journal. Admission is checked against
+    // an upper bound (every lane gets the full unfiltered payload) before any
+    // key is written, so a refused append leaves no partial state behind.
+    //
+    // Every hint the record carries gets an entry in its lane, whatever
+    // consumers are active (`replay_journal_format_v3`): where readers use
+    // hint lanes, the filtered payload copy the base revision writes, so its
+    // binary still finds every hinted record; on a shared-lane store, which
+    // filters the all-lane at read time, an empty index entry, so "a record
+    // for this hint in (a, b]" stays one seek.
+    const mask_all = change_journal_mod.encodedRecordHintMask(payload) catch 0;
+    const mask = if (keep_base_layout) mask_all else 0;
+    const lane_count: u64 = 1 + @popCount(mask);
+    const index_count: u64 = if (keep_base_layout) 0 else @popCount(mask_all);
+    const upper_bound_charge: u64 = lane_count * (internal_keys.replay_key_len + payload.len) + index_count * internal_keys.replay_key_len;
+    // Loaded once here for the admission check and reused below for the
+    // final charge instead of a second `txn.get` of the same key: nothing
+    // in between writes `journal_credit_ledger_key` (the puts above are to
+    // unrelated replay-journal keys), so the bytes read here are still
+    // exactly what a second read would return.
+    var reserved_ledger: ?internal_keys.JournalCreditLedger = null;
+    if (txn.owner) |owner| {
+        const ledger = try loadJournalCreditLedger(txn);
+        const admissible = owner.journal_credit_capacity_bytes -| owner.journal_credit_progress_reserve_bytes;
+        if (ledger.bytes + upper_bound_charge > admissible) return error.JournalCreditCapacityExceeded;
+        reserved_ledger = ledger;
+    }
+
+    // The init marker's value never changes once set; rewriting the same
+    // empty string every commit cost this record its own document_index
+    // leaf for no reason after the first append ever made.
+    if (!already_initialized) try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplayNextSequence(sequence + 1);
+    txn.artifact_inputs.replay_meta_previous_hint = previous_fixed;
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
+    if (keep_base_layout) try txn.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
     const latest_raw = encodeReplaySequence(sequence);
 
     const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
@@ -212,23 +330,44 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     const all_latest_key = internal_keys.replayLatestSequenceKey(internal_keys.replay_all_kind);
     try txn.put(all_latest_key[0..], latest_raw[0..]);
 
-    const mask = change_journal_mod.encodedRecordHintMask(payload) catch return;
-    if (mask == 0) return;
-
-    var decoded = change_journal_mod.decodeRecord(alloc, payload) catch {
-        try writeOriginalReplayHintEntries(txn, sequence, mask, payload);
-        return;
+    var charged_bytes: u64 = internal_keys.replay_key_len + payload.len;
+    var charged_records: u64 = 1;
+    if (!keep_base_layout) for (replay_hints) |hint| {
+        if ((mask_all & change_journal_mod.singleHintMask(hint)) == 0) continue;
+        const index_key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
+        try txn.put(index_key[0..], "");
+        charged_bytes += internal_keys.replay_key_len;
+        charged_records += 1;
     };
-    defer decoded.deinit();
 
-    for (replay_hints) |hint| {
-        if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
-        const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
-        defer alloc.free(lane_payload);
-        const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
-        try txn.put(key[0..], lane_payload);
-        const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
-        try txn.put(latest_key[0..], latest_raw[0..]);
+    write_hints: {
+        if (mask == 0) break :write_hints;
+
+        var decoded = change_journal_mod.decodeRecord(alloc, payload) catch {
+            try writeOriginalReplayHintEntries(txn, sequence, mask, payload);
+            charged_bytes += @as(u64, @popCount(mask)) * (internal_keys.replay_key_len + payload.len);
+            charged_records += @popCount(mask);
+            break :write_hints;
+        };
+        defer decoded.deinit();
+
+        for (replay_hints) |hint| {
+            if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
+            const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
+            defer alloc.free(lane_payload);
+            const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
+            try txn.put(key[0..], lane_payload);
+            const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+            try txn.put(latest_key[0..], latest_raw[0..]);
+            charged_bytes += internal_keys.replay_key_len + lane_payload.len;
+            charged_records += 1;
+        }
+    }
+
+    if (txn.owner != null) {
+        var ledger = reserved_ledger.?;
+        ledger = ledger.charged(charged_bytes, charged_records);
+        try storeJournalCreditLedger(txn, ledger);
     }
 }
 // ============================================================================
@@ -265,6 +404,8 @@ pub const ReplayIterationStats = struct {
     hint_filter_skips: usize = 0,
     scan_batches: usize = 0,
     fallback_used: bool = false,
+    /// See `backend_types.ReplayLaneIterationStats.scan_budget_exhausted`.
+    scan_budget_exhausted: bool = false,
 };
 
 // ============================================================================
@@ -487,6 +628,9 @@ pub const DocStore = struct {
     // Reservations are not visibility. Zero means the durable committed cut
     // has not yet been loaded; intentional persisted replay floors count.
     committed_replay_next_cached: AtomicU64 = .init(0),
+    /// The backend adoption epoch these caches were derived under; see
+    /// `revalidateAdoptedState`.
+    adopted_epoch: AtomicU64 = .init(0),
     // A failed portable-import rollback leaves a durable recovery marker. Once
     // fenced, this handle must not expose the partial generation or accept
     // writes that restart recovery would later erase. Reopening constructs a
@@ -501,6 +645,48 @@ pub const DocStore = struct {
     // transactions. Packing both into one atomic makes reader admission versus
     // publication closure a single indivisible transition.
     portable_import_reader_state: std.atomic.Value(usize) = .init(0),
+    // WS5: owner-queued journal retirement. `retirement_queue` is the
+    // foreground-raised watermark; `active_consumer_hint_mask` gates which
+    // hinted lanes an append writes (see replay_reference.zig); the credit
+    // policy bounds how large the unretired journal may grow before a
+    // producer append is refused.
+    retirement_queue: replay_chunks.RetirementQueue = .{},
+    active_consumer_hint_mask: std.atomic.Value(u8) = .init(replay_reference.all_hints_mask),
+    journal_credit_capacity_bytes: u64 = std.math.maxInt(u64),
+    journal_credit_progress_reserve_bytes: u64 = 0,
+    // WS5: the DB layer's last computed "every registered consumer has
+    // applied at least this sequence" watermark (`mutation_commit.zig`'s
+    // `truncateReplayJournalIfSafeContext`, the same catalog-derived walk
+    // that drives `active_consumer_hint_mask` above). `requestRetirement`
+    // only ever raises a *requested* ceiling -- a foreground caller's own
+    // just-applied sequence, not a cross-consumer minimum -- so nothing
+    // before `serviceRetirement` validates that ceiling against what every
+    // consumer has actually, durably applied. Default
+    // `maxInt(u64)` ("no constraint observed yet") preserves prior
+    // behavior for callers with no DB-layer consumer registry (native-only
+    // tests, backends with no managed indexes).
+    // WS5 (a): diagnostic only now -- `serviceRetirement` clamps against
+    // `apply_state.minAppliedSequenceAcrossAllConsumers` (a fresh scan of
+    // every progress-v2 record, done at drain time), not this field. Kept
+    // for `noteSafeRetirementWatermark` callers/tests that want to assert
+    // on the last value the DB layer's catalog walk computed.
+    known_safe_retirement_watermark: @import("antfly_platform").atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    // WS5 (a): consumer-generic clamp hook. `apply_state.
+    // minAppliedSequenceAcrossAllConsumers` only covers managed-index
+    // progress-v2 records; enrichment (`enrichment/enrichment_state.zig`)
+    // and resolution/promotion (`resolution_runtime.zig`) now also ride
+    // along (per perf/lwa-integration) but keep their own, differently-
+    // keyed progress records and import this very file, so `DocStore`
+    // cannot import them back without a cycle. The DB layer registers a
+    // callback here (`setExtraConsumerProgressProvider`) that reads those
+    // other kinds fresh and returns their minimum applied sequence;
+    // `serviceRetirement` clamps against it too, alongside the progress-v2
+    // scan. `null` (no DB-layer registration yet, or a native-only caller
+    // with no such consumers) contributes no additional constraint.
+    extra_consumer_progress_ctx: ?*anyopaque = null,
+    extra_consumer_progress_fn: ?ExtraConsumerProgressFn = null,
+
+    pub const ExtraConsumerProgressFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror!u64;
 
     const replay_index_unknown: u8 = 0;
     const replay_index_missing: u8 = 1;
@@ -515,6 +701,7 @@ pub const DocStore = struct {
         .begin_current_scan = beginCurrentScanTxn,
         .begin_write = beginWriteTxn,
         .begin_batch = beginWriteBatch,
+        .begin_batch_with_options = beginWriteBatchWithOptions,
     });
 
     pub const Txn = struct {
@@ -621,6 +808,16 @@ pub const DocStore = struct {
                 try self.document_revisions.stage(self);
                 try self.history.stage(self.alloc, self);
             }
+            // NOT an `errdefer self.retained.deinit(...)` (and friends) here:
+            // every caller of `commit()` in this codebase already pairs it
+            // with its own `errdefer write.abort()` (see e.g.
+            // `artifact_footprint.zig`'s `initializeEmpty`/`invalidate`),
+            // and `abort()` deinits these same three. Adding a second deinit
+            // here double-frees them -- `HashMapUnmanaged.deinit` sets the
+            // map to `undefined`, so a caller's subsequent `abort()` would
+            // crash (caught by the crash sweep as an "incorrect alignment"
+            // panic inside `retained_effects.Capture.deinit`). Cleanup on a
+            // failed commit is the caller's `abort()`, by convention.
             const reader_owner = self.portable_import_reader_owner;
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const source_owner = self.columnar_owner;
@@ -843,6 +1040,13 @@ pub const DocStore = struct {
             if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
         }
 
+        /// Stages index-catalog mutations into this write's own native
+        /// commit (`backend_erased.WriteTxn.putIndexCatalogBatch`).
+        pub fn putIndexCatalogBatch(self: *Txn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+            if (self.write) |*write| return write.putIndexCatalogBatch(scope, mutations);
+            return error.ReadOnly;
+        }
+
         pub fn delete(self: *Txn, key: []const u8) anyerror!void {
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
             try removeGraphRetirementReference(self, self.alloc, key, &self.graph_retirements_maybe);
@@ -943,9 +1147,39 @@ pub const DocStore = struct {
         graph_retirements_maybe: ?bool = null,
         unordered_bulk_append_puts: bool = false,
         runtime: ?backend_erased.Batch = null,
+        /// Set once this batch's `source_certificates.begin()` credit (if
+        /// any) has been released via `end()`. `commitStaged`'s own
+        /// `errdefer` and `StagedBatch.wait`'s `defer` are meant to be
+        /// mutually exclusive paths to exactly one release, but both
+        /// ultimately act on value-copied wrappers (`StagedBatch`,
+        /// `StagedDocBatch`, `backend_erased.Ticket`) around this
+        /// heap-resident `*Batch` -- a second release reached through any
+        /// copy of those wrappers (observed empirically: WS3 concurrent
+        /// capi writers, the first caller to ever make staged batches
+        /// genuinely overlap) must not double-decrement another writer's
+        /// in-flight count. See `releaseSourceCertificateOnce`.
+        source_certificate_released: bool = false,
 
         pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
             try self.artifact_inputs.attach(participant);
+        }
+
+        /// The only path allowed to call `source_certificates.end()` for
+        /// this batch. `owner` is `source_owner`/`columnar_owner` as
+        /// captured at `commitStaged` time, not re-read from `self` here,
+        /// so a caller's own capture stays authoritative even if `self`
+        /// is reused before this runs. Idempotent: see
+        /// `source_certificate_released`'s doc comment.
+        fn releaseSourceCertificateOnce(self: *Batch, owner: ?*DocStore) void {
+            if (self.source_certificate_released) {
+                if (comptime @import("builtin").is_test) std.debug.print(
+                    "source_certificates: ignored a second release for batch {*} (owner {?*})\n",
+                    .{ self, owner },
+                );
+                return;
+            }
+            self.source_certificate_released = true;
+            if (owner) |o| o.source_certificates.end();
         }
 
         pub const BatchTxn = struct {
@@ -965,6 +1199,9 @@ pub const DocStore = struct {
             graph_retirements_maybe: *?bool,
             unordered_bulk_append_puts: bool = false,
             runtime: ?*backend_erased.Batch = null,
+            // WS5: lets `setReplayOpaque` -> `writeReplayEntries` reach the
+            // owning DocStore's consumer-hint mask and credit policy.
+            owner: ?*DocStore = null,
 
             pub fn consumeDenseManySorted(self: @This(), alloc: Allocator, keys: []const []const u8, values: []?[]const u8, dims: usize, sink: artifact_payload.DenseSink) !artifact_payload.DenseReadStats {
                 const session = self.payload_session orelse return error.Unsupported;
@@ -1140,6 +1377,16 @@ pub const DocStore = struct {
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
                 try writeReplayEntries(self.alloc, self, sequence, payload);
             }
+
+            /// WS4 phase 2: forwards to `backend_erased.Batch.putIndexCatalogBatch`
+            /// -- supported only on Lite (`error.Unsupported` elsewhere) --
+            /// so a `commit_participant.Participant` reached through this
+            /// `BatchTxn` (see `commit_participant.View.putIndexCatalog`)
+            /// can publish index-catalog records in the same native
+            /// transaction as this batch's own primary-keyspace writes.
+            pub fn putIndexCatalogBatch(self: @This(), scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+                try self.runtime.?.putIndexCatalogBatch(scope, mutations);
+            }
         };
 
         pub const Adapter = backend_adapter.Batch(Batch, .{
@@ -1171,7 +1418,99 @@ pub const DocStore = struct {
             self.* = undefined;
         }
 
-        pub fn commit(self: *Batch) !void {
+        /// Returned by `commitStaged` (WS3). The batch's effects are applied
+        /// (and, for backends with a staged commit phase, enqueued into a
+        /// group some thread will drive to a shared fsync) by the time this
+        /// is returned; `wait` blocks only for that durability. A caller may
+        /// drop locks scoped to "a write is in flight" (the DB apply lock,
+        /// the capi connection gate) between `commitStaged` returning and
+        /// calling `wait`, instead of holding them across the fsync.
+        ///
+        /// `batch` must stay heap-resident until `wait` runs: it owns the
+        /// staging captures (`retained`/`artifact_inputs`/`document_revisions`)
+        /// that `source_certificates` and the payload session still reference
+        /// while the group is in flight, mirroring the bracket `commit` used
+        /// to hold open for its own duration.
+        pub const StagedBatch = struct {
+            alloc: Allocator,
+            batch: *Batch,
+            ticket: backend_erased.Ticket,
+            /// Captured eagerly in `commitStaged`, not read back through
+            /// `batch` here: success frees/invalidates `batch` before these
+            /// run, so a lazy `batch.columnar_owner` read would be undefined
+            /// memory by the time these fire.
+            source_owner: ?*DocStore,
+            payload_session: ?*artifact_payload.Session,
+            /// Only set when this batch actually touched columnar state;
+            /// bumped on successful durability, matching `commit`'s original
+            /// success-only `columnar_revision` bump.
+            bump_columnar_revision: ?*DocStore,
+
+            /// Does not free `batch`'s own memory: that allocation (if any
+            /// -- a plain `commit` caller's `batch` is typically a stack
+            /// local it owns itself) belongs to whoever created it, not to
+            /// this generic staged-commit path. The staged `put*` entry
+            /// points below, which heap-allocate it, free it themselves
+            /// after this returns.
+            pub fn wait(self: StagedBatch) !void {
+                _ = try self.waitSequence();
+            }
+
+            /// Like `wait`, also returning the commit sequence this batch's
+            /// own native group committed at (0 on a backend with no such
+            /// concept -- see `backend_erased.Ticket.waitSequence`).
+            /// Regression-B test hook.
+            pub fn waitSequence(self: StagedBatch) !u64 {
+                // `self.batch` (not yet freed: the caller -- `StagedDocBatch.
+                // wait`/`commit` -- only destroys it after this function has
+                // returned) owns the one-shot guard, so a second `wait()`
+                // reached through another copy of this value-type wrapper
+                // cannot double-release `source_owner`'s certificate credit.
+                defer self.batch.releaseSourceCertificateOnce(self.source_owner);
+                const sequence = self.ticket.waitSequence() catch |err| {
+                    self.batch.retained.poisoned = true;
+                    if (self.source_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
+                    // Deliberately not releasing `retained`/`artifact_inputs`/
+                    // `document_revisions` here even though `commitStaged`
+                    // already staged them: not every caller reaches `wait`
+                    // through `backend_erased.Batch.commitStaged`'s
+                    // inert-vtable swap (which makes a caller's later
+                    // `errdefer batch.abort()` a safe no-op once a ticket
+                    // exists). A caller that drives this inner `StagedBatch`
+                    // directly -- `db.zig`'s `saveIndexStatusSnapshots`, in
+                    // particular -- still wraps `commit()` (`commitStaged`
+                    // then `wait`) in its own `errdefer status_batch.abort()`
+                    // and expects `abort()` to be the one place these three
+                    // are released on any failure, including a failed
+                    // `wait`. Releasing them here too double-frees (caught as
+                    // an "incorrect alignment" panic inside
+                    // `retained_effects.Capture.deinit`'s `keyIterator` on
+                    // the now-`undefined` map). This path's leak when
+                    // nothing else aborts is real (see git history for the
+                    // attempted fix and why it was reverted) but needs a
+                    // change to the abort/release contract itself, not a
+                    // second release bolted on here.
+                    return err;
+                };
+                if (self.payload_session) |session| {
+                    session.committed = true;
+                    session.release();
+                }
+                self.batch.retained.deinit(self.batch.alloc);
+                self.batch.history.deinit(self.batch.alloc);
+                self.batch.artifact_inputs.deinit(self.batch.alloc);
+                self.batch.document_revisions.deinit(self.batch.alloc);
+                if (self.bump_columnar_revision) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
+                self.batch.* = undefined;
+                return sequence;
+            }
+        };
+
+        /// Stage this batch's writes and return once they are applied and
+        /// enqueued for durability (WS3), instead of blocking for the fsync.
+        /// `commit` is this plus an immediate `wait`, for callers with no
+        /// locks of their own to drop in between.
+        pub fn commitStaged(self: *Batch) !StagedBatch {
             if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             errdefer if (self.columnar_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
@@ -1184,27 +1523,41 @@ pub const DocStore = struct {
                 try self.document_revisions.stage(self.asTxn());
                 try self.history.stage(self.alloc, self.asTxn());
             }
-            const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
+            // NOT an `errdefer` deinit of these three here, matching
+            // `Txn.commit`: `backend_erased.Batch.commitStaged` only swaps
+            // its own vtable to the inert `consumed_vtable` (making a
+            // caller's later `errdefer batch.abort()` a safe no-op) *after*
+            // this inner `commitStaged` has actually returned a
+            // `StagedBatch`. A failure before that point leaves this batch
+            // still abortable by convention, exactly like a failed
+            // `Txn.commit`; double-releasing here would crash the same way
+            // reverting `Txn.commit`'s own attempt at this did (see that
+            // comment). Only `StagedBatch.wait` -- reached after a ticket
+            // already exists, where that inert-vtable swap has already
+            // happened and nothing else will ever call `abort()` again --
+            // owns cleanup for a failure after staging.
+            const bump_columnar_revision = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const source_owner = self.columnar_owner;
-            if (source_owner) |owner| owner.source_certificates.begin(&self.document_revisions.documents);
-            defer if (source_owner) |owner| owner.source_certificates.end();
             const payload_session = self.payload_session;
+            if (source_owner) |owner| owner.source_certificates.begin(&self.document_revisions.documents);
+            errdefer self.releaseSourceCertificateOnce(source_owner);
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             if (payload_session) |session| try session.prepareCommit();
             if (payload_session) |session| session.primary_commit_attempted = true;
-            if (self.runtime) |*runtime| {
-                try runtime.commit();
-            }
-            if (payload_session) |session| {
-                session.committed = true;
-                session.release();
-            }
-            self.retained.deinit(self.alloc);
-            self.history.deinit(self.alloc);
-            self.artifact_inputs.deinit(self.alloc);
-            self.document_revisions.deinit(self.alloc);
-            self.* = undefined;
-            if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
+            const ticket = if (self.runtime) |*runtime| try runtime.commitStaged() else backend_erased.Ticket.alreadyDurable();
+            return .{
+                .alloc = self.alloc,
+                .batch = self,
+                .ticket = ticket,
+                .source_owner = source_owner,
+                .payload_session = payload_session,
+                .bump_columnar_revision = bump_columnar_revision,
+            };
+        }
+
+        pub fn commit(self: *Batch) !void {
+            const staged = try self.commitStaged();
+            try staged.wait();
         }
 
         pub fn asTxn(self: *Batch) BatchTxn {
@@ -1225,6 +1578,7 @@ pub const DocStore = struct {
                 .graph_retirements_maybe = &self.graph_retirements_maybe,
                 .unordered_bulk_append_puts = self.unordered_bulk_append_puts,
                 .runtime = if (self.runtime) |*runtime| runtime else null,
+                .owner = self.columnar_owner,
             };
         }
 
@@ -1270,8 +1624,9 @@ pub const DocStore = struct {
             .wal_enabled = !opts.read_only,
         });
         errdefer backend.close();
-        const runtime_store = try backend.backend.runtimeStore(alloc, .{});
-        return .{
+        var runtime_store = try backend.backend.runtimeStore(alloc, .{});
+        errdefer runtime_store.deinit();
+        var opened: DocStore = .{
             .alloc = alloc,
             .runtime_store = runtime_store,
             .owns_runtime_store = true,
@@ -1279,17 +1634,63 @@ pub const DocStore = struct {
             .replay_index_state = .init(replay_index_unknown),
             .next_replay_sequence_cached = .init(0),
         };
+        if (!opts.read_only) try opened.upgradeLegacyReplayJournalAtOpen();
+        return opened;
     }
 
     pub fn openRuntime(alloc: Allocator, store: anytype) !DocStore {
-        const runtime_store = try initRuntimeStore(alloc, store);
-        return .{
+        var runtime_store = try initRuntimeStore(alloc, store);
+        // A store handed over by value stays the caller's to release when the
+        // open fails; only a wrapper made here is released here.
+        errdefer if (runtime_store.owned and @TypeOf(store) != backend_erased.Store) runtime_store.store.deinit();
+        var opened: DocStore = .{
             .alloc = alloc,
             .runtime_store = runtime_store.store,
             .owns_runtime_store = runtime_store.owned,
             .owned_lsm_backend = null,
             .replay_index_state = .init(replay_index_unknown),
             .next_replay_sequence_cached = .init(0),
+        };
+        try opened.upgradeLegacyReplayJournalAtOpen();
+        return opened;
+    }
+
+    /// Upgrades a journal the base revision initialized before this store
+    /// serves anything: its next append, and every reader of
+    /// `next_sequence`, expect the current layout. A read-only store cannot
+    /// upgrade and is left as it is. An unknown format fails the open.
+    fn upgradeLegacyReplayJournalAtOpen(self: *DocStore) !void {
+        const keep_base_layout = !self.sharedReplayLane();
+        const state = blk: {
+            var probe = try self.beginProbeTxn();
+            defer probe.abort();
+            break :blk try replay_journal_format.state(&probe);
+        };
+        if (state == .absent or (state == .current and !keep_base_layout)) return;
+        var batch = self.beginWriteBatch() catch |err| switch (err) {
+            error.ReadOnly => return,
+            else => return err,
+        };
+        errdefer batch.abort();
+        // A base binary rolled back onto this store may have appended (its
+        // records are in every lane, but the ledger and index floor never
+        // saw them) or retired rows (the keys still agree, but the ledger
+        // still charges them). A scan of the lanes settles both.
+        if (state == .current and !try replay_journal_format.baseWroteSince(batch.asTxn())) {
+            const stored = try loadJournalCreditLedger(batch.asTxn());
+            const scanned = try scanReplayJournalLedger(batch.asTxn());
+            if (stored.bytes == scanned.bytes and stored.records == scanned.records) {
+                batch.abort();
+                return;
+            }
+        }
+        try upgradeLegacyReplayJournal(batch.asTxn(), keep_base_layout);
+        batch.commit() catch |err| switch (err) {
+            error.ReadOnly => {
+                batch.abort();
+                return;
+            },
+            else => return err,
         };
     }
 
@@ -1302,6 +1703,11 @@ pub const DocStore = struct {
 
     fn backendCapabilities(self: *DocStore) backend_types.Capabilities {
         return self.runtime_store.capabilities();
+    }
+
+    /// See `backend_types.Capabilities.shared_replay_lane`.
+    pub fn sharedReplayLane(self: *DocStore) bool {
+        return self.backendCapabilities().shared_replay_lane;
     }
 
     /// Preserve transaction coordination when this document facade wraps an
@@ -1434,6 +1840,7 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
+        self.revalidateAdoptedState();
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         var txn = try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission);
@@ -1489,6 +1896,7 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
+        self.revalidateAdoptedState();
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         self.lockPayloadPolicy();
@@ -2108,6 +2516,7 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteTxn(self: *DocStore) !Txn {
+        self.revalidateAdoptedState();
         try self.ensurePortableImportOperational();
         const payload_session = try self.createWritePayloadSession();
         errdefer if (payload_session) |session| session.release();
@@ -2124,6 +2533,7 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
+        self.revalidateAdoptedState();
         try self.ensurePortableImportOperational();
         const payload_session = try self.createWritePayloadSession();
         errdefer if (payload_session) |session| session.release();
@@ -2399,7 +2809,11 @@ pub const DocStore = struct {
         return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null, 0);
     }
 
-    fn putBatchWithReplayOnceAndParticipant(
+    /// Shared preparation for `putBatchWithReplayOnceAndParticipant` and its
+    /// staged twin (WS3): builds and populates a `Batch`, stopping just
+    /// short of committing it so the caller can choose `commit` (wait
+    /// inline) or `commitStaged` (return a ticket instead).
+    fn prepareBatchWithReplayAndParticipant(
         self: *DocStore,
         writes: []const KVPair,
         deletes: []const []const u8,
@@ -2407,7 +2821,7 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
         history_commit_time_ns: i64,
-    ) !void {
+    ) !Batch {
         const has_owner_job = blk: {
             for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
             break :blk false;
@@ -2452,7 +2866,158 @@ pub const DocStore = struct {
         if (replay) |entry| {
             try batch.setReplayOpaque(entry.sequence, entry.payload);
         }
+        return batch;
+    }
+
+    fn putBatchWithReplayOnceAndParticipant(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
+    ) !void {
+        var batch = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns);
+        errdefer batch.abort();
         try batch.commit();
+    }
+
+    /// A pending `markReplayIndexAvailable`/`observeCommittedReplaySequence`
+    /// call, run from `StagedDocBatch.wait` only once the write is durable
+    /// (WS2 §3.2: visibility only after durability) rather than eagerly when
+    /// it is merely staged.
+    const StagedReplayObservation = struct {
+        store: *DocStore,
+        sequence: u64,
+    };
+
+    /// Returned by the staged `put*` entry points (WS3): the batch is
+    /// applied and enqueued for durability by the time this is returned.
+    /// `wait` blocks only for that durability; a caller (mutation_commit.zig's
+    /// `batchInternalPreparedOwned`) releases the DB apply lock and the capi
+    /// connection gate between getting this and calling `wait`.
+    pub const StagedDocBatch = struct {
+        inner: Batch.StagedBatch,
+        /// Owns `inner.batch`'s own heap allocation (the staged `put*` entry
+        /// points below heap-box it so it survives past their return; `wait`
+        /// is where it is finally freed, after `inner.wait` is done with it).
+        heap_batch: *Batch,
+        heap_alloc: Allocator,
+        replay_observation: ?StagedReplayObservation = null,
+
+        pub fn wait(self: StagedDocBatch) !void {
+            _ = try self.waitSequence();
+        }
+
+        /// Like `wait`, also returning the commit sequence this batch's own
+        /// native group committed at (0 on a backend with no such concept).
+        /// Regression-B test hook; see `backend_erased.Ticket.waitSequence`.
+        pub fn waitSequence(self: StagedDocBatch) !u64 {
+            // `inner.wait()` (`Batch.StagedBatch.wait`) deliberately does
+            // *not* release `heap_batch`'s retained/artifact_inputs/
+            // document_revisions captures on failure -- that contract
+            // (documented on `Batch.commitStaged`/`StagedBatch.wait`) leaves
+            // them owned by `heap_batch` so a caller's own `errdefer
+            // batch.abort()` is the one place that frees them, exactly
+            // once. But no caller of this `StagedDocBatch` ever holds such
+            // an `errdefer` on `heap_batch` -- `mutation_commit.zig`'s
+            // `batchInternalPreparedOwned`, in particular, only ever calls
+            // `wait()` itself (see its comment: "wait frees the ticket's
+            // owned heap state unconditionally the first time"). Unlike the
+            // success path below, a failure here used to fall straight
+            // through to the unconditional `defer destroy(heap_batch)`
+            // without ever calling `abort()` first, leaking those captures'
+            // underlying allocations (the hash maps' backing arrays) even
+            // though the struct that pointed to them was freed. This is
+            // the one and only place responsible for finishing that abort
+            // on this path, matching `backend_erased.zig`'s own `TicketBox`
+            // wait_fn wrapper, which does the same for its layer.
+            const sequence = self.inner.waitSequence() catch |err| {
+                self.heap_batch.abort();
+                self.heap_alloc.destroy(self.heap_batch);
+                return err;
+            };
+            self.heap_alloc.destroy(self.heap_batch);
+            if (self.replay_observation) |observation| {
+                observation.store.markReplayIndexAvailable();
+                observation.store.observeCommittedReplaySequence(observation.sequence);
+            }
+            return sequence;
+        }
+    };
+
+    fn putBatchWithReplayStagedOnceAndParticipant(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
+    ) !StagedDocBatch {
+        const batch_box = try self.alloc.create(Batch);
+        errdefer self.alloc.destroy(batch_box);
+        batch_box.* = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns);
+        errdefer batch_box.abort();
+        const staged = try batch_box.commitStaged();
+        return .{
+            .inner = staged,
+            .heap_batch = batch_box,
+            .heap_alloc = self.alloc,
+            .replay_observation = if (replay) |entry| .{ .store = self, .sequence = entry.sequence } else null,
+        };
+    }
+
+    /// Stage a batch and return once it is applied and enqueued for
+    /// durability (WS3), instead of blocking for the fsync. Retries exactly
+    /// like `putBatchWithReplayAndParticipant` on `error.WriterLocked`;
+    /// unlike it, this never retries after staging succeeds, since there is
+    /// nothing left to retry once a ticket has been handed out.
+    pub fn putBatchWithReplayStagedAndParticipant(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+    ) !StagedDocBatch {
+        return self.putBatchWithHistoryTimeStaged(io, writes, deletes, replay, options, participant, 0);
+    }
+
+    pub fn putBatchWithHistoryTimeStaged(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
+    ) !StagedDocBatch {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            return self.putBatchWithReplayStagedOnceAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns) catch |err| switch (err) {
+                error.WriterLocked => {
+                    if (attempt >= writer_locked_retry_count) return err;
+                    backoffWriterLockRetry(io);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    pub fn putBatchWithReplayStagedWithOptions(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+    ) !StagedDocBatch {
+        return self.putBatchWithReplayStagedAndParticipant(io, writes, deletes, replay, options, null);
     }
 
     fn putBatchWithReplayOnce(self: *DocStore, writes: []const KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
@@ -2626,7 +3191,7 @@ pub const DocStore = struct {
     }
 
     pub fn lastReplaySequenceFromTxn(_: *DocStore, txn: *Txn, fallback_last: u64) !u64 {
-        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+        const raw = replay_journal_format.getNextSequence(txn) catch |err| switch (err) {
             error.NotFound => return fallback_last,
             else => return err,
         };
@@ -2639,15 +3204,59 @@ pub const DocStore = struct {
         return try self.latestReplaySequenceForOrdinal(replayHintOrdinal(hint), fallback_last);
     }
 
+    /// Whether a record carrying `hint` lies in (`from_sequence`,
+    /// `through`], from one seek of the hint's lane: a current-format journal
+    /// gives every such record an entry there from the index floor on. Null
+    /// when the lane cannot say (an older layout, or a range below the floor).
+    pub fn replayHintRecordBetween(self: *DocStore, hint: change_journal_mod.TargetHint, from_sequence: u64, through: u64) !?bool {
+        if (from_sequence >= through) return false;
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        if (try replay_journal_format.state(&txn) != .current) return null;
+        const floor_raw = txn.get(internal_keys.replay_hint_index_floor_key[0..]) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (floor_raw) |raw| {
+            const floor = decodeReplaySequence(raw) orelse return error.CorruptReplayMetadata;
+            if (from_sequence +| 1 < floor) return null;
+        }
+        const ordinal = replayHintOrdinal(hint);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(ordinal, from_sequence + 1);
+        const upper = internal_keys.replayRangeUpper(ordinal);
+        cursor.setUpperBound(&upper);
+        const entry = (cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        }) orelse return false;
+        if (entry.key.len != internal_keys.replay_key_len or entry.key[0] != internal_keys.replay_namespace or entry.key[1] != ordinal) return false;
+        return std.mem.readInt(u64, entry.key[2..10], .big) <= through;
+    }
+
     pub fn latestReplaySequenceForOrdinal(self: *DocStore, kind_ordinal: u8, fallback_last: u64) !u64 {
         if (!(try self.hasReplayEntries())) return fallback_last;
+        // A shared-lane journal's producer head is the only live answer: a
+        // per-hint marker there is a leftover of the layout before the
+        // upgrade, frozen at whatever it last held, and would report a
+        // target behind the hint's newer writes.
+        if (self.sharedReplayLane()) return @max(self.lastReplaySequence(fallback_last), fallback_last);
 
         var txn = try self.beginProbeTxn();
         defer txn.abort();
 
         const key = internal_keys.replayLatestSequenceKey(kind_ordinal);
         const raw = txn.get(key[0..]) catch |err| switch (err) {
-            error.NotFound => return fallback_last,
+            // Journal sharing: a per-hint latest-sequence marker is no
+            // longer written on every commit (see lite/docstore.zig's
+            // `writeReplayEntries`). Its absence just means this lane's
+            // progress now lives entirely in the single producer head
+            // sequence -- an upper bound on "how far could this hint
+            // possibly be behind," not an exact per-hint watermark. A
+            // backend that still maintains the per-hint marker (anything
+            // other than Lite, today) keeps its exact answer unchanged.
+            error.NotFound => return @max(self.lastReplaySequence(fallback_last), fallback_last),
             else => return err,
         };
         const latest = decodeReplaySequence(raw) orelse return error.CorruptReplayMetadata;
@@ -2658,7 +3267,26 @@ pub const DocStore = struct {
         return self.ensureReplayNextSequenceCached(fallback_next);
     }
 
+    /// Caches here are derived from durable state and advanced by this
+    /// store's own commits. When the backend adopts commits it did not make
+    /// through this store (another process, or a forwarded writer), drop
+    /// them so the next use reloads, and bump the query revisions so result
+    /// caches built on the old state are not reused.
+    fn revalidateAdoptedState(self: *DocStore) void {
+        const epoch = self.runtime_store.adoptionEpoch();
+        const seen = self.adopted_epoch.load(.acquire);
+        if (seen == epoch) return;
+        if (self.adopted_epoch.cmpxchgStrong(seen, epoch, .acq_rel, .acquire) != null) return;
+        self.next_replay_sequence_cached.store(0, .release);
+        self.committed_replay_next_cached.store(0, .release);
+        if (self.replay_index_state.load(.monotonic) == replay_index_missing) self.replay_index_state.store(replay_index_unknown, .monotonic);
+        self.retained_effects_cache.store(0, .release);
+        _ = self.columnar_revision.fetchAdd(1, .acq_rel);
+        _ = self.query_generation_revision.fetchAdd(1, .acq_rel);
+    }
+
     pub fn reserveNextReplaySequence(self: *DocStore, fallback_next: u64) u64 {
+        self.revalidateAdoptedState();
         while (true) {
             if (self.next_replay_sequence_cached.load(.acquire) != 0) {
                 return self.next_replay_sequence_cached.fetchAdd(1, .acq_rel);
@@ -2682,6 +3310,7 @@ pub const DocStore = struct {
     }
 
     pub fn hasReplayEntries(self: *DocStore) !bool {
+        self.revalidateAdoptedState();
         switch (self.replay_index_state.load(.monotonic)) {
             replay_index_available => return true,
             replay_index_missing => return false,
@@ -2707,8 +3336,16 @@ pub const DocStore = struct {
         var batch = try self.beginWriteBatch();
         errdefer batch.abort();
         try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        // WS5: this bootstrap path stamps the journal exactly like the first
+        // real append in writeReplayEntries does. Without it, a destination
+        // store seeded this way (e.g. a DB split destination, via
+        // ensureReplayFloor) looks "already initialized" with no version
+        // marker, and its first real append fails UnsupportedReplayJournalFormat.
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_current);
+        try batch.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
         const next_raw = encodeReplayNextSequence(1);
         try batch.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
+        if (!self.sharedReplayLane()) try batch.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
         try batch.commit();
         self.markReplayIndexAvailable();
         _ = self.next_replay_sequence_cached.cmpxchgStrong(0, 1, .acq_rel, .acquire);
@@ -2724,8 +3361,19 @@ pub const DocStore = struct {
 
         var batch = try self.beginWriteBatch();
         errdefer batch.abort();
+        // An older journal is upgraded first: stamping the current format
+        // over it would claim markers it never kept.
+        const keep_base_layout = !self.sharedReplayLane();
+        if (try replay_journal_format.state(batch.asTxn()) == .legacy) try upgradeLegacyReplayJournal(batch.asTxn(), keep_base_layout);
         try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        // See ensureReplayIndexInitialized: this must stamp the same version
+        // marker writeReplayEntries stamps on its own bootstrap path, or a
+        // store seeded only through this helper is rejected on its first
+        // real append.
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_current);
+        try batch.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
         try batch.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
+        if (keep_base_layout) try batch.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
         try batch.commit();
 
         self.markReplayIndexAvailable();
@@ -2739,12 +3387,13 @@ pub const DocStore = struct {
     fn loadReplayNextSequenceFromStore(self: *DocStore, fallback_next: u64) u64 {
         var txn = self.beginProbeTxn() catch return fallback_next;
         defer txn.abort();
-        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch return fallback_next;
+        const raw = replay_journal_format.getNextSequence(&txn) catch return fallback_next;
         if (raw.len != 8) return fallback_next;
         return std.mem.readInt(u64, raw[0..8], .little);
     }
 
     fn ensureReplayNextSequenceCached(self: *DocStore, fallback_next: u64) u64 {
+        self.revalidateAdoptedState();
         const cached = self.next_replay_sequence_cached.load(.acquire);
         if (cached != 0) return cached;
 
@@ -2770,13 +3419,14 @@ pub const DocStore = struct {
     }
 
     fn ensureCommittedReplayNextCached(self: *DocStore, fallback_next: u64) u64 {
+        self.revalidateAdoptedState();
         const cached = self.committed_replay_next_cached.load(.acquire);
         if (cached != 0) return cached;
         // A transient probe/read failure is not a durable empty cut. Leave
         // the cache unknown so the next observation retries recovery.
         var txn = self.beginProbeTxn() catch return fallback_next;
         defer txn.abort();
-        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+        const raw = replay_journal_format.getNextSequence(&txn) catch |err| switch (err) {
             error.NotFound => return fallback_next,
             else => return fallback_next,
         };
@@ -2847,6 +3497,7 @@ pub const DocStore = struct {
             .last_sequence = lane_stats.last_sequence,
             .scan_batches = lane_stats.scan_batches,
             .fallback_used = lane_stats.fallback_used,
+            .scan_budget_exhausted = lane_stats.scan_budget_exhausted,
         };
     }
 
@@ -2933,72 +3584,186 @@ pub const DocStore = struct {
         return try self.forEachReplayEntryFromHint(from_sequence, hint, ctx, callback);
     }
 
+    /// Back-compat full drain, used directly by low-level tests: loop bounded
+    /// chunks until retirement catches up to `up_to_sequence` (inclusive) or
+    /// there is nothing left to do.
     pub fn truncateReplayUpTo(self: *DocStore, alloc: Allocator, up_to_sequence: u64) !void {
-        try self.truncateReplayEntries(alloc, up_to_sequence);
+        while (true) {
+            const stats = try self.retireReplaySlice(alloc, up_to_sequence, default_retirement_budget);
+            if (stats.done) return;
+        }
     }
 
-    fn truncateReplayEntries(self: *DocStore, alloc: Allocator, up_to_sequence: u64) !void {
-        if (up_to_sequence == 0) return;
-        if (!(try self.hasReplayEntries())) return;
+    /// WS5: raise the foreground retirement watermark. Foreground/ack
+    /// callers only ever call this -- never `retireReplaySlice` directly --
+    /// so a write's acknowledgement never pays for a physical delete.
+    pub fn requestRetirement(self: *DocStore, min_progress: u64) void {
+        self.retirement_queue.request(min_progress);
+    }
 
+    /// WS5: gate which hinted lanes future appends write. Derived from the
+    /// DB layer's consumer catalog (see replay_reference.zig); callers that
+    /// never call this keep the safe all-hints default.
+    pub fn setActiveConsumerHintMask(self: *DocStore, mask: u8) void {
+        self.active_consumer_hint_mask.store(mask, .release);
+    }
+
+    /// WS5: the DB layer calls this every time it recomputes
+    /// `min_applied` (alongside `setActiveConsumerHintMask`, same call
+    /// site), so `serviceRetirement` below always clamps against a
+    /// reasonably fresh cross-consumer minimum instead of trusting
+    /// whatever ceiling a `requestRetirement` caller happened to pass.
+    pub fn noteSafeRetirementWatermark(self: *DocStore, min_consumer_progress: u64) void {
+        self.known_safe_retirement_watermark.store(min_consumer_progress, .release);
+    }
+
+    /// WS5 (a): register (or clear, with `null`) the consumer-generic
+    /// clamp callback `serviceRetirement` additionally consults. See
+    /// `extra_consumer_progress_fn`'s doc comment. Idempotent and cheap
+    /// (two pointer stores); safe to call on every retirement-adjacent
+    /// pass, not just once at open.
+    pub fn setExtraConsumerProgressProvider(self: *DocStore, ctx: ?*anyopaque, fn_: ?ExtraConsumerProgressFn) void {
+        self.extra_consumer_progress_ctx = ctx;
+        self.extra_consumer_progress_fn = fn_;
+    }
+
+    pub fn setJournalCreditPolicy(self: *DocStore, capacity_bytes: u64, progress_reserve_bytes: u64) void {
+        self.journal_credit_capacity_bytes = capacity_bytes;
+        self.journal_credit_progress_reserve_bytes = progress_reserve_bytes;
+    }
+
+    /// WS5 owner-only retirement entry point: one bounded, single-transaction
+    /// chunk, across every lane, draining the watermark `requestRetirement`
+    /// raised. The caller must already know it is the active owner (the Lite
+    /// path-lease holder or the Raft leader) -- `is_owner` is not derived
+    /// here, it is asserted, so a caller cannot mistake a skipped turn for a
+    /// completed one.
+    ///
+    /// `requestRetirement` callers (foreground acks, replay catch-up, a
+    /// caller's own just-applied sequence) raise a *requested* ceiling; they
+    /// are never required to prove it is safe. Per `clampRetireTarget`'s doc
+    /// comment, the owner must independently clamp to whatever every
+    /// registered consumer has actually applied before physically deleting
+    /// anything: `apply_state.minAppliedSequenceAcrossAllConsumers` (managed
+    /// indexes) and `extra_consumer_progress_fn` (every other journal
+    /// consumer kind: enrichments, resolvers/promotions, and anything else
+    /// the DB layer registers) are that clamp, both read fresh every call.
+    /// Their defaults (`maxInt(u64)`/no registration) preserve the
+    /// historical unclamped behavior for a store with no such consumers.
+    pub fn serviceRetirement(self: *DocStore, alloc: Allocator, is_owner: bool, budget: replay_chunks.RetirementBudget) !replay_chunks.RetirementStats {
+        if (!is_owner) return error.RetirementRequiresOwner;
+        const requested = self.retirement_queue.requested();
+        var safe_ceiling = try apply_state.minAppliedSequenceAcrossAllConsumers(alloc, self);
+        if (self.extra_consumer_progress_fn) |fn_| {
+            safe_ceiling = @min(safe_ceiling, try fn_(self.extra_consumer_progress_ctx.?, alloc));
+        }
+        return try self.retireReplaySlice(alloc, replay_chunks.clampRetireTarget(requested, safe_ceiling), budget);
+    }
+
+    /// WS5: one bounded, single-transaction retirement chunk across every
+    /// lane (the all-lane plus every hinted lane), replacing the former
+    /// one-commit-per-lane-per-chunk `truncateReplayEntries`. The scan phase
+    /// is read-only (safe across every backend_erased implementation); the
+    /// delete phase and the matching credit-ledger release happen in one
+    /// shared write batch, so a crash mid-turn can never durably delete an
+    /// entry without releasing its credit, or the reverse. `up_to_sequence`
+    /// is inclusive, matching this layer's historical `truncateReplayUpTo`.
+    fn retireReplaySlice(
+        self: *DocStore,
+        alloc: Allocator,
+        up_to_sequence: u64,
+        budget: replay_chunks.RetirementBudget,
+    ) !replay_chunks.RetirementStats {
+        var stats = replay_chunks.RetirementStats{ .done = true, .no_op = true };
+        if (up_to_sequence == 0) return stats;
+        if (!(try self.hasReplayEntries())) return stats;
+
+        // Only the key is buffered across the scan/delete phase boundary
+        // (matching the historical `truncateReplayEntries` footprint
+        // exactly): bytes and the retired-through sequence are running
+        // accumulators computed once, while each key is still in hand
+        // during the scan, rather than carried per-entry.
         var deletes = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (deletes.items) |key| alloc.free(key);
             deletes.deinit(alloc);
         }
-        try deletes.ensureTotalCapacityPrecise(alloc, replay_truncate_batch_keys);
+        try deletes.ensureTotalCapacityPrecise(alloc, @min(budget.max_keys, replay_truncate_batch_keys));
 
-        // Replay lanes are append-only. Capturing each lane independently is
-        // sufficient below an acknowledged retirement watermark, and avoids
-        // cloning/sorting unrelated document and artifact keys after every
-        // enrichment completion.
+        var planned_bytes: u64 = 0;
+        var any_retired = false;
+        var max_retired_sequence: u64 = 0;
+        var all_lanes_done = true;
+        var budget_exhausted = false;
+
+        // Replay lanes are append-only. Scanning each lane independently is
+        // sufficient below an acknowledged retirement watermark.
         for (0..replay_hints.len + 1) |lane| {
             const ordinal = if (lane < replay_hints.len) replayHintOrdinal(replay_hints[lane]) else internal_keys.replay_all_kind;
-            var from_sequence: u64 = 0;
-            while (true) {
-                var last_sequence = from_sequence;
-                {
-                    var txn = try self.beginReplayLaneScanTxn(ordinal, from_sequence);
-                    defer txn.abort();
-                    var cur = try txn.openCursor();
-                    defer cur.close();
-                    const lower = internal_keys.replayRangeLower(ordinal, from_sequence);
-                    const upper = internal_keys.replayRangeUpper(ordinal);
-                    cur.setUpperBound(&upper);
-                    var entry = try cur.seekAtOrAfter(&lower);
-                    while (entry) |kv| : (entry = try cur.next()) {
-                        if (std.mem.order(u8, kv.key, &upper) != .lt) break;
-                        const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
-                        if (sequence > up_to_sequence) break;
-                        const key = try alloc.dupe(u8, kv.key);
-                        errdefer alloc.free(key);
-                        try deletes.append(alloc, key);
-                        last_sequence = sequence;
-                        if (deletes.items.len == replay_truncate_batch_keys) break;
-                    }
+            if (budget_exhausted) {
+                all_lanes_done = false;
+                continue;
+            }
+
+            var txn = try self.beginReplayLaneScanTxn(ordinal, 0);
+            defer txn.abort();
+            var cur = try txn.openCursor();
+            defer cur.close();
+            const lower = internal_keys.replayRangeLower(ordinal, 0);
+            const upper = internal_keys.replayRangeUpper(ordinal);
+            cur.setUpperBound(&upper);
+            var entry = try cur.seekAtOrAfter(&lower);
+            while (entry) |kv| : (entry = try cur.next()) {
+                if (std.mem.order(u8, kv.key, &upper) != .lt) break;
+                const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
+                if (sequence > up_to_sequence) break;
+                const key = try alloc.dupe(u8, kv.key);
+                errdefer alloc.free(key);
+                try deletes.append(alloc, key);
+                planned_bytes += kv.key.len + kv.value.len;
+                if (!any_retired or sequence > max_retired_sequence) max_retired_sequence = sequence;
+                any_retired = true;
+                if (deletes.items.len >= budget.max_keys or planned_bytes >= budget.max_bytes) {
+                    budget_exhausted = true;
+                    all_lanes_done = false;
+                    break;
                 }
-                if (deletes.items.len == 0) break;
-                // Release the read generation before each bounded commit.
-                // Acknowledged rows are never replayed again; interruption
-                // leaves idempotent progress for the next maintenance pass.
-                var batch = try self.beginWriteBatch();
-                errdefer batch.abort();
-                for (deletes.items) |key| {
-                    batch.delete(key) catch |err| switch (err) {
-                        error.NotFound => {},
-                        else => return err,
-                    };
-                }
-                try batch.commit();
-                for (deletes.items) |key| alloc.free(key);
-                deletes.clearRetainingCapacity();
-                if (last_sequence >= up_to_sequence or last_sequence == std.math.maxInt(u64)) break;
-                from_sequence = last_sequence + 1;
             }
         }
+
+        if (deletes.items.len == 0) return stats;
+        stats.no_op = false;
+
+        var batch = try self.beginWriteBatch();
+        var committed = false;
+        defer if (!committed) batch.abort();
+
+        for (deletes.items) |key| {
+            batch.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+
+        var ledger = try loadJournalCreditLedger(&batch);
+        ledger = ledger.released(planned_bytes, @intCast(deletes.items.len));
+        try storeJournalCreditLedger(&batch, ledger);
+
+        try batch.commit();
+        committed = true;
+
+        stats.keys_deleted = deletes.items.len;
+        stats.bytes_deleted = @intCast(planned_bytes);
+        stats.retired_through = max_retired_sequence;
+        stats.done = all_lanes_done;
+        return stats;
     }
 
     const replay_truncate_batch_keys: usize = 4096;
+    const default_retirement_budget = replay_chunks.RetirementBudget{
+        .max_keys = replay_truncate_batch_keys,
+        .max_bytes = replay_chunks.RetirementBudget.default_max_bytes,
+    };
 
     /// Scan all keys with the given prefix. Caller owns returned slices.
     pub fn scanPrefix(self: *DocStore, alloc: Allocator, prefix: []const u8) ![]OwnedKVPair {
@@ -3305,17 +4070,71 @@ pub const DocStore = struct {
         return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.primary_kind, ctx, checkpoint, callback);
     }
 
+    /// Visit one physical source row per owner, skipping artifact tails.
+    pub fn scanStoredDocumentRowsReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        reverse: bool,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
+        if (reverse) return self.scanStoredDocumentRowsReverse(txn, lower, upper, ctx, checkpoint, callback);
+        return self.scanRowKindReadTxnWithContext(txn, lower, upper, null, ctx, checkpoint, callback);
+    }
+
+    fn scanStoredDocumentRowsReverse(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
+        cursor.setUpperBound(end);
+        var candidate: std.ArrayListUnmanaged(u8) = .empty;
+        defer candidate.deinit(self.alloc);
+        var entry = try cursor.seekAtOrBefore(end);
+        while (entry) |item| {
+            if (std.mem.order(u8, item.key, end) != .lt) {
+                entry = try cursor.prev();
+                continue;
+            }
+            if (std.mem.order(u8, item.key, lower) == .lt or !internal_keys.isInternalUserKey(item.key)) return;
+            const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
+            candidate.clearRetainingCapacity();
+            try candidate.appendSlice(self.alloc, item.key[0 .. term + 2]);
+            try candidate.append(self.alloc, internal_keys.relational_row_kind);
+            if (try checkpoint(ctx, candidate.items) == .stop) return;
+            for ([_]u8{ internal_keys.relational_row_kind, internal_keys.primary_kind }) |kind| {
+                candidate.items[term + 2] = kind;
+                const row = (try cursor.seekAtOrBefore(candidate.items)) orelse continue;
+                if (std.mem.eql(u8, row.key, candidate.items)) {
+                    if (try callback(ctx, row.key, row.value) == .stop) return;
+                    break;
+                }
+            }
+            entry = try cursor.seekAtOrBefore(candidate.items[0 .. term + 2]);
+        }
+    }
+
     fn scanRowKindReadTxnWithContext(
         self: *DocStore,
         txn: *Txn,
         lower: []const u8,
         upper: []const u8,
-        row_kind: u8,
+        row_kind: ?u8,
         ctx: ?*anyopaque,
         checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
         callback: ScanWithContextCallback,
     ) !void {
-        var cursor = try txn.openCursor();
+        var cursor = if (row_kind == null) try txn.openPhysicalCursorAdapter() else try txn.openCursor();
         defer cursor.close();
         const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
         cursor.setUpperBound(end);
@@ -3330,7 +4149,7 @@ pub const DocStore = struct {
             const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
             candidate.clearRetainingCapacity();
             try candidate.appendSlice(self.alloc, item.key[0 .. term + 2]);
-            try candidate.append(self.alloc, row_kind);
+            try candidate.append(self.alloc, row_kind orelse internal_keys.primary_kind);
             if (try checkpoint(ctx, candidate.items) == .stop) return;
             var current = item;
             if (std.mem.order(u8, current.key, candidate.items) == .lt) {
@@ -3338,6 +4157,16 @@ pub const DocStore = struct {
                 if (!std.mem.startsWith(u8, current.key, candidate.items[0 .. term + 2])) {
                     entry = current;
                     continue;
+                }
+            }
+            if (row_kind == null and !std.mem.eql(u8, current.key, candidate.items)) {
+                candidate.items[term + 2] = internal_keys.relational_row_kind;
+                if (std.mem.order(u8, current.key, candidate.items) == .lt) {
+                    current = (try cursor.seekAtOrAfter(candidate.items)) orelse return;
+                    if (!std.mem.startsWith(u8, current.key, candidate.items[0 .. term + 2])) {
+                        entry = current;
+                        continue;
+                    }
                 }
             }
             if (std.mem.eql(u8, current.key, candidate.items)) {
@@ -5415,6 +6244,25 @@ test "ordered artifact inventory replay reservations do not publish a committed 
     try std.testing.expectEqual(@as(u64, 4), reopened.nextReplaySequence(1));
 }
 
+test "a store seeded only through ensureReplayNextSequenceAtLeast accepts its first real append" {
+    // db.zig's ensureReplayFloor (used to bootstrap a DB split destination)
+    // calls ensureReplayNextSequenceAtLeast before the destination ever takes
+    // a real write. That bootstrap must stamp the same journal-format marker
+    // writeReplayEntries stamps on its own first append: otherwise the store
+    // looks "already initialized" (replay_meta_init_key is set) with no
+    // version marker, and the first real append is rejected outright as an
+    // unsupported pre-ledger journal.
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.ensureReplayNextSequenceAtLeast(5);
+    try std.testing.expectEqual(@as(u64, 4), store.lastReplaySequence(0));
+    try store.appendReplayOpaque(alloc, 5, "payload");
+    try std.testing.expectEqual(@as(u64, 5), store.lastReplaySequence(0));
+}
+
 test "ordered artifact inventory ambiguous replay commit reloads durable cut without reusing reservation" {
     const Fault = struct {
         inner: backend_erased.Batch,
@@ -5678,6 +6526,85 @@ test "docstore indexes replay rows by hint and truncates them" {
         alloc.free(after);
     }
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "WS5 DocStore serviceRetirement retires every lane in one commit and refuses non-owners" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{ .dense_vector, .full_text },
+    });
+    defer alloc.free(payload);
+    try store.putBatchWithReplay(null, &.{
+        .{ .key = "doc:a", .value = "A" },
+    }, &.{}, .{ .sequence = 1, .payload = payload });
+
+    // Non-owner callers never retire anything.
+    store.requestRetirement(1);
+    try std.testing.expectError(error.RetirementRequiresOwner, store.serviceRetirement(alloc, false, .{}));
+    try std.testing.expect(try store.hasReplayEntries());
+    const all_entries_before = try store.iterateReplayFrom(alloc, 1);
+    defer {
+        for (all_entries_before) |*entry| entry.deinit(alloc);
+        alloc.free(all_entries_before);
+    }
+    try std.testing.expectEqual(@as(usize, 1), all_entries_before.len);
+
+    // The owner drains the watermark in one bounded retirement turn.
+    const stats = try store.serviceRetirement(alloc, true, .{});
+    try std.testing.expect(!stats.no_op);
+    try std.testing.expect(stats.done);
+    try std.testing.expectEqual(@as(u64, 1), stats.retired_through);
+
+    const dense_after = try store.iterateReplayEntriesFromHint(alloc, 1, .dense_vector);
+    defer {
+        for (dense_after) |*entry| entry.deinit(alloc);
+        alloc.free(dense_after);
+    }
+    try std.testing.expectEqual(@as(usize, 0), dense_after.len);
+    const full_text_after = try store.iterateReplayEntriesFromHint(alloc, 1, .full_text);
+    defer {
+        for (full_text_after) |*entry| entry.deinit(alloc);
+        alloc.free(full_text_after);
+    }
+    try std.testing.expectEqual(@as(usize, 0), full_text_after.len);
+}
+
+test "WS5 DocStore journal credit ledger is charged on append and released on retirement" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    try store.putBatchWithReplay(null, &.{
+        .{ .key = "doc:a", .value = "A" },
+    }, &.{}, .{ .sequence = 1, .payload = "replay:1" });
+
+    const ledger_after_append = try store.get(alloc, internal_keys.journal_credit_ledger_key[0..]);
+    defer alloc.free(ledger_after_append);
+    const decoded_after_append = internal_keys.JournalCreditLedger.decode(ledger_after_append) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(decoded_after_append.bytes > 0);
+    try std.testing.expectEqual(@as(u64, 1), decoded_after_append.records);
+
+    store.requestRetirement(1);
+    _ = try store.serviceRetirement(alloc, true, .{});
+
+    const ledger_after_retire = try store.get(alloc, internal_keys.journal_credit_ledger_key[0..]);
+    defer alloc.free(ledger_after_retire);
+    const decoded_after_retire = internal_keys.JournalCreditLedger.decode(ledger_after_retire) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), decoded_after_retire.bytes);
+    try std.testing.expectEqual(@as(u64, 0), decoded_after_retire.records);
 }
 
 test "docstore relational bulk appends retain direct ingest and atomic dirty tokens" {
@@ -7110,4 +8037,198 @@ test "docstore source artifact abort reopen and bounded reclamation preserve aut
         try std.testing.expectEqual(@as(u64, 0), (try artifact.readQuota(&txn, root)).reserved);
         try std.testing.expectError(error.SourceReceiptExpired, artifact.stageBegin(a, &txn, root, spec));
     }
+}
+
+fn writeLegacyReplayJournal(store: *DocStore) !void {
+    // The base revision's layout: no format marker, no credit ledger,
+    // `next_sequence` under its old key, and a per-hint lane copy.
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    var next_raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &next_raw, 2, .little);
+    try batch.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
+    const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try batch.put(all_key[0..], "replay:1");
+    const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    try batch.put(lane_key[0..], "replay:1");
+    try batch.commit();
+}
+
+test "docstore upgrades a base-revision replay journal when it opens" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try writeLegacyReplayJournal(&store);
+    }
+
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try std.testing.expectEqual(@as(u64, 1), store.lastReplaySequence(0));
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        // A store whose readers use hint lanes keeps the base key, so a base
+        // binary rolled back onto it still reads where the journal is.
+        try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, (try txn.get(replay_journal_format.legacy_next_sequence_key[0..]))[0..8], .little));
+        // An older layout may have skipped a hint's appends: every marker
+        // starts at the head.
+        for (replay_hints) |hint| {
+            const marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+            try std.testing.expectEqual(@as(?u64, 1), decodeReplaySequence(try txn.get(marker[0..])));
+        }
+        const version = internal_keys.decodeReplayJournalFormatVersion(try txn.get(internal_keys.replay_journal_format_version_key[0..]));
+        try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_current), version);
+        const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 2), ledger.records);
+        try std.testing.expectEqual(@as(u64, 2 * (internal_keys.replay_key_len + "replay:1".len)), ledger.bytes);
+    }
+
+    // The next journal-producing mutation succeeds.
+    try store.putBatchWithReplay(null, &.{
+        .{ .key = "doc:a", .value = "A" },
+    }, &.{}, .{
+        .sequence = 2,
+        .payload = "replay:2",
+    });
+    try std.testing.expectEqual(@as(u64, 2), store.lastReplaySequence(0));
+}
+
+// A base binary rolled back onto an upgraded store appends in its own
+// layout: the base key only, no ledger charge. The next open notices and
+// reconciles.
+test "docstore reconciles appends a base binary made after the upgrade" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try writeLegacyReplayJournal(&store);
+    }
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        // The base binary's append of sequence 2.
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        var next_raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &next_raw, 3, .little);
+        try batch.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
+        const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+        try batch.put(all_key[0..], "replay:2");
+        try batch.commit();
+        // Before any reconciliation (a read-only reopen never runs one), the
+        // head is read from both keys in one snapshot.
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 2), try store.lastReplaySequenceFromTxn(&txn, 0));
+    }
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try std.testing.expectEqual(@as(u64, 2), store.lastReplaySequence(0));
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, (try txn.get(internal_keys.replay_meta_next_sequence_key[0..]))[0..8], .little));
+    const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 3), ledger.records);
+    const marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.enrichment));
+    try std.testing.expectEqual(@as(?u64, 2), decodeReplaySequence(try txn.get(marker[0..])));
+}
+
+// A base binary that only retires rows leaves both sequence keys agreeing;
+// the ledger still has to stop charging them.
+test "docstore reconciles rows a base binary retired after the upgrade" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try writeLegacyReplayJournal(&store);
+    }
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+        try batch.delete(lane_key[0..]);
+        try batch.commit();
+    }
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), ledger.records);
+    try std.testing.expectEqual(@as(u64, internal_keys.replay_key_len + "replay:1".len), ledger.bytes);
+}
+
+// Appends keep the base layout where readers use hint lanes: every hint the
+// record carries gets its lane and marker, whatever consumers are active,
+// and `next_sequence` stays under the base key too.
+test "docstore appends stay readable by the base layout" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    store.setActiveConsumerHintMask(0);
+    const payload = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 1, .changed_doc_keys = &.{"doc"}, .target_hints = &.{ .enrichment, .dense_vector } });
+    defer alloc.free(payload);
+    try store.putBatchWithReplay(null, &.{.{ .key = "doc", .value = "v" }}, &.{}, .{ .sequence = 1, .payload = payload });
+
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, (try txn.get(replay_journal_format.legacy_next_sequence_key[0..]))[0..8], .little));
+    for ([_]change_journal_mod.TargetHint{ .enrichment, .dense_vector }) |hint| {
+        const lane = internal_keys.replayEntryKey(replayHintOrdinal(hint), 1);
+        _ = try txn.get(lane[0..]);
+        const marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+        try std.testing.expectEqual(@as(?u64, 1), decodeReplaySequence(try txn.get(marker[0..])));
+    }
+    const full_text_lane = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    try std.testing.expectError(error.NotFound, txn.get(full_text_lane[0..]));
+    try std.testing.expectEqual(@as(?bool, true), try store.replayHintRecordBetween(.enrichment, 0, 1));
+    try std.testing.expectEqual(@as(?bool, false), try store.replayHintRecordBetween(.enrichment, 1, 5));
+    try std.testing.expectEqual(@as(?bool, false), try store.replayHintRecordBetween(.full_text, 0, 1));
+}
+
+// A read-only open never upgrades a base-revision journal; its sequence
+// readers must still find `next_sequence` under the legacy key rather than
+// report an empty journal.
+test "docstore reads a base-revision journal's watermark before it is upgraded" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try writeLegacyReplayJournal(&store);
+    try std.testing.expectEqual(@as(u64, 1), store.lastReplaySequence(0));
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 1), try store.lastReplaySequenceFromTxn(&txn, 0));
+}
+
+test "docstore refuses an unknown replay journal format when it opens" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(7);
+        try batch.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
+        try batch.commit();
+    }
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    try std.testing.expectError(error.UnsupportedReplayJournalFormat, DocStore.openRuntime(alloc, &runtime));
 }

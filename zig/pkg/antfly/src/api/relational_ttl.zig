@@ -142,6 +142,7 @@ pub fn expireStep(alloc: std.mem.Allocator, source: StatusSource, reader: reads.
     if (declaration.version != request.schema_version or declaration.ttl_duration_ns != request.ttl_duration_ns or
         !std.mem.eql(u8, declaration.ttl_field, request.ttl_field)) return error.PreparedGenerationChanged;
     const initial: contract.TableCommitRequest = .{
+        .source_producer = .ordinary,
         .table_name = table.name,
         .schema_version = request.schema_version,
         .relational_schema_version = if (declaration.storage_mode == .relational) request.schema_version else null,

@@ -1221,7 +1221,7 @@ pub const Config = struct {
         const has_lite = value.lite != null;
         const has_local = value.local != null;
         const has_object = value.object != null;
-        const selected_count: u8 = @intFromBool(has_lite) + @intFromBool(has_local) + @intFromBool(has_object);
+        const selected_count: u8 = @as(u8, @intFromBool(has_lite)) + @as(u8, @intFromBool(has_local)) + @as(u8, @intFromBool(has_object));
         if (selected_count > 1) return error.InvalidConfig;
 
         switch (engine) {
@@ -1497,6 +1497,14 @@ fn optionalU64Field(root: std.json.ObjectMap, field_name: []const u8) !?u64 {
         .integer => std.math.cast(u64, value.integer) orelse error.InvalidConfig,
         else => error.InvalidConfig,
     };
+}
+
+test "common config rejects multiple storage engines without integer overflow" {
+    for ([_][]const u8{
+        "{\"storage\":{\"engine\":\"local\",\"local\":{},\"object\":{\"connection\":\"data\",\"bucket\":\"data\"}}}",
+        "{\"storage\":{\"engine\":\"local\",\"local\":{},\"lite\":{\"path\":\"data.aflite\"}}}",
+        "{\"storage\":{\"engine\":\"local\",\"local\":{},\"lite\":{\"path\":\"data.aflite\"},\"object\":{\"connection\":\"data\",\"bucket\":\"data\"}}}",
+    }) |raw| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
 }
 
 test "common config keeps Lite as a storage engine independent of standalone topology" {

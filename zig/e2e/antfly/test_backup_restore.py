@@ -638,10 +638,21 @@ def _create_cluster_table_when_admitted(
 
 
 def _seed_cluster_docs_when_writable(
-    cluster, session: requests.Session, table_name: str, docs: dict, *, timeout_s=30.0
+    cluster,
+    session: requests.Session,
+    table_name: str,
+    docs: dict,
+    *,
+    timeout_s=30.0,
+    sync_level="write",
 ) -> dict | None:
     return _batch_cluster_docs_when_writable(
-        cluster, session, table_name, inserts=docs, timeout_s=timeout_s
+        cluster,
+        session,
+        table_name,
+        inserts=docs,
+        timeout_s=timeout_s,
+        sync_level=sync_level,
     )
 
 
@@ -869,6 +880,7 @@ def _batch_cluster_docs_when_writable(
     inserts: dict | None = None,
     deletes: tuple[str, ...] = (),
     timeout_s=30.0,
+    sync_level="write",
 ) -> dict | None:
     # Replication status is an observation, not a lease on the data leader or
     # its routing catalog. Mutate through the write API's admission contract.
@@ -878,7 +890,7 @@ def _batch_cluster_docs_when_writable(
     docs = inserts or {}
     assert docs or deletes, "expected a nonempty batch"
     assert not docs.keys() & set(deletes), "ambiguous insert/delete expectation"
-    mutation = {"sync_level": "write"}
+    mutation = {"sync_level": sync_level}
     if docs:
         mutation["inserts"] = docs
     if deletes:
@@ -3624,6 +3636,21 @@ def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
             interval_s=1.0,
         )
 
+    alias_path = f"/tables/{table_a}/index-aliases/live"
+    alias = backup_api._request(
+        "PUT",
+        alias_path,
+        {
+            "index": "full_text_index_v0",
+            "idempotency_key": "before-overwrite",
+            "require": "queryable",
+        },
+    )
+    assert alias.ok, alias.text
+    observed = backup_api._request("GET", alias_path)
+    assert observed.ok, observed.text
+    old_etag = observed.headers["ETag"]
+
     with tempfile.TemporaryDirectory(prefix="antfly-cluster-modes-") as backup_dir:
         location = _file_location(backup_dir)
 
@@ -3695,12 +3722,23 @@ def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
                 backup_id=backup_id,
                 location=location,
                 restore_mode="overwrite",
+                table_names=[table_a, table_b],
             )
             assert overwrite_restore["status"] == "completed", overwrite_restore
             assert overwrite_restore["committed_table_count"] == 2, overwrite_restore
             assert overwrite_restore["triggered_table_count"] == 0, overwrite_restore
             assert overwrite_restore["skipped_table_count"] == 0, overwrite_restore
             assert overwrite_restore["failed_table_count"] == 0, overwrite_restore
+
+        stale = backup_api.s.delete(
+            backup_api.url + alias_path,
+            headers={"If-Match": old_etag},
+            timeout=30,
+        )
+        assert stale.status_code == 412, stale.text
+        restored_alias = backup_api._request("GET", alias_path)
+        assert restored_alias.ok, restored_alias.text
+        assert restored_alias.json()["index"] == "full_text_index_v0"
 
         restored_docs = wait_until(
             lambda: _lookup_docs(backup_api, (table_a, table_b), "doc:1"),

@@ -28,6 +28,17 @@ pub const Budget = struct {
         return self.visits >= self.max_visits or self.bytes >= self.max_bytes or
             (if (self.deadline_ns) |deadline| @import("antfly_platform").time.monotonicNs() >= deadline else false);
     }
+    /// Strict admission for metadata/proof work, unlike resumable cursor
+    /// pages which permit one oversized forward step to prevent starvation.
+    pub fn check(self: Budget) !void {
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (self.visits >= self.max_visits or self.bytes >= self.max_bytes) return error.ResourceBudgetExceeded;
+    }
+    pub fn consume(self: *Budget, bytes: usize) !void {
+        try self.check();
+        if (bytes > self.max_bytes -| self.bytes) return error.ResourceBudgetExceeded;
+        self.visit(bytes);
+    }
     pub fn visit(self: *Budget, bytes: usize) void {
         self.visits +|= 1;
         self.bytes +|= bytes;

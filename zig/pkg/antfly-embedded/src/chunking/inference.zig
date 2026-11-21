@@ -178,6 +178,14 @@ pub fn chunkPageWithProvider(alloc: Allocator, cfg: chunking_types.Config, input
     return page;
 }
 
+fn appendChunkRequirement(a: Allocator, entries: *std.ArrayList([]const u8), task: []const u8, model: []const u8, identity: ?[]const u8) !void {
+    const value = if (identity) |pin|
+        try std.fmt.allocPrint(a, "{s}@{s}:{s}", .{ task, pin, model })
+    else
+        try std.fmt.allocPrint(a, "{s}:{s}", .{ task, model });
+    try entries.append(a, value);
+}
+
 fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput, antfly_provider: ?chunk_provider.Provider) !(if (paged) ChunkPage else []RemoteChunk) {
     // An empty source has nothing to chunk. Short-circuit before any
     // provider or remote dispatch: the inference endpoint rejects an empty
@@ -286,8 +294,18 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         value.value = try value.value.includingEmbedding(value.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
     };
     const boundary = if (resolved_outputs) |value| try value.value.boundary() else null;
-    const model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else if (cfg.model.len > 0) cfg.model else "fixed";
-    const capability_task: inference_work.Operation = if (boundary) |value| if (value.kind == .transcribe) .transcribe else .embed else if (cfg.embedding != null) .embed else .chunk;
+    const configured_chunk_model = std.mem.trim(u8, cfg.model, " \t\r\n");
+    const chunk_model = if (configured_chunk_model.len == 0 or
+        std.mem.eql(u8, configured_chunk_model, "fixed_bert") or
+        std.mem.eql(u8, configured_chunk_model, "fixed_bpe") or
+        std.mem.eql(u8, configured_chunk_model, "fixed-bert-tokenizer")) "fixed" else configured_chunk_model;
+    const boundary_model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else null;
+    const boundary_task: []const u8 = if (boundary) |target| switch (target.kind) {
+        .transcribe => "transcribe",
+        .diarize => "diarize",
+        .embedding => "embed",
+        .classify => return error.InvalidChunkBoundaryModel,
+    } else "embed";
     // The node default credential accompanies only the node default endpoint
     // (chunkers carry no credential of their own); discovery and the chunk
     // call authenticate identically.
@@ -301,25 +319,63 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     }
     routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, routing_header_count);
     const routing_headers = routing_header_storage[0..routing_header_count];
+    var placement: remote_capabilities.DiscoveryHeaders = .{};
+    var boundary_value: ?[]u8 = null;
+    defer if (boundary_value) |value| alloc.free(value);
+    var discovery_base: [4][2][]const u8 = undefined;
+    @memcpy(discovery_base[0..routing_header_count], routing_headers);
+    var discovery_count = routing_header_count;
+    if (boundary_model) |model| {
+        boundary_value = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ boundary_task, model });
+        discovery_base[discovery_count] = .{ "X-Antfly-Inference-Chunk-Boundary", boundary_value.? };
+        discovery_count += 1;
+    }
+    var requirements: ?[]u8 = null;
+    defer if (requirements) |value| alloc.free(value);
+    if (boundary_value != null) {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var entries: std.ArrayList([]const u8) = .empty;
+        const allow_partial = cfg.page or (if (cfg.embedding) |target| target.allow_partial orelse false else false);
+        if (resolved_outputs) |outputs| {
+            for (outputs.value.targets) |target| {
+                if (!std.mem.eql(u8, target.name, outputs.value.boundary_model) and (allow_partial or !target.required)) continue;
+                const task = if (target.kind == .embedding) "embed" else @tagName(target.kind);
+                const speaker_pin = target.speakerConfig().model_identity;
+                const pin = target.model_identity orelse if (target.kind == .diarize) speaker_pin else null;
+                if (target.kind == .diarize and speaker_pin != null and !std.mem.eql(u8, pin.?, speaker_pin.?))
+                    return error.EmbeddingIdentityMismatch;
+                try appendChunkRequirement(a, &entries, task, target.model, pin);
+                if (target.kind != .diarize and target.hasDiarization())
+                    try appendChunkRequirement(a, &entries, "diarize", target.speakerModel(), speaker_pin);
+            }
+        } else if (cfg.embedding) |target| {
+            try appendChunkRequirement(a, &entries, "embed", target.model, target.model_identity);
+        }
+        if (entries.items.len > 1 or (entries.items.len == 1 and !std.mem.eql(u8, entries.items[0], boundary_value.?))) {
+            requirements = try std.json.Stringify.valueAlloc(alloc, entries.items, .{});
+            discovery_base[discovery_count] = .{ "X-Antfly-Inference-Chunk-Requirements", requirements.? };
+            discovery_count += 1;
+        }
+    }
+    const discovery_headers = try placement.withShape(discovery_base[0..discovery_count], .{ .items = 1, .media = input != .text, .output_tokens = 0 });
     var capability_lease = dispatch: {
         const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
         defer if (accounting) |hook| hook.finish(hook.ptr, started);
-        break :dispatch try capability_cache.?.getOrDiscoverLeaseWithContext(
-            http,
-            endpoint,
-            model,
-            capability_task,
-            routing_headers,
-            execution.waitContext(),
-        );
+        break :dispatch capability_cache.?.getOrDiscoverLeaseWithContext(http, endpoint, chunk_model, .chunk, discovery_headers, execution.waitContext()) catch |err| switch (err) {
+            error.RemoteCapabilitySelectorAbsent, error.RemoteCapabilityDiscoveryUnsupported => if (boundary_model != null)
+                remote_capabilities.CapabilityLease{ .capabilities = null }
+            else
+                return err,
+            else => return err,
+        };
     };
     var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
     if (capability_lease.capabilities) |capabilities| {
-        if (cfg.isModelAware() and !capabilities.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
-        if (capabilities.framed_attachments and switch (input) {
-            .binary => true,
-            .text, .source => false,
-        }) attachment_transport = .segmented_framed_binary;
+        if (boundary_model != null and !capabilities.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
+        if (capabilities.framed_attachments and input == .binary)
+            attachment_transport = .segmented_framed_binary;
         const shape: inference_work.InvocationShape = switch (input) {
             .source => .{ .item_count = 1 },
             .text => |text| .{
@@ -400,7 +456,10 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         if (resp.status.code == 409 and stale != null and
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
         {
-            try capability_cache.?.invalidate(endpoint, model, capability_task, routing_headers);
+            try capability_cache.?.invalidateLease(endpoint, chunk_model, .chunk, discovery_headers, .{
+                .routing_token = capability_lease.routing_token,
+                .descriptor_revision = capability_lease.descriptor_revision,
+            });
             return error.InferenceCapabilitiesStale;
         }
         if (paged and resp.status.code == 409) {

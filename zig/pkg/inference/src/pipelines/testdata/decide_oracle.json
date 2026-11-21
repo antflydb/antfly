@@ -257,7 +257,7 @@
     "model_safetensors_sha256": "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997",
     "model_safetensors_size": 1945828140,
     "repo": "fastino/GLiNER2.5-Decide",
-    "revision": "7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6"
+    "revision": "5a7adf72a23b4d311abae6ce050d7f0012bb3416"
   },
   "runtime": {
     "device": "cpu",

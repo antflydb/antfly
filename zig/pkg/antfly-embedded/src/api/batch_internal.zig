@@ -506,6 +506,7 @@ test "merge page tail binding cannot be downgraded to snapshot only wire" {
 }
 
 pub const OwnedBatchRequest = struct {
+    prepared_enrichments_json: ?[]u8 = null,
     writes: []db_mod.types.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
     transforms: []db_mod.types.DocumentTransform = &.{},
@@ -554,6 +555,7 @@ pub const OwnedBatchRequest = struct {
 
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
         if (self.transaction_source_checkpoint) |*checkpoint| checkpoint.deinit();
+        if (self.prepared_enrichments_json) |json| alloc.free(json);
         @import("relational_integrity_wire.zig").free(alloc, self.integrity);
         if (self.integrity_commands) |*commands| commands.deinit();
         if (self.graph_endpoint_cleanup_guards) |*guards| guards.deinit();
@@ -644,6 +646,23 @@ pub const public_codec = @import("batch.zig");
 /// Borrow public buffers for a synchronous storage/coordinator call. Every
 /// private field remains its default; public data cannot grant owner authority.
 pub const fromPublic = db_mod.types.fromPublicMutation;
+
+test "internal batch commit requirements survive native owner and forwarded codecs" {
+    const a = std.testing.allocator;
+    for ([_]?db_mod.types.CommitRequires{ null, .none, .direct_enrichments }) |requirement| {
+        const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write, .commit_requires = requirement };
+        const wire = try encodeBatchRequest(a, request);
+        defer a.free(wire);
+        var forwarded = try parseInternalBatchRequest(a, wire);
+        defer forwarded.deinit(a);
+        try std.testing.expectEqual(requirement, forwarded.req.commit_requires);
+        const native = try encodeOwnerBatchRequest(a, forwarded.req);
+        defer a.free(native);
+        var owner = try parseOwnerBatchRequest(a, native);
+        defer owner.deinit(a);
+        try std.testing.expectEqual(requirement, owner.req.commit_requires);
+    }
+}
 
 pub fn takePublic(owned: *public_codec.OwnedBatchRequest) OwnedBatchRequest {
     const result_value: OwnedBatchRequest = .{ .writes = owned.writes, .deletes = owned.deletes, .transforms = owned.transforms, .graph_writes = owned.graph_writes, .graph_deletes = owned.graph_deletes, .req = fromPublic(owned.req) };
@@ -755,10 +774,11 @@ fn parseBatchRequestWithOptions(
         batch_value = envelope[2];
     }
     const versioned = batch_value == .array;
+    const prepared_envelope = versioned and batch_value.array.items.len == 2 and batch_value.array.items[0] == .string and std.mem.eql(u8, batch_value.array.items[0].string, "prepared-enrichments-batch-v1");
     const document_versions_envelope = versioned and batch_value.array.items.len == 2 and batch_value.array.items[0] == .string and std.mem.eql(u8, batch_value.array.items[0].string, "document-revisions-batch-v1");
     const root_value = if (versioned) blk: {
         const entries = batch_value.array.items;
-        if (!allow_internal or entries.len != 2 or entries[0] != .string or (!document_versions_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1"))) return error.InvalidBatchRequest;
+        if (!allow_internal or entries.len != 2 or entries[0] != .string or (!prepared_envelope and !document_versions_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1"))) return error.InvalidBatchRequest;
         break :blk entries[1];
     } else batch_value;
     if (root_value != .object) return error.InvalidBatchRequest;
@@ -1164,7 +1184,7 @@ fn parseBatchRequestWithOptions(
             resolver_review != null or artifact_publication != null or artifact_publication_transport != null or
             leann_record_index != null or merge_proof_adoption != null;
         const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner or isolated_control) .admit_current else .legacy;
-        if (!allow_internal or !document_versions_envelope) return error.InvalidBatchRequest;
+        if (!allow_internal or (!document_versions_envelope and !prepared_envelope)) return error.InvalidBatchRequest;
         const version = try parseInternalU64(value);
         break :scheme switch (version) {
             0 => .legacy,
@@ -1822,7 +1842,13 @@ fn parseBatchRequestWithOptions(
     // strings, not the entire parsed request, alive with the owned batch.
     const admission_bytes: ?[]u8 = if (row_policy_proof.len == 0) null else try std.mem.concat(alloc, u8, &.{ row_policy_proof, row_policy_database });
     errdefer if (admission_bytes) |bytes| alloc.free(bytes);
+    const prepared_json = if (root.get("_prepared_enrichments")) |value| blk: {
+        if (!allow_internal or !prepared_envelope or value != .object) return error.InvalidBatchRequest;
+        break :blk try std.json.Stringify.valueAlloc(alloc, value, .{});
+    } else null;
+    errdefer if (prepared_json) |json| alloc.free(json);
     const result_value: OwnedBatchRequest = .{
+        .prepared_enrichments_json = prepared_json,
         .writes = writes,
         .deletes = deletes,
         .transforms = transforms,
@@ -1910,6 +1936,8 @@ fn parseBatchRequestWithOptions(
             .timestamp_ns = timestamp_ns,
             .document_version_scheme = document_version_scheme,
             .sync_level = sync_level,
+            .prepared_enrichments_json = prepared_json,
+            .commit_requires = if (root.get("commit_requires")) |value| try @import("../storage/db/mutation_values.zig").parseCommitRequires(value) else null,
             .reject_graph_transform_projections = reject_graph_transform_projections,
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
@@ -1938,7 +1966,8 @@ fn parseBatchRequestWithOptions(
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
     try @import("../storage/db/artifact_inventory.zig").validateRequest(result_value.req);
     if (requiresRowSemanticsEnvelope(result_value.req.writes, result_value.req.predicates) and !versioned) return error.InvalidBatchRequest;
-    if (allow_internal and requiresDocumentVersionsEnvelope(result_value.req) != document_versions_envelope) return error.InvalidBatchRequest;
+    if (prepared_envelope != (result_value.req.prepared_enrichments_json != null or result_value.req.commit_requires == .direct_enrichments)) return error.InvalidBatchRequest;
+    if (allow_internal and !prepared_envelope and requiresDocumentVersionsEnvelope(result_value.req) != document_versions_envelope) return error.InvalidBatchRequest;
     return result_value;
 }
 
@@ -2128,8 +2157,8 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    const versioned = requiresRowSemanticsEnvelope(req.writes, req.predicates) or requiresDocumentVersionsEnvelope(req);
-    if (versioned) try writer.writeAll(if (requiresDocumentVersionsEnvelope(req)) "[\"document-revisions-batch-v1\"," else "[\"row-semantics-batch-v1\",");
+    const versioned = req.prepared_enrichments_json != null or req.commit_requires == .direct_enrichments or requiresRowSemanticsEnvelope(req.writes, req.predicates) or requiresDocumentVersionsEnvelope(req);
+    if (versioned) try writer.writeAll(if (req.prepared_enrichments_json != null or req.commit_requires == .direct_enrichments) "[\"prepared-enrichments-batch-v1\"," else if (requiresDocumentVersionsEnvelope(req)) "[\"document-revisions-batch-v1\"," else "[\"row-semantics-batch-v1\",");
 
     try writer.writeAll("{\"inserts\":{");
     for (if (req.merge_page != null) &.{} else req.writes, 0..) |write, i| {
@@ -2627,6 +2656,11 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         }
         try writer.writeByte('}');
     }
+    if (req.prepared_enrichments_json) |json| {
+        try writer.writeAll(",\"_prepared_enrichments\":");
+        try writer.writeAll(json);
+    }
+    if (req.commit_requires) |requirement| try writer.print(",\"commit_requires\":\"{s}\"", .{@tagName(requirement)});
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});
     if (versioned) try writer.writeByte(']');
     return try out.toOwnedSlice();
@@ -3988,7 +4022,12 @@ pub fn completionPrepareInput(a: std.mem.Allocator, request: db_mod.types.BatchR
     const mutation = request.transaction orelse return error.InvalidBatchRequest;
     if (mutation != .prepare) return error.InvalidBatchRequest;
     if (std.mem.allEqual(u8, &mutation.prepare.txn_id, 0)) return error.InvalidBatchRequest;
-    return encodeBatchRequest(a, request);
+    // The leader prepares this packet after admission freezes the request.
+    // The ordered log retains its bytes. Native PREPARE verifies the packet
+    // against this request and the physical read set before recording a vote.
+    var input = request;
+    if (input.commit_requires == .direct_enrichments) input.prepared_enrichments_json = null;
+    return encodeBatchRequest(a, input);
 }
 
 pub fn requireCompletionPrepareInput(a: std.mem.Allocator, plan: @import("../storage/transaction_completion.zig").Admission, namespace: [24]u8, request: db_mod.types.BatchRequest) !void {

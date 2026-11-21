@@ -1,0 +1,51 @@
+{
+  "scope": "Independent PyAV RGB8 reference for limited-range BT.601, no resize",
+  "width": 32,
+  "height": 16,
+  "pitch": 32,
+  "matrix": 2,
+  "full_range": 0,
+  "source": "NV12 byte i = (i * 37 + 23) % 256; lossless planar conversion to match upstream decoded yuv420p",
+  "pyav": "17.1.0",
+  "libraries": {
+    "libavutil": [
+      60,
+      26,
+      101
+    ],
+    "libavcodec": [
+      62,
+      28,
+      101
+    ],
+    "libavformat": [
+      62,
+      12,
+      101
+    ],
+    "libavdevice": [
+      62,
+      3,
+      101
+    ],
+    "libavfilter": [
+      11,
+      14,
+      101
+    ],
+    "libswscale": [
+      9,
+      5,
+      101
+    ],
+    "libswresample": [
+      6,
+      3,
+      101
+    ]
+  },
+  "sha256": {
+    "gemma4-rgb601.nv12": "2e5a9315bab6e840f3d74510775116fb63c39c0784b52ccf4d8fda241eb3337f",
+    "gemma4-rgb601.rgb": "23e9b7c20efbc1d4d7e5ab7ab00a1a610d915a5a01ed5ecf1cf92a40f7b58161"
+  }
+}

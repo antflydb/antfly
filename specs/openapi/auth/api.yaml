@@ -52,11 +52,6 @@ components:
         username:
           type: string
           example: johndoe
-        password_hash:
-          type: string
-          format: byte # Typically base64 encoded
-          description: "Base64 encoded password hash. Exposing this is a security risk."
-          example: "JGFyZ29uMm..."
         metadata:
           type: object
           additionalProperties: {}
@@ -67,7 +62,6 @@ components:
             department: "eng"
       required:
         - username
-        - password_hash
 
     ResourceType:
       type: string

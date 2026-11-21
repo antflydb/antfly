@@ -1111,6 +1111,13 @@ pub const Detail = enum(c_int) {
     storage_descriptor_pressure,
     input_output,
     catalog_changed,
+    index_referenced_by_alias,
+    index_alias_graph_conflict,
+    index_alias_precondition_required,
+    index_alias_precondition_failed,
+    storage_kernel_owner_stale_descriptor,
+    object_table_definition_conflict,
+    row_policy_limit_exceeded,
     // Appended: source admission and committed-history lifecycle contracts.
     invalid_source_admission,
     source_admission_corrupt,
@@ -1161,6 +1168,10 @@ pub const Detail = enum(c_int) {
     invalid_history_control_wire,
     invalid_history_control_response,
     conflicting_ordered_apply_receipt,
+    unsupported_commit_requirement,
+    commit_requirement_unavailable,
+    commit_requirement_too_large,
+    commit_requirement_failed,
 };
 
 pub const Status = extern struct {
@@ -1178,6 +1189,10 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.IndexAliasPreconditionRequired => status(.conflict, .index_alias_precondition_required),
+        error.IndexAliasPreconditionFailed => status(.conflict, .index_alias_precondition_failed),
+        error.IndexReferencedByAlias => status(.conflict, .index_referenced_by_alias),
+        error.IndexAliasGraphConflict => status(.conflict, .index_alias_graph_conflict),
         error.CatalogChanged => status(.conflict, .catalog_changed),
         error.SqlStatementReadUnavailable => status(.retryable, .sql_statement_read_unavailable),
         error.UnsupportedSqlExecution => status(.unsupported, .unsupported_sql_execution),
@@ -1546,6 +1561,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.HASeedSnapshotRuntimeBusy => status(.unavailable, .ha_seed_snapshot_runtime_busy),
         error.HASeedCaptureAlreadyInProgress => status(.unavailable, .ha_seed_capture_already_in_progress),
         error.StorageKernelOwnerUnavailable => status(.unavailable, .storage_kernel_owner_unavailable),
+        error.StorageKernelOwnerStaleDescriptor => status(.retryable, .storage_kernel_owner_stale_descriptor),
+        error.ObjectTableDefinitionConflict => status(.conflict, .object_table_definition_conflict),
         error.TableTopologyProtocolUpgradeRequired => status(.unavailable, .table_topology_protocol_upgrade_required),
         error.DatabaseNotFound => status(.not_found, .database_not_found),
         error.NamespaceNotFound => status(.not_found, .namespace_not_found),
@@ -1569,6 +1586,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidTablespacePlacementPolicy => status(.invalid_argument, .invalid_tablespace_placement_policy),
         error.CatalogCommandTooLarge => status(.invalid_argument, .catalog_command_too_large),
         error.InvalidCatalogRecord => status(.corrupt, .invalid_catalog_record),
+        error.RowPolicyLimitExceeded => status(.invalid_argument, .row_policy_limit_exceeded),
         error.RowPolicyCatalogChanged => status(.conflict, .row_policy_catalog_changed),
         error.CatalogIdExhausted => status(.internal, .catalog_id_exhausted),
 
@@ -2236,6 +2254,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.ChangefeedResynchronizationRequired => status(.conflict, .changefeed_resynchronization_required),
         error.ChangefeedLeaseExpired => status(.conflict, .changefeed_lease_expired),
         error.ChangefeedCapabilityUnsupported => status(.unsupported, .changefeed_capability_unsupported),
+        error.UnsupportedCommitRequirement => status(.unsupported, .unsupported_commit_requirement),
+        error.CommitRequirementUnavailable => status(.retryable, .commit_requirement_unavailable),
+        error.CommitRequirementTooLarge => status(.invalid_argument, .commit_requirement_too_large),
+        error.CommitRequirementFailed => status(.invalid_argument, .commit_requirement_failed),
 
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
@@ -2441,6 +2463,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .index_alias_precondition_required => "IndexAliasPreconditionRequired",
+        .index_alias_precondition_failed => "IndexAliasPreconditionFailed",
+        .index_referenced_by_alias => "IndexReferencedByAlias",
+        .index_alias_graph_conflict => "IndexAliasGraphConflict",
         .hierarchy_cursor_stale => "HierarchyCursorStale",
         .read_transient_failure => "ReadTransientFailure",
         .read_request_failed => "ReadRequestFailed",
@@ -2654,6 +2680,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_tablespace_placement_policy => "InvalidTablespacePlacementPolicy",
         .catalog_command_too_large => "CatalogCommandTooLarge",
         .invalid_catalog_record => "InvalidCatalogRecord",
+        .row_policy_limit_exceeded => "RowPolicyLimitExceeded",
         .row_policy_catalog_changed => "RowPolicyCatalogChanged",
         .catalog_id_exhausted => "CatalogIdExhausted",
 
@@ -2854,6 +2881,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .ha_seed_snapshot_runtime_busy => "HASeedSnapshotRuntimeBusy",
         .ha_seed_capture_already_in_progress => "HASeedCaptureAlreadyInProgress",
         .storage_kernel_owner_unavailable => "StorageKernelOwnerUnavailable",
+        .storage_kernel_owner_stale_descriptor => "StorageKernelOwnerStaleDescriptor",
+        .object_table_definition_conflict => "ObjectTableDefinitionConflict",
         .invalid_table_storage_settings => "InvalidTableStorageSettings",
         .vector_store_requires_local_single_shard_table => "VectorStoreRequiresLocalSingleShardTable",
         .vector_store_requires_empty_table => "VectorStoreRequiresEmptyTable",
@@ -3326,6 +3355,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .changefeed_resynchronization_required => "ChangefeedResynchronizationRequired",
         .changefeed_lease_expired => "ChangefeedLeaseExpired",
         .changefeed_capability_unsupported => "ChangefeedCapabilityUnsupported",
+        .unsupported_commit_requirement => "UnsupportedCommitRequirement",
+        .commit_requirement_unavailable => "CommitRequirementUnavailable",
+        .commit_requirement_too_large => "CommitRequirementTooLarge",
+        .commit_requirement_failed => "CommitRequirementFailed",
     };
 }
 
@@ -3514,7 +3547,7 @@ test "system catalog errors retain their stable runtime boundary classification"
     const unavailable = statusFromError(error.SettingAuthorityUnavailable);
     try std.testing.expectEqual(@backingInt(Code.unavailable), unavailable.code);
     try std.testing.expectEqual(error.SettingAuthorityUnavailable, errorFromStatus(unavailable));
-    const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
+    const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted, error.RowPolicyLimitExceeded };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }
 
@@ -4016,4 +4049,22 @@ test "history RPC request and receipt errors retain stable boundary identities" 
         };
         try std.testing.expectEqual(@backingInt(expected), transported.code);
     }
+}
+
+test "index dependency conflicts preserve identity across owner callbacks" {
+    for ([_]anyerror{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict, error.IndexAliasPreconditionRequired, error.IndexAliasPreconditionFailed }) |err| {
+        const result = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.conflict), result.code);
+        try std.testing.expectEqual(err, errorFromStatus(result));
+    }
+}
+
+test "index alias owner failures retain their runtime identities" {
+    inline for (.{ error.StorageKernelOwnerStaleDescriptor, error.ObjectTableDefinitionConflict }) |failure|
+        try std.testing.expectEqual(failure, errorFromStatus(statusFromError(failure)));
+}
+
+test "direct enrichment prerequisites retain stable runtime errors" {
+    inline for (.{ error.UnsupportedCommitRequirement, error.CommitRequirementUnavailable, error.CommitRequirementTooLarge, error.CommitRequirementFailed }) |err|
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }

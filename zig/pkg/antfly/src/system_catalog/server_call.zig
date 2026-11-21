@@ -74,6 +74,7 @@ pub const Call = union(enum) {
     /// owner descriptors or policy bundle bytes.
     policy_publication_begin: @import("antfly_local_sources").system_catalog_policies.BeginRequest,
     /// Administrator-authored draft definition. Never activates enforcement.
+    policy_definition_read: domain.PolicyRead,
     policy_definition_mutate: @import("antfly_local_sources").system_catalog_policies.Command,
     /// Private coordinator-only transition. Never accepted from public SQL.
     policy_publication_mutate: @import("antfly_local_sources").system_catalog_policies.PublicationCommand,
@@ -129,7 +130,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate, .native_memory_create => true,
+            .relation_replace, .relation_schema_mutate, .native_memory_create, .policy_definition_read => true,
             .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -176,7 +177,7 @@ pub const Call = union(enum) {
 
     pub fn isMutation(self: @This()) bool {
         return self == .mutate or self == .fk_initial_retirement_ack or
-            (self != .store_root_enrollment_status and self.requiresAdministrativeGrant());
+            (self != .store_root_enrollment_status and self != .policy_definition_read and self.requiresAdministrativeGrant());
     }
 };
 

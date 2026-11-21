@@ -28,7 +28,17 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     const sa = scratch.allocator();
     var state = try local.metadata_lake_index_catalog.parse(sa, table.lake_index_catalog_json);
     defer state.deinit();
-    const publication = state.value.published orelse return &.{};
+    const publication = state.value.published orelse {
+        if (state.value.pending != null or state.value.failure != null or
+            (table.indexes_json.len != 0 and !std.mem.eql(u8, table.indexes_json, "{}")) or
+            std.mem.indexOf(u8, table.schema_json, "\"relational_indexes\"") != null or
+            std.mem.indexOf(u8, table.schema_json, "iceberg_writer") != null)
+        {
+            try request.ensureActive();
+            try server.requestLakePublication(table.name);
+        }
+        return &.{};
+    };
     const eligible = for (publication.declarations) |declaration| {
         if ((declaration.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(declaration.artifact.metadata_version)) or declaration.artifact.kind == .ordered_row_index) break true;
     } else false;
@@ -63,7 +73,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, sa, table.schema_json, table.table_id, table.name);
-    sql_table.external_indexes = .{ .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) };
+    sql_table.external_indexes = .{ .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table) };
     const transport = try server.lakeProviderTransport();
     const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = transport.io, .requests = transport.requests, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store };
     try server.prepareLakeCache();
@@ -86,6 +96,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         try context.ensureActive();
         if (err == error.OutOfMemory) return err;
         switch (err) {
+            error.ExternalLakeIndexNotPublished,
             error.ExternalLakeIndexUnavailable,
             error.InvalidLogicalRowIdentity,
             error.LakeIndexArtifactUnavailable,

@@ -27,8 +27,8 @@ class TableRepairJobStartRequest:
                 to target=index. Default: False.
             limit (int | Unset): Maximum artifact repair records to attempt per pass. For target=index, any positive value
                 permits one named index repair. Default: 100.
-            advance (bool | Unset): When true, the server immediately attempts the first bounded repair pass before
-                returning the job. Default: True.
+            advance (bool | Unset): When true, the server starts the job and continues bounded passes automatically,
+                including after restart. When false, each pass requires an explicit advance request. Default: True.
     """
 
     target: RepairTarget | Unset = UNSET

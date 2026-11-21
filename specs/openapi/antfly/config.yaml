@@ -329,7 +329,7 @@ components:
           description: Literal path to an externally managed secret file. Never written by the API.
     PgwireConfig:
       type: object
-      description: Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+      description: Optional PostgreSQL wire listener. Requires authentication. Supports explicit transactions and savepoints. The listener does not terminate TLS, so remote bindings require externally_protected_transport with a TLS proxy or authenticated private transport in front.
       properties:
         enabled:
           type: boolean

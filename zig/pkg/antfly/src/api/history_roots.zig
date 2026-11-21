@@ -538,7 +538,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
         var adapter = try Routed.initForRoot(allocation_fixture.source(), &captured, captured.roots[1].namespace);
         try std.testing.expectEqual(selected[0].table_id, (try adapter.validateScope(state)).table_id);
         var relational = try Routed.initForRoot(allocation_fixture.source(), &captured, captured.roots[2].namespace);
-        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, relational.validateScope(state));
+        try std.testing.expectEqual(selected[1].table_id, (try relational.validateScope(state)).table_id);
         const root = captured.roots[0];
         try allocation_fixture.source().validate(a, state, root.namespace, root.fence, root.table_name, .{});
         var wrong_fence = root.fence;

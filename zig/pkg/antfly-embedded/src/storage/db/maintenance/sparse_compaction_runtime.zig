@@ -312,8 +312,18 @@ const MandatoryApplyRetirement = struct {
     }
 };
 
+/// Backoff used when there is no sparse-vector index at all. Far longer
+/// than `idle_interval_ms` since a demand-triggered wake (notify()) already
+/// re-dispatches sooner; this is only a safety net for catalog changes
+/// that don't call notify().
+const no_sparse_index_interval_ms: u64 = 5_000;
+
 fn workerStep(runtime: *SparseCompactionRuntime) ?u64 {
     if (isShutdown(runtime)) return null;
+    // Edge-triggered: zero sparse indexes means beginSparseCompactionTask()
+    // could not possibly find anything, so skip the exclusive apply lock
+    // this tick would otherwise take.
+    if (runtime.index_manager.sparse_indexes.items.len == 0) return no_sparse_index_interval_ms;
     const ran = runtime.runOnce() catch |err| {
         if (err == error.Canceled) return null;
         std.log.warn("sparse compaction worker failed: {s}", .{@errorName(err)});

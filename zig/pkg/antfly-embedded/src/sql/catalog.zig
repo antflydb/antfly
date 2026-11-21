@@ -118,10 +118,14 @@ pub const Table = struct {
     id: u64,
     physical_name: []const u8,
     schema_version: u32,
+    column_lineage: ?u32 = null,
     storage_mode: enum { relational, document } = .relational,
     /// External bindings are read-only and pinned by the serving cursor.
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     external_indexes: ?ExternalIndexes = null,
+    /// Execution-owned catalog cut for resolving explicit index aliases.
+    /// Never retain this in a schema or prepared-plan cache.
+    index_catalog_json: []const u8 = "{}",
     columns: []const Column,
     indexes: []const Index = &.{},
     constraints: []const Constraint = &.{},
@@ -989,6 +993,7 @@ pub const AggregatePartialCursor = struct {
 };
 
 pub const Backend = struct {
+    index_attribution: ?struct { ptr: *anyopaque, bind: *const fn (*anyopaque, ?@import("cypher").backend.IndexObserver) void } = null,
     distributed_join: ?DistributedJoin = null,
     distributed_context: @import("../api/operation.zig").RequestContext = .{},
     error_context: ?*@import("errors.zig").Context = null,

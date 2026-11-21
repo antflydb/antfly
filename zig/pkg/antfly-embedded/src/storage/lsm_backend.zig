@@ -40,6 +40,7 @@ const recovery_mod = @import("lsm_backend/recovery.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
 const cache_mod = @import("lsm_backend/cache.zig");
 const wal_mod = @import("lsm_backend/wal.zig");
+const wal_trace = @import("write_amplification_trace.zig");
 const internal_keys = @import("internal_keys.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
@@ -1510,6 +1511,8 @@ pub const Backend = struct {
         ) !wal_mod.AppendResult {
             self.reset_proven = false;
             errdefer self.invalidatePrimary();
+            const wal_trace_scope = wal_trace.scope(.lsm_backend_wal);
+            defer wal_trace_scope.end();
             const result = try wal_mod.appendStateWithOptionsResult(
                 storage,
                 allocator,
@@ -1660,6 +1663,7 @@ pub const Backend = struct {
     root_writer_lock: ?storage_io.NativePathLock = null,
     wal_operation_lock_file: ?storage_io.NativePathLockFile = null,
     storage_owner: ?*storage_io.NativeStorage = null,
+    native_storage_owner_transferred: bool = false,
     storage: ?storage_io.Storage = null,
     manifest_backing: ?[]u8 = null,
     recovered_manifest: ?@import("lsm_backend/manifest_replay.zig").RecoveryState = null,
@@ -1831,6 +1835,9 @@ pub const Backend = struct {
     run_directory_dirty: bool = true,
     run_directory_generation: u64 = 0,
     retired_run_directories: ?*RunDirectory = null,
+    // Includes the active continuation. Publication must repay retirement
+    // debt even when slow allocator/destructor work consumes the time slice.
+    retired_run_directory_count: usize = 0,
     retired_run_stores: ?*RunStore = null,
     active_compaction_publications: ?*compaction_mod.Publication = null,
     output_cleanup_retry_at_ns: u64 = 0,
@@ -2805,6 +2812,16 @@ pub const Backend = struct {
     pub fn acquireNativeStorageLease(self: *Backend) !?storage_io.NativeStorage.Lease {
         const owner = self.storage_owner orelse return null;
         return try owner.acquireLease();
+    }
+
+    /// Move destruction responsibility to a successor while the LSM still
+    /// borrows the runtime during its shutdown. The successor must outlive
+    /// shutdown and close the transferred owner with the page allocator.
+    pub fn transferNativeStorageOwnership(self: *Backend) ?*storage_io.NativeStorage {
+        const owner = self.storage_owner orelse return null;
+        std.debug.assert(!self.native_storage_owner_transferred);
+        self.native_storage_owner_transferred = true;
+        return owner;
     }
 
     pub fn maintenanceDebtHint(self: *const Backend) u64 {
@@ -3962,7 +3979,12 @@ pub const Backend = struct {
         defer self.directory_reclaim_in_flight = false;
         var credits: usize = 2048;
         const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
+        while (credits != 0) {
+            // Keep idle reclamation latency bounded, but do not let a fixed
+            // wall-clock allowance turn sustained publication into unbounded
+            // retained COW generations. Pressure repays a bounded node quantum
+            // outside the mutex; the existing work-credit cap still applies.
+            if (self.retired_run_directory_count <= 8 and runtime_mod.workNowNs(self) >= deadline) break;
             if (self.directory_reclaimer == null) {
                 const directory = self.retired_run_directories orelse break;
                 self.retired_run_directories = directory.retired_next;
@@ -3974,10 +3996,14 @@ pub const Backend = struct {
             const before = quantum;
             const done = self.directory_reclaimer.?.step(self.allocator, &quantum);
             _ = runtime_mod.lockBackend(Backend, self);
-            credits -= before - quantum;
+            // Empty/shared generations can complete without visiting a node.
+            // Charge their header/destructor work too, so pressure never
+            // bypasses the slice's hard work bound.
+            credits -= @max(@as(usize, 1), before - quantum);
             if (done) {
                 self.directory_reclaimer.?.finish(self.allocator);
                 self.directory_reclaimer = null;
+                self.retired_run_directory_count -= 1;
             }
             self.releaseReaderKind(.other);
         }
@@ -6476,6 +6502,7 @@ pub const Backend = struct {
             std.debug.assert(job.step(self.allocator, &credits));
             job.finish(self.allocator);
             self.directory_reclaimer = null;
+            self.retired_run_directory_count -= 1;
         }
         if (self.pending_directory_closure) |pending| pending.destroy(self);
         for (&self.pending_admissions) |*slot| {
@@ -6515,6 +6542,7 @@ pub const Backend = struct {
         while (self.retired_run_directories) |directory| {
             self.retired_run_directories = directory.retired_next;
             directory.destroy(self.allocator);
+            self.retired_run_directory_count -= 1;
         }
         while (self.retired_read_versions) |version| {
             self.retired_read_versions = version.retired_next;
@@ -6525,6 +6553,7 @@ pub const Backend = struct {
     fn retireRunDirectory(self: *Backend, directory: *RunDirectory) void {
         directory.retired_next = self.retired_run_directories;
         self.retired_run_directories = directory;
+        self.retired_run_directory_count += 1;
     }
 
     pub fn retireCheckpointDirectory(self: *Backend, directory: *RunDirectory) void {
@@ -26727,4 +26756,18 @@ test "lsm cold optimization writer reuses mutable probe metadata across short li
     std.debug.print("lite mixed writer: 100 batches, metadata allocations={d}\n", .{metadata.alloc_calls - calls});
     try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
     metadata.limit = std.math.maxInt(usize);
+}
+
+test "lsm directory reclamation bounds empty-generation work under pressure" {
+    const a = std.testing.allocator;
+    var backend = Backend.init(a, .{ .wal_enabled = false });
+    defer backend.close();
+    for (0..4096) |_| backend.retireRunDirectory(try RunDirectory.create(a));
+    const before = backend.retired_run_directory_count;
+    _ = runtime_mod.lockBackend(Backend, &backend);
+    backend.reclaimDirectorySliceLocked();
+    const remaining = backend.retired_run_directory_count;
+    backend.mu.unlock();
+    try std.testing.expect(remaining > 0);
+    try std.testing.expect(remaining < before);
 }
