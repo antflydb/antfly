@@ -6104,6 +6104,16 @@ pub const ModelManager = struct {
             if (expected) |pin| {
                 if (!std.mem.eql(u8, &pin, &revision)) continue;
             }
+            // A compiled CUDA backend is not evidence of an available device.
+            // Probe only after resolving the exact recipe, so a CPU pin never
+            // waits for the CUDA driver.
+            if (!include_unavailable and backend == .cuda and manifest.embedding_style != .embedding_gemma2) {
+                const available_device = backends.probeCudaDeviceWithControl(control) catch |err| switch (err) {
+                    error.ProcessIsolationRequired => false,
+                    else => return err,
+                };
+                if (!available_device) continue;
+            }
             result.backends[result.len] = backend;
             result.revisions[result.len] = revision;
             result.len += 1;
@@ -12377,6 +12387,32 @@ test "model selection durable embedding revision transfers request preparation a
         // boundary. It can succeed only by resolving its native pin first.
         const exact = try manager.embeddingRevisionCandidatesFromArtifacts(path, manifest.*, .{ .io = io }, true, revisions.revisions[0], &prepared.construction.?.artifacts);
         try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, exact.backends[0..exact.len]);
+    }
+
+    if (comptime build_options.enable_cuda) {
+        // Exercise a generic backend recipe on the same verified artifact
+        // metadata. Its CUDA pin is publishable only with positive device
+        // evidence, while its exact CPU pin stays independent of the probe.
+        var generic = manifest.*;
+        generic.embedding_style = .none;
+        const artifacts = &prepared.construction.?.artifacts;
+        const declared = try receiptedModelRevision(a, io, &artifacts.receipt.?, null, .{}, false);
+        const revision = try embeddingArtifactRevision(generic, imagePreprocessingRevision(generic, declared), artifacts);
+        manager.session_manager.required_backend = null;
+        manager.session_manager.preferred_backends = &.{ .cuda, .native };
+        manager.session_manager.native_call_policy = .in_process;
+        const control: InferenceExecutionControl = .{ .io = io, .native_call_policy = .in_process };
+        const cpu_pin = durableEmbeddingRevision(generic, revision, .native);
+        const before = backends.knownCudaDeviceAvailability();
+        const exact_cpu = try manager.declaredEmbeddingRevisionsFromArtifacts(path, generic, control, artifacts, cpu_pin);
+        try std.testing.expect(exact_cpu.contains(cpu_pin));
+        try std.testing.expectEqual(before, backends.knownCudaDeviceAvailability());
+        const cuda_pin = durableEmbeddingRevision(generic, revision, .cuda);
+        const exact_cuda = try manager.declaredEmbeddingRevisionsFromArtifacts(path, generic, control, artifacts, cuda_pin);
+        const device = backends.knownCudaDeviceAvailability();
+        try std.testing.expect(device != null);
+        try std.testing.expectEqual(device.?, exact_cuda.contains(cuda_pin));
+        manager.session_manager.required_backend = .native;
     }
 
     // Keep the size and receipt unchanged. The construction task must
