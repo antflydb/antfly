@@ -1746,7 +1746,7 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
             for (state.roots) |item| {
                 if (item.released) continue;
                 const catalog_root = for (state.definition.?.tables) |table| {
-                    if (table.contract == .writable_iceberg_rows and same(item.namespace, control.catalogRootNamespace(table))) break true;
+                    if (table.contract == .writable_iceberg_rows and std.meta.eql(item.namespace, control.catalogRootNamespace(table))) break true;
                 } else false;
                 if (catalog_root) continue;
                 const route = try captured.findInstalled(item);

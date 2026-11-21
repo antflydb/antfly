@@ -447,6 +447,49 @@ pub fn testRetainedTransaction() !void {
         try std.testing.expectEqual(@as(u64, 13), pair.candidate.delivery.advances[1].position.sequence);
         try std.testing.expectEqualStrings("BRURUC", &.{ pair.messages[0][0], pair.messages[1][0], pair.messages[2][0], pair.messages[3][0], pair.messages[4][0], pair.messages[5][0] });
     }
+    {
+        const initial_roots = try scratch.dupe(feeds.Root, state.roots);
+        initial_roots[0].physical = .{ .group_id = 11, .range_id = 11 };
+        var split = state;
+        split.roots = initial_roots;
+        const handoff: feeds.SplitHandoff = .{
+            .predecessor = initial_roots[0].physical.?,
+            .successor = .{ .group_id = 12, .range_id = 12 },
+            .cut = .{
+                .namespace = namespace,
+                .transition = 20,
+                .attempt = 1,
+                .successor_group = 12,
+                .term = 1,
+                .index = 21,
+                .latest = 10,
+                .reclaimed = 10,
+                .root_generation = 0,
+                .reserved_bytes = 0,
+                .boundary = @splat(1),
+            },
+        };
+        const topology = [_]feeds.Mutation{
+            .{ .stage_split_handoff = .{ .namespace = namespace, .ownership_epoch = 1, .handoff = handoff } },
+            .{ .confirm_split_successor = .{ .namespace = namespace, .grant_sequence = 5, .consumer_epoch = 2 } },
+            .{ .activate_split_successor = .{ .namespace = namespace, .grant_sequence = 5 } },
+        };
+        for (topology, 5..) |mutation, sequence| split = try mutation.apply(scratch, split, .{ .incarnation = @splat(4), .sequence = sequence });
+        const child = for (split.roots) |root| {
+            if (root.storage_namespace != null) break root;
+        } else return error.TestExpectedEqual;
+        try std.testing.expectEqual(state.slot.?.mapped_cursor, split.slot.?.mapped_cursor);
+        try std.testing.expectEqual(state.slot.?.confirmed_lsn, split.slot.?.confirmed_lsn);
+        var child_page = page;
+        child_page.header.?.sequence = 1;
+        child_page.next.sequence = 1;
+        child_page.observed_latest = 1;
+        var child_spool = try encode(a, split, &.{.{ .stream = child.namespace, .page = child_page, .relation = relation }}, 112, 1024);
+        defer child_spool.deinit();
+        try std.testing.expectEqual(child.namespace, child_spool.candidate.delivery.advances[0].namespace);
+        try std.testing.expectEqual(state.slot.?.next_lsn, child_spool.candidate.spec.start_lsn);
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, encode(a, split, &.{.{ .page = child_page, .relation = relation }}, 112, 1024));
+    }
     page.frame_events = 2;
     try std.testing.expectError(error.InvalidPgSpool, encode(a, state, &.{.{ .page = page, .relation = relation }}, 111, 1024));
 }
