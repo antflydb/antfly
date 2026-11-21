@@ -5569,6 +5569,8 @@ fn writeDenseRecordTransposed2d(
     try file.writeStreamingAll(io, transposed);
 }
 
+/// The formats Metal's fused decode block accepts (`fused_block_formats`),
+/// so default candidates never leave a layer without a fast route.
 const default_sensitivity_formats = "q4_0,q4_k,q5_k,q6_k,q8_0";
 
 fn parseSensitivityFormats(allocator: std.mem.Allocator, csv: []const u8) ![]QuantizationMode {
@@ -5664,6 +5666,7 @@ fn applyQuantizationPlan(
         }
         tensor.quantization = mode;
     }
+    warnSplitFusedGroups(plan);
 }
 
 fn writeWeightSensitivity(
@@ -5681,10 +5684,104 @@ fn writeWeightSensitivity(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const items = try measureWeightSensitivity(arena.allocator(), allocator, access, plan, formats, true);
-    const json = try mixed_plan.writeSensitivityJson(allocator, weight_sensitivity_metric, items);
+    const groups = try fusedTensorGroups(arena.allocator(), items);
+    const json = try mixed_plan.writeSensitivityJson(allocator, weight_sensitivity_metric, items, groups);
     defer allocator.free(json);
     try std.Io.Dir.cwd().writeFile(io_compat(), .{ .sub_path = output_path, .data = json });
-    print("wrote weight sensitivity for {d} tensors to {s}\n", .{ items.len, output_path });
+    print("wrote weight sensitivity for {d} tensors in {d} fused groups to {s}\n", .{ items.len, groups.len, output_path });
+}
+
+/// Tensors that runtimes execute as one fused kernel, found by GGUF name
+/// (llama.cpp naming: blk.N.ffn_gate*/ffn_up*, blk.N.attn_q/k/v). On Metal
+/// decode a layer stays in the fused quantized block only when FFN gate and
+/// up share a format (`directQuantizedBlockFormatForRequest`), and Q/K/V fuse
+/// only as all-q4_0, all-q4_k, all-q8_0 or q5_k/q4_k/q4_k
+/// (`tryApplyQuantizedRuntimeLinearQkv`). Plans keep these groups together
+/// unless `quantize-plan --untied` is used.
+const qkv_uniform_formats: []const []const u8 = &.{ "q4_0", "q4_k", "q8_0" };
+const qkv_extra_combos: []const []const []const u8 = &.{&.{ "q5_k", "q4_k", "q4_k" }};
+/// Formats `directQuantizedBlockFormatForKind` admits for the fused block.
+const fused_block_formats: []const []const u8 = &.{ "q4_0", "q4_k", "q5_k", "q6_k", "q8_0" };
+
+const FusedGroupKind = enum { gate_up, qkv };
+
+fn fusedGroupSiblings(buffer: *[3][256]u8, name: []const u8) ?struct { kind: FusedGroupKind, members: [3][]const u8, len: usize } {
+    if (!std.mem.startsWith(u8, name, "blk.")) return null;
+    if (std.mem.indexOf(u8, name, ".ffn_gate")) |at| {
+        const suffix = name[at + ".ffn_gate".len ..];
+        const up = std.fmt.bufPrint(&buffer[1], "{s}.ffn_up{s}", .{ name[0..at], suffix }) catch return null;
+        return .{ .kind = .gate_up, .members = .{ name, up, "" }, .len = 2 };
+    }
+    if (std.mem.endsWith(u8, name, ".attn_q.weight")) {
+        const prefix = name[0 .. name.len - ".attn_q.weight".len];
+        const k = std.fmt.bufPrint(&buffer[1], "{s}.attn_k.weight", .{prefix}) catch return null;
+        const v = std.fmt.bufPrint(&buffer[2], "{s}.attn_v.weight", .{prefix}) catch return null;
+        return .{ .kind = .qkv, .members = .{ name, k, v }, .len = 3 };
+    }
+    return null;
+}
+
+fn fusedTensorGroups(arena: std.mem.Allocator, items: []const mixed_plan.Item) ![]mixed_plan.Group {
+    var names = std.StringHashMapUnmanaged(void).empty;
+    for (items) |item| try names.put(arena, item.name, {});
+    var groups = std.ArrayListUnmanaged(mixed_plan.Group).empty;
+    var buffer: [3][256]u8 = undefined;
+    for (items) |item| {
+        const siblings = fusedGroupSiblings(&buffer, item.name) orelse continue;
+        const members = try arena.alloc([]const u8, siblings.len);
+        var complete = true;
+        for (siblings.members[0..siblings.len], members) |member, *slot| {
+            const key = names.getKey(member) orelse {
+                complete = false;
+                break;
+            };
+            slot.* = key;
+        }
+        if (!complete) continue;
+        const group_name = switch (siblings.kind) {
+            .gate_up => blk: {
+                const at = std.mem.indexOf(u8, item.name, ".ffn_gate").?;
+                break :blk try std.fmt.allocPrint(arena, "{s}.ffn_gate_up{s}", .{ item.name[0..at], item.name[at + ".ffn_gate".len ..] });
+            },
+            .qkv => try std.fmt.allocPrint(arena, "{s}.attn_qkv", .{item.name[0 .. item.name.len - ".attn_q.weight".len]}),
+        };
+        try groups.append(arena, .{
+            .name = group_name,
+            .members = members,
+            .uniform_formats = if (siblings.kind == .qkv) qkv_uniform_formats else fused_block_formats,
+            .extra_combos = if (siblings.kind == .qkv) qkv_extra_combos else &.{},
+        });
+    }
+    return groups.toOwnedSlice(arena);
+}
+
+/// Report planned formats that split a fused group; the export still works
+/// but runs those tensors outside the fused kernels.
+fn warnSplitFusedGroups(plan: *const ExportPlan) void {
+    var buffer: [3][256]u8 = undefined;
+    for (plan.tensors) |tensor| {
+        const siblings = fusedGroupSiblings(&buffer, tensor.output_name) orelse continue;
+        var modes: [3]QuantizationMode = undefined;
+        for (siblings.members[0..siblings.len], 0..) |member, i| {
+            modes[i] = for (plan.tensors) |other| {
+                if (std.mem.eql(u8, other.output_name, member)) break other.quantization;
+            } else return;
+        }
+        const ok = switch (siblings.kind) {
+            .gate_up => modes[0] == modes[1] and
+                (modes[0] == .q4_0 or modes[0] == .q4_k or modes[0] == .q5_k or modes[0] == .q6_k or modes[0] == .q8_0),
+            .qkv => (modes[0] == modes[1] and modes[1] == modes[2] and
+                (modes[0] == .q4_0 or modes[0] == .q4_k or modes[0] == .q8_0)) or
+                (modes[0] == .q5_k and modes[1] == .q4_k and modes[2] == .q4_k),
+        };
+        if (!ok) print("warning: {s} and its fused siblings use {s}/{s}{s}{s}; Metal decode runs them outside the fused kernel\n", .{
+            tensor.output_name,
+            @tagName(modes[0]),
+            @tagName(modes[1]),
+            if (siblings.len == 3) "/" else "",
+            if (siblings.len == 3) @tagName(modes[2]) else "",
+        });
+    }
 }
 
 const weight_sensitivity_metric = "weight_sse";
@@ -9391,10 +9488,11 @@ test "weight sensitivity measures each candidate and feeds the allocator" {
         low += item.candidates[0].bytes;
         high += item.candidates[2].bytes;
     }
-    var allocation = try mixed_plan.allocate(allocator, items, (low + high) / 2);
-    defer allocation.deinit(allocator);
-    try std.testing.expect(allocation.total_bytes <= (low + high) / 2);
-    const plan_json = try mixed_plan.writePlanJson(allocator, weight_sensitivity_metric, (low + high) / 2, items, allocation);
+    const groups = try fusedTensorGroups(arena.allocator(), items);
+    var selection = try mixed_plan.select(allocator, items, groups, (low + high) / 2, .{});
+    defer selection.deinit();
+    try std.testing.expect(selection.total_bytes <= (low + high) / 2);
+    const plan_json = try mixed_plan.writePlanJson(allocator, weight_sensitivity_metric, (low + high) / 2, items, selection);
     defer allocator.free(plan_json);
     var quant_plan = try mixed_plan.parsePlan(allocator, plan_json);
     defer quant_plan.deinit();
@@ -9404,12 +9502,74 @@ test "weight sensitivity measures each candidate and feeds the allocator" {
     defer allocator.free(out_path);
     try writePlannedExport(allocator, dir_path, out_path, null, &planned);
     var planned_bytes: u64 = 0;
-    for (items, allocation.choices) |item, choice| {
-        const want = tensorTypeForQuantizationMode(parseQuantizationMode(item.candidates[choice].format).?);
+    for (items, selection.formats) |item, format| {
+        const want = tensorTypeForQuantizationMode(parseQuantizationMode(format).?);
         try std.testing.expectEqual(want, try readExportedTensorType(allocator, out_path, item.name));
-        planned_bytes += item.candidates[choice].bytes;
+        for (item.candidates) |candidate| {
+            if (std.mem.eql(u8, candidate.format, format)) planned_bytes += candidate.bytes;
+        }
     }
-    try std.testing.expectEqual(allocation.total_bytes, planned_bytes);
+    try std.testing.expectEqual(selection.total_bytes, planned_bytes);
+}
+
+test "fused tensor groups follow GGUF names and keep plans on fused kernels" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // q is very sensitive, k/v and gate are not, up is: untied plans would split both groups.
+    const Spec = struct { name: []const u8, q4: f64, q5: f64, q8: f64 };
+    const specs = [_]Spec{
+        .{ .name = "blk.0.attn_q.weight", .q4 = 50, .q5 = 5, .q8 = 0.1 },
+        .{ .name = "blk.0.attn_k.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.0.attn_v.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.0.ffn_gate.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.0.ffn_up.weight", .q4 = 30, .q5 = 3, .q8 = 0.1 },
+        .{ .name = "blk.0.ffn_down.weight", .q4 = 2, .q5 = 1, .q8 = 0.01 },
+        .{ .name = "blk.1.ffn_gate_exps.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.1.ffn_up_exps.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.2.ffn_gate.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 }, // no up: not grouped
+    };
+    var items: [specs.len]mixed_plan.Item = undefined;
+    for (specs, &items) |spec, *item| {
+        const candidates = try a.alloc(mixed_plan.Candidate, 3);
+        candidates[0] = .{ .format = "q4_k", .bytes = 144, .loss = spec.q4 };
+        candidates[1] = .{ .format = "q5_k", .bytes = 176, .loss = spec.q5 };
+        candidates[2] = .{ .format = "q8_0", .bytes = 272, .loss = spec.q8 };
+        item.* = .{ .name = spec.name, .elements = 256, .candidates = candidates };
+    }
+    const groups = try fusedTensorGroups(a, &items);
+    try std.testing.expectEqual(@as(usize, 3), groups.len);
+    try std.testing.expectEqualStrings("blk.0.attn_qkv", groups[0].name);
+    try std.testing.expectEqual(@as(usize, 3), groups[0].members.len);
+    try std.testing.expectEqual(@as(usize, 1), groups[0].extra_combos.len);
+    try std.testing.expectEqualStrings("blk.0.ffn_gate_up.weight", groups[1].name);
+    try std.testing.expectEqualStrings("blk.1.ffn_gate_up_exps.weight", groups[2].name);
+    try std.testing.expectEqualStrings("blk.1.ffn_up_exps.weight", groups[2].members[1]);
+
+    // Room for two q5_k upgrades: untied puts them on q and up alone.
+    const budget: u64 = 9 * 144 + 2 * 32;
+    var untied = try mixed_plan.select(allocator, &items, groups, budget, .{ .untied = true });
+    defer untied.deinit();
+    try std.testing.expectEqualStrings("q5_k", untied.formats[0]);
+    try std.testing.expectEqualStrings("q4_k", untied.formats[1]);
+    try std.testing.expectEqualStrings("q4_k", untied.formats[3]);
+    try std.testing.expectEqualStrings("q5_k", untied.formats[4]);
+
+    // Tied: q takes the fused q5_k/q4_k/q4_k combination, and up cannot move without gate.
+    var tied = try mixed_plan.select(allocator, &items, groups, budget, .{});
+    defer tied.deinit();
+    try std.testing.expectEqualStrings("q5_k", tied.formats[0]);
+    try std.testing.expectEqualStrings("q4_k", tied.formats[1]);
+    try std.testing.expectEqualStrings("q4_k", tied.formats[2]);
+    try std.testing.expectEqualStrings(tied.formats[3], tied.formats[4]);
+    try std.testing.expectEqualStrings(tied.formats[6], tied.formats[7]);
+
+    // With room for everything, Q/K/V still take a fused combination (q8_0),
+    // never uniform q5_k/q6_k.
+    var roomy = try mixed_plan.select(allocator, &items, groups, 9 * 272, .{});
+    defer roomy.deinit();
+    for (roomy.formats[0..3]) |format| try std.testing.expectEqualStrings("q8_0", format);
 }
 
 test "mixed-precision flags parse and require a sensitivity target for formats" {

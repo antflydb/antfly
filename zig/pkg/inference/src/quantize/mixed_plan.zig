@@ -55,10 +55,24 @@ pub const Item = struct {
     candidates: []const Candidate,
 };
 
+/// Tensors a runtime executes as one fused kernel, which accepts only some
+/// format combinations. The allocator treats a group as one item: every
+/// member in one shared format from `uniform_formats` (any measured format
+/// when null), or one of `extra_combos` (formats in member order). Splitting
+/// such tensors otherwise falls off the fused path; on Metal decode,
+/// mismatched FFN gate/up leave the fused block entirely.
+pub const Group = struct {
+    name: []const u8,
+    members: []const []const u8,
+    uniform_formats: ?[]const []const u8 = null,
+    extra_combos: []const []const []const u8 = &.{},
+};
+
 pub const SensitivityFile = struct {
     schema: []const u8,
     metric: []const u8,
     tensors: []const Item,
+    groups: []const Group = &.{},
 };
 
 pub const Allocation = struct {
@@ -415,6 +429,190 @@ pub fn parseSensitivity(allocator: Allocator, bytes: []const u8) !std.json.Parse
     return parsed;
 }
 
+pub const SelectOptions = struct {
+    /// Ignore groups and choose every tensor independently (for backends
+    /// without fused kernels, such as the CPU encoder path).
+    untied: bool = false,
+    /// Only consider these formats; null keeps every measured candidate.
+    formats: ?[]const []const u8 = null,
+};
+
+/// One format per input tensor, aligned with the `items` passed to `select`.
+pub const Selection = struct {
+    arena: std.heap.ArenaAllocator,
+    formats: []const []const u8,
+    total_bytes: u64,
+    total_loss: f64,
+    total_elements: u64,
+
+    pub fn deinit(self: *Selection) void {
+        self.arena.deinit();
+    }
+
+    pub fn bitsPerWeight(self: Selection) f64 {
+        if (self.total_elements == 0) return 0;
+        return @as(f64, @floatFromInt(self.total_bytes)) * 8.0 / @as(f64, @floatFromInt(self.total_elements));
+    }
+};
+
+fn candidateFor(item: Item, format: []const u8) ?Candidate {
+    for (item.candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.format, format)) return candidate;
+    }
+    return null;
+}
+
+fn containsFormat(list: []const []const u8, format: []const u8) bool {
+    for (list) |name| {
+        if (std.mem.eql(u8, name, format)) return true;
+    }
+    return false;
+}
+
+fn formatAllowed(options: SelectOptions, format: []const u8) bool {
+    const allowed = options.formats orelse return true;
+    return containsFormat(allowed, format);
+}
+
+/// Group-aware allocation: collapses each group into one item whose
+/// candidates are its allowed format combinations, allocates, and expands
+/// the choice back to every member.
+pub fn select(
+    allocator: Allocator,
+    items: []const Item,
+    groups: []const Group,
+    budget_bytes: u64,
+    options: SelectOptions,
+) !Selection {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var index = std.StringHashMapUnmanaged(usize).empty;
+    for (items, 0..) |item, i| try index.put(a, item.name, i);
+
+    // owner[i]: the unit (synthetic allocation item) tensor i belongs to.
+    const owner = try a.alloc(?usize, items.len);
+    @memset(owner, null);
+    var units = std.ArrayListUnmanaged(Item).empty;
+    // For each unit candidate, the format of each of the unit's members.
+    var unit_members = std.ArrayListUnmanaged([]const usize).empty;
+    var unit_combos = std.ArrayListUnmanaged([]const []const []const u8).empty;
+
+    const active_groups = if (options.untied) &[_]Group{} else groups;
+    for (active_groups) |group| {
+        if (group.members.len < 2) return error.InvalidGroup;
+        const members = try a.alloc(usize, group.members.len);
+        for (group.members, members) |name, *slot| {
+            const i = index.get(name) orelse {
+                std.debug.print("group {s} names a tensor the file does not list: {s}\n", .{ group.name, name });
+                return error.InvalidGroup;
+            };
+            if (owner[i] != null) {
+                std.debug.print("tensor {s} is in more than one group\n", .{name});
+                return error.InvalidGroup;
+            }
+            owner[i] = units.items.len;
+            slot.* = i;
+        }
+
+        var candidates = std.ArrayListUnmanaged(Candidate).empty;
+        var combos = std.ArrayListUnmanaged([]const []const u8).empty;
+        // Uniform combinations: a format every member was measured in.
+        for (items[members[0]].candidates) |first| {
+            if (group.uniform_formats) |allowed| {
+                if (!containsFormat(allowed, first.format)) continue;
+            }
+            const combo = try a.alloc([]const u8, members.len);
+            @memset(combo, first.format);
+            try appendCombo(a, items, members, combo, options, &candidates, &combos);
+        }
+        for (group.extra_combos) |combo| {
+            if (combo.len != members.len) return error.InvalidGroup;
+            try appendCombo(a, items, members, combo, options, &candidates, &combos);
+        }
+        if (candidates.items.len == 0) {
+            std.debug.print("group {s} has no format combination measured for every member\n", .{group.name});
+            return error.GroupHasNoCandidates;
+        }
+        var elements: u64 = 0;
+        for (members) |i| elements += items[i].elements;
+        try units.append(a, .{ .name = group.name, .elements = elements, .candidates = try candidates.toOwnedSlice(a) });
+        try unit_members.append(a, members);
+        try unit_combos.append(a, try combos.toOwnedSlice(a));
+    }
+    for (items, 0..) |item, i| {
+        if (owner[i] != null) continue;
+        var candidates = std.ArrayListUnmanaged(Candidate).empty;
+        for (item.candidates) |candidate| {
+            if (formatAllowed(options, candidate.format)) try candidates.append(a, candidate);
+        }
+        if (candidates.items.len == 0) {
+            std.debug.print("tensor {s} has no candidate in the allowed formats\n", .{item.name});
+            return error.EmptyCandidates;
+        }
+        owner[i] = units.items.len;
+        const member = try a.alloc(usize, 1);
+        member[0] = i;
+        try units.append(a, .{ .name = item.name, .elements = item.elements, .candidates = try candidates.toOwnedSlice(a) });
+        try unit_members.append(a, member);
+        try unit_combos.append(a, &.{});
+    }
+
+    var allocation = try allocate(allocator, units.items, budget_bytes);
+    defer allocation.deinit(allocator);
+
+    const formats = try a.alloc([]const u8, items.len);
+    for (units.items, unit_members.items, unit_combos.items, allocation.choices) |unit, members, combos, choice| {
+        if (combos.len == 0) {
+            formats[members[0]] = unit.candidates[choice].format;
+        } else {
+            for (members, combos[choice]) |i, format| formats[i] = format;
+        }
+    }
+    return .{
+        .arena = arena,
+        .formats = formats,
+        .total_bytes = allocation.total_bytes,
+        .total_loss = allocation.total_loss,
+        .total_elements = allocation.total_elements,
+    };
+}
+
+fn appendCombo(
+    a: Allocator,
+    items: []const Item,
+    members: []const usize,
+    combo: []const []const u8,
+    options: SelectOptions,
+    candidates: *std.ArrayListUnmanaged(Candidate),
+    combos: *std.ArrayListUnmanaged([]const []const u8),
+) !void {
+    var bytes: u64 = 0;
+    var loss: f64 = 0;
+    for (members, combo) |i, format| {
+        if (!formatAllowed(options, format)) return;
+        const candidate = candidateFor(items[i], format) orelse return;
+        bytes += candidate.bytes;
+        loss += candidate.loss;
+    }
+    for (combos.items) |existing| {
+        var same = true;
+        for (existing, combo) |x, y| same = same and std.mem.eql(u8, x, y);
+        if (same) return;
+    }
+    const label = if (allSame(combo)) combo[0] else try std.mem.join(a, ",", combo);
+    try candidates.append(a, .{ .format = label, .bytes = bytes, .loss = loss });
+    try combos.append(a, combo);
+}
+
+fn allSame(combo: []const []const u8) bool {
+    for (combo[1..]) |format| {
+        if (!std.mem.eql(u8, format, combo[0])) return false;
+    }
+    return true;
+}
+
 pub const PlanEntry = struct {
     name: []const u8,
     format: []const u8,
@@ -463,7 +661,7 @@ pub fn writePlanJson(
     metric: []const u8,
     budget_bytes: u64,
     items: []const Item,
-    allocation: Allocation,
+    selection: Selection,
 ) ![]u8 {
     var text: std.Io.Writer.Allocating = .init(allocator);
     errdefer text.deinit();
@@ -473,24 +671,24 @@ pub fn writePlanJson(
     try w.writeAll("  \"metric\": ");
     try std.json.Stringify.value(metric, .{}, w);
     try w.print(",\n  \"budget_bytes\": {d},\n", .{budget_bytes});
-    try w.print("  \"planned_bytes\": {d},\n", .{allocation.total_bytes});
-    try w.print("  \"planned_elements\": {d},\n", .{allocation.total_elements});
-    try w.print("  \"bits_per_weight\": {d:.4},\n", .{allocation.bitsPerWeight()});
+    try w.print("  \"planned_bytes\": {d},\n", .{selection.total_bytes});
+    try w.print("  \"planned_elements\": {d},\n", .{selection.total_elements});
+    try w.print("  \"bits_per_weight\": {d:.4},\n", .{selection.bitsPerWeight()});
     try w.writeAll("  \"total_loss\": ");
-    try std.json.Stringify.value(allocation.total_loss, .{}, w);
+    try std.json.Stringify.value(selection.total_loss, .{}, w);
     try w.writeAll(",\n  \"tensors\": {");
     for (items, 0..) |item, i| {
         try w.writeAll(if (i == 0) "\n    " else ",\n    ");
         try std.json.Stringify.value(item.name, .{}, w);
         try w.writeAll(": ");
-        try std.json.Stringify.value(item.candidates[allocation.choices[i]].format, .{}, w);
+        try std.json.Stringify.value(selection.formats[i], .{}, w);
     }
     try w.writeAll(if (items.len == 0) "}\n}\n" else "\n  }\n}\n");
     return text.toOwnedSlice();
 }
 
-pub fn writeSensitivityJson(allocator: Allocator, metric: []const u8, items: []const Item) ![]u8 {
-    const file: SensitivityFile = .{ .schema = sensitivity_schema, .metric = metric, .tensors = items };
+pub fn writeSensitivityJson(allocator: Allocator, metric: []const u8, items: []const Item, groups: []const Group) ![]u8 {
+    const file: SensitivityFile = .{ .schema = sensitivity_schema, .metric = metric, .tensors = items, .groups = groups };
     return std.json.Stringify.valueAlloc(allocator, file, .{ .whitespace = .indent_2 });
 }
 
@@ -508,6 +706,8 @@ pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
     var sensitivity_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
     var budget: ?Budget = null;
+    var options: SelectOptions = .{};
+    var formats_csv: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -525,12 +725,26 @@ pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--budget-bytes") and i + 1 < args.len) {
             budget = .{ .bytes = std.fmt.parseInt(u64, args[i + 1], 10) catch return usage() };
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--formats") and i + 1 < args.len) {
+            formats_csv = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--untied")) {
+            options.untied = true;
         } else {
             return usage();
         }
     }
     const path = sensitivity_path orelse return usage();
     const chosen_budget = budget orelse return usage();
+
+    var formats = std.ArrayListUnmanaged([]const u8).empty;
+    defer formats.deinit(allocator);
+    if (formats_csv) |csv| {
+        var it = std.mem.tokenizeScalar(u8, csv, ',');
+        while (it.next()) |name| try formats.append(allocator, std.mem.trim(u8, name, " "));
+        if (formats.items.len == 0) return usage();
+        options.formats = formats.items;
+    }
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(512 * 1024 * 1024));
     defer allocator.free(bytes);
@@ -539,27 +753,22 @@ pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
     const items = parsed.value.tensors;
 
     const budget_bytes = chosen_budget.resolve(items);
-    var allocation = allocate(allocator, items, budget_bytes) catch |err| switch (err) {
+    var selection = select(allocator, items, parsed.value.groups, budget_bytes, options) catch |err| switch (err) {
         error.BudgetTooSmall => {
-            var minimum: u64 = 0;
-            for (items) |item| {
-                var smallest: u64 = std.math.maxInt(u64);
-                for (item.candidates) |candidate| smallest = @min(smallest, candidate.bytes);
-                minimum += smallest;
-            }
-            std.debug.print("budget {d} bytes is below the smallest plan ({d} bytes)\n", .{ budget_bytes, minimum });
+            std.debug.print("budget {d} bytes is below the smallest plan the candidates and groups allow\n", .{budget_bytes});
             return err;
         },
         else => return err,
     };
-    defer allocation.deinit(allocator);
+    defer selection.deinit();
 
-    const json = try writePlanJson(allocator, parsed.value.metric, budget_bytes, items, allocation);
+    const json = try writePlanJson(allocator, parsed.value.metric, budget_bytes, items, selection);
     defer allocator.free(json);
     if (output_path) |out| {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = json });
-        std.debug.print("wrote plan to {s}: {d} tensors, {d} bytes, {d:.4} bits/weight, loss {e}\n", .{
-            out, items.len, allocation.total_bytes, allocation.bitsPerWeight(), allocation.total_loss,
+        std.debug.print("wrote plan to {s}: {d} tensors, {d} groups{s}, {d} bytes, {d:.4} bits/weight, loss {e}\n", .{
+            out,                   items.len,                 parsed.value.groups.len, if (options.untied) " ignored" else "",
+            selection.total_bytes, selection.bitsPerWeight(), selection.total_loss,
         });
     } else {
         std.debug.print("{s}", .{json});
@@ -568,10 +777,14 @@ pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
 
 fn usage() error{InvalidArguments} {
     std.debug.print(
-        \\usage: antfly inference quantize-plan --sensitivity <file.json> (--bits-per-weight <x> | --budget-bytes <n>) [--output <plan.json>]
+        \\usage: antfly inference quantize-plan --sensitivity <file.json> (--bits-per-weight <x> | --budget-bytes <n>) [--formats <csv>] [--untied] [--output <plan.json>]
         \\
         \\Chooses one format per tensor from a sensitivity file so the summed loss is
         \\smallest within the budget. The budget covers only the tensors the file lists.
+        \\Tensors in a group (fused kernels such as FFN gate/up and attention Q/K/V)
+        \\get one of the group's allowed format combinations; --untied ignores groups
+        \\for backends without those fusions. --formats limits the candidates, e.g. to
+        \\the formats a target backend has fast routes for.
         \\Apply the plan with: antfly inference export <model-dir> --target gguf --format <base> --quantize-plan <plan.json>
         \\
     , .{});
@@ -760,17 +973,20 @@ test "sensitivity and plan files round-trip" {
         .{ .format = "q8_0", .bytes = 272, .loss = 0.25 },
     };
     const items = [_]Item{ testItem("blk.0.attn_q.weight", 256, &candidates), testItem("token_embd.weight", 256, &candidates) };
-    const sensitivity = try writeSensitivityJson(allocator, "weight_sse", &items);
+    const groups = [_]Group{.{ .name = "pair", .members = &.{ "blk.0.attn_q.weight", "token_embd.weight" }, .extra_combos = &.{&.{ "q8_0", "q4_k" }} }};
+    const sensitivity = try writeSensitivityJson(allocator, "weight_sse", &items, &groups);
     defer allocator.free(sensitivity);
     const parsed = try parseSensitivity(allocator, sensitivity);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.value.tensors.len);
     try std.testing.expectEqualStrings("token_embd.weight", parsed.value.tensors[1].name);
     try std.testing.expectEqual(@as(u64, 272), parsed.value.tensors[1].candidates[1].bytes);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.groups.len);
+    try std.testing.expectEqualStrings("q8_0", parsed.value.groups[0].extra_combos[0][0]);
 
-    var allocation = try allocate(allocator, parsed.value.tensors, 144 + 272);
-    defer allocation.deinit(allocator);
-    const plan_json = try writePlanJson(allocator, parsed.value.metric, 144 + 272, parsed.value.tensors, allocation);
+    var selection = try select(allocator, parsed.value.tensors, parsed.value.groups, 144 + 272, .{});
+    defer selection.deinit();
+    const plan_json = try writePlanJson(allocator, parsed.value.metric, 144 + 272, parsed.value.tensors, selection);
     defer allocator.free(plan_json);
     var plan = try parsePlan(allocator, plan_json);
     defer plan.deinit();
@@ -779,6 +995,96 @@ test "sensitivity and plan files round-trip" {
     const second = plan.find("token_embd.weight").?;
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expect(plan.find("missing.weight") == null);
+}
+
+test "sensitivity files without groups still parse" {
+    const parsed = try parseSensitivity(std.testing.allocator,
+        \\{"schema":"antfly-quant-sensitivity/v1","metric":"m","tensors":[
+        \\ {"name":"a","elements":32,"candidates":[{"format":"q8_0","bytes":34,"loss":0}]}]}
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.groups.len);
+}
+
+test "select keeps grouped tensors on allowed combinations" {
+    const allocator = std.testing.allocator;
+    // gate is sensitive and up is not; untied, they would split.
+    const gate = [_]Candidate{
+        .{ .format = "q4_k", .bytes = 100, .loss = 40 },
+        .{ .format = "q6_k", .bytes = 150, .loss = 4 },
+    };
+    const up = [_]Candidate{
+        .{ .format = "q4_k", .bytes = 100, .loss = 1 },
+        .{ .format = "q6_k", .bytes = 150, .loss = 0.5 },
+    };
+    const other = [_]Candidate{
+        .{ .format = "q4_k", .bytes = 100, .loss = 10 },
+        .{ .format = "q6_k", .bytes = 150, .loss = 1 },
+    };
+    const items = [_]Item{ testItem("gate", 400, &gate), testItem("up", 400, &up), testItem("other", 400, &other) };
+    const groups = [_]Group{.{ .name = "gate_up", .members = &.{ "gate", "up" } }};
+
+    var untied = try select(allocator, &items, &groups, 350, .{ .untied = true });
+    defer untied.deinit();
+    try std.testing.expectEqualStrings("q6_k", untied.formats[0]);
+    try std.testing.expectEqualStrings("q4_k", untied.formats[1]);
+
+    // Tied, the gate/up upgrade costs 100 bytes and does not fit in 350;
+    // only "other" can be upgraded, and gate/up stay together.
+    var tight = try select(allocator, &items, &groups, 350, .{});
+    defer tight.deinit();
+    try std.testing.expectEqualStrings(tight.formats[0], tight.formats[1]);
+    try std.testing.expectEqualStrings("q4_k", tight.formats[0]);
+    try std.testing.expectEqualStrings("q6_k", tight.formats[2]);
+    try std.testing.expect(tight.total_bytes <= 350);
+
+    var roomy = try select(allocator, &items, &groups, 400, .{});
+    defer roomy.deinit();
+    try std.testing.expectEqualStrings("q6_k", roomy.formats[0]);
+    try std.testing.expectEqualStrings("q6_k", roomy.formats[1]);
+    try std.testing.expectEqualStrings("q4_k", roomy.formats[2]);
+    try std.testing.expectApproxEqAbs(@as(f64, 14.5), roomy.total_loss, 1e-9);
+}
+
+test "select honors extra combinations and the format filter" {
+    const allocator = std.testing.allocator;
+    const q = [_]Candidate{
+        .{ .format = "q4_k", .bytes = 100, .loss = 20 },
+        .{ .format = "q5_k", .bytes = 120, .loss = 2 },
+        .{ .format = "q6_k", .bytes = 150, .loss = 1 },
+    };
+    const kv = [_]Candidate{
+        .{ .format = "q4_k", .bytes = 50, .loss = 0.1 },
+        .{ .format = "q5_k", .bytes = 60, .loss = 0.05 },
+        .{ .format = "q6_k", .bytes = 75, .loss = 0.02 },
+    };
+    const items = [_]Item{ testItem("q", 400, &q), testItem("k", 200, &kv), testItem("v", 200, &kv) };
+    const qkv = [_]Group{.{ .name = "qkv", .members = &.{ "q", "k", "v" }, .uniform_formats = &.{"q4_k"}, .extra_combos = &.{&.{ "q5_k", "q4_k", "q4_k" }} }};
+
+    // 220 bytes: all-q4_k (200) or the q5_k,q4_k,q4_k combination (220).
+    var mixed = try select(allocator, &items, &qkv, 220, .{});
+    defer mixed.deinit();
+    try std.testing.expectEqualStrings("q5_k", mixed.formats[0]);
+    try std.testing.expectEqualStrings("q4_k", mixed.formats[1]);
+    try std.testing.expectEqualStrings("q4_k", mixed.formats[2]);
+
+    // Uniform q6_k would fit 400 bytes but is not a fused combination.
+    var roomy = try select(allocator, &items, &qkv, 400, .{});
+    defer roomy.deinit();
+    try std.testing.expectEqualStrings("q5_k", roomy.formats[0]);
+    try std.testing.expectEqualStrings("q4_k", roomy.formats[1]);
+
+    // Without q5_k allowed, the extra combination is unavailable.
+    var filtered = try select(allocator, &items, &qkv, 220, .{ .formats = &.{ "q4_k", "q6_k" } });
+    defer filtered.deinit();
+    for (filtered.formats) |format| try std.testing.expectEqualStrings("q4_k", format);
+
+    // A group with no shared candidate cannot be planned.
+    const only_q8 = [_]Candidate{.{ .format = "q8_0", .bytes = 200, .loss = 0 }};
+    const odd = [_]Item{ testItem("q", 400, &q), testItem("k", 200, &only_q8), testItem("v", 200, &kv) };
+    try std.testing.expectError(error.GroupHasNoCandidates, select(allocator, &odd, &qkv, 1000, .{}));
+    const missing = [_]Group{.{ .name = "bad", .members = &.{ "q", "nope" } }};
+    try std.testing.expectError(error.InvalidGroup, select(allocator, &items, &missing, 1000, .{}));
 }
 
 test "parse rejects unknown schemas and duplicate names" {

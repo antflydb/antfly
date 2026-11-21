@@ -180,6 +180,14 @@ def load_sensitivity(path: Path) -> dict:
     return data
 
 
+def measured_groups(groups: list[dict], tensors: list[dict]) -> list[dict]:
+    """Fused-kernel groups whose members were all measured (others are dropped,
+    so a filtered run still allocates; its unmeasured tensors stay at the base
+    format)."""
+    names = {t["name"] for t in tensors}
+    return [g for g in groups if all(m in names for m in g["members"])]
+
+
 def measure(args: argparse.Namespace) -> None:
     weight = load_sensitivity(Path(args.sensitivity))
     texts = read_corpus(Path(args.corpus), args.limit)
@@ -222,7 +230,12 @@ def measure(args: argparse.Namespace) -> None:
 
     Path(args.output).write_text(
         json.dumps(
-            {"schema": SENSITIVITY_SCHEMA, "metric": METRIC, "tensors": measured},
+            {
+                "schema": SENSITIVITY_SCHEMA,
+                "metric": METRIC,
+                "tensors": measured,
+                "groups": measured_groups(weight.get("groups", []), measured),
+            },
             indent=2,
         )
     )

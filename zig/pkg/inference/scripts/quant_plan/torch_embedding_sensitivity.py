@@ -140,6 +140,14 @@ def recall(ref, emb, k=10):
     )
 
 
+def measured_groups(groups: list[dict], tensors: list[dict]) -> list[dict]:
+    """Fused-kernel groups whose members were all measured (others are dropped,
+    so a filtered run still allocates; its unmeasured tensors stay at the base
+    format)."""
+    names = {t["name"] for t in tensors}
+    return [g for g in groups if all(m in names for m in g["members"])]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -209,6 +217,7 @@ def main():
                     "schema": "antfly-quant-sensitivity/v1",
                     "metric": "embedding_cosine_loss",
                     "tensors": out,
+                    "groups": measured_groups(weight.get("groups", []), out),
                 },
                 indent=2,
             )
