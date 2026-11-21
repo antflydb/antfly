@@ -717,7 +717,7 @@ pub const PendingSessionRecovery = union(enum) {
         /// The source returned only a terminal error, so coordinator metadata
         /// must be recovered without re-entering the failed visibility barrier.
         repair_handoff_needs_coordinator: bool = false,
-        request: OwnedTransactionCommitRequest,
+        request: ?OwnedTransactionCommitRequest,
         execution_plan: ?[]u8 = null,
     },
     acknowledge: PendingTerminalAcknowledgement,
@@ -725,7 +725,7 @@ pub const PendingSessionRecovery = union(enum) {
     pub fn deinit(self: *PendingSessionRecovery, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .commit => |*value| {
-                value.request.deinit(alloc);
+                if (value.request) |*request| request.deinit(alloc);
                 if (value.execution_plan) |bytes| alloc.free(bytes);
             },
             .acknowledge => |*value| value.deinit(alloc),
@@ -1445,6 +1445,23 @@ pub const DurableSessionStore = struct {
         };
         defer self.alloc.free(value);
         return try decodeSessionRecord(self.alloc, txn_id, value);
+    }
+
+    fn graphStatus(self: *DurableSessionStore, id: db_mod.types.TxnId, filter: SessionRegistry.StatusPrincipalFilter) !?GraphStatusLookup {
+        const key = try makeSessionKey(self.alloc, id);
+        defer self.alloc.free(key);
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                return readGraphStatus(&txn, self.alloc, key, id, filter);
+            },
+            .runtime => |store| {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                return readGraphStatus(&txn, self.alloc, key, id, filter);
+            },
+        }
     }
 
     // Compact completion facts outlive the expiring session payload and its
@@ -3953,10 +3970,8 @@ pub const SessionRegistry = struct {
             if (terminal.status != .committed or repair_handoff_needs_coordinator) {
                 if (candidate.commit_body_digest == null or !candidate.commit_execution_started)
                     return error.InvalidTransactionSessionRecord;
-                const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
-                var cloned_request = try request.clone(alloc);
-                errdefer cloned_request.deinit(alloc);
                 const cloned_plan = if (candidate.execution_plan) |bytes| try alloc.dupe(u8, bytes) else null;
+                const cloned_request = if (cloned_plan == null) try (candidate.staged orelse return error.InvalidTransactionSessionRecord).clone(alloc) else null;
                 return .{
                     .commit = .{
                         .txn_id = txn_id,
@@ -3988,10 +4003,8 @@ pub const SessionRegistry = struct {
             } };
         }
         if (candidate.commit_body_digest == null or !candidate.commit_execution_started) return null;
-        const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
-        var cloned_request = try request.clone(alloc);
-        errdefer cloned_request.deinit(alloc);
         const cloned_plan = if (candidate.execution_plan) |bytes| try alloc.dupe(u8, bytes) else null;
+        const cloned_request = if (cloned_plan == null) try (candidate.staged orelse return error.InvalidTransactionSessionRecord).clone(alloc) else null;
         return .{ .commit = .{
             .txn_id = txn_id,
             .begin_timestamp = candidate.begin_timestamp,
@@ -4144,6 +4157,18 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
+        if (self.durableMissIsAuthoritative()) {
+            if (try self.durable.?.graphStatus(txn_id, filter)) |projection| switch (projection) {
+                .absent => return null,
+                .found => |status| {
+                    var result = status;
+                    result.lease_expires_at = try self.loadLeaseExpiryLocked(alloc, txn_id);
+                    result.savepoint_limit = self.max_savepoints;
+                    result.remaining_savepoints = if (self.max_savepoints) |limit| limit - @min(limit, result.savepoint_count) else null;
+                    return result;
+                },
+            };
+        }
         var view = (try self.readSessionAssumeStripe(txn_id)) orelse return null;
         defer view.deinit();
         const session = view.session;
@@ -6452,6 +6477,8 @@ fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, se
 fn sessionDisposition(session: Session) SessionDisposition {
     if (session.terminal_abort) return .aborted;
     if (session.terminal_commit) |terminal| {
+        if (session.graph_receipt and terminal.status == .committed and terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged)
+            return .committed_pending;
         if (terminal.repair_required) return .committed_repair_required;
         return if (terminal.status == .committed) .committed else .committed_pending;
     }
@@ -6791,6 +6818,81 @@ fn checkDurableReaderSession(alloc: std.mem.Allocator, read: anytype, key: []con
     try checkSqlReader(&legacy, principal, owner);
 }
 
+const graph_status_field = "\"g1\":\"";
+const graph_status_bytes = 32 + 3 + 3 * 8 + 4 * 4;
+const graph_status_encoded_len = std.base64.standard.Encoder.calcSize(graph_status_bytes);
+const graph_status_read_len = session_record.bound_session_header.len + graph_status_field.len + graph_status_encoded_len + 2;
+comptime {
+    std.debug.assert(graph_status_read_len <= session_record.cached_prefix_bytes);
+}
+const GraphStatusLookup = union(enum) { absent, found: SessionStatus };
+
+fn encodeGraphStatus(out: *std.ArrayList(u8), alloc: std.mem.Allocator, session: *const Session) !void {
+    var bits: [graph_status_bytes]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(session.principal orelse "", bits[0..32], .{});
+    bits[32] = @intFromBool(session.principal != null);
+    bits[33] = @backingInt(sessionDisposition(session.*));
+    bits[34] = @intCast(@backingInt(session.sync_level));
+    const counts = stagedCounts(session);
+    const stamps = [_]u64{ session.owner_node_id, session.begin_timestamp, session.last_touched_timestamp };
+    for (stamps, 0..) |value, index| std.mem.writeInt(u64, bits[35 + index * 8 ..][0..8], value, .little);
+    const sizes = [_]usize{ counts.tables, counts.reads, counts.writes, counts.deletes };
+    for (sizes, 0..) |value, index| std.mem.writeInt(u32, bits[59 + index * 4 ..][0..4], std.math.cast(u32, value) orelse return error.SessionRecordTooLarge, .little);
+    var encoded: [graph_status_encoded_len]u8 = undefined;
+    try out.appendSlice(alloc, graph_status_field);
+    try out.appendSlice(alloc, std.base64.standard.Encoder.encode(&encoded, &bits));
+    try out.appendSlice(alloc, "\",");
+}
+
+fn readGraphStatus(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: db_mod.types.TxnId, filter: SessionRegistry.StatusPrincipalFilter) !?GraphStatusLookup {
+    var scope = txn.openReadScope(alloc) catch |err| switch (err) {
+        error.Unsupported => return null,
+        else => return err,
+    };
+    defer scope.close();
+    const raw = scope.getRange(key, 0, graph_status_read_len) catch |err| switch (err) {
+        error.NotFound => return .absent,
+        error.Unsupported, error.EndOfStream => return null,
+        else => return err,
+    };
+    const header: []const u8 = if (std.mem.startsWith(u8, raw, session_record.bound_session_header)) session_record.bound_session_header else "{";
+    if (raw.len < graph_status_read_len or !std.mem.startsWith(u8, raw[header.len..], graph_status_field)) return null;
+    const start = header.len + graph_status_field.len;
+    var bits: [graph_status_bytes]u8 = undefined;
+    std.base64.standard.Decoder.decode(&bits, raw[start..][0..graph_status_encoded_len]) catch return error.InvalidTransactionSessionRecord;
+    switch (filter) {
+        .all => {},
+        .principal => |principal| {
+            if ((principal != null) != (bits[32] != 0)) return .absent;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(principal orelse "", &digest, .{});
+            if (!std.mem.eql(u8, &digest, bits[0..32])) return .absent;
+        },
+    }
+    var stamps: [3]u64 = undefined;
+    for (&stamps, 0..) |*value, index| value.* = std.mem.readInt(u64, bits[35 + index * 8 ..][0..8], .little);
+    var sizes: [4]u32 = undefined;
+    for (&sizes, 0..) |*value, index| value.* = std.mem.readInt(u32, bits[59 + index * 4 ..][0..4], .little);
+    const disposition = std.enums.fromInt(SessionDisposition, bits[33]) orelse return error.InvalidTransactionSessionRecord;
+    const sync_level = std.enums.fromInt(db_mod.types.SyncLevel, bits[34]) orelse return error.InvalidTransactionSessionRecord;
+    return .{ .found = .{
+        .txn_id = id,
+        .owner_node_id = stamps[0],
+        .begin_timestamp = stamps[1],
+        .last_touched_timestamp = stamps[2],
+        .lease_expires_at = 0,
+        .sync_level = sync_level,
+        .disposition = disposition,
+        .staged_table_count = @intCast(sizes[0]),
+        .staged_read_count = @intCast(sizes[1]),
+        .staged_write_count = @intCast(sizes[2]),
+        .staged_delete_count = @intCast(sizes[3]),
+        .read_snapshot_count = 0,
+        .savepoint_count = 0,
+        .durable = true,
+    } };
+}
+
 fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -6800,7 +6902,9 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         break :blk false;
     };
     try out.appendSlice(alloc, if (bound) session_record.bound_session_header else "{");
-    if (session.connection_id != null or session.sql != null) {
+    if (session.graph_receipt) {
+        try encodeGraphStatus(&out, alloc, &session);
+    } else if (session.connection_id != null or session.sql != null) {
         const bytes = try sqlPrefixPayload(&session);
         var encoded: [encoded_len]u8 = undefined;
         try out.appendSlice(alloc, if (session.connection_id != null) connection_field else sql_field);
@@ -6809,7 +6913,7 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         try out.appendSlice(alloc, reader_field);
         try out.appendSlice(alloc, &std.fmt.bytesToHex(readerPayload(&session), .lower));
     }
-    try out.appendSlice(alloc, "\",");
+    if (!session.graph_receipt) try out.appendSlice(alloc, "\",");
     if (session.graph_receipt) {
         try out.appendSlice(alloc, "\"graph_receipt\":true,");
         if (session.terminal_abort) {
@@ -7775,7 +7879,10 @@ test "distributed txn graph admission reserves terminal and acknowledgement capa
     const second = try registry.beginGraphExecution(a, @splat(10), 1, "alice", &request, &tables);
     defer second.plan.deinit();
     try std.testing.expect((try registry.recordTerminalCommitWithRepair(a, @splat(10), .committed, false, 42, "docs")) != null);
+    try std.testing.expectEqual(SessionDisposition.committed_pending, (try registry.getStatusForPrincipal(a, @splat(10), "alice")).?.disposition);
+    try std.testing.expect((try registry.getStatusForPrincipal(a, @splat(10), "bob")) == null);
     try std.testing.expect((try registry.markTerminalCoordinatorAcknowledged(a, @splat(10))) != null);
+    try std.testing.expectEqual(SessionDisposition.committed, (try registry.getStatusForPrincipal(a, @splat(10), "alice")).?.disposition);
     try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpired(a, std.math.maxInt(u64)));
 }
 
@@ -7963,7 +8070,7 @@ test "distributed txn sessions durably seal exact binary integrity plans before 
     try std.testing.expectEqualStrings("\x00\xffa", decoded.value[0].integrity_commands[0].operation.check_owner.parent_key);
     try std.testing.expectEqualSlices(u8, &commands[0].address.routing, &decoded.value[0].integrity_commands[0].address.routing);
     // Public retry identity and original read dependencies remain separate.
-    try std.testing.expectEqual(@as(u64, 7), recovery.commit.request.read_set[0].expected_version);
+    try std.testing.expect(recovery.commit.request == null);
 }
 
 test "distributed txn sealed request cloning is allocation failure safe" {

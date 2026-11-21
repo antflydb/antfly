@@ -176,6 +176,7 @@ const Write = struct {
     refs: std.atomic.Value(usize) = .init(1),
     scanned: bool = false,
     owned_bytes: usize = 0,
+    owned_limit: usize = record.max_bytes,
     changes: std.ArrayList(record.Change) = .empty,
     fn cast(ptr: *anyopaque) *Write {
         return @ptrCast(@alignCast(ptr));
@@ -212,7 +213,7 @@ const Write = struct {
         return &self.changes.items[self.changes.items.len - 1];
     }
     fn own(self: *Write, bytes: []const u8) ![]const u8 {
-        if (bytes.len > record.max_bytes -| self.owned_bytes) return error.TransactionTooLarge;
+        if (bytes.len > self.owned_limit -| self.owned_bytes) return error.TransactionTooLarge;
         const copy = try self.read.arena.allocator().dupe(u8, bytes);
         self.owned_bytes += bytes.len;
         return copy;
@@ -223,6 +224,12 @@ const Write = struct {
     fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
         const self = cast(ptr);
         const change = try self.observe(key);
+        if (std.mem.startsWith(u8, key, record.session_prefix) and change.expected != null and
+            value.len <= record.max_bytes + record.max_receipt_growth and value.len <= change.expected.?.len +| record.max_receipt_growth and
+            value.len > record.max_bytes -| self.owned_bytes)
+        {
+            self.owned_limit = record.max_bytes + record.max_receipt_growth;
+        }
         change.value = try self.own(value);
     }
     fn delete(ptr: *anyopaque, key: []const u8) !void {
@@ -265,7 +272,18 @@ const Write = struct {
                 change.expected = digest;
                 change.expected_is_digest = true;
             }
-            return record.encode(a, .{ .changes = compact, .scan_epoch = epoch });
+            return record.encode(a, .{ .changes = compact, .scan_epoch = epoch }) catch |compact_err| {
+                if (compact_err != error.TransactionTooLarge) return compact_err;
+                for (compact, self.changes.items) |*change, original| {
+                    if (!change.expected_is_digest) continue;
+                    const replacement = original.value orelse continue;
+                    if (try record.receiptSplice(a, original.expected.?, replacement)) |patch| {
+                        change.value = patch;
+                        change.value_is_splice = true;
+                    }
+                }
+                return record.encode(a, .{ .changes = compact, .scan_epoch = epoch });
+            };
         };
     }
 
@@ -305,6 +323,7 @@ const Cursor = struct {
     physical: erased.Cursor,
     key: std.ArrayList(u8) = .empty,
     seek: std.ArrayList(u8) = .empty,
+    at_row: bool = false,
     fn cast(ptr: *anyopaque) *Cursor {
         return @ptrCast(@alignCast(ptr));
     }
@@ -339,7 +358,12 @@ const Cursor = struct {
         self.seek.clearRetainingCapacity();
         try self.seek.appendSlice(self.a, self.read.prefix);
         if (bound) |key| try self.seek.appendSlice(self.a, key) else if (!forward) self.seek.items[self.seek.items.len - 1] += 1;
-        var base = if (forward) try self.physical.seekAtOrAfter(self.seek.items) else try self.physical.seekAtOrBefore(self.seek.items);
+        const base = if (forward) try self.physical.seekAtOrAfter(self.seek.items) else try self.physical.seekAtOrBefore(self.seek.items);
+        return self.project(base, bound, forward, inclusive);
+    }
+
+    fn project(self: *Cursor, initial: ?erased.Entry, bound: ?[]const u8, forward: bool, inclusive: bool) !?erased.Entry {
+        var base = initial;
         while (base) |entry| {
             if (!std.mem.startsWith(u8, entry.key, self.read.prefix)) {
                 // An inclusive reverse seek may initially land on the first
@@ -372,6 +396,7 @@ const Cursor = struct {
             if (!eligible(change.key, bound, forward, inclusive)) continue;
             if (selected == null or std.mem.order(u8, change.key, selected.?.key) == @as(std.math.Order, if (forward) .lt else .gt)) selected = .{ .key = change.key, .value = value };
         };
+        self.at_row = selected != null;
         const entry = selected orelse return null;
         self.key.clearRetainingCapacity();
         try self.key.appendSlice(self.a, entry.key);
@@ -385,10 +410,12 @@ const Cursor = struct {
     }
     fn next(ptr: *anyopaque) !?erased.Entry {
         const self = cast(ptr);
+        if (self.write == null and self.at_row) return self.project(try self.physical.next(), null, true, true);
         return self.position(self.key.items, true, false);
     }
     fn prev(ptr: *anyopaque) !?erased.Entry {
         const self = cast(ptr);
+        if (self.write == null and self.at_row) return self.project(try self.physical.prev(), null, false, true);
         return self.position(self.key.items, false, false);
     }
     fn after(ptr: *anyopaque, key: []const u8) !?erased.Entry {
@@ -577,5 +604,37 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
             try txn.commit();
             try std.testing.expectEqual(@as(u8, 3), fixture.last_frame);
         }
+    }
+    {
+        const key = record.session_prefix ++ "legacy-near-limit";
+        const prefix = "{\"id\":1,\"execution_plan\":\"";
+        const end = "\"}";
+        const payload = try a.alloc(u8, record.max_bytes - 512);
+        defer a.free(payload);
+        @memset(payload, 'x');
+        @memcpy(payload[0..prefix.len], prefix);
+        @memcpy(payload[payload.len - end.len ..], end);
+        {
+            var txn = try logical.beginWrite();
+            errdefer txn.abort();
+            try txn.put(key, payload);
+            try txn.commit();
+        }
+        const replacement = try a.alloc(u8, record.max_bytes + 1);
+        defer a.free(replacement);
+        @memcpy(replacement[0 .. payload.len - end.len], payload[0 .. payload.len - end.len]);
+        @memset(replacement[payload.len - end.len ..], 'y');
+        @memcpy(replacement[replacement.len - end.len ..], end);
+        {
+            var txn = try logical.beginWrite();
+            errdefer txn.abort();
+            try txn.put(key, replacement);
+            try txn.put("lease-update", "owner:2");
+            try txn.commit();
+            try std.testing.expectEqual(@as(u8, 4), fixture.last_frame);
+        }
+        var read = try logical.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualSlices(u8, replacement, try read.get(key));
     }
 }

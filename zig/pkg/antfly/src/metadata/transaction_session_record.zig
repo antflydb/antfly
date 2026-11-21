@@ -19,6 +19,7 @@ pub const count_key = "\x00session-count-v1";
 pub const session_prefix = "\x00\x00__api_txn_sessions__:";
 pub const bound_session_header = "{\"session_format\":2,";
 fn frameVersion(changes: []const Change) u8 {
+    for (changes) |change| if (change.value_is_splice) return 4;
     for (changes) |change| if (change.expected_is_digest) return 3;
     for (changes) |change| {
         if (!std.mem.startsWith(u8, change.key, session_prefix)) continue;
@@ -28,6 +29,7 @@ fn frameVersion(changes: []const Change) u8 {
 }
 
 pub const max_bytes = 32 << 20;
+pub const max_receipt_growth = 64 << 10;
 pub const max_operations = 4096;
 const Digest = std.crypto.hash.Blake3;
 pub const Change = struct {
@@ -35,6 +37,7 @@ pub const Change = struct {
     expected: ?[]const u8,
     value: ?[]const u8,
     expected_is_digest: bool = false,
+    value_is_splice: bool = false,
 };
 pub const Record = struct { changes: []const Change, scan_epoch: ?u64 = null };
 pub fn prefixForGroup(buf: []u8, group: u64) ![]const u8 {
@@ -126,8 +129,8 @@ pub fn encode(a: std.mem.Allocator, record: Record) ![]u8 {
     for (record.changes) |change| {
         if (change.key.len == 0 or change.key.len > 512 or internalKey(change.key)) return error.InvalidTransactionSessionRecord;
         const size = change.key.len +| (if (change.expected) |value| value.len else 0) +| (if (change.value) |value| value.len else 0);
-        if (size +| out.items.len +| (if (version == 3) @as(usize, 13) else 12) > max_bytes) return error.TransactionTooLarge;
-        if (version == 3) try out.append(a, @intFromBool(change.expected_is_digest));
+        if (size +| out.items.len +| (if (version >= 3) @as(usize, 13) else 12) > max_bytes) return error.TransactionTooLarge;
+        if (version >= 3) try out.append(a, @as(u8, @intFromBool(change.expected_is_digest)) | (@as(u8, @intFromBool(change.value_is_splice)) << 1));
         try appendBytes(&out, a, change.key);
         try appendBytes(&out, a, change.expected);
         try appendBytes(&out, a, change.value);
@@ -156,24 +159,63 @@ pub fn decode(a: std.mem.Allocator, bytes: []const u8) !Record {
     if (bytes.len > max_bytes) return error.TransactionTooLarge;
     var reader: Decoder = .{ .bytes = bytes };
     const version = try reader.int(u8);
-    if (version != 1 and version != 2 and version != 3) return error.InvalidTransactionSessionRecord;
+    if (version != 1 and version != 2 and version != 3 and version != 4) return error.InvalidTransactionSessionRecord;
     const epoch = try reader.int(u64);
     const count = try reader.int(u32);
     if (count > max_operations) return error.TransactionTooLarge;
     const changes = try a.alloc(Change, count);
     errdefer a.free(changes);
     for (changes, 0..) |*change, i| {
-        const compare = if (version == 3) try reader.int(u8) else 0;
-        if (compare > 1) return error.InvalidTransactionSessionRecord;
+        const compare = if (version >= 3) try reader.int(u8) else 0;
+        if (compare > (if (version == 4) @as(u8, 3) else 1)) return error.InvalidTransactionSessionRecord;
         const key = (try reader.slice()) orelse return error.InvalidTransactionSessionRecord;
         if (key.len == 0 or key.len > 512 or internalKey(key)) return error.InvalidTransactionSessionRecord;
         for (changes[0..i]) |previous| if (std.mem.eql(u8, key, previous.key)) return error.InvalidTransactionSessionRecord;
-        change.* = .{ .key = key, .expected = try reader.slice(), .value = try reader.slice(), .expected_is_digest = compare == 1 };
+        change.* = .{ .key = key, .expected = try reader.slice(), .value = try reader.slice(), .expected_is_digest = compare & 1 != 0, .value_is_splice = compare & 2 != 0 };
         if (change.expected_is_digest and (change.expected == null or change.expected.?.len != Digest.digest_length)) return error.InvalidTransactionSessionRecord;
+        if (change.value_is_splice and (!change.expected_is_digest or change.value == null or change.value.?.len < 12 or !std.mem.startsWith(u8, key, session_prefix)))
+            return error.InvalidTransactionSessionRecord;
     }
     if (version != frameVersion(changes) or reader.pos != bytes.len) return error.InvalidTransactionSessionRecord;
     return .{ .changes = changes, .scan_epoch = if (epoch == std.math.maxInt(u64)) null else epoch };
 }
+/// Reuse the largest unchanged portion of a sealed receipt's staged data
+/// or execution plan. Validate the entire base value with the ordinary CAS.
+pub fn receiptSplice(a: std.mem.Allocator, previous: []const u8, replacement: []const u8) !?[]const u8 {
+    var old_offset: usize = 0;
+    var new_offset: usize = 0;
+    var shared: usize = 0;
+    for ([_][]const u8{ ",\"staged\":", ",\"execution_plan\":" }) |anchor| {
+        const old_start = std.mem.indexOf(u8, previous, anchor) orelse continue;
+        const new_start = std.mem.indexOf(u8, replacement, anchor) orelse continue;
+        const old = previous[old_start..];
+        const new = replacement[new_start..];
+        var same: usize = 0;
+        while (same < @min(old.len, new.len) and old[same] == new[same]) : (same += 1) {}
+        if (same > shared) {
+            old_offset = old_start;
+            new_offset = new_start;
+            shared = same;
+        }
+    }
+    if (shared <= 12 or replacement.len > max_bytes + max_receipt_growth) return null;
+    var header: [12]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], @intCast(old_offset), .little);
+    std.mem.writeInt(u32, header[4..8], @intCast(new_offset), .little);
+    std.mem.writeInt(u32, header[8..12], @intCast(shared), .little);
+    return try std.mem.concat(a, u8, &.{ &header, replacement[0..new_offset], replacement[new_offset + shared ..] });
+}
+
+fn expandReceiptSplice(a: std.mem.Allocator, previous: []const u8, patch: []const u8) ![]u8 {
+    const old_offset: usize = std.mem.readInt(u32, patch[0..4], .little);
+    const new_offset: usize = std.mem.readInt(u32, patch[4..8], .little);
+    const shared: usize = std.mem.readInt(u32, patch[8..12], .little);
+    const edits = patch[12..];
+    if (old_offset > previous.len or shared > previous.len - old_offset or new_offset > edits.len or
+        edits.len +| shared > max_bytes + max_receipt_growth) return error.InvalidTransactionSessionRecord;
+    return std.mem.concat(a, u8, &.{ edits[0..new_offset], previous[old_offset..][0..shared], edits[new_offset..] });
+}
+
 pub fn apply(txn: anytype, a: std.mem.Allocator, group: u64, bytes: []const u8) !bool {
     const record = try decode(a, bytes);
     defer a.free(record.changes);
@@ -223,13 +265,19 @@ pub fn apply(txn: anytype, a: std.mem.Allocator, group: u64, bytes: []const u8) 
     for (record.changes) |change| {
         const key = try keyAlloc(a, group, change.key);
         defer a.free(key);
-        if (change.value) |value| try txn.put(key, value) else txn.delete(key) catch |err| {
+        const expanded = if (change.value_is_splice)
+            try expandReceiptSplice(a, (try optionalGet(txn, key)) orelse return error.InvalidTransactionSessionRecord, change.value.?)
+        else
+            null;
+        defer if (expanded) |bytes_owned| a.free(bytes_owned);
+        const replacement = if (expanded) |value| value else change.value;
+        if (replacement) |value| try txn.put(key, value) else txn.delete(key) catch |err| {
             if (err != error.NotFound) return err;
         };
         if (std.mem.startsWith(u8, change.key, session_prefix)) {
             const entry_key = try cacheKey(a, group, change.key);
             defer a.free(entry_key);
-            if (change.value) |value| {
+            if (replacement) |value| {
                 var entry: [8 + cached_prefix_bytes]u8 = undefined;
                 std.mem.writeInt(u64, entry[0..8], gen, .little);
                 const n = @min(value.len, cached_prefix_bytes);
@@ -312,6 +360,21 @@ test "replicated session compare and set rejects lost updates and scan phantoms 
     try std.testing.expectEqual(@as(u8, 3), compact[0]);
     try std.testing.expect(try apply(&map, a, 7, compact));
     try std.testing.expect(!try apply(&map, a, 7, compact));
+    const old_plan = "{\"id\":1,\"execution_plan\":\"retained plan that is longer than the splice header\"}";
+    const new_plan = "{\"id\":1,\"execution_plan\":\"retained plan that is longer than the splice header\",\"terminal\":true}";
+    Digest.hash(old_plan, &digest, .{});
+    const patch = (try receiptSplice(a, old_plan, new_plan)).?;
+    defer a.free(patch);
+    const session_key = session_prefix ++ "splice";
+    const physical_session_key = try keyAlloc(a, 7, session_key);
+    defer a.free(physical_session_key);
+    try map.put(physical_session_key, old_plan);
+    const spliced = try encode(a, .{ .changes = &.{.{ .key = session_key, .expected = &digest, .value = patch, .expected_is_digest = true, .value_is_splice = true }} });
+    defer a.free(spliced);
+    try std.testing.expectEqual(@as(u8, 4), spliced[0]);
+    try std.testing.expect(try apply(&map, a, 7, spliced));
+    try std.testing.expectEqualStrings(new_plan, try map.get(physical_session_key));
+    try std.testing.expect(!try apply(&map, a, 7, spliced));
     // Restore the fixture for the remaining epoch tests.
     try map.put(key, "pending");
     const other = try keyAlloc(a, 7, "other");
@@ -321,7 +384,7 @@ test "replicated session compare and set rejects lost updates and scan phantoms 
     const phantom = try encode(a, .{ .scan_epoch = 0, .changes = &.{.{ .key = "receipt", .expected = "pending", .value = "committed" }} });
     defer a.free(phantom);
     try std.testing.expect(!try apply(&map, a, 7, phantom));
-    const committed = try encode(a, .{ .scan_epoch = 2, .changes = &.{.{ .key = "receipt", .expected = "pending", .value = "committed" }} });
+    const committed = try encode(a, .{ .scan_epoch = 3, .changes = &.{.{ .key = "receipt", .expected = "pending", .value = "committed" }} });
     defer a.free(committed);
     try std.testing.expect(try apply(&map, a, 7, committed));
     try std.testing.expectEqualStrings("committed", try map.get(key));

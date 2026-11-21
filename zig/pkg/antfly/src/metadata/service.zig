@@ -3831,6 +3831,7 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
             1 => metadata_topology_protocol.transaction_sessions_version,
             2 => metadata_topology_protocol.bound_session_version,
             3 => metadata_topology_protocol.compact_session_compare_version,
+            4 => metadata_topology_protocol.spliced_session_record_version,
             else => metadata_topology_protocol.current_version,
         };
     }

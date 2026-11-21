@@ -6627,7 +6627,7 @@ pub const ApiHttpServer = struct {
                         continue;
                     } else null;
                     defer if (execution_plan) |*plan| plan.deinit();
-                    var legacy_view = if (execution_plan == null) commit.request.distributedTables(self.alloc) catch |err| {
+                    var legacy_view = if (execution_plan == null) commit.request.?.distributedTables(self.alloc) catch |err| {
                         std.log.err("invalid legacy stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                         continue;
                     } else null;
