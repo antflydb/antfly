@@ -81,10 +81,18 @@ Without `mail-public/local/` or a published catalog, the opt-in panel reports
 that on-device search is not installed, and the rest of the app is unaffected.
 
 Building the embedded database WASM needs a lot of memory: its LLVM step
-declares a 20 GiB ceiling and was killed on a 16 GiB machine. Build it on a
-larger host (CI uses one) and copy `zig/zig-out/antfly-wasm/`, then run
-`LOCAL_SKIP_ZIG=1 npm run build:local`. The inference WASM builds in about
-four minutes within that budget.
+declares a 20 GiB ceiling. On a 16 GiB machine, add swap and pass the
+ceiling explicitly (`zig build wasm -j1 --maxrss 21474836480` took about 28
+minutes with 12 GiB of swap), or build on a larger host and copy
+`zig/zig-out/antfly-wasm/`. Then run `LOCAL_SKIP_ZIG=1 npm run build:local`.
+
+To try the whole feature in headless Chromium with the real model and stubbed
+server APIs:
+
+```sh
+npm run publish:local-model -- --model-dir <bundle> --out dist/local-model
+LOCAL_SEARCH_MODEL=dist/local-model node test/local-search-browser.mjs
+```
 
 Limits:
 

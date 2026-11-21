@@ -241,36 +241,58 @@ bounded by the 2 GiB wasm32 memory.
 
 ### Validation and limits
 
-Covered by tests:
+Verified end to end in headless Chromium (`test/local-search-browser.mjs`).
+The test uses the real `mail-public` app, the Worker's CSP, the runtime from
+`build-local.mjs` and the real EmbeddingGemma 2 checkpoint
+(`google/embeddinggemma-2` @914f7f8, stripped by `publish-local-model.mjs`);
+only the server APIs are stubbed.
 
-- `wasm_opfs_fs_test.mjs` runs the slot pool against a simulated OPFS where
-  only flushed bytes survive a crash. It covers the storage contract,
-  unsynced-data loss, interrupted renames, torn header records, deletion,
-  capacity exhaustion and the exclusive lock.
-- A native embedded API test runs a hosted database (full-text and external
-  vector indexes) through `HostFileStorage` and reopens it.
-- The WASM smoke test does the same through the real module and the OPFS pool.
-  The 20 GiB LLVM step for that bundle could not finish on the 16 GiB
-  development host, so CI's WASM job is the first to run it.
-- `test-backends-runtime.mjs` adds `embed` checks to the synthetic
-  full-geometry EmbeddingGemma 2 fixture. These pass against a freshly built
-  `antfly-extraction-cpu.wasm`, along with the rest of the browser runtime
-  suite.
-- `test/mail-local.test.mjs` covers the sync log and backfill, the bounded
-  export, route scoping, CSP and caching headers, document and query shapes,
-  media-tower stripping and catalog pins, opt-in UI, sign-out wipe and offline
-  start.
+- Opting in, downloading and loading the model, then syncing and embedding 5
+  messages into OPFS took 59 s.
+- Device-only searches ("how much do I owe the plumber", "when does my plane
+  leave", "weekend noodle plans with friends") each ranked the right message
+  first, in about 3 s.
+- After a reload the copy reopened from OPFS without re-indexing, and the
+  next query was also correct.
 
-Not yet validated:
+Other checks:
 
-- A real EmbeddingGemma 2 checkpoint in a real browser. That includes retrieval
-  quality, embedding throughput on CPU and OPFS behavior under quota pressure
-  per engine.
-- Running the stripped checkpoint through the full loader.
-- An end-to-end `build-local.mjs` run and a deployment.
+- **Real checkpoint in the browser runtime**
+  (`test-embedding-gemma2-retrieval.mjs`): five queries each retrieve their
+  message, with a clear gap to the rest (0.855 against at most 0.606). The
+  552 MiB text-only copy embeds identically to the 1.49 GB bundle (cosine
+  above 0.99999).
+- **OPFS pool:** `wasm_opfs_fs_test.mjs` simulates OPFS with separate durable
+  and volatile bytes. It covers the storage contract, unsynced-data loss,
+  interrupted renames, torn header records, deletion, capacity and the
+  exclusive lock. `wasm_opfs_fs_browser_test.mjs` repeats the round trip on
+  real sync access handles in Chromium, and with `ANTFLY_WASM` runs a real
+  database through 20 batches, a reload and searches.
+- **Native and WASM:** a native embedded API test runs a hosted database
+  through `HostFileStorage`; the WASM smoke test does the same through the
+  real module and the pool.
+- **Mail example:** `test/mail-local.test.mjs` covers the sync log and reset,
+  route scoping and model grants, CSP and caching, document and query shapes,
+  model stripping, the opt-in UI, sign-out wipe and retry, offline start and
+  service-worker caching.
 
-Runtime files over the 25 MiB Workers asset limit (the WASM modules; the CPU
-inference module alone is 27 MB) are uploaded to the private R2 bucket under
-the same content-addressed path. The Worker serves `/local/<build>/…` from R2
-when the asset is missing. This is public code, so it needs no session, and it
-is cached as immutable.
+Issues these runs found and fixed:
+
+- Dense search was compiled out of the WASM build.
+- The browser runtime rejected the real checkpoint's scalar tensors.
+- External vector indexes need a `field`.
+- The pool's reserve was too small for an index build's file burst.
+
+Limits and remaining work:
+
+- **Deployment.** A real Cloudflare deployment (R2, Better Auth, Email
+  Routing) has not been run; Workers behavior is covered by the Node tests
+  above.
+- **Browsers.** Only Chromium was exercised. Safari and Firefox support sync
+  access handles in workers, but they are unverified here.
+- **Throughput.** Embedding runs on WASM CPU, at roughly a few seconds per
+  message on this host, so a large mailbox's first sync takes a long time.
+  It runs in the background and resumes after reloads.
+- **Build memory.** The embedded database WASM link needs about 20 GiB.
+- **Deletes and edits** are not synchronized, because the app has no
+  deletion yet.
