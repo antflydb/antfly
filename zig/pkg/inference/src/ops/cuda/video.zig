@@ -121,38 +121,86 @@ fn probeReader(allocator: std.mem.Allocator, ctx: *context.CudaContext, reader: 
     try checkStatusCode(antfly_nvdec_probe_begin(decoder.?, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, sar.horizontal, sar.vertical, @intFromBool(track.pixel_aspect_declared)));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
-    switch (track.codec) {
-        .avc => try avccHeaders(allocator, &annex, track.avcc),
-        .hevc => try hvccHeaders(allocator, &annex, track.codec_config),
-        .av1 => try annex.appendSlice(allocator, track.codec_config[4..]),
-        .mjpeg => unreachable,
-    }
-    var observed: Sequence = undefined;
-    if (annex.items.len != 0) {
-        const status = antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), 0, .configuration);
-        if (status != 8) try checkStatusCode(status);
-        if (antfly_nvdec_probe_result(decoder.?, &observed) != 0) {
-            _ = try observed.bytes();
-            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames, .display_width = display[0], .display_height = display[1], .raster_width = raster[0], .raster_height = raster[1] };
-        }
-        if (status == 8) return error.InvalidVideoGeometry;
-    }
+    const headers = try parserHeaders(allocator, &annex, track);
+    var probe = EmbeddingProbe{ .sequence = undefined, .samples = samples, .unique_frames = unique_frames, .display_width = display[0], .display_height = display[1], .raster_width = raster[0], .raster_height = raster[1] };
+    if (headers.len != 0 and try probeUnit(decoder.?, headers, 0, .configuration, &probe.sequence)) return probe;
     for (reader.packets, 0..) |packet, index| {
         try reader.input.control.check();
         var lease = try reader.readPacket(index);
         defer lease.deinit();
-        annex.clearRetainingCapacity();
-        if (track.codec == .av1) try annex.appendSlice(allocator, lease.bytes) else try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
-        const status = antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), try timestampUs(packet.pts, track.timescale), .sample);
-        if (status != 8) try checkStatusCode(status);
-        if (antfly_nvdec_probe_result(decoder.?, &observed) != 0) {
-            _ = try observed.bytes();
-            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames, .display_width = display[0], .display_height = display[1], .raster_width = raster[0], .raster_height = raster[1] };
+        var units = try ParserUnits.init(allocator, &annex, track, lease.bytes);
+        const pts = try timestampUs(packet.pts, track.timescale);
+        while (try units.next(reader.input.control)) |unit| {
+            if (try probeUnit(decoder.?, unit, pts, .sample, &probe.sequence)) return probe;
         }
-        if (status == 8) return error.InvalidVideoGeometry;
     }
     return error.InvalidVideoGeometry;
 }
+
+fn probeUnit(decoder: *anyopaque, bytes: []const u8, pts: i64, kind: ParserPacket, observed: *Sequence) !bool {
+    const status = antfly_nvdec_packet(decoder, bytes.ptr, @intCast(bytes.len), pts, kind);
+    if (status != 8) try checkStatusCode(status);
+    if (antfly_nvdec_probe_result(decoder, observed) != 0) {
+        _ = try observed.bytes();
+        return true;
+    }
+    if (status == 8) return error.InvalidVideoGeometry;
+    return false;
+}
+
+fn parserHeaders(a: std.mem.Allocator, annex: *std.ArrayList(u8), track: media.mp4.Track) ![]const u8 {
+    switch (track.codec) {
+        .avc => try avccHeaders(a, annex, track.avcc),
+        .hevc => try hvccHeaders(a, annex, track.codec_config),
+        .av1 => return track.codec_config[4..],
+        .mjpeg => return error.UnsupportedVideoFormat,
+    }
+    return annex.items;
+}
+
+/// AV1 frame units borrow the MP4 sample. AVC and HEVC need one Annex B conversion.
+const ParserUnits = union(enum) {
+    av1: packet_sampling.Av1FrameUnits,
+    annex_b: ?[]const u8,
+
+    fn init(a: std.mem.Allocator, annex: *std.ArrayList(u8), track: media.mp4.Track, sample: []const u8) !ParserUnits {
+        if (track.codec == .av1) return .{ .av1 = .{ .bytes = sample } };
+        annex.clearRetainingCapacity();
+        try annexPacket(a, annex, sample, track.nal_length_bytes);
+        return .{ .annex_b = annex.items };
+    }
+
+    fn next(self: *ParserUnits, control: media.source.Control) !?[]const u8 {
+        switch (self.*) {
+            .av1 => |*units| return units.next(control),
+            .annex_b => |*unit| {
+                const result = unit.*;
+                unit.* = null;
+                return result;
+            },
+        }
+    }
+};
+
+test "NVDEC AV1 parser units borrow configuration and split samples without scratch allocation" {
+    const a = std.testing.failing_allocator;
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(a);
+    var track: media.mp4.Track = undefined;
+    track.codec = .av1;
+    track.codec_config = &.{ 0x81, 0, 0, 0, 0x12, 0 };
+    try std.testing.expectEqual(track.codec_config[4..].ptr, (try parserHeaders(a, &scratch, track)).ptr);
+    const sample = [_]u8{ 0x12, 0, 0x32, 1, 0, 0x32, 1, 0 };
+    var units = try ParserUnits.init(a, &scratch, track, &sample);
+    const first = (try units.next(.{})).?;
+    try std.testing.expectEqual(sample[0..5].ptr, first.ptr);
+    try std.testing.expectEqualSlices(u8, sample[0..5], first);
+    const second = (try units.next(.{})).?;
+    try std.testing.expectEqual(sample[5..].ptr, second.ptr);
+    try std.testing.expectEqualSlices(u8, sample[5..], second);
+    try std.testing.expect(try units.next(.{}) == null);
+}
+
 pub fn cachedSequenceMatches(ctx: *const context.CudaContext, sequence: Sequence) bool {
     if (comptime builtin.os.tag != .linux) return false;
     const decoder = ctx.video_decoder_cache orelse return false;
@@ -887,11 +935,13 @@ const DecodeState = struct {
         if (self.failure == null and self.consumer.surface_ready != null) {
             self.consumer.surface_ready.?(self.consumer.context) catch |err| {
                 self.failure = err;
-                self.ctx.synchronize() catch {};
             };
-        } else self.ctx.synchronize() catch |err| {
-            self.failure = err;
-        };
+        }
+        if (self.failure != null or self.consumer.surface_ready == null) {
+            // Returning to NVDEC unmaps the surface. If the stream cannot be
+            // drained, the worker cannot safely return it to the decoder.
+            self.ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
         if (self.failure != null) return -1;
         self.stats.selected_frames += repetitions;
         return 1;
@@ -1015,27 +1065,16 @@ fn decodeReader(allocator: std.mem.Allocator, state: *DecodeState, reader: *medi
     try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, state.sar.horizontal, state.sar.vertical, @intFromBool(track.pixel_aspect_declared), nvdec_max_samples));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
-    switch (track.codec) {
-        .avc => try avccHeaders(allocator, &annex, track.avcc),
-        .hevc => try hvccHeaders(allocator, &annex, track.codec_config),
-        .av1 => try annex.appendSlice(allocator, track.codec_config[4..]),
-        .mjpeg => unreachable,
-    }
-    if (annex.items.len != 0) try state.checkStatus(antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), 0, .configuration));
+    const headers = try parserHeaders(allocator, &annex, track);
+    if (headers.len != 0) try state.checkStatus(antfly_nvdec_packet(decoder.?, headers.ptr, @intCast(headers.len), 0, .configuration));
     for (reader.packets, 0..) |packet, index| {
         try reader.input.control.check();
         var lease = try reader.readPacket(index);
         defer lease.deinit();
         const pts = if (state.selected_packets != null) @as(i64, @intCast(index)) else try timestampUs(packet.pts, track.timescale);
-        if (track.codec == .av1) {
-            var units = packet_sampling.Av1FrameUnits{ .bytes = lease.bytes };
-            while (try units.next(reader.input.control)) |unit| {
-                try state.checkStatus(antfly_nvdec_packet(decoder.?, unit.ptr, @intCast(unit.len), pts, .sample));
-            }
-        } else {
-            annex.clearRetainingCapacity();
-            try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
-            try state.checkStatus(antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), pts, .sample));
+        var units = try ParserUnits.init(allocator, &annex, track, lease.bytes);
+        while (try units.next(reader.input.control)) |unit| {
+            try state.checkStatus(antfly_nvdec_packet(decoder.?, unit.ptr, @intCast(unit.len), pts, .sample));
         }
         state.stats.compressed_bytes += lease.bytes.len;
     }
@@ -2105,6 +2144,7 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
             copies: usize = 0,
             ready: usize = 0,
             fail: bool = false,
+            fail_ready: bool = false,
             fn consume(raw: *anyopaque, frame: Frame) !void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.calls += 1;
@@ -2114,6 +2154,7 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
             fn surfaceReady(raw: *anyopaque) !void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.ready += 1;
+                if (self.fail_ready) return error.FenceFailed;
             }
         };
     };
@@ -2141,6 +2182,14 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     try std.testing.expectEqual(@as(usize, 1), consumer.ready);
     try std.testing.expectEqual(@as(usize, 1), Mock.synchronizations);
     try std.testing.expectEqual(error.Cancelled, state.failure.?);
+
+    consumer.fail = false;
+    consumer.fail_ready = true;
+    state.failure = null;
+    try std.testing.expectEqual(@as(c_int, -1), DecodeState.callback(&state, 1, 256, 160, 96, 2, 2, 0, 8, 2));
+    try std.testing.expectEqual(@as(usize, 2), consumer.ready);
+    try std.testing.expectEqual(@as(usize, 2), Mock.synchronizations);
+    try std.testing.expectEqual(error.FenceFailed, state.failure.?);
 }
 
 test "CUDA detached NVDEC retirement frees old surfaces and quota without touching the actual replacement decoder budget" {

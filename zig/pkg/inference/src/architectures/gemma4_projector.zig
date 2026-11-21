@@ -357,7 +357,7 @@ pub fn encodeProjectedVideoWithSession(
     session: ?@import("../backends/session.zig").Session,
 ) !ProjectedVideo {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.UnsupportedVideoBackend;
-    if (cb.kind() != .cuda or !cb.supportsCopyRows2D() or cb.vtable.sliceRows2D == null) return error.UnsupportedVideoBackend;
+    if (cb.kind() != .cuda or !cb.supportsCopyRows2D()) return error.UnsupportedVideoBackend;
     const video = @import("../ops/cuda/video.zig");
     const cuda = @import("../ops/cuda/cuda_compute.zig");
     const compute: *cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -405,6 +405,14 @@ pub fn encodeProjectedVideoWithSession(
         capacity: usize,
         batches: usize = 0,
         max_batch: usize = 0,
+
+        staging_event: @import("../ops/cuda/driver.zig").CUevent,
+
+        fn ready(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const c: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+            try c.ctx.driver.check(c.ctx.synchronizeEventResult(self.staging_event));
+        }
 
         const PendingFrame = struct { patches: CT, timestamp: i64, repetitions: usize };
 
@@ -467,20 +475,29 @@ pub fn encodeProjectedVideoWithSession(
                 const raster = frame.rasterSize();
                 const rgb = try self.preprocess.?.rgb8Gemma4(gpu_compute, frame);
                 defer self.cb.free(rgb);
+                try gpu_compute.ctx.recordEvent(self.staging_event);
                 break :resized try gpu_compute.preprocessResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height), if (self.cfg.direct_unified) .channel_planar_unit else .channel_planar_centered);
-            } else try self.preprocess.?.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
+            } else direct: {
+                const owned = try self.preprocess.?.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
+                errdefer self.cb.free(owned);
+                try gpu_compute.ctx.recordEvent(self.staging_event);
+                break :direct owned;
+            };
             self.pending[self.pending_count] = .{ .patches = patches, .timestamp = frame.timestamp_us, .repetitions = frame.repetitions };
             self.pending_count += 1;
             if (self.pending_count == self.capacity) try self.flush();
         }
     };
-    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .resample = videoResample(cb, cfg), .capacity = if (batch_permit != null) 2 else 1 };
+    const staging_event = try compute.ctx.createStreamEvent();
+    defer _ = compute.ctx.driver.fns.cuEventDestroy(staging_event);
+    var state = State{ .staging_event = staging_event, .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .resample = videoResample(cb, cfg), .capacity = if (batch_permit != null) 2 else 1 };
     defer if (state.preprocess) |*preprocess| preprocess.deinit();
     defer {
         for (state.pending[0..state.pending_count]) |entry| cb.free(entry.patches);
         if (state.output) |out| cb.free(out);
     }
-    const stats = try video.decodeMp4Sampled(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check, .coalesce_repetitions = true }, .gemma4);
+    errdefer compute.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+    const stats = try video.decodeMp4Sampled(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check, .surface_ready = State.ready, .coalesce_repetitions = true }, .gemma4);
     try state.flush();
     if (state.count != state.planned_frames) return error.InvalidVideoGeometry;
     const embeddings = state.output orelse return error.InvalidVideoGeometry;

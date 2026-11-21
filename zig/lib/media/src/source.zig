@@ -86,7 +86,11 @@ pub const Source = struct {
     /// descendants charge successful and partial I/O to the same physical owner.
     /// The owner must outlive every view and its leases.
     pub fn view(self: *Source, allocator: std.mem.Allocator, pool: ?*admission.Pool, control: Control) Source {
-        return .{ .allocator = allocator, .storage = self.storage, .identity = self.identity, .limits = self.limits, .control = control, .admission_pool = pool, .physical = self.physical orelse self };
+        const root = self.physical orelse self;
+        // Preserve adapter synchronization when a worker passes the same raw
+        // backing allocator. A distinct worker allocator keeps its own ownership.
+        const a = RangeAllocator.forWorker(root.allocator, allocator);
+        return .{ .allocator = a, .storage = self.storage, .identity = self.identity, .limits = self.limits, .control = control, .admission_pool = pool, .physical = self.physical orelse self };
     }
     pub fn length(self: *const Source) u64 {
         return switch (self.storage) {
@@ -124,16 +128,6 @@ pub const Source = struct {
         // Mutable providers retain serial semantics. Poll only a contended gate
         // so a waiting worker can observe a provider-independent deadline.
         const serial = !self.storage.range.concurrent;
-        if (serial and owner.provider_busy.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
-            while (true) {
-                try control.check();
-                if (owner.provider_busy.swap(2, .acquire) == 0) break;
-                try std.Io.futexWaitTimeout(io, u32, &owner.provider_busy.raw, 2, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } });
-            }
-        }
-        defer if (serial and owner.provider_busy.swap(0, .release) == 2) {
-            std.Io.futexWake(io, u32, &owner.provider_busy.raw, 1);
-        };
         try self.reserveRead(owner, size);
         var done: usize = 0;
         var first_call_used = false;
@@ -148,6 +142,8 @@ pub const Source = struct {
         errdefer reservation.deinit();
         const range = self.storage.range;
         if (range.borrow_at) |borrow| {
+            if (serial) try owner.lockProvider(control);
+            defer if (serial) owner.unlockProvider();
             const result = borrow(range.context, offset, size, control) catch |err| {
                 first_call_used = true;
                 return err;
@@ -160,11 +156,14 @@ pub const Source = struct {
                 return .{ .bytes = bytes, .source = self, .reservation = reservation };
             }
         }
-        const owned = self.allocator.alloc(u8, size) catch |err| retry: {
-            if (!admission.Reclaimer.reclaim(reclaimer)) return err;
-            break :retry try self.allocator.alloc(u8, size);
+        const a = self.rangeAllocator();
+        const owned = RangeAllocator.readBuffer(a, size, control) catch |err| retry: {
+            if (err != error.OutOfMemory or !admission.Reclaimer.reclaim(reclaimer)) return err;
+            break :retry try RangeAllocator.readBuffer(a, size, control);
         };
-        errdefer self.allocator.free(owned);
+        errdefer a.free(owned);
+        if (serial) try owner.lockProvider(control);
+        defer if (serial) owner.unlockProvider();
         while (done < size) {
             try control.check();
             if (first_call_used) try self.chargeCall(owner);
@@ -177,6 +176,72 @@ pub const Source = struct {
         try control.check();
         return .{ .bytes = owned, .source = self, .owned = owned, .reservation = reservation };
     }
+    fn lockProvider(self: *Source, control: ?Control) !void {
+        if (self.provider_busy.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        while (true) {
+            if (control) |c| try c.check();
+            if (self.provider_busy.swap(2, .acquire) == 0) return;
+            if (control != null) {
+                try std.Io.futexWaitTimeout(io, u32, &self.provider_busy.raw, 2, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } });
+            } else std.Io.futexWaitUncancelable(io, u32, &self.provider_busy.raw, 2);
+        }
+    }
+
+    fn unlockProvider(self: *Source) void {
+        if (self.provider_busy.swap(0, .release) == 2)
+            std.Io.futexWake(std.Io.Threaded.global_single_threaded.io(), u32, &self.provider_busy.raw, 1);
+    }
+
+    /// Range adapters may share the backing allocator with the original callbacks.
+    /// Coordinate their buffers, scratch and lease releases with the physical source.
+    /// Borrowed storage promises immutable bytes but makes no allocator guarantee.
+    pub fn rangeAllocator(self: *Source) std.mem.Allocator {
+        if (self.allocator.vtable == &RangeAllocator.vtable or (self.storage == .range and self.storage.range.concurrent)) return self.allocator;
+        return .{ .ptr = self, .vtable = &RangeAllocator.vtable };
+    }
+
+    const RangeAllocator = struct {
+        const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+        fn forWorker(original: std.mem.Allocator, worker: std.mem.Allocator) std.mem.Allocator {
+            if (original.vtable != &vtable) return worker;
+            const source: *Source = @ptrCast(@alignCast(original.ptr));
+            return if (std.meta.eql(worker, source.allocator)) original else worker;
+        }
+        fn readBuffer(a: std.mem.Allocator, size: usize, control: Control) ![]u8 {
+            if (a.vtable != &vtable) return a.alloc(u8, size);
+            const src: *Source = @ptrCast(@alignCast(a.ptr));
+            const gate = src.physical orelse src;
+            try gate.lockProvider(control);
+            defer gate.unlockProvider();
+            return src.allocator.alloc(u8, size);
+        }
+        fn lock(raw: *anyopaque) *Source {
+            const src: *Source = @ptrCast(@alignCast(raw));
+            (src.physical orelse src).lockProvider(null) catch unreachable;
+            return src;
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const src = lock(raw);
+            defer (src.physical orelse src).unlockProvider();
+            return src.allocator.rawAlloc(len, alignment, ra);
+        }
+        fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            const src = lock(raw);
+            defer (src.physical orelse src).unlockProvider();
+            return src.allocator.rawResize(bytes, alignment, len, ra);
+        }
+        fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            const src = lock(raw);
+            defer (src.physical orelse src).unlockProvider();
+            return src.allocator.rawRemap(bytes, alignment, len, ra);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const src = lock(raw);
+            defer (src.physical orelse src).unlockProvider();
+            src.allocator.rawFree(bytes, alignment, ra);
+        }
+    };
     fn admitBytes(self: *Source, size: usize, reclaimer: ?admission.Reclaimer) !admission.Token {
         return if (self.admission_pool) |pool| pool.acquire(.{ .host_bytes = size }) catch |err| retry: {
             if (!admission.Reclaimer.reclaim(reclaimer)) return err;
@@ -251,7 +316,7 @@ pub const Lease = struct {
     reservation: admission.Token = .{},
     pub fn deinit(self: *Lease) void {
         if (self.source) |s| {
-            if (self.owned) |owned| s.allocator.free(owned);
+            if (self.owned) |owned| s.rangeAllocator().free(owned);
             s.releaseBytes(self.bytes.len);
         }
         self.reservation.deinit();

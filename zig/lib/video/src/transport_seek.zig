@@ -307,7 +307,7 @@ pub const View = struct {
     map: Mapping,
     wire: *media.source.Source,
     pub fn source(self: *View, identity: []const u8, limits: media.source.Limits) media.source.Source {
-        return .{ .allocator = self.wire.allocator, .identity = identity, .control = self.wire.control, .admission_pool = self.wire.admission_pool, .limits = limits, .storage = .{ .range = .{ .concurrent = true, .context = self, .length = self.map.len, .read_at = read } } };
+        return .{ .allocator = self.wire.rangeAllocator(), .identity = identity, .control = self.wire.control, .admission_pool = self.wire.admission_pool, .limits = limits, .storage = .{ .range = .{ .concurrent = true, .context = self, .length = self.map.len, .read_at = read } } };
     }
     fn read(raw: *anyopaque, start: u64, out: []u8, control: media.source.Control) !usize {
         const self: *View = @ptrCast(@alignCast(raw));
@@ -336,7 +336,7 @@ pub const View = struct {
         const extent_bound = 2 * (physical_runs + final_id - id + 1) + out.len / 184;
         const calls_tight = available.max_reads < extent_bound + out.len / @max(1, hard_capacity);
         var separate: ?bool = null;
-        var scratch = media.admission.TrackedAllocator{ .backing = self.wire.allocator, .limit = std.math.maxInt(usize), .reservation = .{} };
+        var scratch = media.admission.TrackedAllocator{ .backing = self.wire.rangeAllocator(), .limit = std.math.maxInt(usize), .reservation = .{} };
         defer scratch.reservation.deinit();
         var constrained: ?[]WireSpan = null;
         defer if (constrained) |ranges| scratch.allocator().free(ranges);
@@ -844,6 +844,45 @@ test "seekable transport builds within one physical scan under the cache-free pe
         try std.testing.expectEqual(bytes.len, provider.next);
         if (capture) try std.testing.expect(index.planningHeaders() == null);
     }
+}
+
+test "seekable transport allocations and lease releases share the serial wire provider gate" {
+    const Provider = struct {
+        source: *media.source.Source,
+        allocations: usize = 0,
+        frees: usize = 0,
+
+        fn guarded(raw: *anyopaque) *@This() {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.source.provider_busy.load(.acquire) != 0);
+            return self;
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            guarded(raw).allocations += 1;
+            return std.testing.allocator.rawAlloc(len, alignment, ra);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            guarded(raw).frees += 1;
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn read(raw: *anyopaque, _: u64, out: []u8, _: media.source.Control) !usize {
+            _ = guarded(raw);
+            @memset(out, 42);
+            return out.len;
+        }
+    };
+    var wire: media.source.Source = undefined;
+    var provider = Provider{ .source = &wire };
+    const a = std.mem.Allocator{ .ptr = &provider, .vtable = &.{ .alloc = Provider.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = Provider.free } };
+    wire = .{ .allocator = a, .identity = "serial", .storage = .{ .range = .{ .context = &provider, .length = 1, .read_at = Provider.read } } };
+    var view = View{ .wire = &wire, .map = .{ .len = 5, .nals = &.{.{ .logical = 0, .elementary = 0, .size = 1 }}, .runs = &.{.{ .elementary = 0, .wire = 0, .len = 1 }} } };
+    var normalized = view.source("normalized", .{});
+    var worker = normalized.view(a, null, .{});
+    var lease = try worker.read(0, 5);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 42 }, lease.bytes);
+    lease.deinit();
+    try std.testing.expectEqual(2, provider.allocations);
+    try std.testing.expectEqual(provider.allocations, provider.frees);
 }
 
 test "seekable transport forwards worker cancellation inside a physical read" {

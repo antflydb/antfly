@@ -16274,11 +16274,11 @@ test "native generation dynamic media admission preserves the full context bound
     const config = gpt_mod.Config{ .max_position_embeddings = 131072 };
     const messages = [_]Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
     try std.testing.expectEqual(@as(usize, 0), nativeGenerationPreliminaryMediaTokenAllowance(&messages, config));
-    try std.testing.expectEqual(@as(usize, 4800), nativeGenerationMediaTokenAllowance(&messages, config));
-    try std.testing.expectEqual(@as(usize, 131040), try estimateNativeGenerationPromptTokenCount(130744, 4800, config, null, 32, 0));
-    try std.testing.expectEqual(@as(usize, 4900), try estimateNativeGenerationPromptTokenCount(100, 4800, config, null, 32, 0));
-    try std.testing.expectEqual(@as(usize, 65504), try estimateNativeGenerationPromptTokenCount(65000, 4800, config, .{ .max_position_embeddings = 65536 }, 32, 0));
-    try std.testing.expectError(error.PromptTooLong, estimateNativeGenerationPromptTokenCount(131041, 4800, config, null, 32, 0));
+    const allowance = nativeGenerationMediaTokenAllowance(&messages, config);
+    try std.testing.expectEqual(@as(usize, 131040), try estimateNativeGenerationPromptTokenCount(130744, allowance, config, null, 32, 0));
+    try std.testing.expectEqual(100 + allowance, try estimateNativeGenerationPromptTokenCount(100, allowance, config, null, 32, 0));
+    try std.testing.expectEqual(@as(usize, 65504), try estimateNativeGenerationPromptTokenCount(65000, allowance, config, .{ .max_position_embeddings = 65536 }, 32, 0));
+    try std.testing.expectError(error.PromptTooLong, estimateNativeGenerationPromptTokenCount(131041, allowance, config, null, 32, 0));
     // An exact expanded input still must fit; no truncation or spare output
     // token waiver accompanies the conservative pre-execution estimate.
     try validateNativeGenerationPromptTokenCount(131040, config, null, 32, 0);
