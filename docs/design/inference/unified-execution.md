@@ -349,7 +349,8 @@ projection remains first choice; an unfused fallback consumes the supplied span
 without allocating a clamp tensor. Optional scratch pressure preserves the old
 output bank. A staged, backed-off upgrade can later fund a separate scratch bank
 without invalidating queued output references or resetting replay selection.
-Partial upgrades retire only their own quota and views before retry.
+Both placements use the same checked view geometry and byte bounds. Partial
+upgrades retire only their own quota and views before retry.
 Merged seq2seq caches and full-prefix host decoders use the same execution-owned
 stage entry as encoders. That entry preserves an installed dispatcher's exact
 permit, gate and cancellation contract, propagates its failures without serial

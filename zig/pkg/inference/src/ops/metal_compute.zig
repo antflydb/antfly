@@ -21888,11 +21888,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.metadata_bytes += bytes;
         plan.host_bytes += bytes;
     }
+    const audio_schedule_bank_limit = 64 * 1024 * 1024;
+
     fn audioTryPrepare(self: *MetalCompute, plan: *audio_tape.Plan) !void {
         if (self.provider_impl.audio_schedule_clock < plan.retry_after) return;
         if (plan.prepared) {
-            if (plan.input_workspace_bytes != 0 or plan.input_workspace_wanted_bytes == 0 or plan.input_workspace_wanted_bytes > 64 * 1024 * 1024 or plan.workspaces.len != plan.count) return;
-            self.audioUpgradeInputWorkspace(plan) catch |err| {
+            const bytes = plan.arena_recipe.workspaceBytes(plan.workspaces.len, plan.count, audio_schedule_bank_limit);
+            if (plan.input_workspace_bytes != 0 or bytes == 0) return;
+            self.audioUpgradeInputWorkspace(plan, bytes) catch |err| {
                 plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
                 plan.retry_delay = @min(@as(u8, 64), plan.retry_delay *| 2);
                 switch (err) {
@@ -21913,25 +21916,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         plan.selection = .{};
         plan.retry_delay = 1;
-        if (plan.input_workspace_wanted_bytes != 0 and plan.input_workspace_bytes == 0) plan.retry_after = self.provider_impl.audio_schedule_clock + 1;
+        if (plan.arena_recipe.workspaceBytes(plan.workspaces.len, plan.count, audio_schedule_bank_limit) != 0 and plan.input_workspace_bytes == 0) plan.retry_after = self.provider_impl.audio_schedule_clock + 1;
     }
 
     /// A refused optional tail can recover without dropping the active output
     /// bank, resetting selection history or invalidating queued old commands.
     /// Stage every quota and view before publishing the complete scratch bank.
-    fn audioUpgradeInputWorkspace(self: *MetalCompute, plan: *audio_tape.Plan) !void {
+    fn audioUpgradeInputWorkspace(self: *MetalCompute, plan: *audio_tape.Plan, bytes: usize) !void {
         var views: [audio_tape.instruction_capacity]?CT = @splat(null);
         var staged = audio_tape.Plan{ .host_bytes = 0, .metadata_bytes = 0, .workspaces = views[0..plan.count] };
         errdefer self.audioUnpreparePlan(&staged);
-        const bank = (try self.audioPlanBuffer(&staged, plan.input_workspace_wanted_bytes, false)) orelse return error.AudioScheduleAdmission;
+        const bank = (try self.audioPlanBuffer(&staged, bytes, false)) orelse return error.AudioScheduleAdmission;
         staged.arena = self.audioPersistentCt(&staged, bank) catch |err| {
             var owned = bank;
             owned.deinit();
             return err;
         };
-        for (plan.nodes[0..plan.count], 0..) |node, i| if (node.inputWorkspaceShape()) |shape| {
-            const bytes = try std.math.mul(usize, try std.math.mul(usize, shape.rows, shape.width), @sizeOf(f32));
-            const view = try bank.retainedView(0, bytes, &.{ @intCast(shape.rows), @intCast(shape.width) });
+        for (plan.nodes[0..plan.count], 0..) |*node, i| if (try plan.arena_recipe.workspaceView(node, .separate)) |region| {
+            const view = try bank.retainedView(region.offset, region.bytes, &region.shape);
             views[i] = self.audioPersistentCt(&staged, view) catch |err| {
                 var owned = view;
                 owned.deinit();
@@ -21943,7 +21945,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         @memcpy(plan.workspaces, views[0..plan.count]);
         plan.input_workspace_bank = staged.arena;
         if (plan.drop_ct == null) plan.drop_ct = staged.drop_ct;
-        plan.input_workspace_bytes = plan.input_workspace_wanted_bytes;
+        plan.input_workspace_bytes = bytes;
         plan.host_bytes = host;
         plan.backend_bytes = backend;
         plan.retry_delay = 1;
@@ -21959,7 +21961,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.host_bytes = plan.metadata_bytes;
         plan.backend_bytes = 0;
         plan.arena_size = 0;
-        plan.input_workspace_wanted_bytes = 0;
+        plan.arena_recipe = .{};
         plan.drop_ct = null;
         plan.prepared = false;
         for (plan.constants[0..plan.constant_count]) |*c| c.required = true;
@@ -22072,12 +22074,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         const recipe = try plan.arenaLayout();
-        plan.input_workspace_wanted_bytes = recipe.input_workspace_bytes;
+        plan.arena_recipe = recipe;
         // Preserve the previous output-bank eligibility and admission fallback.
         // Optional clamp scratch must not evict an otherwise fitting bank.
-        if (recipe.outputs_bytes <= 64 * 1024 * 1024) {
-            var workspace_bytes = if (plan.workspaces.len == plan.count and recipe.input_workspace_bytes <= 64 * 1024 * 1024) recipe.input_workspace_bytes else 0;
-            var bytes = try std.math.add(usize, recipe.outputs_bytes, workspace_bytes);
+        if (recipe.outputs_bytes <= audio_schedule_bank_limit) {
+            var workspace_bytes = recipe.workspaceBytes(plan.workspaces.len, plan.count, audio_schedule_bank_limit);
+            var bytes = if (workspace_bytes != 0) recipe.total_bytes else recipe.outputs_bytes;
             var bank: ?MetalTensor = if (bytes != 0) try self.audioPlanBuffer(plan, bytes, false) else null;
             if (bank == null and workspace_bytes != 0) {
                 workspace_bytes = 0;
@@ -22092,19 +22094,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 };
                 plan.arena_size = bytes;
                 plan.input_workspace_bytes = workspace_bytes;
-                for (plan.nodes[0..plan.count], 0..) |node, i| if (node.arena_offset) |offset| {
+                for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.outputView(node)) |region| {
                     if (plan.outputs.len == 0 or plan.linear_only) continue;
-                    const d = node.outputDimensions().?;
-                    const view = try mt.retainedView(offset, d.rows * d.out_dim * 4, &.{ @intCast(d.rows), @intCast(d.out_dim) });
+                    const view = try mt.retainedView(region.offset, region.bytes, &region.shape);
                     plan.outputs[i] = self.audioPersistentCt(plan, view) catch |err| {
                         var owned = view;
                         owned.deinit();
                         return err;
                     };
                 };
-                if (workspace_bytes != 0) for (plan.nodes[0..plan.count], 0..) |node, i| if (node.inputWorkspaceShape()) |shape| {
-                    const needed = try std.math.mul(usize, try std.math.mul(usize, shape.rows, shape.width), @sizeOf(f32));
-                    const view = try mt.retainedView(recipe.outputs_bytes, needed, &.{ @intCast(shape.rows), @intCast(shape.width) });
+                if (workspace_bytes != 0) for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.workspaceView(node, .combined)) |region| {
+                    const view = try mt.retainedView(region.offset, region.bytes, &region.shape);
                     plan.workspaces[i] = self.audioPersistentCt(plan, view) catch |err| {
                         var owned = view;
                         owned.deinit();
