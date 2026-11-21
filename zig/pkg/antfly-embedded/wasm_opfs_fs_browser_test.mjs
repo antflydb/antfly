@@ -79,23 +79,22 @@ self.onmessage = async ({ data }) => {
 const dbWorker = `
 self.onmessage = async ({ data }) => {
   try {
-    const { openOpfsFileSystem } = await import("/fs/wasm_opfs_fs.mjs");
-    const { instantiateAntflyEmbeddedApiFromBytes } = await import("/wasm/antfly_embedded_wasm_client.mjs");
+    const { openOpfsFileSystem, withCapacity } = await import("/fs/wasm_opfs_fs.mjs");
+    const { instantiateAntflyEmbeddedApiFromBytes } = await import("/fs/wasm_client.mjs");
     const bytes = new Uint8Array(await (await fetch("/wasm/antfly.wasm")).arrayBuffer());
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle("db-test", { create: true });
     const fs = await openOpfsFileSystem(dir);
     const api = await instantiateAntflyEmbeddedApiFromBytes(bytes, { fileSystem: fs });
-    api.openFileSystem("/mail");
+    await withCapacity(fs, () => api.openFileSystem("/mail"));
     if (data.phase === "write") {
-      api.addIndex({ name: "v", kind: "dense_vector", config_json: JSON.stringify({ field: "embedding", dims: 3, metric: "cosine", external: true }) });
+      await withCapacity(fs, () => api.addIndex({ name: "v", kind: "dense_vector", config_json: JSON.stringify({ field: "embedding", dims: 3, metric: "cosine", external: true }) }));
       for (let i = 0; i < 20; i++) {
-        await fs.ensureCapacity();
-        api.putMany({
+        await withCapacity(fs, () => api.putMany({
           ["m" + i + "a"]: { content: "plumber invoice " + i, _embeddings: { v: [1, 0, 0] } },
           ["m" + i + "b"]: { content: "team offsite " + i, _embeddings: { v: [0, 1, 0] } },
-        });
-        api.runUntilIdle();
+        }));
+        await withCapacity(fs, () => api.runUntilIdle());
       }
     }
     const dense = JSON.stringify(api.search({ embeddings: { v: [1, 0, 0] }, indexes: ["v"], limit: 5 }));

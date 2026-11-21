@@ -206,6 +206,7 @@ export class LocalMailIndex {
     this.syncing ??= (async () => {
       try {
         let more = true;
+        let rebuilt = false;
         while (more) {
           signal?.throwIfAborted();
           const response = await fetch("/mail/sync?cursor=" + encodeURIComponent(this.state.cursor ?? ""), {
@@ -234,11 +235,21 @@ export class LocalMailIndex {
             );
             onStatus({ stage: "embedding", loaded: (this.state.messages ?? 0) + vectors.length });
           }
-          this.state = await this.database.call("apply", {
-            messages: page.messages,
-            vectors,
-            cursor: page.cursor,
-          });
+          try {
+            this.state = await this.database.call("apply", {
+              messages: page.messages,
+              vectors,
+              cursor: page.cursor,
+            });
+          } catch (error) {
+            // The worker rebuilt an unrecoverable copy: start over from cursor
+            // "" once; a second failure in the same run is reported instead.
+            if (error.message !== "LocalIndexRebuilt" || rebuilt) throw error;
+            rebuilt = true;
+            this.state = await this.database.call("status");
+            onStatus({ stage: "reset" });
+            continue;
+          }
           onStatus({ stage: "synced", loaded: this.state.messages, bytes: this.state.bytes, more: page.more });
           more = page.more;
         }

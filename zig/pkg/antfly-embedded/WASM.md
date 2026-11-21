@@ -161,14 +161,13 @@ System. It must run in a dedicated worker, because synchronous access handles
 exist only there:
 
 ```js
-import { openOpfsFileSystem } from "./antfly_embedded_opfs_fs.mjs";
+import { openOpfsFileSystem, withCapacity } from "./antfly_embedded_opfs_fs.mjs";
 const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("my-db", { create: true });
 const fs = await openOpfsFileSystem(dir);              // throws OpfsBusy if another tab holds it
 const api = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, { fileSystem: fs });
-api.openFileSystem("/db");                             // new or existing database
-await fs.ensureCapacity();                             // keep free slots between operations
-api.putMany(docs);
-api.runUntilIdle();
+await withCapacity(fs, () => api.openFileSystem("/db"));  // new or existing database
+await withCapacity(fs, () => api.putMany(docs));      // top up free slots before each call
+await withCapacity(fs, () => api.runUntilIdle());
 api.close();
 fs.close();                                            // release the handles
 ```
@@ -190,9 +189,19 @@ files and stores the logical namespace inside them, like SQLite's
   generation wins on reopen, so `rename_is_atomic` holds.
 - **Data durability.** Data becomes durable at `sync`, as with `fsync`.
   Deleted slots are truncated and reused.
-- **Capacity.** Creating a file with no free slot returns "no space" and never
-  loses data. Call `ensureCapacity()` (asynchronous) between operations; it
-  keeps 32 free slots by default.
+- **Capacity.** Slots can only be added asynchronously, between database
+  calls, so the free reserve must cover one call's peak file demand. That peak
+  is bursty: a first vector index build writes about 128 block files and up to
+  about 128 spool files before deleting them, measured at 159 files for 25
+  documents and 265 for 2,000. Later calls need about 10.
+  - Defaults: 512 slots with 384 kept free. Opening them takes about half a
+    second in Chromium.
+  - The pool tracks each call's peak and keeps at least twice the largest.
+  - `withCapacity(fs, fn)` tops up the reserve before a call.
+  - If a call still runs out, it fails with `OpfsPoolExhausted`. Don't retry
+    it. The hosted profile has no durable index-repair checkpoint, so an index
+    interrupted mid-build stays unusable even after a reopen. Treat the copy
+    as a cache: delete it and rebuild from the source of truth.
 - **One tab at a time.** Sync access handles are exclusive, so a second tab gets
   `OpfsBusy`. Close the pool to hand it over.
 

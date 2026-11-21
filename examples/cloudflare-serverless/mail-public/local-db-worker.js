@@ -63,6 +63,20 @@ function close() {
   mailbox = null;
 }
 
+// Database calls are synchronous and can create many files; keep the OPFS
+// pool topped up before each. If one still runs out, an index may have been
+// interrupted mid-build, which the hosted profile cannot repair: rebuild this
+// cache from scratch and tell the page to resync from the start.
+async function work(fn) {
+  try {
+    return await runtime.fs.withCapacity(pool, fn);
+  } catch (error) {
+    if (error?.name !== "OpfsPoolExhausted" || !lastOpen) throw error;
+    await handlers.reset();
+    throw Error("LocalIndexRebuilt");
+  }
+}
+
 function state() {
   try {
     return api.lookup(STATE)._source ?? null;
@@ -91,7 +105,7 @@ const handlers = {
       throw error;
     }
     api = await client.instantiateAntflyEmbeddedApiFromBytes(runtime.bytes, { fileSystem: pool });
-    api.openFileSystem(DATABASE);
+    await work(() => api.openFileSystem(DATABASE));
     mailbox = mailboxId;
     const current = state();
     if (current && JSON.stringify(current.space) !== JSON.stringify(space)) {
@@ -103,8 +117,8 @@ const handlers = {
       // Setup is two commits; an interrupted first open may have added the
       // index already, so only add what is missing.
       const index = localSchema.vectorIndex(space.dimensions);
-      if (!api.listIndexes().some((existing) => existing.name === index.name)) api.addIndex(index);
-      api.put(STATE, { space, cursor: "", messages: 0 });
+      if (!api.listIndexes().some((existing) => existing.name === index.name)) await work(() => api.addIndex(index));
+      await work(() => api.put(STATE, { space, cursor: "", messages: 0 }));
     }
     return status();
   },
@@ -114,17 +128,14 @@ const handlers = {
   async apply({ messages, vectors, cursor }) {
     if (!api) throw Error("LocalIndexClosed");
     if (messages.length !== vectors.length) throw Error("LocalVectorMismatch");
-    // Keep free slots ahead of the database's next files (asynchronous).
-    await pool.ensureCapacity();
     const previous = state() ?? {};
     const next = { ...previous, cursor, messages: (previous.messages ?? 0) + messages.length, synced_at: Date.now() };
     const inserts = { [STATE]: next };
     messages.forEach((message, i) => {
       inserts[localSchema.key(message.id)] = documentFor(message, vectors[i]);
     });
-    api.batch({ inserts });
-    api.runUntilIdle();
-    await pool.ensureCapacity();
+    await work(() => api.batch({ inserts }));
+    await work(() => api.runUntilIdle());
     return status(next);
   },
 

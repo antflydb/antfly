@@ -16,7 +16,7 @@
 // OPFS slot pool against a simulated OPFS in which only flushed bytes survive
 // a crash. The WASM bridge is exercised by wasm_smoke_run.mjs.
 import assert from "node:assert/strict";
-import { openOpfsFileSystem, destroyOpfsFileSystem, status } from "./wasm_opfs_fs.mjs";
+import { openOpfsFileSystem, destroyOpfsFileSystem, status, withCapacity, OpfsPoolExhausted } from "./wasm_opfs_fs.mjs";
 
 const notFound = () => Object.assign(new Error("missing"), { name: "NotFoundError" });
 
@@ -227,8 +227,11 @@ function readAll(fs, path) {
     assert.equal(fs.write("/db/2", bytes("2"), false), 0);
     assert.equal(fs.write("/db/3", bytes("3"), false), status.noSpace);
     assert.equal(fs.size("/db/3"), status.notFound);
+    assert.equal(fs.exhausted, true);
     await fs.ensureCapacity(3);
-    assert.equal(fs.stats().free, 3);
+    // Running out shows the reserve was too small: the pool over-provisions.
+    assert.ok(fs.stats().free > 3, "an exhaustion raises the reserve");
+    assert.equal(fs.exhausted, false);
     assert.equal(fs.write("/db/3", bytes("3"), false), 0);
     fs.close();
     const reopened = await openOpfsFileSystem(dir, { initialSlots: 2, reserve: 1 });
@@ -260,6 +263,37 @@ function readAll(fs, path) {
     await Promise.all([fs.ensureCapacity(4), fs.ensureCapacity(6), fs.ensureCapacity(5)]);
     assert.equal(fs.stats().free, 6);
     assert.equal(new Set(dir.files.keys()).size, fs.stats().slots);
+    fs.close();
+}
+
+// Bursty calls: running out surfaces OpfsPoolExhausted (never a silent
+// retry), and the reserve then adapts to cover the observed peak.
+{
+    const dir = directory();
+    const fs = await openOpfsFileSystem(dir, { initialSlots: 4, reserve: 2 });
+    // Like an index build: create 40 temporary files, then delete them.
+    const burst = () => {
+        for (let i = 0; i < 40; i++) {
+            const code = fs.write(`/db/tmp/${i}`, bytes("t"), false);
+            if (code < 0) {
+                fs.remove("/db/tmp", true);
+                throw new Error("NoSpaceLeft");
+            }
+        }
+        fs.remove("/db/tmp", true);
+        return "done";
+    };
+    await assert.rejects(withCapacity(fs, burst), (error) => error instanceof OpfsPoolExhausted && error.cause.message === "NoSpaceLeft");
+    assert.equal(await withCapacity(fs, burst), "done", "the next call has grown capacity");
+    assert.equal(await withCapacity(fs, burst), "done");
+    assert.ok(fs.stats().free >= 80, "reserve is twice the observed peak");
+    await assert.rejects(withCapacity(fs, () => { throw new Error("boom"); }), /^Error: boom$/);
+    fs.close();
+}
+{
+    // Defaults cover the measured first-index-build burst (~265 files).
+    const fs = await openOpfsFileSystem(directory());
+    assert.ok(fs.stats().free >= 384);
     fs.close();
 }
 

@@ -113,7 +113,11 @@ class FsError extends Error {
  * Open (or create) a slot pool in `directory`, a FileSystemDirectoryHandle in
  * a dedicated worker. Throws `OpfsBusy` if another tab holds the pool.
  */
-export async function openOpfsFileSystem(directory, { initialSlots = 64, reserve = 32 } = {}) {
+// Defaults cover the largest measured single-call demand of the embedded
+// database: a first vector index build writes ~128 block and up to ~128
+// spool files before deleting them (265 peak at 2,000 documents). Opening
+// 512 handles takes about half a second in Chromium.
+export async function openOpfsFileSystem(directory, { initialSlots = 512, reserve = 384 } = {}) {
     const slots = []; // { name, number, handle, generation, record, path }
     const byPath = new Map();
     const free = [];
@@ -121,6 +125,13 @@ export async function openOpfsFileSystem(directory, { initialSlots = 64, reserve
     let lastNow = 0n;
     let closed = false;
     let growing = Promise.resolve();
+    // Demand tracking: one database call can create (and delete) many files,
+    // and slots can only be added between calls. Track the deepest dip below
+    // the free count since the last ensureCapacity, and whether it ran out.
+    let freeAtCheckpoint = 0;
+    let lowestFree = 0;
+    let peakDemand = 0;
+    let exhausted = false;
 
     async function openSlot(name, number) {
         const file = await directory.getFileHandle(name, { create: true });
@@ -213,7 +224,11 @@ export async function openOpfsFileSystem(directory, { initialSlots = 64, reserve
     function claim(path) {
         if (encoder.encode(path).length > MAX_PATH) throw new FsError(status.io, "path too long");
         const slot = free.pop();
-        if (!slot) throw new FsError(status.noSpace, "OPFS pool exhausted; call ensureCapacity");
+        if (!slot) {
+            exhausted = true;
+            throw new FsError(status.noSpace, "OPFS pool exhausted; call ensureCapacity");
+        }
+        lowestFree = Math.min(lowestFree, free.length);
         slot.handle.truncate(HEADER);
         return slot;
     }
@@ -336,14 +351,26 @@ export async function openOpfsFileSystem(directory, { initialSlots = 64, reserve
          * are serialized, so overlapping callers never race for a slot file.
          */
         ensureCapacity(minimum = reserve) {
-            const run = growing.then(() => grow(minimum));
+            // Keep twice the largest per-call demand seen so far (and more
+            // after an exhaustion, which only shows the demand's lower bound).
+            const demand = freeAtCheckpoint - lowestFree + (exhausted ? Math.max(freeAtCheckpoint, 16) : 0);
+            peakDemand = Math.max(peakDemand, demand);
+            const target = Math.max(minimum, 2 * peakDemand);
+            const run = growing.then(() => grow(target)).then(() => {
+                freeAtCheckpoint = lowestFree = free.length;
+                exhausted = false;
+            });
             growing = run.catch(() => {});
             return run;
+        },
+        /** True if a file create failed for lack of a free slot since the last ensureCapacity. */
+        get exhausted() {
+            return exhausted;
         },
         stats() {
             let bytes = 0;
             for (const slot of byPath.values()) bytes += Math.max(0, slot.handle.getSize() - HEADER);
-            return { files: byPath.size, slots: slots.length, free: free.length, bytes };
+            return { files: byPath.size, slots: slots.length, free: free.length, bytes, peakDemand };
         },
         paths: () => [...byPath.keys()].sort(),
         /** Release every handle; the pool can then be reopened (e.g. by another tab). */
@@ -362,6 +389,31 @@ export async function openOpfsFileSystem(directory, { initialSlots = 64, reserve
     // At least `initialSlots` in total and `reserve` free.
     await fs.ensureCapacity(Math.max(reserve, initialSlots - (slots.length - free.length)));
     return fs;
+}
+
+export class OpfsPoolExhausted extends Error {
+    constructor(cause) {
+        super("OPFS pool ran out of free slots during a database call; reopen the database and raise the pool reserve", { cause });
+        this.name = "OpfsPoolExhausted";
+    }
+}
+
+/**
+ * Top up free slots (asynchronously), then run `fn` (synchronous database
+ * work). Slots cannot be added during a call, so the reserve must cover the
+ * call's peak file demand; the pool learns that peak and keeps twice it.
+ * If a call still runs out, it fails with OpfsPoolExhausted: a storage
+ * failure mid-call needs crash recovery (reopen) and must not be retried on
+ * the same handle.
+ */
+export async function withCapacity(fs, fn) {
+    await fs.ensureCapacity();
+    try {
+        return fn();
+    } catch (error) {
+        if (fs.exhausted) throw new OpfsPoolExhausted(error);
+        throw error;
+    }
 }
 
 /** Remove a pool directory (opt-out, sign-out, or a corrupt copy). Close it first. */

@@ -21,7 +21,7 @@ import {
     formatDotpromptMediaUrl,
     instantiateAntflyEmbeddedApiFromBytes,
 } from "./antfly_embedded_wasm_client.mjs";
-import { openOpfsFileSystem } from "./antfly_embedded_opfs_fs.mjs";
+import { openOpfsFileSystem, withCapacity } from "./antfly_embedded_opfs_fs.mjs";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const wasmPath = path.join(dir, "antfly.wasm");
@@ -238,18 +238,19 @@ function opfsDirectory(files = new Map()) {
     };
 }
 const opfs = opfsDirectory();
-const pool = await openOpfsFileSystem(opfs, { initialSlots: 64, reserve: 32 });
+const pool = await openOpfsFileSystem(opfs);
 const fsApi = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, { fileSystem: pool });
-fsApi.openFileSystem("/mail");
-fsApi.addIndex({ name: "mail_semantic", kind: "dense_vector", config_json: JSON.stringify({ field: "embedding", dims: 3, metric: "cosine", external: true }) });
+await withCapacity(pool, () => fsApi.openFileSystem("/mail"));
+await withCapacity(pool, () => fsApi.addIndex({ name: "mail_semantic", kind: "dense_vector", config_json: JSON.stringify({ field: "embedding", dims: 3, metric: "cosine", external: true }) }));
 for (let round = 0; round < 4; round++) {
-    await pool.ensureCapacity();
-    fsApi.putMany({
+    await withCapacity(pool, () => fsApi.putMany({
         [`msg:${round}a`]: { content: `invoice from the plumber ${round}`, _embeddings: { mail_semantic: [1, 0, 0] } },
         [`msg:${round}b`]: { content: `team offsite agenda ${round}`, _embeddings: { mail_semantic: [0, 1, 0] } },
-    });
-    fsApi.runUntilIdle();
+    }));
+    await withCapacity(pool, () => fsApi.runUntilIdle());
 }
+// The first index build is the burst the default reserve is sized for.
+if (pool.stats().peakDemand < 100 || pool.stats().free < 2 * pool.stats().peakDemand) throw new Error(`unexpected pool demand: ${JSON.stringify(pool.stats())}`);
 if (pool.stats().files === 0 || pool.stats().bytes === 0) throw new Error("OPFS pool received no database files");
 fsApi.close();
 pool.close();
@@ -257,7 +258,7 @@ pool.close();
 // Reopen from the pool alone, in a fresh module instance.
 const reopenedPool = await openOpfsFileSystem(opfs);
 const reopened = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, { fileSystem: reopenedPool });
-reopened.openFileSystem("/mail");
+await withCapacity(reopenedPool, () => reopened.openFileSystem("/mail"));
 if (!reopened.listIndexes().some((index) => index.name === "mail_semantic")) throw new Error("OPFS reopen lost the vector index");
 if (reopened.lookup("msg:3b")._source.content !== "team offsite agenda 3") throw new Error("OPFS reopen lookup failed");
 const dense = JSON.stringify(reopened.search({ embeddings: { mail_semantic: [1, 0, 0] }, indexes: ["mail_semantic"], limit: 4 }));
