@@ -42,6 +42,9 @@ pub const Stats = struct {
     storage_usage: ?accounting.Snapshot = null,
     replay_decision: ReplayDecision = .not_requested,
     dispatches: u64 = 0,
+    region_callbacks: u64 = 0,
+    region_callback_nodes: u64 = 0,
+    assigned_regions: ?@import("stats.zig").AssignedRegions = null,
     transfers: u64 = 0,
     output_copies: u64 = 0,
     transfer_bytes: u64 = 0,
@@ -1306,9 +1309,6 @@ pub const Pool = struct {
         for (self.replay_outputs) |*output| output.allocation = (self.plan.slotForNode(output.node) orelse return error.InvalidPhysicalAllocation).allocation;
     }
 
-    fn prepareRegions(self: *Pool) !void {
-        return self.prepareRegionsWithAuthority(null);
-    }
     fn prepareRegionsWithAuthority(self: *Pool, authority: ?@import("backend_operation.zig").Borrowed) !void {
         if (self.region_execution_profile == .unknown) {
             var ordinary = false;
@@ -2132,9 +2132,6 @@ pub const Frame = struct {
         };
         for (self.completions) |completion| if (completion) |value| try value.wait();
     }
-    fn deinitAfterWaitWithBoundary(self: *Frame, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
-        self.deinitAfterWaitWithCleanup(.{ .boundary = boundary });
-    }
     fn deinitAfterWaitWithCleanup(self: *Frame, cleanup: @import("cleanup_context.zig").Context) void {
         self.clearNativeProgramViews(cleanup);
         if (cleanup.boundary == null) {
@@ -2408,6 +2405,11 @@ pub const Frame = struct {
         };
         if (self.collect_storage_stats) {
             self.stats.prepared_payload_coverage = self.pool.payload_coverage;
+            self.stats.assigned_regions = .{
+                .selected = self.pool.regions.len,
+                .accepted_callbacks = self.stats.region_callbacks,
+                .covered_callback_nodes = self.stats.region_callback_nodes,
+            };
             if (self.pool.accounting) |ledger| self.stats.storage_usage = ledger.snapshot();
         }
         return self.stats;
@@ -2921,6 +2923,10 @@ pub const Frame = struct {
         const outcome = try installed.owner.dispatch(invocation);
         if (outcome == .declined_before_submission) return error.PreparedRegionDeclined;
         self.stats.dispatches += 1;
+        if (self.collect_storage_stats) {
+            self.stats.region_callbacks += 1;
+            self.stats.region_callback_nodes += installed.owner.covered_nodes.len;
+        }
         if (self.region_claims[index]) |*owned| {
             // Concrete numerical callbacks established independent tickets before
             // encoding on EVERY actual command buffer, including nested flushes.

@@ -435,6 +435,7 @@ pub const Runtime = struct {
 
     fn addPhysicalStats(stats: *partition_mod.PartitionExecutor.ExecutionStats, physical: @import("../execution/physical_buffers.zig").Stats) void {
         stats.prepared_payload_coverage = physical.prepared_payload_coverage;
+        stats.assigned_regions = physical.assigned_regions;
         stats.planned_storage = physical.storage_usage;
         stats.physical_replay = physical.replay_decision;
         stats.assigned_kernel_dispatches += physical.dispatches;

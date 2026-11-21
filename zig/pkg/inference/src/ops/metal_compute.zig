@@ -55034,6 +55034,10 @@ const PreparedDenseRegionFixture = struct {
         if (profile.profile == .synchronous) {
             try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_slots_reserved);
             try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_bytes_reserved);
+            const regions = result.stats.assigned_regions orelse return error.MissingAssignedRegionObservation;
+            try std.testing.expectEqual(@as(usize, 1), regions.selected);
+            try std.testing.expectEqual(@as(u64, 1), regions.accepted_callbacks);
+            try std.testing.expectEqual(selected.pool.regions[0].owner.covered_nodes.len, regions.covered_callback_nodes);
         }
         try std.testing.expect(claims.closed);
         // This counter increments at the real Frame.executeRegion seam, and

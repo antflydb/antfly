@@ -105,6 +105,8 @@ pub const Report = struct {
     /// A compatibility reason is not a numerical fallback or a quota grant.
     payload_admission_coverage: ?PayloadAdmissionCoverage = null,
     metal_region_policy: ?MetalRegionPolicy = null,
+    /// Available from the corresponding successfully published physical Frame.
+    assigned_regions: ?@import("stats.zig").AssignedRegions = null,
     owned_program_fallbacks: ?ProgramFallbacks = null,
     program_output_copies: ?ProgramOutputCopies = null,
     fallback_detail_scope: enum { invocation_errors_and_corresponding_program_only } = .invocation_errors_and_corresponding_program_only,
@@ -170,6 +172,7 @@ pub const Report = struct {
         if (value.execution) |program| {
             if (program.prepared_payload_coverage) |coverage| report.payload_admission_coverage = .{ .scope = .corresponding_program_last_finished_frame_prepared_metadata, .value = coverage };
             if (program.metal_region_policy_observed) report.metal_region_policy = MetalRegionPolicy.init(program);
+            report.assigned_regions = program.assigned_regions;
             report.owned_program_fallbacks = ProgramFallbacks.init(program);
             report.program_output_copies = .{ .total_owned = program.graph_output_owned_copies, .planned_literal = program.planned_literal_output_copies, .opaque_metal_graph_output = program.opaque_graph_output_copies };
             report.program_storage_scope = @tagName(value.execution_scope);

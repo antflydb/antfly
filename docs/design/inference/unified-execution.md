@@ -697,8 +697,10 @@ preparation API do not by themselves complete these remaining requirements:
   Successful frames and entered Native calls copy their prepared payload admission
   coverage into the report, including the existing compatibility reason. This
   describes prepared accounting rather than a numerical fallback or quota grant.
-  Instrumented Metal region-policy counters remain absent until their actual
-  planner runs.
+  Assigned regions report selected regions, accepted callbacks, and covered
+  nodes from the finished Frame across CUDA and Metal. A recorded callback
+  is separate from a graph launch. Instrumented Metal legacy region-policy
+  counters remain absent until their actual planner runs.
   Unobserved fallback reasons and opaque vendor/private allocation domains remain
   unavailable. These scoped observations do not claim a whole-backend census or
   an exclusive invocation memory peak.
