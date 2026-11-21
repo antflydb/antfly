@@ -236,10 +236,7 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
         // references retained for later forward work.
         if (indexed.pictures[first].packet_index.? < owner.next_packet) return decode(a, reader, indexed, selected, options, sink, null, config);
         restart = .{ .packet = owner.next_packet, .logical = first };
-    } else for (indexed.restarts) |point| {
-        if (point.logical > first) break;
-        restart = point;
-    }
+    } else restart = indexed.restartFor(first);
     const end = indexed.pictures[last].packet_index.?;
     if (restart.packet > end) return error.InvalidVideoIndex;
     if (end - restart.packet + 1 > options.decode.max_decode_packets) return error.ResourceLimitExceeded;
