@@ -1551,6 +1551,32 @@ pub const ModelLoadPolicy = struct {
     }
 };
 
+const CudaGemmaPolicy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
+const CudaGemmaPolicyProbe = struct {
+    lock: std.Io.Mutex = .init,
+    expires: std.Io.Timestamp = .{ .nanoseconds = 0 },
+    policy: ?CudaGemmaPolicy = null,
+
+    fn resolve(self: *CudaGemmaPolicyProbe, a: std.mem.Allocator, io: std.Io, control: InferenceExecutionControl) !?CudaGemmaPolicy {
+        if (comptime !build_options.enable_cuda) return null;
+        try managed_receipt.lockVerification(control, &self.lock, io);
+        defer self.lock.unlock(io);
+        if (std.Io.Timestamp.now(io, .awake).nanoseconds < self.expires.nanoseconds) return self.policy;
+        var guard = try control.enterUninterruptible(.uninterruptible);
+        defer guard.deinit();
+        const result: anyerror!CudaGemmaPolicy = @import("../ops/cuda/cuda_compute.zig").probeEmbeddingGemma2Policy(a);
+        const policy: ?CudaGemmaPolicy = result catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+        try control.check();
+        self.policy = policy;
+        const lifetime: i128 = if (policy == null) std.time.ns_per_s else 60 * std.time.ns_per_s;
+        self.expires = .{ .nanoseconds = std.Io.Timestamp.now(io, .awake).nanoseconds + lifetime };
+        return policy;
+    }
+};
+
 pub const ModelManager = struct {
     /// One physical ledger for an invocation's target, draft and artifact
     /// managers. Managers retain the stable domain; cache/lease lifetimes can
@@ -2022,6 +2048,7 @@ pub const ModelManager = struct {
     verified_artifacts: @import("../registry/published_artifacts.zig").VerificationCache = .{},
     unhealthy_backend_lock: std.atomic.Mutex = .unlocked,
     declared_receipt_revisions: [64]DeclaredReceiptRevision = @splat(.{}),
+    cuda_gemma_policy: CudaGemmaPolicyProbe = .{},
     unhealthy_model_backends: std.AutoHashMapUnmanaged(ModelBackendHealthKey, u64) = .empty,
     tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
     resource_domain: ?*ResourceDomain = null,
@@ -6005,11 +6032,25 @@ pub const ModelManager = struct {
             if (manifest.embedding_style == .embedding_gemma2 and backend != .native and backend != .metal and backend != .cuda) continue;
             if (backend == .wasm and manifest.onnx_path == null) continue;
             if (std.mem.indexOfScalar(backends.BackendType, result.backends[0..result.len], backend) != null) continue;
+            const revision = if (backend == .cuda and manifest.embedding_style == .embedding_gemma2) resolved: {
+                if (try self.residentCudaEmbeddingRevision(model_dir, artifacts.installation, load_policy.cache_policy)) |resident|
+                    break :resolved resident;
+                const policy = (try self.cuda_gemma_policy.resolve(self.allocator, artifacts.io, control)) orelse continue;
+                break :resolved loaded_runtime.durableEmbeddingRevisionWithCudaPolicy(manifest, artifact_revision, backend, policy);
+            } else durableEmbeddingRevision(manifest, artifact_revision, backend);
             result.backends[result.len] = backend;
-            result.revisions[result.len] = durableEmbeddingRevision(manifest, artifact_revision, backend);
+            result.revisions[result.len] = revision;
             result.len += 1;
         }
         return result;
+    }
+
+    fn residentCudaEmbeddingRevision(self: *ModelManager, model_dir: []const u8, installation: ?managed_receipt.Installation, policy: ModelLoadCachePolicy) !?[32]u8 {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        const model = (try self.lookupLoadedModelLocked(model_dir, &.{.cuda}, false, policy)) orelse return null;
+        if (!std.meta.eql(model.managed_installation, installation) or model.session.backend() != .cuda) return null;
+        return model.durable_embedding_revision;
     }
 
     pub fn acquirePinnedEmbedding(

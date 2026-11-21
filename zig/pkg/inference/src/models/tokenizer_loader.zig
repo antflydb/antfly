@@ -874,7 +874,37 @@ const gemma_identity = @import("embedding_gemma2_identity.zig");
 
 pub fn usesDurableGemmaTokenizer(man: manifest_mod.ModelManifest, artifacts: *const PublishedArtifacts) bool {
     return man.embedding_style == .embedding_gemma2 and
-        if (artifacts.receipt) |receipt| receipt.all_checksums_declared else false;
+        if (artifacts.receipt) |*receipt| receipt.hasCompleteChecksums() else false;
+}
+
+test "model selection legacy checksum aliases use the same managed Gemma tokenizer" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const receipt_mod = @import("../registry/managed_receipt.zig");
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{}" });
+    try temp.dir.writeFile(io, .{ .sub_path = "tokenizer.model", .data = "unused" });
+    try temp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "weights" });
+    try temp.dir.symLink(io, "tokenizer.json", "historical-tokenizer.json", .{});
+    try temp.dir.writeFile(io, .{ .sub_path = receipt_mod.complete_filename, .data =
+        \\{"version":1,"artifacts":[
+        \\{"path":"model.safetensors","size":7,"sha256":"1111111111111111111111111111111111111111111111111111111111111111"},
+        \\{"path":"tokenizer.model","size":6,"sha256":"2222222222222222222222222222222222222222222222222222222222222222"},
+        \\{"path":"historical-tokenizer.json","size":2},
+        \\{"path":"tokenizer.json","size":2,"sha256":"3333333333333333333333333333333333333333333333333333333333333333"}]}
+    });
+    const root = try temp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    try std.testing.expect(!artifacts.receipt.?.all_checksums_declared);
+    try std.testing.expect(artifacts.receipt.?.hasCompleteChecksums());
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .embedding_style = .embedding_gemma2, .tokenizer_type = .huggingface };
+    try std.testing.expect(usesDurableGemmaTokenizer(manifest, &artifacts));
+    for ([_]bool{ false, true }) |compat| {
+        try std.testing.expectEqual(manifest_mod.TokenizerType.huggingface, try tokenizerKindWithArtifacts(manifest, &artifacts, compat));
+    }
 }
 
 pub fn readGemmaSidecar(artifacts: *const PublishedArtifacts, sidecar: gemma_identity.CheckedSidecar) ![]u8 {

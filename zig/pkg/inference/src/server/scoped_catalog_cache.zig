@@ -35,8 +35,26 @@ const gemma_inspection_limit = 512 * 1024 * 1024;
 var gemma_inspection_bytes: std.atomic.Value(usize) = .init(0);
 
 fn validateGemmaSidecar(artifacts: *const PublishedArtifacts, check: gemma_identity.CheckedSidecar, encoded: u64, control: ExecutionControl) !void {
-    const estimate = @import("../models/load_plan.zig").tokenizerAdmissionPlan(@intCast(encoded), .huggingface) catch return check.invalidError();
-    const charge = @min(gemma_inspection_limit, estimate.peak.host_weight_bytes);
+    const estimate = @import("../models/load_plan.zig").tokenizerAdmissionPlan(std.math.cast(usize, encoded) orelse return error.MemoryBudgetExceeded, .huggingface) catch return error.MemoryBudgetExceeded;
+    try validateGemmaSidecarWithEstimate(artifacts, check, @min(gemma_inspection_limit, estimate.peak.host_weight_bytes), control);
+}
+
+fn validateGemmaSidecarWithEstimate(artifacts: *const PublishedArtifacts, check: gemma_identity.CheckedSidecar, charge: usize, control: ExecutionControl) !void {
+    validateGemmaSidecarWithBudget(artifacts, check, charge, control) catch |err| switch (err) {
+        error.GemmaInspectionScratchExceeded => {
+            if (charge == gemma_inspection_limit) return error.MemoryBudgetExceeded;
+            // The admission estimate is not a format constraint. Retry an
+            // underestimated tokenizer with the full shared scratch budget.
+            validateGemmaSidecarWithBudget(artifacts, check, gemma_inspection_limit, control) catch |retry| switch (retry) {
+                error.GemmaInspectionScratchExceeded => return error.MemoryBudgetExceeded,
+                else => return retry,
+            };
+        },
+        else => return err,
+    };
+}
+
+fn validateGemmaSidecarWithBudget(artifacts: *const PublishedArtifacts, check: gemma_identity.CheckedSidecar, charge: usize, control: ExecutionControl) !void {
     // Reserve before reading or parsing. Other installations may still use
     // the rest of the shared discovery scratch allowance concurrently.
     var current = gemma_inspection_bytes.load(.monotonic);
@@ -63,7 +81,7 @@ fn validateGemmaSidecar(artifacts: *const PublishedArtifacts, check: gemma_ident
         },
     };
     result catch |err| {
-        if (err == error.OutOfMemory and scratch.denied) return check.invalidError();
+        if (err == error.OutOfMemory and scratch.denied) return error.GemmaInspectionScratchExceeded;
         return err;
     };
     try control.check();
@@ -697,3 +715,19 @@ pub const Cache = struct {
         return .{ .snapshot = snapshot, .slot = slot };
     }
 };
+
+test "scoped model discovery retries a valid Gemma sidecar after scratch underestimation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const processor = @embedFile("../models/embedding_gemma2_processor.json");
+    try tmp.dir.writeFile(io, .{ .sub_path = "processor_config.json", .data = processor });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+
+    try std.testing.expectError(error.GemmaInspectionScratchExceeded, validateGemmaSidecarWithBudget(&artifacts, .processor, processor.len, .{}));
+    try validateGemmaSidecarWithEstimate(&artifacts, .processor, processor.len, .{});
+}

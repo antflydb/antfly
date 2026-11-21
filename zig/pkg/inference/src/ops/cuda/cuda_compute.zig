@@ -2345,6 +2345,64 @@ const AuxiliaryCacheSlot = struct {
     quota: CacheQuota = .none,
 };
 
+const EmbeddingGemma2CudaProviders = struct {
+    policy: @import("embedding_gemma2_policy.zig").Policy,
+    bf16_blas: ?@import("libraries.zig").Cublas = null,
+    source_audio_convolution: ?@import("cudnn_conv.zig").Module = null,
+
+    fn init(ctx: *context_mod.CudaContext, retained_lt: bool) !EmbeddingGemma2CudaProviders {
+        const library_policy = @import("libraries.zig").Policy.current();
+        var encoder_policy = @import("embedding_gemma2_policy.zig").configured();
+        var bf16_blas: ?@import("libraries.zig").Cublas = null;
+        errdefer if (bf16_blas) |*blas| blas.deinit();
+        var source_audio_convolution: ?@import("cudnn_conv.zig").Module = null;
+        errdefer if (source_audio_convolution) |*module| module.deinit();
+        if (library_policy != .off) {
+            bf16_blas = @import("libraries.zig").Cublas.initWithLibrary(ctx.stream, null) catch |err| switch (err) {
+                error.CudaLibrariesUnavailable => if (library_policy == .required) return err else null,
+                else => return err, // SDK/resource/operational errors are not availability.
+            };
+            if (bf16_blas) |*blas| blas.requireBf16() catch |err| switch (err) {
+                error.CublasBf16Unavailable => {
+                    if (library_policy == .required) return err;
+                    blas.deinit();
+                    bf16_blas = null;
+                },
+            };
+        }
+        encoder_policy.matmul_arithmetic = try @import("libraries.zig").MatmulArithmetic.select(library_policy, bf16_blas != null);
+        const AudioArithmetic = @import("embedding_gemma2_policy.zig").AudioArithmetic;
+        if (AudioArithmetic.needsConvolution(true, library_policy, bf16_blas != null, retained_lt)) {
+            source_audio_convolution = @import("cudnn_conv.zig").Module.init(ctx.stream) catch |err| switch (err) {
+                error.CudnnUnavailable => if (library_policy == .required) return err else null,
+                else => return err, // Operational/resource errors are not optional availability.
+            };
+        }
+        if (encoder_policy.source_convolution == .backend_graph) {
+            const retained = if (source_audio_convolution) |*module| module else return error.CudnnUnavailable;
+            if (retained.backend_api == null) return error.CudnnUnavailable;
+        }
+        encoder_policy.audio_arithmetic = try AudioArithmetic.select(library_policy, bf16_blas != null, retained_lt, source_audio_convolution != null);
+        encoder_policy.source_vision_geometry = @import("embedding_gemma2_policy.zig").selectSourceVisionGeometry(retained_lt, ctx.info.compute_major);
+        return .{ .policy = encoder_policy, .bf16_blas = bf16_blas, .source_audio_convolution = source_audio_convolution };
+    }
+};
+
+/// Resolve the same providers as a model load, without loading kernels, weights
+/// or constructing a compute backend.
+pub fn probeEmbeddingGemma2Policy(allocator: std.mem.Allocator) !@import("embedding_gemma2_policy.zig").Policy {
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var lt = initCublasLtIfAvailable(allocator, &ctx);
+    defer if (lt) |*value| value.deinit();
+    const tuning = try CublasLtBf16TuningProfile.resolve(ctx.info.compute_major, ctx.info.compute_minor);
+    if (tuning.from_env and tuning.profile != .off and lt == null) return error.InvalidCudaState;
+    var providers = try EmbeddingGemma2CudaProviders.init(&ctx, lt != null);
+    defer if (providers.bf16_blas) |*value| value.deinit();
+    defer if (providers.source_audio_convolution) |*value| value.deinit();
+    return providers.policy;
+}
+
 pub const CudaCompute = struct {
     /// Exact roots selected while an owned decoder graph is authored. The cold
     /// epoch header owns final-address slots and immutable norm requests; this
@@ -8615,48 +8673,18 @@ pub const CudaCompute = struct {
         };
         const lighton_device = @import("recurrent_device_policy.zig").Device{ .major = ctx.info.compute_major, .minor = ctx.info.compute_minor, .driver_version = ctx.info.driver_version };
         const lighton_auto = lighton_device.automatic(profile == .lightonocr3, cublaslt != null and cudaCublasLtEnabled(), null);
-        // The adapter selects arithmetic; generic/default model constructors
-        // retain their previous handles and allocations.
-        const library_policy = @import("libraries.zig").Policy.current();
-        var encoder_policy = @import("embedding_gemma2_policy.zig").configured();
-        var bf16_blas: ?@import("libraries.zig").Cublas = null;
+        const providers = if (profile == .embedding_gemma2)
+            try EmbeddingGemma2CudaProviders.init(&ctx, cublaslt != null)
+        else
+            EmbeddingGemma2CudaProviders{ .policy = @import("embedding_gemma2_policy.zig").configured() };
+        var bf16_blas = providers.bf16_blas;
         errdefer if (bf16_blas) |*blas| blas.deinit();
-        // The audio-capable profile prepares this optional provider before any
-        // cache key, storage scope, rounding or source convolution is selected.
-        // Metadata-only capability queries never load libraries/create handles.
-        var source_audio_convolution: ?@import("cudnn_conv.zig").Module = null;
+        var source_audio_convolution = providers.source_audio_convolution;
         errdefer if (source_audio_convolution) |*module| module.deinit();
+        const encoder_policy = providers.policy;
         if (profile == .embedding_gemma2) {
-            if (library_policy != .off) {
-                bf16_blas = @import("libraries.zig").Cublas.initWithLibrary(ctx.stream, null) catch |err| switch (err) {
-                    error.CudaLibrariesUnavailable => if (library_policy == .required) return err else null,
-                    else => return err, // SDK/resource/operational errors are not availability.
-                };
-                if (bf16_blas) |*blas| blas.requireBf16() catch |err| switch (err) {
-                    error.CublasBf16Unavailable => {
-                        if (library_policy == .required) return err;
-                        blas.deinit();
-                        bf16_blas = null;
-                    },
-                };
-            }
-            encoder_policy.matmul_arithmetic = try @import("libraries.zig").MatmulArithmetic.select(library_policy, bf16_blas != null);
-            const AudioArithmetic = @import("embedding_gemma2_policy.zig").AudioArithmetic;
-            if (AudioArithmetic.needsConvolution(profile == .embedding_gemma2, library_policy, bf16_blas != null, cublaslt != null)) {
-                source_audio_convolution = @import("cudnn_conv.zig").Module.init(ctx.stream) catch |err| switch (err) {
-                    error.CudnnUnavailable => if (library_policy == .required) return err else null,
-                    else => return err, // Operational/resource errors are not optional availability.
-                };
-            }
-            if (encoder_policy.source_convolution == .backend_graph) {
-                const retained = if (source_audio_convolution) |*module| module else return error.CudnnUnavailable;
-                if (retained.backend_api == null) return error.CudnnUnavailable;
-            }
-            encoder_policy.audio_arithmetic = try AudioArithmetic.select(library_policy, bf16_blas != null, cublaslt != null, source_audio_convolution != null);
-            std.log.info("cuda_source_audio_policy arithmetic={s} reason={s}", .{ @tagName(encoder_policy.audio_arithmetic), if (library_policy == .off) "libraries_off" else if (bf16_blas == null) "cublas_unavailable" else if (cublaslt == null) "cublaslt_unavailable" else if (source_audio_convolution == null) "cudnn_unavailable" else "complete" });
-            // Match the actual cold geometry receiver's profile/Lt/device
-            // predicate. The retained handle is immutable for this model.
-            encoder_policy.source_vision_geometry = @import("embedding_gemma2_policy.zig").selectSourceVisionGeometry(cublaslt != null, ctx.info.compute_major);
+            const off = @import("libraries.zig").Policy.current() == .off;
+            std.log.info("cuda_source_audio_policy arithmetic={s} reason={s}", .{ @tagName(encoder_policy.audio_arithmetic), if (off) "libraries_off" else if (bf16_blas == null) "cublas_unavailable" else if (cublaslt == null) "cublaslt_unavailable" else if (source_audio_convolution == null) "cudnn_unavailable" else "complete" });
         }
         // This property is numerical launch metadata for the selected source
         // reduction contract, not a guessed occupancy claim for other models.

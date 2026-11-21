@@ -62,10 +62,20 @@ pub const ValidatedArtifact = struct {
 pub const ValidatedReceipt = struct {
     publication_generation: [32]u8 = @splat(0),
     all_checksums_declared: bool = false,
+    effective_checksums_complete: ?bool = null,
     allocator: std.mem.Allocator,
     parsed: std.json.Parsed(DownloadReceipt),
     artifacts: []ValidatedArtifact,
     path_index: std.StringHashMapUnmanaged(usize),
+
+    pub fn hasCompleteChecksums(self: *const ValidatedReceipt) bool {
+        if (self.all_checksums_declared) return true;
+        if (self.effective_checksums_complete) |complete| return complete;
+        for (self.artifacts) |artifact| {
+            if (artifact.sha256 == null) return false;
+        }
+        return true;
+    }
 
     pub fn find(self: *const ValidatedReceipt, path: []const u8) ?*const ValidatedArtifact {
         const index = self.path_index.get(path) orelse return null;
@@ -518,9 +528,11 @@ fn loadValidatedSource(
     }
     if (!has_supported_payload) return error.InvalidManagedDownload;
     // A linear second pass also covers aliases encountered before a digest.
+    var effective_checksums_complete = true;
     for (artifacts, 0..) |*artifact, i| {
         if (i % 256 == 0) try control.check();
         artifact.sha256 = artifacts[canonical_groups.get(artifact.canonical_path).?].sha256;
+        effective_checksums_complete = effective_checksums_complete and artifact.sha256 != null;
     }
     switch (source) {
         .completion => if (try publicationBlockedPaths(cwd, io, in_progress_path, plan_path)) {
@@ -539,6 +551,7 @@ fn loadValidatedSource(
     return .{
         .publication_generation = publication_generation,
         .all_checksums_declared = all_checksums_declared,
+        .effective_checksums_complete = effective_checksums_complete,
         .allocator = allocator,
         .parsed = parsed,
         .artifacts = artifacts,

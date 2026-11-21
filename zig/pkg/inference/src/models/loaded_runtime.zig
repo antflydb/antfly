@@ -2658,12 +2658,7 @@ pub fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: [
 }
 
 pub fn hasCompleteChecksums(artifacts: *const PublishedArtifacts) bool {
-    const receipt = artifacts.receipt orelse return false;
-    if (receipt.all_checksums_declared) return true;
-    for (receipt.artifacts) |artifact| {
-        if (artifact.sha256 == null) return false;
-    }
-    return true;
+    return if (artifacts.receipt) |*receipt| receipt.hasCompleteChecksums() else false;
 }
 
 // Explicit checksums make the digest a function of the raw receipt. If a
@@ -2763,14 +2758,14 @@ pub fn embeddingArtifactRevision(manifest: manifest_mod.ModelManifest, receipt_r
 /// retain separate identities until their embedding recipes are qualified.
 /// Bump the domain when the generic embedding recipe changes incompatibly.
 pub fn durableEmbeddingRevision(manifest: manifest_mod.ModelManifest, artifact_revision: [32]u8, backend: backends.BackendType) [32]u8 {
-    return buildDurableEmbeddingRevision(manifest, artifact_revision, backend, null);
+    return durableEmbeddingRevisionWithCudaPolicy(manifest, artifact_revision, backend, null);
 }
 
 fn durableEmbeddingRevisionForSession(manifest: manifest_mod.ModelManifest, artifact_revision: [32]u8, session: backends.Session) [32]u8 {
-    return buildDurableEmbeddingRevision(manifest, artifact_revision, session.backend(), session_factory.getEmbeddingGemma2CudaPolicy(session));
+    return durableEmbeddingRevisionWithCudaPolicy(manifest, artifact_revision, session.backend(), session_factory.getEmbeddingGemma2CudaPolicy(session));
 }
 
-fn buildDurableEmbeddingRevision(manifest: manifest_mod.ModelManifest, artifact_revision: [32]u8, backend: backends.BackendType, cuda_policy: ?@import("../ops/cuda/embedding_gemma2_policy.zig").Policy) [32]u8 {
+pub fn durableEmbeddingRevisionWithCudaPolicy(manifest: manifest_mod.ModelManifest, artifact_revision: [32]u8, backend: backends.BackendType, cuda_policy: ?@import("../ops/cuda/embedding_gemma2_policy.zig").Policy) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly-durable-embedding-v2\x00");
     hash.update(&artifact_revision);
