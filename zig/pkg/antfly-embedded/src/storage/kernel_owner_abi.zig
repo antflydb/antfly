@@ -1759,6 +1759,8 @@ pub extern fn antfly_metadata_apply_store_projection(
     request: *const MetadataProjectionRequest,
     out_json: *OwnedBytes,
 ) callconv(.c) Status;
+/// Stored receipts may exceed one Raft frame after a bounded splice.
+pub const metadata_session_max_value_bytes = (32 << 20) + (64 << 10);
 pub const MetadataSessionReadOperation = enum(u32) { get, first, last, next, prev, seek_at_or_after, seek_at_or_before, get_range, count_prefix };
 pub const MetadataSessionReadRequest = extern struct {
     version: u32 = abi_version,
@@ -1772,6 +1774,10 @@ pub const MetadataSessionReadRequest = extern struct {
 pub extern fn antfly_metadata_session_read_open(store: ?*anyopaque, request: *const MetadataApplyGroupRequest, out_read: *?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_metadata_session_read_invoke(read: ?*anyopaque, request: *const MetadataSessionReadRequest, out_value: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_metadata_session_read_close(read: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_metadata_session_cursor_open(read: ?*anyopaque, out_cursor: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_metadata_session_cursor_invoke(cursor: ?*anyopaque, request: *const MetadataSessionReadRequest, out_value: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_metadata_session_cursor_close(cursor: ?*anyopaque) callconv(.c) void;
+
 pub extern fn antfly_metadata_apply_store_add_listeners(
     store: ?*anyopaque,
     request: *const MetadataListenerRequest,

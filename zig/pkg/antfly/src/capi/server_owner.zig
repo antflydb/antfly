@@ -2808,7 +2808,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
         var scope = if (request.operation == .get_range) read.txn.openReadScope(read.alloc) catch |err| return storageOwnerStatusFromError(err) else null;
         defer if (scope) |*s| s.close();
         const value = if (scope) |*s| blk: {
-            if (request.length > 32 << 20) return .invalid_argument;
+            if (request.length > kernel_owner_abi.metadata_session_max_value_bytes) return .invalid_argument;
             if (s.getRange(key, request.offset, request.length)) |bytes| {
                 break :blk bytes;
             } else |err| if (err != error.Unsupported) return storageOwnerStatusFromError(err);
@@ -2818,7 +2818,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
             if (request.offset > full.len or request.length > full.len - request.offset) return .end_of_stream;
             break :blk full[@intCast(request.offset)..][0..request.length];
         } else read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
-        if (value.len > 32 << 20) return .invalid_argument;
+        if (value.len > kernel_owner_abi.metadata_session_max_value_bytes) return .invalid_argument;
         const copy = read.alloc.dupe(u8, value) catch return .out_of_memory;
         out_value.* = .{ .ptr = if (copy.len == 0) null else copy.ptr, .len = @intCast(copy.len) };
         return .ok;
@@ -2838,8 +2838,70 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     }
     const current = entry orelse return .not_found;
     if (!std.mem.startsWith(u8, current.key, read.prefix)) return .not_found;
+    return encodeMetadataSessionCursorEntry(read, current, out_value);
+}
+
+const MetadataSessionCursor = struct {
+    read: *MetadataSessionRead,
+    cursor: antfly.capi_dependencies.storage_docstore.DocStore.Txn.CursorAdapter,
+};
+
+pub fn metadataSessionCursorOpen(read_ptr: ?*anyopaque, out_cursor: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    out_cursor.* = null;
+    const read: *MetadataSessionRead = @ptrCast(@alignCast(read_ptr orelse return .invalid_argument));
+    const state = read.alloc.create(MetadataSessionCursor) catch return .out_of_memory;
+    const cursor = read.txn.openPhysicalCursorAdapter() catch |err| {
+        read.alloc.destroy(state);
+        return storageOwnerStatusFromError(err);
+    };
+    state.* = .{ .read = read, .cursor = cursor };
+    out_cursor.* = state;
+    return .ok;
+}
+
+pub fn metadataSessionCursorClose(ptr: ?*anyopaque) callconv(.c) void {
+    const state: *MetadataSessionCursor = @ptrCast(@alignCast(ptr orelse return));
+    state.cursor.close();
+    state.read.alloc.destroy(state);
+}
+
+pub fn metadataSessionCursorInvoke(ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataSessionReadRequest, out_value: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_value.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const state: *MetadataSessionCursor = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+    const read = state.read;
+    const key = request.key.slice();
+    var upper: [96]u8 = undefined;
+    @memcpy(upper[0..read.prefix.len], read.prefix);
+    upper[read.prefix.len - 1] += 1;
+    const upper_bound = upper[0..read.prefix.len];
+    if (request.operation == .seek_at_or_after or request.operation == .seek_at_or_before) {
+        const at_upper = request.operation == .seek_at_or_before and std.mem.eql(u8, key, upper_bound);
+        if ((!std.mem.startsWith(u8, key, read.prefix) and !at_upper) or key.len > read.prefix.len + 512) return .invalid_argument;
+    }
+    if (request.length == 1) state.cursor.setKeysOnly();
+    var entry = switch (request.operation) {
+        .first => state.cursor.seekAtOrAfter(read.prefix),
+        .last => state.cursor.seekAtOrBefore(upper_bound),
+        .next => state.cursor.next(),
+        .prev => state.cursor.prev(),
+        .seek_at_or_after => state.cursor.seekAtOrAfter(key),
+        .seek_at_or_before => state.cursor.seekAtOrBefore(key),
+        else => return .invalid_argument,
+    } catch |err| return storageOwnerStatusFromError(err);
+    if (entry) |row| {
+        if ((request.operation == .last or request.operation == .seek_at_or_before) and std.mem.eql(u8, row.key, upper_bound))
+            entry = state.cursor.prev() catch |err| return storageOwnerStatusFromError(err);
+    }
+    var row = entry orelse return .not_found;
+    if (!std.mem.startsWith(u8, row.key, read.prefix)) return .not_found;
+    if (request.length == 1) row.value = &.{};
+    return encodeMetadataSessionCursorEntry(read, row, out_value);
+}
+
+fn encodeMetadataSessionCursorEntry(read: *MetadataSessionRead, current: @import("antfly_local_sources").storage_backend_erased.Entry, out_value: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
     const size = current.key.len +| current.value.len +| 4;
-    if (size > (32 << 20) + 1024) return .invalid_argument;
+    if (size > kernel_owner_abi.metadata_session_max_value_bytes + 1024) return .invalid_argument;
     const output = read.alloc.alloc(u8, size) catch return .out_of_memory;
     std.mem.writeInt(u32, output[0..4], @intCast(current.key.len), .little);
     @memcpy(output[4..][0..current.key.len], current.key);

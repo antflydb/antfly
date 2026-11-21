@@ -3999,6 +3999,60 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     try std.testing.expectEqual(@as(u64, 0), try retained.countPrefix(prefix));
     try std.testing.expectEqual(@as(u64, 1), try recovered.countPrefix(prefix));
     try std.testing.expectError(error.InvalidArgument, recovered.countPrefix("outside-session-namespace"));
+
+    // Exercise the same opaque read-back and deletion used after Raft apply.
+    const oversized = try a.alloc(u8, records.max_bytes + 1);
+    defer a.free(oversized);
+    const base_len = records.max_bytes - 512;
+    const header = "{\"id\":1,\"execution_plan\":\"";
+    @memset(oversized, 'z');
+    @memcpy(oversized[0..header.len], header);
+    const base = oversized[0..base_len];
+    const Blake3 = std.crypto.hash.Blake3;
+    var digest: [Blake3.digest_length]u8 = undefined;
+    Blake3.hash(large, &digest, .{});
+    const neighbor = session ++ "-next";
+    const neighbor_key = try records.keyAlloc(a, group, neighbor);
+    defer a.free(neighbor_key);
+    const create = try records.encode(a, .{ .changes = &.{
+        .{ .key = session, .expected = &digest, .value = base, .expected_is_digest = true },
+        .{ .key = neighbor, .expected = null, .value = "neighbor" },
+    } });
+    defer a.free(create);
+    try restored.applyStandaloneCommand(group, .{ .apply_transaction_sessions = create });
+    oversized[oversized.len - 1] = '}';
+    const patch = (try records.receiptSplice(a, base, oversized)).?;
+    defer a.free(patch);
+    Blake3.hash(base, &digest, .{});
+    const update = try records.encode(a, .{ .changes = &.{.{
+        .key = session,
+        .expected = &digest,
+        .value = patch,
+        .expected_is_digest = true,
+        .value_is_splice = true,
+    }} });
+    defer a.free(update);
+    try restored.applyStandaloneCommand(group, .{ .apply_transaction_sessions = update });
+    {
+        var expanded = try restored.openSessionRead(a, group);
+        defer expanded.abort();
+        try std.testing.expectEqualSlices(u8, oversized, try expanded.get(session_key));
+        var scan = try expanded.openCursor();
+        defer scan.close();
+        scan.setKeysOnly();
+        const row = (try scan.seekAtOrAfter(session_key)).?;
+        try std.testing.expectEqualStrings(session_key, row.key);
+        try std.testing.expectEqual(@as(usize, 0), row.value.len);
+        try std.testing.expectEqualStrings(neighbor_key, (try scan.next()).?.key);
+        try std.testing.expectEqualStrings(session_key, (try scan.prev()).?.key);
+    }
+    Blake3.hash(oversized, &digest, .{});
+    const remove = try records.encode(a, .{ .changes = &.{.{ .key = session, .expected = &digest, .value = null, .expected_is_digest = true }} });
+    defer a.free(remove);
+    try restored.applyStandaloneCommand(group, .{ .apply_transaction_sessions = remove });
+    var after = try restored.openSessionRead(a, group);
+    defer after.abort();
+    try std.testing.expectError(error.NotFound, after.get(session_key));
 }
 
 test "opaque metadata apply owner preserves semantic error identity" {

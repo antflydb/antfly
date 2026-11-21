@@ -44,7 +44,7 @@ const Read = struct {
         var response: abi.OwnedBytes = .{};
         try status(abi.antfly_metadata_session_read_invoke(self.handle, &request, &response));
         defer abi.antfly_storage_owner_buffer_destroy(&response);
-        if (response.len > 32 << 20) return error.TransactionTooLarge;
+        if (response.len > abi.metadata_session_max_value_bytes) return error.TransactionTooLarge;
         return a.dupe(u8, response.slice());
     }
     fn countPrefix(ptr: *anyopaque, key: []const u8) !u64 {
@@ -68,7 +68,7 @@ const Read = struct {
             return self.read.readValue(self.arena.allocator(), .{ .operation = .get, .key = .fromSlice(key) });
         }
         pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
-            if (length > 32 << 20) return error.TransactionTooLarge;
+            if (length > abi.metadata_session_max_value_bytes) return error.TransactionTooLarge;
             const value = try self.read.readValue(self.arena.allocator(), .{ .operation = .get_range, .key = .fromSlice(key), .offset = offset, .length = @intCast(length) });
             if (value.len != length) return error.StorageKernelFailure;
             return value;
@@ -80,9 +80,23 @@ const Read = struct {
     };
     fn cursor(a: A, ptr: *anyopaque) !erased.Cursor {
         const self = try a.create(Cursor);
-        _ = cast(ptr).refs.fetchAdd(1, .monotonic);
-        self.* = .{ .read = cast(ptr), .arena = std.heap.ArenaAllocator.init(a) };
-        return .{ .allocator = a, .ptr = self, .vtable = &.{ .close = Cursor.close, .first = Cursor.first, .last = Cursor.last, .next = Cursor.next, .prev = Cursor.prev, .seek_at_or_after = Cursor.after, .seek_at_or_before = Cursor.before } };
+        errdefer a.destroy(self);
+        const read = cast(ptr);
+        var handle: ?*anyopaque = null;
+        try status(abi.antfly_metadata_session_cursor_open(read.handle, &handle));
+        const native = handle orelse return error.StorageKernelFailure;
+        _ = read.refs.fetchAdd(1, .monotonic);
+        self.* = .{ .read = read, .handle = native, .arena = std.heap.ArenaAllocator.init(a) };
+        return .{ .allocator = a, .ptr = self, .vtable = &.{
+            .close = Cursor.close,
+            .first = Cursor.first,
+            .last = Cursor.last,
+            .next = Cursor.next,
+            .prev = Cursor.prev,
+            .seek_at_or_after = Cursor.after,
+            .seek_at_or_before = Cursor.before,
+            .set_keys_only = Cursor.setKeysOnly,
+        } };
     }
 };
 pub fn open(a: A, store: ?*anyopaque, group: u64) !erased.ReadTxn {
@@ -100,32 +114,34 @@ fn status(value: abi.Status) !void {
 const Cursor = struct {
     read: *Read,
     arena: std.heap.ArenaAllocator,
-    key: std.ArrayList(u8) = .empty,
+    handle: *anyopaque,
+    keys_only: bool = false,
     fn cast(ptr: *anyopaque) *Cursor {
         return @ptrCast(@alignCast(ptr));
     }
     fn close(a: A, ptr: *anyopaque) void {
         const self = cast(ptr);
+        abi.antfly_metadata_session_cursor_close(self.handle);
         self.read.release();
-        self.key.deinit(a);
         self.arena.deinit();
         a.destroy(self);
     }
     fn invoke(self: *Cursor, operation: abi.MetadataSessionReadOperation, key: []const u8) !?erased.Entry {
         var response: abi.OwnedBytes = .{};
-        const result = abi.antfly_metadata_session_read_invoke(self.read.handle, &.{ .operation = operation, .key = .fromSlice(key) }, &response);
+        const result = abi.antfly_metadata_session_cursor_invoke(self.handle, &.{ .operation = operation, .key = .fromSlice(key), .length = @intFromBool(self.keys_only) }, &response);
         defer abi.antfly_storage_owner_buffer_destroy(&response);
         if (result == .not_found) return null;
         try status(result);
         const bytes = response.slice();
-        if (bytes.len < 4 or bytes.len > (32 << 20) + 1024) return error.StorageKernelFailure;
+        if (bytes.len < 4 or bytes.len > abi.metadata_session_max_value_bytes + 1024) return error.StorageKernelFailure;
         const length = std.mem.readInt(u32, bytes[0..4], .little);
         if (length > bytes.len - 4) return error.StorageKernelFailure;
         _ = self.arena.reset(.retain_capacity);
         const owned = self.arena.allocator();
-        self.key.clearRetainingCapacity();
-        try self.key.appendSlice(self.arena.child_allocator, bytes[4..][0..length]);
-        return .{ .key = self.key.items, .value = try owned.dupe(u8, bytes[4 + length ..]) };
+        return .{ .key = try owned.dupe(u8, bytes[4..][0..length]), .value = try owned.dupe(u8, bytes[4 + length ..]) };
+    }
+    fn setKeysOnly(ptr: *anyopaque) void {
+        cast(ptr).keys_only = true;
     }
     fn first(ptr: *anyopaque) !?erased.Entry {
         return cast(ptr).invoke(.first, "");
@@ -135,11 +151,11 @@ const Cursor = struct {
     }
     fn next(ptr: *anyopaque) !?erased.Entry {
         const self = cast(ptr);
-        return self.invoke(.next, self.key.items);
+        return self.invoke(.next, "");
     }
     fn prev(ptr: *anyopaque) !?erased.Entry {
         const self = cast(ptr);
-        return self.invoke(.prev, self.key.items);
+        return self.invoke(.prev, "");
     }
     fn after(ptr: *anyopaque, key: []const u8) !?erased.Entry {
         return cast(ptr).invoke(.seek_at_or_after, key);
