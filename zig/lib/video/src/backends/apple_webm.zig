@@ -27,6 +27,11 @@ pub const Options = struct {
     pool: ?*media.admission.Pool = null,
     device_surfaces: bool = false,
     replay_budget: ?pictures.ReplayBudget = null,
+    reference_admission: ?ReferenceAdmission = null,
+};
+pub const ReferenceAdmission = struct {
+    context: *anyopaque,
+    acquire: *const fn (*anyopaque, u64) anyerror!void,
 };
 pub const Receipt = struct { hardware: bool, submitted_packets: usize };
 pub const Sink = struct {
@@ -207,16 +212,20 @@ pub const Continuation = struct {
         return self.decodeBounded(reader, indexed, selected, self.options.replay_budget, sink);
     }
     pub fn decodeBounded(self: *@This(), reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, budget: ?pictures.ReplayBudget, sink: Sink) !Receipt {
+        return self.decodeAdmitted(reader, indexed, selected, budget, self.options.reference_admission, sink);
+    }
+    pub fn decodeAdmitted(self: *@This(), reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, budget: ?pictures.ReplayBudget, admission: ?ReferenceAdmission, sink: Sink) !Receipt {
         if (self.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return error.InvalidDecodeOptions;
         defer self.busy.store(false, .release);
         if (reader.packets.ptr != self.reader.packets.ptr or reader.packets.len != self.reader.packets.len or !std.mem.eql(u8, reader.input.identity, self.reader.input.identity)) return error.InvalidVideoIndex;
         var options = self.options;
         options.replay_budget = budget;
-        return decode(self.allocator, reader, indexed, selected, options, sink, self, null);
+        options.reference_admission = admission;
+        return decode(self.allocator, reader, indexed, selected, options, sink, self);
     }
 };
 pub fn decodeTo(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink) !Receipt {
-    return decode(a, reader, indexed, selected, options, sink, null, null);
+    return decode(a, reader, indexed, selected, options, sink, null);
 }
 pub const ReplayPlan = struct {
     restart: pictures.Restart,
@@ -267,20 +276,23 @@ fn checkPacketLimit(options: Options, first: usize, end: usize) !void {
     }
 }
 
-fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink, continuation: ?*Continuation, validated: ?Configuration) !Receipt {
+fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink, continuation: ?*Continuation) !Receipt {
     if (@import("builtin").os.tag != .macos) return error.UnsupportedVideoBackend;
     try reader.input.control.check();
     if (indexed.reader != reader or indexed.operating_point != 0) return error.InvalidVideoIndex;
-    const config = if (validated) |value| value else if (continuation) |owner| try owner.validateIndex(reader, indexed) else try validate(reader, indexed);
+    const config = if (continuation) |owner| try owner.validateIndex(reader, indexed) else try validate(reader, indexed);
     const cursor = if (continuation) |owner| if (owner.native != null) owner.next_packet else null else null;
     const plan = try planReplay(reader, indexed, selected, options, cursor);
-    if (plan.preserve) return decode(a, reader, indexed, selected, options, sink, null, config);
+    const retained_owner = if (plan.preserve) null else continuation;
     const restart = plan.restart;
     const end = plan.end;
     const warm = plan.reuse;
     const shape = indexed.pictures[0];
     const bytes = try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, selected.len, shape.bit_depth);
     if (bytes > options.decode.max_surface_bytes) return error.ResourceLimitExceeded;
+    if (retained_owner != null and !warm) if (options.reference_admission) |admission| {
+        try admission.acquire(admission.context, try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth));
+    };
     const metadata = try std.math.mul(usize, selected.len, @sizeOf(?apple.Surface) + @sizeOf(bool));
     const charge = if (options.device_surfaces) media.admission.Resources{ .device_bytes = bytes, .host_bytes = metadata } else media.admission.Resources{ .host_bytes = try std.math.add(u64, bytes, metadata) };
     var reservation = if (options.pool) |pool| try pool.acquire(charge) else media.admission.Token{};
@@ -295,8 +307,8 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     var capture = Capture{ .indexed = indexed, .selected = selected, .slots = slots, .seen = seen, .format = config.format, .control = reader.input.control, .limit = options.decode.max_retained_surface_bytes };
     var transient: ?apple.CodedSession = null;
     defer if (transient) |*session| session.deinit();
-    errdefer if (continuation) |owner| owner.reset();
-    const session = if (continuation) |owner| retained: {
+    errdefer if (retained_owner) |owner| owner.reset();
+    const session = if (retained_owner) |owner| retained: {
         if (!warm and owner.native != null) owner.reset();
         owner.active = &capture;
         if (owner.native == null) {
@@ -315,7 +327,7 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     // Fences callbacks on errors too, before the stack capture or slots expire.
     defer {
         session.drain() catch {};
-        if (continuation) |owner| owner.active = null;
+        if (retained_owner) |owner| owner.active = null;
     }
     for (restart.packet..end + 1) |packet_id| {
         try reader.input.control.check();
@@ -347,7 +359,7 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     for (seen) |value| if (!value) return error.MissingDecodedFrame;
     try reader.input.control.check();
     const submitted = end - restart.packet + 1;
-    if (continuation) |owner| {
+    if (retained_owner) |owner| {
         owner.next_packet = end + 1;
         owner.decoded_packets += submitted;
         owner.reused_windows += @intFromBool(warm);
