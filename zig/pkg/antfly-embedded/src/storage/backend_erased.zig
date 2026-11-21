@@ -2342,18 +2342,18 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             parent.finalizing = true;
             parent.mutex.unlock();
 
-            const payload = parent.handle.commitStaged() catch |err| {
+            errdefer {
                 platform.sync.lockYielding(&parent.mutex);
                 parent.finalizing = false;
                 parent.mutex.unlock();
-                return err;
-            };
-
+            }
             const TicketBox = struct {
                 parent: *ParentBox(Handle),
-                payload: @TypeOf(payload),
+                payload: @typeInfo(@typeInfo(@TypeOf(Handle.commitStaged)).@"fn".return_type.?).error_union.payload,
             };
             const box = try ticket_allocator.create(TicketBox);
+            errdefer ticket_allocator.destroy(box);
+            const payload = try parent.handle.commitStaged();
             box.* = .{ .parent = parent, .payload = payload };
             return .{
                 .allocator = ticket_allocator,

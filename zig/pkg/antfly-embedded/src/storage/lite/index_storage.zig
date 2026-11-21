@@ -352,28 +352,12 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    const Context = struct {
-        store: *Store,
-        path: []const u8,
-        fn apply(context: *anyopaque, _: *native.NativeFile) !void {
-            const request: *@This() = @ptrCast(@alignCast(context));
-            try deleteTreeLocked(request.store, request.path);
-        }
-    };
-    var request = Context{ .store = self, .path = directory };
-    try self.docs.submitIndexMutation(&request, Context.apply, true);
-}
-
-fn deleteTreeLocked(self: *Store, path: []const u8) !void {
-    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
-    try validateIndexPath(self, directory);
-    const file = &self.docs.file;
     const prefix = if (std.mem.eql(u8, directory, "/"))
         try self.allocator.dupe(u8, "/")
     else
         try std.fmt.allocPrint(self.allocator, "{s}/", .{directory});
     defer self.allocator.free(prefix);
-    try file.deleteIndexCatalogPrefix(prefix, directory);
+    try self.docs.submitIndexTreeDeletion(prefix, directory);
 }
 
 fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
@@ -2001,6 +1985,20 @@ test "lite subtree deletion's large-transaction fallback preserves an unrelated 
     }
     try docs.file.putIndexCatalogBatch(mutations);
     try docs.file.putIndexCatalogRecord("/scope", "exact");
+    // The last sorted row exists only in the old overlay. Later physical
+    // delete batches must clear it along with the already folded rows.
+    {
+        var mutation = native.CatalogMutation{ .key = "/scope/overlay-only", .value = "old" };
+        // This writes through the normal index queue below, using the same
+        // index root and redo path as the tree delete.
+        const Insert = struct {
+            fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+                const record: *const native.CatalogMutation = @ptrCast(@alignCast(ptr));
+                try file.putIndexCatalogBatch(&.{record.*});
+            }
+        };
+        try docs.submitIndexMutation(&mutation, Insert.apply, true);
+    }
     var store = Store.initWithNamespace(a, &docs, "/scope");
     try store.storage().deleteTree("/scope");
 
@@ -2011,6 +2009,8 @@ test "lite subtree deletion's large-transaction fallback preserves an unrelated 
     try std.testing.expectEqualStrings("unfolded", early);
     try std.testing.expectEqual(@as(?usize, null), try docs.file.getIndexCatalogRecordSize("/scope"));
 
+    try std.testing.expectEqual(@as(?usize, null), try docs.file.getIndexCatalogRecordSize("/scope/overlay-only"));
+
     docs.close();
     docs_open = false;
     var reopened = try docstore.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
@@ -2019,6 +2019,7 @@ test "lite subtree deletion's large-transaction fallback preserves an unrelated 
     defer a.free(early_reopened);
     try std.testing.expectEqualStrings("unfolded", early_reopened);
     try std.testing.expectEqual(@as(?usize, null), try reopened.file.getIndexCatalogRecordSize("/scope"));
+    try std.testing.expectEqual(@as(?usize, null), try reopened.file.getIndexCatalogRecordSize("/scope/overlay-only"));
     try std.testing.expect((try reopened.checkWithCancel(null)).valid);
 }
 

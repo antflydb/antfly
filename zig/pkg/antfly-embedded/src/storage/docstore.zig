@@ -263,6 +263,7 @@ fn replayCreditLaneFloor(heads: *ReplayCreditLaneHeads, lane: usize) *[8]u8 {
 }
 
 fn storeEmptyReplayCreditLaneHeads(txn: anytype, next: u64) !void {
+    try storeJournalCreditLedger(txn, .{});
     var heads: ReplayCreditLaneHeads = @splat(0);
     for (0..replay_credit_lanes.len) |lane| {
         std.mem.writeInt(u64, replayCreditLaneFloor(&heads, lane), next, .little);
@@ -307,6 +308,17 @@ fn storedReplayCreditLaneHeads(txn: anytype) !?ReplayCreditLaneHeads {
 fn replayCreditsNeedRepair(txn: anytype) !bool {
     if (try replay_journal_format.baseWroteSince(txn)) return true;
     const stored = try storedReplayCreditLaneHeads(txn) orelse return true;
+    const ledger_raw = txn.get(&internal_keys.journal_credit_ledger_key) catch |err| switch (err) {
+        error.NotFound => return true,
+        else => return err,
+    };
+    const ledger = internal_keys.JournalCreditLedger.decode(ledger_raw) orelse return true;
+    var nonempty: u64 = 0;
+    for (0..replay_credit_lanes.len) |lane| {
+        if (std.mem.readInt(u64, stored[lane * 16 ..][0..8], .little) != 0) nonempty += 1;
+    }
+    if (ledger.records < nonempty or (nonempty == 0 and (ledger.records != 0 or ledger.bytes != 0)) or
+        ledger.bytes < ledger.records *| internal_keys.replay_key_len) return true;
     var cursor = try txn.openPhysicalCursorAdapter();
     defer cursor.close();
     cursor.setKeysOnly();
@@ -3754,14 +3766,12 @@ pub const DocStore = struct {
         deletes: std.ArrayListUnmanaged([internal_keys.replay_key_len]u8) = .empty,
         deleted_through: [replay_credit_lanes.len]u64 = @splat(0),
         heads: ?ReplayCreditLaneHeads = null,
-        emptied_lane: bool = false,
 
         fn reset(plan: *ReplayRetirementPlan) void {
             plan.stats = .{};
             plan.deletes.clearRetainingCapacity();
             plan.deleted_through = @splat(0);
             plan.heads = null;
-            plan.emptied_lane = false;
         }
     };
 
@@ -3817,7 +3827,6 @@ pub const DocStore = struct {
                 for (replay_credit_lanes, plan.deleted_through, 0..) |kind, from, i| {
                     if (from == 0) continue;
                     const head = try seekReplayCreditLaneHead(&cursor, kind, from);
-                    plan.emptied_lane = plan.emptied_lane or head == 0;
                     std.mem.writeInt(u64, replayCreditLaneHead(&heads, i), head, .little);
                     std.mem.writeInt(u64, replayCreditLaneFloor(&heads, i), if (head == 0) @max(from, next) else 0, .little);
                 }
@@ -3861,15 +3870,42 @@ pub const DocStore = struct {
         const txn = batch.asTxn();
         const initial_heads = if (lanes_witnessed) try storedReplayCreditLaneHeads(txn) else null;
         const next = if (initial_heads != null) try replayCreditNextSequence(txn) else 0;
-        // An append beyond the cutoff cannot change a surviving successor.
-        // Empty lanes still need a fresh seek if the append advanced the tip.
-        const next_compatible = observed_next == next or
-            (next > observed_next and observed_next > up_to_sequence and !plan.emptied_lane);
-        const unchanged = if (observed_heads) |before|
-            if (initial_heads) |after| next_compatible and std.mem.eql(u8, &before, &after) else false
-        else
-            false;
-        if (!unchanged) {
+        var reusable = false;
+        if (observed_heads != null and initial_heads != null and
+            (observed_next == next or (next > observed_next and observed_next > up_to_sequence)))
+        {
+            const before = observed_heads.?;
+            const current = initial_heads.?;
+            reusable = true;
+            for (plan.deleted_through, 0..) |from, lane| {
+                if (from == 0) continue;
+                const start = lane * 16;
+                if (!std.mem.eql(u8, before[start..][0..16], current[start..][0..16])) {
+                    reusable = false;
+                    break;
+                }
+            }
+            if (reusable) {
+                const heads = &plan.heads.?;
+                var cursor: ?backend_erased.Cursor = null;
+                defer if (cursor) |*open_cursor| open_cursor.close();
+                for (replay_credit_lanes, plan.deleted_through, 0..) |kind, from, lane| {
+                    const start = lane * 16;
+                    if (from == 0) {
+                        heads[start..][0..16].* = current[start..][0..16].*;
+                    } else if (observed_next != next and std.mem.readInt(u64, replayCreditLaneHead(heads, lane), .little) == 0) {
+                        if (cursor == null) {
+                            cursor = try txn.openPhysicalCursorAdapter();
+                            cursor.?.setKeysOnly();
+                        }
+                        const head = try seekReplayCreditLaneHead(&cursor.?, kind, from);
+                        std.mem.writeInt(u64, replayCreditLaneHead(heads, lane), head, .little);
+                        std.mem.writeInt(u64, replayCreditLaneFloor(heads, lane), if (head == 0) @max(from, next) else 0, .little);
+                    }
+                }
+            }
+        }
+        if (!reusable) {
             plan.reset();
             try planReplayRetirement(txn, &plan, alloc, up_to_sequence, budget, initial_heads, next);
             if (plan.deletes.items.len == 0) return plan.stats;
@@ -7880,6 +7916,38 @@ test "docstore reconciles rows a base binary retired after the upgrade" {
     var read = try store.beginReadTxn();
     defer read.abort();
     try std.testing.expect(!try replayCreditsNeedRepair(&read));
+}
+
+test "docstore reconciles missing and malformed ledgers with a matching lane witness" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.appendReplayOpaque(alloc, 1, "kept");
+    }
+    for ([_]bool{ false, true }) |malformed| {
+        {
+            var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+            defer store.close();
+            var batch = try store.beginWriteBatch();
+            errdefer batch.abort();
+            if (malformed) {
+                try batch.put(&internal_keys.journal_credit_ledger_key, "invalid");
+            } else {
+                try batch.delete(&internal_keys.journal_credit_ledger_key);
+            }
+            try batch.commit();
+        }
+        var reopened = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer reopened.close();
+        var read = try reopened.beginReadTxn();
+        defer read.abort();
+        const ledger = try loadJournalCreditLedger(&read);
+        try std.testing.expectEqual(@as(u64, 1), ledger.records);
+        try std.testing.expectEqual(@as(u64, internal_keys.replay_key_len + "kept".len), ledger.bytes);
+    }
 }
 
 test "docstore installs a credit witness without advancing hint coverage" {

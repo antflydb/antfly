@@ -2917,6 +2917,7 @@ const MutationRequest = struct {
     index_only: bool = false,
     artifact_lease: bool = false,
     scope_delete_prefix: ?[]const u8 = null,
+    scope_delete_exact_key: ?[]const u8 = null,
     scope_delete_only: bool = false,
     scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
     /// Never closes a group by becoming its leader, and never durable on
@@ -5564,6 +5565,7 @@ pub const Store = struct {
         index_only: bool = false,
         artifact_lease: bool = false,
         scope_delete_prefix: ?[]const u8 = null,
+        scope_delete_exact_key: ?[]const u8 = null,
         scope_delete_only: bool = false,
         scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
         /// Estimated size of this member's writes. Used only to bound group
@@ -5733,6 +5735,7 @@ pub const Store = struct {
             .index_only = plan.index_only,
             .artifact_lease = plan.artifact_lease,
             .scope_delete_prefix = plan.scope_delete_prefix,
+            .scope_delete_exact_key = plan.scope_delete_exact_key,
             .scope_delete_only = plan.scope_delete_only,
             .scope_delete_redo_bytes = plan.scope_delete_redo_bytes,
             .ride_along = ride_along,
@@ -6481,6 +6484,27 @@ pub const Store = struct {
         });
     }
 
+    pub fn submitIndexTreeDeletion(self: *Store, prefix: []const u8, exact_key: []const u8) !void {
+        const Request = struct {
+            prefix: []const u8,
+            exact_key: []const u8,
+
+            fn apply(context: *anyopaque, file: *native.NativeFile) !void {
+                const request: *const @This() = @ptrCast(@alignCast(context));
+                try file.deleteIndexCatalogPrefix(request.prefix, request.exact_key);
+            }
+        };
+        var request = Request{ .prefix = prefix, .exact_key = exact_key };
+        try self.submitScopedMutation(.{
+            .context = &request,
+            .apply = Request.apply,
+            .index_only = true,
+            .scope_delete_prefix = prefix,
+            .scope_delete_exact_key = exact_key,
+            .scope_delete_only = true,
+        });
+    }
+
     /// A durability barrier allocates no pages and requires no allocator
     /// admission, retirement service, or synthetic mutation transaction.
     pub fn syncIndexContents(self: *Store) !void {
@@ -6742,7 +6766,7 @@ pub const Store = struct {
             // This is under the writer lease and store mutex, so an empty
             // scope cannot acquire postings between the probe and the delete.
             const other_bytes = if (head.scope_delete_redo_bytes) |measure| measure(head.context, &self.file) else 0;
-            switch (try self.file.planIndexScopeDeletion(prefix, other_bytes)) {
+            switch (try self.file.planIndexScopeDeletion(prefix, head.scope_delete_exact_key, other_bytes)) {
                 .empty => if (head.scope_delete_only) {
                     head.committed_sequence = self.file.committedSequence();
                     return;

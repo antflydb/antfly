@@ -13732,20 +13732,28 @@ pub const NativeFile = struct {
 
     /// A keys-only preflight with the same byte threshold used by private
     /// flushes. Caller holds writer admission and the store mutation mutex.
-    pub fn planIndexScopeDeletion(self: *NativeFile, prefix: []const u8, other_bytes: usize) !IndexScopeDeletion {
+    pub fn planIndexScopeDeletion(self: *NativeFile, prefix: []const u8, exact_key: ?[]const u8, other_bytes: usize) !IndexScopeDeletion {
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
         try self.refreshIfWriterBaseStale();
         try self.resyncRedoTailUnderAuthority();
-        var cursor = try self.indexCatalogCursor(self.activeCheckpoint(), prefix);
+        const checkpoint = self.activeCheckpoint();
+        const exact_exists = if (exact_key) |key|
+            try self.getIndexCatalogRecordSizeAtCheckpoint(key, checkpoint) != null
+        else
+            false;
+        var cursor = try self.indexCatalogCursor(checkpoint, prefix);
         defer cursor.deinit();
-        var entry = (try cursor.next()) orelse return .empty;
+        var entry = (try cursor.next()) orelse return if (exact_exists) .inline_delete else .empty;
         const redo = self.redo orelse {
             self.allocator.free(entry.key);
             return .inline_delete;
         };
         var bytes = other_bytes;
+        if (exact_exists) bytes +|= logicalMutationWireBytes(exact_key.?.len, 0, false);
         while (true) {
-            bytes +|= logicalMutationWireBytes(entry.key.len, 0, false);
+            if (exact_key == null or !std.mem.eql(u8, entry.key, exact_key.?)) {
+                bytes +|= logicalMutationWireBytes(entry.key.len, 0, false);
+            }
             self.allocator.free(entry.key);
             if (bytes >= redo.large_txn_fallback_bytes) return .fold_first;
             entry = (try cursor.next()) orelse return .inline_delete;
