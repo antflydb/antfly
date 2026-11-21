@@ -87,6 +87,18 @@ pub const DotDimensionNumbers = struct {
     rhs_batch_dimensions: []const i64 = &.{},
 };
 
+/// Canonical N,C,spatial convolution; frontends express other layouts using
+/// explicit transposes. Fixed metadata carries no borrowed array lifetimes.
+pub const Convolution = struct {
+    spatial_rank: u8,
+    kernel_sizes: [4]i64 = @splat(0),
+    strides: [4]i64 = @splat(1),
+    padding_low: [4]i64 = @splat(0),
+    padding_high: [4]i64 = @splat(0),
+    dilations: [4]i64 = @splat(1),
+    groups: i64 = 1,
+};
+
 pub const GatherDimensionNumbers = struct {
     offset_dims: []const i64 = &.{},
     collapsed_slice_dims: []const i64 = &.{},
@@ -108,6 +120,11 @@ pub const Builder = struct {
     next_id: Id,
     /// First ID this builder will assign. Used by getInst to compute array index.
     base_id: Id = 1,
+    /// Explicit mixed-precision dot operands; result type controls accumulation.
+    matrix_operand_type: ?ElementType = null,
+    /// Retain the source evaluation order and finite negative tail before a
+    /// reduced-precision publication. The default keeps the existing F32 graph.
+    gelu_schedule: enum { cube_first, coefficient_first_stable_tail } = .cube_first,
 
     const Instruction = struct {
         id: Id,
@@ -117,19 +134,23 @@ pub const Builder = struct {
         operand_ids: []const Id,
         // Op-specific payloads (null if unused):
         parameter_number: ?u32 = null,
+        tuple_index: ?u32 = null,
         dot_dimension_numbers: ?DotDimensionNumbers = null,
+        convolution: ?Convolution = null,
+        strict_float32: bool = false,
         gather_dimension_numbers: ?GatherDimensionNumbers = null,
         gather_slice_sizes: ?[]const i64 = null,
         slice_dimensions: ?[]const xla.HloInstructionProto.SliceDimensions = null,
         dimensions: ?[]const i64 = null,
         literal_f32s: ?[]const f32 = null,
-        literal_f32s_owned: bool = false,
         literal_s32s: ?[]const i32 = null,
+        literal_s64s: ?[]const i64 = null,
+        literal_preds: ?[]const u8 = null,
         called_computation_ids: ?[]const Id = null,
         comparison_direction: ?[]const u8 = null,
         // Tuple root support:
         is_tuple_root: bool = false,
-        tuple_child_shapes: ?[]Shape = null,
+        tuple_child_shapes: ?[]const Shape = null,
     };
 
     pub fn init(allocator: Allocator, name: []const u8) Builder {
@@ -143,44 +164,49 @@ pub const Builder = struct {
     }
 
     pub fn deinit(self: *Builder) void {
-        for (self.instructions.items) |inst| {
-            self.allocator.free(inst.name);
-            if (inst.shape.dimensions.len > 0)
-                self.allocator.free(inst.shape.dimensions);
-            if (inst.operand_ids.len > 0)
-                self.allocator.free(inst.operand_ids);
-            if (inst.dimensions) |d|
-                self.allocator.free(d);
-            if (inst.called_computation_ids) |c|
-                self.allocator.free(c);
-            if (inst.gather_slice_sizes) |s|
-                self.allocator.free(s);
-            if (inst.slice_dimensions) |s|
-                self.allocator.free(s);
-            if (inst.literal_f32s_owned)
-                if (inst.literal_f32s) |f| self.allocator.free(f);
-            if (inst.tuple_child_shapes) |tcs|
-                self.allocator.free(tcs);
-            if (inst.dot_dimension_numbers) |dot_dims| {
-                if (dot_dims.lhs_contracting_dimensions.len > 0)
-                    self.allocator.free(dot_dims.lhs_contracting_dimensions);
-                if (dot_dims.rhs_contracting_dimensions.len > 0)
-                    self.allocator.free(dot_dims.rhs_contracting_dimensions);
-                if (dot_dims.lhs_batch_dimensions.len > 0)
-                    self.allocator.free(dot_dims.lhs_batch_dimensions);
-                if (dot_dims.rhs_batch_dimensions.len > 0)
-                    self.allocator.free(dot_dims.rhs_batch_dimensions);
-            }
-            if (inst.gather_dimension_numbers) |gather_dims| {
-                if (gather_dims.offset_dims.len > 0)
-                    self.allocator.free(gather_dims.offset_dims);
-                if (gather_dims.collapsed_slice_dims.len > 0)
-                    self.allocator.free(gather_dims.collapsed_slice_dims);
-                if (gather_dims.start_index_map.len > 0)
-                    self.allocator.free(gather_dims.start_index_map);
-            }
-        }
+        for (self.instructions.items) |inst| self.freeInstruction(inst);
         self.instructions.deinit(self.allocator);
+    }
+
+    fn freeInstruction(self: *Builder, inst: Instruction) void {
+        self.allocator.free(inst.name);
+        if (inst.shape.dimensions.len > 0)
+            self.allocator.free(inst.shape.dimensions);
+        if (inst.operand_ids.len > 0)
+            self.allocator.free(inst.operand_ids);
+        if (inst.dimensions) |d|
+            self.allocator.free(d);
+        if (inst.called_computation_ids) |c|
+            self.allocator.free(c);
+        if (inst.gather_slice_sizes) |s|
+            self.allocator.free(s);
+        if (inst.slice_dimensions) |s|
+            self.allocator.free(s);
+        if (inst.literal_f32s) |f| self.allocator.free(f);
+        if (inst.literal_s32s) |f| self.allocator.free(f);
+        if (inst.literal_s64s) |f| self.allocator.free(f);
+        if (inst.literal_preds) |f| self.allocator.free(f);
+        if (inst.comparison_direction) |direction| self.allocator.free(direction);
+        if (inst.tuple_child_shapes) |tcs|
+            self.allocator.free(tcs);
+        if (inst.dot_dimension_numbers) |dot_dims| {
+            if (dot_dims.lhs_contracting_dimensions.len > 0)
+                self.allocator.free(dot_dims.lhs_contracting_dimensions);
+            if (dot_dims.rhs_contracting_dimensions.len > 0)
+                self.allocator.free(dot_dims.rhs_contracting_dimensions);
+            if (dot_dims.lhs_batch_dimensions.len > 0)
+                self.allocator.free(dot_dims.lhs_batch_dimensions);
+            if (dot_dims.rhs_batch_dimensions.len > 0)
+                self.allocator.free(dot_dims.rhs_batch_dimensions);
+        }
+        if (inst.gather_dimension_numbers) |gather_dims| {
+            if (gather_dims.offset_dims.len > 0)
+                self.allocator.free(gather_dims.offset_dims);
+            if (gather_dims.collapsed_slice_dims.len > 0)
+                self.allocator.free(gather_dims.collapsed_slice_dims);
+            if (gather_dims.start_index_map.len > 0)
+                self.allocator.free(gather_dims.start_index_map);
+        }
     }
 
     fn nextId(self: *Builder) Id {
@@ -189,52 +215,47 @@ pub const Builder = struct {
         return id;
     }
 
+    fn copyOptional(self: *Builder, comptime T: type, value: ?[]const T) !?[]const T {
+        return if (value) |items| try self.allocator.dupe(T, items) else null;
+    }
+
+    /// All inputs are borrowed until this transaction commits. A failed clone
+    /// refunds every partial allocation and leaves instruction numbering intact.
     fn addInst(self: *Builder, inst: Instruction) !Id {
-        // Duplicate borrowed slices so the instruction owns its memory
-        // (callers may pass slices pointing to stack or temp-allocated buffers).
-        var owned_inst = inst;
-        // XLA requires unique instruction names within a computation.
-        owned_inst.name = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ inst.name, inst.id });
-        if (inst.shape.dimensions.len > 0) {
-            owned_inst.shape.dimensions = try self.allocator.dupe(i64, inst.shape.dimensions);
-        }
-        // Duplicate DotDimensionNumbers slices (often stack-allocated by callers like matmul).
-        if (inst.dot_dimension_numbers) |dot_dims| {
-            owned_inst.dot_dimension_numbers = .{
-                .lhs_contracting_dimensions = if (dot_dims.lhs_contracting_dimensions.len > 0) try self.allocator.dupe(i64, dot_dims.lhs_contracting_dimensions) else dot_dims.lhs_contracting_dimensions,
-                .rhs_contracting_dimensions = if (dot_dims.rhs_contracting_dimensions.len > 0) try self.allocator.dupe(i64, dot_dims.rhs_contracting_dimensions) else dot_dims.rhs_contracting_dimensions,
-                .lhs_batch_dimensions = if (dot_dims.lhs_batch_dimensions.len > 0) try self.allocator.dupe(i64, dot_dims.lhs_batch_dimensions) else dot_dims.lhs_batch_dimensions,
-                .rhs_batch_dimensions = if (dot_dims.rhs_batch_dimensions.len > 0) try self.allocator.dupe(i64, dot_dims.rhs_batch_dimensions) else dot_dims.rhs_batch_dimensions,
-            };
-        }
-        if (inst.gather_dimension_numbers) |gather_dims| {
-            owned_inst.gather_dimension_numbers = .{
-                .offset_dims = if (gather_dims.offset_dims.len > 0) try self.allocator.dupe(i64, gather_dims.offset_dims) else gather_dims.offset_dims,
-                .collapsed_slice_dims = if (gather_dims.collapsed_slice_dims.len > 0) try self.allocator.dupe(i64, gather_dims.collapsed_slice_dims) else gather_dims.collapsed_slice_dims,
-                .start_index_map = if (gather_dims.start_index_map.len > 0) try self.allocator.dupe(i64, gather_dims.start_index_map) else gather_dims.start_index_map,
-                .index_vector_dim = gather_dims.index_vector_dim,
-            };
-        }
-        if (inst.gather_slice_sizes) |slice_sizes| {
-            owned_inst.gather_slice_sizes = try self.allocator.dupe(i64, slice_sizes);
-        }
-        if (inst.slice_dimensions) |slice_dims| {
-            owned_inst.slice_dimensions = try self.allocator.dupe(xla.HloInstructionProto.SliceDimensions, slice_dims);
-        }
-        try self.instructions.append(self.allocator, owned_inst);
+        errdefer self.next_id = inst.id;
+        var owned = inst;
+        owned.name = &.{};
+        owned.shape.dimensions = &.{};
+        owned.operand_ids = &.{};
+        inline for (.{ "dimensions", "called_computation_ids", "gather_slice_sizes", "slice_dimensions", "literal_f32s", "literal_s32s", "literal_s64s", "literal_preds", "tuple_child_shapes", "comparison_direction" }) |field| @field(owned, field) = null;
+        owned.dot_dimension_numbers = if (inst.dot_dimension_numbers != null) .{} else null;
+        owned.gather_dimension_numbers = if (inst.gather_dimension_numbers) |dims| .{ .index_vector_dim = dims.index_vector_dim } else null;
+        errdefer self.freeInstruction(owned);
+        owned.name = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ inst.name, inst.id });
+        owned.shape.dimensions = try self.allocator.dupe(i64, inst.shape.dimensions);
+        owned.operand_ids = try self.allocator.dupe(Id, inst.operand_ids);
+        owned.dimensions = try self.copyOptional(i64, inst.dimensions);
+        owned.called_computation_ids = try self.copyOptional(Id, inst.called_computation_ids);
+        owned.gather_slice_sizes = try self.copyOptional(i64, inst.gather_slice_sizes);
+        owned.slice_dimensions = try self.copyOptional(xla.HloInstructionProto.SliceDimensions, inst.slice_dimensions);
+        owned.literal_f32s = try self.copyOptional(f32, inst.literal_f32s);
+        owned.literal_s32s = try self.copyOptional(i32, inst.literal_s32s);
+        owned.literal_s64s = try self.copyOptional(i64, inst.literal_s64s);
+        owned.literal_preds = try self.copyOptional(u8, inst.literal_preds);
+        owned.tuple_child_shapes = try self.copyOptional(Shape, inst.tuple_child_shapes);
+        owned.comparison_direction = try self.copyOptional(u8, inst.comparison_direction);
+        if (inst.dot_dimension_numbers) |dims| inline for (.{ "lhs_contracting_dimensions", "rhs_contracting_dimensions", "lhs_batch_dimensions", "rhs_batch_dimensions" }) |field| {
+            @field(owned.dot_dimension_numbers.?, field) = try self.allocator.dupe(i64, @field(dims, field));
+        };
+        if (inst.gather_dimension_numbers) |dims| inline for (.{ "offset_dims", "collapsed_slice_dims", "start_index_map" }) |field| {
+            @field(owned.gather_dimension_numbers.?, field) = try self.allocator.dupe(i64, @field(dims, field));
+        };
+        try self.instructions.append(self.allocator, owned);
         return inst.id;
     }
 
     pub fn getInst(self: *const Builder, id: Id) *const Instruction {
         return &self.instructions.items[@intCast(id - self.base_id)];
-    }
-
-    fn dupeIds(self: *Builder, ids: []const Id) ![]const Id {
-        return self.allocator.dupe(Id, ids);
-    }
-
-    fn dupeI64s(self: *Builder, vals: []const i64) ![]const i64 {
-        return self.allocator.dupe(i64, vals);
     }
 
     // ── Parameters & constants ──────────────────────────────────────
@@ -272,30 +293,35 @@ pub const Builder = struct {
         });
     }
 
-    pub fn constantScalarF32(self: *Builder, value: f32) !Id {
-        const data = try self.allocator.dupe(f32, &.{value});
+    pub fn constantS64(self: *Builder, shape: Shape, data: []const i64) !Id {
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "constant",
             .name = "constant",
-            .shape = Shape.scalar(.f32),
+            .shape = shape,
             .operand_ids = &.{},
-            .literal_f32s = data,
-            .literal_f32s_owned = true,
+            .literal_s64s = data,
         });
+    }
+
+    pub fn constantPred(self: *Builder, shape: Shape, data: []const u8) !Id {
+        return self.addInst(.{ .id = self.nextId(), .opcode = "constant", .name = "constant", .shape = shape, .operand_ids = &.{}, .literal_preds = data });
+    }
+
+    pub fn constantScalarF32(self: *Builder, value: f32) !Id {
+        return self.constantF32(Shape.scalar(.f32), &.{value});
     }
 
     // ── Elementwise unary ───────────────────────────────────────────
 
     fn unaryOp(self: *Builder, opcode: []const u8, operand: Id) !Id {
         const op_shape = self.getInst(operand).shape;
-        const ids = try self.dupeIds(&.{operand});
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = opcode,
             .name = opcode,
             .shape = op_shape,
-            .operand_ids = ids,
+            .operand_ids = &.{operand},
         });
     }
 
@@ -342,6 +368,7 @@ pub const Builder = struct {
         var actual_lhs = lhs;
         var actual_rhs = rhs;
         var result_shape = lhs_shape;
+        var sizes: [8]i64 = undefined;
 
         // HLO requires explicit broadcasts — no implicit broadcasting.
         // Auto-broadcast the lower-rank operand to match the higher-rank one
@@ -351,15 +378,25 @@ pub const Builder = struct {
             result_shape = rhs_shape;
         } else if (rhs_shape.dimensions.len < lhs_shape.dimensions.len) {
             actual_rhs = try self.broadcastToMatch(rhs, rhs_shape, lhs_shape);
+        } else if (!std.mem.eql(i64, lhs_shape.dimensions, rhs_shape.dimensions)) {
+            if (lhs_shape.dimensions.len > 8 or lhs_shape.element_type != rhs_shape.element_type) return error.UnsupportedShape;
+            var axes: [8]i64 = undefined;
+            for (lhs_shape.dimensions, rhs_shape.dimensions, 0..) |left, right, axis| {
+                if (left != right and left != 1 and right != 1) return error.UnsupportedShape;
+                sizes[axis] = if (left == 1) right else left;
+                axes[axis] = @intCast(axis);
+            }
+            result_shape = Shape.init(lhs_shape.element_type, sizes[0..lhs_shape.dimensions.len]);
+            actual_lhs = try self.broadcast(lhs, axes[0..lhs_shape.dimensions.len], result_shape);
+            actual_rhs = try self.broadcast(rhs, axes[0..rhs_shape.dimensions.len], result_shape);
         }
 
-        const ids = try self.dupeIds(&.{ actual_lhs, actual_rhs });
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = opcode,
             .name = opcode,
             .shape = result_shape,
-            .operand_ids = ids,
+            .operand_ids = &.{ actual_lhs, actual_rhs },
         });
     }
 
@@ -435,6 +472,13 @@ pub const Builder = struct {
     pub fn divide(self: *Builder, lhs: Id, rhs: Id) !Id {
         return self.binaryOp("divide", lhs, rhs);
     }
+    pub fn logicalAnd(self: *Builder, lhs: Id, rhs: Id) !Id {
+        return self.binaryOp("and", lhs, rhs);
+    }
+    pub fn logicalOr(self: *Builder, lhs: Id, rhs: Id) !Id {
+        return self.binaryOp("or", lhs, rhs);
+    }
+
     pub fn maximum(self: *Builder, lhs: Id, rhs: Id) !Id {
         return self.binaryOp("maximum", lhs, rhs);
     }
@@ -449,13 +493,12 @@ pub const Builder = struct {
 
     pub fn compare(self: *Builder, lhs: Id, rhs: Id, direction: []const u8) !Id {
         const lhs_shape = self.getInst(lhs).shape;
-        const ids = try self.dupeIds(&.{ lhs, rhs });
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "compare",
             .name = "compare",
             .shape = Shape.init(.pred, lhs_shape.dimensions),
-            .operand_ids = ids,
+            .operand_ids = &.{ lhs, rhs },
             .comparison_direction = direction,
         });
     }
@@ -466,15 +509,74 @@ pub const Builder = struct {
 
     // ── Contraction ─────────────────────────────────────────────────
 
+    /// Recover half storage only through exact widening and layout operations.
+    /// F32 probabilities/reductions are never silently rounded to fit a GEMM.
+    pub fn provenBf16(self: *Builder, value: Id) anyerror!?Id {
+        const inst = self.getInst(value).*;
+        if (inst.shape.element_type == .bf16) return value;
+        if (inst.shape.element_type != .f32) return null;
+        if (std.mem.eql(u8, inst.opcode, "convert")) {
+            return if (self.getInst(inst.operand_ids[0]).shape.element_type == .bf16) inst.operand_ids[0] else null;
+        }
+        const layout = std.mem.eql(u8, inst.opcode, "reshape") or std.mem.eql(u8, inst.opcode, "transpose") or std.mem.eql(u8, inst.opcode, "slice") or std.mem.eql(u8, inst.opcode, "broadcast") or std.mem.eql(u8, inst.opcode, "concatenate");
+        if (!layout) return null;
+        const operands = try self.allocator.alloc(Id, inst.operand_ids.len);
+        defer self.allocator.free(operands);
+        for (inst.operand_ids, operands) |input, *output| output.* = (try self.provenBf16(input)) orelse return null;
+        var narrow = inst;
+        narrow.id = self.nextId();
+        narrow.shape.element_type = .bf16;
+        narrow.operand_ids = operands;
+        return try self.addInst(narrow);
+    }
+
+    fn matrixOperands(self: *Builder, lhs: Id, rhs: Id) ![2]Id {
+        if (self.matrix_operand_type == .bf16) {
+            const left = try self.provenBf16(lhs);
+            const right = try self.provenBf16(rhs);
+            if (left != null and right != null) return .{ left.?, right.? };
+        }
+        return .{ lhs, rhs };
+    }
+
+    pub fn convolution(self: *Builder, lhs: Id, rhs: Id, shape: Shape, attrs: Convolution) !Id {
+        if (attrs.spatial_rank == 0 or attrs.spatial_rank > 4 or attrs.groups <= 0) return error.UnsupportedShape;
+        const operands = try self.matrixOperands(lhs, rhs);
+        const left = operands[0];
+        const right = operands[1];
+        const input = self.getInst(left).shape;
+        const weight = self.getInst(right).shape;
+        const rank: usize = @as(usize, attrs.spatial_rank) + 2;
+        if (input.dimensions.len != rank or weight.dimensions.len != rank or shape.dimensions.len != rank) return error.UnsupportedShape;
+        if (input.element_type != weight.element_type or (input.element_type != shape.element_type and !(input.element_type == .bf16 and shape.element_type == .f32))) return error.UnsupportedTensorType;
+        for (input.dimensions) |dimension| if (dimension <= 0) return error.UnsupportedShape;
+        for (weight.dimensions) |dimension| if (dimension <= 0) return error.UnsupportedShape;
+        for (shape.dimensions) |dimension| if (dimension <= 0) return error.UnsupportedShape;
+        if (input.dimensions[0] != shape.dimensions[0] or weight.dimensions[0] != shape.dimensions[1]) return error.UnsupportedShape;
+        if (@mod(input.dimensions[1], attrs.groups) != 0 or @mod(weight.dimensions[0], attrs.groups) != 0 or weight.dimensions[1] != @divExact(input.dimensions[1], attrs.groups)) return error.UnsupportedShape;
+        for (0..attrs.spatial_rank) |axis| {
+            if (attrs.strides[axis] <= 0 or attrs.dilations[axis] <= 0 or weight.dimensions[axis + 2] <= 0) return error.UnsupportedShape;
+            const extent = try std.math.add(i64, try std.math.mul(i64, weight.dimensions[axis + 2] - 1, attrs.dilations[axis]), 1);
+            const padded = try std.math.add(i64, try std.math.add(i64, input.dimensions[axis + 2], attrs.padding_low[axis]), attrs.padding_high[axis]);
+            if (padded < extent or shape.dimensions[axis + 2] != @divFloor(padded - extent, attrs.strides[axis]) + 1) return error.UnsupportedShape;
+        }
+        var resolved = attrs;
+        for (0..attrs.spatial_rank) |axis| resolved.kernel_sizes[axis] = weight.dimensions[axis + 2];
+        return self.addInst(.{ .id = self.nextId(), .opcode = "convolution", .name = "convolution", .shape = shape, .operand_ids = &.{ left, right }, .convolution = resolved, .strict_float32 = input.element_type == .f32 });
+    }
+
     pub fn dot(self: *Builder, lhs: Id, rhs: Id, result_shape: Shape, dot_dims: DotDimensionNumbers) !Id {
-        const ids = try self.dupeIds(&.{ lhs, rhs });
+        const operands = try self.matrixOperands(lhs, rhs);
+        const left = operands[0];
+        const right = operands[1];
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "dot",
             .name = "dot",
             .shape = result_shape,
-            .operand_ids = ids,
+            .operand_ids = &.{ left, right },
             .dot_dimension_numbers = dot_dims,
+            .strict_float32 = self.getInst(left).shape.element_type == .f32,
         });
     }
 
@@ -511,56 +613,85 @@ pub const Builder = struct {
     /// `reducer_id`. The reducer must be a separate computation built and
     /// serialized into the module.
     pub fn reduce(self: *Builder, input: Id, init_value: Id, dimensions: []const i64, result_shape: Shape, reducer_computation_id: Id) !Id {
-        const ids = try self.dupeIds(&.{ input, init_value });
-        const dims = try self.dupeI64s(dimensions);
-        const comp_ids = try self.dupeIds(&.{reducer_computation_id});
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "reduce",
             .name = "reduce",
             .shape = result_shape,
-            .operand_ids = ids,
-            .dimensions = dims,
-            .called_computation_ids = comp_ids,
+            .operand_ids = &.{ input, init_value },
+            .dimensions = dimensions,
+            .called_computation_ids = &.{reducer_computation_id},
         });
     }
 
     // ── Shape manipulation ──────────────────────────────────────────
 
     pub fn reshape(self: *Builder, operand: Id, new_shape: Shape) !Id {
-        const ids = try self.dupeIds(&.{operand});
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "reshape",
             .name = "reshape",
             .shape = new_shape,
-            .operand_ids = ids,
+            .operand_ids = &.{operand},
         });
     }
 
     pub fn transpose(self: *Builder, operand: Id, permutation: []const i64, result_shape: Shape) !Id {
-        const ids = try self.dupeIds(&.{operand});
-        const dims = try self.dupeI64s(permutation);
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "transpose",
             .name = "transpose",
             .shape = result_shape,
-            .operand_ids = ids,
-            .dimensions = dims,
+            .operand_ids = &.{operand},
+            .dimensions = permutation,
         });
     }
 
     pub fn broadcast(self: *Builder, operand: Id, broadcast_dimensions: []const i64, result_shape: Shape) !Id {
-        const ids = try self.dupeIds(&.{operand});
-        const dims = try self.dupeI64s(broadcast_dimensions);
+        const input = self.getInst(operand).shape;
+        if (input.dimensions.len != broadcast_dimensions.len or input.dimensions.len > 8 or result_shape.dimensions.len > 8 or input.element_type != result_shape.element_type) return error.UnsupportedShape;
+        var dims: [8]i64 = undefined;
+        var targets: [8]i64 = undefined;
+        var seen: [8]bool = @splat(false);
+        var count: usize = 0;
+        for (input.dimensions, broadcast_dimensions) |size, destination| {
+            const axis = std.math.cast(usize, destination) orelse return error.UnsupportedShape;
+            if (axis >= result_shape.dimensions.len or seen[axis] or size < 0 or result_shape.dimensions[axis] < 0) return error.UnsupportedShape;
+            seen[axis] = true;
+            if (size == 1 and result_shape.dimensions[axis] != 1) continue;
+            if (size != result_shape.dimensions[axis]) return error.UnsupportedShape;
+            dims[count] = size;
+            targets[count] = destination;
+            count += 1;
+        }
+        // HLO broadcast maps equal-sized operand axes. Expanding singleton
+        // axes must first be removed, including keepdims reduction results.
+        var source = if (count != input.dimensions.len) try self.reshape(operand, Shape.init(input.element_type, dims[0..count])) else operand;
+        var permutation: [8]i64 = undefined;
+        var sorted: [8]i64 = undefined;
+        var sorted_dims: [8]i64 = undefined;
+        for (0..count) |index| permutation[index] = @intCast(index);
+        for (0..count) |index| {
+            var smallest_axis = index;
+            for (index + 1..count) |other| if (targets[@intCast(permutation[other])] < targets[@intCast(permutation[smallest_axis])]) {
+                smallest_axis = other;
+            };
+            std.mem.swap(i64, &permutation[index], &permutation[smallest_axis]);
+            sorted[index] = targets[@intCast(permutation[index])];
+            sorted_dims[index] = dims[@intCast(permutation[index])];
+        }
+        var reordered = false;
+        for (permutation[0..count], 0..) |axis, index| if (axis != index) {
+            reordered = true;
+        };
+        if (reordered) source = try self.transpose(source, permutation[0..count], Shape.init(input.element_type, sorted_dims[0..count]));
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "broadcast",
             .name = "broadcast",
             .shape = result_shape,
-            .operand_ids = ids,
-            .dimensions = dims,
+            .operand_ids = &.{source},
+            .dimensions = sorted[0..count],
         });
     }
 
@@ -578,27 +709,24 @@ pub const Builder = struct {
             };
         }
 
-        const ids = try self.dupeIds(&.{operand});
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "slice",
             .name = "slice",
             .shape = result_shape,
-            .operand_ids = ids,
+            .operand_ids = &.{operand},
             .slice_dimensions = slice_dims[0..rank],
         });
     }
 
     pub fn concatenate(self: *Builder, operands: []const Id, dimension: i64, result_shape: Shape) !Id {
-        const ids = try self.dupeIds(operands);
-        const dims = try self.dupeI64s(&.{dimension});
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "concatenate",
             .name = "concatenate",
             .shape = result_shape,
-            .operand_ids = ids,
-            .dimensions = dims,
+            .operand_ids = operands,
+            .dimensions = &.{dimension},
         });
     }
 
@@ -609,12 +737,10 @@ pub const Builder = struct {
     pub fn tuple(self: *Builder, operand_ids: []const Id) !Id {
         // Collect the child shapes from the operand instructions.
         const child_shapes = try self.allocator.alloc(Shape, operand_ids.len);
-        errdefer self.allocator.free(child_shapes);
+        defer self.allocator.free(child_shapes);
         for (operand_ids, 0..) |id, i| {
             child_shapes[i] = self.getInst(id).shape;
         }
-        const ids = try self.dupeIds(operand_ids);
-        errdefer self.allocator.free(ids);
         const inst_id = self.nextId();
         // shape field is unused for the tuple instruction itself; the real shape
         // is serialized from tuple_child_shapes.  Use a scalar f32 placeholder.
@@ -624,42 +750,82 @@ pub const Builder = struct {
             .opcode = "tuple",
             .name = "tuple",
             .shape = Shape.scalar(.f32),
-            .operand_ids = ids,
+            .operand_ids = operand_ids,
             .is_tuple_root = true,
             .tuple_child_shapes = child_shapes,
         });
     }
 
     pub fn convertType(self: *Builder, operand: Id, target_type: ElementType) !Id {
-        const op_shape = self.getInst(operand).shape;
-        const ids = try self.dupeIds(&.{operand});
+        const inst = self.getInst(operand).*;
+        const op_shape = inst.shape;
+        if (op_shape.element_type == target_type) return operand;
+        if (target_type == .bf16 and op_shape.element_type == .f32 and std.mem.eql(u8, inst.opcode, "convert") and self.getInst(inst.operand_ids[0]).shape.element_type == .bf16) return inst.operand_ids[0];
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "convert",
             .name = "convert",
             .shape = Shape.init(target_type, op_shape.dimensions),
-            .operand_ids = ids,
+            .operand_ids = &.{operand},
         });
+    }
+
+    /// Loop-carried arrays use one flat tuple. Child dimensions are borrowed
+    /// from live instructions until module serialization, like tuple().
+    pub fn tupleParameter(self: *Builder, number: u32, shapes: []const Shape) !Id {
+        return self.addInst(.{ .id = self.nextId(), .opcode = "parameter", .name = "state", .shape = Shape.scalar(.f32), .operand_ids = &.{}, .parameter_number = number, .is_tuple_root = true, .tuple_child_shapes = shapes });
+    }
+
+    pub fn tupleElement(self: *Builder, operand: Id, index: u32) !Id {
+        const children = self.getInst(operand).tuple_child_shapes orelse return error.UnsupportedShape;
+        if (index >= children.len) return error.UnsupportedShape;
+        return self.addInst(.{ .id = self.nextId(), .opcode = "get-tuple-element", .name = "state_element", .shape = children[index], .operand_ids = &.{operand}, .tuple_index = index });
+    }
+
+    pub fn whileLoop(self: *Builder, initial: Id, condition: Id, body: Id) !Id {
+        const children = self.getInst(initial).tuple_child_shapes orelse return error.UnsupportedShape;
+        // XLA's wire ABI orders body before condition.
+        return self.addInst(.{ .id = self.nextId(), .opcode = "while", .name = "scan", .shape = Shape.scalar(.f32), .operand_ids = &.{initial}, .is_tuple_root = true, .tuple_child_shapes = children, .called_computation_ids = &.{ body, condition } });
+    }
+
+    pub fn dynamicSlice(self: *Builder, operand: Id, starts: []const Id, sizes: []const i64) !Id {
+        const shape = self.getInst(operand).shape;
+        if (starts.len != shape.dimensions.len or sizes.len != starts.len or starts.len > 8) return error.UnsupportedShape;
+        var operands: [9]Id = undefined;
+        operands[0] = operand;
+        @memcpy(operands[1..][0..starts.len], starts);
+        for (sizes, shape.dimensions) |size, bound| if (size <= 0 or size > bound) return error.UnsupportedShape;
+        return self.addInst(.{ .id = self.nextId(), .opcode = "dynamic-slice", .name = "scan_row", .shape = Shape.init(shape.element_type, sizes), .operand_ids = operands[0 .. 1 + starts.len], .dimensions = sizes });
+    }
+
+    pub fn dynamicUpdateSlice(self: *Builder, operand: Id, update: Id, starts: []const Id) !Id {
+        const shape = self.getInst(operand).shape;
+        const patch = self.getInst(update).shape;
+        if (starts.len != shape.dimensions.len or starts.len != patch.dimensions.len or starts.len > 8 or shape.element_type != patch.element_type) return error.UnsupportedShape;
+        var operands: [10]Id = undefined;
+        operands[0] = operand;
+        operands[1] = update;
+        @memcpy(operands[2..][0..starts.len], starts);
+        for (patch.dimensions, shape.dimensions) |size, bound| if (size <= 0 or size > bound) return error.UnsupportedShape;
+        return self.addInst(.{ .id = self.nextId(), .opcode = "dynamic-update-slice", .name = "scan_publish", .shape = shape, .operand_ids = operands[0 .. 2 + starts.len] });
     }
 
     // ── Select ──────────────────────────────────────────────────────
 
     pub fn select(self: *Builder, pred: Id, on_true: Id, on_false: Id) !Id {
         const true_shape = self.getInst(on_true).shape;
-        const ids = try self.dupeIds(&.{ pred, on_true, on_false });
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "select",
             .name = "select",
             .shape = true_shape,
-            .operand_ids = ids,
+            .operand_ids = &.{ pred, on_true, on_false },
         });
     }
 
     // ── Gather ──────────────────────────────────────────────────────
 
     pub fn gather(self: *Builder, operand: Id, indices: Id, result_shape: Shape) !Id {
-        const ids = try self.dupeIds(&.{ operand, indices });
         const operand_shape = self.getInst(operand).shape;
         const indices_shape = self.getInst(indices).shape;
         const operand_rank = operand_shape.dimensions.len;
@@ -679,19 +845,30 @@ pub const Builder = struct {
             slice_sizes_buf[i] = operand_shape.dimensions[i];
         }
 
+        return self.gatherWithDimensions(operand, indices, result_shape, .{
+            .offset_dims = offset_dims_buf[0 .. operand_rank - 1],
+            .collapsed_slice_dims = &.{0},
+            .start_index_map = &.{0},
+            .index_vector_dim = @intCast(indices_rank),
+        }, slice_sizes_buf[0..operand_rank]);
+    }
+
+    pub fn gatherWithDimensions(self: *Builder, operand: Id, indices: Id, result_shape: Shape, dimensions: GatherDimensionNumbers, slice_sizes: []const i64) !Id {
+        const input = self.getInst(operand).shape;
+        if (input.element_type == .f32 and result_shape.element_type == .f32) if (try self.provenBf16(operand)) |narrow| {
+            const selected = try self.gatherWithDimensions(narrow, indices, Shape.init(.bf16, result_shape.dimensions), dimensions, slice_sizes);
+            return self.convertType(selected, .f32);
+        };
+        if (slice_sizes.len != input.dimensions.len or dimensions.index_vector_dim < 0 or dimensions.index_vector_dim > self.getInst(indices).shape.dimensions.len) return error.UnsupportedShape;
+        for (slice_sizes, input.dimensions) |size, bound| if (size < 0 or size > bound) return error.UnsupportedShape;
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "gather",
             .name = "gather",
             .shape = result_shape,
-            .operand_ids = ids,
-            .gather_dimension_numbers = .{
-                .offset_dims = offset_dims_buf[0 .. operand_rank - 1],
-                .collapsed_slice_dims = &.{0},
-                .start_index_map = &.{0},
-                .index_vector_dim = @intCast(indices_rank),
-            },
-            .gather_slice_sizes = slice_sizes_buf[0..operand_rank],
+            .operand_ids = &.{ operand, indices },
+            .gather_dimension_numbers = dimensions,
+            .gather_slice_sizes = slice_sizes,
         });
     }
 
@@ -703,13 +880,28 @@ pub const Builder = struct {
         const c_sqrt2pi = try self.constantScalarF32(0.7978845608028654); // sqrt(2/pi)
         const c_half = try self.constantScalarF32(0.5);
         const c_one = try self.constantScalarF32(1.0);
-        const c_three = try self.constantScalarF32(3.0);
-
-        const x3 = try self.power(x, c_three);
-        const inner = try self.add(x, try self.multiply(c_044715, x3));
+        const correction = switch (self.gelu_schedule) {
+            .cube_first => try self.multiply(c_044715, try self.power(x, try self.constantScalarF32(3.0))),
+            .coefficient_first_stable_tail => try self.multiply(try self.multiply(try self.multiply(c_044715, x), x), x),
+        };
+        const inner = try self.add(x, correction);
         const scaled = try self.multiply(c_sqrt2pi, inner);
-        const tanh_val = try self.tanh(scaled);
+        var tanh_val = try self.tanh(scaled);
+        if (self.gelu_schedule == .coefficient_first_stable_tail) {
+            // GPU intrinsic tanh can saturate before libdevice tanhf. Evaluate
+            // its tail explicitly so cancellation in 1+tanh retains the source
+            // F32 value before the BF16 store. All arithmetic remains F32.
+            const magnitude = try self.abs(scaled);
+            const e = try self.exponential(try self.multiply(try self.constantScalarF32(-2), magnitude));
+            const tail = try self.subtract(c_one, try self.divide(try self.multiply(try self.constantScalarF32(2), e), try self.add(c_one, e)));
+            const shape = self.getInst(scaled).shape;
+            const zero = try self.broadcast(try self.constantScalarF32(0), &.{}, shape);
+            const threshold = try self.broadcast(try self.constantScalarF32(3), &.{}, shape);
+            const signed_tail = try self.select(try self.compare(scaled, zero, "LT"), try self.negate(tail), tail);
+            tanh_val = try self.select(try self.compare(magnitude, threshold, "GT"), signed_tail, tanh_val);
+        }
         const one_plus_tanh = try self.add(c_one, tanh_val);
+        if (self.gelu_schedule == .coefficient_first_stable_tail) return self.multiply(try self.multiply(c_half, x), one_plus_tanh);
         return self.multiply(c_half, try self.multiply(x, one_plus_tanh));
     }
 
@@ -769,6 +961,14 @@ pub const Module = struct {
 
     pub fn initWithAux(name: []const u8, entry: Computation, aux: []const Computation) Module {
         return .{ .name = name, .entry = entry, .auxiliary = aux };
+    }
+
+    /// Pin the public buffer ABI independently of internal provider layouts.
+    /// Required when outputs become another executable's resident operands.
+    pub fn serializeEntryLayoutOptions(self: Module, alloc: Allocator) ![]u8 {
+        var program = try buildProgramShapeProto(alloc, self.entry);
+        defer program.deinit(alloc);
+        return @import("xla_proto").encodeEntryLayoutOptions(alloc, program);
     }
 
     /// Serialize to HloModuleProto protobuf bytes. Caller owns the result.
@@ -853,6 +1053,8 @@ fn buildLiteralProto(
     shape: Shape,
     f32s: ?[]const f32,
     s32s: ?[]const i32,
+    s64s: ?[]const i64,
+    predicates: ?[]const u8,
 ) !xla.LiteralProto {
     var proto: xla.LiteralProto = .{};
     errdefer proto.deinit(alloc);
@@ -860,6 +1062,11 @@ fn buildLiteralProto(
     proto.shape = try buildShapeProto(alloc, shape);
     if (f32s) |data| proto.f32s = try alloc.dupe(f32, data);
     if (s32s) |data| proto.s32s = try alloc.dupe(i32, data);
+    if (s64s) |data| proto.s64s = try alloc.dupe(i64, data);
+    if (predicates) |data| {
+        proto.preds = try alloc.alloc(bool, data.len);
+        for (proto.preds, data) |*value, byte| value.* = byte != 0;
+    }
     return proto;
 }
 
@@ -920,11 +1127,34 @@ fn buildInstructionProto(alloc: Allocator, inst: Builder.Instruction) !xla.HloIn
         proto.operand_ids = try idsToI64s(alloc, inst.operand_ids);
     }
     if (inst.dimensions) |dims| {
-        proto.dimensions = try alloc.dupe(i64, dims);
+        if (std.mem.eql(u8, inst.opcode, "dynamic-slice")) proto.dynamic_slice_sizes = try alloc.dupe(i64, dims) else proto.dimensions = try alloc.dupe(i64, dims);
     }
     if (inst.dot_dimension_numbers) |dot_dims| {
         proto.dot_dimension_numbers = try buildDotDimensionNumbers(alloc, dot_dims);
     }
+    if (inst.convolution) |conv| {
+        var window: xla.Window = .{};
+        var transferred = false;
+        errdefer if (!transferred) window.deinit(alloc);
+        window.dimensions = try alloc.alloc(xla.WindowDimension, conv.spatial_rank);
+        // Kernel sizes are recorded by the builder alongside the canonical window.
+        for (window.dimensions, 0..) |*dimension, axis| dimension.* = .{ .size = conv.kernel_sizes[axis], .stride = conv.strides[axis], .padding_low = conv.padding_low[axis], .padding_high = conv.padding_high[axis], .window_dilation = conv.dilations[axis], .base_dilation = 1 };
+        proto.window = window;
+        transferred = true;
+        var dimensions: xla.ConvolutionDimensionNumbers = .{};
+        var dims_transferred = false;
+        errdefer if (!dims_transferred) dimensions.deinit(alloc);
+        var spatial: [4]i64 = undefined;
+        for (spatial[0..conv.spatial_rank], 0..) |*axis, i| axis.* = @intCast(i + 2);
+        dimensions.input_spatial_dimensions = try alloc.dupe(i64, spatial[0..conv.spatial_rank]);
+        dimensions.kernel_spatial_dimensions = try alloc.dupe(i64, spatial[0..conv.spatial_rank]);
+        dimensions.output_spatial_dimensions = try alloc.dupe(i64, spatial[0..conv.spatial_rank]);
+        proto.convolution_dimension_numbers = dimensions;
+        dims_transferred = true;
+        proto.feature_group_count = conv.groups;
+        proto.batch_group_count = 1;
+    }
+    if (inst.strict_float32) proto.precision_config = .{ .operand_precision = try alloc.dupe(i32, &.{ 2, 2 }) };
     if (inst.gather_dimension_numbers) |gather_dims| {
         proto.gather_dimension_numbers = try buildGatherDimensionNumbers(alloc, gather_dims);
     }
@@ -934,12 +1164,13 @@ fn buildInstructionProto(alloc: Allocator, inst: Builder.Instruction) !xla.HloIn
     if (inst.slice_dimensions) |slice_dims| {
         proto.slice_dimensions = try alloc.dupe(xla.HloInstructionProto.SliceDimensions, slice_dims);
     }
-    if (inst.literal_f32s != null or inst.literal_s32s != null) {
-        proto.literal = try buildLiteralProto(alloc, inst.shape, inst.literal_f32s, inst.literal_s32s);
+    if (inst.literal_f32s != null or inst.literal_s32s != null or inst.literal_s64s != null or inst.literal_preds != null) {
+        proto.literal = try buildLiteralProto(alloc, inst.shape, inst.literal_f32s, inst.literal_s32s, inst.literal_s64s, inst.literal_preds);
     }
     if (inst.parameter_number) |pn| {
         proto.parameter_number = @intCast(pn);
     }
+    if (inst.tuple_index) |index| proto.tuple_index = index;
     if (inst.called_computation_ids) |comp_ids| {
         proto.called_computation_ids = try idsToI64s(alloc, comp_ids);
     }
@@ -973,7 +1204,7 @@ fn buildProgramShapeProto(alloc: Allocator, comp: Computation) !xla.ProgramShape
         var names_written: usize = 0;
         for (comp.instructions) |inst| {
             if (inst.parameter_number == null) continue;
-            params[written] = try buildShapeProto(alloc, inst.shape);
+            params[written] = try buildInstructionShapeProto(alloc, inst);
             written += 1;
             // Borrow: Builder owns inst.name for the lifetime of serialization.
             names[names_written] = inst.name;
@@ -1046,10 +1277,77 @@ fn buildModuleProto(alloc: Allocator, module: Module) !xla.HloModuleProto {
     proto.computations = comps;
 
     proto.host_program_shape = try buildProgramShapeProto(alloc, module.entry);
+    try compactWireIds(alloc, &proto);
     return proto;
 }
 
+/// Builder-local IDs reserve disjoint ranges for auxiliary computations.
+/// XLA import indexes metadata by the maximum instruction ID; serialize a
+/// dense module namespace so import memory is O(instructions), not O(ranges).
+fn compactWireIds(alloc: Allocator, module: *xla.HloModuleProto) !void {
+    var computations: std.AutoHashMapUnmanaged(i64, i64) = .empty;
+    defer computations.deinit(alloc);
+    for (module.computations, 0..) |comp, i| {
+        const slot = try computations.getOrPut(alloc, comp.id);
+        if (slot.found_existing) return error.DuplicateComputationId;
+        slot.value_ptr.* = @intCast(i + 1);
+    }
+    module.entry_computation_id = computations.get(module.entry_computation_id) orelse return error.MissingComputation;
+    module.id = 1;
+    var next: i64 = 1;
+    for (module.computations) |*comp| {
+        var instructions: std.AutoHashMapUnmanaged(i64, i64) = .empty;
+        defer instructions.deinit(alloc);
+        for (comp.instructions) |inst| {
+            const slot = try instructions.getOrPut(alloc, inst.id);
+            if (slot.found_existing) return error.DuplicateInstructionId;
+            slot.value_ptr.* = next;
+            next = try std.math.add(i64, next, 1);
+        }
+        comp.id = computations.get(comp.id) orelse return error.MissingComputation;
+        comp.root_id = instructions.get(comp.root_id) orelse return error.MissingInstruction;
+        for (comp.instructions) |*inst| {
+            inst.id = instructions.get(inst.id) orelse return error.MissingInstruction;
+            const operands: []i64 = @constCast(inst.operand_ids);
+            for (operands) |*id| id.* = instructions.get(id.*) orelse return error.MissingInstruction;
+            const callees: []i64 = @constCast(inst.called_computation_ids);
+            for (callees) |*id| id.* = computations.get(id.*) orelse return error.MissingComputation;
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
+
+test "wire IDs stay dense across sparse tuple loop computations" {
+    const a = std.testing.allocator;
+    var entry = Builder.init(a, "entry");
+    defer entry.deinit();
+    const initial = try entry.tuple(&.{try entry.constantS32(Shape.scalar(.s32), &.{0})});
+    var condition = Builder.init(a, "condition");
+    defer condition.deinit();
+    condition.next_id = 1_000_000_001;
+    condition.base_id = condition.next_id;
+    const cs = try condition.tupleParameter(0, entry.getInst(initial).tuple_child_shapes.?);
+    _ = try condition.lessThan(try condition.tupleElement(cs, 0), try condition.constantS32(Shape.scalar(.s32), &.{3}));
+    var body = Builder.init(a, "body");
+    defer body.deinit();
+    body.next_id = 2_000_000_001;
+    body.base_id = body.next_id;
+    const bs = try body.tupleParameter(0, entry.getInst(initial).tuple_child_shapes.?);
+    _ = try body.tuple(&.{try body.add(try body.tupleElement(bs, 0), try body.constantS32(Shape.scalar(.s32), &.{1}))});
+    const loop = try entry.whileLoop(initial, condition.build().id, body.build().id);
+    _ = try entry.tupleElement(loop, 0);
+    var proto = try buildModuleProto(a, Module.initWithAux("loop", entry.build(), &.{ condition.build(), body.build() }));
+    defer proto.deinit(a);
+    var count: i64 = 0;
+    for (proto.computations) |comp| for (comp.instructions) |inst| {
+        count += 1;
+        try std.testing.expectEqual(count, inst.id);
+        if (std.mem.eql(u8, inst.opcode, "while")) try std.testing.expectEqualSlices(i64, &.{ 2, 1 }, inst.called_computation_ids);
+    };
+    try std.testing.expectEqual(@as(i64, 3), proto.entry_computation_id);
+    try std.testing.expect(count < 30);
+}
 
 test "build and serialize simple add" {
     const alloc = std.testing.allocator;
@@ -1249,4 +1547,110 @@ test "dot with explicit dimension numbers" {
     const bytes = try module.serialize(alloc);
     defer alloc.free(bytes);
     try std.testing.expect(bytes.len > 0);
+}
+
+fn checkBuilderOwnedPayloads(allocator: Allocator) !void {
+    var b = Builder.init(allocator, "owned_payloads");
+    defer b.deinit();
+    var sizes = [_]i64{ 2, 2 };
+    const x = try b.parameter(0, Shape.init(.f32, &sizes), "x");
+    sizes[0] = 99;
+    try std.testing.expectEqual(@as(i64, 2), b.getInst(x).shape.dimensions[0]);
+    var values = [_]f32{ 1, 2, 3, 4 };
+    const y = try b.constantF32(Shape.init(.f32, &.{ 2, 2 }), &values);
+    values[0] = 99;
+    try std.testing.expectEqual(@as(f32, 1), b.getInst(y).literal_f32s.?[0]);
+    const product = try b.matmul(x, y);
+    const reduced = try b.reduce(product, try b.constantScalarF32(0), &.{1}, Shape.init(.f32, &.{2}), 900);
+    const indices = try b.constantS32(Shape.init(.s32, &.{2}), &.{ 1, 0 });
+    const selected = try b.gather(product, indices, Shape.init(.f32, &.{ 2, 2 }));
+    const sliced = try b.slice(selected, &.{ 0, 0 }, &.{ 2, 1 }, &.{ 1, 1 }, Shape.init(.f32, &.{ 2, 1 }));
+    const predicate = try b.compare(reduced, reduced, "EQ");
+    const wide = try b.constantS64(Shape.scalar(.s64), &.{9007199254740993});
+    const truth = try b.constantPred(Shape.scalar(.pred), &.{1});
+    _ = try b.tuple(&.{ product, sliced, predicate, wide, truth });
+}
+
+test "hlo builder owns all borrowed payloads and unwinds every allocation failure" {
+    try checkBuilderOwnedPayloads(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkBuilderOwnedPayloads, .{});
+}
+
+test "mixed BF16 matrix operands retain F32 accumulation without changing default precision" {
+    const a = std.testing.allocator;
+    var b = Builder.init(a, "bf16_matrix");
+    defer b.deinit();
+    const x = try b.parameter(0, Shape.init(.f32, &.{ 2, 3 }), "x");
+    const w = try b.parameter(1, Shape.init(.f32, &.{ 3, 4 }), "w");
+    const strict = try b.matmul(x, w);
+    try std.testing.expect(b.getInst(strict).strict_float32);
+    b.matrix_operand_type = .bf16;
+    const unchanged = try b.matmul(x, w);
+    try std.testing.expect(b.getInst(unchanged).strict_float32);
+    const x_view = try b.convertType(try b.convertType(x, .bf16), .f32);
+    const w_view = try b.convertType(try b.convertType(w, .bf16), .f32);
+    const mixed = try b.matmul(x_view, w_view);
+    try std.testing.expectEqual(ElementType.f32, b.getInst(mixed).shape.element_type);
+    try std.testing.expect(!b.getInst(mixed).strict_float32);
+    for (b.getInst(mixed).operand_ids) |operand| try std.testing.expectEqual(ElementType.bf16, b.getInst(operand).shape.element_type);
+}
+
+test "BF16 gather widens selected rows instead of the complete operand" {
+    const a = std.testing.allocator;
+    var b = Builder.init(a, "narrow_gather");
+    defer b.deinit();
+    const table = try b.parameter(0, Shape.init(.bf16, &.{ 1000, 4 }), "table");
+    const wide = try b.convertType(table, .f32);
+    const ids = try b.constantS64(Shape.init(.s64, &.{2}), &.{ 1, 7 });
+    const selected = try b.gather(wide, ids, Shape.init(.f32, &.{ 2, 4 }));
+    const gather = b.getInst(b.getInst(selected).operand_ids[0]);
+    try std.testing.expectEqualStrings("gather", gather.opcode);
+    try std.testing.expectEqual(table, gather.operand_ids[0]);
+    try std.testing.expectEqual(ElementType.bf16, gather.shape.element_type);
+    try std.testing.expectEqual(ElementType.f32, b.getInst(selected).shape.element_type);
+}
+
+test "resident entry layout options encode typed parameters and tuple results" {
+    const a = std.testing.allocator;
+    var b = Builder.init(a, "layouts");
+    defer b.deinit();
+    const ids = try b.parameter(0, Shape.init(.s64, &.{3}), "ids");
+    const bank = try b.parameter(1, Shape.init(.f32, &.{ 448, 768 }), "bank");
+    _ = try b.tuple(&.{ ids, bank });
+    const module = Module.init("layouts", b.build());
+    const options = try module.serializeEntryLayoutOptions(a);
+    defer a.free(options);
+    var signature = try buildProgramShapeProto(a, module.entry);
+    defer signature.deinit(a);
+    const wire = @import("protobuf").wire;
+    var cursor: usize = 0;
+    for (signature.parameters) |_| {
+        try std.testing.expectEqual(@as(u32, 1), (try wire.readTag(options, &cursor)).field);
+        const shape = try wire.readLengthDelimited(options, &cursor);
+        try std.testing.expect(shape.len != 0);
+    }
+    try std.testing.expectEqual(@as(u32, 3), (try wire.readTag(options, &cursor)).field);
+    const build = try wire.readLengthDelimited(options, &cursor);
+    try std.testing.expectEqual(options.len, cursor);
+    cursor = 0;
+    try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(build, &cursor)).field);
+    const result = try wire.readLengthDelimited(build, &cursor);
+    try std.testing.expectEqual(build.len, cursor);
+    // A tuple result carries each bank's concrete layout, not a tuple-only
+    // marker that would leave the provider free to change the boundary ABI.
+    var shape_cursor: usize = 0;
+    try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(result, &shape_cursor)).field);
+    try std.testing.expectEqual(@as(u64, 13), try wire.readVarint(result, &shape_cursor));
+    for (signature.result.tuple_shapes) |_| {
+        try std.testing.expectEqual(@as(u32, 4), (try wire.readTag(result, &shape_cursor)).field);
+        const child = try wire.readLengthDelimited(result, &shape_cursor);
+        var child_cursor: usize = 0;
+        var has_layout = false;
+        while (child_cursor < child.len) {
+            const tag = try wire.readTag(child, &child_cursor);
+            if (tag.field == 5) has_layout = true;
+            try wire.skipField(child, &child_cursor, tag.wire_type);
+        }
+        try std.testing.expect(has_layout);
+    }
 }

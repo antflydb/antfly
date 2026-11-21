@@ -440,11 +440,15 @@ pub const AttentionAttrs = struct {
     batch: u32,
     seq_len: u32,
     kv_seq_len: u32 = 0,
+    /// K/V are complete explicit operands, independent of request cache state.
+    functional_kv: bool = false,
     num_heads: u32,
     num_kv_heads: u32 = 0,
     head_dim: u32,
     layer_index: u32 = std.math.maxInt(u32),
     skip_kv_write: bool = false,
+    /// Null inherits a legacy interpreter context; authored zero means global.
+    sliding_window: ?u32 = null,
 };
 
 /// Version-1 training attention with replayable probability dropout. This is
@@ -592,7 +596,7 @@ pub const SegmentTrainingAttentionAttrs = struct {
 /// logical positions. A row with no visible key outputs zero. The scale is
 /// `1/sqrt(head_dim)`. The backward replays the softmax statistics instead of
 /// saving them, and returns the packed [dQ;dK;dV] gradient.
-pub const ModernBertTrainingAttentionAttrs = struct {
+pub const RangeTrainingAttentionAttrs = struct {
     batch: u32,
     seq_len: u32,
     num_heads: u32,
@@ -617,7 +621,7 @@ pub const ModernBertTrainingAttentionAttrs = struct {
     };
 
     /// Shape validation only; backends validate the control contents.
-    pub fn layout(self: ModernBertTrainingAttentionAttrs) !Layout {
+    pub fn layout(self: RangeTrainingAttentionAttrs) !Layout {
         for ([_]u32{ self.batch, self.seq_len, self.num_heads, self.head_dim }) |dim|
             if (dim == 0 or dim > std.math.maxInt(i32)) return error.InvalidModernBertTrainingAttentionShape;
         const tokens = try std.math.mul(i64, self.batch, self.seq_len);
@@ -629,6 +633,9 @@ pub const ModernBertTrainingAttentionAttrs = struct {
         return .{ .tokens = tokens, .hidden = hidden, .qkv_rows = qkv_rows, .control_elements = control_elements };
     }
 };
+
+/// Compatibility type for the historical graph operation.
+pub const ModernBertTrainingAttentionAttrs = RangeTrainingAttentionAttrs;
 
 pub const RopeAttrs = struct {
     seq_len: u32,
@@ -647,6 +654,23 @@ pub const RopeAttrs = struct {
 ///   forward: (lo*cos - hi*sin, lo*sin + hi*cos)
 ///   inverse: (lo*cos + hi*sin, hi*cos - lo*sin), the transpose, which is
 ///   the VJP of the forward (and vice versa).
+/// Segmented token-major inference attention. The fourth operand is immutable
+/// i32 visibility metadata: six range endpoints per query, then query and key
+/// positions. Q/K/V remain ordinary dynamic tensors.
+pub const SegmentAttentionAttrs = struct {
+    queries: u32,
+    keys: u32,
+    num_heads: u32,
+    head_dim: u32,
+    window: u32 = 0xffffffff,
+    /// Zero retains the legacy one-KV-head-per-query-head contract.
+    num_kv_heads: u32 = 0,
+    /// Unnormalized softmax weights cross BF16 before the value dot; denominator stays F32.
+    bf16_probability: bool = false,
+    /// Null retains rsqrt(head_dim); an explicit scale avoids activation rescaling.
+    score_scale: ?f32 = null,
+};
+
 pub const RopeTableAttrs = struct {
     head_dim: u32,
     inverse: bool = false,
@@ -784,6 +808,17 @@ pub const SelectedTiedHeadAttrs = struct {
 // ── Node ───────────────────────────────────────────────────────────────
 
 /// Discriminated union of all ops in the graph IR.
+/// Zero-initialized full-sequence gated delta rule. Q/K are L2 normalized
+/// with epsilon 1e-6; query scaling follows normalization. Recurrence and
+/// publication accumulate in F32, independently of projection storage.
+pub const GatedDeltaAttrs = struct {
+    rows: u32,
+    key_heads: u32,
+    value_heads: u32,
+    key_dim: u32,
+    value_dim: u32,
+};
+
 pub const OpCode = union(enum) {
     // Primitives
     parameter: ParameterAttrs,
@@ -848,7 +883,9 @@ pub const OpCode = union(enum) {
     fused_concat: ConcatFusedAttrs,
     fused_elem_add: void,
     fused_elem_multiply: void,
-    fused_add_mul_scalar: void,
+    /// False: (a + b) * scalar. True: a * scalar + b. These are distinct
+    /// arithmetic contracts even when a backend supplies a fused launcher.
+    fused_add_mul_scalar: struct { scale_before_add: bool = false },
     fused_boundary_training_attention_v1: BoundaryTrainingAttentionAttrs,
     fused_boundary_training_attention_backward_v1: BoundaryTrainingAttentionAttrs,
     fused_sdpa: AttentionAttrs,
@@ -884,6 +921,7 @@ pub const OpCode = union(enum) {
     fused_from_float32: void,
     fused_to_float32: void,
     fused_zero_tensor: LinearAttrs,
+    fused_gated_delta: GatedDeltaAttrs,
     fused_eval_tensor: void,
     fused_argmax_last_row: ArgmaxAttrs,
     fused_softmax: SoftmaxAttrs,
@@ -899,6 +937,7 @@ pub const OpCode = union(enum) {
     /// Inputs are the precomputed cotangent * probability and probability.
     /// Output is weighted_cotangent - probability * row_sum(weighted_cotangent).
     fused_softmax_backward: SoftmaxAttrs,
+    fused_segment_attention: SegmentAttentionAttrs,
 
     pub fn isFused(self: OpCode) bool {
         return switch (self) {

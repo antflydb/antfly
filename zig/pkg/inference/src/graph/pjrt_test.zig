@@ -55,12 +55,96 @@ const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-const plugin_path: [:0]const u8 = "/Users/ajroetker/go/src/github.com/antflydb/antfly/termite/pjrt/darwin-arm64/lib/pjrt_c_api_cpu_v0.83.4_plugin.so";
+test "PJRT gated delta compact loop preserves reset and changed runtime inputs" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try initClient();
+    defer client.deinit();
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const rows = 7;
+    const heads = 2;
+    const key = 3;
+    const value = 4;
+    const channels = 2 * key + heads * value;
+    const mixed = try builder.parameter("mixed", Shape.init(.f32, &.{ rows, channels }));
+    const beta = try builder.parameter("beta", Shape.init(.f32, &.{ rows, heads }));
+    const decay = try builder.parameter("decay", Shape.init(.f32, &.{ rows, heads }));
+    const output = try graph.addNode(.{ .op = .{ .fused_gated_delta = .{ .rows = rows, .key_heads = 1, .value_heads = heads, .key_dim = key, .value_dim = value } }, .output_shape = Shape.init(.f32, &.{ rows, heads * value }), .inputs = .{ mixed, beta, decay, ml.graph.null_node }, .num_inputs = 3 });
+    try graph.markOutput(output);
+    const second = try graph.addNode(graph.node(output).*);
+    try graph.markOutput(second);
+    const ids = [_]NodeId{ output, second };
+    const inputs = [_]partition_mod.ExternalInput{ .{ .node_id = mixed, .source_partition = 0 }, .{ .node_id = beta, .source_partition = 0 }, .{ .node_id = decay, .source_partition = 0 } };
+    const part = Partition{ .backend = .pjrt, .node_ids = &ids, .external_inputs = &inputs };
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var executable = try pjrt_executor.createExecutor(a, &graph, &part, &cb, &cb, &client);
+    defer executable.partitionExecutor().deinitExecutor();
+    var source: [rows * channels]f32 = undefined;
+    var betas: [rows * heads]f32 = undefined;
+    var decays: [rows * heads]f32 = undefined;
+    for (0..3) |round| {
+        for (&source, 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + round * 13) % 37)) - 18)) / 19;
+        for (&betas, &decays, 0..) |*b, *d, i| {
+            b.* = 0.1 + @as(f32, @floatFromInt((i + round) % 7)) / 10;
+            d.* = 0.7 + @as(f32, @floatFromInt((i + round) % 5)) / 20;
+        }
+        var expected: [rows * heads * value]f32 = undefined;
+        var state: [heads][key][value]f32 = @splat(@splat(@splat(0)));
+        for (0..rows) |t| for (0..heads) |h| {
+            const row = source[t * channels ..][0..channels];
+            var q: [key]f32 = undefined;
+            var k: [key]f32 = undefined;
+            var q_sum: f32 = 0;
+            var k_sum: f32 = 0;
+            for (0..key) |i| {
+                q_sum += row[i] * row[i];
+                k_sum += row[key + i] * row[key + i];
+            }
+            for (0..key) |i| {
+                q[i] = row[i] / @sqrt(q_sum + 1e-6) / @sqrt(@as(f32, key));
+                k[i] = row[key + i] / @sqrt(k_sum + 1e-6);
+            }
+            for (0..value) |col| {
+                var memory: f32 = 0;
+                for (0..key) |i| {
+                    state[h][i][col] *= decays[t * heads + h];
+                    memory += state[h][i][col] * k[i];
+                }
+                const delta = (row[2 * key + h * value + col] - memory) * betas[t * heads + h];
+                var out: f32 = 0;
+                for (0..key) |i| {
+                    state[h][i][col] += k[i] * delta;
+                    out += state[h][i][col] * q[i];
+                }
+                expected[(t * heads + h) * value + col] = out;
+            }
+        };
+        var values: [5]?CT = @splat(null);
+        defer for (values) |tensor| if (tensor) |x| cb.free(x);
+        values[mixed] = try cb.fromFloat32Shape(&source, &.{ rows, channels });
+        values[beta] = try cb.fromFloat32Shape(&betas, &.{ rows, heads });
+        values[decay] = try cb.fromFloat32Shape(&decays, &.{ rows, heads });
+        var devices: [5]device_mesh_mod.DeviceId = @splat(0);
+        try executable.partitionExecutor().execute(&values, &devices, &ids, 0, .{});
+        const actual = try cb.toFloat32(values[output].?, a);
+        defer a.free(actual);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+        const other = try cb.toFloat32(values[second].?, a);
+        defer a.free(other);
+        for (expected, other) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+    }
+}
 
-fn initClient() ?pjrt_lib.pjrt.Client {
-    return pjrt_lib.pjrt.Client.init(plugin_path) catch |err| {
-        std.debug.print("Skipping PJRT test (plugin load failed: {s})\n", .{@errorName(err)});
-        return null;
+fn initClient() !pjrt_lib.pjrt.Client {
+    return pjrt_lib.pjrt.Client.initFromEnv(std.testing.allocator) catch |err| switch (err) {
+        error.PjrtPluginNotFound => error.SkipZigTest,
+        else => return err,
     };
 }
 
@@ -162,10 +246,10 @@ fn populateExternalInputs(
 // ── Test: compiler produces valid HLO accepted by PJRT ─────────────
 
 test "pjrt_compiler: linear partition compiles to valid HLO" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: Y = X @ W^T + bias (fused_linear)
@@ -235,10 +319,10 @@ test "pjrt_compiler: linear partition compiles to valid HLO" {
 // ── Test: executor produces correct output for linear layer ────────
 
 test "pjrt_executor: linear layer end-to-end" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: Y = X @ W^T + bias
@@ -348,10 +432,10 @@ test "pjrt_executor: linear layer end-to-end" {
 }
 
 test "pjrt_executor: embedding lookup uses runtime embedding ids" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     var g = Graph.init(allocator);
@@ -497,10 +581,10 @@ test "pjrt_executor: embedding lookup uses runtime embedding ids" {
 }
 
 test "pjrt_model_runtime: decode uses single token id" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     var g = Graph.init(allocator);
@@ -584,10 +668,10 @@ test "pjrt_model_runtime: decode uses single token id" {
 // ── Test: gelu activation through PJRT ─────────────────────────────
 
 test "pjrt_executor: gelu activation end-to-end" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: Y = gelu(X)
@@ -670,10 +754,10 @@ test "pjrt_executor: gelu activation end-to-end" {
 // ── Test: linear + rms_norm + gelu pipeline ────────────────────────
 
 test "pjrt_executor: linear + rms_norm + gelu pipeline" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: gelu(rms_norm(X @ W^T, gamma))
@@ -789,10 +873,10 @@ test "pjrt_executor: linear + rms_norm + gelu pipeline" {
 // ── Test: PJRT mesh creation ───────────────────────────────────────
 
 test "pjrt_mesh: createPjrtMesh from CPU plugin" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Use fake backends — we only test mesh structure, not execution.
@@ -832,10 +916,10 @@ test "pjrt_mesh: createPjrtMesh from CPU plugin" {
 // ── Test: elem_add through PJRT ────────────────────────────────────
 
 test "pjrt_executor: element-wise add end-to-end" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: Z = X + Y (fused_elem_add)
@@ -912,4 +996,227 @@ test "pjrt_executor: element-wise add end-to-end" {
     try std.testing.expectApproxEqAbs(@as(f32, 22), output_f32[1], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 33), output_f32[2], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 44), output_f32[3], 1e-4);
+}
+
+const ResidentFixture = struct {
+    const Cancel = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks == 2) return error.Cancelled;
+        }
+    };
+
+    fn graph(a: std.mem.Allocator, rows: usize, recurrent: bool, bf16: bool, cached: bool) !Graph {
+        var g = Graph.init(a);
+        errdefer g.deinit();
+        var b = Builder.init(&g);
+        const r: i64 = @intCast(rows);
+        if (cached and rows == 8) _ = try b.parameter("logits_row", Shape.init(.i64, &.{1}));
+        if (recurrent) {
+            const mixed = try b.parameter("mixed", Shape.init(.f32, &.{ r, 6 }));
+            const weight = try b.tensorConst(&.{ 0.2, 0.1, -0.2, 0.3, -0.1, 0.4, 0.5, -0.2, 0.1, 0.2, 0.3, -0.4 }, Shape.init(.f32, &.{ 2, 6 }));
+            const convolved = try @import("temporal_program.zig").depthwiseCausal(&g, mixed, weight, rows, 6, 2);
+            const beta = try b.parameter("beta", Shape.init(.f32, &.{ r, 1 }));
+            const decay = try b.parameter("decay", Shape.init(.f32, &.{ r, 1 }));
+            const result = try g.addNode(.{ .op = .{ .fused_gated_delta = .{ .rows = @intCast(rows), .key_heads = 1, .value_heads = 1, .key_dim = 2, .value_dim = 2 } }, .output_shape = Shape.init(.f32, &.{ r, 2 }), .inputs = .{ convolved, beta, decay, ml.graph.null_node }, .num_inputs = 3 });
+            try g.markOutput(result);
+        } else {
+            const query = try b.parameter("q", Shape.init(.f32, &.{ r, 4 }));
+            const key = try b.parameter("k", Shape.init(.f32, &.{ r, 2 }));
+            const value = try b.parameter("v", Shape.init(.f32, &.{ r, 2 }));
+            var rotated: [2]NodeId = undefined;
+            for ([_]NodeId{ query, key }, &rotated) |source, *destination| {
+                const attrs = ml.graph.node.RopeAttrs{ .seq_len = @intCast(rows), .head_dim = 2, .rope_dim = 2, .theta = 10000, .freq_scale = 1, .consecutive_pairs = true };
+                destination.* = if (bf16 and !cached) try @import("rotary_program.zig").emitBf16(&g, source, attrs) else try g.addNode(.{ .op = .{ .fused_rope = attrs }, .output_shape = g.node(source).output_shape, .inputs = .{ source, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+            }
+            const result = try g.addNode(.{ .op = .{ .fused_gqa_causal_attention = .{ .batch = 1, .seq_len = @intCast(rows), .num_heads = 2, .num_kv_heads = 1, .head_dim = 2, .sliding_window = 3 } }, .output_shape = Shape.init(.f32, &.{ r, 4 }), .inputs = .{ rotated[0], rotated[1], value, ml.graph.null_node }, .num_inputs = 3 });
+            var donor_node = g.node(result).*;
+            donor_node.op.fused_gqa_causal_attention.skip_kv_write = cached;
+            const consumer = try g.addNode(donor_node);
+            try g.markOutput(try b.add(result, consumer));
+        }
+        return g;
+    }
+    fn compile(a: std.mem.Allocator, g: *Graph, cb: *const ComputeBackend, client: *pjrt_lib.pjrt.Client, cached: bool, bf16: bool) !*pjrt_executor.PjrtExecutor {
+        const nodes = try a.alloc(NodeId, g.nodeCount());
+        defer a.free(nodes);
+        for (nodes, 0..) |*node, i| node.* = @intCast(i);
+        const part = Partition{ .backend = .pjrt, .node_ids = nodes, .external_inputs = &.{} };
+        return pjrt_executor.createExecutorWithOptions(a, g, &part, cb, cb, client, .{ .parameter_inputs = true, .resident_capacity = if (cached) 8 else 0, .resident_initial = cached and g.node(g.outputs.items[0]).output_shape.dims[0] > 1, .precision = if (bf16) .bf16 else .f32 }, null);
+    }
+    fn inputs(a: std.mem.Allocator, g: *Graph, cb: *const ComputeBackend, offset: usize) ![]?CT {
+        const values = try a.alloc(?CT, g.nodeCount());
+        @memset(values, null);
+        errdefer release(a, cb, values);
+        for (g.parameters.items) |node| {
+            const shape = g.node(node).output_shape;
+            if (shape.dtype == .i64) {
+                const index: i64 = 2;
+                values[node] = (try cb.fromConstantBytes(std.mem.asBytes(&index), .i64, &.{1})).?;
+                continue;
+            }
+            const count: usize = @intCast(shape.numElements().?);
+            const data = try a.alloc(f32, count);
+            defer a.free(data);
+            const width: usize = @intCast(shape.dims[1]);
+            const name = g.parameterName(g.node(node));
+            for (data, 0..) |*x, i| x.* = if (std.mem.eql(u8, name, "beta")) 0.4 else if (std.mem.eql(u8, name, "decay")) 0.9 else @as(f32, @floatFromInt(@as(i32, @intCast(((i + offset * width) * 7) % 23)) - 11)) / 13;
+            values[node] = try cb.fromFloat32Shape(data, &.{ @intCast(shape.dims[0]), @intCast(shape.dims[1]) });
+        }
+        return values;
+    }
+    fn expectPrecision(reference: []const f32, source: []const f32, actual: []const f32, bf16: bool) !void {
+        var source_error: f64 = 0;
+        var actual_error: f64 = 0;
+        var energy: f64 = 0;
+        for (reference, source, actual) |fp32, baseline, cached| {
+            if (!bf16) try std.testing.expectApproxEqAbs(baseline, cached, 2e-5);
+            energy += @as(f64, fp32) * fp32;
+            source_error += @as(f64, baseline - fp32) * (baseline - fp32);
+            actual_error += @as(f64, cached - fp32) * (cached - fp32);
+        }
+        if (bf16) try std.testing.expect(@sqrt(actual_error / @max(energy, 1e-30)) <= @max(@as(f64, 0.003), 1.5 * @sqrt(source_error / @max(energy, 1e-30))));
+    }
+
+    fn release(a: std.mem.Allocator, cb: *const ComputeBackend, values: []?CT) void {
+        for (values) |value| if (value) |tensor| cb.free(tensor);
+        a.free(values);
+    }
+};
+
+test "PJRT resident decoder caches attention and recurrent history transactionally" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try initClient();
+    defer client.deinit();
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]bool{ false, true }) |recurrent| for ([_]bool{ false, true }) |bf16| {
+        if (recurrent and bf16) continue;
+        std.debug.print("resident fixture recurrent={} bf16={}\n", .{ recurrent, bf16 });
+        var prefill = try ResidentFixture.graph(a, 8, recurrent, bf16, true);
+        defer prefill.deinit();
+        var decode = try ResidentFixture.graph(a, 1, recurrent, bf16, true);
+        defer decode.deinit();
+        var full = try ResidentFixture.graph(a, 6, recurrent, bf16, false);
+        defer full.deinit();
+        const prefill_exec = try ResidentFixture.compile(a, &prefill, &cb, &client, true, bf16);
+        defer prefill_exec.partitionExecutor().deinitExecutor();
+        const decode_exec = try ResidentFixture.compile(a, &decode, &cb, &client, true, bf16);
+        defer decode_exec.partitionExecutor().deinitExecutor();
+        const full_exec = try ResidentFixture.compile(a, &full, &cb, &client, false, bf16);
+        defer full_exec.partitionExecutor().deinitExecutor();
+        const full_inputs = try ResidentFixture.inputs(a, &full, &cb, 0);
+        defer ResidentFixture.release(a, &cb, full_inputs);
+        var full_outputs = try full_exec.executeToBuffers(full_inputs, .{ .backend = &cb }, a);
+        defer {
+            for (full_outputs) |*buffer| buffer.deinit();
+            a.free(full_outputs);
+        }
+        const expected = try full_outputs[0].toFloat32WithShape(a, full_exec.output_shapes[0]);
+        defer a.free(expected);
+        var reference_graph = try ResidentFixture.graph(a, 6, recurrent, false, false);
+        defer reference_graph.deinit();
+        const reference_exec = try ResidentFixture.compile(a, &reference_graph, &cb, &client, false, false);
+        defer reference_exec.partitionExecutor().deinitExecutor();
+        const reference_inputs = try ResidentFixture.inputs(a, &reference_graph, &cb, 0);
+        defer ResidentFixture.release(a, &cb, reference_inputs);
+        var reference_outputs = try reference_exec.executeToBuffers(reference_inputs, .{ .backend = &cb }, a);
+        defer {
+            for (reference_outputs) |*buffer| buffer.deinit();
+            a.free(reference_outputs);
+        }
+        const reference = try reference_outputs[0].toFloat32WithShape(a, reference_exec.output_shapes[0]);
+        defer a.free(reference);
+        var state = @import("pjrt_decoder_state.zig").State{ .allocator = a, .capacity = 8 };
+        defer state.deinit();
+        const width: usize = if (recurrent) 2 else 4;
+        for (0..2) |_| {
+            const prefill_inputs = try ResidentFixture.inputs(a, &prefill, &cb, 0);
+            defer ResidentFixture.release(a, &cb, prefill_inputs);
+            state.admitted_bytes = 0;
+            try std.testing.expectError(error.UnadmittedResidentState, state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, null));
+            try std.testing.expectEqual(@as(usize, 0), state.buffers.len);
+            state.admitted_bytes = std.math.maxInt(usize);
+            var cancelled_prefill = ResidentFixture.Cancel{};
+            try std.testing.expectError(error.Cancelled, state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, .{ .ptr = &cancelled_prefill, .check_fn = ResidentFixture.Cancel.check }));
+            try std.testing.expectEqual(@as(usize, 0), state.buffers.len);
+            try std.testing.expectEqual(@as(usize, 0), state.position);
+            const first = try state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, null);
+            defer a.free(first);
+            try ResidentFixture.expectPrecision(reference[0 .. 3 * width], expected[0 .. 3 * width], first[0 .. 3 * width], bf16);
+            for (3..6) |position| {
+                std.debug.print("resident step position={d}\n", .{position});
+                const decode_inputs = try ResidentFixture.inputs(a, &decode, &cb, position);
+                defer ResidentFixture.release(a, &cb, decode_inputs);
+                if (position == 3) {
+                    var cancellation = ResidentFixture.Cancel{};
+                    try std.testing.expectError(error.Cancelled, state.run(decode_exec, &cb, decode_inputs, 1, 1, a, .{ .ptr = &cancellation, .check_fn = ResidentFixture.Cancel.check }));
+                    try std.testing.expectEqual(position, state.position);
+                    var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                    try std.testing.expectError(error.OutOfMemory, state.run(decode_exec, &cb, decode_inputs, 1, 1, failed.allocator(), null));
+                    try std.testing.expectEqual(position, state.position);
+                }
+                const next = try state.run(decode_exec, &cb, decode_inputs, 1, 1, a, null);
+                defer a.free(next);
+                try ResidentFixture.expectPrecision(reference[position * width ..][0..width], expected[position * width ..][0..width], next, bf16);
+            }
+            try std.testing.expectEqual(@as(usize, 6), state.position);
+            const empty = try a.alloc(?CT, decode.nodeCount());
+            defer a.free(empty);
+            @memset(empty, null);
+            try std.testing.expectError(error.MissingValue, state.run(decode_exec, &cb, empty, 1, 1, a, null));
+            try std.testing.expectEqual(@as(usize, 6), state.position);
+            try std.testing.expectError(error.InvalidResidentDecodePosition, state.run(decode_exec, &cb, empty, 3, 3, a, null));
+            state.reset();
+        }
+    };
+}
+
+test "PJRT resident decoder retains one bank per immutable shared donor" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try initClient();
+    defer client.deinit();
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]bool{ false, true }) |bf16| {
+        var tracer = @import("tracing_compute.zig").TracingCompute.init(a);
+        defer tracer.deinit();
+        tracer.precision = if (bf16) .bf16 else .f32;
+        tracer.resident_decoder = true;
+        const tracing = tracer.backend();
+        var donors = try @import("../execution/forward_kv_reuse.zig").Scope.init(a, &tracing, 1, null);
+        defer donors.deinit();
+        const q = try tracing.fromFloat32Shape(&@as([8]f32, @splat(0)), &.{ 2, 4 });
+        const k = try tracing.fromFloat32Shape(&@as([4]f32, @splat(0)), &.{ 2, 2 });
+        const v = try tracing.fromFloat32Shape(&.{ 2, 4, 6, 8 }, &.{ 2, 2 });
+        var context = ops_mod.AttentionContext{ .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2, .forward_kv_reuse = donors.context() };
+        const donor = try tracing.gqaPagedAttention(q, k, v, null, context, 1, 2, 1, 2);
+        context.skip_kv_write = true;
+        const consumer = try tracing.gqaPagedAttention(q, q, q, null, context, 1, 2, 1, 2);
+        _ = try tracer.markOutput(try tracing.add(donor, consumer));
+        var graph = tracer.extractGraph();
+        defer graph.deinit();
+        const executable = try ResidentFixture.compile(a, &graph, &cb, &client, true, bf16);
+        defer executable.partitionExecutor().deinitExecutor();
+        const inputs = try a.alloc(?CT, graph.nodeCount());
+        defer a.free(inputs);
+        @memset(inputs, null);
+        // Exactly one donor pair; retention must not create extra banks under
+        // a reshape or an otherwise redundant BF16 publication node.
+        var state = @import("pjrt_decoder_state.zig").State{ .allocator = a, .capacity = 8, .admitted_bytes = 2 * 8 * 2 * @sizeOf(f32) };
+        defer state.deinit();
+        const actual = try state.run(executable, &cb, inputs, 2, 2, a, null);
+        defer a.free(actual);
+        try std.testing.expectEqual(@as(usize, 2), state.buffers.len);
+        try std.testing.expectEqual(@as(usize, 2), state.position);
+        for ([_]f32{ 4, 8, 4, 8, 8, 12, 8, 12 }, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+    }
 }

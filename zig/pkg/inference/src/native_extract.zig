@@ -16,6 +16,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const backends = @import("backends/backends.zig");
+const backend_choice = @import("native_backend_choice.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const gliner_mod = @import("pipelines/gliner.zig");
 const ner_mod = @import("pipelines/ner.zig");
@@ -26,6 +27,8 @@ const BackendChoice = enum {
     auto,
     native,
     metal,
+    cuda,
+    xla,
 };
 
 const Options = struct {
@@ -33,6 +36,7 @@ const Options = struct {
     text: []const u8,
     schema_json: []const u8,
     backend: BackendChoice = .auto,
+    pjrt: @import("execution/pjrt_options.zig").Options = .{},
     relation_labels: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
@@ -43,6 +47,8 @@ const Options = struct {
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var opts = try parseArgs(allocator, args);
     defer opts.deinit(allocator);
+    try opts.pjrt.validateTask(.legacy_extraction);
+    try backend_choice.validate(backend_choice.parse(@tagName(opts.backend)).?);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, opts.schema_json, .{});
     defer parsed.deinit();
@@ -50,6 +56,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     configureBackendPreference(&session_manager, opts.backend);
+    try opts.pjrt.applyPolicy(&session_manager);
+    if (opts.backend == .xla) try opts.pjrt.configure(&session_manager);
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
@@ -101,7 +109,11 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--backend")) {
+        if (std.mem.startsWith(u8, arg, "--pjrt-")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            if (!try opts.pjrt.parse(arg, args[i])) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--backend")) {
             i += 1;
             if (i >= args.len) return error.MissingBackendValue;
             opts.backend = parseBackendChoice(args[i]) orelse return error.InvalidBackend;
@@ -253,6 +265,8 @@ fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 }
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
+    if (std.mem.eql(u8, value, "cuda")) return .cuda;
+    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .xla;
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
@@ -260,22 +274,23 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
-    session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal)
-            &.{ backends.BackendType.metal, backends.BackendType.native }
-        else
-            &.{backends.BackendType.native},
-        .native => &.{backends.BackendType.native},
-        .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-    };
+    if (choice != .auto) {
+        @import("native_backend_choice.zig").configureDirectSession(session_manager, @import("native_backend_choice.zig").parse(@tagName(choice)).?);
+        return;
+    }
+    session_manager.preferred_backends = if (build_options.enable_metal)
+        &.{ backends.BackendType.metal, backends.BackendType.native }
+    else
+        &.{backends.BackendType.native};
 }
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference extract <model-dir> <text> <schema-json> [--backend auto|native|metal] [--relation-label LABEL]...
+        \\usage: antfly inference extract <model-dir> <text> <schema-json> [--backend auto|native|metal|cuda|xla] [--relation-label LABEL]...
         \\  Runs native local extraction and prints a JSON response to stdout.
         \\
     , .{});
+    print("{s}\n", .{@import("execution/pjrt_options.zig").usage});
 }
 
 test "parseArgs accepts schema json and backend" {
@@ -309,4 +324,23 @@ test "parseArgs accepts repeated relation labels" {
     try std.testing.expectEqual(@as(usize, 2), opts.relation_labels.items.len);
     try std.testing.expectEqualStrings("works_for", opts.relation_labels.items[0]);
     try std.testing.expectEqualStrings("located_in", opts.relation_labels.items[1]);
+}
+
+test "task CLI extraction accepts explicit PJRT placement and retains owned parser cleanup" {
+    var options = try parseArgs(std.testing.allocator, &.{ "model", "Ada works at Antfly", "{}", "--backend", "pjrt", "--pjrt-device", "cpu", "--pjrt-precision", "f32" });
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqual(BackendChoice.xla, options.backend);
+    try std.testing.expect((try options.pjrt.sessionOptions()).memory_policy.? == .cpu);
+    try std.testing.expectEqual(BackendChoice.cuda, parseBackendChoice("cuda").?);
+}
+
+test "task direct legacy extractor honors explicit placement over inherited policy" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.required_backend = .pjrt;
+    manager.required_backend_invalid = true;
+    configureBackendPreference(&manager, .native);
+    var storage: [1]backends.BackendType = undefined;
+    const order = try manager.requiredBackendCandidates(&.{.pjrt}, &storage);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, order);
+    try std.testing.expect(!manager.required_backend_invalid);
 }

@@ -40,7 +40,7 @@ const ops = @import("../ops/ops.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const gpt_arch = @import("gpt.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
-const CudaLinearState = if (build_options.enable_cuda) @import("../ops/cuda/lighton_recurrent.zig").State else struct {
+const CudaLinearState = if (build_options.enable_cuda) @import("../ops/cuda/gated_delta.zig").State else struct {
     fn deinit(_: *@This()) void {}
 };
 
