@@ -1835,7 +1835,7 @@ checkpoint regardless, so this loses nothing a workload would need.
 
 ### 9.5 Recovery: last durable checkpoint plus a validated log prefix
 
-#### Protected redo files (native format v12)
+#### Protected redo files (native formats v12 and v13)
 
 Durable redo commits use two ordered barriers per group. The writer
 appends the existing compact redo records, flushes them, writes a
@@ -1852,13 +1852,21 @@ replaced by the next append. A failed frontier write or flush leaves the
 group outcome unknown. The writer retains the redo bytes and any
 referenced pages and requires reopening before another write.
 
-The idle checkpointer publishes the folded checkpoint before recycling
-the redo extent, and reader pins can defer that recycle. Each restart
-assigns a new salt. Vacuum creates a fresh protected extent and an empty
-frontier covered by its checkpoint. Owners with maintenance enabled
-schedule the v11 rewrite through the ordinary vacuum admission path,
-including its disk headroom and workspace checks. A manual vacuum can
-also upgrade a legacy file. New durable redo files use v12 at creation. A v11-only binary refuses to open a v12 file.
+New durable redo files use v13 and reserve two equal WAL extents.
+A fold can switch to the other extent while readers still need the one
+it is retiring. Reuse requires a checkpoint covering the destination's
+retirement sequence and reader pins at or past that sequence. The reset
+of a reusable destination is included in the folded pages' durability
+barrier. The subsequent durable checkpoint records the selected extent
+and the retirement sequence. The shared lock-region watermark publishes
+that selection with its offsets, and cold recovery reads the selector
+from the checkpoint.
+
+Vacuum constructs a fresh pair of extents and an empty frontier covered
+by its checkpoint. Owners with maintenance enabled schedule the v11 or
+v12 rewrite through the ordinary vacuum admission path, including its
+disk headroom and workspace checks. A manual vacuum can also upgrade a
+legacy file.
 
 Recovery becomes: open the on-disk checkpoint (still the v8/v9 slot
 mechanism's job -- `recoverActiveCheckpoint`, native.zig:15357-15420,

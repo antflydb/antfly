@@ -89,6 +89,42 @@ pub const header_len: usize = 32;
 pub const legacy_format_version: u16 = 1;
 pub const legacy_header_len: usize = 24;
 
+/// Two preallocated WAL extents. A checkpoint publishes the selected
+/// extent and the sequence that retired the previous one together.
+pub const SegmentRotation = struct {
+    active: u1 = 0,
+    retired_through: ?u64 = null,
+
+    /// Select the other extent only if the checkpoint covers the extent
+    /// being retired and no reader still needs the destination extent.
+    /// The caller publishes the result before appending to the new extent.
+    pub fn afterCheckpoint(self: SegmentRotation, checkpoint_sequence: u64, active_end_sequence: u64, oldest_reader: ?u64) ?SegmentRotation {
+        if (active_end_sequence > checkpoint_sequence) return null;
+        if (self.retired_through) |retired| {
+            if (retired > checkpoint_sequence) return null;
+            if (oldest_reader) |reader| {
+                if (reader < retired) return null;
+            }
+        }
+        return .{ .active = self.active ^ 1, .retired_through = checkpoint_sequence };
+    }
+
+    pub fn offset(self: SegmentRotation, base_offset: u64, extent_capacity: u64) !u64 {
+        return std.math.add(u64, base_offset, if (self.active == 0) 0 else extent_capacity);
+    }
+};
+
+test "redo segment rotation leaves the retired extent available to pinned readers" {
+    const initial: SegmentRotation = .{};
+    const rotated = initial.afterCheckpoint(12, 11, 4).?;
+    try std.testing.expectEqual(@as(u64, 8192), try rotated.offset(4096, 4096));
+    try std.testing.expect(rotated.afterCheckpoint(20, 19, 4) == null);
+    try std.testing.expect(rotated.afterCheckpoint(20, 21, null) == null);
+    const reused = rotated.afterCheckpoint(20, 19, 12).?;
+    try std.testing.expectEqual(@as(u64, 4096), try reused.offset(4096, 4096));
+    try std.testing.expectEqual(@as(?u64, 20), reused.retired_through);
+}
+
 /// A durable group frontier, stored separately from the records it covers.
 pub const Frontier = struct {
     generation: u64,

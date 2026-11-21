@@ -1213,6 +1213,7 @@ const recovery_agenda = @import("recovery_agenda.zig");
 pub const magic = "AFLITE\x0cP";
 pub const format_version: u32 = 11;
 pub const protected_redo_format_version: u32 = 12;
+pub const segmented_redo_format_version: u32 = 13;
 const redo_frontier_page_count = 2;
 pub const default_page_size: u32 = 4096;
 
@@ -4564,6 +4565,7 @@ pub const CheckpointSlot = struct {
     /// non-redo-log file (meaningless there) and for a brand-new/bootstrap
     /// checkpoint (nothing to fold yet, correctly).
     redo_folded_through: u64 = 0,
+    redo_rotation: ?redo_log.SegmentRotation = null,
 };
 
 /// A compact, log-record-sized encoding of exactly the `CheckpointSlot`
@@ -5306,7 +5308,20 @@ pub const Header = struct {
     redo_log_capacity: u64 = 0,
     protected_redo: bool = false,
 
+    segmented_redo: bool = false,
+
+    fn redoOffset(self: Header) u64 {
+        if (!self.segmented_redo) return self.redo_log_offset;
+        const rotation = self.checkpoints[self.active_checkpoint].redo_rotation orelse return self.redo_log_offset;
+        return rotation.offset(self.redo_log_offset, self.redo_log_capacity) catch unreachable;
+    }
+
+    pub fn redoReservation(self: Header) u64 {
+        return self.redo_log_capacity *| @as(u64, if (self.segmented_redo) 2 else 1);
+    }
+
     pub fn diskFormatVersion(self: Header) u32 {
+        if (self.segmented_redo) return segmented_redo_format_version;
         return if (self.protected_redo) protected_redo_format_version else format_version;
     }
 };
@@ -7229,6 +7244,7 @@ pub const NativeFile = struct {
     // A failed redo frontier publication may already name durable WAL bytes.
     // Preserve them and require reopening before another mutation.
     redo_frontier_uncertain: bool = false,
+    rotate_redo_on_checkpoint: bool = false,
     // A publication that fails after it may have started writing the slot
     // may leave disk ahead of header -- this means exactly that: a
     // publication *failed* in a way that leaves the relationship between
@@ -7668,7 +7684,7 @@ pub const NativeFile = struct {
     pub fn createWithRedoLog(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions, redo_log_capacity_bytes: u64) !NativeFile {
         var file = try createWithIo(allocator, io, path, opts);
         errdefer file.close();
-        try file.enableRedoLog(redo_log_capacity_bytes);
+        try file.enableRedoLog(redo_log_capacity_bytes, !opts.no_sync);
         return file;
     }
 
@@ -7680,7 +7696,7 @@ pub const NativeFile = struct {
     pub fn createWithRedoLogOwnedIo(allocator: Allocator, path: []const u8, opts: CreateOptions, redo_log_capacity_bytes: u64) !NativeFile {
         var file = try createWithOptions(allocator, path, opts);
         errdefer file.close();
-        try file.enableRedoLog(redo_log_capacity_bytes);
+        try file.enableRedoLog(redo_log_capacity_bytes, !opts.no_sync);
         return file;
     }
 
@@ -7778,12 +7794,13 @@ pub const NativeFile = struct {
     /// no such cross-check (`readFreePagesAlloc` tolerates a `page_count`
     /// ahead of the free-map page's own last-written content), so it
     /// keeps the simpler direct bump.
-    fn enableRedoLog(self: *NativeFile, capacity_bytes: u64) !void {
+    fn enableRedoLog(self: *NativeFile, capacity_bytes: u64, segmented: bool) !void {
         std.debug.assert(self.redo == null);
         const page_size: u64 = self.header.page_size;
         const frontier_pages: u64 = if (self.no_sync) 0 else redo_frontier_page_count;
         const log_pages = std.math.divCeil(u64, @max(capacity_bytes, 1), page_size) catch unreachable;
         const capacity = log_pages * page_size;
+        const total_log_pages = log_pages * @as(u64, if (segmented) 2 else 1);
         const io = self.runtimeIo();
 
         var checkpoint = self.header.checkpoints[self.header.active_checkpoint];
@@ -7792,12 +7809,12 @@ pub const NativeFile = struct {
         // Zero-filled, preallocated extent: `redo_log.replay`'s
         // end-of-region detection relies on untouched space reading back
         // as zero, exactly like every other page range this file grows.
-        try self.file.setLength(io, offset + capacity);
+        try self.file.setLength(io, offset + total_log_pages * page_size);
 
         if (self.header.indexed_reclamation) {
             var pages = try self.pageAllocatorFromFreeMap(checkpoint);
             defer pages.deinit();
-            for (0..log_pages + frontier_pages) |_| _ = try pages.allocateFresh();
+            for (0..total_log_pages + frontier_pages) |_| _ = try pages.allocateFresh();
             checkpoint.free_map_root_page = try pages.allocate();
             checkpoint.page_count = pages.next_page_id;
             try pages.flush();
@@ -7820,7 +7837,7 @@ pub const NativeFile = struct {
             try self.persistAllocator(&pages, &checkpoint);
             checkpoint.commit_sequence = epoch;
         } else {
-            checkpoint.page_count += log_pages + frontier_pages;
+            checkpoint.page_count += total_log_pages + frontier_pages;
         }
         // perf/lwa-fold-boundary: this file has no redo log at all yet
         // (`self.redo == null`, asserted above) -- everything this
@@ -7831,10 +7848,12 @@ pub const NativeFile = struct {
         // carries it forward unchanged; see `redo_folded_through`'s own
         // doc comment.
         checkpoint.redo_folded_through = checkpoint.commit_sequence;
+        if (segmented) checkpoint.redo_rotation = .{};
         self.header.checkpoints = .{ checkpoint, checkpoint };
         self.header.redo_log_offset = offset;
         self.header.redo_log_capacity = capacity;
         self.header.protected_redo = !self.no_sync;
+        self.header.segmented_redo = segmented;
 
         // Both checkpoint slots and the header are written here, but
         // deliberately synced *once*, together: a crash before that one
@@ -7974,7 +7993,7 @@ pub const NativeFile = struct {
         var apply: Apply = .{ .overlay = overlay, .io = io };
         const start_after = @max(floor, overlay.appliedThrough(), overlay.decodedThrough());
         if (start_offset > file.header.redo_log_capacity) return error.NativeRedoLogCorrupt;
-        var outcome = try redo_log.replayBounded(file.allocator, file.file, io, file.header.redo_log_offset + start_offset, file.header.redo_log_capacity - start_offset, start_after, ceiling, unlogged_through, Apply.onRecord, &apply);
+        var outcome = try redo_log.replayBounded(file.allocator, file.file, io, file.header.redoOffset() + start_offset, file.header.redo_log_capacity - start_offset, start_after, ceiling, unlogged_through, Apply.onRecord, &apply);
         outcome.valid_bytes += start_offset;
         if (outcome.valid_count != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
         return outcome;
@@ -8343,7 +8362,7 @@ pub const NativeFile = struct {
                 };
                 if (ctx.skip) return;
                 var rctx: RecordCtx = .{ .overlay = overlay, .pop_allocator = pop_allocator };
-                var full_outcome = try redo_log.replayBounded(pop_allocator, ctx.file.file, ctx.io, ctx.file.header.redo_log_offset + ctx.start_offset, ctx.end_offset - ctx.start_offset, ctx.start_after_sequence, ctx.max_sequence, ctx.check.covered, RecordCtx.onRecord, &rctx);
+                var full_outcome = try redo_log.replayBounded(pop_allocator, ctx.file.file, ctx.io, ctx.file.header.redoOffset() + ctx.start_offset, ctx.end_offset - ctx.start_offset, ctx.start_after_sequence, ctx.max_sequence, ctx.check.covered, RecordCtx.onRecord, &rctx);
                 full_outcome.valid_bytes += ctx.start_offset;
                 // A failure here discards the overlay this call built.
                 try ctx.check.verify(full_outcome);
@@ -8405,7 +8424,13 @@ pub const NativeFile = struct {
                 replay_ceiling = publishedReplayCeiling(r, checked);
                 published_offset = published.durable_offset;
                 durable_ceiling_offset = publishedDurableCeiling(r, published);
-                if (published.checkpoint_sequence <= folded_through) break;
+                if (published.checkpoint_sequence <= folded_through) {
+                    if (checkpoint.redo_rotation) |rotation| {
+                        if (checked != null and published.durable_sequence > folded_through and published.segment != rotation.active)
+                            return error.FileBusy;
+                    }
+                    break;
+                }
                 try self.adoptOnDiskCheckpoint(io);
                 checkpoint = self.activeCheckpoint();
                 const adopted = checkpoint.redo_folded_through;
@@ -8589,13 +8614,13 @@ pub const NativeFile = struct {
                 };
                 var visit: Visit = .{ .meta = &meta_ctx, .have_through = have_through, .allocator = allocator, .entry = entry, .io = io };
                 defer visit.deinit();
-                meta_outcome = try redo_log.replayBounded(allocator, self.file, io, self.header.redo_log_offset + fold_start, scan_end - fold_start, folded_through, ceiling, scan_check.covered, Visit.onRecord, &visit);
+                meta_outcome = try redo_log.replayBounded(allocator, self.file, io, self.header.redoOffset() + fold_start, scan_end - fold_start, folded_through, ceiling, scan_check.covered, Visit.onRecord, &visit);
                 meta_outcome.valid_bytes += fold_start;
                 try visit.flush(null);
                 if (visit.decoded != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
                 overlay_caught_up = true;
             } else {
-                meta_outcome = try redo_log.replayBounded(allocator, self.file, io, self.header.redo_log_offset + fold_start, scan_end - fold_start, folded_through, replay_ceiling, scan_check.covered, MetaCtx.onRecord, &meta_ctx);
+                meta_outcome = try redo_log.replayBounded(allocator, self.file, io, self.header.redoOffset() + fold_start, scan_end - fold_start, folded_through, replay_ceiling, scan_check.covered, MetaCtx.onRecord, &meta_ctx);
                 meta_outcome.valid_bytes += fold_start;
             }
             scan_check.verify(meta_outcome) catch |err| switch (err) {
@@ -8691,6 +8716,7 @@ pub const NativeFile = struct {
                 // physically-published checkpoint slot said it was.
                 self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
                 self.header.checkpoints[self.header.active_checkpoint].redo_folded_through = folded_through;
+                self.header.checkpoints[self.header.active_checkpoint].redo_rotation = checkpoint.redo_rotation;
             }
         }
 
@@ -8724,7 +8750,7 @@ pub const NativeFile = struct {
         const recovered_checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].commit_sequence;
         const resumed_sequence = @max(outcome.last_sequence orelse recovered_checkpoint_sequence, recovered_checkpoint_sequence);
         self.redo = RedoCommitState{
-            .writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, resumed_sequence),
+            .writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, outcome.valid_bytes, resumed_sequence),
             .shared = shared,
             .durable_sequence = resumed_sequence,
             .checkpoint_sequence = folded_through,
@@ -9345,6 +9371,10 @@ pub const NativeFile = struct {
         const previous_maintenance = self.maintenance_publication;
         self.maintenance_publication = true;
         defer self.maintenance_publication = previous_maintenance;
+        const previous_offset = redo.writer.base_offset;
+        self.rotate_redo_on_checkpoint = durable and self.header.segmented_redo and
+            !(builtin.is_test and self.test_skip_redo_log_zero);
+        defer self.rotate_redo_on_checkpoint = false;
         try self.commitTransactionWithDurability(durable, null);
 
         // Everything above is durable now (if `durable`); only space reclamation is
@@ -9428,8 +9458,20 @@ pub const NativeFile = struct {
         // pressure, the explicit API, or this same idle path once pressure
         // makes it durable) retries this and actually reclaims them.
         if (!durable) {
-            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, old_tail, new_checkpoint_sequence);
+            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, old_tail, new_checkpoint_sequence);
             redo.fold_start_offset = old_tail;
+            return;
+        }
+        if (self.header.segmented_redo) {
+            const selected = self.header.redoOffset();
+            const rotated = selected != previous_offset;
+            const tail = if (rotated) 0 else old_tail;
+            redo.writer = redo_log.Writer.initAt(self.file, io, selected, self.header.redo_log_capacity, tail, new_checkpoint_sequence);
+            redo.fold_start_offset = tail;
+            if (rotated) self.noteRedoLogReset(redo);
+            redo.tail_source = .own;
+            redo.tail_fold_boundary = new_checkpoint_sequence;
+            self.publishRedoLogState();
             return;
         }
         if (builtin.is_test and self.test_skip_redo_log_zero) {
@@ -9474,7 +9516,7 @@ pub const NativeFile = struct {
             self.noteRedoLogReset(redo);
             // The log is erased: appends start over at its beginning, even
             // if the capacity shrink below fails.
-            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, 0, redo.writer.last_sequence);
+            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, 0, redo.writer.last_sequence);
             redo.pending_log_reset = null;
             // §9.7f: the same "no cross-process reader pinned below the
             // checkpoint this fold just published" gate this branch
@@ -9484,7 +9526,7 @@ pub const NativeFile = struct {
             try self.maybeShrinkRedoLogCapacity();
             // The shrink's own slot-only commits advanced the sequence the
             // next append must follow.
-            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, 0, redo.writer.last_sequence);
+            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, 0, redo.writer.last_sequence);
             // perf/lwa-fold-churn: a clean reclaim means the next
             // opportunistic attempt is worth paying for again regardless
             // of what used to block it.
@@ -9511,7 +9553,7 @@ pub const NativeFile = struct {
             // own superseded-run handling (redo_log.zig) is built to
             // tolerate exactly this gap on a later reopen/cross-process
             // catch-up.
-            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, old_tail, new_checkpoint_sequence);
+            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, old_tail, new_checkpoint_sequence);
             redo.fold_start_offset = old_tail;
         }
         self.publishRedoLogState();
@@ -9566,6 +9608,7 @@ pub const NativeFile = struct {
     /// one of them for real content while a crash-recovered writer
     /// still believed it owned that exact byte range for the log.
     fn maybeShrinkRedoLogCapacity(self: *NativeFile) anyerror!void {
+        if (self.header.segmented_redo) return;
         // An earlier shrink interrupted after its header write still owes
         // its release; finish it first (its record names how much).
         try self.resumeRedoReservationRelease();
@@ -9624,6 +9667,7 @@ pub const NativeFile = struct {
     /// superseded log (gated on cross-process reader pins, as a fold's own
     /// reclaim is), resets the writer to the log's start, and shrinks.
     fn reclaimFoldedRedoReservation(self: *NativeFile, io: std.Io) anyerror!void {
+        if (self.header.segmented_redo) return;
         const redo: *RedoCommitState = &self.redo.?;
         redo.checkpointing = true;
         defer redo.checkpointing = false;
@@ -9645,12 +9689,12 @@ pub const NativeFile = struct {
             try self.eraseRedoLogPrefix(io, old_tail);
             redo.fold_start_offset = 0;
             self.noteRedoLogReset(redo);
-            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, 0, redo.writer.last_sequence);
+            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, 0, redo.writer.last_sequence);
             redo.pending_log_reset = null;
             self.publishRedoLogState();
         }
         try self.maybeShrinkRedoLogCapacity();
-        redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, 0, redo.writer.last_sequence);
+        redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, 0, redo.writer.last_sequence);
         self.publishRedoLogState();
     }
 
@@ -9845,6 +9889,11 @@ pub const NativeFile = struct {
                 redo.checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].redo_folded_through;
             }
 
+            if (self.activeCheckpoint().redo_rotation) |rotation| {
+                if (rotation.active != published.segment and published.durable_sequence > redo.checkpoint_sequence)
+                    return error.FileBusy;
+            }
+
             // Everything the writer has made durable is already folded into the
             // checkpoint just adopted. Its fold may be erasing the old log right
             // now (it published before checking pins, and may not have seen
@@ -9855,7 +9904,7 @@ pub const NativeFile = struct {
                 redo.shared.noteApplied(published.durable_sequence);
                 if (published.durable_sequence > redo.durable_sequence) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
                 redo.durable_sequence = @max(redo.durable_sequence, published.durable_sequence);
-                redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, published.durable_offset, redo.durable_sequence);
+                redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, published.durable_offset, redo.durable_sequence);
                 redo.tail_source = .unknown;
                 redo.tail_fold_boundary = null;
                 redo.tail_reset_generation = null;
@@ -9936,7 +9985,7 @@ pub const NativeFile = struct {
                 redo.shared.noteApplied(@max(published.durable_sequence, outcome.last_sequence orelse 0));
                 redo.durable_sequence = @max(redo.durable_sequence, seen);
                 const last_sequence = outcome.last_sequence orelse if (incremental) redo.writer.last_sequence else null;
-                redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, last_sequence);
+                redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, outcome.valid_bytes, last_sequence);
                 redo.tail_fold_boundary = redo.checkpoint_sequence;
                 redo.tail_reset_generation = published.reset_generation;
                 redo.log_reset_generation = @max(redo.log_reset_generation, published.reset_generation);
@@ -10337,9 +10386,9 @@ pub const NativeFile = struct {
     /// inside the region is unknown until writer authority rebuilds it.
     fn rebindRedoWriterToHeader(self: *NativeFile) void {
         const redo = if (self.redo) |*r| r else return;
-        if (redo.writer.base_offset == self.header.redo_log_offset and redo.writer.capacity == self.header.redo_log_capacity) return;
-        const moved = redo.writer.base_offset != self.header.redo_log_offset;
-        redo.writer.base_offset = self.header.redo_log_offset;
+        if (redo.writer.base_offset == self.header.redoOffset() and redo.writer.capacity == self.header.redo_log_capacity) return;
+        const moved = redo.writer.base_offset != self.header.redoOffset();
+        redo.writer.base_offset = self.header.redoOffset();
         redo.writer.capacity = self.header.redo_log_capacity;
         if (moved or redo.writer.tail > redo.writer.capacity) {
             redo.writer.tail = @min(redo.writer.tail, redo.writer.capacity);
@@ -10444,6 +10493,27 @@ pub const NativeFile = struct {
         return disk_header.checkpoints[recovered.index].commit_sequence > fold_sequence;
     }
 
+    fn prepareRedoSegmentRotation(self: *NativeFile, next: *CheckpointSlot, previous: Header) !void {
+        const rotation = previous.checkpoints[previous.active_checkpoint].redo_rotation orelse return error.InvalidNativeCheckpoint;
+        const io = self.runtimeIo();
+        // If the reader registry is unavailable, retain the old extent
+        // until a subsequent checkpoint can prove it is reusable.
+        const region = (try self.regionForInode()) orelse return;
+        const redo = &self.redo.?;
+        const oldest = region.minimumUncoveredPinnedSequence(antfly_platform.process.currentId() orelse 0, redo.shared.minimumPin(io));
+        const selected = rotation.afterCheckpoint(next.commit_sequence, redo.writer.last_sequence orelse 0, oldest) orelse return;
+        const offset = try selected.offset(previous.redo_log_offset, previous.redo_log_capacity);
+        const zeros: [redo_log.header_len]u8 = @splat(0);
+        try self.file.writePositionalAll(io, &zeros, offset);
+        if (builtin.is_test) if (self.test_fail_redo_log_erase) |err| {
+            self.test_fail_redo_log_erase = null;
+            return err;
+        };
+        // The pre-checkpoint data barrier persists this reset together
+        // with the folded data pages before the selector is written.
+        next.redo_rotation = selected;
+    }
+
     /// Ends the redo log at its start, so replay of the reset log stops
     /// there, and syncs. Only the first record header is zeroed: every
     /// append writes an end marker after its own record
@@ -10455,7 +10525,7 @@ pub const NativeFile = struct {
         if (used == 0) return;
         const zeros: [redo_log.header_len]u8 = @splat(0);
         const len: usize = @intCast(@min(used, @as(u64, redo_log.header_len)));
-        try self.file.writePositionalAll(io, zeros[0..len], self.header.redo_log_offset);
+        try self.file.writePositionalAll(io, zeros[0..len], self.header.redoOffset());
         if (builtin.is_test) if (self.test_fail_redo_log_erase) |err| {
             self.test_fail_redo_log_erase = null;
             return err;
@@ -10479,7 +10549,7 @@ pub const NativeFile = struct {
             // region; a redo append advances neither slot): check the log
             // itself too. A complete record newer than the fold at its start
             // means another writer reset the log and appended there.
-            const reused = try redo_log.firstRecordNewerThan(self.allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, pending.fold_sequence);
+            const reused = try redo_log.firstRecordNewerThan(self.allocator, self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, pending.fold_sequence);
             if (reused != null or try self.redoLogAdvancedPast(io, pending.fold_sequence)) {
                 redo.pending_log_reset = null;
                 redo.tail_source = .unknown;
@@ -10489,7 +10559,7 @@ pub const NativeFile = struct {
             try self.eraseRedoLogPrefix(io, pending.old_tail);
             redo.fold_start_offset = 0;
             self.noteRedoLogReset(redo);
-            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, 0, redo.writer.last_sequence);
+            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, 0, redo.writer.last_sequence);
             redo.pending_log_reset = null;
             redo.tail_source = .own;
             self.publishRedoLogState();
@@ -10589,7 +10659,7 @@ pub const NativeFile = struct {
                 };
                 var visit: Visit = .{ .overlay = overlay, .have_through = @max(overlay.appliedThrough(), overlay.decodedThrough()) };
                 const file = ctx.file;
-                ctx.outcome = try redo_log.replayBounded(file.allocator, file.file, ctx.io, file.header.redo_log_offset + ctx.start_offset, ctx.end_offset - ctx.start_offset, ctx.floor, ctx.ceiling, ctx.unlogged_through, Visit.onRecord, &visit);
+                ctx.outcome = try redo_log.replayBounded(file.allocator, file.file, ctx.io, file.header.redoOffset() + ctx.start_offset, ctx.end_offset - ctx.start_offset, ctx.floor, ctx.ceiling, ctx.unlogged_through, Visit.onRecord, &visit);
                 ctx.outcome.valid_bytes += ctx.start_offset;
                 ctx.compact = visit.compact;
                 if (visit.decoded != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
@@ -10605,7 +10675,7 @@ pub const NativeFile = struct {
                     (scan.valid_count != 0 and scan.generation != seal.frontier.generation)))
                 return error.NativeRedoLogCorrupt;
         } else if (scan.stop_reason == .corrupt_record) {
-            if (!try discardTornRedoAppend(self.file, io, self.header.redo_log_offset, capacity, scan, covered, published)) return error.NativeRedoLogCorrupt;
+            if (!try discardTornRedoAppend(self.file, io, self.header.redoOffset(), capacity, scan, covered, published)) return error.NativeRedoLogCorrupt;
         }
         // Whatever stopped the scan (zeros, a short read, corruption), the
         // log must still hold everything the watermark promised as durable.
@@ -10635,11 +10705,12 @@ pub const NativeFile = struct {
                 var recovered_header = self.header;
                 recovered_header.checkpoints[active] = compact.toCheckpointSlot();
                 recovered_header.checkpoints[active].redo_folded_through = self.header.checkpoints[active].redo_folded_through;
+                recovered_header.checkpoints[active].redo_rotation = self.header.checkpoints[active].redo_rotation;
                 try self.adoptIndexPublicationHeader(recovered_header);
             }
         };
         const last = @max(scan.last_sequence orelse 0, floor, redo.writer.last_sequence orelse 0);
-        redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, capacity, scan.valid_bytes, if (last == 0) null else last);
+        redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), capacity, scan.valid_bytes, if (last == 0) null else last);
         if (scan.valid_count != 0) {
             redo.shared.noteApplied(last);
             _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
@@ -10688,9 +10759,9 @@ pub const NativeFile = struct {
     /// region, a position past `floor`, and a log that still starts with the
     /// cursor's run (its first record carries the cursor's salt; a restart
     /// picks a new one). Null sends the caller to a full scan.
-    fn redoResumeCursor(self: *NativeFile, io: std.Io, entry: *inode_lock.Entry, floor: u64) !?inode_lock.RedoAppendCursor {
+    fn redoResumeCursor(self: *NativeFile, io: std.Io, entry: *inode_lock.Entry, floor: u64, header: Header) !?inode_lock.RedoAppendCursor {
         const cursor = inode_lock.redoAppendCursor(entry, io) orelse return null;
-        if (cursor.log_offset != self.header.redo_log_offset or cursor.capacity != self.header.redo_log_capacity) return null;
+        if (cursor.log_offset != header.redoOffset() or cursor.capacity != header.redo_log_capacity) return null;
         if (cursor.tail == 0 or cursor.tail > cursor.capacity or cursor.last_sequence < floor) return null;
         const salt = (try redo_log.firstRecordSalt(self.file, io, cursor.log_offset, cursor.capacity)) orelse return null;
         if (salt != cursor.salt) return null;
@@ -10789,10 +10860,10 @@ pub const NativeFile = struct {
                 // where it left the tail when the log still starts with the
                 // same run, instead of rereading and checksumming every
                 // retained record. The shared overlay already holds them.
-                const resume_at = try self.redoResumeCursor(io, entry, floor);
+                const resume_at = try self.redoResumeCursor(io, entry, floor, header);
                 if (builtin.is_test and resume_at == null) test_stale_writer_full_scans += 1;
                 const start_offset: u64 = if (resume_at) |cursor| cursor.tail else 0;
-                var outcome = try redo_log.replayBounded(self.allocator, self.file, io, self.header.redo_log_offset + start_offset, self.header.redo_log_capacity - start_offset, if (resume_at) |cursor| @max(floor, cursor.last_sequence) else floor, null, header.checkpoints[header.active_checkpoint].commit_sequence, Noop.onRecord, null);
+                var outcome = try redo_log.replayBounded(self.allocator, self.file, io, header.redoOffset() + start_offset, header.redo_log_capacity - start_offset, if (resume_at) |cursor| @max(floor, cursor.last_sequence) else floor, null, header.checkpoints[header.active_checkpoint].commit_sequence, Noop.onRecord, null);
                 outcome.valid_bytes += start_offset;
                 if (resume_at) |cursor| if (outcome.last_sequence == null) {
                     outcome.last_sequence = cursor.last_sequence;
@@ -10809,6 +10880,8 @@ pub const NativeFile = struct {
                 // two races on.
                 const ceiling = if (self.regionForInode() catch null) |r| publishedDurableCeiling(r, r.readLogState()) else null;
                 if (outcome.stop_reason == .corrupt_record and (ceiling == null or outcome.valid_bytes < ceiling.?)) return error.NativeRedoLogCorrupt;
+                redo.writer.base_offset = header.redoOffset();
+                redo.writer.capacity = header.redo_log_capacity;
                 redo.writer.tail = outcome.valid_bytes;
                 // Another handle may have restarted the log since: learn the
                 // salt of the run this tail belongs to.
@@ -11283,6 +11356,7 @@ pub const NativeFile = struct {
             var slot_payload: [checkpoint_slot_payload_size]u8 = undefined;
             encodeCheckpointSlotPayload(&slot_payload, slot);
             hasher.update(&slot_payload);
+            if (slot.redo_rotation) |rotation| hasher.update(&encodeCheckpointRotation(rotation));
         }
         var digest: [32]u8 = undefined;
         hasher.final(&digest);
@@ -11631,6 +11705,7 @@ pub const NativeFile = struct {
             .durable_sequence = redo.syncedSequence(),
             .durable_offset = redo.writer.tail,
             .fold_start_offset = redo.fold_start_offset,
+            .segment = if (self.activeCheckpoint().redo_rotation) |rotation| rotation.active else 0,
             .reset_generation = redo.log_reset_generation,
         });
     }
@@ -13316,7 +13391,7 @@ pub const NativeFile = struct {
         // so a page that is *not* actually recoverable -- truly missing,
         // not merely undiverted -- still fails there, not here.
         const truncation_floor = if (self.header.redo_log_capacity != 0)
-            self.header.redo_log_offset +| self.header.redo_log_capacity
+            self.header.redo_log_offset +| self.header.redoReservation()
         else
             expected_size;
         if (file_size < truncation_floor) return invalidCheck(report, "truncated_file");
@@ -17917,6 +17992,11 @@ pub const NativeFile = struct {
         // the same budget by construction.
         const reserve_redo_log = self.redo != null;
         const frontier_pages: u64 = if (self.no_sync) 0 else redo_frontier_page_count;
+        const extent_count: u64 = if (self.no_sync) 1 else 2;
+        const target_capacity = if (self.redo_log_budget_bytes != 0)
+            @min(self.header.redo_log_capacity, redoLogCapacityForBudget(self.redo_log_budget_bytes))
+        else
+            self.header.redo_log_capacity;
         var redo_log_offset_bytes: u64 = 0;
         var redo_log_capacity_bytes: u64 = 0;
 
@@ -17974,10 +18054,10 @@ pub const NativeFile = struct {
             // its own last-written content -- that function's own doc
             // comment).
             const page_size_u64: u64 = self.header.page_size;
-            const log_pages = std.math.divCeil(u64, @max(self.header.redo_log_capacity, 1), page_size_u64) catch unreachable;
+            const log_pages = std.math.divCeil(u64, @max(target_capacity, 1), page_size_u64) catch unreachable;
             redo_log_offset_bytes = (next_page_id + frontier_pages) * page_size_u64;
             redo_log_capacity_bytes = log_pages * page_size_u64;
-            next_page_id += log_pages + frontier_pages;
+            next_page_id += log_pages * extent_count + frontier_pages;
         }
 
         var checkpoint = CheckpointSlot{
@@ -18043,10 +18123,10 @@ pub const NativeFile = struct {
                 // checkpoint's `page_count` (set by `persistAllocator`
                 // below, from `pages.next_page_id`) land in lockstep.
                 const page_size_u64: u64 = self.header.page_size;
-                const log_pages = std.math.divCeil(u64, @max(self.header.redo_log_capacity, 1), page_size_u64) catch unreachable;
+                const log_pages = std.math.divCeil(u64, @max(target_capacity, 1), page_size_u64) catch unreachable;
                 redo_log_offset_bytes = (next_page_id + frontier_pages) * page_size_u64;
                 redo_log_capacity_bytes = log_pages * page_size_u64;
-                for (0..log_pages + frontier_pages) |_| _ = try pages.allocateFresh();
+                for (0..log_pages * extent_count + frontier_pages) |_| _ = try pages.allocateFresh();
             }
             checkpoint.free_map_root_page = try pages.allocate();
             try writer.persistAllocator(&pages, &checkpoint);
@@ -18107,6 +18187,10 @@ pub const NativeFile = struct {
         compact_header.redo_log_offset = redo_log_offset_bytes;
         compact_header.redo_log_capacity = redo_log_capacity_bytes;
         compact_header.protected_redo = reserve_redo_log and !self.no_sync;
+        compact_header.segmented_redo = compact_header.protected_redo;
+        if (compact_header.segmented_redo) {
+            for (&compact_header.checkpoints) |*slot| slot.redo_rotation = .{};
+        }
         var encoded_header: [header_size]u8 = undefined;
         encodeHeader(&encoded_header, compact_header);
         try compact_file.writePositionalAll(io, &encoded_header, 0);
@@ -20698,8 +20782,22 @@ pub const NativeFile = struct {
         {
             // The write landed. Adopt it exactly as the successful tail of
             // `publishCheckpoint` would have.
+            const old_offset = self.header.redoOffset();
+            if (self.header.segmented_redo) try self.syncRedoData();
             self.header.checkpoints[slot_index] = on_disk;
             self.header.active_checkpoint = slot_index;
+            const selected = self.header.redoOffset();
+            if (selected != old_offset) if (self.redo) |*redo| {
+                redo.writer = redo_log.Writer.initAt(self.file, io, selected, self.header.redo_log_capacity, 0, on_disk.commit_sequence);
+                redo.checkpoint_sequence = on_disk.redo_folded_through;
+                redo.durable_sequence = on_disk.commit_sequence;
+                redo.fold_start_offset = 0;
+                redo.tail_source = .own;
+                redo.tail_fold_boundary = redo.checkpoint_sequence;
+                redo.shared.reclaim(std.heap.page_allocator, io, redo.checkpoint_sequence);
+                self.noteRedoLogReset(redo);
+                self.publishRedoLogState();
+            };
             self.last_synced_header = self.header;
         }
         // Else: the previous checkpoint is still active in `self.header`
@@ -21257,6 +21355,9 @@ pub const NativeFile = struct {
             self.namespace_directory_delta_depth = 0;
         }
         if (changed) next.commit_sequence = previous.checkpoints[previous.active_checkpoint].commit_sequence + 1;
+        if (changed and self.rotate_redo_on_checkpoint) {
+            try self.prepareRedoSegmentRotation(&next, previous);
+        }
         // perf/lwa-fold-boundary: the general case of the same stamp the
         // certify-on-commit branch above already applies for itself --
         // most commits never go through that branch at all, so this is
@@ -22733,7 +22834,7 @@ pub const NativeFile = struct {
             // surviving overlay, while the fold boundary
             // (`redo_folded_through`) stays truthful for `self`'s own
             // later folds.
-            try self.attachFreshRedoState(io, self.header.redo_log_offset, self.header.redo_log_capacity, self.activeCheckpoint().commit_sequence, self.activeCheckpoint().redo_folded_through);
+            try self.attachFreshRedoState(io, self.header.redoOffset(), self.header.redo_log_capacity, self.activeCheckpoint().commit_sequence, self.activeCheckpoint().redo_folded_through);
             // `attachFreshRedoState`'s own `Writer.init` call above always
             // resumes at `tail = 0`, correct only for the "nothing to
             // replay yet" case its doc comment promises (a vacuum's
@@ -23265,6 +23366,7 @@ fn recoverCrashedWriterDataFile(allocator: Allocator, io: std.Io, path: []const 
     const file_size = (try file.stat(io)).size;
     header.checkpoints = loadCheckpointSlots(file, io, header.page_size, file_size);
     const recovered = try recoverActiveCheckpoint(file, io, header, file_size, !header.protected_redo);
+    header.active_checkpoint = recovered.index;
     if (region) |r| if (header.redo_log_capacity != 0) try recoverCrashedWriterRedoState(allocator, io, file, header, header.checkpoints[recovered.index], r);
 }
 
@@ -23305,7 +23407,7 @@ fn recoverCrashedWriterRedoState(allocator: Allocator, io: std.Io, file: std.Io.
         if (seal.frontier.end_offset == 0 or seal.frontier.end_offset > header.redo_log_capacity) return error.NativeRedoLogCorrupt;
         break :end seal.frontier.end_offset;
     } else header.redo_log_capacity;
-    const outcome = try redo_log.replayBounded(allocator, file, io, header.redo_log_offset, scan_end, folded_through, ceiling, checkpoint.commit_sequence, null, null);
+    const outcome = try redo_log.replayBounded(allocator, file, io, header.redoOffset(), scan_end, folded_through, ceiling, checkpoint.commit_sequence, null, null);
     const published = region.readLogStateChecked();
     if (persisted) |seal| {
         if (seal.frontier.sequence > folded_through and
@@ -23327,7 +23429,12 @@ fn recoverCrashedWriterRedoState(allocator: Allocator, io: std.Io, file: std.Io.
         if (current.durable_sequence == durable_sequence and current.durable_offset == outcome.valid_bytes and current.checkpoint_sequence == folded_through) return;
     }
     try file.sync(io);
-    region.publishLogState(.{ .checkpoint_sequence = folded_through, .durable_sequence = durable_sequence, .durable_offset = outcome.valid_bytes });
+    region.publishLogState(.{
+        .checkpoint_sequence = folded_through,
+        .durable_sequence = durable_sequence,
+        .durable_offset = outcome.valid_bytes,
+        .segment = if (checkpoint.redo_rotation) |rotation| rotation.active else 0,
+    });
 }
 
 const FairLockRecoveryCtx = struct {
@@ -24014,7 +24121,7 @@ pub fn decodeHeader(raw: []const u8) !Header {
     if (!std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    if (version != format_version and version != protected_redo_format_version) return error.UnsupportedNativeFormatVersion;
+    if (version != format_version and version != protected_redo_format_version and version != segmented_redo_format_version) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -24032,7 +24139,9 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const indexed_reclamation = flags & feature_flag_indexed_reclamation != 0;
     const redo_offset = std.mem.readInt(u64, header_raw[redo_log_offset_offset..][0..8], .little);
     const redo_capacity = std.mem.readInt(u64, header_raw[redo_log_capacity_offset..][0..8], .little);
-    const protected_redo = version == protected_redo_format_version;
+    const segmented_redo = version == segmented_redo_format_version;
+    const protected_redo = version == protected_redo_format_version or segmented_redo;
+    if (segmented_redo and redo_capacity > (std.math.maxInt(u64) - redo_offset) / 2) return error.InvalidNativeHeaderSize;
     if (protected_redo and (redo_capacity == 0 or redo_offset % page_size != 0 or
         redo_offset / page_size < reserved_header_pages + redo_frontier_page_count))
         return error.InvalidNativeHeaderSize;
@@ -24047,6 +24156,7 @@ pub fn decodeHeader(raw: []const u8) !Header {
         .redo_log_offset = redo_offset,
         .redo_log_capacity = redo_capacity,
         .protected_redo = protected_redo,
+        .segmented_redo = segmented_redo,
     };
 }
 
@@ -24317,15 +24427,37 @@ fn encodeCheckpointSlotPayload(out: *[checkpoint_slot_payload_size]u8, slot: Che
     std.mem.writeInt(u64, out[136..144], slot.redo_folded_through, .little);
 }
 
+const checkpoint_rotation_payload_size = 16;
+
+fn encodeCheckpointRotation(rotation: redo_log.SegmentRotation) [checkpoint_rotation_payload_size]u8 {
+    var bytes: [checkpoint_rotation_payload_size]u8 = @splat(0);
+    bytes[0] = rotation.active;
+    bytes[1] = @intFromBool(rotation.retired_through != null);
+    std.mem.writeInt(u64, bytes[8..16], rotation.retired_through orelse 0, .little);
+    return bytes;
+}
+
 fn encodeCheckpointSlotPage(out: []u8, slot: CheckpointSlot) void {
     var payload: [checkpoint_slot_payload_size]u8 = undefined;
     encodeCheckpointSlotPayload(&payload, slot);
-    encodePage(out, .checkpoint_slot, &payload);
+    if (slot.redo_rotation) |rotation| {
+        encodePageParts(out, .checkpoint_slot, &payload, &encodeCheckpointRotation(rotation));
+    } else encodePage(out, .checkpoint_slot, &payload);
 }
 
 fn decodeCheckpointSlotPage(raw: []const u8) !CheckpointSlot {
     const payload = try decodePagePayload(raw, .checkpoint_slot);
-    if (payload.len != checkpoint_slot_payload_size) return error.InvalidNativeCheckpoint;
+    const rotation: ?redo_log.SegmentRotation = switch (payload.len) {
+        checkpoint_slot_payload_size => null,
+        checkpoint_slot_payload_size + checkpoint_rotation_payload_size => rotation: {
+            const bytes = payload[checkpoint_slot_payload_size..];
+            if (bytes[0] > 1 or bytes[1] > 1) return error.InvalidNativeCheckpoint;
+            const retired = std.mem.readInt(u64, bytes[8..16], .little);
+            if (retired > std.mem.readInt(u64, payload[136..144], .little)) return error.InvalidNativeCheckpoint;
+            break :rotation .{ .active = @intCast(bytes[0]), .retired_through = if (bytes[1] == 1) retired else null };
+        },
+        else => return error.InvalidNativeCheckpoint,
+    };
     return .{
         .commit_sequence = std.mem.readInt(u64, payload[0..8], .little),
         .catalog_root_page = std.mem.readInt(u64, payload[8..16], .little),
@@ -24345,7 +24477,24 @@ fn decodeCheckpointSlotPage(raw: []const u8) !CheckpointSlot {
         .manifest_page_count = std.mem.readInt(u32, payload[124..128], .little),
         .presynced = payload[128] != 0,
         .redo_folded_through = std.mem.readInt(u64, payload[136..144], .little),
+        .redo_rotation = rotation,
     };
+}
+
+test "lite checkpoint round-trips redo segment rotation" {
+    var page: [default_page_size]u8 = undefined;
+    const slot: CheckpointSlot = .{
+        .commit_sequence = 20,
+        .redo_folded_through = 19,
+        .redo_rotation = .{ .active = 1, .retired_through = 19 },
+    };
+    encodeCheckpointSlotPage(&page, slot);
+    try std.testing.expectEqualDeep(slot, try decodeCheckpointSlotPage(&page));
+
+    var legacy = slot;
+    legacy.redo_rotation = null;
+    encodeCheckpointSlotPage(&page, legacy);
+    try std.testing.expectEqualDeep(legacy, try decodeCheckpointSlotPage(&page));
 }
 
 /// Shared by `NativeFile.writeSlotPage` and anything that builds a whole new
@@ -24503,6 +24652,8 @@ fn recoverActiveCheckpoint(
             const index: u8 = @intCast(raw_index);
             if (std.mem.indexOfScalar(u8, order[0..candidates], index) != null) continue;
             if (!validCheckpointSlot(slot)) continue;
+            if (header.segmented_redo != (slot.redo_rotation != null)) continue;
+            if (header.segmented_redo and header.redo_log_offset + header.redoReservation() > (checkpointPrefixSize(slot, header.page_size) catch continue)) continue;
             const expected_size = checkpointPrefixSize(slot, header.page_size) catch continue;
             if (expected_size > file_size) continue;
             if (best == null or slot.commit_sequence > header.checkpoints[best.?].commit_sequence) best = index;
@@ -25272,7 +25423,7 @@ test "lite native header rejects corrupted checksum" {
 test "lite native header rejects unsupported format version" {
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{});
-    std.mem.writeInt(u32, encoded[version_offset..][0..4], protected_redo_format_version + 1, .little);
+    std.mem.writeInt(u32, encoded[version_offset..][0..4], segmented_redo_format_version + 1, .little);
 
     try std.testing.expectError(error.UnsupportedNativeFormatVersion, decodeHeader(&encoded));
 }
@@ -25937,7 +26088,7 @@ test "lite native open rejects unsupported format version" {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
         var raw_version: [4]u8 = undefined;
-        std.mem.writeInt(u32, &raw_version, protected_redo_format_version + 1, .little);
+        std.mem.writeInt(u32, &raw_version, segmented_redo_format_version + 1, .little);
         try file.writePositionalAll(std.testing.io, &raw_version, version_offset);
     }
 
@@ -36205,7 +36356,7 @@ test "lite redo log a second writer-mode handle catches up across a deferred fol
     const path = try testPath(a, tmp, "redo-stale-writer-deferred-fold.aflite");
     defer a.free(path);
 
-    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    var writer = try createSingleExtentRedoForTest(a, std.testing.io, path, .{}, 64 * 1024);
     try writer.beginTransaction();
     try writer.putDocument("alpha", "one");
     try writer.commitTransaction();
@@ -36290,7 +36441,7 @@ test "lite redo log checkpointer defers log reclaim while a reader without an ov
     const path = try testPath(a, tmp, "redo-refresh-gate.aflite");
     defer a.free(path);
 
-    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    var writer = try createSingleExtentRedoForTest(a, std.testing.io, path, .{}, 64 * 1024);
     defer writer.close();
     try writer.beginTransaction();
     try writer.putDocument("alpha", "one");
@@ -36627,7 +36778,7 @@ test "lite redo log rollback after a sync failure never truncates another commit
     try std.testing.expect((try reopened.check()).valid);
 }
 
-test "lite redo log cross-process: a forked child sees commits the parent makes after the child opens" {
+test "lite redo log cross-process: a forked child reads commits from the newly selected extent" {
     if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -36656,11 +36807,14 @@ test "lite redo log cross-process: a forked child sees commits the parent makes 
         var reader = NativeFile.openWithIo(a, io, path, .{ .read_only = true }) catch crossProcessParkForever();
         const region = (reader.regionForInode() catch crossProcessParkForever()) orelse crossProcessParkForever();
         region.reclaimLivenessAfterFork() catch crossProcessParkForever();
+        const ready: [1]u8 = .{1};
+        _ = std.c.write(result_fds[1], &ready, ready.len);
         var go: [1]u8 = undefined;
         crossProcessReadBounded(go_fds[0], &go, cross_process_fork_read_timeout_ms) catch crossProcessParkForever();
         reader.refreshCrossProcessRedoOverlay() catch crossProcessParkForever();
         const beta = (reader.getDocumentAlloc(a, "beta") catch crossProcessParkForever()) orelse crossProcessParkForever();
-        const ok = std.mem.eql(u8, beta, "two");
+        const rotation = reader.activeCheckpoint().redo_rotation orelse crossProcessParkForever();
+        const ok = rotation.active == 1 and std.mem.eql(u8, beta, "two");
         const report: [1]u8 = .{if (ok) 1 else 0};
         _ = std.c.write(result_fds[1], &report, report.len);
         crossProcessParkForever();
@@ -36675,6 +36829,11 @@ test "lite redo log cross-process: a forked child sees commits the parent makes 
     defer _ = std.posix.system.close(go_fds[1]);
     defer _ = std.posix.system.close(result_fds[0]);
 
+    var ready: [1]u8 = undefined;
+    try crossProcessReadBounded(result_fds[0], &ready, cross_process_fork_read_timeout_ms);
+    try std.testing.expectEqual(@as(u8, 1), ready[0]);
+    try writer.checkpointRedoLog();
+    try std.testing.expectEqual(@as(u1, 1), writer.activeCheckpoint().redo_rotation.?.active);
     try writer.beginTransaction();
     try writer.putDocument("beta", "two");
     try writer.commitTransaction();
@@ -36696,6 +36855,13 @@ test "lite redo log cross-process: a forked child sees commits the parent makes 
 // record, so the log skips that sequence. Another process catching up from
 // before the fold must start after the checkpoint it adopts, not walk into
 // the skipped sequence and report the gap as `NativeRedoLogCorrupt`.
+fn createSingleExtentRedoForTest(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions, capacity: u64) !NativeFile {
+    var file = try NativeFile.createWithIo(allocator, io, path, opts);
+    errdefer file.close();
+    try file.enableRedoLog(capacity, false);
+    return file;
+}
+
 test "lite redo log cross-process: a forked child catches up across a deferred fold's skipped sequence" {
     if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -36704,7 +36870,7 @@ test "lite redo log cross-process: a forked child catches up across a deferred f
     const path = try testPath(a, tmp, "redo-fork-deferred-fold.aflite");
     defer a.free(path);
 
-    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    var writer = try createSingleExtentRedoForTest(a, std.testing.io, path, .{}, 64 * 1024);
     defer writer.close();
     try writer.beginTransaction();
     try writer.putDocument("alpha", "one");
@@ -36806,7 +36972,7 @@ test "lite redo log cross-process: a cold open pins before scanning so a concurr
     const path = try testPath(a, tmp, "redo-coldopen-scan-pin.aflite");
     defer a.free(path);
 
-    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    var writer = try createSingleExtentRedoForTest(a, std.testing.io, path, .{}, 64 * 1024);
     defer writer.close();
     try writer.beginTransaction();
     try writer.putDocument("alpha", "one");
@@ -37035,6 +37201,14 @@ var test_cold_recovery_sync: struct { count: u32 = 0, fail: ?anyerror = null } =
 fn writeLegacyRedoHeaderForTest(writer: *NativeFile, io: std.Io) !void {
     var legacy = writer.header;
     legacy.protected_redo = false;
+    legacy.segmented_redo = false;
+    const file_size = (try writer.file.stat(io)).size;
+    for (loadCheckpointSlots(writer.file, io, legacy.page_size, file_size), 0..) |slot, i| {
+        if (slot.page_count == 0) continue;
+        var old_slot = slot;
+        old_slot.redo_rotation = null;
+        try writeSlotPageTo(writer.file, io, legacy.page_size, @intCast(i), old_slot);
+    }
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, legacy);
     try writer.file.writePositionalAll(io, &encoded, 0);
@@ -37175,7 +37349,7 @@ test "lite redo log cross-process: checkpointer defers reclaim while a forked ch
     const path = try testPath(a, tmp, "redo-fork-gate.aflite");
     defer a.free(path);
 
-    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    var writer = try createSingleExtentRedoForTest(a, std.testing.io, path, .{}, 64 * 1024);
     defer writer.close();
     try writer.beginTransaction();
     try writer.putDocument("alpha", "one");
@@ -39376,7 +39550,7 @@ test "lite redo log a failed log erase is finished before the next append" {
     const path = try testPath(a, tmp, "redo-failed-erase.aflite");
     defer a.free(path);
     {
-        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        var writer = try createSingleExtentRedoForTest(a, io, path, .{}, 64 * 1024);
         defer writer.close();
         try writer.beginTransaction();
         try writer.putDocument("alpha", "one");
@@ -39683,6 +39857,69 @@ test "lite redo durable frontier failure retains redo for recovery" {
     try expectRedoDocument(&reader, "beta", "two");
 }
 
+test "lite redo segment rotation switches extents and recovers the selected extent" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-two-extents.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        const first_offset = writer.header.redoOffset();
+        try writer.beginTransaction();
+        try writer.putDocument("alpha", "one");
+        try writer.commitTransaction();
+
+        const region = (try writer.regionForInode()).?;
+        const slot = try region.claimReaderSlot(antfly_platform.process.currentId().?);
+        defer region.releaseReaderSlot(slot);
+        region.pinReader(slot, writer.committedSequence());
+        try writer.checkpointRedoLog();
+        const second_offset = writer.header.redoOffset();
+        try std.testing.expectEqual(first_offset + writer.header.redo_log_capacity, second_offset);
+
+        try writer.beginTransaction();
+        try writer.putDocument("beta", "two");
+        try writer.commitTransaction();
+        try std.testing.expectEqual(second_offset, writer.redo.?.writer.base_offset);
+        try writer.checkpointRedoLog();
+        try std.testing.expectEqual(second_offset, writer.header.redoOffset());
+
+        try writer.beginTransaction();
+        try writer.putDocument("gamma", "three");
+        try writer.commitTransaction();
+    }
+    var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+    defer region.close();
+    region.resetLogStateForTest();
+    {
+        var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+        defer reader.close();
+        try std.testing.expectEqual(@as(u1, 1), reader.activeCheckpoint().redo_rotation.?.active);
+        try expectRedoDocument(&reader, "alpha", "one");
+        try expectRedoDocument(&reader, "beta", "two");
+        try expectRedoDocument(&reader, "gamma", "three");
+    }
+    {
+        var writer = try NativeFile.openWithIo(a, io, path, .{});
+        defer writer.close();
+        try writer.checkpointRedoLog();
+        try std.testing.expectEqual(@as(u1, 0), writer.activeCheckpoint().redo_rotation.?.active);
+        try writer.beginTransaction();
+        try writer.putDocument("delta", "four");
+        try writer.commitTransaction();
+    }
+    region.resetLogStateForTest();
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reader.close();
+    try std.testing.expectEqual(@as(u1, 0), reader.activeCheckpoint().redo_rotation.?.active);
+    try expectRedoDocument(&reader, "alpha", "one");
+    try expectRedoDocument(&reader, "gamma", "three");
+    try expectRedoDocument(&reader, "delta", "four");
+}
+
 test "lite redo durable frontier survives a checkpoint and log generation reuse" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -39833,7 +40070,7 @@ test "lite redo log a pending log reset is dropped once another writer has advan
     const path = try testPath(a, tmp, "redo-stale-reset.aflite");
     defer a.free(path);
     {
-        var first = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        var first = try createSingleExtentRedoForTest(a, io, path, .{}, 64 * 1024);
         defer first.close();
         try first.beginTransaction();
         try first.putDocument("alpha", "one");
@@ -39908,7 +40145,7 @@ test "lite redo log resumes a reservation release an interrupted shrink left owe
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "redo-shrink-resume.aflite");
     defer a.free(path);
-    var writer = try NativeFile.createWithRedoLog(a, io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+    var writer = try createSingleExtentRedoForTest(a, io, path, .{ .indexed_reclamation = true }, 256 * 1024);
     defer writer.close();
     try writer.beginTransaction();
     try writer.putDocument("alpha", "one");
@@ -40019,7 +40256,7 @@ test "lite redo log a cold reader skips the superseded prefix a deferred fold ke
     const path = try testPath(a, tmp, "redo-fold-start.aflite");
     defer a.free(path);
     {
-        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        var writer = try createSingleExtentRedoForTest(a, io, path, .{}, 64 * 1024);
         defer writer.close();
         try writer.beginTransaction();
         try writer.putDocument("alpha", "one");
@@ -40055,7 +40292,7 @@ test "lite redo log a refreshed writer adopts another handle's smaller log capac
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "redo-capacity-rebind.aflite");
     defer a.free(path);
-    var first = try NativeFile.createWithRedoLog(a, io, path, .{}, 256 * 1024);
+    var first = try createSingleExtentRedoForTest(a, io, path, .{}, 256 * 1024);
     defer first.close();
     var second = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true });
     defer second.close();
@@ -40101,7 +40338,7 @@ test "lite redo log an empty-overlay reservation reclaim publishes the deferred 
     const path = try testPath(a, tmp, "redo-deferred-shrink.aflite");
     defer a.free(path);
     {
-        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 256 * 1024);
+        var writer = try createSingleExtentRedoForTest(a, io, path, .{}, 256 * 1024);
         defer writer.close();
         try writer.beginTransaction();
         try writer.putDocument("alpha", "one");
@@ -40130,7 +40367,7 @@ test "lite redo log a reset retry keeps a record another writer appended unseen 
     const path = try testPath(a, tmp, "redo-reset-retry-unseen.aflite");
     defer a.free(path);
     {
-        var first = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        var first = try createSingleExtentRedoForTest(a, io, path, .{}, 64 * 1024);
         defer first.close();
         try first.beginTransaction();
         try first.putDocument("alpha", "one");

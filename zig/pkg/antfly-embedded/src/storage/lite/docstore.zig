@@ -3560,7 +3560,7 @@ pub const Store = struct {
         // common/production case, keeps the full default untouched.
         const redo_log_capacity_bytes = native.NativeFile.redoLogCapacityForBudget(opts.reclamation.max_storage_bytes);
         const frontier_bytes = if (opts.no_sync) 0 else native.NativeFile.default_redo_frontier_reservation_bytes;
-        const redo_reservation = if (use_redo_log) redo_log_capacity_bytes +| frontier_bytes else 0;
+        const redo_reservation = if (use_redo_log) redo_log_capacity_bytes *| @as(u64, if (opts.no_sync) 1 else 2) +| frontier_bytes else 0;
         const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse) +| redo_reservation;
         if (opts.reclamation.max_storage_bytes != 0 and minimum > opts.reclamation.max_storage_bytes) return error.LiteStorageBudgetExceeded;
         const available = if (opts.reclamation.capacity_probe) |probe|
@@ -4497,7 +4497,9 @@ pub const Store = struct {
     }
 
     fn needsProtectedRedoUpgrade(self: *const Store) bool {
-        return self.file.header.redo_log_capacity != 0 and !self.file.header.protected_redo and !self.file.no_sync;
+        const header = self.file.header;
+        if (header.redo_log_capacity == 0 or self.file.no_sync) return false;
+        return !header.segmented_redo or native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) < header.redo_log_capacity;
     }
 
     // Adoption discards the cached ledger. This probe can therefore replay a
@@ -4688,9 +4690,9 @@ pub const Store = struct {
             if (cancel) |token| try token.check();
             if (self.assessment_generation != assessed_generation) return error.FileBusy;
             const due = if (cached_stats != null)
-                self.maintenance_policy.worthwhile(assessed_size, stats.compact_size, self.file.header.redo_log_capacity)
+                self.maintenance_policy.worthwhile(assessed_size, stats.compact_size, self.file.header.redoReservation())
             else
-                self.maintenance_policy.assessed(assessed_size, stats.compact_size, stats.bytes, assessed_checkpoint.commit_sequence, self.file.header.redo_log_capacity);
+                self.maintenance_policy.assessed(assessed_size, stats.compact_size, stats.bytes, assessed_checkpoint.commit_sequence, self.file.header.redoReservation());
             if (cached_stats == null) {
                 // Spend at most ~1/64 of elapsed time rescanning changed roots
                 // under sustained pressure, with a 30-second minimum interval.
@@ -4749,7 +4751,7 @@ pub const Store = struct {
         // redo-log reservation (passed as `fixed_overhead`) is this new
         // generation's own, same as the assessment path above; see
         // `Policy.worthwhile`'s own doc comment.
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redo_log_capacity);
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redoReservation());
     }
 
     fn admitShrinkWorkspaceAssumeLocked(self: *Store, compact: u64, cancel: ?*const maintenance.CancelToken) !?u64 {
@@ -5051,7 +5053,7 @@ pub const Store = struct {
         // redo-log reservation (passed as `fixed_overhead`) is this new
         // generation's own, same as the assessment path above; see
         // `Policy.worthwhile`'s own doc comment.
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redo_log_capacity);
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redoReservation());
         return report;
     }
 
@@ -5130,6 +5132,7 @@ pub const Store = struct {
             var snapshot = try self.file.captureFullReadSnapshot();
             snapshot.page_cache_policy = .metadata_only;
             snapshot.vacuum_target_indexed = self.file.vacuum_target_indexed;
+            snapshot.redo_log_budget_bytes = self.file.redo_log_budget_bytes;
             self.file.change_capture = &capture;
             break :blk snapshot;
         };
@@ -6120,7 +6123,7 @@ pub const Store = struct {
         lockStoreExclusive(self);
         defer self.mutex.unlock();
         if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return error.FileBusy;
-        if (self.file.redo == null) return false;
+        if (self.file.redo == null or self.file.header.segmented_redo) return false;
         const before = self.file.header.redo_log_capacity;
         const oversized = native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) < before;
         // An interrupted shrink can leave the capacity at its target with the
@@ -11237,7 +11240,7 @@ test "lite maintenance upgrades a v11 redo file without reclamation debt" {
     defer store.close();
     try std.testing.expectEqual(native.format_version, store.file.header.diskFormatVersion());
     try store.maintainOnce(false);
-    try std.testing.expectEqual(native.protected_redo_format_version, store.file.header.diskFormatVersion());
+    try std.testing.expectEqual(native.segmented_redo_format_version, store.file.header.diskFormatVersion());
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("old", try read.get("doc"));

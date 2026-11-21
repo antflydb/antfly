@@ -1565,7 +1565,7 @@ test "lite backend auto rejects invalid native headers without fallback" {
     {
         var encoded: [native.header_size]u8 = undefined;
         native.encodeHeader(&encoded, .{});
-        std.mem.writeInt(u32, encoded[native.magic.len..][0..4], native.protected_redo_format_version + 1, .little);
+        std.mem.writeInt(u32, encoded[native.magic.len..][0..4], native.segmented_redo_format_version + 1, .little);
         var file = try std.Io.Dir.cwd().createFile(std.testing.io, unsupported_version_path, .{});
         defer file.close(std.testing.io);
         try file.writePositionalAll(std.testing.io, &encoded, 0);

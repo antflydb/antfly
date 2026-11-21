@@ -2404,6 +2404,8 @@ pub const Region = struct {
         durable_offset: u64,
         /// See `Header.log_fold_start_offset`.
         fold_start_offset: u64 = 0,
+        /// Selected extent for the offsets in this publication.
+        segment: u1 = 0,
         /// See `Header.log_reset_generation`.
         reset_generation: u32 = 0,
     };
@@ -2454,7 +2456,9 @@ pub const Region = struct {
         hdr.log_checkpoint_sequence.store(state.checkpoint_sequence, .seq_cst);
         hdr.log_durable_sequence.store(state.durable_sequence, .seq_cst);
         hdr.log_durable_offset.store(state.durable_offset, .seq_cst);
-        hdr.log_fold_start_offset.store(state.fold_start_offset, .seq_cst);
+        const segment_bit = @as(u64, state.segment) << 63;
+        std.debug.assert(state.fold_start_offset < @as(u64, 1) << 63);
+        hdr.log_fold_start_offset.store(state.fold_start_offset | segment_bit, .seq_cst);
         hdr.log_reset_generation.store(@max(hdr.log_reset_generation.load(.seq_cst), state.reset_generation), .seq_cst);
         hdr.log_generation.store(publishing +% 1, .seq_cst);
     }
@@ -2513,11 +2517,13 @@ pub const Region = struct {
     /// was published.
     pub fn readLogStateRaw(self: *const Region) LogState {
         const hdr = self.header();
+        const extent = hdr.log_fold_start_offset.load(.seq_cst);
         return .{
             .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.seq_cst),
             .durable_sequence = hdr.log_durable_sequence.load(.seq_cst),
             .durable_offset = hdr.log_durable_offset.load(.seq_cst),
-            .fold_start_offset = hdr.log_fold_start_offset.load(.seq_cst),
+            .fold_start_offset = extent & (std.math.maxInt(u64) >> 1),
+            .segment = @intCast(extent >> 63),
             .reset_generation = hdr.log_reset_generation.load(.seq_cst),
         };
     }
@@ -2542,11 +2548,13 @@ pub const Region = struct {
                 std.atomic.spinLoopHint();
                 continue;
             }
+            const extent = hdr.log_fold_start_offset.load(.seq_cst);
             const state: LogState = .{
                 .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.seq_cst),
                 .durable_sequence = hdr.log_durable_sequence.load(.seq_cst),
                 .durable_offset = hdr.log_durable_offset.load(.seq_cst),
-                .fold_start_offset = hdr.log_fold_start_offset.load(.seq_cst),
+                .fold_start_offset = extent & (std.math.maxInt(u64) >> 1),
+                .segment = @intCast(extent >> 63),
                 .reset_generation = hdr.log_reset_generation.load(.seq_cst),
             };
             const after = hdr.log_generation.load(.seq_cst);
