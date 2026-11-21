@@ -65,7 +65,7 @@ def flags_for(case):
     batch = 1
     extra = []
     cohort = re.fullmatch(
-        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall|attn|block|strict|trace|qkvtrace|stable|invariant|invariantprofile|share|tails|pool|head|headprofile|fused|reuse|optimized|optimizedprofile)?",
+        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall|attn|block|strict|trace|qkvtrace|stable|invariant|invariantprofile|tails|pool|head|headprofile|fused|reuse|optimized|optimizedprofile)?",
         case,
     )
     if cohort or case in {
@@ -96,7 +96,6 @@ def flags_for(case):
         if variant in {
             "invariant",
             "invariantprofile",
-            "share",
             "tails",
             "pool",
             "head",
@@ -116,8 +115,6 @@ def flags_for(case):
             # An odd cadence samples both backbone and optional head frames.
             flags["TERMITE_METAL_STAGE_TIMING_DECODE_STRIDE"] = "65"
             flags["TERMITE_METAL_STAGE_TIMING_DECODE_MAX"] = "16"
-        if variant in {"share", "fused", "reuse", "optimized", "optimizedprofile"}:
-            flags["TERMITE_METAL_Q4_0_BATCH_SHARED"] = "1"
         if variant in {
             "tails",
             "pool",

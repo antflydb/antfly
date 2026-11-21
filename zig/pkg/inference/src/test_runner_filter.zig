@@ -33,6 +33,12 @@ pub const debug = struct {
 };
 
 var log_err_count: usize = 0;
+var expected_error_log_count: usize = 0;
+
+// Same exact-count test-only contract as antfly-embedded/test_runner.zig.
+pub export fn antfly_test_expect_error_logs(count: usize) callconv(.c) void {
+    expected_error_log_count += count;
+}
 
 pub const std_options: std.Options = .{
     .logFn = log,
@@ -125,6 +131,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.testing.environ = init.environ;
         std.testing.log_level = .warn;
         log_err_count = 0;
+        expected_error_log_count = 0;
 
         writeRuntimeTestProgress(selected_count, test_fn.name);
         std.debug.print("{d}/{d} {s}...", .{ selected_count, test_fn_list.len, test_fn.name });
@@ -148,7 +155,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (progress) |p| p.record("ALLOCATOR_DEINIT", test_fn.name);
         if (std.testing.allocator_instance.deinit() != 0) leak_count += 1;
         if (progress) |p| p.record("DONE", test_fn.name);
-        if (log_err_count != 0) fail_count += 1;
+        if (log_err_count != expected_error_log_count) {
+            std.debug.print("Expected {d} error logs, observed {d}: {s}\n", .{ expected_error_log_count, log_err_count, test_fn.name });
+            fail_count += 1;
+        }
     }
 
     if (selected_count == 0) {

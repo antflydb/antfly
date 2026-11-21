@@ -198,6 +198,22 @@ pub fn attachPjrtExecutors(
     pjrt_client: *anyopaque,
     attachment_target: compiled_backend.AttachmentTarget,
 ) !void {
+    return attachPjrtExecutorsWithParameters(allocator, entry, graph, dpp, cb, pjrt_client, attachment_target, null, null, false, .f32);
+}
+
+fn attachPjrtExecutorsWithParameters(
+    allocator: std.mem.Allocator,
+    entry: *cache_mod.CacheEntry,
+    graph: *const Graph,
+    dpp: *multi_executor_mod.DevicePartitionPlan,
+    cb: *const ops.ComputeBackend,
+    pjrt_client: *anyopaque,
+    attachment_target: compiled_backend.AttachmentTarget,
+    mutable_parameters: ?[]const bool,
+    parameter_store: ?*anyopaque,
+    required: bool,
+    precision: @import("../execution/precision.zig").Policy,
+) !void {
     if (!build_options.enable_pjrt) return;
 
     const pjrt_lib = @import("pjrt");
@@ -231,14 +247,17 @@ pub fn attachPjrtExecutors(
         for (dpp.base.partitions, 0..) |part, part_idx| {
             if (!isPartitionPjrtEligible(graph, part)) continue;
 
-            const pjrt_exec = pjrt_executor_mod.createExecutor(
+            const pjrt_exec = pjrt_executor_mod.createExecutorWithOptions(
                 allocator,
                 graph,
                 &dpp.base.partitions[part_idx],
                 cb,
                 cb,
                 client,
+                .{ .mutable_parameters = mutable_parameters, .precision = precision },
+                if (parameter_store) |store| @ptrCast(@alignCast(store)) else null,
             ) catch |err| {
+                if (required) return err;
                 std.log.warn("PJRT compilation failed for partition {d}: {s}", .{ part_idx, @errorName(err) });
                 continue;
             };
@@ -293,7 +312,7 @@ pub fn isPartitionPjrtEligible(
 
 fn pjrtSupportsGraphConstantDType(dtype: @import("ml").graph.DType) bool {
     return switch (dtype) {
-        .f32, .i32 => true,
+        .f32, .f16, .bf16, .i32, .i64, .bool_ => true,
         else => false,
     };
 }
@@ -356,7 +375,7 @@ fn attachExecutorsViaDefinition(
         return error.PjrtLoadOnlyArtifactsRequired;
     }
     const client = context.pjrt_client orelse return error.MissingPjrtClient;
-    return attachPjrtExecutors(allocator, entry, graph, dpp, context.cb, client, context.attachment_target);
+    return attachPjrtExecutorsWithParameters(allocator, entry, graph, dpp, context.cb, client, context.attachment_target, context.mutable_parameters, context.pjrt_parameter_store, context.require_compiled, context.pjrt_precision);
 }
 
 fn executeModelForwardViaDefinition(
@@ -372,6 +391,7 @@ fn executeModelForwardViaDefinition(
     if (!build_options.enable_pjrt) return null;
     if (context.attachment_target != .whole_model) return null;
 
+    cache.selectPjrtPrecision(context.pjrt_precision);
     entry.selectCompiledModelExecutorBackend(.pjrt, context.attachment_target);
 
     if (cache.getSessionCompiledModelRuntime(.pjrt, context.attachment_target)) |runtime| {
@@ -510,13 +530,23 @@ fn executeModelForwardViaDefinition(
             if (part.backend != .pjrt) continue;
             if (!isPartitionPjrtEligible(graph, part.*)) continue;
 
-            const model_executor_ctx = try pjrt_executor_mod.createModelExecutor(
+            // Dynamic request tensors stay inputs; immutable checkpoint operands
+            // upload once into the session inventory, across prompt shapes.
+            const mutable_parameters = try allocator.alloc(bool, graph.nodeCount());
+            defer allocator.free(mutable_parameters);
+            // Decoder tracing creates parameters only through getWeight;
+            // token IDs use the separate embedding_ids binding. Adapters that
+            // explicitly declare mutable parameters provide their own table.
+            @memset(mutable_parameters, false);
+            const model_executor_ctx = try pjrt_executor_mod.createModelExecutorWithOptions(
                 allocator,
                 graph,
                 part,
                 context.cb,
                 context.cb,
                 client,
+                .{ .precision = context.pjrt_precision, .mutable_parameters = context.mutable_parameters orelse mutable_parameters },
+                if (context.pjrt_parameter_store) |store| @ptrCast(@alignCast(store)) else null,
             );
             entry.compiled_model_executor = .{
                 .ptr = model_executor_ctx,
@@ -1366,8 +1396,15 @@ test "PJRT whole-model availability rejects host-fallback plans even with artifa
     });
     try graph.markOutput(selected);
 
+    const Restricted = struct {
+        fn supports(op: ml_graph.OpCode) bool {
+            return op != .where_select and partition_mod.supportsPjrt(op);
+        }
+    };
+    // Exercise an explicitly restricted provider rather than assuming an
+    // operation remains unsupported as the real PJRT implementation grows.
     const capabilities = [_]partition_mod.Capability{
-        .{ .backend = .pjrt, .priority = 10, .supports = &partition_mod.supportsPjrt },
+        .{ .backend = .pjrt, .priority = 10, .supports = &Restricted.supports },
         .{ .backend = .native, .priority = 1, .supports = &partition_mod.supportsAll },
     };
     const plan = try partition_mod.partition(allocator, &graph, &capabilities);
@@ -1434,38 +1471,39 @@ test "PJRT whole-model availability accepts single PJRT-owned plans without arti
     try std.testing.expect(hasCompilablePartition(&graph, &dpp, context, .single_device));
 }
 
-test "PJRT partition eligibility rejects unsupported typed constants" {
+test "PJRT partition eligibility accepts I64 constants and rejects unsupported F64 constants" {
     const allocator = std.testing.allocator;
-    var graph = @import("ml").graph.Graph.init(allocator);
-    defer graph.deinit();
-    var builder = @import("ml").graph.Builder.init(&graph);
     const ml_graph = @import("ml").graph;
+    for ([_]ml_graph.DType{ .i64, .f64 }) |dtype| {
+        var graph = ml_graph.Graph.init(allocator);
+        defer graph.deinit();
+        var builder = ml_graph.Builder.init(&graph);
+        const values = [_]i64{ 1, 2 };
+        const c = try builder.tensorConstBytes(std.mem.sliceAsBytes(&values), ml_graph.Shape.init(dtype, &.{2}));
+        const cast = try graph.addNode(.{
+            .op = .{ .convert_dtype = .{ .target = .f32 } },
+            .output_shape = ml_graph.Shape.init(.f32, &.{2}),
+            .inputs = .{ c, ml_graph.null_node, ml_graph.null_node, ml_graph.null_node },
+            .num_inputs = 1,
+        });
 
-    const values = [_]i64{ 1, 2 };
-    const c = try builder.tensorConstBytes(std.mem.sliceAsBytes(&values), ml_graph.Shape.init(.i64, &.{2}));
-    const cast = try graph.addNode(.{
-        .op = .{ .convert_dtype = .{ .target = .f32 } },
-        .output_shape = ml_graph.Shape.init(.f32, &.{2}),
-        .inputs = .{ c, ml_graph.null_node, ml_graph.null_node, ml_graph.null_node },
-        .num_inputs = 1,
-    });
+        var internal_nodes = [_]NodeId{ c, cast };
+        const internal_part = partition_mod.Partition{
+            .backend = .pjrt,
+            .node_ids = internal_nodes[0..],
+            .external_inputs = &.{},
+        };
+        try std.testing.expectEqual(dtype == .i64, isPartitionPjrtEligible(&graph, internal_part));
 
-    var internal_nodes = [_]NodeId{ c, cast };
-    const internal_part = partition_mod.Partition{
-        .backend = .pjrt,
-        .node_ids = internal_nodes[0..],
-        .external_inputs = &.{},
-    };
-    try std.testing.expect(!isPartitionPjrtEligible(&graph, internal_part));
-
-    var external_nodes = [_]NodeId{cast};
-    const external_inputs = [_]partition_mod.ExternalInput{
-        .{ .node_id = c, .source_partition = 0 },
-    };
-    const external_part = partition_mod.Partition{
-        .backend = .pjrt,
-        .node_ids = external_nodes[0..],
-        .external_inputs = &external_inputs,
-    };
-    try std.testing.expect(!isPartitionPjrtEligible(&graph, external_part));
+        var external_nodes = [_]NodeId{cast};
+        const external_inputs = [_]partition_mod.ExternalInput{
+            .{ .node_id = c, .source_partition = 0 },
+        };
+        const external_part = partition_mod.Partition{
+            .backend = .pjrt,
+            .node_ids = external_nodes[0..],
+            .external_inputs = &external_inputs,
+        };
+        try std.testing.expectEqual(dtype == .i64, isPartitionPjrtEligible(&graph, external_part));
+    }
 }
