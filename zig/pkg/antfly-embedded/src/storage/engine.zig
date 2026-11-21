@@ -576,6 +576,7 @@ pub const VTable = struct {
     sourcePlanChunk: *const fn (*DB, std.mem.Allocator, @import("source_plan_control.zig").ReadRequest) Outcome(@import("source_plan_control.zig").Read),
     orderedSourcePlanOutcome: *const fn (*DB, @import("source_plan_control.zig").Recovery) Outcome(@import("source_plan_control.zig").Outcome),
     nativeHistoryConsumerControl: *const fn (self: *DB, command: @import("history_consumer.zig").Command) Outcome(@import("history_consumer.zig").Result),
+    artifactPublicationHistory: *const fn (*DB, std.mem.Allocator, @import("db/artifact_publication.zig").HistoryRead, ?u64) Outcome(@import("db/artifact_publication.zig").HistoryObservation),
     nativeHistoryPage: *const fn (self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) Outcome(@import("history_page.zig").Page),
     provisionNativeHistoryAuthority: *const fn (self: *DB, expected_namespace: [24]u8) Outcome(void),
     applyOrderedHistoryConsumerControl: *const fn (*DB, @import("history_consumer.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("history_ordered.zig").Outcome),
@@ -628,7 +629,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 68 returns atomically retained legacy resolution outcomes.
 /// Version 69 adds snapshot-bound read-only legacy recovery outcomes.
 /// Version 74 combines committed history with staged producer durability.
-pub const descriptor_version: u32 = 74;
+/// Version 75 adds snapshot-qualified artifact publication history reads.
+pub const descriptor_version: u32 = 75;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

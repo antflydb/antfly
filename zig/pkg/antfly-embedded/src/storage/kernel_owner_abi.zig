@@ -46,7 +46,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 121 returns durable original-terminal recovery outcomes.
 // Version 122 adds read-only original-terminal outcome observations.
 // Version 125 includes immutable direct preparation and retained history.
-pub const abi_version: u32 = 125;
+pub const abi_version: u32 = 126;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -2087,6 +2087,11 @@ pub extern fn antfly_storage_owner_history_resolution(
 
 /// Private page request JSON contains the retained position and required cut;
 /// the response is the bounded HPG1 binary page envelope, not JSON.
+pub extern fn antfly_storage_owner_artifact_publication_history(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_history_page(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,

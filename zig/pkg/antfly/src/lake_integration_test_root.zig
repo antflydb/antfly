@@ -147,4 +147,5 @@ comptime {
     _ = @import("serverless/lake_vacuum_plan.zig");
     _ = @import("serverless/lake_vacuum_inputs.zig");
     _ = @import("api/lake_search_overlay.zig");
+    _ = @import("api/lake_publication_changefeed.zig");
 }

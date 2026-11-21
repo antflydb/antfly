@@ -61,6 +61,26 @@ pub const Captured = struct {
         return plans;
     }
 
+    pub fn validateInstalledRoutes(self: *const Captured, state: control.State) !void {
+        const definition = state.definition orelse return error.ChangefeedResynchronizationRequired;
+        var route_index: usize = 0;
+        for (state.roots) |root| {
+            const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
+            const table = for (definition.tables) |candidate| {
+                if (candidate.table_id == table_id) break candidate;
+            } else return error.ChangefeedResynchronizationRequired;
+            if (root.ownership_epoch != 1 or root.released) return error.ChangefeedResynchronizationRequired;
+            if (table.contract == .writable_iceberg_rows) {
+                if (!std.mem.eql(u8, &root.namespace, &control.catalogRootNamespace(table))) return error.ChangefeedResynchronizationRequired;
+                continue;
+            }
+            if (route_index >= self.roots.len or !std.mem.eql(u8, &root.namespace, &self.roots[route_index].namespace))
+                return error.ChangefeedResynchronizationRequired;
+            route_index += 1;
+        }
+        if (route_index != self.roots.len) return error.ChangefeedResynchronizationRequired;
+    }
+
     /// Initial ownership only. A replacement root needs a verified handoff
     /// before a feed can use the new route to advance its retained cursor.
     pub fn validateInitialRoutes(self: *const Captured, planned: []const control.Root) !void {
@@ -94,6 +114,8 @@ test "history root discovery validates the complete installed route vector" {
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(&planned));
 }
 pub const Source = struct {
+    artifact_owners: ?@import("history_owner_operations.zig").Port = null,
+    artifact_history: ?@import("artifact_history_operations.zig").Port = null,
     catalog: catalog_api.CatalogSource,
     controls: @import("history_control_operations.zig").Port,
     pages: @import("history_page_operations.zig").Port,
@@ -116,6 +138,7 @@ pub const Source = struct {
             const index = session.table_id_indexes.get(expected.table_id) orelse return error.ChangefeedResynchronizationRequired;
             const table = session.snapshot.value.tables[index];
             if (!std.mem.eql(u8, &expected.binding, &control.tableBinding(table))) return error.ChangefeedResynchronizationRequired;
+            if (expected.contract == .writable_iceberg_rows) continue;
             if (table.storage.engine != .local or (expected.contract != .native_document and expected.contract != .native_relational)) return error.ChangefeedCapabilityUnsupported;
             const view = try session.tableRoutingView(table.name, budget);
             if (!view.covers_keyspace) return error.TopologyChanged;
@@ -165,10 +188,10 @@ pub const Source = struct {
             return error.ChangefeedCapabilityUnsupported;
         if (read.now == 0 or read.now >= state.expires_at) return error.ChangefeedLeaseExpired;
         if (read.max_frame_bytes == 0 or read.max_frame_bytes > history.pages.max_source_bytes) return error.HistoryTooLarge;
-        try captured.validateInitialRoutes(state.roots);
+        try captured.validateInstalledRoutes(state);
         const item = state.roots[read.root_index];
         if (item.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
-        const root = captured.roots[read.root_index];
+        const root = try captured.find(item.namespace);
         for (definition.tables) |table| {
             if (table.table_id != root.fence.table_id) continue;
             if (table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
@@ -280,13 +303,14 @@ const enrollment = @import("../metadata/root_control_driver.zig");
 pub fn qualifyEnrollmentCut(a: A, source: Source, policy: anytype, captured: *const Captured, state: control.State, request: Context) !control.Digest {
     try state.validate();
     if (state.phase != .enrolling or state.roots.len == 0) return error.ChangefeedConflict;
-    try captured.validateInitialRoutes(state.roots);
+    try captured.validateInstalledRoutes(state);
     const definition = state.definition.?;
     const identity = definition.identity();
     var proof = control.hash(.{ .domain = "antfly:coherent-enrollment-cut:v1", .consumer = state.consumerId(), .definition = identity });
     for (0..2) |scan| {
-        for (captured.roots, state.roots) |route, root| {
+        for (captured.roots) |route| {
             try request.ensureActive();
+            const root = state.roots[try state.rootIndex(route.namespace)];
             if (root.consumer_epoch == 0 or root.pending_control != null) return error.ChangefeedConflict;
             const table = for (definition.tables) |table| {
                 if (table.table_id == route.fence.table_id) break table;

@@ -410,6 +410,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         }),
         .filters = &.{"source effects"},
     });
+    source_effects_tests.root_module.addImport("antfly_cancellation", antfly_imports.cancellation);
     const run_source_effects_tests = b.addRunArtifact(source_effects_tests);
     const source_control_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -708,7 +709,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
     const lake_catalog_step = b.step("antfly-lake-index-catalog-test", "Run durable native lake index generation framing and decoder admission contracts");
     for ([_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[1] }) |module| {
-        const tests = b.addTest(.{ .root_module = module, .filters = &.{ "metadata.lake index", "metadata.lake reader authority", "metadata raft apply store snapshot key registry" } });
+        const tests = b.addTest(.{ .root_module = module, .filters = &.{ "metadata.lake index", "metadata.lake reader authority", "metadata raft apply store snapshot key registry", "lake lifecycle history records committed activation" } });
         lake_catalog_step.dependOn(&b.addRunArtifact(tests).step);
     }
     const system_catalog_projection_tests = b.addTest(.{
@@ -8338,6 +8339,30 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.prepared_score_request.",
             "storage.document_mutation_revision.",
             "storage.source_authority.",
+            "storage.committed_frame.",
+            "storage.committed_history.",
+            "storage.history_admission_wire.",
+            "storage.history_decision_wire.",
+            "storage.history_grant_wire.",
+            "storage.history_ordered.",
+            "storage.history_page_wire.",
+            "storage.history_publication_wire.",
+            "storage.history_resolution_wire.",
+            "storage.source_admission.",
+            "storage.source_checkpoint.",
+            "storage.source_checkpoint_read.",
+            "storage.source_effects.",
+            "storage.source_legacy_terminal_ordered.",
+            "storage.source_plan_storage.",
+            "storage.source_plan_wire.",
+            "storage.source_producer_policy.",
+            "storage.source_scope.",
+            "storage.source_scope_control.",
+            "storage.source_scope_ordered.",
+            "storage.source_scope_rebind_test.",
+            "storage.source_scope_retirement.",
+            "storage.source_transaction.",
+            "storage.transaction_completion.",
             "storage.typed_json.",
             "storage.vector_payload_store.",
             "storage.vector_wal_view.",

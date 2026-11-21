@@ -50,6 +50,14 @@ pub const Collection = struct {
     retired: []const u64,
     progress: ?@import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef = null,
 };
+pub const max_activation_history = 256;
+pub const Activation = struct {
+    sequence: u64,
+    generation: u64,
+    published_at_ms: u64,
+    publication_digest: [32]u8,
+};
+
 pub const State = struct {
     version: u16 = 1,
     source_owner: ?source_admission.State = null,
@@ -65,6 +73,15 @@ pub const State = struct {
     readers: []const Reader = &.{},
     collection: ?Collection = null,
     completed_collection: ?catalog.Token = null,
+    activation_history: ?[]const Activation = null,
+
+    pub fn activationAfter(self: State, after: u64) !?Activation {
+        const history = self.activation_history orelse return if (after == 0) null else error.ChangefeedResynchronizationRequired;
+        if (history.len == 0 or after < history[0].sequence - 1 or after > history[history.len - 1].sequence)
+            return error.ChangefeedResynchronizationRequired;
+        const index = after - (history[0].sequence - 1);
+        return if (index < history.len) history[@intCast(index)] else null;
+    }
 
     pub fn findPublication(self: State, generation: u64) ?catalog.Publication {
         for (self.publications) |publication| if (publication.generation == generation) return publication;
@@ -82,6 +99,14 @@ pub const State = struct {
         return false;
     }
     pub fn validate(self: State) !void {
+        if (self.activation_history) |history| {
+            if (history.len == 0 or history.len > max_activation_history) return error.InvalidLakeIndexLifecycle;
+            for (history, 0..) |event, index| {
+                if (event.sequence == 0 or event.generation == 0 or event.published_at_ms == 0 or
+                    std.mem.allEqual(u8, &event.publication_digest, 0) or
+                    (index != 0 and event.sequence - 1 != history[index - 1].sequence)) return error.InvalidLakeIndexLifecycle;
+            }
+        }
         if ((self.version != 1 and self.version != 2) or (self.source_owner != null and self.version != 2) or self.publications.len > max_publications or self.readers.len > max_readers or self.stores.len > 64) return error.InvalidLakeIndexLifecycle;
         if (self.source_owner) |owner| {
             try owner.validate();
@@ -172,6 +197,27 @@ pub const State = struct {
         try next.validate();
         return next;
     }
+    /// Used only by the table's atomic metadata mutation. Reconstructing a
+    /// legacy lifecycle read does not manufacture publication events.
+    pub fn synchronizeCommitted(self: State, a: A, catalog_state: catalog.State) !State {
+        var next = try self.synchronize(a, catalog_state);
+        const publication = catalog_state.published orelse return next;
+        if (self.current == publication.generation) return next;
+        const previous = self.activation_history orelse &.{};
+        const sequence = if (previous.len == 0) 1 else try std.math.add(u64, previous[previous.len - 1].sequence, 1);
+        const kept = previous[previous.len -| (max_activation_history - 1)..];
+        const events = try a.alloc(Activation, kept.len + 1);
+        @memcpy(events[0..kept.len], kept);
+        const identity = try std.json.Stringify.valueAlloc(a, .{ .generation = publication.generation, .token = publication.token, .signature = publication.signature, .base = publication.base_source }, .{});
+        defer a.free(identity);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(identity, &digest, .{});
+        events[kept.len] = .{ .sequence = sequence, .generation = publication.generation, .published_at_ms = publication.published_at_ms, .publication_digest = digest };
+        next.activation_history = events;
+        try next.validate();
+        return next;
+    }
+
     fn retainStore(self: *State, a: A, identity: catalog.Digest, locator: catalog.StoreLocator) !void {
         for (self.stores) |store| if (std.mem.eql(u8, &store.identity, &identity)) {
             const before = try std.json.Stringify.valueAlloc(a, store.locator, .{});
@@ -794,4 +840,20 @@ test "external lake lifecycle command ownership unwinds every allocation failure
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .admit_source = .{ .scope = scope, .epoch = 1, .source_uuid = "source-uuid", .cut = cut, .now_ms = 1 } }});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .retain_query_store = .{ .binding = .{ .identity = @splat(4), .locator = .{ .protocol = .s3, .connection = "artifacts", .bucket = "bucket", .prefix = "prefix", .root = "https://objects.example" } }, .until_ms = 100 } }});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .checkpoint_collection = .{ .token = @splat(7), .previous = "previous", .progress = .{ .kind = .doc_values, .name = "checkpoint", .artifact_id = "artifact", .byte_len = 42, .checksum = "checksum" }, .now_ms = 100 } }});
+}
+
+test "lake lifecycle history records committed activation once across reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first: catalog.State = .{ .generation = 1, .published = testPublication(1) };
+    const hydrated = try (State{}).synchronize(a, first);
+    try std.testing.expect((try hydrated.activationAfter(0)) == null);
+    var state = try (State{}).synchronizeCommitted(a, first);
+    try std.testing.expectEqual(@as(u64, 1), (try state.activationAfter(0)).?.generation);
+    state = try state.synchronizeCommitted(a, first);
+    state = try parse(a, try encode(a, state));
+    try std.testing.expect((try state.activationAfter(1)) == null);
+    state = try state.synchronizeCommitted(a, .{ .generation = 2, .published = testPublication(2) });
+    try std.testing.expectEqual(@as(u64, 2), (try state.activationAfter(1)).?.generation);
 }

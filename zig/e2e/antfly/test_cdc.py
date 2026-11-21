@@ -2425,17 +2425,19 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
             binary,
             "127.0.0.1",
             0,
+            auth_enabled=True,
             metadata_config=node_config("metadata"),
             data_config=node_config("data"),
         )
     table = "/tables/cdc_iceberg"
     provider = pg_cdc_source["table_name"]
+    client = requests.Session()
+    if deployment == "distributed":
+        client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
 
     def call(method, path, body=None):
         try:
-            reply = requests.request(
-                method, server.api_url + path, json=body, timeout=40
-            )
+            reply = client.request(method, server.api_url + path, json=body, timeout=40)
         except requests.RequestException as error:
             pytest.fail(f"{method} {path} {error}\n{server.debug_logs()}")
 
@@ -2549,6 +2551,31 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         assert rows() == [["user-1", "Alice"]]
         check_row_count()
 
+        feed = None
+        if deployment == "distributed":
+            feeds = f"{server.api_url}/changefeeds"
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": "postgres-iceberg-bootstrap"},
+                json={
+                    "tables": ["cdc_iceberg"],
+                    "start": "snapshot_then_changes",
+                    "include": "rows",
+                },
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            bootstrap = _changefeed_call(
+                client, "GET", f"{feed}/events", params={"after": created["cursor"]}
+            )
+            assert [event["after"] for event in bootstrap.json()["events"]] == [
+                {"id": "user-1", "name": "Alice", "tier": "gold"}
+            ]
+            assert bootstrap.json()["snapshot"]["complete"]
+            cursor = bootstrap.headers["Antfly-Changefeed-Cursor"]
+            _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+
         server.pause(crash=True)
         _run_psql(
             f"update {provider} set id = 'user-2', name = 'Bob' where id = 'user-1'"
@@ -2560,7 +2587,33 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         assert resumed["antfly.cdc.checkpoint"] != cut
         assert rows() == [["user-2", "Bob"]]
         check_row_count()
+        if feed is not None:
+            params = {"after": cursor}
+            page = _changefeed_call(client, "GET", f"{feed}/events", params=params)
+            replay = _changefeed_call(client, "GET", f"{feed}/events", params=params)
+            assert replay.content == page.content
+            next_cursor = page.headers["Antfly-Changefeed-Cursor"]
+            assert replay.headers["Antfly-Changefeed-Cursor"] == next_cursor
+            body = page.json()
+            assert body["transaction"]["complete"]
+            events = {event["operation"]: event for event in body["events"]}
+            assert len(body["events"]) == 2 and set(events) == {"insert", "delete"}
+            assert events["delete"]["before"] == {
+                "id": "user-1",
+                "name": "Alice",
+                "tier": "gold",
+            }
+            assert events["insert"]["after"] == {
+                "id": "user-2",
+                "name": "Bob",
+                "tier": "gold",
+            }
+            _changefeed_call(
+                client, "POST", f"{feed}/ack", json={"cursor": next_cursor}
+            )
+            _changefeed_call(client, "DELETE", feed)
     finally:
+        client.close()
         server.stop()
 
 

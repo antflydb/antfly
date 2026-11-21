@@ -2209,10 +2209,12 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const completion_decision = @import("antfly_local_sources").storage_history_decision_wire;
-    const HistoryReadKind = enum { page, bootstrap, outcome, grant, resolution, publication, admission, decision };
+    const artifact_history = @import("antfly_local_sources").storage_db_artifact_publication;
+    const HistoryReadKind = enum { page, bootstrap, outcome, grant, resolution, publication, admission, decision, artifact_history };
     fn HistoryReadInput(comptime kind: HistoryReadKind) type {
         return switch (kind) {
             .page => table_write_source.history_page.Request,
+            .artifact_history => artifact_history.HistoryRead,
             .bootstrap => table_write_source.history_page.BootstrapRequest,
             .outcome => table_write_source.history_ordered.Lookup,
             .grant => table_write_source.history_consumer.GrantIdentity,
@@ -2225,6 +2227,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     fn HistoryReadResult(comptime kind: HistoryReadKind) type {
         return switch (kind) {
             .page => table_write_source.history_page.Page,
+            .artifact_history => artifact_history.HistoryObservation,
             .bootstrap => table_write_source.history_page.BootstrapPage,
             .outcome => table_write_source.history_ordered.Outcome,
             .grant => table_write_source.history_consumer.GrantObservation,
@@ -2233,6 +2236,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .admission => completion_admission.Reply,
             .decision => completion_decision.OwnedReply,
         };
+    }
+
+    pub fn artifactPublicationHistoryRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: artifact_history.HistoryRead) !artifact_history.HistoryObservation {
+        return self.historyReadRouted(alloc, fence, table_name, .artifact_history, request);
     }
 
     /// Private retained-history reads never fall back to stale consistency.
@@ -2322,7 +2329,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .page, .bootstrap => request.reference.namespace,
             .outcome => request.command.namespace(),
             .grant => request.namespace,
-            .resolution => request.namespace,
+            .resolution, .artifact_history => request.namespace,
             .publication, .admission, .decision => request.owner.namespace,
         };
         if (comptime kind == .grant or kind == .bootstrap) try request.validate();
@@ -2358,6 +2365,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             // positive persisted marker establishes native Raft authority.
             // The quorum/owner fences establish freshness for every read.
             .page => try lease.owner().orderedHistoryPage(alloc, table_name, request, 1),
+            .artifact_history => blk: {
+                if (request.root_generation != lease.entry.generation) return error.HistoryResynchronizationRequired;
+                break :blk try lease.owner().artifactPublicationHistory(alloc, table_name, request, 1);
+            },
             .bootstrap => try lease.owner().orderedHistoryBootstrapPage(alloc, table_name, request, 1),
             .outcome => try lease.owner().orderedHistoryOutcome(alloc, table_name, request),
             .grant => try lease.owner().orderedHistoryGrant(alloc, table_name, request, 1),

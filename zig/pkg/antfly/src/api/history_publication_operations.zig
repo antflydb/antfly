@@ -51,7 +51,7 @@ pub const ErrorResponse = struct {
     pub fn fromError(err: anyerror) ErrorResponse {
         return .{ .version = 1, .code = switch (err) {
             error.InvalidHistoryAdmission, error.InvalidCatalogRouteFence, error.UnsupportedCatalogRouteFence => .invalid_request,
-            error.HistoryResynchronizationRequired, error.HistoryAuthorityRequired => .resynchronization_required,
+            error.HistoryResynchronizationRequired, error.ChangefeedResynchronizationRequired, error.HistoryAuthorityRequired => .resynchronization_required,
             error.TopologyChanged, error.DocIdentityNamespaceMismatch, error.IdentityReadGenerationChanged => .topology_changed,
             error.ChangefeedCapabilityUnsupported => .unsupported,
             error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.ReadIndexTimeout, error.Timeout, error.ReadUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded, error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout => .unavailable,

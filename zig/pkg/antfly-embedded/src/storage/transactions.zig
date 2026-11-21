@@ -7067,11 +7067,11 @@ test "transaction source purpose closed legacy terminal recovery preserves origi
     forged = commit;
     forged.root.root_generation += 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, manager.resolveClosedLegacyTerminal(forged, .{}));
-    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveIntentsWithExtraBatchInternal(commit.transaction_id, .committed, 30, .{}, forged));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveIntentsWithExtraBatchStagedAndLegacy(commit.transaction_id, .committed, 30, .{}, forged));
     forged = commit;
     forged.record_digest[0] ^= 1;
-    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveIntentsWithExtraBatchInternal(commit.transaction_id, .committed, 30, .{}, forged));
-    try std.testing.expectError(error.DecisionConflict, manager.resolveIntentsWithExtraBatchInternal(commit.transaction_id, .aborted, 99, .{}, commit));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveIntentsWithExtraBatchStagedAndLegacy(commit.transaction_id, .committed, 30, .{}, forged));
+    try std.testing.expectError(error.DecisionConflict, manager.resolveIntentsWithExtraBatchStagedAndLegacy(commit.transaction_id, .aborted, 99, .{}, commit));
     try std.testing.expectError(error.SourcePendingWork, manager.resolveIntentsWithExtraBatch(commit.transaction_id, .committed, 30, .{}));
     try std.testing.expect(try manager.hasIntents(commit.transaction_id));
     _ = try manager.resolveClosedLegacyTerminal(commit, .{});

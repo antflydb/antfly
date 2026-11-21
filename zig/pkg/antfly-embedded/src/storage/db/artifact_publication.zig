@@ -512,6 +512,129 @@ pub const Command = struct {
     }
 };
 
+pub const history_limit: u64 = 4096;
+const history_head_key = "\x00\x00__artifact_publication__:history-head";
+const history_prefix = "\x00\x00__artifact_publication__:history:";
+pub const HistoryEvent = struct {
+    sequence: u64,
+    namespace: Namespace,
+    authority_epoch: u64,
+    producer_generation: u64,
+    source_count: u32,
+    catalog_digest: Digest,
+    publication_digest: Digest,
+    source_digest: Digest,
+};
+
+pub const HistoryRead = struct {
+    namespace: Namespace,
+    root_generation: u64,
+    after: ?u64 = null,
+
+    pub fn validateObservation(self: HistoryRead, value: HistoryObservation, minimum_applied_index: ?u64) !void {
+        if (self.root_generation != value.root_generation or !std.mem.eql(u8, &self.namespace, &value.namespace))
+            return error.HistoryResynchronizationRequired;
+        if (minimum_applied_index) |minimum| {
+            if (minimum == 0 or (value.applied_index orelse 0) < minimum) return error.StorageReadTemporarilyUnavailable;
+        } else if (value.applied_index != null) return error.HistoryCorrupt;
+        const after = self.after orelse {
+            if (value.event != null) return error.HistoryCorrupt;
+            return;
+        };
+        if (after > value.latest or after < value.latest -| history_limit) return error.ChangefeedResynchronizationRequired;
+        if (after == value.latest) {
+            if (value.event != null) return error.HistoryCorrupt;
+            return;
+        }
+        const event = value.event orelse return error.HistoryCorrupt;
+        if (event.sequence != after + 1 or !std.mem.eql(u8, &event.namespace, &self.namespace) or
+            event.authority_epoch == 0 or event.producer_generation == 0 or event.source_count == 0 or event.source_count > max_source_documents or
+            std.mem.allEqual(u8, &event.catalog_digest, 0) or std.mem.allEqual(u8, &event.publication_digest, 0) or std.mem.allEqual(u8, &event.source_digest, 0))
+            return error.HistoryCorrupt;
+    }
+};
+pub const OrderedHistoryRead = struct { request: HistoryRead, minimum_applied_index: u64 };
+pub const max_history_read_bytes = 4096;
+pub const HistoryObservation = struct {
+    namespace: Namespace,
+    root_generation: u64,
+    latest: u64,
+    applied_index: ?u64,
+    event: ?HistoryEvent,
+};
+
+fn historyKey(sequence: u64) [history_prefix.len + 8]u8 {
+    var key: [history_prefix.len + 8]u8 = undefined;
+    @memcpy(key[0..history_prefix.len], history_prefix);
+    std.mem.writeInt(u64, key[history_prefix.len..], sequence, .big);
+    return key;
+}
+
+pub fn historyHead(txn: anytype) !u64 {
+    const bytes_ = txn.get(history_head_key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    if (bytes_.len != 8) return error.ArtifactCatalogCorrupt;
+    return std.mem.readInt(u64, bytes_[0..8], .big);
+}
+
+pub fn historyAfter(a: std.mem.Allocator, txn: anytype, after: u64) !?HistoryEvent {
+    const latest = try historyHead(txn);
+    if (after > latest or after < latest -| history_limit) return error.ChangefeedResynchronizationRequired;
+    if (after == latest) return null;
+    const key = historyKey(after + 1);
+    const encoded = txn.get(&key) catch |err| switch (err) {
+        error.NotFound => return error.ArtifactCatalogCorrupt,
+        else => return err,
+    };
+    const event = std.json.parseFromSliceLeaky(HistoryEvent, a, encoded, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.ArtifactCatalogCorrupt,
+    };
+    if (event.sequence != after + 1 or event.authority_epoch == 0 or event.producer_generation == 0 or event.source_count == 0)
+        return error.ArtifactCatalogCorrupt;
+    return event;
+}
+
+/// Append only after all stable-source, catalog and final-output checks have
+/// succeeded. The same write transaction makes output and history visible.
+pub fn stageHistory(a: std.mem.Allocator, txn: anytype, command: Command) !void {
+    if (command.mode != .publish) return error.InvalidBatchRequest;
+    const sequence = try std.math.add(u64, try historyHead(txn), 1);
+    var scope = std.crypto.hash.Blake3.init(.{});
+    scope.update("antfly:artifact-history-sources:v1");
+    const output = try command.outputSources();
+    var docs = output.iterator(.{});
+    while (docs.next()) |index| {
+        const source = command.sources[index];
+        bytes(&scope, source.document_key);
+        scope.update(&source.content_digest);
+        var stamp: [8]u8 = undefined;
+        std.mem.writeInt(u64, &stamp, source.timestamp, .big);
+        scope.update(&stamp);
+    }
+    var source_digest: Digest = undefined;
+    scope.final(&source_digest);
+    const event: HistoryEvent = .{
+        .sequence = sequence,
+        .namespace = command.namespace,
+        .authority_epoch = command.authority_epoch,
+        .producer_generation = command.producer_generation,
+        .source_count = @intCast(output.count()),
+        .catalog_digest = command.catalog_digest,
+        .publication_digest = command.publication_digest,
+        .source_digest = source_digest,
+    };
+    const body = try std.json.Stringify.valueAlloc(a, event, .{});
+    defer a.free(body);
+    try txn.put(&historyKey(sequence), body);
+    if (sequence > history_limit) try txn.delete(&historyKey(sequence - history_limit));
+    var head: [8]u8 = undefined;
+    std.mem.writeInt(u64, &head, sequence, .big);
+    try txn.put(history_head_key, &head);
+}
+
 pub const Receipt = struct { publication_digest: Digest, sequence: u64 };
 pub const Rejection = enum(u8) { stale_source = 1, stale_catalog = 2, sealed_source = 3, invalid_output = 4, baseline_pending = 5 };
 pub const Rejected = struct { publication_digest: Digest, applied_index: u64, reason: Rejection };
@@ -1341,6 +1464,30 @@ test "ordered artifact inventory publication binds exact sources families values
     try command.validate(alloc);
     command.mutation_preconditions = &.{};
     command.publication_digest = command.digest();
+    var history_arena = std.heap.ArenaAllocator.init(alloc);
+    defer history_arena.deinit();
+    const ha = history_arena.allocator();
+    const HistoryTxn = struct {
+        a: std.mem.Allocator,
+        entries: std.StringHashMapUnmanaged([]const u8) = .empty,
+        pub fn get(self: *@This(), name: []const u8) anyerror![]const u8 {
+            return self.entries.get(name) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+            try self.entries.put(self.a, try self.a.dupe(u8, name), try self.a.dupe(u8, value));
+        }
+        pub fn delete(self: *@This(), name: []const u8) !void {
+            _ = self.entries.remove(name);
+        }
+    };
+    var history: HistoryTxn = .{ .a = ha };
+    try std.testing.expect((try historyAfter(ha, &history, 0)) == null);
+    try stageHistory(ha, &history, command);
+    const published = (try historyAfter(ha, &history, 0)).?;
+    try std.testing.expectEqual(command.producer_generation, published.producer_generation);
+    try std.testing.expectEqual(command.publication_digest, published.publication_digest);
+    try std.testing.expectEqual(@as(u32, 1), published.source_count);
+    try std.testing.expect((try historyAfter(ha, &history, 1)) == null);
     const first_receipt = receiptKey(command, command.sources[0]);
     command.producer_artifact_name = "second-model";
     try std.testing.expect(!std.mem.eql(u8, &first_receipt, &receiptKey(command, command.sources[0])));

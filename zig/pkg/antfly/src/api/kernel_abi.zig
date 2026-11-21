@@ -47,7 +47,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 42 includes the optional authenticated pgwire replication factory.
 // Version 43 includes the fenced PostgreSQL publication metadata port.
 // Version 44 includes the pgwire publication scope for native startup.
-pub const abi_version: u32 = 44;
+// Version 45 adds the artifact history read provider to API configuration.
+pub const abi_version: u32 = 45;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

@@ -30,7 +30,7 @@ const V = std.json.Value;
 /// several bounded jobs instead of exceeding one job's read budget forever.
 /// Planning and execution checkpoint independently under the same operation ID;
 /// callers repeat incomplete results. max_plan_steps bounds immutable input reads.
-pub const Options = struct { operation_id: []const u8, dry_run: bool = true, exclusive_ownership: bool = false, retain_ms: u64 = 7 * 24 * 60 * 60 * 1000, keep_latest: usize = 2, max_deleted: usize = 4096, max_expired: usize = default_max_expired, max_plan_steps: usize = 16 };
+pub const Options = struct { operation_id: []const u8, dry_run: bool = true, exclusive_ownership: bool = false, retain_ms: u64 = 7 * 24 * 60 * 60 * 1000, keep_latest: usize = 2, max_deleted: usize = 4096, max_expired: usize = default_max_expired, max_plan_steps: usize = 16, protect_committed_history: bool = false };
 pub const default_max_expired: usize = 256;
 pub const Result = struct { planning: bool = false, expired_snapshots: usize = 0, remaining_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false, conflicted: bool = false, delegated: bool = false, provider: ?catalog.maintenance.Provider = null, provider_state: ?catalog.maintenance.State = null };
 const plan = @import("lake_vacuum_plan.zig");
@@ -245,7 +245,8 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     defer latest.deinit(a);
     const live = try catalog.metadata.parse(a, latest.table.metadata_json);
     const now_ms: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
-    const keep = try retainedIds(a, live, protected, request.keep_latest, now_ms -| @as(i64, @intCast(request.retain_ms)));
+    const live_protected = try protectCommittedHistory(a, binding, options, context, latest.table, live, request, protected);
+    const keep = try retainedIds(a, live, live_protected, request.keep_latest, now_ms -| @as(i64, @intCast(request.retain_ms)));
     for ((try catalog.metadata.get(live, "snapshots")).array.items) |snapshot| {
         const id = try std.fmt.allocPrint(a, "{d}", .{try catalog.metadata.int(try catalog.metadata.get(snapshot, "snapshot-id"))});
         if (!keep.contains(id)) result.remaining_snapshots += 1;
@@ -532,6 +533,19 @@ fn retainedIds(a: A, root: V, extra: []const []const u8, keep_latest: usize, bef
     }
     return retained;
 }
+fn protectCommittedHistory(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, context: catalog.types.Context, table: catalog.types.Table, root: V, request: Options, protected: []const []const u8) ![]const []const u8 {
+    if (!request.protect_committed_history) return protected;
+    const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    const retention = try ingestion.retainedWalFloor(a, root, try ingestion.coverage(a, table), now, request.retain_ms, request.keep_latest);
+    var anchors: std.ArrayList([]const u8) = .empty;
+    const floor = try ingestion.pinnedWalFloor(a, binding, options, context, retention, now, &anchors);
+    var result: std.ArrayList([]const u8) = .empty;
+    try result.appendSlice(a, protected);
+    try result.appendSlice(a, try protectOverlayAncestry(a, root, anchors.items));
+    try ingestion.protectRetainedWalSnapshots(a, root, floor, &result);
+    return result.items;
+}
+
 pub fn run(backing: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, parent_context: catalog.types.Context, request: Options, protected: []const []const u8) !Result {
     // Provider transports allocate internally as well as through per-call
     // result allocators. One shared wrapper protects all providers opened in
@@ -551,8 +565,9 @@ pub fn run(backing: A, binding: local.serverless_external_source_catalog_binding
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const metadata = try catalog.metadata.parse(arena.allocator(), current.table.metadata_json);
+        const retained = try protectCommittedHistory(arena.allocator(), binding, options, context, current.table, metadata, request, protected);
         const uuid = try catalog.metadata.str(try catalog.metadata.get(metadata, "table-uuid"));
-        const body = try configured.executeExternalMaintenanceAlloc(a, binding, options, context, uuid, current.table.metadata_location, protected, .{ .operation_id = request.operation_id, .dry_run = request.dry_run, .retain_ms = request.retain_ms, .keep_latest = request.keep_latest, .max_deleted = request.max_deleted });
+        const body = try configured.executeExternalMaintenanceAlloc(a, binding, options, context, uuid, current.table.metadata_location, retained, .{ .operation_id = request.operation_id, .dry_run = request.dry_run, .retain_ms = request.retain_ms, .keep_latest = request.keep_latest, .max_deleted = request.max_deleted });
         defer a.free(body);
         const receipt = try std.json.parseFromSliceLeaky(catalog.maintenance.Result, arena.allocator(), body, .{ .ignore_unknown_fields = true });
         return .{ .expired_snapshots = receipt.expired_snapshots, .eligible_objects = receipt.eligible_objects, .deleted_objects = receipt.deleted_objects, .retained_objects = receipt.retained_objects, .complete = receipt.state == .complete, .delegated = true, .provider = receipt.provider, .provider_state = receipt.state };
@@ -575,6 +590,7 @@ pub fn run(backing: A, binding: local.serverless_external_source_catalog_binding
     var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
     defer current.deinit(a);
     const root = try catalog.metadata.parse(scratch, current.table.metadata_json);
+    const retained = try protectCommittedHistory(scratch, binding, options, context, current.table, root, request, protected);
     const uuid = try catalog.metadata.str(try catalog.metadata.get(root, "table-uuid"));
     const pin_store: pins.Store = .{ .client = queue.client, .bucket = queue.bucket, .prefix = try pins.namespace(scratch, queue.prefix, binding, uuid), .context = context };
     var file_options = options;
@@ -602,7 +618,7 @@ pub fn run(backing: A, binding: local.serverless_external_source_catalog_binding
         var authority_root = root;
         if (!request.dry_run) {
             const planning_key = try std.fmt.allocPrint(scratch, "{s}/maintenance/vacuum-planning/{s}.json", .{ base, catalog.types.digestHex(request.operation_id) });
-            const progress = (try planningTurn(scratch, queue.client, queue.bucket, planning_key, root, uuid, protected, request, pin_store, destination, &plans, &budget, &manifests)) orelse return .{ .planning = true };
+            const progress = (try planningTurn(scratch, queue.client, queue.bucket, planning_key, root, uuid, retained, request, pin_store, destination, &plans, &budget, &manifests)) orelse return .{ .planning = true };
             // Rebase only the unfinished planner, never an immutable intent.
             // Ingestion may have published many snapshots between turns.
             const refreshed = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
@@ -610,7 +626,8 @@ pub fn run(backing: A, binding: local.serverless_external_source_catalog_binding
             current = refreshed;
             authority_root = try catalog.metadata.parse(scratch, current.table.metadata_json);
             if (!std.mem.eql(u8, uuid, try catalog.metadata.str(try catalog.metadata.get(authority_root, "table-uuid")))) return error.InvalidLakeVacuumPlan;
-            const keep = try retainedIds(scratch, authority_root, protected, progress.keep_latest, progress.before);
+            const refreshed_retained = try protectCommittedHistory(scratch, binding, options, context, current.table, authority_root, request, protected);
+            const keep = try retainedIds(scratch, authority_root, refreshed_retained, progress.keep_latest, progress.before);
             var candidate_uris: std.AutoHashMapUnmanaged(i64, []const u8) = .empty;
             for (progress.candidates) |candidate| try candidate_uris.put(scratch, candidate.id, candidate.uri);
             for (progress.retired) |entry| {
@@ -626,7 +643,7 @@ pub fn run(backing: A, binding: local.serverless_external_source_catalog_binding
             }
         } else {
             const before = now_ms -| (std.math.cast(i64, request.retain_ms) orelse return error.InvalidLakeMaintenanceLimits);
-            const keep = try retainedIds(scratch, root, protected, request.keep_latest, before);
+            const keep = try retainedIds(scratch, root, retained, request.keep_latest, before);
             for ((try catalog.metadata.get(root, "snapshots")).array.items) |snapshot| {
                 const id = try catalog.metadata.int(try catalog.metadata.get(snapshot, "snapshot-id"));
                 const text = try std.fmt.allocPrint(scratch, "{d}", .{id});
@@ -692,7 +709,8 @@ pub fn run(backing: A, binding: local.serverless_external_source_catalog_binding
     // job replay. It must not disappear after a timeout, deletion limit or pin.
     const now_ms: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
     const before = now_ms -| (std.math.cast(i64, request.retain_ms) orelse return error.InvalidLakeMaintenanceLimits);
-    const keep = try retainedIds(scratch, live_root, protected, request.keep_latest, before);
+    const live_protected = try protectCommittedHistory(scratch, binding, options, context, latest.table, live_root, request, protected);
+    const keep = try retainedIds(scratch, live_root, live_protected, request.keep_latest, before);
     var marked: std.StringHashMapUnmanaged(void) = .empty;
     inline for (.{ "statistics", "partition-statistics" }) |kind| {
         if (live_root.object.get(kind)) |entries| {
@@ -918,6 +936,15 @@ test "external lake vacuum expires a large backlog in bounded oldest-first jobs"
         const prepared = try catalog.row_commit.prepare(a, table, files, batch, n, @intCast(n + 1));
         table = try managed.commit(a, .{ .id = batch.batch_id, .expected_metadata_location = table.metadata_location, .body = prepared.body, .timestamp_ms = @intCast(n + 1) });
     }
+    // With history enabled, the newest commit also protects its predecessor,
+    // even though the predecessor's timestamp is outside the vacuum window.
+    const history = try run(alloc, binding, options, .{}, .{
+        .operation_id = "vacuum-retained-history",
+        .retain_ms = 600_000,
+        .keep_latest = 1,
+        .protect_committed_history = true,
+    }, &.{});
+    try std.testing.expectEqual(@as(usize, 4), history.expired_snapshots);
     const expected = [_][2]usize{ .{ 2, 3 }, .{ 2, 1 }, .{ 1, 0 } };
     for (expected, 0..) |counts, pass| {
         const request: Options = .{ .operation_id = try std.fmt.allocPrint(a, "vacuum-{d}", .{pass}), .dry_run = false, .exclusive_ownership = true, .retain_ms = 10 * 60 * 1000, .keep_latest = 1, .max_expired = 2, .max_deleted = 1 };

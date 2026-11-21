@@ -91,8 +91,13 @@ binding. Local credentials bind ownership to the authenticated user instance.
 ## Public HTTP changefeeds
 
 Create an authorized feed with `POST /db/v1/changefeeds` and an
-`Idempotency-Key` header. The definition selects native document or relational tables,
-`start`, `include`, and an optional lease. `start` accepts `now` and
+`Idempotency-Key` header. The definition selects tables, `start`, `include`, and an optional lease.
+Row changefeeds support native document and relational tables and Antfly-written
+Iceberg tables with retained WAL lineage. A subscription can select tables
+from both providers. Its cursor tracks each provider's commit frontier.
+External Iceberg snapshots and remote Parquet inventories expose publication
+activation. Requests for row changefeeds on these read-only bindings fail
+with a capability error. `start` accepts `now` and
 `snapshot_then_changes`. Use optional per-table selectors to limit row payloads
 and match exact scalar values.
 
@@ -118,6 +123,16 @@ when an update changes whether the row matches. Delivery is at least once. Use `
 deduplication and the transaction completion marker before applying a whole
 transaction.
 
+Use `events: ["artifact_published"]` for native artifact publications and
+`events: ["publication_activated"]` for coordinated activation on external
+lake tables. Each starts at `now` and requires table-wide replication
+permission. These event feeds omit row images and selectors. Artifact events
+carry the producer generation, configuration digest, and source coverage digest.
+Activation events carry the committed publication digest and generation.
+The native artifact journal keeps the most recent 4,096 publications per
+physical root. The lake activation journal keeps up to 256 activations per
+table. A cursor behind retained history requires resynchronization.
+
 Read `GET /db/v1/changefeeds/{id}/events?after={cursor}` and advance using
 `Antfly-Changefeed-Cursor`. Acknowledge successfully applied pages with
 `POST /db/v1/changefeeds/{id}/ack` and a JSON `cursor`. Get the acknowledged
@@ -132,8 +147,9 @@ Repeating the requested timestamp is safe and preserves the acknowledged cursor.
 fixed. Active pgoutput sessions renew their one-hour history lease before
 it expires. Disconnected slots remain subject to their recorded expiry.
 
-Expired or invalidated cuts require resynchronization. Each read rechecks
-current authorization.
+Expired or invalidated cuts require resynchronization. A native partition
+split or merge can invalidate an existing cut. Each read rechecks current
+authorization.
 
 ## Retained HTTP feed benchmark
 
@@ -329,6 +345,20 @@ ingress. Configure the same artifact store on metadata and serving nodes.
 Each writable Iceberg table owns one PostgreSQL source cut and checkpoint. A retry uses the
 same source epoch, transaction identity, and checkpoint. Unsupported mutation
 messages, including inbound TRUNCATE, stop progress before the checkpoint.
+
+An Iceberg bootstrap records its staged checkpoint under the source ordinal
+and cutover authority before uploading pages. When a replacement cutover
+retires that authority, the destination marks it retired before sweeping its
+staging objects. The table maintenance worker revisits retired authorities
+with a durable cursor to collect uploads that arrived after the initial sweep.
+
+Each Antfly Iceberg row commit records the exact WAL interval in its catalog
+snapshot. WAL garbage collection preserves groups inside the maintenance
+retention window and honors the configured minimum count of committed groups.
+Active changefeed pins and index readers can hold the collection floor back
+further. An Iceberg changefeed advances its pin after acknowledgment and
+can renew it while streaming. Managed vacuum preserves the snapshot lineage
+and historical row images needed by retained groups.
 
 A native destination can separately expose retained committed history through
 the public changefeed API and eligible relational tables through pgoutput.

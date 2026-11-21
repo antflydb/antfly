@@ -187,6 +187,32 @@ pub const Store = struct {
         defer wal.deinit();
         return (try wal.indexed.?.readSnapshot(namespace)).first_lsn - 1;
     }
+    pub fn retainedCut(self: Store, a: A, cut: u64, now_ms: u64, anchors: *std.ArrayList([]const u8)) !u64 {
+        var opened = try self.open(a, false);
+        defer opened.deinit();
+        const live = try opened.indexed.?.captureRead(namespace);
+        if (live.head.retention_pins) |pins| for (pins) |entry| {
+            if (entry) |saved_pin| if (saved_pin.retired != true and saved_pin.expires_ms > now_ms) {
+                if (saved_pin.snapshot) |snapshot| try anchors.append(a, try std.fmt.allocPrint(a, "{d}", .{snapshot}));
+            };
+        };
+        return live.head.retentionCut(cut, now_ms);
+    }
+    pub fn pinRetention(self: Store, a: A, owner: [16]u8, through: u64, snapshot: ?i64, expires_ms: u64) !void {
+        try self.context.ensureActive();
+        var opened = try self.open(a, true);
+        defer opened.deinit();
+        const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        try opened.indexed.?.pinRetention(namespace, .{ .owner = owner, .through = through, .snapshot = snapshot, .expires_ms = expires_ms }, now);
+    }
+    pub fn retireRetentionPin(self: Store, a: A, owner: [16]u8, expiry_seconds: u64) !void {
+        try self.context.ensureActive();
+        var opened = try self.open(a, true);
+        defer opened.deinit();
+        const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        const expires_ms = try std.math.mul(u64, expiry_seconds, std.time.ms_per_s);
+        try opened.indexed.?.retireRetentionPin(namespace, owner, expires_ms, now);
+    }
     pub const GcResult = struct { records_removed: usize = 0, floor: u64 = 0, complete: bool = false, collection: ?@import("wal/collector.zig").Collector.Result = null };
     /// Catalog/serving leases choose the safe logical cut. The shared collector
     /// subsequently reclaims pages under its persisted epoch/root-use contract.
@@ -198,7 +224,11 @@ pub const Store = struct {
         const before = try indexed.captureRead(namespace);
         if (cut > before.snapshot.latest_lsn) return error.LakeWalCoverageGap;
         const floor = before.snapshot.first_lsn - 1;
-        if (dry_run) return .{ .floor = floor, .records_removed = @intCast(@min(maximum, cut -| floor)), .complete = cut <= floor };
+        if (dry_run) {
+            const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+            const safe_cut = before.head.retentionCut(cut, now);
+            return .{ .floor = floor, .records_removed = @intCast(@min(maximum, safe_cut -| floor)), .complete = safe_cut <= floor };
+        }
         if (cut > floor) _ = try indexed.truncatePrefix(namespace, cut + 1);
         const more = try indexed.compactPrefixStepWithCancellation(namespace, @min(maximum, 256), catalog.types.contextCancellation(&self.context));
         const after = try indexed.captureRead(namespace);
@@ -237,13 +267,20 @@ pub const Store = struct {
         }
     };
     pub fn reader(self: *const Store, a: A, cut: u64) !Reader {
+        return self.openReader(a, cut, null);
+    }
+    pub fn readerThrough(self: *const Store, a: A, cut: u64, through: u64) !Reader {
+        return self.openReader(a, cut, through);
+    }
+    fn openReader(self: *const Store, a: A, cut: u64, through: ?u64) !Reader {
         var opened = try self.open(a, false);
         errdefer opened.deinit();
         const captured = try opened.indexed.?.captureRead(namespace);
         const snapshot = captured.snapshot;
         if (cut < snapshot.first_lsn - 1) return error.LakeOverlayCoverageUnavailable;
-        if (snapshot.latest_lsn < cut) return error.LakeWalCoverageGap;
-        const cursor = try opened.indexed.?.capturedReader(a, namespace, captured, .{ .start_lsn = cut + 1, .end_lsn = snapshot.latest_lsn, .max_record_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(&self.context) });
+        const end = through orelse snapshot.latest_lsn;
+        if (end < cut or end > snapshot.latest_lsn) return error.LakeWalCoverageGap;
+        const cursor = try opened.indexed.?.capturedReader(a, namespace, captured, .{ .start_lsn = cut + 1, .end_lsn = end, .max_record_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(&self.context) });
         return .{ .wal = opened, .cursor = cursor, .position = cut, .context = self.context };
     }
     pub fn next(self: Store, a: A, cut: u64) !?Record {

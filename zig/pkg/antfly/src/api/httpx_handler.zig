@@ -1962,6 +1962,9 @@ pub const AntflyApiHandler = struct {
             try server.postWithBodyLimit(table_prefix ++ routes.history_owner_suffix, @import("history_owner_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryOwner));
         } else try server.post(table_prefix ++ routes.history_owner_suffix, httpx.Handler.bind(self, internalHistoryOwner));
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_artifact_suffix, @import("artifact_history_operations.zig").max_bytes, httpx.Handler.bind(self, internalArtifactHistory));
+        } else try server.post(table_prefix ++ routes.history_artifact_suffix, httpx.Handler.bind(self, internalArtifactHistory));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
             try server.postWithBodyLimit(table_prefix ++ routes.history_publication_suffix, @import("history_publication_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryPublication));
         } else try server.post(table_prefix ++ routes.history_publication_suffix, httpx.Handler.bind(self, internalHistoryPublication));
         try self.registerInternalSqlRoutes(server);
@@ -4107,6 +4110,22 @@ pub const AntflyApiHandler = struct {
         return ctx.json(failure);
     }
 
+    fn internalArtifactHistory(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("artifact_history_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "artifact history request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_artifact_history, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPublicationFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
     fn internalHistoryPublication(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const operations = @import("history_publication_operations.zig");
         const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
@@ -5114,11 +5133,11 @@ pub const AntflyApiHandler = struct {
         switch (err) {
             error.Forbidden, error.Unauthorized, error.UserNotFound, error.ApiKeyExpired, error.ApiKeyNotFound => return jsonErrorResponse(ctx, 403, "changefeed access denied"),
             error.InvalidChangefeed => return jsonErrorResponse(ctx, 400, "invalid changefeed request"),
-            error.ChangefeedResynchronizationRequired, error.ChangefeedCursorExpired, error.ChangefeedLeaseExpired, error.HistoryResynchronizationRequired, error.TopologyChanged => return jsonErrorResponse(ctx, 409, "changefeed_resynchronization_required"),
-            error.ChangefeedConflict, error.MetadataMutationOutcomeUnknown => return jsonErrorResponse(ctx, 409, "changefeed_retry_required"),
-            error.ChangefeedBackpressure, error.HistoryTooLarge => return jsonErrorResponse(ctx, 429, "changefeed_backpressure"),
+            error.ChangefeedResynchronizationRequired, error.ChangefeedCursorExpired, error.ChangefeedLeaseExpired, error.HistoryResynchronizationRequired, error.TopologyChanged, error.WalSnapshotExpired, error.WalRetentionRetired, error.LakeSnapshotRetired, error.LakeWalCoverageGap, error.LakeOverlayCoverageUnavailable => return jsonErrorResponse(ctx, 409, "changefeed_resynchronization_required"),
+            error.ChangefeedConflict, error.MetadataMutationOutcomeUnknown, error.WalRetentionPositionRegressed => return jsonErrorResponse(ctx, 409, "changefeed_retry_required"),
+            error.ChangefeedBackpressure, error.HistoryTooLarge, error.WalRetentionQuota => return jsonErrorResponse(ctx, 429, "changefeed_backpressure"),
             error.ChangefeedCapabilityUnsupported => return jsonErrorResponse(ctx, 501, "changefeed_capability_unsupported"),
-            error.ReadUnavailable, error.ReadIndexTimeout, error.StorageReadTemporarilyUnavailable, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DeadlineExceeded => return jsonErrorResponse(ctx, 503, "changefeed_unavailable"),
+            error.ReadUnavailable, error.ReadIndexTimeout, error.StorageReadTemporarilyUnavailable, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DeadlineExceeded, error.LakeSnapshotReadLeaseExpired, error.WalCommitContended, error.WalVisibilityUnavailable => return jsonErrorResponse(ctx, 503, "changefeed_unavailable"),
             else => return err,
         }
     }

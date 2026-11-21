@@ -4019,6 +4019,8 @@ const LocalStandaloneMetadata = struct {
         const current = (try store.getReplicationSourceStatus(self.alloc, CdcService.group, table.table_id, request.cutover.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
         defer CdcService.tm.freeReplicationSourceStatus(self.alloc, current);
         if (!antfly.metadata_service.replicationCutoverAuthorityMatches(current, request.cutover)) return error.ReplicationCutoverAuthorityLost;
+        if (request.cutover.retired_cutover_authority_id != 0 and
+            !antfly.metadata_service.replicationCutoverRetirementMatches(current, request.cutover)) return error.ReplicationCutoverAuthorityLost;
         const definition = try @import("../metadata/source_control.zig").definitionDigest(self.alloc, table.replication_sources_json, request.cutover.source_ordinal);
         if (!try store.legacyReplicationSourceIntakeAllowed(self.alloc, CdcService.group, table.table_id, request.cutover.source_ordinal, definition)) return error.SourcePendingWork;
     }

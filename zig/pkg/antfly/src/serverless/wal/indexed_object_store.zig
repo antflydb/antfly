@@ -114,6 +114,15 @@ pub const IndexedObjectStore = struct {
 
     pub const DocumentIndex = struct { first_lsn: u64, root: ?tree.Ref = null };
     pub const ReadParent = struct { latest_lsn: u64, write_epoch: u64, physical_first_lsn: u64, records: ?tree.Ref = null };
+    pub const RetentionPin = struct {
+        owner: [16]u8,
+        through: u64,
+        expires_ms: u64,
+        snapshot: ?i64 = null,
+        retired: ?bool = null,
+    };
+    const max_retention_pins = 16;
+
     pub const Head = struct {
         // Keep unfenced HEAD encodings readable by legacy binaries. Format 8
         // deliberately exposes the new fields and requires upgraded readers.
@@ -132,6 +141,17 @@ pub const IndexedObjectStore = struct {
             try writer.endObject();
         }
 
+        pub fn retentionCut(self: Head, requested: u64, now_ms: u64) u64 {
+            var cut = requested;
+            if (self.retention_pins) |pins| for (pins) |entry| {
+                if (entry) |pin| {
+                    if (pin.retired != true and pin.expires_ms > now_ms) cut = @min(cut, pin.through);
+                }
+            };
+            return cut;
+        }
+
+        retention_pins: ?[max_retention_pins]?RetentionPin = null,
         native_owner: ?[16]u8 = null,
         catalog_fenced: bool = false,
         catalog_epoch: u64 = 0,
@@ -1163,6 +1183,82 @@ pub const IndexedObjectStore = struct {
         return out.toOwnedSlice(alloc);
     }
 
+    /// Use the same HEAD CAS as truncation. A successful pin proves that
+    /// the required prefix still exists at the instant collection is fenced.
+    pub fn pinRetention(self: *@This(), namespace: []const u8, pin: RetentionPin, now_ms: u64) !void {
+        if (std.mem.allEqual(u8, &pin.owner, 0) or now_ms == 0 or pin.expires_ms <= now_ms)
+            return error.InvalidWal;
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        for (0..self.max_attempts) |_| {
+            var head = try ctx.readHead();
+            defer head.deinit(self.alloc);
+            if (pin.through < head.value.first_lsn - 1) return error.WalSnapshotExpired;
+            if (pin.through > head.value.latest_lsn) return error.WalVisibilityUnavailable;
+            var next = head.value;
+            var pins = next.retention_pins orelse @as([max_retention_pins]?RetentionPin, @splat(null));
+            var available: ?usize = null;
+            var previous: ?usize = null;
+            for (&pins, 0..) |*entry, index| {
+                if (entry.*) |saved| {
+                    if (saved.expires_ms <= now_ms) {
+                        entry.* = null;
+                    } else if (std.mem.eql(u8, &saved.owner, &pin.owner)) {
+                        previous = index;
+                    }
+                }
+                if (entry.* == null and available == null) available = index;
+            }
+            const slot = previous orelse available orelse return error.WalRetentionQuota;
+            if (pins[slot]) |saved| {
+                if (saved.retired == true) return error.WalRetentionRetired;
+                if (pin.through < saved.through) return error.WalRetentionPositionRegressed;
+                pins[slot] = .{ .owner = pin.owner, .through = pin.through, .expires_ms = @max(saved.expires_ms, pin.expires_ms), .snapshot = pin.snapshot };
+            } else pins[slot] = pin;
+            next.retention_pins = pins;
+            ctx.writeHead(next, head.revision) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            return;
+        }
+        return error.WalCommitContended;
+    }
+
+    /// Fence stale renewals for the rest of the pin's accepted lifetime.
+    /// A retired entry consumes no WAL or snapshot retention.
+    pub fn retireRetentionPin(self: *@This(), namespace: []const u8, owner: [16]u8, expires_ms: u64, now_ms: u64) !void {
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        for (0..self.max_attempts) |_| {
+            var head = try ctx.readHead();
+            defer head.deinit(self.alloc);
+            var next = head.value;
+            var pins = next.retention_pins orelse @as([max_retention_pins]?RetentionPin, @splat(null));
+            var available: ?usize = null;
+            const existing = for (pins, 0..) |entry, index| {
+                if (entry) |pin| {
+                    if (std.mem.eql(u8, &pin.owner, &owner)) break index;
+                    if (pin.expires_ms > now_ms) continue;
+                }
+                if (available == null) available = index;
+            } else null;
+            const accepted_expiry = if (existing) |index| @max(expires_ms, pins[index].?.expires_ms) else expires_ms;
+            if (accepted_expiry <= now_ms) return;
+            const index = existing orelse available orelse return error.WalRetentionQuota;
+            if (pins[index]) |saved| if (saved.retired == true and saved.expires_ms == accepted_expiry and
+                std.mem.eql(u8, &saved.owner, &owner)) return;
+            pins[index] = .{ .owner = owner, .through = head.value.first_lsn - 1, .expires_ms = accepted_expiry, .retired = true };
+            next.retention_pins = pins;
+            ctx.writeHead(next, head.revision) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            return;
+        }
+        return error.WalCommitContended;
+    }
+
     /// Logical retention does not reset the high watermark or idempotency
     /// receipts. Immutable page reclamation must be separately lease-fenced.
     pub fn truncatePrefix(self: *@This(), namespace: []const u8, keep_from: u64) !u64 {
@@ -1171,7 +1267,9 @@ pub const IndexedObjectStore = struct {
         for (0..self.max_attempts) |_| {
             var head = try ctx.readHead();
             defer head.deinit(self.alloc);
-            const next_floor = @min(keep_from, head.value.latest_lsn + 1);
+            const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+            const requested_floor = @min(keep_from, head.value.latest_lsn + 1);
+            const next_floor = if (requested_floor == 0) 0 else head.value.retentionCut(requested_floor - 1, now_ms) + 1;
             if (next_floor <= head.value.first_lsn) return 0;
             var updated = head.value;
             updated.first_lsn = next_floor;
@@ -1439,6 +1537,11 @@ pub const IndexedObjectStore = struct {
             defer parsed.deinit();
             const head = parsed.value;
             if (head.native_owner) |owner| if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidWal;
+            if (head.retention_pins) |pins| for (pins) |entry| {
+                if (entry) |pin| {
+                    if (pin.through > head.latest_lsn or pin.expires_ms == 0 or std.mem.allEqual(u8, &pin.owner, 0)) return error.InvalidWal;
+                }
+            };
             if ((head.packed_pages orelse false) != (head.format == 5) and head.format != 6 and head.format != 7 and head.format != 8) return error.InvalidWal;
             if ((head.format != 7 and head.format != 8 and (head.deferred_indexes == true) != (head.format == 6)) or (head.deferred_tail != null and head.deferred_indexes != true)) return error.InvalidWal;
             if (head.deferred_tail) |*tail| try tail.validate(head.latest_lsn);

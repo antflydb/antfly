@@ -1585,7 +1585,16 @@ pub fn prepareSourceCommit(
     }
     var routing = (try table_catalog.transactionRoutingSnapshot(alloc, coordinator.recovery.catalog, grant.authority.table_name)) orelse return error.TableNotFound;
     defer routing.deinit(alloc);
-    _ = try ensureParticipantTxn(alloc, &participants, grant.authority.table_name, grant.authority.owner.group_id, routing.topology_epoch);
+    for (participants.items) |participant| {
+        if (participant.group_id != grant.authority.owner.group_id or
+            !std.mem.eql(u8, participant.table_name, grant.authority.table_name)) continue;
+        if (participant.topology_epoch != routing.topology_epoch) return error.TopologyChanged;
+        break;
+    } else try participants.append(alloc, .{
+        .table_name = grant.authority.table_name,
+        .group_id = grant.authority.owner.group_id,
+        .topology_epoch = routing.topology_epoch,
+    });
     const inputs = try alloc.alloc(@import("completion_admission.zig").Input, participants.items.len);
     defer alloc.free(inputs);
     for (participants.items, inputs) |*participant, *input| {

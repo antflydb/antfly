@@ -39,11 +39,16 @@ pub const Guard = struct {
 /// names, schema/index generations, leader terms and per-feed authorization.
 pub fn authority(fence: metadata.CatalogRouteFence) ![32]u8 {
     try fence.validate();
-    const incarnation = fence.metadata_incarnation orelse return error.ChangefeedCapabilityUnsupported;
+    return authorityForCatalog(fence.metadata_group_id, fence.metadata_incarnation);
+}
+
+pub fn authorityForCatalog(metadata_group_id: u64, observed: ?metadata.MetadataClusterIncarnation) ![32]u8 {
+    if (metadata_group_id == 0) return error.ChangefeedCapabilityUnsupported;
+    const incarnation = observed orelse return error.ChangefeedCapabilityUnsupported;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly:root-history-authority:v1");
     var group: [8]u8 = undefined;
-    std.mem.writeInt(u64, &group, fence.metadata_group_id, .little);
+    std.mem.writeInt(u64, &group, metadata_group_id, .little);
     hash.update(&group);
     hash.update(&incarnation);
     return hash.finalResult();

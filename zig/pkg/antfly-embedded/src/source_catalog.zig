@@ -947,3 +947,13 @@ pub const storage_source_plan_control = @import("storage/source_plan_control.zig
 pub const storage_source_checkpoint_read = @import("storage/source_checkpoint_read.zig");
 
 pub const storage_source_plan_wire = @import("storage/source_plan_wire.zig");
+
+pub const storage_committed_frame = @import("storage/committed_frame.zig");
+pub const storage_history_grant_wire = @import("storage/history_grant_wire.zig");
+pub const storage_history_ordered = @import("storage/history_ordered.zig");
+pub const storage_history_page_wire = @import("storage/history_page_wire.zig");
+pub const storage_history_resolution_wire = @import("storage/history_resolution_wire.zig");
+pub const storage_source_admission = @import("storage/source_admission.zig");
+pub const storage_source_effects = @import("storage/source_effects.zig");
+pub const storage_source_scope_rebind_test = @import("storage/source_scope_rebind_test.zig");
+pub const storage_source_transaction = @import("storage/source_transaction.zig");

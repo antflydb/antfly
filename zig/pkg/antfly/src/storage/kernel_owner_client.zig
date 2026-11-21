@@ -889,6 +889,22 @@ pub const Owner = struct {
         return parsed.value;
     }
 
+    const artifact_history = @import("antfly_local_sources").storage_db_artifact_publication;
+    pub fn artifactPublicationHistory(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: artifact_history.HistoryRead, minimum_applied_index: u64) !artifact_history.HistoryObservation {
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        const json = try std.json.Stringify.valueAlloc(alloc, artifact_history.OrderedHistoryRead{ .request = request, .minimum_applied_index = minimum_applied_index }, .{});
+        defer alloc.free(json);
+        if (json.len > artifact_history.max_history_read_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_artifact_publication_history(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        if (response.bytes().len > artifact_history.max_history_read_bytes) return error.HistoryCorrupt;
+        var parsed = try std.json.parseFromSlice(artifact_history.HistoryObservation, alloc, response.bytes(), .{});
+        defer parsed.deinit();
+        try request.validateObservation(parsed.value, minimum_applied_index);
+        return parsed.value;
+    }
+
     /// Decode into caller-owned page storage before releasing the ABI buffer.
     pub fn orderedHistoryPage(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Request, minimum_applied_index: u64) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Page {
         if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;

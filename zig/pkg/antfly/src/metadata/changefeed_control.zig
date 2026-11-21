@@ -25,9 +25,11 @@ pub const protocol_version: u16 = 120;
 pub const verified_bootstrap_protocol_version: u16 = 122;
 pub const qualified_bootstrap_protocol_version: u16 = 123;
 pub const slot_snapshot_start_protocol_version: u16 = 124;
+pub const provider_history_protocol_version: u16 = 125;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
+pub const artifact_event: u8 = 2;
 pub const max_roots = 4096;
 pub const max_cursors = 128;
 pub const max_provider_context_bytes = 64 * 1024;
@@ -82,6 +84,9 @@ pub fn validProviderContext(value: []const u8) bool {
 pub const Start = enum { now, snapshot_then_changes };
 pub const Projection = enum { keys_and_versions, rows };
 pub const Contract = enum { native_document, native_relational, writable_iceberg_rows, external_snapshot_lifecycle };
+pub fn catalogBacked(contract: Contract) bool {
+    return contract == .writable_iceberg_rows or contract == .external_snapshot_lifecycle;
+}
 pub const Predicate = struct { field: []const u8, value: std.json.Value };
 pub const Table = struct {
     table_id: u64,
@@ -107,6 +112,8 @@ pub const Definition = struct {
             self.events == 0 or self.events & ~@as(u8, 7) != 0 or self.cursor_window == 0 or self.cursor_window > max_cursors or
             self.cursor_byte_limit < 4096 or self.cursor_byte_limit > max_cursor_bytes) return error.InvalidChangefeed;
         for (self.tables, 0..) |table, index| {
+            if (self.events == artifact_event and (self.start != .now or catalogBacked(table.contract) or
+                table.fields.len != 0 or table.predicates.len != 0)) return error.InvalidChangefeed;
             if (table.table_id == 0 or !nz(table.binding) or table.fields.len > 64 or table.predicates.len > 16 or
                 (index != 0 and self.tables[index - 1].table_id >= table.table_id) or
                 (table.contract == .external_snapshot_lifecycle and self.events & 1 != 0)) return error.InvalidChangefeed;
@@ -123,6 +130,11 @@ pub const Definition = struct {
             }
         }
         if (encodedSize(self) > max_definition_bytes) return error.InvalidChangefeed;
+    }
+    fn usesProviderHistory(self: Definition) bool {
+        if (self.events != 1) return true;
+        for (self.tables) |table| if (catalogBacked(table.contract)) return true;
+        return false;
     }
     pub fn identity(self: Definition) Digest {
         return hash(.{ .domain = "antfly:changefeed-definition:v1", .definition = self });
@@ -166,6 +178,16 @@ pub const Root = struct {
     last_reconciliation: ?root_intent.Reconciliation = null,
 };
 pub const RootPlan = struct { namespace: Namespace, ownership_epoch: u64 };
+
+/// Catalog-backed history has one logical root per table incarnation and
+/// remains stable across placement or index topology changes.
+pub fn catalogRootNamespace(table: Table) Namespace {
+    var namespace: Namespace = undefined;
+    std.mem.writeInt(u64, namespace[0..8], table.table_id, .big);
+    const identity = hash(.{ .domain = "antfly:catalog-history-root:v1", .binding = table.binding });
+    namespace[8..24].* = identity[0..16].*;
+    return namespace;
+}
 pub const Advance = struct { namespace: Namespace, position: Position, snapshot: ?BootstrapPosition = null };
 pub const Delivery = struct {
     sequence: u64,
@@ -458,6 +480,34 @@ pub const RootControlMutation = union(enum) {
         }
     }
 };
+pub const CatalogStart = struct { namespace: Namespace, through: u64, snapshot: ?Snapshot = null };
+
+pub const Seal = struct {
+    cut: Digest,
+    slot: ?pg_slot.Configuration = null,
+    provider_context: []const u8 = "",
+    /// Catalog roots have no native consumer RPC. Enrollment and the starting
+    /// provider position commit together against the planned root.
+    catalog_starts: []const CatalogStart = &.{},
+
+    pub fn jsonStringify(self: Seal, writer: anytype) @TypeOf(writer.*).Error!void {
+        try writer.beginObject();
+        try writer.objectField("cut");
+        try writer.write(self.cut);
+        try writer.objectField("slot");
+        try writer.write(self.slot);
+        if (self.provider_context.len != 0) {
+            try writer.objectField("provider_context");
+            try writer.write(self.provider_context);
+        }
+        if (self.catalog_starts.len != 0) {
+            try writer.objectField("catalog_starts");
+            try writer.write(self.catalog_starts);
+        }
+        try writer.endObject();
+    }
+};
+
 pub const Mutation = union(enum) {
     root_control: struct { namespace: Namespace, operation: RootControlMutation },
     slot: pg_slot.Mutation,
@@ -466,7 +516,8 @@ pub const Mutation = union(enum) {
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
     refresh_grant: struct { namespace: Namespace, previous: u64 },
-    seal: struct { cut: Digest, slot: ?pg_slot.Configuration = null },
+    stage_catalog_start: []const u8,
+    seal: Seal,
     skip_slot_projection: struct { session: pg_slot.Session, now: u64, delivery: Delivery },
     issue: Delivery,
     acknowledge: Digest,
@@ -477,6 +528,7 @@ pub const Mutation = union(enum) {
     start_exported_slot: struct { name: SlotSnapshot, now: u64, requested_lsn: u64 },
     release_snapshot: struct { namespace: Namespace, snapshot_id: Id, proof: Digest },
     renew: struct { now: u64, expires_at: u64 },
+    renew_catalog: struct { now: u64, expires_at: u64 },
     expire: u64,
     reset: Reset,
     close,
@@ -484,6 +536,13 @@ pub const Mutation = union(enum) {
     finish_close,
     restart: struct { definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
     pub fn requiredProtocol(self: Mutation) u16 {
+        switch (self) {
+            .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
+            .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
+            .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
+            .seal => |sealed| if (sealed.catalog_starts.len != 0) return provider_history_protocol_version,
+            else => {},
+        }
         if (self == .root_control) switch (self.root_control.operation) {
             .reconciled => |result| if (result.effect == .progress and result.effect.progress == .snapshot_enrolled) return qualified_bootstrap_protocol_version,
             .settled => |result| if (result.effect == .rejected and result.effect.rejected == 8) return qualified_bootstrap_protocol_version,
@@ -516,9 +575,18 @@ pub const Mutation = union(enum) {
             },
             .refresh_grant => |value| if (!nz(value.namespace) or value.previous == 0) return error.InvalidChangefeed,
             .rebind => |value| if (!nz(value.namespace) or value.previous == 0 or value.next <= value.previous or !nz(value.proof)) return error.InvalidChangefeed,
+            .stage_catalog_start => |provider| if (provider.len == 0 or !validProviderContext(provider)) return error.InvalidChangefeed,
             .seal => |value| {
-                if (!nz(value.cut)) return error.InvalidChangefeed;
-                if (value.slot) |configuration| try configuration.validate();
+                if (!nz(value.cut) or !validProviderContext(value.provider_context)) return error.InvalidChangefeed;
+                if (value.catalog_starts.len > max_roots or (value.catalog_starts.len != 0 and (value.provider_context.len == 0 or value.slot != null))) return error.InvalidChangefeed;
+                for (value.catalog_starts, 0..) |start, index| {
+                    if (!nz(start.namespace) or (index != 0 and std.mem.order(u8, &value.catalog_starts[index - 1].namespace, &start.namespace) != .lt)) return error.InvalidChangefeed;
+                    if (start.snapshot) |snapshot| if (!nz(snapshot.id) or !nz(snapshot.digest) or snapshot.expires_at == 0) return error.InvalidChangefeed;
+                }
+                if (value.slot) |configuration| {
+                    if (value.provider_context.len != 0) return error.InvalidChangefeed;
+                    try configuration.validate();
+                }
             },
             .skip_slot_projection => |skip| {
                 if (skip.now == 0 or skip.delivery.issued_at > skip.now or skip.delivery.advances.len == 0) return error.InvalidChangefeed;
@@ -540,6 +608,7 @@ pub const Mutation = union(enum) {
             .start_exported_slot => |value| if (!nz(value.name.feed) or !nz(value.name.proof) or value.now == 0) return error.InvalidChangefeed,
             .release_snapshot => |value| if (!nz(value.namespace) or !nz(value.snapshot_id) or !nz(value.proof)) return error.InvalidChangefeed,
             .renew => |value| try lease(value.now, value.expires_at),
+            .renew_catalog => |value| try lease(value.now, value.expires_at),
             .expire => |value| if (value == 0) return error.InvalidChangefeed,
             .reset => |value| if (value == .none) return error.InvalidChangefeed,
             .close, .finish_close => {},
@@ -782,12 +851,62 @@ pub const Mutation = union(enum) {
                 roots[index].grant_sequence = stamp.sequence;
                 next.roots = roots;
             },
+            .stage_catalog_start => |provider| {
+                const definition = state.definition orelse return error.ChangefeedConflict;
+                if (state.phase != .enrolling) return error.ChangefeedConflict;
+                var catalog_roots: usize = 0;
+                for (definition.tables) |table| {
+                    if (!catalogBacked(table.contract)) continue;
+                    _ = try state.rootIndex(catalogRootNamespace(table));
+                    catalog_roots += 1;
+                }
+                if (catalog_roots == 0 and (definition.events != artifact_event or state.roots.len == 0)) return error.ChangefeedConflict;
+                if (definition.events == artifact_event and provider.len != std.base64.url_safe_no_pad.Encoder.calcSize(state.roots.len * @sizeOf(u64)))
+                    return error.ChangefeedConflict;
+                if (state.latest_provider_context.len != 0) {
+                    if (std.mem.eql(u8, state.latest_provider_context, provider)) return state;
+                    return error.ChangefeedConflict;
+                }
+                next.latest_provider_context = provider;
+                next.acknowledged_provider_context = provider;
+            },
             .seal => |sealed| {
                 if (state.phase != .enrolling or state.roots.len == 0 or !nz(sealed.cut)) return error.ChangefeedConflict;
-                for (state.roots) |root| if (root.consumer_epoch == 0) return error.ChangefeedConflict;
+                if (sealed.catalog_starts.len != 0) {
+                    if (!std.mem.eql(u8, state.latest_provider_context, sealed.provider_context)) return error.ChangefeedConflict;
+                    const definition = state.definition.?;
+                    const roots = try a.dupe(Root, state.roots);
+                    var start_index: usize = 0;
+                    const artifact = definition.events == artifact_event;
+                    const count = if (artifact) roots.len else definition.tables.len;
+                    for (0..count) |index| {
+                        const namespace = if (artifact) roots[index].namespace else blk: {
+                            const table = definition.tables[index];
+                            if (!catalogBacked(table.contract)) continue;
+                            break :blk catalogRootNamespace(table);
+                        };
+                        if (start_index >= sealed.catalog_starts.len) return error.ChangefeedConflict;
+                        const start = sealed.catalog_starts[start_index];
+                        start_index += 1;
+                        if (!equal(start.namespace, namespace) or
+                            (definition.start == .snapshot_then_changes) != (start.snapshot != null)) return error.ChangefeedConflict;
+                        if (start.snapshot) |snapshot| if (snapshot.expires_at != state.bootstrap_expires_at) return error.ChangefeedConflict;
+                        const root = &roots[try state.rootIndex(start.namespace)];
+                        if (root.consumer_epoch != 0 or root.pending_control != null) return error.ChangefeedConflict;
+                        root.consumer_epoch = state.epoch;
+                        root.start = start.through;
+                        root.delivered = .{ .sequence = start.through };
+                        root.acknowledged = .{ .sequence = start.through };
+                        root.reclaimed_through = start.through;
+                        root.snapshot = start.snapshot;
+                    }
+                    if (start_index != sealed.catalog_starts.len) return error.ChangefeedConflict;
+                    next.roots = roots;
+                }
+                for (next.roots) |root| if (root.consumer_epoch == 0) return error.ChangefeedConflict;
                 for (state.definition.?.tables) |table| {
                     var found = false;
-                    for (state.roots) |root| if (std.mem.readInt(u64, root.namespace[0..8], .big) == table.table_id) {
+                    for (next.roots) |root| if (std.mem.readInt(u64, root.namespace[0..8], .big) == table.table_id) {
                         found = true;
                         break;
                     };
@@ -795,8 +914,13 @@ pub const Mutation = union(enum) {
                 }
                 next.cut = sealed.cut;
                 next.phase = if (state.definition.?.start == .snapshot_then_changes) .bootstrap else .streaming;
-                next.latest_cursor = initialCursor(state, sealed.cut);
+                next.latest_cursor = if (sealed.provider_context.len == 0)
+                    initialCursor(state, sealed.cut)
+                else
+                    hash(.{ .domain = "antfly:changefeed-cut:v2", .base = initialCursor(state, sealed.cut), .provider_context = sealed.provider_context });
                 next.acknowledged_cursor = next.latest_cursor;
+                next.latest_provider_context = sealed.provider_context;
+                next.acknowledged_provider_context = sealed.provider_context;
                 if (sealed.slot) |configuration| {
                     try slotDefinition(state.definition.?);
                     if (!equal(state.id, pg_slot.feedId(configuration.database, configuration.name))) return error.ChangefeedConflict;
@@ -883,6 +1007,16 @@ pub const Mutation = union(enum) {
             .finish_verified_bootstrap => |completion| {
                 if (!equal(completion.proof, try state.bootstrapCompletionProof())) return error.ChangefeedConflict;
                 next.phase = .streaming;
+                const definition = state.definition.?;
+                var catalog_roots: ?[]Root = null;
+                for (definition.tables) |table| {
+                    if (!catalogBacked(table.contract)) continue;
+                    // The WAL anchor remains after the snapshot scan.
+                    const roots = catalog_roots orelse try a.dupe(Root, state.roots);
+                    roots[try state.rootIndex(catalogRootNamespace(table))].snapshot_released = true;
+                    catalog_roots = roots;
+                }
+                if (catalog_roots) |roots| next.roots = roots;
             },
             .start_exported_slot => |start| {
                 const slot = state.slot orelse return error.ReplicationSlotNotFound;
@@ -913,6 +1047,26 @@ pub const Mutation = union(enum) {
                 try lease(renewal.now, renewal.expires_at);
                 next.expires_at = renewal.expires_at;
                 next.renewal_pending = state.phase == .streaming and state.slot == null;
+            },
+            .renew_catalog => |renewal| {
+                const definition = state.definition orelse return error.ChangefeedConflict;
+                if (state.phase != .streaming or state.slot != null) return error.ChangefeedConflict;
+                if (renewal.now >= state.expires_at or renewal.expires_at <= state.expires_at) return error.ChangefeedLeaseExpired;
+                const roots = try a.dupe(Root, state.roots);
+                var catalog_count: usize = 0;
+                for (definition.tables) |table| {
+                    if (!catalogBacked(table.contract)) continue;
+                    roots[try state.rootIndex(catalogRootNamespace(table))].renewed_through = renewal.expires_at;
+                    catalog_count += 1;
+                }
+                if (definition.events == artifact_event) {
+                    for (roots) |*root| root.renewed_through = renewal.expires_at;
+                    catalog_count = roots.len;
+                }
+                if (catalog_count == 0) return error.ChangefeedConflict;
+                next.roots = roots;
+                next.expires_at = renewal.expires_at;
+                next.renewal_pending = catalog_count != roots.len;
             },
             .expire => |now| {
                 if (state.phase == .empty or state.phase == .closing or state.phase == .deleted or state.phase == .reset_required) return state;
@@ -1636,12 +1790,17 @@ test "changefeed control preserves private continuation at each cursor across AC
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var state = try testState(a, .now);
+    const start = Start.now;
+    var enrolled = try step(a, .{}, .{ .create = .{ .id = @splat(4), .definition = testDefinition(start), .now = 100, .expires_at = 1000, .bootstrap_expires_at = 0 } });
+    enrolled = try step(a, enrolled, .{ .plan_roots = &.{.{ .namespace = testNamespace(7), .ownership_epoch = 1 }} });
+    enrolled = try step(a, enrolled, .{ .enroll = .{ .namespace = testNamespace(7), .ownership_epoch = 1, .grant_sequence = enrolled.roots[0].grant_sequence, .consumer_epoch = 6, .start = 10 } });
+    var state = try step(a, enrolled, .{ .seal = .{ .cut = @splat(7), .provider_context = "Yw" } });
+    try std.testing.expect(!equal(state.latest_cursor, (try step(a, enrolled, .{ .seal = .{ .cut = @splat(7) } })).latest_cursor));
     const initial = state.latest_cursor;
     var first: Delivery = .{ .sequence = 1, .before = initial, .cursor = @splat(0), .authority = @splat(1), .issued_at = 101, .provider_context = "YQ", .advances = &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 10, .event = 3 } }} };
     first.cursor = first.identity(state.id, state.epoch);
     state = try step(a, state, .{ .issue = first });
-    try std.testing.expectEqualStrings("", try state.contextAt(initial));
+    try std.testing.expectEqualStrings("Yw", try state.contextAt(initial));
     try std.testing.expectEqualStrings("YQ", try state.contextAt(first.cursor));
     state = try step(a, state, .{ .acknowledge = first.cursor });
     const bytes = try encode(a, state);
@@ -2099,4 +2258,73 @@ test "changefeed slot snapshot name binds pins and initial LSN across metadata r
     const issued = testDelivery(state, &.{.{ .namespace = namespace, .position = .{ .sequence = 10 }, .snapshot = .{ .page = 1, .done = true } }});
     state = try step(a, state, .{ .issue = issued });
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, imported.verify(state, database, definition.owner, 101));
+}
+
+test "changefeed control seals the complete catalog root vector atomically" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var definition = testDefinition(.now);
+    definition.tables = &.{
+        .{ .table_id = 7, .binding = @splat(3), .policy_revision = 1, .contract = .writable_iceberg_rows },
+        .{ .table_id = 9, .binding = @splat(4), .policy_revision = 1, .contract = .writable_iceberg_rows },
+    };
+    const first = catalogRootNamespace(definition.tables[0]);
+    const second = catalogRootNamespace(definition.tables[1]);
+    var state = try step(a, .{}, .{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } });
+    state = try step(a, state, .{ .plan_roots = &.{ .{ .namespace = first, .ownership_epoch = 1 }, .{ .namespace = second, .ownership_epoch = 1 } } });
+    state = try step(a, state, .{ .stage_catalog_start = "YQ" });
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .seal = .{ .cut = @splat(7), .provider_context = "YQ", .catalog_starts = &.{.{ .namespace = first, .through = 3 }} } }));
+    const sealed = try step(a, state, .{ .seal = .{ .cut = @splat(7), .provider_context = "YQ", .catalog_starts = &.{ .{ .namespace = first, .through = 3 }, .{ .namespace = second, .through = 10 } } } });
+    try std.testing.expectEqual(.streaming, sealed.phase);
+    try std.testing.expectEqual(@as(u64, 3), sealed.roots[0].acknowledged.sequence);
+    try std.testing.expectEqual(@as(u64, 10), sealed.roots[1].acknowledged.sequence);
+    try std.testing.expectEqualStrings("YQ", try sealed.contextAt(sealed.acknowledged_cursor));
+}
+
+test "changefeed control mixed renewal leaves native root work durable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var definition = testDefinition(.now);
+    definition.tables = &.{
+        .{ .table_id = 7, .binding = @splat(3), .policy_revision = 1, .contract = .native_relational },
+        .{ .table_id = 9, .binding = @splat(4), .policy_revision = 1, .contract = .writable_iceberg_rows },
+    };
+    const native = testNamespace(7);
+    const iceberg = catalogRootNamespace(definition.tables[1]);
+    var state = try step(a, .{}, .{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } });
+    state = try step(a, state, .{ .plan_roots = &.{ .{ .namespace = native, .ownership_epoch = 1 }, .{ .namespace = iceberg, .ownership_epoch = 1 } } });
+    state = try step(a, state, .{ .enroll = .{ .namespace = native, .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .consumer_epoch = 3, .start = 10 } });
+    state = try step(a, state, .{ .stage_catalog_start = "YQ" });
+    state = try step(a, state, .{ .seal = .{ .cut = @splat(7), .provider_context = "YQ", .catalog_starts = &.{.{ .namespace = iceberg, .through = 3 }} } });
+    state = try step(a, state, .{ .renew_catalog = .{ .now = 200, .expires_at = 2000 } });
+    try std.testing.expect(state.renewal_pending);
+    try std.testing.expectEqual(@as(u64, 0), state.roots[0].renewed_through);
+    try std.testing.expectEqual(@as(u64, 2000), state.roots[1].renewed_through);
+}
+
+test "changefeed control binds artifact offsets to the enrolled physical root generations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var definition = testDefinition(.now);
+    definition.events = artifact_event;
+    const create: Mutation = .{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } };
+    try std.testing.expectEqual(provider_history_protocol_version, create.requiredProtocol());
+    const first = testNamespace(definition.tables[0].table_id);
+    var second = first;
+    second[second.len - 1] += 1;
+    const generations = "AAAAAAAAAAAAAAAAAAAAAQ";
+    var state = try step(a, .{}, create);
+    state = try step(a, state, .{ .plan_roots = &.{ .{ .namespace = first, .ownership_epoch = 1 }, .{ .namespace = second, .ownership_epoch = 1 } } });
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .stage_catalog_start = "YQ" }));
+    state = try step(a, state, .{ .stage_catalog_start = generations });
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .seal = .{ .cut = @splat(7), .provider_context = generations, .catalog_starts = &.{.{ .namespace = first, .through = 3 }} } }));
+    state = try step(a, state, .{ .seal = .{ .cut = @splat(7), .provider_context = generations, .catalog_starts = &.{ .{ .namespace = first, .through = 3 }, .{ .namespace = second, .through = 10 } } } });
+    try std.testing.expectEqualStrings(generations, try state.contextAt(state.acknowledged_cursor));
+    try std.testing.expectEqual(@as(u64, 3), state.roots[0].acknowledged.sequence);
+    try std.testing.expectEqual(@as(u64, 10), state.roots[1].acknowledged.sequence);
+    state = try step(a, state, .{ .renew_catalog = .{ .now = 200, .expires_at = 2000 } });
+    try std.testing.expect(!state.renewal_pending);
 }

@@ -358,6 +358,11 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
     const s = try schema(a, root);
     const rows = try normalize(a, s, batch, files.context);
     const props = try m.get(root, "properties");
+    const previous_wal_coverage = if (props.object.get("antfly.wal.coverage")) |value|
+        std.fmt.parseInt(u64, try m.str(value), 10) catch return error.LakeWalCoverageGap
+    else
+        0;
+    if (wal_lsn <= previous_wal_coverage) return error.LakeWalCoverageGap;
     const key_definition = try std.json.Stringify.valueAlloc(a, batch.key_fields, .{});
     if (props.object.get("antfly.cdc.source")) |owner| {
         if (!std.mem.eql(u8, try m.str(owner), batch.source) or !std.mem.eql(u8, try m.str(try m.get(props, "antfly.cdc.epoch")), batch.epoch) or !std.mem.eql(u8, try m.str(try m.get(props, "antfly.cdc.key-fields")), key_definition)) return error.LakeSourceConflict;
@@ -440,7 +445,24 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
     }
     const manifest_list = try avro.ocf(a, avro.list_schema, manifests.array.items, &.{ .{ .key = "format-version", .value = "2" }, .{ .key = "snapshot-id", .value = try std.fmt.allocPrint(a, "{d}", .{snapshot_id}) }, .{ .key = "sequence-number", .value = try std.fmt.allocPrint(a, "{d}", .{seq}) } });
     const list_uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-{s}-list.avro", .{digest}), manifest_list);
-    var snapshot = try json(a, .{ .@"snapshot-id" = snapshot_id, .@"sequence-number" = seq, .@"timestamp-ms" = timestamp_ms, .@"manifest-list" = list_uri, .@"schema-id" = try m.int(try m.get(root, "current-schema-id")), .summary = .{ .operation = "overwrite", .@"antfly.batch-id" = batch.batch_id, .@"antfly.wal.coverage" = try std.fmt.allocPrint(a, "{d}", .{wal_lsn}) } });
+    // Publish the accepted-WAL interval with the snapshot CAS. A consumer
+    // can distinguish source commits from physical rewrites and recover the
+    // interval even after the table properties move to a later snapshot.
+    var snapshot = try json(a, .{
+        .@"snapshot-id" = snapshot_id,
+        .@"sequence-number" = seq,
+        .@"timestamp-ms" = timestamp_ms,
+        .@"manifest-list" = list_uri,
+        .@"schema-id" = try m.int(try m.get(root, "current-schema-id")),
+        .summary = .{
+            .operation = "overwrite",
+            .@"antfly.batch-id" = batch.batch_id,
+            .@"antfly.wal.coverage" = try std.fmt.allocPrint(a, "{d}", .{wal_lsn}),
+            .@"antfly.wal.previous-coverage" = try std.fmt.allocPrint(a, "{d}", .{previous_wal_coverage}),
+            .@"antfly.cdc.source" = batch.source,
+            .@"antfly.cdc.epoch" = batch.epoch,
+        },
+    });
     if (parent != .null and try m.int(parent) != -1) try put(a, &snapshot, "parent-snapshot-id", parent);
     try append(&updates, try json(a, .{ .action = "add-snapshot", .snapshot = snapshot }));
     try append(&updates, try json(a, .{ .action = "set-snapshot-ref", .@"ref-name" = "main", .@"snapshot-id" = snapshot_id, .type = "branch" }));
@@ -536,6 +558,13 @@ test "lake native row commit checkpoint-only progress preserves rows and catalog
     defer advanced.deinit(alloc);
     const final_root = try m.parse(a, advanced.metadata_json);
     const final_snapshots = (try m.get(final_root, "snapshots")).array.items;
+    for (final_snapshots, 0..) |committed, previous| {
+        const summary = try m.get(committed, "summary");
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{previous}), try m.str(try m.get(summary, "antfly.wal.previous-coverage")));
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{previous + 1}), try m.str(try m.get(summary, "antfly.wal.coverage")));
+        try std.testing.expectEqualStrings("pg", try m.str(try m.get(summary, "antfly.cdc.source")));
+        try std.testing.expectEqualStrings("slot-1", try m.str(try m.get(summary, "antfly.cdc.epoch")));
+    }
     var retained = try iceberg.parseManifestListAlloc(alloc, try read(a, files, try m.str(try m.get(final_snapshots[final_snapshots.len - 1], "manifest-list"))));
     defer retained.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), retained.entries.len);

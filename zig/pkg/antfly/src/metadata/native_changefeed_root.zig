@@ -182,7 +182,7 @@ pub const Routed = struct {
         const definition = state.definition orelse return error.ChangefeedConflict;
         if ((definition.start == .snapshot_then_changes and self.source.bootstrap_pages == null) or definition.events != 1)
             return error.ChangefeedCapabilityUnsupported;
-        try self.captured.validateInitialRoutes(state.roots);
+        try self.captured.validateInstalledRoutes(state);
         const selected = try self.captured.find(self.namespace);
         const table = for (definition.tables) |table| {
             if (selected.fence.table_id == table.table_id) break table;

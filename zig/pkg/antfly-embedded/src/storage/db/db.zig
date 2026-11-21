@@ -27313,6 +27313,31 @@ pub const DB = struct {
         return self.historyPageForAuthority(allocator, request, .raft, minimum_applied_index);
     }
 
+    /// The Raft owner supplies a frozen ReadIndex. Standalone readers use the
+    /// same namespace and physical generation checks without a Raft barrier.
+    pub fn artifactPublicationHistory(self: *DB, allocator: Allocator, request: @import("artifact_publication.zig").HistoryRead, minimum_applied_index: ?u64) !@import("artifact_publication.zig").HistoryObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("artifactPublicationHistory", .{ self, allocator, request, minimum_applied_index });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.namespace) or request.root_generation != self.core.root_generation)
+            return error.HistoryResynchronizationRequired;
+        if (try doc_identity.loadNamespaceTxn(&txn)) |persisted| {
+            if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        }
+        _ = try @import("../source_authority.zig").require(&txn, if (minimum_applied_index == null) .native else .raft, namespace);
+        const applied_index = if (minimum_applied_index) |index| (try orderedHistoryReadCut(&txn, index)).index else null;
+        const publication = @import("artifact_publication.zig");
+        const latest = try publication.historyHead(&txn);
+        const event = if (request.after) |after| try publication.historyAfter(allocator, &txn, after) else null;
+        const observed: publication.HistoryObservation = .{ .namespace = namespace, .root_generation = self.core.root_generation, .latest = latest, .applied_index = applied_index, .event = event };
+        try request.validateObservation(observed, minimum_applied_index);
+        return observed;
+    }
+
     fn historyPageForAuthority(self: *DB, allocator: std.mem.Allocator, request: HistoryPageRequest, kind: @import("../source_authority.zig").Kind, minimum_applied_index: u64) !HistoryPage {
         if (self.isClosed()) return error.StorageUnavailable;
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
@@ -30609,6 +30634,7 @@ pub const DB = struct {
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
+                if (guard.command.mode == .publish) try publication.stageHistory(alloc, txn, guard.command);
                 try @import("artifact_producer_provenance.zig").stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);
                 try publication.stageArtifactRevisions(alloc, txn, guard.command, guard.position);
                 if (guard.command.producer_kind == .resolver) try @import("artifact_publication_resolution.zig").stageHandoff(alloc, txn, guard.command);
@@ -162205,4 +162231,53 @@ test "optional numeric range graph admission preserves legacy indexed predicates
         .index_name = "ft",
         .filter_query_json = conjunction,
     }, &.{"a"}));
+}
+
+test "db ordered artifact inventory producer history is retained and qualified after reopen" {
+    const alloc = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-history-read", .{tmp.sub_path});
+    defer alloc.free(path);
+    const identity: doc_identity.Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    const namespace = @import("online_source_contract.zig").namespaceBytes(identity);
+    const options: OpenOptions = .{
+        .identity_namespace = identity,
+        .primary_backend = .{ .lsm = .{} },
+        .lsm_root_generation = 0,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.provisionNativeHistoryAuthority(namespace);
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try publication.stageHistory(alloc, &txn, .{
+            .namespace = namespace,
+            .authority_epoch = 1,
+            .catalog_digest = @splat(2),
+            .producer_name = "fixture",
+            .producer_generation = 3,
+            .sources = &.{.{ .document_key = "doc", .content_digest = @splat(4), .timestamp = 5, .input_position = null }},
+            .mutations = &.{.{ .family = .base_vector, .key = "private", .value = "payload", .source_index = 0 }},
+            .publication_digest = @splat(8),
+        });
+        try txn.commit();
+    }
+    var reopened = try DB.open(alloc, path, options);
+    defer reopened.close();
+    const request: publication.HistoryRead = .{ .namespace = namespace, .root_generation = reopened.core.root_generation, .after = 0 };
+    const observed = try reopened.artifactPublicationHistory(alloc, request, null);
+    try std.testing.expectEqual(@as(u64, 1), observed.latest);
+    try std.testing.expectEqual(@as(u64, 3), observed.event.?.producer_generation);
+    try std.testing.expect(observed.applied_index == null);
+    var wrong = request;
+    wrong.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, reopened.artifactPublicationHistory(alloc, wrong, null));
+    wrong = request;
+    wrong.namespace[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, reopened.artifactPublicationHistory(alloc, wrong, null));
 }

@@ -1732,6 +1732,7 @@ pub const ApiHttpServerConfig = struct {
     native_history_resolution: ?@import("history_resolution_operations.zig").Port = null,
     native_history_decision: ?@import("history_decision_operations.zig").Port = null,
     native_history_owner: ?@import("history_owner_operations.zig").Port = null,
+    native_artifact_history: ?@import("artifact_history_operations.zig").Port = null,
     native_history_publication: ?@import("history_publication_operations.zig").Port = null,
     /// Internal owner discovery and routed history transport; not public feed capability.
     native_history_roots: ?@import("history_roots.zig").Source = null,
@@ -17891,7 +17892,8 @@ pub const ApiHttpServer = struct {
         }
         var schema = try schema_mod.parseValidatedTableSchema(self.alloc, table.schema_json);
         defer schema.deinit(self.alloc);
-        if (schema.external_base_source == null) return;
+        const external = schema.external_base_source orelse return;
+        if (external.binding.write_policy == .iceberg_writer) self.scheduleLakeMaintenance(table.table_id);
         // A slow or leased attempt retains its retry/backoff rather than being
         // superseded on every supervisor tick.
         platform_sync.lockYielding(&self.index_installation_mutex);
@@ -18199,15 +18201,29 @@ pub const ApiHttpServer = struct {
                 .deadline_ns = request.deadline_ns,
                 .cancellation = .{ .ptr = server, .is_cancelled_fn = canceled },
             };
-            const continuation_delay_ms = @import("lake_maintenance_scheduler.zig").run(std.heap.smp_allocator, server, table.*, source.binding, options, context) catch |err| {
+            const retirement_delay = @import("../serverless/lake_ingestion.zig").sweepBootstrapRetirements(
+                std.heap.smp_allocator,
+                source.binding,
+                options,
+                context,
+            ) catch |err| blk: {
+                if (err == error.Canceled) return;
+                std.log.warn("Iceberg bootstrap retirement deferred table={s} err={s}", .{ table.name, @errorName(err) });
+                break :blk @as(?u64, 60_000);
+            };
+            const continuation_delay_ms = @import("lake_maintenance_scheduler.zig").run(std.heap.smp_allocator, server, table.*, source.binding, options, context) catch |err| blk: {
                 if (err != error.Canceled and err != error.DeadlineExceeded)
                     std.log.warn("native lake maintenance deferred table={s} err={s}", .{ table.name, @errorName(err) });
-                return;
+                break :blk null;
             };
             // Release admission before enqueueing another pass, so a fast
             // reconciler can claim the continuation.
             work.release();
-            if (continuation_delay_ms) |delay_ms| {
+            const delay = if (retirement_delay) |retirement|
+                @min(retirement, continuation_delay_ms orelse retirement)
+            else
+                continuation_delay_ms;
+            if (delay) |delay_ms| {
                 if (canceled(server)) return;
                 if (delay_ms == 0) return server.notifyLakeCommit(table.name);
                 // Pending collection needs only another maintenance step.

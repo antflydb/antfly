@@ -610,6 +610,7 @@ pub const SnapshotBackfillRunner = struct {
         const ExactCutoverIntentContext = struct {
             alloc: Allocator,
             runner: *SnapshotBackfillRunner,
+            lake_owner: ?ExternalStreamDestination,
             status_sink: @TypeOf(status_sink),
             table: metadata_table_manager.TableRecord,
             expected_replication_sources_json: []const u8,
@@ -712,6 +713,16 @@ pub const SnapshotBackfillRunner = struct {
             fn retirementComplete(ptr: *anyopaque) !void {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
                 try check(ptr);
+                if (ctx.lake_owner) |owner| {
+                    if (owner.retire_bootstrap) |retire| try retire(owner.ptr, ctx.alloc, .{
+                        .table = ctx.table,
+                        .cutover = ctx.record,
+                        .previous_checkpoint = null,
+                        .checkpoint = "",
+                        .changes = &.{},
+                        .deadline_ns = try ctx.runner.workDeadlineNs(),
+                    });
+                }
                 var expected = ctx.record;
                 expected.updated_at_ms = ioNowMillis(ctx.runner.io);
                 var record = expected;
@@ -731,6 +742,7 @@ pub const SnapshotBackfillRunner = struct {
         var exact_cutover_intent_context = ExactCutoverIntentContext{
             .alloc = self.alloc,
             .runner = self,
+            .lake_owner = lake_owner,
             .status_sink = status_sink,
             .table = table,
             .expected_replication_sources_json = table.replication_sources_json,
@@ -1723,6 +1735,7 @@ pub const ExternalStreamDestination = struct {
     bootstrap_committed: ?*const fn (*anyopaque, Allocator, Request) anyerror!bool = null,
     stage_bootstrap: ?*const fn (*anyopaque, Allocator, Request) anyerror!void = null,
     stage_snapshot_page: ?*const fn (*anyopaque, Allocator, Request) anyerror![32]u8 = null,
+    retire_bootstrap: ?*const fn (*anyopaque, Allocator, Request) anyerror!void = null,
 
     pub const Outcome = enum { accepted, committed };
     pub const Request = struct {
@@ -4652,9 +4665,10 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
         ) !foreign_mod.PostgresQueryExecutor.PreparedReplicationSnapshot {
             if (platform_time.monotonicNs() >= execution_deadline_ns) return error.Timeout;
             Parent.exact_cutover_calls += 1;
-            if (params.exact_cutover_intent) |intent| try intent.persist(
-                @as([cutover_config_fingerprint_len]u8, @splat(0x7a)),
-            );
+            if (params.exact_cutover_intent) |intent| {
+                try intent.persist(@as([cutover_config_fingerprint_len]u8, @splat(0x7a)));
+                if (params.retired_slot_name != null) try intent.retirementComplete();
+            }
             const session = try inner_alloc.create(SnapshotSession);
             session.* = .{};
             return .{
@@ -4705,6 +4719,8 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
 
     const StatusSink = struct {
         alloc: Allocator,
+        fail_retirement: bool = false,
+        retirement_attempts: usize = 0,
         records: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
 
         pub fn deinit(self: *@This()) void {
@@ -4734,7 +4750,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
                 return error.ReplicationCutoverAuthorityLost;
         }
 
-        fn completeReplicationSourceCutoverRetirementDurable(
+        pub fn completeReplicationSourceCutoverRetirementDurable(
             self: *@This(),
             expected: metadata_table_manager.ReplicationSourceStatusRecord,
         ) !void {
@@ -4784,6 +4800,15 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     try std.testing.expect(std.mem.indexOf(u8, final_status.slot_name, "_af_") != null);
 
     const Lake = struct {
+        fn retire(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !void {
+            const sink: *StatusSink = @ptrCast(@alignCast(raw));
+            const current = sink.records.items[sink.records.items.len - 1];
+            try std.testing.expectEqual(current.retired_cutover_authority_id, request.cutover.retired_cutover_authority_id);
+            try std.testing.expect(request.cutover.retired_cutover_authority_id != 0);
+            sink.retirement_attempts += 1;
+            if (sink.fail_retirement) return error.TestRetirementUnavailable;
+        }
+
         fn page(_: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) ![32]u8 {
             const rows = request.snapshot_rows.?;
             try std.testing.expectEqual(@as(usize, 1), rows.len);
@@ -4806,18 +4831,34 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             return true;
         }
     };
-    runner.external_destination = .{ .ptr = &status_sink, .apply = Lake.apply, .bootstrap_committed = Lake.observe, .stage_bootstrap = Lake.stage, .stage_snapshot_page = Lake.page };
-    const captured = try runner.runTableSource(&status_sink, .{
+    runner.external_destination = .{ .ptr = &status_sink, .apply = Lake.apply, .bootstrap_committed = Lake.observe, .stage_bootstrap = Lake.stage, .stage_snapshot_page = Lake.page, .retire_bootstrap = Lake.retire };
+    const lake_table: metadata_table_manager.TableRecord = .{
         .table_id = 12,
         .name = "lake",
         .schema_json =
         \\{"base_source":{"kind":"external","table_id":"lake","uri":"file:///lake","format":"iceberg","write_policy":"iceberg_writer","catalog":{"type":"managed"},"row_identity":{"key_columns":["id"]}}}
         ,
         .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
-    }, 0);
+    };
+    const captured = try runner.runTableSource(&status_sink, lake_table, 0);
     try std.testing.expect(captured.snapshot_complete);
     try std.testing.expectEqual(@as(usize, 2), captured.rows_applied);
     try std.testing.expectEqualStrings("cutover_prepared", status_sink.records.items[status_sink.records.items.len - 1].phase);
+    var interrupted = status_sink.records.items[status_sink.records.items.len - 1];
+    interrupted.phase = "failed";
+    interrupted.checkpoint = "snapshot_offset:0";
+    interrupted.prepared_checkpoint = "";
+    interrupted.snapshot_offset = 0;
+    const predecessor = interrupted.cutover_authority_id;
+    status_sink.fail_retirement = true;
+    try std.testing.expectError(error.TestRetirementUnavailable, runner.runTableSourceFromStatus(&status_sink, lake_table, 0, 0, interrupted));
+    const pending = status_sink.records.items[status_sink.records.items.len - 1];
+    try std.testing.expectEqual(predecessor, pending.retired_cutover_authority_id);
+    status_sink.fail_retirement = false;
+    const resumed = try runner.runTableSourceFromStatus(&status_sink, lake_table, 0, 0, pending);
+    try std.testing.expect(resumed.snapshot_complete);
+    try std.testing.expectEqual(@as(usize, 2), status_sink.retirement_attempts);
+    try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[status_sink.records.items.len - 1].retired_cutover_authority_id);
 }
 
 test "metadata replication backfill applies configured update transforms" {
@@ -9407,7 +9448,7 @@ test "metadata replication live snapshot and later streaming insert through runn
                 return error.ReplicationCutoverAuthorityLost;
         }
 
-        fn completeReplicationSourceCutoverRetirementDurable(
+        pub fn completeReplicationSourceCutoverRetirementDurable(
             self: *@This(),
             expected: metadata_table_manager.ReplicationSourceStatusRecord,
         ) !void {

@@ -1274,6 +1274,9 @@ fn historyBootstrapPage(self: *DB, allocator: std.mem.Allocator, request: @impor
 fn orderedHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request, minimum_applied_index: u64) engine.Outcome(@import("history_page.zig").Page) {
     return .{ .value = self.orderedHistoryPage(allocator, request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn artifactPublicationHistory(self: *DB, allocator: std.mem.Allocator, request: @import("db/artifact_publication.zig").HistoryRead, minimum_applied_index: ?u64) engine.Outcome(@import("db/artifact_publication.zig").HistoryObservation) {
+    return .{ .value = self.artifactPublicationHistory(allocator, request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn nativeHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) engine.Outcome(@import("history_page.zig").Page) {
     return .{ .value = self.nativeHistoryPage(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

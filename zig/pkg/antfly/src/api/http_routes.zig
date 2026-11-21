@@ -21,7 +21,7 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
     if (isInternalSourcePlanPath(path)) return 2 * 1024 * 1024;
-    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryBootstrapPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path) or isInternalHistoryPublicationPath(path) or isInternalHistoryOwnerPath(path) or isInternalHistoryDecisionPath(path)) return 4096;
+    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryBootstrapPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path) or isInternalHistoryPublicationPath(path) or isInternalHistoryArtifactPath(path) or isInternalHistoryOwnerPath(path) or isInternalHistoryDecisionPath(path)) return 4096;
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
     if (privacyMutationBodyLimit(path)) |limit| return limit;
@@ -99,6 +99,9 @@ pub fn isInternalHistoryDecisionPath(path: []const u8) bool {
 }
 pub fn isInternalHistoryOwnerPath(path: []const u8) bool {
     return isInternalHistoryPath(path, "owner-v1");
+}
+pub fn isInternalHistoryArtifactPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "artifact-v1");
 }
 pub fn isInternalHistoryPublicationPath(path: []const u8) bool {
     return isInternalHistoryPath(path, "publication-v1");
@@ -266,6 +269,7 @@ pub const Routes = struct {
     pub const history_decision_suffix = "/history/decision-v1";
     pub const history_owner_suffix = "/history/owner-v1";
     pub const history_publication_suffix = "/history/publication-v1";
+    pub const history_artifact_suffix = "/history/artifact-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";

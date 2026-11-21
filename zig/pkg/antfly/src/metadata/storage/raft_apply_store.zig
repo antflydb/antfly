@@ -16041,6 +16041,23 @@ pub const RaftApplyStore = struct {
         defer self.alloc.free(projected);
         try txn.put(try lakeSourceOwnerKeyForGroup(&buffer, group_id, table_id), projected);
     }
+    fn synchronizeLakeLifecycleState(
+        txn: *docstore.DocStore.Txn,
+        a: std.mem.Allocator,
+        group_id: u64,
+        state: @import("../lake_index_lifecycle.zig").State,
+        catalog_state: @import("antfly_local_sources").metadata_lake_index_catalog.State,
+    ) !@import("../lake_index_lifecycle.zig").State {
+        var buffer: [160]u8 = undefined;
+        if (try stagingGet(txn, try topologyActivationKeyForGroup(&buffer, group_id))) |bytes| {
+            if (bytes.len > 1024) return error.InvalidCatalogRecord;
+            const activation = try std.json.parseFromSliceLeaky(topology_protocol.Activation, a, bytes, .{});
+            if (activation.version >= @import("../changefeed_control.zig").provider_history_protocol_version)
+                return state.synchronizeCommitted(a, catalog_state);
+        }
+        return state.synchronize(a, catalog_state);
+    }
+
     fn synchronizeLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !void {
         // Legacy/native tables without lake state don't create maintenance rows.
         var buffer: [160]u8 = undefined;
@@ -16052,7 +16069,7 @@ pub const RaftApplyStore = struct {
         const state = if (prior) |bytes| try @import("../lake_index_lifecycle.zig").parse(a, bytes) else @import("../lake_index_lifecycle.zig").State{};
         var catalog_state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
         defer catalog_state.deinit();
-        try self.putLakeIndexLifecycleTxn(txn, group_id, table.table_id, try state.synchronize(a, catalog_state.value));
+        try self.putLakeIndexLifecycleTxn(txn, group_id, table.table_id, try synchronizeLakeLifecycleState(txn, a, group_id, state, catalog_state.value));
     }
     fn dropLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !void {
         var buffer: [160]u8 = undefined;
@@ -24472,7 +24489,7 @@ pub const RaftApplyStore = struct {
             const state = try self.loadLakeIndexLifecycleTxn(a, txn, group_id, current.table_id);
             var catalog_state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(a, replacement.lake_index_catalog_json);
             defer catalog_state.deinit();
-            const next = state.synchronize(a, catalog_state.value) catch |err| switch (err) {
+            const next = synchronizeLakeLifecycleState(txn, a, group_id, state, catalog_state.value) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return,
             };

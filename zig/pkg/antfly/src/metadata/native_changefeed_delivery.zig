@@ -34,7 +34,7 @@ pub const Images = struct { before: projection.Image, after: projection.Image };
 fn equal(a: anytype, b: @TypeOf(a)) bool {
     return std.mem.eql(u8, &a, &b);
 }
-fn hex(a: A, digest: Digest) ![]const u8 {
+pub fn hex(a: A, digest: Digest) ![]const u8 {
     const text = std.fmt.bytesToHex(digest, .lower);
     return a.dupe(u8, &text);
 }
@@ -83,14 +83,14 @@ const json = @import("changefeed_json.zig");
 const Json = json.Value;
 const RawJson = json.Raw;
 const Key = struct { encoding: enum { utf8, base64url }, value: []const u8 };
-fn key(a: A, bytes: []const u8) !Key {
+pub fn key(a: A, bytes: []const u8) !Key {
     if (std.unicode.utf8ValidateSlice(bytes)) return .{ .encoding = .utf8, .value = bytes };
     const encoder = std.base64.url_safe_no_pad.Encoder;
     const value = try a.alloc(u8, encoder.calcSize(bytes.len));
     _ = encoder.encode(value, bytes);
     return .{ .encoding = .base64url, .value = value };
 }
-const Event = struct {
+pub const Event = struct {
     kind: enum { document_committed } = .document_committed,
     event_id: []const u8,
     transaction_id: []const u8,
@@ -102,7 +102,7 @@ const Event = struct {
     before: ?Json,
     after: ?Json,
 };
-const SnapshotEvent = struct {
+pub const SnapshotEvent = struct {
     kind: enum { document_snapshot } = .document_snapshot,
     event_id: []const u8,
     table_id: []const u8,
@@ -110,14 +110,14 @@ const SnapshotEvent = struct {
     version: []const u8,
     after: ?Json,
 };
-const SnapshotEnvelope = struct {
+pub const SnapshotEnvelope = struct {
     version: u8 = 1,
     events: []const RawJson,
     transaction: ?Transaction = null,
     snapshot: struct { complete: bool },
 };
 const Transaction = struct { transaction_id: []const u8, complete: bool };
-const Envelope = struct { version: u8 = 1, events: []const RawJson, transaction: ?Transaction };
+pub const Envelope = struct { version: u8 = 1, events: []const RawJson, transaction: ?Transaction };
 fn size(a: A, value: anytype) !u64 {
     _ = a;
     return json.size(value);
@@ -215,6 +215,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
         root: *Root,
         policy: *Policy,
         raw_bytes_limit: u32 = page_types.max_source_bytes,
+        provider_context_override: ?[]const u8 = null,
         const Self = @This();
         pub fn authorize(self: *Self, state: control.State, request: anytype) !void {
             try self.policy.authorize(state, request);
@@ -337,7 +338,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                 } else true;
                 return self.renderSnapshot(a, state, roots[index], other_roots_done, original, limits, request);
             }
-            const context = try state.contextAt(before);
+            const context = self.provider_context_override orelse try state.contextAt(before);
             const coordinated = try continuation.Coordinated.decode(scope(state), roots, context);
             const seen = if (coordinated == null) try continuation.decode(a, scope(state), roots, context) else try a.alloc(bool, roots.len);
             if (coordinated != null) @memset(seen, false);
