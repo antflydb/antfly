@@ -1172,6 +1172,19 @@ pub const Detail = enum(c_int) {
     commit_requirement_unavailable,
     commit_requirement_too_large,
     commit_requirement_failed,
+    replication_read_deferred,
+    replication_feedback_deferred,
+    replication_slot_active,
+    replication_slot_not_found,
+    unsupported_replication_mode,
+    unsupported_replication_option,
+    invalid_replication_slot_name,
+    invalid_replication_snapshot,
+    pg_spool_cursor_invalid,
+    pg_spool_storage_unsupported,
+    pg_spool_corrupt,
+    invalid_pg_spool,
+    query_canceled,
 };
 
 pub const Status = extern struct {
@@ -2258,6 +2271,19 @@ pub fn statusFromError(err: anyerror) Status {
         error.CommitRequirementUnavailable => status(.retryable, .commit_requirement_unavailable),
         error.CommitRequirementTooLarge => status(.invalid_argument, .commit_requirement_too_large),
         error.CommitRequirementFailed => status(.invalid_argument, .commit_requirement_failed),
+        error.ReplicationReadDeferred => status(.retryable, .replication_read_deferred),
+        error.ReplicationFeedbackDeferred => status(.retryable, .replication_feedback_deferred),
+        error.ReplicationSlotActive => status(.conflict, .replication_slot_active),
+        error.ReplicationSlotNotFound => status(.not_found, .replication_slot_not_found),
+        error.UnsupportedReplicationMode => status(.unsupported, .unsupported_replication_mode),
+        error.UnsupportedReplicationOption => status(.unsupported, .unsupported_replication_option),
+        error.InvalidReplicationSlotName => status(.invalid_argument, .invalid_replication_slot_name),
+        error.InvalidReplicationSnapshot => status(.invalid_argument, .invalid_replication_snapshot),
+        error.PgSpoolCursorInvalid => status(.conflict, .pg_spool_cursor_invalid),
+        error.PgSpoolStorageUnsupported => status(.unsupported, .pg_spool_storage_unsupported),
+        error.PgSpoolCorrupt => status(.corrupt, .pg_spool_corrupt),
+        error.InvalidPgSpool => status(.invalid_argument, .invalid_pg_spool),
+        error.QueryCanceled => status(.cancelled, .query_canceled),
 
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
@@ -3359,6 +3385,19 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .commit_requirement_unavailable => "CommitRequirementUnavailable",
         .commit_requirement_too_large => "CommitRequirementTooLarge",
         .commit_requirement_failed => "CommitRequirementFailed",
+        .replication_read_deferred => "ReplicationReadDeferred",
+        .replication_feedback_deferred => "ReplicationFeedbackDeferred",
+        .replication_slot_active => "ReplicationSlotActive",
+        .replication_slot_not_found => "ReplicationSlotNotFound",
+        .unsupported_replication_mode => "UnsupportedReplicationMode",
+        .unsupported_replication_option => "UnsupportedReplicationOption",
+        .invalid_replication_slot_name => "InvalidReplicationSlotName",
+        .invalid_replication_snapshot => "InvalidReplicationSnapshot",
+        .pg_spool_cursor_invalid => "PgSpoolCursorInvalid",
+        .pg_spool_storage_unsupported => "PgSpoolStorageUnsupported",
+        .pg_spool_corrupt => "PgSpoolCorrupt",
+        .invalid_pg_spool => "InvalidPgSpool",
+        .query_canceled => "QueryCanceled",
     };
 }
 
