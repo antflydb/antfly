@@ -5772,14 +5772,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
             if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
             return err;
-        };
+        }) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var stage_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidTransactionCommitRequest => {
@@ -5829,14 +5825,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
             if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
             return err;
-        };
+        }) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var read_req = transactions_api.parseStageReadPayload(alloc, body_data) catch {
             _ = ctx.status(400);
@@ -5853,7 +5845,7 @@ pub const AntflyApiHandler = struct {
         var stage_req = try transactions_api.ownedRequestFromStageReadRequest(alloc, read_req);
         defer stage_req.deinit(alloc);
         self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), &stage_req, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
-        var owned_snapshot = (self.api_server.txn_sessions.getReadSnapshot(alloc, txn_id, read_req.table_name, read_req.key) catch |err| switch (err) {
+        var owned_snapshot = (self.api_server.txn_sessions.getReadSnapshotForMutation(alloc, guard, read_req.table_name, read_req.key) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -5961,14 +5953,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
             if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
             return err;
-        };
+        }) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var stage_req = switch (kind) {
             .write => transactions_api.parseStageWriteRequest(alloc, body_data) catch {
@@ -6021,20 +6009,17 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
             if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
             return err;
-        };
+        }) orelse return textResponse(ctx, 404, "not found");
         const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, guard) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
+            error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -6068,20 +6053,17 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid savepoint id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
             if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
             return err;
-        };
+        }) orelse return textResponse(ctx, 404, "not found");
         const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, guard, parsed_savepoint_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
+            error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -6101,6 +6083,7 @@ pub const AntflyApiHandler = struct {
     // separate from post-decision visibility/unknown-outcome handling below.
     fn transactionPreparationError(_: *AntflyApiHandler, ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
+            error.SessionWriteOutcomeUnknown => textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying"),
             error.DeadlineExceeded, error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "transaction preparation deadline exceeded before commit"),
             error.Forbidden, error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => textResponse(ctx, 403, "forbidden"),
             error.TransactionTooLarge, error.SessionRecordTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity"),
@@ -6153,6 +6136,8 @@ pub const AntflyApiHandler = struct {
 
     fn sessionInspectionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
+            error.SessionLeaseLost => textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
+            error.SessionWriteOutcomeUnknown => textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying"),
             error.StorageReadTemporarilyUnavailable, error.ReadIndexUnavailable, error.ReadIndexTimeout, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.Timeout, error.ConcurrencyUnavailable => blk: {
                 try ctx.setHeader("Retry-After", "1");
                 break :blk textResponse(ctx, 503, "transaction status unavailable; retry this transaction id");
@@ -6184,24 +6169,18 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (self.forwardTransactionSession(ctx, txn_id, body_data) catch |err| return sessionInspectionFailure(ctx, err)) |response| return response;
-        if (!(self.api_server.transactionSessionAccessible(txn_id, authenticated_identity) catch |err| return sessionInspectionFailure(ctx, err))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err|
+            return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
         const execution = try self.api_server.txn_sessions.acquireCommitExecution(txn_id, ctx.io);
         defer execution.release();
         const alloc = self.api_server.alloc;
         const owner = self.api_server.localSessionNodeId();
-        const session = (self.api_server.txn_sessions.readInfo(txn_id) catch |err| return sessionInspectionFailure(ctx, err)) orelse {
+        const session = (self.api_server.txn_sessions.readMutationInfo(guard) catch |err| return sessionInspectionFailure(ctx, err)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
         if (session.version.owner != owner) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
         if (session.terminal_abort) return abortedSessionResponse(ctx, txn_id);
-        const guard = self.api_server.txn_sessions.mutation(alloc, txn_id, owner) catch |err| {
-            if (err == error.SessionLeaseLost) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
-            return err;
-        };
         var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
         defer if (parsed_req) |*commit_req| commit_req.deinit(alloc);
         if (!transactions_api.isEmptySessionCommitBody(body_data)) {
@@ -6218,6 +6197,7 @@ pub const AntflyApiHandler = struct {
             if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, request.*))) return textResponse(ctx, 403, "forbidden");
         }
         var commit_req = (self.api_server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
             error.TransactionCommitRequestMismatch => {
@@ -6236,7 +6216,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
 
-        if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
+        if (self.api_server.txn_sessions.getTerminalCommitForMutation(alloc, guard) catch |err| return sessionInspectionFailure(ctx, err)) |terminal_value| {
             var terminal = terminal_value;
             defer terminal.deinit(alloc);
             var status = terminal.status;
@@ -6260,7 +6240,7 @@ pub const AntflyApiHandler = struct {
                     };
                     if (acknowledged == null) {
                         status = .committed_recovery_pending;
-                    } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledged(alloc, txn_id) catch |err| blk: {
+                    } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledgedForMutation(alloc, guard) catch |err| blk: {
                         std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                         break :blk null;
                     }) == null) {
@@ -6361,7 +6341,7 @@ pub const AntflyApiHandler = struct {
             if (rejection == .fresh or rejection == .confirmed) {
                 // Publish the abort and settle consumers before attempting
                 // payload retirement or returning a safe rejection to callers.
-                self.api_server.txn_sessions.publishAbortAndRetire(alloc, txn_id, if (rejection == .fresh) execution_plan.?.publication else null) catch return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
+                self.api_server.txn_sessions.publishAbortAndRetireForMutation(alloc, guard, if (rejection == .fresh) execution_plan.?.publication else null) catch return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
             }
             break :rejected switch (err) {
                 error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "row_policy_denied", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
@@ -6470,9 +6450,9 @@ pub const AntflyApiHandler = struct {
                     // throws this legacy outcome cannot return coordinator metadata
                     // in the same call, so maintenance replays the transaction at
                     // write durability solely to recover and release that handoff.
-                    _ = (self.api_server.txn_sessions.recordTerminalCommitWithRepair(
+                    _ = (self.api_server.txn_sessions.recordTerminalCommitForMutation(
                         alloc,
-                        txn_id,
+                        guard,
                         .committed,
                         true,
                         null,
@@ -6524,9 +6504,9 @@ pub const AntflyApiHandler = struct {
                     committed.visibility_retry_pending,
                     committed.visibility_repair_required,
                 );
-                _ = (self.api_server.txn_sessions.recordTerminalCommitWithRepair(
+                _ = (self.api_server.txn_sessions.recordTerminalCommitForMutation(
                     alloc,
-                    txn_id,
+                    guard,
                     status,
                     committed.visibility_repair_required,
                     committed.coordinator_group_id,
@@ -6554,7 +6534,7 @@ pub const AntflyApiHandler = struct {
                         };
                         if (acknowledged == null) {
                             status = .committed_recovery_pending;
-                        } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledged(alloc, txn_id) catch |err| blk: {
+                        } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledgedForMutation(alloc, guard) catch |err| blk: {
                             std.log.warn("failed to persist stable transaction acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                             break :blk null;
                         }) == null) {
@@ -6575,7 +6555,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.openApiJson(response);
             },
             .conflict => |conflict| {
-                self.api_server.txn_sessions.publishAbortAndRetire(alloc, txn_id, execution_plan.?.publication) catch
+                self.api_server.txn_sessions.publishAbortAndRetireForMutation(alloc, guard, execution_plan.?.publication) catch
                     return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id");
                 const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req, conflict);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -6603,25 +6583,17 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (self.forwardTransactionSession(ctx, txn_id, body_data) catch |err| return sessionInspectionFailure(ctx, err)) |response| return response;
-        if (!(self.api_server.transactionSessionAccessible(txn_id, authenticated_identity) catch |err| return sessionInspectionFailure(ctx, err))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err|
+            return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
         const registry = &self.api_server.txn_sessions;
         const execution = try registry.acquireCommitExecution(txn_id, ctx.io);
         defer execution.release();
-        const info = (registry.readInfo(txn_id) catch |err| return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+        const info = (registry.readMutationInfo(guard) catch |err| return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
         if (info.version.owner != self.api_server.localSessionNodeId())
             return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
-        const retired = info.terminal_abort or retired: {
-            const guard = registry.mutation(self.api_server.alloc, txn_id, info.version.owner) catch |err| {
-                if (err == error.SessionLeaseLost) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
-                return err;
-            };
-            break :retired registry.retireBeforeExecution(self.api_server.alloc, guard, info.version, false) catch false;
-        };
+        const retired = info.terminal_abort or (registry.retireBeforeExecution(self.api_server.alloc, guard, info.version, false) catch false);
         if (!retired) {
-            if (try registry.getTerminalCommit(self.api_server.alloc, txn_id)) |terminal_value| {
+            if (registry.getTerminalCommitForMutation(self.api_server.alloc, guard) catch |err| return sessionInspectionFailure(ctx, err)) |terminal_value| {
                 var terminal = terminal_value;
                 defer terminal.deinit(self.api_server.alloc);
                 return textResponse(ctx, 409, "transaction is already committed");

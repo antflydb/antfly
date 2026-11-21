@@ -2824,8 +2824,13 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
             if (s.getRange(key, request.offset, request.length)) |bytes| {
                 break :blk bytes;
             } else |err| if (err != error.Unsupported) return storageOwnerStatusFromError(err);
-            const cached = @import("../metadata/transaction_session_record.zig").cachedRange(s, read.alloc, read.group, key[read.prefix.len..], request.offset, request.length) catch |err| return storageOwnerStatusFromError(err);
+            const session_record = @import("../metadata/transaction_session_record.zig");
+            const logical = key[read.prefix.len..];
+            const cached = session_record.cachedRange(s, read.alloc, read.group, logical, request.offset, request.length) catch |err| return storageOwnerStatusFromError(err);
             if (cached) |bytes| break :blk bytes;
+            // Session header callers can fall back to one full decode.
+            if (request.offset == 0 and request.length <= session_record.cached_prefix_bytes and std.mem.startsWith(u8, logical, session_record.session_prefix))
+                return .end_of_stream;
             const full = s.get(key) catch |err| return storageOwnerStatusFromError(err);
             if (request.offset > full.len or request.length > full.len - request.offset) return .end_of_stream;
             break :blk full[@intCast(request.offset)..][0..request.length];
