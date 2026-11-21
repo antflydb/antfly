@@ -561,7 +561,7 @@ journals during recovery, but cannot create a new release candidate.
 `scripts/release/release-lines.json` is the default-branch controller's map
 from a tag's `X.Y` version line to its trusted source branch. It maps `0.2` to
 `v0.2.x`, `0.3` to `v0.3.x`, and `0.4` to `main`. The 0.3 maintenance
-branch starts at `v0.3.2` (`367419e1c48c942ba5b624c27436af40f4a76e1d`). Release tags are
+branch starts at `v0.3.2` (`4f7d20a1b2c40dd64995c35c4ab1c08f94c1c3d4`). Release tags are
 still created and pushed manually. A non-nightly tag is accepted when its
 commit belongs to the selected branch when the controller validates it. This
 keeps a tag request replayable after the branch advances. The request cannot
