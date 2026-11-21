@@ -3816,7 +3816,7 @@ pub const NativeGenerationPipeline = struct {
 
         // Prefill
         try setWorkloadProfileRegime(&self.cb, .prefill);
-        const allow_prefill_greedy_token = self.prefill_logits_out == null and (!use_speculative or draft_is_gemma4_mtp);
+        const allow_prefill_greedy_token = !use_speculative or draft_is_gemma4_mtp;
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         if (self.usesPjrtSession()) {
             if (prepared_qwen3vl_prompt) |*prepared| {
@@ -4998,7 +4998,7 @@ pub const NativeGenerationPipeline = struct {
                 const is_last_chunk = chunk_end == prompt_ids.len;
                 const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
                 defer phase_timer.finish();
-                const wants_greedy = is_last_chunk and allow_resident_greedy_token and isPureGreedyConfig(config) and config.grammar == null;
+                const wants_greedy = is_last_chunk and request.allow_resident_greedy and isPureGreedyConfig(config) and config.grammar == null;
                 var compiled_prefill = self.prefillRuntime(decode_state, null);
                 const output = compiled_prefill.runCompiledChunk(.{ .token_ids = chunk, .total_sequence_length = total_chunk_end, .output = if (wants_greedy) .greedy_token else if (is_last_chunk) .last_logits else .kv_only }) catch |err| {
                     debugGenerationStage("executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}", .{ processed, chunk_end, @errorName(err) });
@@ -5052,7 +5052,7 @@ pub const NativeGenerationPipeline = struct {
                 .checkpoint_resume = self.checkpoint_resume != null,
                 .backend = self.cb.kind(),
                 .pure_greedy = isPureGreedyConfig(config) and config.grammar == null,
-                .resident_greedy_allowed = allow_resident_greedy_token,
+                .resident_greedy_allowed = request.allow_resident_greedy,
                 .first_token_enabled = enableCudaPrefillFirstToken(),
                 .coalesce_token_limit = cudaPrefillFirstTokenCoalesceTokenLimit(),
             });
@@ -5225,7 +5225,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn prefillNeedsHostLogits(self: *NativeGenerationPipeline, config: GenerationConfig) bool {
-        return self.checkpoint_prepare != null or config.token_observer != null or
+        return self.prefill_logits_out != null or self.checkpoint_prepare != null or config.token_observer != null or
             config.qwen3vl_parity_json_path != null or config.qwen3vl_parity_logits_path != null or
             firstTokenTopKTraceCount() > 0 or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE") or
             platform.env.getenv("TERMITE_METAL_DUMP_GENERATE_LOGITS_F32") != null or
@@ -11657,6 +11657,13 @@ test "cuda prefill greedy token path is pure greedy only" {
     var grammar = greedy;
     grammar.grammar = "json";
     try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, grammar, true, false, true));
+}
+
+test "prefill logits capture requires host output for text and prepared media" {
+    var row: [4]f32 = undefined;
+    var pipeline = NativeGenerationPipeline{ .allocator = std.testing.allocator, .cb = undefined, .tokenizer = undefined, .gpt_config = .{}, .prefill_logits_out = &row };
+    try std.testing.expect(pipeline.prefillNeedsHostLogits(.{}));
+    try std.testing.expect(!pipeline.promptRequest(.{}, 1, 1, 0, true, false).allow_resident_greedy);
 }
 
 test "direct prepared prefill serializes multimodal CUDA and Metal execution" {
