@@ -270,12 +270,22 @@ pub const State = struct {
             .bootstrap => self.bootstrapComplete() or self.expiryDue(now),
             .streaming => for (self.roots) |root| {
                 if (root.snapshot != null and !root.snapshot_released) break true;
-            } else self.renewal_pending or self.expiryDue(now),
+            } else self.renewal_pending or self.pendingCatalogAcknowledgment() != null or self.expiryDue(now),
             .reset_required => for (self.roots) |root| {
                 if (!root.released or (root.snapshot != null and !root.snapshot_released)) break true;
             } else if (self.slot) |slot| slot.spool.records.len != 0 else false,
             else => self.expiryDue(now),
         };
+    }
+
+    pub fn pendingCatalogAcknowledgment(self: State) ?Table {
+        const definition = self.definition orelse return null;
+        for (definition.tables) |table| {
+            if (table.contract != .writable_iceberg_rows) continue;
+            const root = self.roots[self.rootIndex(catalogRootNamespace(table)) catch continue];
+            if (!root.released and root.reclaimed_through < root.acknowledged.sequence) return table;
+        }
+        return null;
     }
 
     pub fn bootstrapComplete(self: State) bool {
@@ -2280,6 +2290,20 @@ test "changefeed control seals the complete catalog root vector atomically" {
     try std.testing.expectEqual(@as(u64, 3), sealed.roots[0].acknowledged.sequence);
     try std.testing.expectEqual(@as(u64, 10), sealed.roots[1].acknowledged.sequence);
     try std.testing.expectEqualStrings("YQ", try sealed.contextAt(sealed.acknowledged_cursor));
+    try std.testing.expect(!sealed.needsMaintenance(200));
+    const receipt = testDelivery(sealed, &.{.{ .namespace = second, .position = .{ .sequence = 11 } }});
+    state = try step(a, sealed, .{ .issue = receipt });
+    try std.testing.expect(!state.needsMaintenance(200));
+    state = try step(a, state, .{ .acknowledge = receipt.cursor });
+    try std.testing.expect(state.needsMaintenance(200));
+    try std.testing.expectEqual(definition.tables[1].table_id, state.pendingCatalogAcknowledgment().?.table_id);
+    state = try step(a, state, .{ .reclaimed = .{
+        .namespace = second,
+        .consumer_epoch = state.roots[1].consumer_epoch,
+        .previous = 10,
+        .next = 11,
+    } });
+    try std.testing.expect(!state.needsMaintenance(200));
 }
 
 test "changefeed control mixed renewal leaves native root work durable" {

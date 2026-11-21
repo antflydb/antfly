@@ -854,6 +854,16 @@ test "lake lifecycle history records committed activation once across reopen" {
     state = try state.synchronizeCommitted(a, first);
     state = try parse(a, try encode(a, state));
     try std.testing.expect((try state.activationAfter(1)) == null);
-    state = try state.synchronizeCommitted(a, .{ .generation = 2, .published = testPublication(2) });
-    try std.testing.expectEqual(@as(u64, 2), (try state.activationAfter(1)).?.generation);
+    var signature = first.published.?.signature;
+    signature.source = @splat(9);
+    const candidate = try first.begin(signature, @splat(8), 150, 30);
+    state = try state.synchronizeCommitted(a, candidate);
+    try std.testing.expect((try state.activationAfter(1)) == null);
+    const failed = try candidate.fail(@splat(8), "index publication interrupted", 300);
+    state = try state.synchronizeCommitted(a, failed);
+    try std.testing.expect((try state.activationAfter(1)) == null);
+    state = try state.synchronizeCommitted(a, .{ .generation = 3, .published = testPublication(3) });
+    const activation = (try state.activationAfter(1)).?;
+    try std.testing.expectEqual(@as(u64, 2), activation.sequence);
+    try std.testing.expectEqual(@as(u64, 3), activation.generation);
 }

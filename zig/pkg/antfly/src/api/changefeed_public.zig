@@ -201,7 +201,10 @@ fn executeIceberg(client: *config.Client, a: A, selection: Selection, limits: ?d
     if (confirmed.phase == .bootstrap and confirmed.bootstrapComplete()) {
         try change(client, a, confirmed, .{ .finish_verified_bootstrap = .{ .proof = try confirmed.bootstrapCompletionProof() } }, request);
     }
-    try pinIcebergPositions(a, confirmed, policy, confirmed.expires_at, request);
+    if (confirmed.pendingCatalogAcknowledgment() != null) {
+        const owner = CatalogFeedOwner.local(policy.api);
+        try settleCatalogAcknowledgment(client, a, confirmed, owner, request);
+    }
     if (native_factory) |factory| {
         var refreshed = try load(client, a, confirmed.id, request);
         defer refreshed.deinit();
@@ -223,12 +226,7 @@ fn executeIceberg(client: *config.Client, a: A, selection: Selection, limits: ?d
 }
 
 fn pinIcebergPositions(a: A, state: control.State, policy: *Policy, expires_at: u64, request: Context) !void {
-    const changes = @import("lake_committed_changes.zig");
-    const scope = changes.feedScope(state);
-    const encoded = if (allIceberg(state.definition.?))
-        state.acknowledged_provider_context
-    else
-        (try composed_context.Context.decode(a, state.acknowledged_provider_context)).iceberg;
+    const owner = CatalogFeedOwner.local(policy.api);
     for (state.definition.?.tables) |selected| {
         if (selected.contract != .writable_iceberg_rows) continue;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -236,16 +234,49 @@ fn pinIcebergPositions(a: A, state: control.State, policy: *Policy, expires_at: 
         const scratch = arena.allocator();
         const access = try policy.accessFor(selected.table_id);
         const table = try resolveWritableIceberg(policy.api, scratch, selected, access.storage_name);
-        const binding = table.schema.external_base_source.?.binding;
-        const options = try policy.api.lakeStreamOwnerOptions(.{ .allocator = scratch, .table = table.record, .request = request });
-        const position = try changes.decodePosition(scratch, scope, selected.table_id, encoded);
-        @import("../serverless/lake_ingestion.zig").pinCommittedWalPosition(scratch, binding, options, try icebergRequestContext(options, request), state.consumerId(), position, expires_at) catch |err| switch (err) {
-            // A concurrent ACK may already have moved this pin farther. A
-            // renewal must reload before extending metadata in that case.
-            error.WalRetentionPositionRegressed => if (expires_at > state.expires_at) return err,
-            else => return err,
-        };
+        try pinIcebergPosition(scratch, state, selected, table, owner, expires_at, request);
     }
+}
+
+fn pinIcebergPosition(a: A, state: control.State, selected: control.Table, table: IcebergTable, owner: CatalogFeedOwner, expires_at: u64, request: Context) !void {
+    const changes = @import("lake_committed_changes.zig");
+    const encoded = if (allIceberg(state.definition.?))
+        state.acknowledged_provider_context
+    else
+        (try composed_context.Context.decode(a, state.acknowledged_provider_context)).iceberg;
+    const binding = table.schema.external_base_source.?.binding;
+    const options = try owner.options_fn(owner.ptr, .{ .allocator = a, .table = table.record, .request = request });
+    const position = try changes.decodePosition(a, changes.feedScope(state), selected.table_id, encoded);
+    const namespace = control.catalogRootNamespace(selected);
+    if (position.through != state.roots[try state.rootIndex(namespace)].acknowledged.sequence) return error.ChangefeedResynchronizationRequired;
+    try @import("../serverless/lake_ingestion.zig").pinCommittedWalPosition(a, binding, options, try icebergRequestContext(options, request), state.consumerId(), position, expires_at);
+}
+
+fn settleCatalogAcknowledgment(client: *config.Client, a: A, confirmed: control.State, owner: CatalogFeedOwner, request: Context) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var parsed = try load(client, scratch, confirmed.id, request);
+    defer parsed.deinit();
+    const state = parsed.value;
+    if (state.epoch != confirmed.epoch or !same(state.authority, confirmed.authority) or state.phase != .streaming)
+        return error.ChangefeedResynchronizationRequired;
+    const selected = state.pendingCatalogAcknowledgment() orelse return;
+    const namespace = control.catalogRootNamespace(selected);
+    const root = state.roots[try state.rootIndex(namespace)];
+    var view = (try owner.source.linearizableSnapshot(request)) orelse return error.MetadataSourceUnavailable;
+    defer owner.source.freeAdminSnapshot(&view);
+    const observed = for (view.tables) |table| {
+        if (table.table_id == selected.table_id) break table;
+    } else return error.ChangefeedResynchronizationRequired;
+    const table = try writableIcebergFromRecord(scratch, selected, observed);
+    try pinIcebergPosition(scratch, state, selected, table, owner, state.expires_at, request);
+    try change(client, scratch, state, .{ .reclaimed = .{
+        .namespace = namespace,
+        .consumer_epoch = root.consumer_epoch,
+        .previous = root.reclaimed_through,
+        .next = root.acknowledged.sequence,
+    } }, request);
 }
 
 /// Recheck the physical table incarnation before a retained position can be
@@ -1086,7 +1117,7 @@ fn createIceberg(a: A, policy: *Policy, meta: config.Port, key: []const u8, defi
             return .{ .id = id, .cursor = state.acknowledged_cursor, .expires_at = state.expires_at };
         if (state.phase == .reset_required and state.reset_reason == .history_expired and std.mem.allEqual(u8, &state.cut, 0)) {
             const provider = factory orelse return error.ChangefeedResynchronizationRequired;
-            if (!try closeIceberg(&client, CatalogRetirement.local(api), a, state, request)) continue;
+            if (!try closeIceberg(&client, CatalogFeedOwner.local(api), a, state, request)) continue;
             var native_policy: RootPolicy(Policy) = .{ .access = policy.*, .io = api.inferenceIo(), .source = provider.source, .allocator = a, .closing = true };
             if (try retireOne(&client, &native_policy, a, state, request)) continue;
             try change(&client, a, state, .{ .restart = .{
@@ -1452,13 +1483,13 @@ fn pendingCatalogRoot(state: control.State) ?struct { root: control.Root, table:
     return null;
 }
 
-pub const CatalogRetirement = struct {
+pub const CatalogFeedOwner = struct {
     const owner = @import("lake_source_owner.zig");
     source: http.StatusSource,
     ptr: *anyopaque,
     options_fn: *const fn (*anyopaque, owner.OptionsInput) anyerror!owner.Options,
 
-    fn local(api: *http.ApiHttpServer) CatalogRetirement {
+    fn local(api: *http.ApiHttpServer) CatalogFeedOwner {
         return .{ .source = api.source, .ptr = api, .options_fn = localOptions };
     }
 
@@ -1468,7 +1499,7 @@ pub const CatalogRetirement = struct {
     }
 };
 
-fn closeIceberg(client: *config.Client, catalog_owner: CatalogRetirement, a: A, state: control.State, request: Context) !bool {
+fn closeIceberg(client: *config.Client, catalog_owner: CatalogFeedOwner, a: A, state: control.State, request: Context) !bool {
     const pending = pendingCatalogRoot(state) orelse {
         if (state.phase == .closing and (allIceberg(state.definition.?) or metadataEvent(state.definition.?))) try change(client, a, state, .finish_close, request);
         return true;
@@ -1532,7 +1563,7 @@ pub fn close(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
         }
 
         if (allIceberg(definition) or metadataEvent(definition) or pendingCatalogRoot(state) != null) {
-            if (try closeIceberg(&client, CatalogRetirement.local(api), a, state, internal)) return;
+            if (try closeIceberg(&client, CatalogFeedOwner.local(api), a, state, internal)) return;
             continue;
         }
         const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
@@ -1554,7 +1585,7 @@ pub fn maintainNativeFeed(metadata: config.Port, source: source_api.Source, io: 
     return maintainNativeFeedWithSpool(metadata, source, io, a, id, null, null, request);
 }
 
-pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Source, io: std.Io, a: A, id: control.Id, spool_registry: ?@import("../metadata/pg_spool_artifacts.zig").Registry, catalog_owner: ?CatalogRetirement, request: Context) !void {
+pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Source, io: std.Io, a: A, id: control.Id, spool_registry: ?@import("../metadata/pg_spool_artifacts.zig").Registry, catalog_owner: ?CatalogFeedOwner, request: Context) !void {
     var client: config.Client = .{ .port = metadata };
     var parsed = try load(&client, a, id, request);
     defer parsed.deinit();
@@ -1576,6 +1607,10 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
                 if (item.renewed_through < state.expires_at) try source_api.renewRoot(&client, &policy, a, state, route, request);
             }
             return;
+        }
+        if (state.pendingCatalogAcknowledgment() != null and !state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) {
+            try requireMaintenancePrincipal(request);
+            return settleCatalogAcknowledgment(&client, a, state, catalog_owner orelse return error.ReadUnavailable, request);
         }
         for (state.roots) |item| {
             if (item.snapshot == null or item.snapshot_released) continue;

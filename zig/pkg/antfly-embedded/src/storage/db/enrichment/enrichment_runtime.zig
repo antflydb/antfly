@@ -42913,6 +42913,12 @@ fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void 
         defer decoded.deinit();
         index += 1;
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const retained = (try publication.historyAfter(alloc, &read, 0)) orelse return error.TestUnexpectedResult;
+        try expect.expectEqual(decoded.command.publication_digest, retained.publication_digest);
+        try expect.expectEqual(@as(u64, 1), try publication.historyHead(&read));
     }
     try Step.run(runtime, dense, request, &cache, &sources, &window);
     try expect.expectEqual(@as(usize, 1), harness.provider_calls);

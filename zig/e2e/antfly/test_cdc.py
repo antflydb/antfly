@@ -2359,8 +2359,18 @@ def test_standalone_postgres_cdc_snapshot_completes_with_embeddings_index(
 
 @pytest.mark.parametrize(
     "deployment, extra_rows",
-    [("standalone", 0), ("standalone", 16_384), ("distributed", 0)],
-    ids=["standalone-single-row", "standalone-multi-file", "distributed-single-row"],
+    [
+        ("standalone", 0),
+        ("standalone", 16_384),
+        ("distributed", 0),
+        ("distributed-mixed", 0),
+    ],
+    ids=[
+        "standalone-single-row",
+        "standalone-multi-file",
+        "distributed-single-row",
+        "distributed-mixed-providers",
+    ],
 )
 def test_postgres_bootstraps_and_streams_to_writable_iceberg(
     pg_cdc_source, tmp_path, deployment, extra_rows, request
@@ -2430,9 +2440,13 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
             data_config=node_config("data"),
         )
     table = "/tables/cdc_iceberg"
+    native_table = "cdc_native"
+    mixed = deployment == "distributed-mixed"
+    native_before = {"id": "native-row", "name": "Native", "tier": "before"}
+    native_after = {**native_before, "tier": "after"}
     provider = pg_cdc_source["table_name"]
     client = requests.Session()
-    if deployment == "distributed":
+    if deployment != "standalone":
         client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
 
     def call(method, path, body=None):
@@ -2552,7 +2566,14 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         check_row_count()
 
         feed = None
-        if deployment == "distributed":
+        if deployment != "standalone":
+            if mixed:
+                call("POST", f"/tables/{native_table}", {"num_shards": 1})
+                call(
+                    "POST",
+                    f"/tables/{native_table}/batch",
+                    {"inserts": {"native-row": native_before}},
+                )
             feeds = f"{server.api_url}/changefeeds"
             created = _changefeed_call(
                 client,
@@ -2560,27 +2581,26 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
                 feeds,
                 headers={"Idempotency-Key": "postgres-iceberg-bootstrap"},
                 json={
-                    "tables": ["cdc_iceberg"],
+                    "tables": ["cdc_iceberg", native_table]
+                    if mixed
+                    else ["cdc_iceberg"],
                     "start": "snapshot_then_changes",
                     "include": "rows",
                 },
             ).json()
             feed = f"{feeds}/{created['id']}"
-            bootstrap = _changefeed_call(
-                client, "GET", f"{feed}/events", params={"after": created["cursor"]}
-            )
-            assert [event["after"] for event in bootstrap.json()["events"]] == [
-                {"id": "user-1", "name": "Alice", "tier": "gold"}
-            ]
-            assert bootstrap.json()["snapshot"]["complete"]
-            cursor = bootstrap.headers["Antfly-Changefeed-Cursor"]
-            _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
 
         server.pause(crash=True)
         _run_psql(
             f"update {provider} set id = 'user-2', name = 'Bob' where id = 'user-1'"
         )
         server.resume()
+        if mixed:
+            call(
+                "POST",
+                f"/tables/{native_table}/batch",
+                {"inserts": {"native-row": native_after}},
+            )
         resumed = wait_until(lambda: committed(2), timeout_s=60, interval_s=0.5)
         assert resumed, server.debug_logs()
         assert resumed["antfly.cdc.bootstrap-cut"] == cut
@@ -2588,16 +2608,51 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         assert rows() == [["user-2", "Bob"]]
         check_row_count()
         if feed is not None:
-            params = {"after": cursor}
-            page = _changefeed_call(client, "GET", f"{feed}/events", params=params)
-            replay = _changefeed_call(client, "GET", f"{feed}/events", params=params)
-            assert replay.content == page.content
-            next_cursor = page.headers["Antfly-Changefeed-Cursor"]
-            assert replay.headers["Antfly-Changefeed-Cursor"] == next_cursor
-            body = page.json()
-            assert body["transaction"]["complete"]
-            events = {event["operation"]: event for event in body["events"]}
-            assert len(body["events"]) == 2 and set(events) == {"insert", "delete"}
+            # Read the original cut after the catalog has committed a newer snapshot.
+            cursor = created["cursor"]
+            expected = {"user-1": {"id": "user-1", "name": "Alice", "tier": "gold"}}
+            if mixed:
+                expected["native-row"] = native_before
+            snapshot_rows = {}
+            for _ in range(len(expected)):
+                bootstrap = _changefeed_call(
+                    client, "GET", f"{feed}/events", params={"after": cursor}
+                )
+                body = bootstrap.json()
+                for event in body["events"]:
+                    row = event["after"]
+                    assert row["id"] not in snapshot_rows
+                    snapshot_rows[row["id"]] = row
+                cursor = bootstrap.headers["Antfly-Changefeed-Cursor"]
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if body["snapshot"]["complete"]:
+                    break
+            else:
+                pytest.fail("changefeed did not complete its pinned snapshot")
+            assert snapshot_rows == expected
+
+            expected_operations = (
+                {"insert", "delete", "update"} if mixed else {"insert", "delete"}
+            )
+            events = {}
+            for _ in range(len(expected_operations)):
+                params = {"after": cursor}
+                page = _changefeed_call(client, "GET", f"{feed}/events", params=params)
+                replay = _changefeed_call(
+                    client, "GET", f"{feed}/events", params=params
+                )
+                assert replay.content == page.content
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                assert replay.headers["Antfly-Changefeed-Cursor"] == cursor
+                body = page.json()
+                assert body["transaction"]["complete"]
+                for event in body["events"]:
+                    assert event["operation"] not in events
+                    events[event["operation"]] = event
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if set(events) == expected_operations:
+                    break
+            assert set(events) == expected_operations
             assert events["delete"]["before"] == {
                 "id": "user-1",
                 "name": "Alice",
@@ -2608,9 +2663,9 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
                 "name": "Bob",
                 "tier": "gold",
             }
-            _changefeed_call(
-                client, "POST", f"{feed}/ack", json={"cursor": next_cursor}
-            )
+            if mixed:
+                assert events["update"]["before"] == native_before
+                assert events["update"]["after"] == native_after
             _changefeed_call(client, "DELETE", feed)
     finally:
         client.close()

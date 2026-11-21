@@ -357,7 +357,9 @@ snapshot. WAL garbage collection preserves groups inside the maintenance
 retention window and honors the configured minimum count of committed groups.
 Active changefeed pins and index readers can hold the collection floor back
 further. An Iceberg changefeed advances its pin after acknowledgment and
-can renew it while streaming. Managed vacuum preserves the snapshot lineage
+can renew it while streaming. If a server stops after persisting an
+acknowledgment, maintenance advances the pin from the durable cursor.
+Managed vacuum preserves the snapshot lineage
 and historical row images needed by retained groups.
 
 A native destination can separately expose retained committed history through

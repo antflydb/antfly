@@ -24516,7 +24516,7 @@ pub const DataServer = struct {
         self.changefeed_maintenance_active.store(false, .release);
     }
 
-    fn changefeedRetirementOptions(ptr: *anyopaque, input: @import("../api/lake_source_owner.zig").OptionsInput) !@import("../api/lake_source_owner.zig").Options {
+    fn changefeedCatalogOptions(ptr: *anyopaque, input: @import("../api/lake_source_owner.zig").OptionsInput) !@import("../api/lake_source_owner.zig").Options {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const server = if (self.http_server) |*server| server else return error.ReadUnavailable;
         return server.lakeStreamOwnerOptions(input);
@@ -24545,7 +24545,7 @@ pub const DataServer = struct {
             break :blk candidate;
         } else null;
         const feeds = @import("../api/changefeed_public.zig");
-        const catalog_owner: feeds.CatalogRetirement = .{ .source = remote.statusSource(), .ptr = self, .options_fn = changefeedRetirementOptions };
+        const catalog_owner: feeds.CatalogFeedOwner = .{ .source = remote.statusSource(), .ptr = self, .options_fn = changefeedCatalogOptions };
         for (page.items()) |id| {
             try request.ensureActive();
             feeds.maintainNativeFeedWithSpool(metadata, self.historyRootsSource(), io, self.alloc, id, spool, catalog_owner, request) catch |err| switch (err) {
