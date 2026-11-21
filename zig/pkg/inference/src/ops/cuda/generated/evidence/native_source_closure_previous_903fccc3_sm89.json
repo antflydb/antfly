@@ -1,0 +1,180 @@
+{
+  "schema": "antfly.cuda_program_closure_equivalence.v1",
+  "historical_image_sha256": "54ad80e2ad5bf16b0f644d5ebeb68da74afa8909c6cb707107837fd0ddec1130",
+  "current_image_sha256": "903fccc35828b95b0a134166d9caae47c3d4c98a1256c2632d19d5a027b35f96",
+  "historical_git_commit": "95ff41c1ac90b82eb7ee6e97ebf6321864a4b213",
+  "programs": [
+    {
+      "function": "antfly_q4_0_pair_activation_q8_1_mmv_v1",
+      "arch": "sm_89",
+      "exact_semantic_payload": {
+        "architecture_flags": 100686084,
+        "symbol": {
+          "name": "antfly_q4_0_pair_activation_q8_1_mmv_v1",
+          "info": 18,
+          "other": 16,
+          "value": 0,
+          "size": 25728
+        },
+        "sections": [
+          {
+            "name": ".nv.info.antfly_q4_0_pair_activation_q8_1_mmv_v1",
+            "type": 1879048192,
+            "flags": 64,
+            "size": 1592,
+            "alignment": 4,
+            "info": "associated-function",
+            "sha256": "35ae1bef1b033fad0cd3130f9196fada19214013bafa6c245e6c49799ef5a2e9"
+          },
+          {
+            "name": ".nv.constant2.antfly_q4_0_pair_activation_q8_1_mmv_v1",
+            "type": 1,
+            "flags": 66,
+            "size": 24,
+            "alignment": 4,
+            "info": "associated-function",
+            "sha256": "e09a8d3eb1967526ac0fcc3da8dd008bbf7ecd1f8c3387cf8fbeb93fd3b3bab1"
+          },
+          {
+            "name": ".nv.constant0.antfly_q4_0_pair_activation_q8_1_mmv_v1",
+            "type": 1,
+            "flags": 66,
+            "size": 400,
+            "alignment": 4,
+            "info": "associated-function",
+            "sha256": "7a12e561363385e9dfeeab326368731c030ed4b374e7f5897ac819159d2884c5"
+          },
+          {
+            "name": ".text.antfly_q4_0_pair_activation_q8_1_mmv_v1",
+            "type": 1,
+            "flags": 6,
+            "size": 25728,
+            "alignment": 128,
+            "info": 48,
+            "sha256": "0b6dd27f298b13ab28b1eabbb94d4f68b544167ebc78de89de3afa52ff338ad3"
+          },
+          {
+            "name": ".nv.shared.antfly_q4_0_pair_activation_q8_1_mmv_v1",
+            "type": 8,
+            "flags": 67,
+            "size": 768,
+            "alignment": 32,
+            "info": "associated-function",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "global_attributes": [
+          {
+            "format": 4,
+            "attribute": 47,
+            "payload_after_symbol_hex": "30000000"
+          },
+          {
+            "format": 4,
+            "attribute": 17,
+            "payload_after_symbol_hex": "00000000"
+          },
+          {
+            "format": 4,
+            "attribute": 18,
+            "payload_after_symbol_hex": "00000000"
+          }
+        ],
+        "resource": "Function antfly_q4_0_pair_activation_q8_1_mmv_v1:\n  REG:48 STACK:0 SHARED:768 LOCAL:0 CONSTANT[2]:24 CONSTANT[0]:400 TEXTURE:0 SURFACE:0 SAMPLER:0",
+        "sass_sha256": "0dba29708e1d69e1e7f09a856f42d4b3c230520f4fcf80587d9f251df461206e",
+        "all_call_targets_within_owned_text": [
+          5472,
+          13600,
+          23792,
+          25440
+        ],
+        "relocations": [],
+        "metadata_normalization": {
+          "offset": 20,
+          "kind": "EIATTR_PARAM_CBANK symbol index",
+          "resolved_name": ".nv.constant0.antfly_q4_0_pair_activation_q8_1_mmv_v1"
+        }
+      }
+    },
+    {
+      "function": "antfly_q4_0_down_q8_1_mmv_v1",
+      "arch": "sm_89",
+      "exact_semantic_payload": {
+        "architecture_flags": 100686084,
+        "symbol": {
+          "name": "antfly_q4_0_down_q8_1_mmv_v1",
+          "info": 18,
+          "other": 16,
+          "value": 0,
+          "size": 5248
+        },
+        "sections": [
+          {
+            "name": ".nv.info.antfly_q4_0_down_q8_1_mmv_v1",
+            "type": 1879048192,
+            "flags": 64,
+            "size": 340,
+            "alignment": 4,
+            "info": "associated-function",
+            "sha256": "02b79b200522caea1e0294e4cf463a56da4fca2d216b37ef502fc2dc45a127ee"
+          },
+          {
+            "name": ".nv.constant0.antfly_q4_0_down_q8_1_mmv_v1",
+            "type": 1,
+            "flags": 66,
+            "size": 388,
+            "alignment": 4,
+            "info": "associated-function",
+            "sha256": "8de76ee7eb6b32c307d4a46a43ac55bc15b917e2a24d36c3d001878a97fd39d6"
+          },
+          {
+            "name": ".text.antfly_q4_0_down_q8_1_mmv_v1",
+            "type": 1,
+            "flags": 6,
+            "size": 5248,
+            "alignment": 128,
+            "info": 38,
+            "sha256": "e3db8bb5a67d1333654caadec17dadd914fbd73021034c2d9b0e48675da9f188"
+          },
+          {
+            "name": ".nv.shared.antfly_q4_0_down_q8_1_mmv_v1",
+            "type": 8,
+            "flags": 67,
+            "size": 128,
+            "alignment": 32,
+            "info": "associated-function",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "global_attributes": [
+          {
+            "format": 4,
+            "attribute": 47,
+            "payload_after_symbol_hex": "26000000"
+          },
+          {
+            "format": 4,
+            "attribute": 17,
+            "payload_after_symbol_hex": "00000000"
+          },
+          {
+            "format": 4,
+            "attribute": 18,
+            "payload_after_symbol_hex": "00000000"
+          }
+        ],
+        "resource": "Function antfly_q4_0_down_q8_1_mmv_v1:\n  REG:38 STACK:0 SHARED:128 LOCAL:0 CONSTANT[0]:388 TEXTURE:0 SURFACE:0 SAMPLER:0",
+        "sass_sha256": "2e9ada55f57d7a35c5df9abeaadb742f2f0b6f35f11f7fff685b7ce966262f70",
+        "all_call_targets_within_owned_text": [],
+        "relocations": [],
+        "metadata_normalization": {
+          "offset": 20,
+          "kind": "EIATTR_PARAM_CBANK symbol index",
+          "resolved_name": ".nv.constant0.antfly_q4_0_down_q8_1_mmv_v1"
+        }
+      }
+    }
+  ],
+  "previous_current_image_sha256": "78e107c20d12bd67c4742e311491bf904fdd750507f3d534c058bc60edfa69bf",
+  "scope": "Historical selectedSM89 qualification preserved only by exact full native text/constants/normalized symbol-index metadata/global resource/closed call payload identity with actual source90e device artifact. Prior disassembly binds transitively to identical bytes; no new GPU or timing claim."
+}

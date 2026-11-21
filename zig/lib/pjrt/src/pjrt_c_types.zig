@@ -25,6 +25,7 @@ const std = @import("std");
 
 pub const PjrtClient = opaque {};
 pub const PjrtDevice = opaque {};
+pub const PjrtDeviceDescription = opaque {};
 pub const PjrtBuffer = opaque {};
 pub const PjrtLoadedExecutable = opaque {};
 pub const PjrtExecutable = opaque {};
@@ -207,6 +208,20 @@ pub const ExecutableGetCompiledMemoryStatsArgs = extern struct {
     peak_unpadded_heap_bytes: i64,
 };
 
+pub const DeviceGetDescriptionArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    device: *PjrtDevice,
+    device_description: ?*PjrtDeviceDescription,
+};
+pub const DeviceDescriptionKindArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    device_description: *PjrtDeviceDescription,
+    device_kind: ?[*]const u8,
+    device_kind_size: usize,
+};
+
 pub const ClientPlatformNameArgs = extern struct {
     struct_size: usize,
     extension_start: ?*anyopaque,
@@ -340,6 +355,8 @@ pub const Api = extern struct {
     pub const FN_CLIENT_ADDRESSABLE_DEVICES = 16;
     pub const FN_CLIENT_COMPILE = 20;
     pub const FN_CLIENT_BUFFER_FROM_HOST = 22;
+    pub const FN_DEVICE_DESCRIPTION_KIND = 26;
+    pub const FN_DEVICE_GET_DESCRIPTION = 29;
     pub const FN_EXEC_DESTROY = 40;
     pub const FN_EXEC_NUM_OUTPUTS = 44;
     pub const FN_EXEC_SERIALIZE = 49;
@@ -382,6 +399,15 @@ pub const Api = extern struct {
 
     pub fn executableGetCompiledMemoryStats(self: *const Api, args: *ExecutableGetCompiledMemoryStatsArgs) ?*PjrtError {
         const f = castFn(*const fn (*ExecutableGetCompiledMemoryStatsArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_COMPILED_MEMORY_STATS].?);
+        return f(args);
+    }
+
+    pub fn deviceGetDescription(self: *const Api, args: *DeviceGetDescriptionArgs) ?*PjrtError {
+        const f = castFn(*const fn (*DeviceGetDescriptionArgs) callconv(.c) ?*PjrtError, self._fns[FN_DEVICE_GET_DESCRIPTION].?);
+        return f(args);
+    }
+    pub fn deviceDescriptionKind(self: *const Api, args: *DeviceDescriptionKindArgs) ?*PjrtError {
+        const f = castFn(*const fn (*DeviceDescriptionKindArgs) callconv(.c) ?*PjrtError, self._fns[FN_DEVICE_DESCRIPTION_KIND].?);
         return f(args);
     }
 

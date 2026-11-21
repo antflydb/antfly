@@ -422,7 +422,6 @@ fn populateCudaWeights(
     var it = store.resident_weights.iterator();
     while (it.next()) |entry| {
         const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
-        errdefer allocator.free(owned_key);
         try cuda.insertWeightFromLoaded(owned_key, entry.value_ptr);
     }
 }

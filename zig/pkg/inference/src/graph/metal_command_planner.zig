@@ -1819,6 +1819,7 @@ pub const GatedFrameCommandLowerer = struct {
 
     pub const BuildOptions = struct {
         rows: usize,
+        kv_tokens: usize = 0,
         hidden_size: usize,
         vocab_size: usize,
         num_attention_heads: usize,
@@ -1907,7 +1908,7 @@ pub const GatedFrameCommandLowerer = struct {
                 .source = options.source,
                 .region = options.layer_region,
                 .rows = frame_descriptor.rows,
-                .kv_len = frame_descriptor.sequence_length,
+                .kv_len = if (options.kv_tokens != 0) options.kv_tokens else frame_descriptor.sequence_length,
                 .hidden_size = frame_descriptor.hidden_size,
                 .attention_input_size = attention_input_size,
                 .kv_dim = kv_dim,
@@ -3087,6 +3088,7 @@ test "metal command planner preserves f16 activation dtypes when appending layer
 
     try frame_plan.build(.{
         .rows = 10,
+        .kv_tokens = 1024,
         .hidden_size = 2048,
         .vocab_size = 32000,
         .num_attention_heads = 16,
@@ -3103,6 +3105,18 @@ test "metal command planner preserves f16 activation dtypes when appending layer
         .tail_region = 8,
     });
 
+    var cursor = GatedFramePlanCursor.init(frame_plan.view());
+    _ = cursor.nextLayer(.{ .shares_kv = false, .value_norm = true, .kv_seed = true, .include_ple = true }) orelse return error.PrefixLayerMissing;
+    try std.testing.expect(cursor.complete());
+    try std.testing.expect(cursor.nextTailLogits() == null);
+    var found_cumulative_attention = false;
+    for (frame_plan.view().ops) |op| if (op.kind == .attention) {
+        const attention = op.operator_plan.?.attention;
+        try std.testing.expectEqual(@as(usize, 10), attention.q_len);
+        try std.testing.expectEqual(@as(usize, 1024), attention.kv_len);
+        found_cumulative_attention = true;
+    };
+    try std.testing.expect(found_cumulative_attention);
     const command = frame_plan.view();
     var found_gate_up_command = false;
     var found_down_command = false;

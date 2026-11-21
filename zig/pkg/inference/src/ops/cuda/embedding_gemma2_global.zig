@@ -19,7 +19,7 @@ const std = @import("std");
 const Context = @import("context.zig").CudaContext;
 const Buffer = @import("buffer.zig").DeviceBuffer;
 const Blas = @import("cublaslt.zig").CublasLt;
-const Encoder = @import("embedding_gemma2.zig");
+const Encoder = @import("encoder_multimodal.zig");
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
 const memory = @import("../../runtime/tier/memory.zig");
 
@@ -38,7 +38,7 @@ pub const Scratch = struct {
 
     pub fn clear(self: *Scratch, ctx: *Context) !void {
         if (self.buffer.ptr != 0) try ctx.synchronize();
-        self.buffer.free(ctx);
+        _ = try self.buffer.freeChecked(ctx);
         if (self.lease) |*lease| lease.release();
         // Cached graphs can outlive this allocation, including failed growth.
         // Preserve its generation so an allocator reusing the address cannot
@@ -179,10 +179,7 @@ test "global MQA retained scratch shares admission and releases failed growth" {
         }
     };
     var controller = memory.AdmissionController{};
-    var ctx: Context = undefined;
-    ctx.ctx = @ptrFromInt(1);
-    ctx.stream = @ptrFromInt(2);
-    ctx.stats = .{};
+    var ctx = Context{ .driver = undefined, .ctx = @ptrFromInt(1), .stream = @ptrFromInt(2), .device = 0, .info = .{} };
     ctx.device_allocations = .{ .limit = 4096 };
     ctx.video_cache_budget = .{ .admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1024 }, .check_live_memory = false } };
     ctx.driver.fns.cuCtxSetCurrent = Mock.current;
@@ -223,10 +220,7 @@ test "global MQA failed growth and reused address invalidate captured workspace"
         }
     };
     var controller = memory.AdmissionController{};
-    var ctx: Context = undefined;
-    ctx.ctx = @ptrFromInt(1);
-    ctx.stream = @ptrFromInt(2);
-    ctx.stats = .{};
+    var ctx = Context{ .driver = undefined, .ctx = @ptrFromInt(1), .stream = @ptrFromInt(2), .device = 0, .info = .{} };
     ctx.device_allocations = .{ .limit = 4096 };
     ctx.video_cache_budget = .{ .admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1024 }, .check_live_memory = false } };
     ctx.driver.fns.cuCtxSetCurrent = Mock.current;
@@ -237,7 +231,7 @@ test "global MQA failed growth and reused address invalidate captured workspace"
     defer scratch.clear(&ctx) catch unreachable;
     const old = (try scratch.acquire(&ctx, 512)).?;
     const old_generation = scratch.generation;
-    var graph = @import("embedding_gemma2_execution.zig").Arena{};
+    var graph = @import("../../backends/embedding_gemma2_cuda.zig").Arena{};
     graph.setAttentionWorkspaces(0, old.ptr, old_generation, 0);
     // Ordinary reuse must preserve the key for a live allocation.
     _ = (try scratch.acquire(&ctx, 256)).?;
@@ -258,4 +252,48 @@ test "global MQA failed growth and reused address invalidate captured workspace"
     _ = (try scratch.acquire(&ctx, 256)).?;
     try std.testing.expect(scratch.generation != previous_generation);
     try std.testing.expectEqual(@as(usize, 256), controller.snapshot().backend_scratch_bytes);
+}
+
+test "global MQA failed physical free retains allocation and admission until retry" {
+    const Mock = struct {
+        var fail_free = true;
+        fn current(_: @import("driver.zig").CUcontext) callconv(.c) c_int {
+            return 0;
+        }
+        fn sync(_: @import("driver.zig").CUstream) callconv(.c) c_int {
+            return 0;
+        }
+        fn alloc(pointer: *u64, _: usize) callconv(.c) c_int {
+            pointer.* = 0x8000;
+            return 0;
+        }
+        fn free(_: u64) callconv(.c) c_int {
+            return if (fail_free) 1 else 0;
+        }
+    };
+    var controller = memory.AdmissionController{};
+    var ctx = Context{ .driver = undefined, .ctx = @ptrFromInt(1), .stream = @ptrFromInt(2), .device = 0, .info = .{} };
+    ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+    ctx.driver.fns.cuStreamSynchronize = Mock.sync;
+    ctx.driver.fns.cuMemAlloc = Mock.alloc;
+    ctx.driver.fns.cuMemFree = Mock.free;
+    ctx.device_allocations = .{ .limit = 1024 };
+    ctx.video_cache_budget = .{ .admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1024 }, .check_live_memory = false } };
+    var scratch = Scratch{};
+    Mock.fail_free = true;
+    defer {
+        Mock.fail_free = false;
+        scratch.clear(&ctx) catch unreachable;
+    }
+    const allocation = (try scratch.acquire(&ctx, 512)).?;
+    const generation = scratch.generation;
+    try std.testing.expectError(error.CudaDriverError, scratch.clear(&ctx));
+    try std.testing.expectEqual(allocation.ptr, scratch.buffer.ptr);
+    try std.testing.expectEqual(generation, scratch.generation);
+    try std.testing.expectEqual(@as(usize, 512), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 512), ctx.device_allocations.snapshot().live);
+    Mock.fail_free = false;
+    try scratch.clear(&ctx);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
 }

@@ -179,7 +179,7 @@ pub fn forwardGreedyFromFinalHidden(
     defer cb.free(lm_head_weight);
 
     started_at = monotonicNowNs();
-    if (gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) {
+    if (gpt_config.suppressTokenIds().len == 0 and gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) {
         if (try applyFinalNormLinearArgmax(
             cb,
             norm_kind,
@@ -214,6 +214,11 @@ pub fn forwardGreedyFromFinalHidden(
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.greedy_fallback_norm_nanos += finished_at - started_at;
     defer cb.free(final_norm);
+    if (gpt_config.suppressTokenIds().len != 0) {
+        const selected = try gpt_arch.greedyLastTokenTensorFromFinalHiddenRetain(cb, allocator, gpt_config, .{ .hidden = final_norm, .total_rows = 1 });
+        defer if (selected.token_tensor) |token| cb.free(token);
+        return @intCast(selected.token_id);
+    }
 
     started_at = monotonicNowNs();
     const logits = try cb.linearNoBias(final_norm, lm_head_weight, 1, gpt_config.hidden_size, gpt_config.vocab_size);
@@ -222,7 +227,7 @@ pub fn forwardGreedyFromFinalHidden(
     defer cb.free(logits);
 
     started_at = monotonicNowNs();
-    if (gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) {
+    if (gpt_config.suppressTokenIds().len == 0 and gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) {
         if (try cb.argmaxLastRow(logits, 1, gpt_config.vocab_size)) |argmax_id| {
             finished_at = monotonicNowNs();
             if (finished_at > started_at) timing_stats.greedy_fallback_host_nanos += finished_at - started_at;
@@ -240,21 +245,6 @@ pub fn forwardGreedyFromFinalHidden(
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.greedy_fallback_host_nanos += finished_at - started_at;
     return @intCast(best_idx);
-}
-
-fn greedyResultFromTokenTensor(
-    cb: *const ops.ComputeBackend,
-    allocator: std.mem.Allocator,
-    token: ops.CT,
-) !gpt_arch.GreedyDeviceTokenResult {
-    errdefer cb.free(token);
-    const ids = try cb.toFloat32(token, allocator);
-    defer allocator.free(ids);
-    if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
-    return .{
-        .token_id = @intFromFloat(ids[0]),
-        .token_tensor = token,
-    };
 }
 
 fn greedyTokenTensorFromFinalHidden(
@@ -319,19 +309,13 @@ pub fn forwardGreedyTokenTensorFromFinalHidden(
     norm_kind: FinalNormKind,
     norm_slot: usize,
 ) !?gpt_arch.GreedyDeviceTokenResult {
-    const token_tensor = (try greedyTokenTensorFromFinalHidden(
-        cb,
-        gpt_config,
-        final_hidden,
-        norm_kind,
-        norm_slot,
-    )) orelse return null;
-
-    const started_at = monotonicNowNs();
-    const result = try greedyResultFromTokenTensor(cb, allocator, token_tensor);
-    const finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.greedy_fallback_host_nanos += finished_at - started_at;
-    return result;
+    // Preserve one normalization and one shared greedy owner. A missing
+    // prepared slot changes how this tail completes, never whether the
+    // already-executed prefix must run again.
+    const normalized = (try applyFinalNorm(cb, norm_kind, norm_slot, final_hidden, gpt_config.hidden_size, gpt_config.norm_eps)) orelse
+        try gpt_arch.applyFinalNorm(cb, allocator, gpt_config, final_hidden);
+    defer cb.free(normalized);
+    return try gpt_arch.greedyLastTokenTensorFromFinalHiddenRetain(cb, allocator, gpt_config, .{ .hidden = normalized, .total_rows = 1 });
 }
 
 pub fn forwardGreedyTokenTensorOnlyFromFinalHidden(

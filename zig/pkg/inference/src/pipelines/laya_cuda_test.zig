@@ -200,7 +200,8 @@ test "laya CUDA warp attention matches legacy at shape and window boundaries" {
                 else
                     (try cb.encoderLocalAttention(q, k, v, mask, batch, seq, heads, dim, radius)).?;
                 defer cb.free(fast);
-                try std.testing.expectEqual(before + 1, gpu.snapshotStats().laya_warp_attention);
+                const warp_eligible = cuda.layaWarpEligible(&gpu, batch, seq, dim);
+                try std.testing.expectEqual(before + @as(usize, @intFromBool(warp_eligible)), gpu.snapshotStats().laya_warp_attention);
                 const expected = try cb.toFloat32(legacy, a);
                 defer a.free(expected);
                 const actual = try cb.toFloat32(fast, a);

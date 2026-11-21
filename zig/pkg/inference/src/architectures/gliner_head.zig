@@ -471,28 +471,22 @@ fn extractWordEmbeddings(
     }
     const num_words: usize = @intCast(max_word_id);
 
-    const output = try allocator.alloc(f32, batch * num_words * H);
+    const rows = std.math.mul(usize, batch, num_words) catch return error.UnexpectedInputShape;
+    const count = std.math.mul(usize, rows, H) catch return error.UnexpectedInputShape;
+    const output = try allocator.alloc(f32, count);
     errdefer allocator.free(output);
-    @memset(output, 0.0);
-    const counts = try allocator.alloc(f32, batch * num_words);
-    defer allocator.free(counts);
-    @memset(counts, 0.0);
-
-    for (0..batch) |b| {
-        for (0..seq_len) |t| {
-            const word_id = words_mask[b * seq_len + t];
-            if (word_id <= 0) continue;
-            const w: usize = @intCast(word_id - 1); // 0-indexed
-            const count_off = b * num_words + w;
-            if (counts[count_off] != 0.0) continue;
-            const src_off = (b * seq_len + t) * H;
-            const dst_off = (b * num_words + w) * H;
-            const dst = output[dst_off..][0..H];
-            const src = hidden[src_off..][0..H];
-            @memcpy(dst, src);
-            counts[count_off] = 1.0;
-        }
-    }
+    const seen = try allocator.alloc(u8, rows);
+    defer allocator.free(seen);
+    try (@import("antfly_tile").native_layout.Program{ .operation = .first_match }).run(.{
+        .input = hidden,
+        .output = output,
+        .rows = rows,
+        .cols = H,
+        .mask = words_mask,
+        .sequence = seq_len,
+        .words = num_words,
+        .seen = seen,
+    });
 
     return .{ .embeddings = output, .num_words = num_words };
 }
@@ -1079,22 +1073,15 @@ fn gruStep(
         const gh_off = i * 3 * H;
 
         for (0..H) |d| {
-            // r = sigmoid(gi_r + gh_r)
-            const r = sigmoid_f32(gi_data[gi_off + d] + gh_data[gh_off + d]);
-            // z = sigmoid(gi_z + gh_z)
-            const z = sigmoid_f32(gi_data[gi_off + H + d] + gh_data[gh_off + H + d]);
-            // n = tanh(gi_n + r * gh_n)
-            const n = std.math.tanh(gi_data[gi_off + 2 * H + d] + r * gh_data[gh_off + 2 * H + d]);
-            // h_1 = (1 - z) * n + z * h_0
-            h_1[i * H + d] = (1.0 - z) * n + z * h_0[i * H + d];
+            h_1[i * H + d] = @import("antfly_tile").native_math.Gru.cell(
+                .{ gi_data[gi_off + d], gi_data[gi_off + H + d], gi_data[gi_off + 2 * H + d] },
+                .{ gh_data[gh_off + d], gh_data[gh_off + H + d], gh_data[gh_off + 2 * H + d] },
+                h_0[i * H + d],
+            );
         }
     }
 
     return h_1;
-}
-
-fn sigmoid_f32(x: f32) f32 {
-    return 1.0 / (1.0 + @exp(-x));
 }
 
 /// DownscaledTransformer: projects from H→128, runs 2-layer transformer, projects back.
@@ -1514,7 +1501,7 @@ test "GLiNER contextual batch projections match distinct ragged samples and perm
         var cb = compute.computeBackend();
         var vtable = cb.vtable.*;
         if (optional_gathers) {
-            vtable.glinerWordEmbeddings = ContextualHeadFixture.gatherWords;
+            vtable.regions.sequence_projection.firstWordRows = ContextualHeadFixture.gatherWords;
             vtable.takeRows = ContextualHeadFixture.gatherRows;
         }
         cb.vtable = &vtable;

@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed, default-off SM89 q=1 paged-GQA split-K online-softmax template.
 //
 // One CTA owns one (query head, chronological KV split). It publishes a stable
@@ -22,9 +27,9 @@
 // works for ordinary launches and CUDA graph replay without host-side memset.
 
 #include <cuda_fp16.h>
-#include <float.h>
+#ifndef __CUDACC_RTC__
 #include <stddef.h>
-#include <stdint.h>
+#endif
 
 #ifndef ANTFLY_SPLITK_ONLINE_NAMESPACE
 #error "ANTFLY_SPLITK_ONLINE_NAMESPACE must name a unique renderer-owned namespace"
@@ -42,11 +47,16 @@
 #error "ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS must match the qualified policy"
 #endif
 
-namespace ANTFLY_SPLITK_ONLINE_NAMESPACE {
+// antfly-splitk:begin common
+#include <cuda_fp16.h>
+#ifndef __CUDACC_RTC__
+#include <stddef.h>
+#endif
+#ifndef ANTFLY_SPLITK_COMMON_DEFINED
+#define ANTFLY_SPLITK_COMMON_DEFINED
+namespace antfly_splitk_common {
 
-constexpr unsigned kHeadDim = ANTFLY_SPLITK_ONLINE_HEAD_DIM;
-constexpr unsigned kSlidingWindow = ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW;
-constexpr unsigned kMaxVisibleTokens = ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS;
+constexpr float kFiniteMax = 0x1.fffffep127f;
 constexpr unsigned kHeads = 8u;
 constexpr unsigned kKvHeads = 1u;
 constexpr unsigned kSplits = 64u;
@@ -54,7 +64,6 @@ constexpr unsigned kThreads = 128u;
 constexpr unsigned kPageTokens = 16u;
 constexpr unsigned kF16Format = 2u;
 constexpr unsigned kInvalidToken = 0xffffffffu;
-constexpr unsigned kMaxItems = kHeadDim / kThreads;
 
 __device__ __forceinline__ float warp_reduce_sum_f32(float value) {
     value += __shfl_down_sync(0xffffffffu, value, 16);
@@ -111,9 +120,9 @@ __device__ __forceinline__ float f16_value(
     return __half2float(reinterpret_cast<const __half*>(row)[index]);
 }
 
-}  // namespace ANTFLY_SPLITK_ONLINE_NAMESPACE
 
-extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
+template<unsigned kHeadDim, unsigned kSlidingWindow, unsigned kMaxVisibleTokens>
+__device__ __forceinline__ void splitk_online_body(
     float* dst,
     unsigned* completion_counters,
     // Volatile is part of the cross-CTA publication contract: after each
@@ -147,12 +156,9 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
     unsigned score_capacity,
     const unsigned* decode_scalars
 ) {
-    using namespace ANTFLY_SPLITK_ONLINE_NAMESPACE;
+    constexpr unsigned kMaxItems = kHeadDim / kThreads;
     if (decode_scalars != nullptr) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
     constexpr unsigned kRowBytes = kHeadDim * sizeof(__half);
     if (dst == nullptr || completion_counters == nullptr ||
@@ -180,18 +186,7 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
     unsigned key_start = 0u;
     unsigned key_end = 0u;
     if (kv_seq_len != 0u && query_position_offset >= kv_position_offset) {
-        const unsigned visible = query_position_offset - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (kSlidingWindow != 0u) {
-            const unsigned window_start_abs =
-                query_position_offset + 1u > kSlidingWindow
-                ? query_position_offset + 1u - kSlidingWindow
-                : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned, query_position_offset, kv_seq_len, kv_position_offset, kSlidingWindow, key_start, key_end)
     }
     const unsigned visible_count = key_end - key_start;
     // Host admission rejects dynamic replay scalars outside the qualified
@@ -238,7 +233,7 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
     __shared__ float beta;
     __shared__ float scale_input;
     if (tid == 0u) {
-        running_max = -FLT_MAX;
+        running_max = -kFiniteMax;
         running_denom = 0.0f;
         scale_input = (float)kHeadDim;
     }
@@ -315,7 +310,7 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
     __shared__ float merge_beta[kSplits];
     __shared__ float final_denom;
     if (tid == 0u) {
-        float merge_max = -FLT_MAX;
+        float merge_max = -kFiniteMax;
         float merge_denom = 0.0f;
         for (unsigned merge_split = 0u;
              merge_split < kSplits;
@@ -366,4 +361,64 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
     }
     if (tid == 0u) atomicExch(&completion_counters[head], 0u);
     asm volatile("" : : "r"(total_sequence_len));
+}
+
+} // namespace antfly_splitk_common
+#endif
+// antfly-splitk:end common
+
+namespace ANTFLY_SPLITK_ONLINE_NAMESPACE {
+using namespace antfly_splitk_common;
+constexpr unsigned kHeadDim = ANTFLY_SPLITK_ONLINE_HEAD_DIM;
+constexpr unsigned kSlidingWindow = ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW;
+constexpr unsigned kMaxVisibleTokens = ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS;
+constexpr unsigned kMaxItems = kHeadDim / kThreads;
+}
+
+extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
+    float* dst,
+    unsigned* completion_counters,
+    // Volatile is part of the cross-CTA publication contract: after each
+    // producer's __threadfence and atomic counter increment, the last CTA must
+    // reload globally visible partials rather than satisfy reads from stale L1.
+    volatile float* partial_values,
+    volatile float* partial_max,
+    volatile float* partial_denom,
+    const float* q,
+    const unsigned char* k,
+    const unsigned char* v,
+    const unsigned* block_table,
+    unsigned batch,
+    unsigned q_seq_len,
+    unsigned kv_seq_len,
+    unsigned num_heads,
+    unsigned num_kv_heads,
+    unsigned head_dim,
+    unsigned query_position_offset,
+    unsigned kv_position_offset,
+    unsigned sliding_window,
+    unsigned total_sequence_len,
+    unsigned key_row_bytes,
+    unsigned base_key_row_bytes,
+    unsigned value_row_bytes,
+    unsigned block_count,
+    unsigned page_size_tokens,
+    unsigned key_format,
+    unsigned value_format,
+    unsigned physical_token_capacity,
+    unsigned score_capacity,
+    const unsigned* decode_scalars
+) {
+    antfly_splitk_common::splitk_online_body<
+        ANTFLY_SPLITK_ONLINE_HEAD_DIM,
+        ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW,
+        ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS>(
+        dst, completion_counters, partial_values, partial_max,
+        partial_denom, q, k, v,
+        block_table, batch, q_seq_len, kv_seq_len,
+        num_heads, num_kv_heads, head_dim, query_position_offset,
+        kv_position_offset, sliding_window, total_sequence_len, key_row_bytes,
+        base_key_row_bytes, value_row_bytes, block_count, page_size_tokens,
+        key_format, value_format, physical_token_capacity, score_capacity,
+        decode_scalars);
 }

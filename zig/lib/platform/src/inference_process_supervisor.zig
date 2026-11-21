@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 pub const worker_env = "ANTFLY_INFERENCE_SUPERVISED_WORKER";
 const lifeline_env = "ANTFLY_INFERENCE_SUPERVISOR_LIFELINE";
 /// Reserved exit code by which a worker asks its supervisor for a fresh
@@ -45,6 +46,7 @@ pub const WorkerLifetime = struct {
         var byte: [1]u8 = undefined;
         const count = std.Io.File.stdin().readStreaming(io, &.{&byte}) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
+            error.EndOfStream => @import("process.zig").exitImmediately(0),
             else => @import("process.zig").exitImmediately(1),
         };
         // No data is legal on this private channel. EOF is an intentional
@@ -72,15 +74,116 @@ fn restartDelayMs(restarts: u32) u64 {
     return @min(@as(u64, 100) << shift, 5_000);
 }
 
-fn shouldRestart(term: std.process.Child.Term) !bool {
+fn signalShutdownSupported() bool {
+    return switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
+        else => false,
+    };
+}
+
+var signals_in_use: std.atomic.Value(bool) = .init(false);
+var stop_requested: std.atomic.Value(bool) = .init(false);
+
+fn requestStop(_: std.posix.SIG) callconv(.c) void {
+    // A listener/native driver may be blocked or hold runtime locks. The
+    // handler only publishes intent; a concurrent task closes the lifeline.
+    stop_requested.store(true, .release);
+}
+
+const StopSignals = struct {
+    old_int: if (signalShutdownSupported()) std.posix.Sigaction else void,
+    old_term: if (signalShutdownSupported()) std.posix.Sigaction else void,
+
+    fn install() !StopSignals {
+        if (comptime !signalShutdownSupported()) return .{ .old_int = {}, .old_term = {} };
+        if (signals_in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+            return error.InferenceSupervisorAlreadyActive;
+        stop_requested.store(false, .release);
+        const action = std.posix.Sigaction{ .handler = .{ .handler = requestStop }, .mask = std.posix.sigemptyset(), .flags = 0 };
+        var self: StopSignals = undefined;
+        std.posix.sigaction(.INT, &action, &self.old_int);
+        std.posix.sigaction(.TERM, &action, &self.old_term);
+        return self;
+    }
+
+    fn deinit(self: *StopSignals) void {
+        if (comptime !signalShutdownSupported()) return;
+        std.posix.sigaction(.INT, &self.old_int, null);
+        std.posix.sigaction(.TERM, &self.old_term, null);
+        signals_in_use.store(false, .release);
+    }
+};
+
+fn shouldRestart(term: std.process.Child.Term, stopping: bool) !bool {
     return switch (term) {
         .exited => |code| switch (code) {
             0 => false,
-            restart_exit_code => true,
+            restart_exit_code => !stopping,
             else => error.InferenceWorkerExited,
         },
-        .signal, .stopped, .unknown => true,
+        .signal => |number| if (!stopping) true else stopped: {
+            if (comptime signalShutdownSupported()) {
+                // A process-group operator signal may reach the worker before
+                // its lifeline sees EOF. Other crashes remain failures on stop.
+                if (number == .INT or number == .TERM)
+                    break :stopped false;
+            }
+            break :stopped error.InferenceWorkerExited;
+        },
+        .stopped, .unknown => if (stopping) error.InferenceWorkerExited else true,
     };
+}
+
+fn watchStop(io: std.Io, lifeline: std.Io.File) std.Io.Cancelable!void {
+    // This task is the sole owner. In particular Child.wait/kill may not
+    // retain a copy that could close a reused descriptor behind this task.
+    defer lifeline.close(io);
+    while (!stop_requested.load(.acquire))
+        try io.sleep(.fromMilliseconds(20), .awake);
+}
+
+fn waitChild(io: std.Io, child: *std.process.Child) !std.process.Child.Term {
+    const child_id = child.id;
+    return child.wait(io) catch |err| {
+        // POSIX wait may clear id before a canceled waitpid reaps the child.
+        // Retain ownership for the parent's deferred kill/reap on failure.
+        if (comptime builtin.os.tag != .windows) child.id = child_id;
+        return err;
+    };
+}
+
+fn runWorker(init: std.process.Init, argv: []const []const u8, environment: *const std.process.Environ.Map) !std.process.Child.Term {
+    var child = try std.process.spawn(init.io, .{
+        .argv = argv,
+        .environ_map = environment,
+        .stdin = .pipe,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(init.io);
+    if (comptime signalShutdownSupported()) {
+        const lifeline = child.stdin.?;
+        child.stdin = null;
+        var watcher = init.io.concurrent(watchStop, .{ init.io, lifeline }) catch |err| {
+            lifeline.close(init.io);
+            return err;
+        };
+        // Join the sole pipe owner before child cleanup on every path.
+        defer _ = watcher.cancel(init.io) catch {};
+        return waitChild(init.io, &child);
+    }
+    return waitChild(init.io, &child);
+}
+
+fn restartDelay(io: std.Io, milliseconds: u64) !void {
+    if (comptime !signalShutdownSupported())
+        return io.sleep(.fromMilliseconds(@intCast(milliseconds)), .awake);
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(@intCast(milliseconds)));
+    while (!stop_requested.load(.acquire)) {
+        const remaining = std.Io.Clock.awake.now(io).durationTo(deadline).nanoseconds;
+        if (remaining <= 0) return;
+        try io.sleep(.fromNanoseconds(@min(remaining, 20 * std.time.ns_per_ms)), .awake);
+    }
 }
 
 /// Turns the long-lived inference server command into a stable supervisor plus
@@ -105,6 +208,11 @@ pub fn runIfNeeded(init: std.process.Init, command_index: usize, lifetime: *Work
     while (args.next()) |arg| try argv.append(init.gpa, arg);
     if (!isRunInvocation(argv.items, command_index)) return false;
 
+    // Only the parent installs handlers. The worker keeps its existing
+    // owner-loss EOF behavior, and non-server commands retain their policy.
+    var signals = try StopSignals.install();
+    defer signals.deinit();
+
     var child_environment = try init.environ_map.clone(init.gpa);
     defer child_environment.deinit();
     try child_environment.put(worker_env, "1");
@@ -112,36 +220,20 @@ pub fn runIfNeeded(init: std.process.Init, command_index: usize, lifetime: *Work
 
     var restarts: u32 = 0;
     while (true) {
-        var child = try std.process.spawn(init.io, .{
-            .argv = argv.items,
-            .environ_map = &child_environment,
-            .stdin = .pipe,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        });
-        // wait consumes the child's handles on success. On cancellation or
-        // error this scope still owns and reaps the child before returning.
-        defer child.kill(init.io);
-        const child_id = child.id;
-        const term = child.wait(init.io) catch |err| {
-            // Zig 0.16's POSIX wait clears id (and closes pipes) even when
-            // canceled before waitpid reaps the process. Retain ownership so
-            // the deferred kill still reaps it. Windows retains its handle.
-            if (comptime @import("builtin").os.tag != .windows) child.id = child_id;
-            return err;
-        };
+        if (stop_requested.load(.acquire)) return true;
+        const term = try runWorker(init, argv.items, &child_environment);
         // Argument/configuration/startup errors use an ordinary exit code and
         // must be returned to the operator, not hidden in an infinite restart
         // loop. The watchdog uses the reserved restart code; native crashes
         // arrive as signals on POSIX.
-        if (!try shouldRestart(term)) return true;
+        if (!try shouldRestart(term, stop_requested.load(.acquire))) return true;
         restarts +|= 1;
         const delay_ms = restartDelayMs(restarts - 1);
         std.log.err(
             "inference worker stopped unexpectedly; restarting generation={d} delay_ms={d} term={any}",
             .{ restarts + 1, delay_ms, term },
         );
-        try init.io.sleep(std.Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake);
+        try restartDelay(init.io, delay_ms);
     }
 }
 
@@ -161,7 +253,48 @@ test "restart backoff is bounded" {
 test "worker restart code is distinct from ordinary process failure" {
     try std.testing.expect(restart_exit_code != 0);
     try std.testing.expect(restart_exit_code != 1);
-    try std.testing.expect(try shouldRestart(.{ .exited = restart_exit_code }));
-    try std.testing.expect(!(try shouldRestart(.{ .exited = 0 })));
-    try std.testing.expectError(error.InferenceWorkerExited, shouldRestart(.{ .exited = 1 }));
+    try std.testing.expect(try shouldRestart(.{ .exited = restart_exit_code }, false));
+    try std.testing.expect(!(try shouldRestart(.{ .exited = 0 }, false)));
+    try std.testing.expectError(error.InferenceWorkerExited, shouldRestart(.{ .exited = 1 }, false));
+}
+
+test "operator stop suppresses restart but preserves failures" {
+    try std.testing.expect(!(try shouldRestart(.{ .exited = 0 }, true)));
+    try std.testing.expect(!(try shouldRestart(.{ .exited = restart_exit_code }, true)));
+    try std.testing.expectError(error.InferenceWorkerExited, shouldRestart(.{ .exited = 1 }, true));
+    try std.testing.expectError(error.InferenceWorkerExited, shouldRestart(.{ .unknown = 0 }, true));
+    if (comptime signalShutdownSupported()) {
+        for ([_]std.posix.SIG{ .INT, .TERM }) |sig|
+            try std.testing.expect(!(try shouldRestart(.{ .signal = sig }, true)));
+        for ([_]std.posix.SIG{ .KILL, .SEGV }) |sig| {
+            try std.testing.expect(try shouldRestart(.{ .signal = sig }, false));
+            try std.testing.expectError(error.InferenceWorkerExited, shouldRestart(.{ .signal = sig }, true));
+        }
+    }
+}
+
+test "supervisor signal ownership restores previous handlers" {
+    if (comptime !signalShutdownSupported()) return error.SkipZigTest;
+    const ignored = std.posix.Sigaction{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    var previous_int: std.posix.Sigaction = undefined;
+    var previous_term: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.INT, &ignored, &previous_int);
+    defer std.posix.sigaction(.INT, &previous_int, null);
+    std.posix.sigaction(.TERM, &ignored, &previous_term);
+    defer std.posix.sigaction(.TERM, &previous_term, null);
+    {
+        var signals = try StopSignals.install();
+        defer signals.deinit();
+        try std.testing.expectError(error.InferenceSupervisorAlreadyActive, StopSignals.install());
+        requestStop(.TERM);
+        try std.testing.expect(stop_requested.load(.acquire));
+    }
+    var actual: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.INT, null, &actual);
+    try std.testing.expectEqual(std.posix.SIG.IGN, actual.handler.handler);
+    std.posix.sigaction(.TERM, null, &actual);
+    try std.testing.expectEqual(std.posix.SIG.IGN, actual.handler.handler);
+    var signals = try StopSignals.install();
+    defer signals.deinit();
+    try std.testing.expect(!stop_requested.load(.acquire));
 }

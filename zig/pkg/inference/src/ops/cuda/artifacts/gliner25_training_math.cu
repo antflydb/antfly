@@ -498,7 +498,7 @@ extern "C" __global__ void termite_gliner25_listwise_vjp_v1(
  out[target]=__fadd_rn(negative,__fmul_rn(seed,expf(__fsub_rn(x[i],all_lse))));
 }
 
-#include "../kernels/gliner25_softmax.cuh"
+#include "../kernels/training_row_softmax.cuh"
 
 extern "C" __global__ void termite_gliner25_record_target_exp_v1(
     float* terms, const float* logp, const int* masks,
