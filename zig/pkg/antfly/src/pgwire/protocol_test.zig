@@ -24,6 +24,8 @@ const Mock = struct {
     probe_change_at: ?usize = null,
     compatible_revision: bool = false,
     cancel_during_validation: bool = false,
+    cancel_during_open: bool = false,
+    stream_without_detach: bool = false,
     session: ?*protocol.Session = null,
     replace_incarnation: bool = false,
     replace_before_setting_execute: bool = false,
@@ -172,7 +174,8 @@ const Mock = struct {
         try request.check();
         if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, if (self.catalog_rebind) "current-catalog-binding" else "immutable-catalog-binding") else false;
-        return .{ .context = self, .columns = &.{.{ .name = "n", .type = .integer }}, .next = nextPage, .close = closeStream, .detach = detachStream, .validate = validateStream };
+        if (self.cancel_during_open) self.session.?.cancel_requested.store(true, .release);
+        return .{ .context = self, .columns = &.{.{ .name = "n", .type = .integer }}, .next = nextPage, .close = closeStream, .detach = if (self.stream_without_detach) null else detachStream, .validate = validateStream };
     }
     fn detachStream(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -1698,14 +1701,19 @@ test "extended rollback to savepoint closes later portals and preserves earlier 
         try frame(&input.writer, 'Q', "BEGIN\x00");
         try parse(&input.writer, "q", "SELECT n FROM t", false);
         try bind(&input.writer, "before", "q", null);
+        try bind(&input.writer, "also_before", "q", null);
         try frame(&input.writer, 'Q', "SAVEPOINT sp\x00");
         try bind(&input.writer, "after", "q", null);
+        try bind(&input.writer, "also_after", "q", null);
         try execute(&input.writer, "after", 1);
         try parse(&input.writer, "rollback", "ROLLBACK TO sp", false);
         try bind(&input.writer, "rollback", "rollback", null);
         try execute(&input.writer, "rollback", 0);
         try frame(&input.writer, 'D', "Pbefore\x00");
+        try frame(&input.writer, 'D', "Palso_before\x00");
         try execute(&input.writer, "after", 1);
+        try frame(&input.writer, 'S', "");
+        try execute(&input.writer, "also_after", 1);
         try frame(&input.writer, 'S', "");
         try frame(&input.writer, 'X', "");
         var mock: Mock = .{ .json_null_results = !streaming, .stream_rows = if (streaming) 3 else 0 };
@@ -1713,7 +1721,7 @@ test "extended rollback to savepoint closes later portals and preserves earlier 
         defer output.deinit();
         const observed = try tags(std.testing.allocator, output.written());
         defer std.testing.allocator.free(observed);
-        try std.testing.expect(std.mem.endsWith(u8, observed, "12CTEZ"));
+        try std.testing.expect(std.mem.endsWith(u8, observed, "12CTTEZEZ"));
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "34000") != null);
     }
 }
@@ -1753,6 +1761,29 @@ test "Describe Portal reuses a compatible revision across frames" {
     defer output.deinit();
     try std.testing.expectEqual(@as(usize, 2), mock.describes);
     try std.testing.expectEqual(@as(usize, 4), mock.probes);
+}
+
+test "stream handoff preserves cancellation and retained portal authority" {
+    for ([_]bool{ true, false }) |extended| {
+        for ([_]bool{ true, false }) |cancel| {
+            var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer input.deinit();
+            try startup(&input.writer);
+            if (extended) {
+                try parse(&input.writer, "q", "SELECT n FROM t", false);
+                try bind(&input.writer, "p", "q", null);
+                try execute(&input.writer, "p", 0);
+                try frame(&input.writer, 'S', "");
+            } else try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+            try frame(&input.writer, 'X', "");
+            var mock: Mock = .{ .stream_rows = 1, .cancel_during_open = cancel, .stream_without_detach = !cancel };
+            var output = try run(&mock, input.written(), .{});
+            defer output.deinit();
+            try std.testing.expectEqual(@as(usize, if (extended or cancel) 0 else 1), mock.stream_pulls);
+            try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+            if (cancel) try std.testing.expect(std.mem.indexOf(u8, output.written(), "57014") != null);
+        }
+    }
 }
 
 test "Describe Portal accepts cancellation during retained-reader validation" {

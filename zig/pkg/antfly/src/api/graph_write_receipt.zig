@@ -52,7 +52,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         };
         try entry.predicates.appendSlice(input_alloc, table.predicates);
     }
-    var staged = (try registry.cloneCommitRequest(owned, id, &input)) orelse return error.InvalidTransactionSessionRecord;
+    var staged = (try registry.cloneOwnedCommitRequest(owned, id, server.localSessionNodeId(), &input)) orelse return error.InvalidTransactionSessionRecord;
     defer staged.deinit(owned);
     var prepared = server.preparePublicCommitWithIntegrity(alloc, tables, context) catch |err| {
         std.log.warn("graph receipt integrity preparation failed err={s}", .{@errorName(err)});
@@ -66,13 +66,13 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         return err;
     };
     execution_sealed = true;
-    var plan = (registry.sealExecutionPlan(owned, id, signed) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
+    var plan = (registry.sealExecutionPlan(owned, id, server.localSessionNodeId(), signed) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
     defer plan.deinit();
     const writer = server.table_writes orelse return .{ .status = .unknown };
     const normalized = context.platformDeadline() catch return .{ .status = .unknown };
-    const outcome = (writer.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, .full_index, plan.first_attempt, normalized.cancellation) catch |err| {
-        if (err == error.TransactionPrepareAbortedRowPolicyDenied or sessions.classifyCommitRejection(plan.first_attempt, err) == .fresh) {
-            _ = (registry.recordTerminalAbort(owned, id) catch null) orelse return .{ .status = .unknown };
+    const outcome = (writer.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, .full_index, plan.firstAttempt(), normalized.cancellation) catch |err| {
+        if (err == error.TransactionPrepareAbortedRowPolicyDenied or sessions.classifyCommitRejection(plan.firstAttempt(), err) == .fresh) {
+            _ = (registry.recordAttemptAbort(owned, id, plan.publication) catch null) orelse return .{ .status = .unknown };
             return .{ .status = .aborted, .failure = if (err == error.TransactionPrepareAbortedRowPolicyDenied) error.RowPolicyDenied else err };
         }
         if (err == error.EnrichmentWorkerFailed) {

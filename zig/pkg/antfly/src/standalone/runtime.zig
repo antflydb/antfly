@@ -2133,7 +2133,12 @@ const LocalStandaloneMetadata = struct {
         defer generation.release();
         const catalog = generation.indexed.snapshot.value;
         const view = try generation.indexed.tableRoutingView(request.table_name, budget);
-        return .{ .stable = view.table_id == request.table_id, .catalog_revision = catalog.catalog_revision, .metadata_group_id = catalog.metadata_group_id, .metadata_incarnation = catalog.metadata_incarnation };
+        var stable = view.table_id == request.table_id;
+        if (stable) if (request.route_check) |check| {
+            const fence = try antfly.public_api.table_catalog.generationDecisionRoute(generation, request.table_name, check.route.group_id, budget);
+            stable = fence.topology_epoch == check.topology_epoch and std.meta.eql(fence.route, check.route);
+        };
+        return .{ .stable = stable, .route_checked = request.route_check != null, .catalog_revision = catalog.catalog_revision, .metadata_group_id = catalog.metadata_group_id, .metadata_incarnation = catalog.metadata_incarnation };
     }
 
     fn catalogOwnerReadiness(ptr: *anyopaque, request: antfly.metadata_api.OwnerReadinessRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.OwnerReadiness {

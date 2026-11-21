@@ -6153,6 +6153,7 @@ pub const AntflyApiHandler = struct {
         const execution = try self.api_server.txn_sessions.acquireCommitExecution(txn_id, ctx.io);
         defer execution.release();
         const alloc = self.api_server.alloc;
+        const owner = self.api_server.localSessionNodeId();
         const session = self.api_server.txn_sessions.getInfo(txn_id) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -6172,25 +6173,13 @@ pub const AntflyApiHandler = struct {
             self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), request, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
             if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, request.*))) return textResponse(ctx, 403, "forbidden");
         }
-        var commit_req = (self.api_server.txn_sessions.cloneCommitRequest(alloc, txn_id, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+        var commit_req = (self.api_server.txn_sessions.cloneOwnedCommitRequest(alloc, txn_id, owner, if (parsed_req) |*value| value else null) catch |err| switch (err) {
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionCommitRequestMismatch => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit retry body does not match the sealed request");
             },
-            error.SessionLeaseLost => {
-                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionCommitResponse(
-                    arena_impl.allocator(),
-                    txn_id,
-                    "aborted",
-                    transactions_api.sessionLeaseLostConflict(if (parsed_req) |value| if (value.tables.len > 0) value.tables[0].table_name else "" else ""),
-                    null,
-                );
-                _ = ctx.status(409);
-                return ctx.openApiJson(response);
-            },
+            error.SessionLeaseLost, error.TransactionCommitSealed => return textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
             else => return err,
         }) orelse {
             _ = ctx.status(400);
@@ -6247,7 +6236,10 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
-        var execution_plan = try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id);
+        var execution_plan = self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id, owner) catch |err| switch (err) {
+            error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
+            else => return err,
+        };
         defer if (execution_plan) |*plan| plan.deinit();
         const distributed_tables_view = try commit_req.distributedTables(alloc);
         defer distributed_tables_view.deinit();
@@ -6272,7 +6264,10 @@ pub const AntflyApiHandler = struct {
             };
             if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
                 if (!self.api_server.txn_sessions.removeBeforeExecution(alloc, txn_id)) {
-                    execution_plan = (try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id)) orelse
+                    execution_plan = (self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id, owner) catch |err| switch (err) {
+                        error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
+                        else => return err,
+                    }) orelse
                         return textResponse(ctx, 503, "transaction preflight changed; retry this transaction id");
                 } else {
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -6299,8 +6294,10 @@ pub const AntflyApiHandler = struct {
             var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
                 return self.transactionPreparationError(ctx, err);
             defer prepared.deinit();
-            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, prepared.tables) catch |err|
-                return self.transactionPreparationError(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, owner, prepared.tables) catch |err| switch (err) {
+                error.SessionLeaseLost, error.TransactionCommitSealed => return textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
+                else => return self.transactionPreparationError(ctx, err),
+            }) orelse return textResponse(ctx, 404, "not found");
         }
         const outcome = (source.commitTransactionAttempt(
             alloc,
@@ -6308,15 +6305,15 @@ pub const AntflyApiHandler = struct {
             session.begin_timestamp,
             execution_plan.?.value,
             session.sync_level,
-            execution_plan.?.first_attempt,
+            execution_plan.?.firstAttempt(),
             commit_request.cancellation,
         ) catch |err| rejected: {
-            const rejection = transactions_api.classifyCommitRejection(execution_plan.?.first_attempt, err);
+            const rejection = transactions_api.classifyCommitRejection(execution_plan.?.firstAttempt(), err);
             if (rejection == .ambiguous) return textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying");
             if (rejection == .fresh) {
                 // Publish the abort and settle consumers before attempting
                 // payload retirement or returning a safe rejection to callers.
-                const published = self.api_server.txn_sessions.recordTerminalAbort(alloc, txn_id) catch null;
+                const published = self.api_server.txn_sessions.recordAttemptAbort(alloc, txn_id, execution_plan.?.publication) catch null;
                 if (published == null) return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
             }
             break :rejected switch (err) {
@@ -22831,7 +22828,7 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     defer committed.deinit(a);
     const tables = try committed.distributedTables(a);
     defer tables.deinit();
-    var sealed = (try api.txn_sessions.sealExecutionPlan(a, session.txn_id, tables.tables)).?;
+    var sealed = (try api.txn_sessions.sealExecutionPlan(a, session.txn_id, api.localSessionNodeId(), tables.tables)).?;
     defer sealed.deinit();
     const id = std.fmt.bytesToHex(session.txn_id, .lower);
     const uri = try std.fmt.allocPrint(a, "http://localhost/db/v1/transactions/{s}/commit", .{id});

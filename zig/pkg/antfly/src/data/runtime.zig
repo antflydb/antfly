@@ -26620,6 +26620,7 @@ const RemoteMetadataSource = struct {
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .catalog_identity = remoteCatalogIdentity,
                 .acquire_routing_generation = remoteAcquireRoutingGeneration,
+                .cached_routing_generation = remoteCachedRoutingGeneration,
                 .repair_route = remoteRepairRoute,
                 .routing_snapshot = remoteRoutingSnapshot,
                 .table_routing_snapshot = remoteTableRoutingSnapshot,
@@ -27564,6 +27565,15 @@ const RemoteMetadataSource = struct {
             if (mutex.tryLock()) return;
             try self.io.sleep(.fromMilliseconds(1), .awake);
         }
+    }
+
+    fn remoteCachedRoutingGeneration(ptr: *anyopaque) ?*antfly.public_api.table_catalog.RoutingGeneration {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        if (!self.cache_mutex.tryLock()) return null;
+        defer self.cache_mutex.unlock();
+        const generation = self.authoritative_routing_generation orelse if (self.cached_routing_snapshot) |snapshot| snapshot.generation else return null;
+        generation.retain();
+        return generation;
     }
 
     fn cachedRoutingGenerationFresh(self: *RemoteMetadataSource, routing_budget: antfly.public_api.table_catalog.RoutingBudget) !?*antfly.public_api.table_catalog.RoutingGeneration {

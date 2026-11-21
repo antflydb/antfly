@@ -119,7 +119,7 @@ pub const Session = struct {
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
     // Results borrow their portal allocator until release. Registry growth and
     // removal must never move that allocator.
-    portals: std.StringHashMapUnmanaged(*Portal) = .empty,
+    portals: std.StringArrayHashMapUnmanaged(*Portal) = .empty,
     sql_cursors: std.StringHashMapUnmanaged(SqlCursor) = .empty,
     cursor_budget: ?*Budget = null,
     cursor_epoch: u64 = 0,
@@ -234,10 +234,11 @@ pub const Session = struct {
                 if (status_before_frame != .idle and self.status == .idle) {
                     self.clearPortals();
                 } else if (self.rollback_portal_epoch) |epoch| {
-                    var it = self.portals.iterator();
-                    // Removal leaves a tombstone in the current hash slot.
-                    while (it.next()) |entry| if (entry.value_ptr.*.creation_epoch > epoch)
-                        self.removePortal(entry.key_ptr.*);
+                    var i = self.portals.count();
+                    while (i != 0) {
+                        i -= 1;
+                        if (self.portals.values()[i].creation_epoch > epoch) self.removePortalAt(i);
+                    }
                 }
                 self.rollback_portal_epoch = null;
             }
@@ -431,15 +432,6 @@ pub const Session = struct {
         return self.describeTyped(alloc, statement, types, &.{});
     }
 
-    // Only the session thread opens scopes. The cancel dispatcher observes
-    // the outer scope continuously through binding and retained-reader checks.
-    fn beginExecutionScope(self: *Session) bool {
-        if (self.executing.load(.acquire)) return false;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        return true;
-    }
-
     fn describeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type, descriptors: []const backend.Parameter) !backend.Description {
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (types.len != 0) return error.InvalidParameter;
@@ -457,8 +449,6 @@ pub const Session = struct {
                 .discard_all => &.{},
             } };
         }
-        const outer = self.beginExecutionScope();
-        defer if (outer) self.executing.store(false, .release);
         var req = self.request(statement, &.{}, types);
         req.parameter_descriptors = descriptors;
         try req.check();
@@ -485,8 +475,6 @@ pub const Session = struct {
         const check = self.source.vtable.description_current orelse return false;
         const stamp = description.stamp orelse return false;
         if (!stamp.reusable) return false;
-        const outer = self.beginExecutionScope();
-        defer if (outer) self.executing.store(false, .release);
         const req = self.request(statement, &.{}, description.parameter_types);
         try req.check();
         return check(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, description);
@@ -586,9 +574,6 @@ pub const Session = struct {
                 .discard_all => self.executeDiscardAll(),
             };
         }
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
         if (self.identity.?.renewable) {
             req.completion = &self.completion;
@@ -712,9 +697,6 @@ pub const Session = struct {
         var request_value = self.request(statement, &.{}, &.{});
         request_value.namespace = if (update.path) |*value| value.first() else self.namespace orelse "public";
         request_value.search_path = update.path;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         try request_value.check();
         if (update.path) |path| {
             for (path.entries[0..path.len]) |*entry| {
@@ -940,6 +922,14 @@ pub const Session = struct {
 
     fn dispatch(self: *Session, tag: u8, payload: []const u8) !void {
         var cursor = Cursor{ .bytes = payload };
+        // Only the session thread dispatches frames. Keep CancelRequest live
+        // through binding, opening a reader, materializing and sending pages.
+        const active = tag == 'Q' or tag == 'P' or tag == 'B' or tag == 'D' or tag == 'E';
+        if (active) {
+            self.cancel_requested.store(false, .release);
+            self.executing.store(true, .release);
+        }
+        defer if (active) self.executing.store(false, .release);
         switch (tag) {
             'Q' => {
                 self.read_receipt_budget = .{};
@@ -1121,8 +1111,6 @@ pub const Session = struct {
                         defer self.request_search_path = previous_path;
                         var scratch = std.heap.ArenaAllocator.init(self.alloc);
                         defer scratch.deinit();
-                        const outer = self.beginExecutionScope();
-                        defer if (outer) self.executing.store(false, .release);
                         const current = try self.checkedPortalDescription(scratch.allocator(), portal, true);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
                         req.binding_guard = portal.description.binding_guard;
@@ -1170,9 +1158,6 @@ pub const Session = struct {
                     portal.stream_opened = true;
                     if (self.session_id) |id| portal.session_id = try portal.arena.allocator().dupe(u8, id);
                     if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
-                        self.cancel_requested.store(false, .release);
-                        self.executing.store(true, .release);
-                        defer self.executing.store(false, .release);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
                         req.parameter_cells = portal.parameter_cells;
                         req.parameter_owner = if (portal.parameter_owner) |owner| owner.lease() else null;
@@ -1180,6 +1165,10 @@ pub const Session = struct {
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
                         portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
+                        if (portal.stream) |stream| {
+                            if (stream.validate == null or stream.detach == null) return error.UnsupportedSqlExecution;
+                        }
+                        try req.check();
                     };
                 }
                 if (portal.stream != null or portal.stream_complete) {
@@ -1279,9 +1268,6 @@ pub const Session = struct {
                 const prepared = self.prepared.getPtr(execute_command.name) orelse return error.InvalidStatementName;
                 const description = try self.preparedDescription(prepared, alloc);
                 if (execute_command.expressions.len != description.parameter_types.len) return error.InvalidParameter;
-                self.cancel_requested.store(false, .release);
-                self.executing.store(true, .release);
-                defer self.executing.store(false, .release);
                 var req = self.request(prepared.statement, &.{}, description.parameter_types);
                 req.parameter_descriptors = description.parameter_descriptors;
                 try req.check();
@@ -1340,9 +1326,6 @@ pub const Session = struct {
         defer if (!arena_moved) arena.deinit();
         const description = try self.describe(arena.allocator(), statement, &.{});
         if (description.parameter_types.len != 0) return error.InvalidParameter;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         var req = self.request(statement, &.{}, &.{});
         req.binding_guard = description.binding_guard;
         req.setting_epoch = description.setting_epoch;
@@ -1408,9 +1391,6 @@ pub const Session = struct {
         if (self.status == .failed) return error.SqlTransactionAborted;
         const cursor = self.sql_cursors.getPtr(fetch.name) orelse return error.InvalidCursorName;
         if (!cursor.committed and (self.status != .in_transaction or self.session_id == null or !std.mem.eql(u8, cursor.session_id, self.session_id.?))) return error.CursorMustBeInTransaction;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         const req = self.cursorRequest(cursor);
         try req.check();
         if (cursor.spool != null) {
@@ -1654,35 +1634,26 @@ pub const Session = struct {
     }
 
     fn removePortal(self: *Session, name: []const u8) void {
-        if (self.portals.fetchRemove(name)) |entry| {
-            self.alloc.free(entry.key);
-            const value = entry.value;
-            if (value.stream) |stream| stream.close(stream.context);
-            if (value.result) |*result| result.deinit();
-            if (value.parameter_owner) |owner| owner.release();
-            value.arena.deinit();
-            self.alloc.destroy(value);
-        }
+        if (self.portals.getIndex(name)) |i| self.removePortalAt(i);
+    }
+
+    fn removePortalAt(self: *Session, i: usize) void {
+        const name = self.portals.keys()[i];
+        const portal = self.portals.values()[i];
+        self.portals.swapRemoveAt(i);
+        self.alloc.free(name);
+        if (portal.stream) |stream| stream.close(stream.context);
+        if (portal.result) |*result| result.deinit();
+        if (portal.parameter_owner) |owner| owner.release();
+        portal.arena.deinit();
+        self.alloc.destroy(portal);
     }
 
     fn clearPortals(self: *Session) void {
-        var it = self.portals.iterator();
-        while (it.next()) |entry| {
-            self.alloc.free(entry.key_ptr.*);
-            const portal = entry.value_ptr.*;
-            if (portal.stream) |stream| stream.close(stream.context);
-            if (portal.result) |*result| result.deinit();
-            if (portal.parameter_owner) |owner| owner.release();
-            portal.arena.deinit();
-            self.alloc.destroy(portal);
-        }
-        self.portals.clearRetainingCapacity();
+        while (self.portals.count() != 0) self.removePortalAt(self.portals.count() - 1);
     }
 
     fn executeStream(self: *Session, portal: *Portal, requested: i32, describe_rows: bool) !void {
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         var req = self.request(portal.statement, portal.parameters, portal.types);
         req.parameter_cells = portal.parameter_cells;
         req.parameter_owner = if (portal.parameter_owner) |owner| owner.lease() else null;
@@ -1690,7 +1661,8 @@ pub const Session = struct {
         req.binding_guard = portal.description.binding_guard;
         req.setting_epoch = portal.description.setting_epoch;
         const previously_complete = portal.stream_complete;
-        if (portal.stream_opened) req.session_id = portal.session_id;
+        if (!describe_rows and portal.stream_opened) req.session_id = portal.session_id;
+        try req.check();
         if (previously_complete) if (portal.stream) |stream| {
             if (stream.validate) |check| {
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -1707,6 +1679,7 @@ pub const Session = struct {
             const wanted: u32 = @intCast(@min(remaining, @min(self.limits.result_rows, 256)));
             var page = try stream.next(stream.context, arena.allocator(), req, wanted);
             defer page.result.deinit();
+            try req.check();
             const result = page.result;
             if (result.rowCount() > wanted or !columnsEqual(portal.description.columns, result.columns) or
                 result.mutation_outcome != null or result.continuation != null or result.session_id != null)
@@ -1751,9 +1724,6 @@ pub const Session = struct {
         defer settings_arena.deinit();
         if (try commands.settingCommand(settings_arena.allocator(), statement) != null) return false;
         const open = self.source.vtable.open_stream orelse return false;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
         req.parameter_descriptors = descriptors;
         req.parameter_cells = native_cells;
@@ -1915,15 +1885,14 @@ pub const Session = struct {
     }
     fn deliverSelect(self: *Session, result: backend.Result, formats: []const u16, req: backend.Request, offset: *usize, count: usize, first_delivery: bool, describe_rows: bool) !void {
         const authority = result.cursor_authority orelse return error.InvalidSqlBackendResponse;
-        if (!first_delivery) self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         var remaining = count;
         var materialized = first_delivery;
         while (true) {
             var scratch = std.heap.ArenaAllocator.init(self.alloc);
             defer scratch.deinit();
+            try req.check();
             try authority.validate(authority.ptr, scratch.allocator(), self.identity orelse return error.AuthenticationFailed, req, materialized);
+            try req.check();
             if (describe_rows and materialized and result.columns.len != 0) try self.rowDescription(result.columns, formats);
             const page = @min(remaining, 256);
             try self.dataResult(try result.view(offset.*, page), formats);

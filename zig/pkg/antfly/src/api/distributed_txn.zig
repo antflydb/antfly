@@ -2239,20 +2239,56 @@ fn loadTableRoutes(a: std.mem.Allocator, by_name: *RoutesByName, snapshot: *cons
     var by_id: std.AutoHashMapUnmanaged(u64, *TableRoutes) = .empty;
     for (snapshot.tables) |*descriptor| {
         const routes = by_name.getPtr(descriptor.name) orelse continue;
-        try table_catalog.validateTransactionTopologyStableSnapshot(snapshot, descriptor.*);
         if (routes.descriptor != null) return error.CatalogGenerationChanged;
         const slot = try by_id.getOrPut(a, descriptor.table_id);
         if (slot.found_existing) return error.CatalogGenerationChanged;
         slot.value_ptr.* = routes;
         routes.descriptor = descriptor;
     }
+    // Walk history once for the whole admission. Old records without a
+    // table ID are matched while collecting the selected tables' ranges.
+    var legacy_groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    inline for (.{ snapshot.split_transitions, snapshot.merge_transitions }) |transitions| {
+        for (transitions) |transition| {
+            if (!table_catalog.blocksTransactionRouting(transition)) continue;
+            const binding = transition.table_contract;
+            if (by_id.contains(binding.table_id) or by_name.contains(binding.table_name)) return error.TopologyChanged;
+            if (binding.table_id == 0) {
+                const split = @hasField(@TypeOf(transition), "source_group_id");
+                try legacy_groups.put(a, if (split) transition.source_group_id else transition.donor_group_id, {});
+                try legacy_groups.put(a, if (split) transition.destination_group_id else transition.receiver_group_id, {});
+            }
+        }
+    }
     for (snapshot.ranges) |*range| {
         const routes = by_id.get(range.table_id) orelse continue;
+        if (legacy_groups.contains(range.group_id)) return error.TopologyChanged;
         try routes.ranges.append(a, range);
     }
     for (by_name.values()) |*routes| {
         if (routes.ranges.items.len == 0) return error.TableNotFound;
         routes.epoch = table_catalog.sortedTransactionTopologyEpoch(routes.descriptor.?.*, routes.ranges.items);
+    }
+}
+
+test "distributed txn batched admission checks legacy owner groups and ignores terminal history" {
+    const metadata = @import("../metadata/api.zig");
+    const manager = @import("../metadata/table_manager.zig");
+    const transitions = @import("../metadata/transition_state.zig");
+    var descriptors = [_]manager.TableRecord{ .{ .name = "a", .table_id = 1 }, .{ .name = "b", .table_id = 2 } };
+    var ranges = [_]manager.RangeRecord{ .{ .table_id = 1, .group_id = 10, .start_key = "" }, .{ .table_id = 2, .group_id = 20, .start_key = "" } };
+    var splits = [_]transitions.SplitTransitionRecord{.{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 99, .destination_group_id = 20 }};
+    var merges = [_]transitions.MergeTransitionRecord{.{ .transition_id = 2, .donor_group_id = 98, .receiver_group_id = 97, .table_contract = .{ .table_name = "a" } }};
+    const snapshot: metadata.AdminSnapshot = .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &descriptors, .ranges = &ranges, .split_transitions = &splits, .merge_transitions = &merges, .stores = &.{}, .placement_intents = &.{} };
+    for (0..3) |phase| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var selected: RoutesByName = .empty;
+        for (descriptors) |table| try selected.put(arena.allocator(), table.name, .{ .requirements = .{ .table_name = table.name } });
+        if (phase != 0) merges[0].phase = .finalized;
+        if (phase == 2) splits[0].phase = .rolled_back;
+        const admitted = loadTableRoutes(arena.allocator(), &selected, &snapshot);
+        if (phase == 2) try admitted else try std.testing.expectError(error.TopologyChanged, admitted);
     }
 }
 

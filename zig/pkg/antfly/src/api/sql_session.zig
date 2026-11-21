@@ -42,7 +42,7 @@ pub const Coordinator = struct {
             if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .aborted, .reconciliation_id = id };
         };
-        var request = (try server.txn_sessions.cloneCommitRequest(alloc, id, null)) orelse {
+        var request = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, id, server.localSessionNodeId(), null)) orelse {
             if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .committed, .reconciliation_id = id };
         };
@@ -67,13 +67,13 @@ pub const Coordinator = struct {
         defer proof_arena.deinit();
         const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, self.context);
         if (self.context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
-        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, signed)) orelse return error.SqlTransactionNotActive;
+        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, server.localSessionNodeId(), signed)) orelse return error.SqlTransactionNotActive;
         defer plan.deinit();
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.
-        const outcome = (source.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, info.sync_level, plan.first_attempt, self.context.cancellation) catch |err| {
-            if (transactions.classifyCommitRejection(plan.first_attempt, err) == .fresh) {
-                _ = (server.txn_sessions.recordTerminalAbort(alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
+        const outcome = (source.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, info.sync_level, plan.firstAttempt(), self.context.cancellation) catch |err| {
+            if (transactions.classifyCommitRejection(plan.firstAttempt(), err) == .fresh) {
+                _ = (server.txn_sessions.recordAttemptAbort(alloc, id, plan.publication) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
                 return .{ .outcome = .aborted, .reconciliation_id = id };
             }
             if (err == error.EnrichmentWorkerFailed) {

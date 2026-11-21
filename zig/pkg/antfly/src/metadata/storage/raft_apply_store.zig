@@ -12469,8 +12469,7 @@ pub const RaftApplyStore = struct {
     // Pre-contract transitions also bind whichever table owns either group.
     fn indexDecisionTransition(txn: *docstore.DocStore.Txn, group: u64, record: anytype) !void {
         const merge = @TypeOf(record) == metadata.MergeTransitionRecord;
-        const blocked = !transitionPhaseTerminal(record.phase) and
-            (!merge or !@import("../../api/table_catalog.zig").onlineMergeAllowsTransactions(record));
+        const blocked = @import("../../api/table_catalog.zig").blocksTransactionRouting(record);
         const contract = record.table_contract;
         var name: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(contract.table_name, &name, .{});
@@ -12496,12 +12495,12 @@ pub const RaftApplyStore = struct {
         var txn = try self.beginOwnerReadinessTxn(group);
         defer txn.abort();
         const cut = try readCatalogCursorTxn(&txn, group);
-        var cursor = try txn.openCursor();
-        defer cursor.close();
         var name: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(request.table_name, &name, .{});
         var buf: [224]u8 = undefined;
         const stable = stable: {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
             for (0..3) |kind| {
                 try budget.checkpoint();
                 const prefix = switch (kind) {
@@ -12528,7 +12527,27 @@ pub const RaftApplyStore = struct {
             break :stable true;
         };
         try budget.checkpoint();
-        return .{ .stable = stable, .metadata_group_id = group, .metadata_incarnation = cut.metadata_incarnation, .catalog_revision = cut.revision };
+        var admitted = stable;
+        if (stable) if (request.route_check) |check| {
+            if (check.verified_revision != cut.revision) {
+                // An unrelated catalog edit invalidates the global revision.
+                // Recheck only this table, on the same cut as transition admission.
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                const a = scratch.allocator();
+                const point = try self.catalogTableProjectionTxn(a, &txn, group, request.table_name, budget);
+                const plan = try @import("../../api/table_catalog.zig").routePlanFromSnapshotWithBudget(a, .{
+                    .tables = point.tables,
+                    .ranges = point.ranges,
+                    .metadata_group_id = group,
+                    .metadata_incarnation = cut.metadata_incarnation,
+                    .catalog_revision = cut.revision,
+                }, request.table_name, .{ .group = check.route.group_id }, budget);
+                admitted = if (plan) |p| p.table_id == request.table_id and p.topology_epoch == check.topology_epoch and
+                    p.groups.len == 1 and std.meta.eql(p.groups[0], check.route) else false;
+            }
+        };
+        return .{ .stable = admitted, .route_checked = request.route_check != null, .metadata_group_id = group, .metadata_incarnation = cut.metadata_incarnation, .catalog_revision = cut.revision };
     }
 
     fn putOwnerMergeIndexTxn(txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.MergeTransitionRecord) !void {
@@ -15630,19 +15649,23 @@ pub const RaftApplyStore = struct {
         // the apply mutex. Startup and snapshot install prepare the indexes.
         try requireDerivedCatalogIndexesTxn(&txn, group_id);
 
-        const cursor = try readCatalogCursorTxn(&txn, group_id);
+        return self.catalogTableProjectionTxn(alloc, &txn, group_id, name, .{ .deadline_ns = deadline_ns });
+    }
+
+    fn catalogTableProjectionTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, name: []const u8, budget: @import("../../api/table_catalog.zig").RoutingBudget) !CatalogProjectionSnapshot {
+        const cursor = try readCatalogCursorTxn(txn, group_id);
         var result: CatalogProjectionSnapshot = .{
             .metadata_incarnation = cursor.metadata_incarnation,
             .catalog_revision = cursor.revision,
             .tables = &.{},
             .ranges = &.{},
         };
-        const identity = (try self.getTableByNameResultTxn(system_catalog.ResolvedTable, alloc, &txn, group_id, name)) orelse {
-            try catalogProjectionDeadline(deadline_ns, null);
+        const identity = (try self.getTableByNameResultTxn(system_catalog.ResolvedTable, alloc, txn, group_id, name)) orelse {
+            try budget.checkpoint();
             return result;
         };
         defer identity.deinit(alloc);
-        const ids = try self.indexedTableRangeIdsTxnUntil(alloc, &txn, group_id, identity.table_id, deadline_ns);
+        const ids = try self.indexedTableRangeIdsTxnUntil(alloc, txn, group_id, identity.table_id, budget);
         defer alloc.free(ids);
         const ranges = try alloc.alloc(metadata.RangeRecord, ids.len);
         var filled: usize = 0;
@@ -15652,7 +15675,7 @@ pub const RaftApplyStore = struct {
         }
         var membership: topology_protocol.RangeMembershipAccumulator = .{};
         for (ids, ranges, 0..) |group, *range, index| {
-            if (index % 64 == 0) try catalogProjectionDeadline(deadline_ns, null);
+            try budget.checkpointIndex(index);
             var key_buf: [160]u8 = undefined;
             const encoded = txn.get(try rangeKeyForGroup(&key_buf, group_id, group)) catch |err| switch (err) {
                 error.NotFound => return error.InvalidDerivedCatalogIndex,
@@ -15664,9 +15687,9 @@ pub const RaftApplyStore = struct {
             if (range.table_id != identity.table_id or range.group_id != group) return error.InvalidDerivedCatalogIndex;
             try membership.add(group);
         }
-        const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, identity.table_id);
+        const fence = try self.loadTableTransitionFenceTxn(txn, group_id, identity.table_id);
         if (!membership.finish(identity.table_id).eql(fence.membership(identity.table_id))) return error.InvalidDerivedCatalogIndex;
-        try catalogProjectionDeadline(deadline_ns, null);
+        try budget.checkpoint();
         const tables = try alloc.alloc(metadata.TableRecord, 1);
         errdefer alloc.free(tables);
         tables[0] = try metadata_table_manager.cloneRoutingTable(alloc, .{ .table_id = identity.table_id, .name = identity.name });
@@ -18399,20 +18422,42 @@ pub const RaftApplyStore = struct {
             try self.putExtensionTableOwnerIndexTxn(txn, group_id, member);
         }
         try self.deleteDerivedPrefixTxn(txn, try std.fmt.allocPrint(listing_alloc, decision_prefix ++ "{d}:", .{group_id}));
-        var split_buf: [160]u8 = undefined;
-        for (try docstore.DocStore.scanPrefixTxn(listing_alloc, txn, try splitTransitionPrefixForGroup(&split_buf, group_id))) |row| {
-            const record = try decodeSplitTransitionRecord(listing_alloc, row.value);
-            if (!transitionPhaseTerminal(record.phase)) try indexDecisionTransition(txn, group_id, record);
-        }
-        // Derived owner membership is rebuilt only on migration/restore.
         try self.deleteDerivedPrefixTxn(txn, try std.fmt.allocPrint(listing_alloc, "\x00\x00__metadata_derived__:owner_merge:{d}:", .{group_id}));
-        var merge_buf: [160]u8 = undefined;
-        for (try docstore.DocStore.scanPrefixTxn(listing_alloc, txn, try mergeTransitionPrefixForGroup(&merge_buf, group_id))) |row| {
-            const record = try decodeMergeTransitionRecord(listing_alloc, row.value);
-            if (!transitionPhaseTerminal(record.phase)) try putOwnerMergeIndexTxn(txn, group_id, record);
-        }
+        try self.rebuildDecisionTransitionsTxn(txn, group_id, metadata.SplitTransitionRecord);
+        try self.rebuildDecisionTransitionsTxn(txn, group_id, metadata.MergeTransitionRecord);
         try txn.put(version_key, derived_catalog_index_version);
         return true;
+    }
+
+    fn rebuildDecisionTransitionsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, comptime Record: type) !void {
+        const split = Record == metadata.SplitTransitionRecord;
+        var buf: [160]u8 = undefined;
+        const prefix = if (split) try splitTransitionPrefixForGroup(&buf, group) else try mergeTransitionPrefixForGroup(&buf, group);
+        var next_key: std.ArrayList(u8) = .empty;
+        defer next_key.deinit(self.alloc);
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        while (true) {
+            // Keep one cursor for runs of terminal history. Close it before
+            // mutating the derived namespace, then resume past the copied key.
+            const active: Record = scan: {
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                var entry = try cursor.seekAtOrAfter(if (next_key.items.len == 0) prefix else next_key.items);
+                while (entry) |row| : (entry = try cursor.next()) {
+                    if (!std.mem.startsWith(u8, row.key, prefix)) return;
+                    _ = scratch.reset(.{ .retain_with_limit = 64 * 1024 });
+                    const record = if (split) try decodeSplitTransitionRecord(scratch.allocator(), row.value) else try decodeMergeTransitionRecord(scratch.allocator(), row.value);
+                    if (transitionPhaseTerminal(record.phase)) continue;
+                    next_key.clearRetainingCapacity();
+                    try next_key.appendSlice(self.alloc, row.key);
+                    try next_key.append(self.alloc, 0);
+                    break :scan record;
+                }
+                return;
+            };
+            if (split) try indexDecisionTransition(txn, group, active) else try putOwnerMergeIndexTxn(txn, group, active);
+        }
     }
 
     fn freeKvs(alloc: std.mem.Allocator, kvs: anytype) void {
@@ -22525,7 +22570,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         table_id: u64,
     ) ![]u64 {
-        return self.indexedTableRangeIdsTxnUntil(alloc, txn, group_id, table_id, null);
+        return self.indexedTableRangeIdsTxnUntil(alloc, txn, group_id, table_id, .{});
     }
 
     fn indexedTableRangeIdsTxnUntil(
@@ -22534,7 +22579,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         table_id: u64,
-        deadline_ns: ?u64,
+        budget: @import("../../api/table_catalog.zig").RoutingBudget,
     ) ![]u64 {
         var prefix_buf: [192]u8 = undefined;
         const prefix = try tableRangeIndexPrefixForTable(&prefix_buf, group_id, table_id);
@@ -22545,7 +22590,7 @@ pub const RaftApplyStore = struct {
         var entry = try cursor.seekAtOrAfter(prefix);
         while (entry) |row| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
-            if (ids.items.len % 64 == 0) try catalogProjectionDeadline(deadline_ns, null);
+            try budget.checkpointIndex(ids.items.len);
             if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
             try ids.append(alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
         }
@@ -46086,6 +46131,53 @@ test "selected owner readiness reads indexed namespaces and ignores unrelated un
     request.owners = &.{.{ .group_id = 99, .shard_id = 99, .range_id = 99 }};
     try std.testing.expectEqual(.topology_changed, (try store.ownerReadiness(a, 21, request, .{})).status);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.ownerReadiness(a, 21, request, .{ .deadline_ns = 0 }));
+}
+
+test "selected owner readiness admits the unchanged decision route across unrelated revisions" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/decision-route", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const table = testTransitionTableRecord();
+    const range = testTransitionRangeRecord(101, test_transition_table_contract.source_identity, "", null);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_table = table });
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_range = range });
+        try txn.commit();
+    }
+    var ranges = [_]*const metadata.RangeRecord{&range};
+    var request: @import("../api.zig").DecisionAdmissionRequest = .{
+        .table_id = table.table_id,
+        .table_name = table.name,
+        .route_check = .{
+            .topology_epoch = @import("../../api/table_catalog.zig").sortedTransactionTopologyEpoch(table, &ranges),
+            .route = .{ .group_id = range.group_id, .range_id = range.range_id, .identity_namespace = .{ .table_id = table.table_id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(range), .range_id = metadata_table_manager.rangeDocIdentityRangeId(range) } },
+        },
+    };
+    const first = try store.decisionAdmission(a, 21, request, .{});
+    try std.testing.expect(first.stable and first.route_checked);
+    request.route_check.?.verified_revision = first.catalog_revision;
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_table = .{ .table_id = 8, .name = "unrelated" } });
+        // This fixture applies commands directly, outside the Raft batch that
+        // normally publishes the catalog revision alongside the change.
+        var key: [160]u8 = undefined;
+        const revision = std.mem.toBytes(std.mem.nativeToLittle(u64, first.catalog_revision + 1));
+        try txn.put(try catalogRevisionKeyForGroup(&key, 21), &revision);
+        try txn.commit();
+    }
+    const current = try store.decisionAdmission(a, 21, request, .{});
+    try std.testing.expect(current.catalog_revision != first.catalog_revision and current.stable and current.route_checked);
+    request.route_check.?.topology_epoch ^= 1;
+    try std.testing.expect(!(try store.decisionAdmission(a, 21, request, .{})).stable);
 }
 
 test "selected owner readiness durable transition index rebuilds and retires active membership" {

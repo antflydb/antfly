@@ -105,6 +105,9 @@ pub const CatalogSource = struct {
         /// owned by the caller. Authoritative captures must still cross the
         /// source's read barrier; an eventual cache hit never proves absence.
         acquire_routing_generation: ?*const fn (ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) anyerror!*RoutingGeneration = null,
+        /// Opportunistic local reference only. Admission can verify the
+        /// target table on its metadata cut when the cache is cold or busy.
+        cached_routing_generation: ?*const fn (*anyopaque) ?*RoutingGeneration = null,
         /// Authoritative table fence and membership of an optional parked group.
         repair_route: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: ?u64, budget: RoutingBudget) anyerror!?RepairRoute = null,
         /// Allocation-efficient point projection used by mutation routing.
@@ -224,6 +227,7 @@ pub const CatalogSource = struct {
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .catalog_identity = metadataServiceCatalogIdentity,
                 .acquire_routing_generation = metadataServiceAcquireRoutingGeneration,
+                .cached_routing_generation = metadataServiceCachedRoutingGeneration,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
@@ -249,6 +253,7 @@ pub const CatalogSource = struct {
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .catalog_identity = metadataHttpServiceCatalogIdentity,
                 .acquire_routing_generation = metadataHttpServiceAcquireRoutingGeneration,
+                .cached_routing_generation = metadataHttpServiceCachedRoutingGeneration,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
@@ -274,6 +279,7 @@ pub const CatalogSource = struct {
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
                 .catalog_identity = metadataServerCatalogIdentity,
                 .acquire_routing_generation = metadataServerAcquireRoutingGeneration,
+                .cached_routing_generation = metadataServerCachedRoutingGeneration,
                 .routing_snapshot = metadataServerRoutingSnapshot,
                 .table_routing_snapshot = metadataServerTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
@@ -1740,7 +1746,7 @@ fn decisionCatalog(catalog: CatalogSource) CatalogSource {
     return catalog;
 }
 
-fn generationDecisionRoute(generation: *RoutingGeneration, table_name: []const u8, group_id: u64, budget: RoutingBudget) !metadata_api.CatalogRouteFence {
+pub fn generationDecisionRoute(generation: *RoutingGeneration, table_name: []const u8, group_id: u64, budget: RoutingBudget) !metadata_api.CatalogRouteFence {
     const session = &generation.indexed;
     const view = try session.tableRoutingView(table_name, budget);
     var fence = (try RoutingSession.routeFence(session, group_id)) orelse return error.TopologyChanged;
@@ -1768,25 +1774,27 @@ pub fn raftDecisionRoute(alloc: std.mem.Allocator, source: CatalogSource, table_
 pub fn validateRaftDecision(source: CatalogSource, table_name: []const u8, fence: metadata_api.CatalogRouteFence, budget: RoutingBudget) !void {
     const catalog = decisionCatalog(source);
     const capture = catalog.vtable.decision_admission orelse return error.CatalogRouteFenceUnsupported;
-    const acquire = catalog.vtable.acquire_routing_generation orelse return error.CatalogRouteFenceUnsupported;
-    var refresh = false;
-    while (true) {
-        try budget.checkpoint();
-        const check = try capture(catalog.ptr, .{ .table_id = fence.table_id, .table_name = table_name }, budget);
-        if (!check.stable or check.metadata_group_id != fence.metadata_group_id or !std.meta.eql(check.metadata_incarnation, fence.metadata_incarnation)) return error.TopologyChanged;
-        // The transition proof linearizes the cached route only when both
-        // name the same durable catalog revision and authority.
-        const generation = try acquire(catalog.ptr, budget, refresh);
+    try budget.checkpoint();
+    const revision: ?u64 = verified: {
+        const peek = catalog.vtable.cached_routing_generation orelse break :verified null;
+        const generation = peek(catalog.ptr) orelse break :verified null;
         defer generation.release();
-        const cut = generation.indexed.snapshot.value;
-        if (cut.catalog_revision != check.catalog_revision or cut.metadata_group_id != check.metadata_group_id or !std.meta.eql(cut.metadata_incarnation, check.metadata_incarnation)) {
-            refresh = true;
-            continue;
-        }
-        const current = try generationDecisionRoute(generation, table_name, fence.route.group_id, budget);
-        if (current.table_id != fence.table_id or current.topology_epoch != fence.topology_epoch or !std.meta.eql(current.route, fence.route)) return error.TopologyChanged;
-        return budget.checkpoint();
-    }
+        const route = generationDecisionRoute(generation, table_name, fence.route.group_id, budget) catch |err| switch (err) {
+            error.TableNotFound, error.TopologyChanged => break :verified null,
+            else => return err,
+        };
+        if (route.catalog_revision != 0 and route.metadata_incarnation != null and route.metadata_group_id == fence.metadata_group_id and std.meta.eql(route.metadata_incarnation, fence.metadata_incarnation) and
+            route.table_id == fence.table_id and route.topology_epoch == fence.topology_epoch and std.meta.eql(route.route, fence.route)) break :verified route.catalog_revision;
+        break :verified null;
+    };
+    const check = try capture(catalog.ptr, .{ .table_id = fence.table_id, .table_name = table_name, .route_check = .{
+        .verified_revision = revision,
+        .topology_epoch = fence.topology_epoch,
+        .route = fence.route,
+    } }, budget);
+    if (!check.stable or check.metadata_group_id != fence.metadata_group_id or !std.meta.eql(check.metadata_incarnation, fence.metadata_incarnation)) return error.TopologyChanged;
+    if (!check.route_checked and revision != check.catalog_revision) return error.CatalogRouteFenceUnsupported;
+    try budget.checkpoint();
 }
 
 pub fn localDecisionRoute(alloc: std.mem.Allocator, source: CatalogSource, table_name: []const u8, epoch: u64, group: u64, cancellation: @import("antfly_cancellation").CancellationToken) !metadata_api.CatalogRouteFence {
@@ -1954,7 +1962,7 @@ pub fn validateTransactionTopologyStableSnapshot(
     table: metadata_table_manager.TableRecord,
 ) !void {
     for (snapshot.split_transitions) |transition| {
-        if (!transitionPhaseActive(transition.phase)) continue;
+        if (!blocksTransactionRouting(transition)) continue;
         if (transition.table_contract.table_id == table.table_id or
             std.mem.eql(u8, transition.table_contract.table_name, table.name))
         {
@@ -1968,8 +1976,7 @@ pub fn validateTransactionTopologyStableSnapshot(
         }
     }
     for (snapshot.merge_transitions) |transition| {
-        if (!transitionPhaseActive(transition.phase)) continue;
-        if (onlineMergeAllowsTransactions(transition)) continue;
+        if (!blocksTransactionRouting(transition)) continue;
         if (transition.table_contract.table_id == table.table_id or
             std.mem.eql(u8, transition.table_contract.table_name, table.name))
         {
@@ -1994,6 +2001,12 @@ pub fn onlineMergeAllowsTransactions(transition: metadata_transition_state.Merge
     // merely an online-looking phase on an ordinary or mismatched record.
     online.validateRecord(transition) catch return false;
     return online.scope.authority == .raft and online.scope.fence.role == .merge_source;
+}
+
+pub fn blocksTransactionRouting(transition: anytype) bool {
+    if (!transitionPhaseActive(transition.phase)) return false;
+    if (@TypeOf(transition) == metadata_transition_state.MergeTransitionRecord) return !onlineMergeAllowsTransactions(transition);
+    return true;
 }
 
 fn transitionPhaseActive(phase: metadata_transition_state.TransitionPhase) bool {
@@ -3149,6 +3162,11 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataServiceCachedRoutingGeneration(ptr: *anyopaque) ?*RoutingGeneration {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return svc.catalog_projection_reader.cachedRoutingGeneration();
+}
+
 fn metadataServiceAcquireRoutingGeneration(ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) !*RoutingGeneration {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     if (authoritative) {
@@ -3254,6 +3272,11 @@ fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataHttpServiceCachedRoutingGeneration(ptr: *anyopaque) ?*RoutingGeneration {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return svc.catalog_projection_reader.cachedRoutingGeneration();
+}
+
 fn metadataHttpServiceAcquireRoutingGeneration(ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) !*RoutingGeneration {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     if (authoritative) {
@@ -3357,6 +3380,11 @@ fn metadataServerCatalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity 
 fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     srv.freeAdminSnapshot(snapshot);
+}
+
+fn metadataServerCachedRoutingGeneration(ptr: *anyopaque) ?*RoutingGeneration {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return srv.svc.catalog_projection_reader.cachedRoutingGeneration();
 }
 
 fn metadataServerAcquireRoutingGeneration(ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) !*RoutingGeneration {
@@ -3925,8 +3953,14 @@ fn consumerTests() type {
                     try budget.checkpoint();
                     const cut = try snapshot(ptr);
                     const table = tables_api.findTableByName(&cut, req.table_name) orelse return error.TableNotFound;
-                    const stable = if (validateTransactionTopologyStableSnapshot(&cut, table.*)) true else |_| false;
-                    return .{ .stable = stable, .metadata_group_id = cut.status.metadata_group_id, .metadata_incarnation = cut.status.metadata_incarnation, .catalog_revision = 0 };
+                    var stable = if (validateTransactionTopologyStableSnapshot(&cut, table.*)) true else |_| false;
+                    if (stable) if (req.route_check) |check| {
+                        const gen = try acquire(ptr, budget, false);
+                        defer gen.release();
+                        const current = try generationDecisionRoute(gen, req.table_name, check.route.group_id, budget);
+                        stable = current.table_id == req.table_id and current.topology_epoch == check.topology_epoch and std.meta.eql(current.route, check.route);
+                    };
+                    return .{ .stable = stable, .route_checked = req.route_check != null, .metadata_group_id = cut.status.metadata_group_id, .metadata_incarnation = cut.status.metadata_incarnation, .catalog_revision = 1 };
                 }
                 fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
