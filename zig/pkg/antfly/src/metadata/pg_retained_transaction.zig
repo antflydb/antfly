@@ -392,6 +392,7 @@ pub fn testRetainedTransaction() !void {
         try std.testing.expectEqual(@as(i64, 1_000_000), qualified.candidate.commit_time);
         try std.testing.expectEqual(coordinated.completion.?.certificate_digest, qualified.candidate.completion);
     }
+    const before_issue = state;
     var first = try encode(a, state, &.{.{ .page = page, .relation = relation }}, 111, 1024);
     defer first.deinit();
     state = try (feeds.Mutation{ .issue = first.candidate.delivery }).apply(scratch, state, .{ .incarnation = @splat(4), .sequence = 5 });
@@ -448,9 +449,9 @@ pub fn testRetainedTransaction() !void {
         try std.testing.expectEqualStrings("BRURUC", &.{ pair.messages[0][0], pair.messages[1][0], pair.messages[2][0], pair.messages[3][0], pair.messages[4][0], pair.messages[5][0] });
     }
     {
-        const initial_roots = try scratch.dupe(feeds.Root, state.roots);
+        const initial_roots = try scratch.dupe(feeds.Root, before_issue.roots);
         initial_roots[0].physical = .{ .group_id = 11, .range_id = 11 };
-        var split = state;
+        var split = before_issue;
         split.roots = initial_roots;
         const handoff: feeds.SplitHandoff = .{
             .predecessor = initial_roots[0].physical.?,
@@ -487,7 +488,7 @@ pub fn testRetainedTransaction() !void {
         var child_spool = try encode(a, split, &.{.{ .stream = child.namespace, .page = child_page, .relation = relation }}, 112, 1024);
         defer child_spool.deinit();
         try std.testing.expectEqual(child.namespace, child_spool.candidate.delivery.advances[0].namespace);
-        try std.testing.expectEqual(state.slot.?.next_lsn, child_spool.candidate.spec.start_lsn);
+        try std.testing.expectEqual(state.slot.?.next_lsn, (try child_spool.candidate.serializationSpec(split, @splat(13))).start_lsn);
         try std.testing.expectError(error.ChangefeedResynchronizationRequired, encode(a, split, &.{.{ .page = child_page, .relation = relation }}, 112, 1024));
     }
     page.frame_events = 2;

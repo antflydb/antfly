@@ -22,9 +22,11 @@ import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 import conftest as harness
 import pytest
+import requests
 from helpers import wait_until
 from port_reservations import find_free_port
 from test_backup_restore import ThreeByThreeBackupCluster
@@ -63,13 +65,14 @@ class PgwireFailoverCluster(ThreeByThreeBackupCluster):
 
 @pytest.mark.e2e_resource("antfly_process")
 @pytest.mark.parametrize(
-    "export_snapshot, multi_table, cross_node",
+    "export_snapshot, multi_table, cross_node, topology",
     [
-        (False, False, False),
-        (True, False, False),
-        (False, True, False),
-        (True, True, False),
-        (False, False, True),
+        (False, False, False, False),
+        (True, False, False, False),
+        (False, True, False, False),
+        (True, True, False, False),
+        (False, False, True, False),
+        (False, False, True, True),
     ],
     ids=[
         "stream-only",
@@ -77,10 +80,11 @@ class PgwireFailoverCluster(ThreeByThreeBackupCluster):
         "multi-table",
         "multi-table-snapshot",
         "cross-node",
+        "split-merge",
     ],
 )
 def test_pg_recvlogical_resume_after_restart(
-    tmp_path, monkeypatch, export_snapshot, multi_table, cross_node
+    tmp_path, monkeypatch, export_snapshot, multi_table, cross_node, topology
 ):
     binary = harness.resolve_binary_path(
         os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
@@ -735,6 +739,97 @@ def test_pg_recvlogical_resume_after_restart(
                     time.sleep(0.2)
                 assert resumed.read_bytes().count(b"after-node-failover") == 1
                 assert all(marker not in resumed.read_bytes() for marker in markers)
+                if topology:
+
+                    def topology_snapshot():
+                        leader = server.metadata_stable_leader_id(timeout_s=30)
+                        assert leader is not None
+                        snapshot = server.metadata_snapshot(leader - 1)
+                        table = next(
+                            table
+                            for table in snapshot["tables"]
+                            if table.get("logical_name", table["name"]) == "smoke"
+                        )
+                        ranges = sorted(
+                            (
+                                item
+                                for item in snapshot["ranges"]
+                                if int(item["table_id"]) == int(table["table_id"])
+                            ),
+                            key=lambda item: item.get("start_key") or "",
+                        )
+                        return leader, quote(table["name"], safe=""), ranges
+
+                    def request_topology(operation, body):
+                        leader, physical_name, _ = topology_snapshot()
+                        response = requests.post(
+                            f"{server.metadata_admin_urls[leader - 1]}/internal/v1/tables/{physical_name}/{operation}",
+                            headers=harness.internal_service_headers(),
+                            json=body,
+                            timeout=20,
+                        )
+                        assert response.ok, response.text
+
+                    def lsn_value(lsn):
+                        high, low = lsn.split("/")
+                        return (int(high, 16) << 32) | int(low, 16)
+
+                    def expect_markers(pairs, previous):
+                        assert wait_until(
+                            lambda: (
+                                reader.poll() is None
+                                and all(
+                                    marker in resumed.read_bytes() for marker in pairs
+                                )
+                            ),
+                            timeout_s=60,
+                            interval_s=0.2,
+                        ), resumed.with_suffix(".log").read_text()
+                        assert all(
+                            resumed.read_bytes().count(marker) == 1 for marker in pairs
+                        )
+                        assert wait_until(
+                            lambda: lsn_value(catalog_slot()[0][4]) > previous,
+                            timeout_s=30,
+                            interval_s=0.2,
+                        )
+                        return lsn_value(catalog_slot()[0][4])
+
+                    floor = lsn_value(recovered[4])
+                    floor = expect_markers([b"after-node-failover"], floor)
+                    request_topology("split", {"split_key": "m"})
+                    assert wait_until(
+                        lambda: len(topology_snapshot()[2]) == 2,
+                        timeout_s=180,
+                        interval_s=0.5,
+                    )
+                    sql(
+                        "INSERT INTO smoke (_id, id, content) VALUES ('a-left', 102, 'after-split-left')"
+                    )
+                    sql(
+                        "INSERT INTO smoke (_id, id, content) VALUES ('z-right', 103, 'after-split-right')"
+                    )
+                    floor = expect_markers(
+                        [b"after-split-left", b"after-split-right"], floor
+                    )
+                    _, _, (left, right) = topology_snapshot()
+                    request_topology(
+                        "merge",
+                        {
+                            "donor_group_id": int(right["group_id"]),
+                            "receiver_group_id": int(left["group_id"]),
+                        },
+                    )
+                    assert wait_until(
+                        lambda: len(topology_snapshot()[2]) == 1,
+                        timeout_s=180,
+                        interval_s=0.5,
+                    )
+                    sql(
+                        "INSERT INTO smoke (_id, id, content) VALUES ('z-merged', 104, 'after-merge')"
+                    )
+                    expect_markers([b"after-merge"], floor)
+                    assert all(marker not in resumed.read_bytes() for marker in markers)
         if not export_snapshot and not multi_table and not cross_node:
             # Change the replica identity after the slot persisted its
             # immutable binding. Old images cannot use the new contract.
