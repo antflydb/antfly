@@ -31,6 +31,31 @@ pub const Root = struct {
     table_binding: control.Digest,
     fence: metadata.CatalogRouteFence,
 };
+const SplitCut = @import("split_history_operations.zig").wire;
+const SplitTransition = @import("../metadata/transition_state.zig").SplitTransitionRecord;
+
+/// Bind a finalized catalog transition to the physical predecessor route.
+fn splitCutRequest(predecessor: Root, generation: u64, split: SplitTransition) !SplitCut.Request {
+    const boundary = split.split_key orelse return error.ChangefeedResynchronizationRequired;
+    const identity = predecessor.fence.route.identity_namespace;
+    const contract = split.table_contract;
+    if (split.phase != .finalized or split.transition_id == 0 or split.attempt_epoch == 0 or
+        split.source_group_id != predecessor.fence.route.group_id or split.destination_group_id == 0 or
+        split.destination_group_id == split.source_group_id or boundary.len == 0 or
+        contract.table_id != identity.table_id or contract.source_identity.shard_id != identity.shard_id or
+        contract.source_identity.range_id != identity.range_id or
+        !std.mem.eql(u8, contract.table_name, predecessor.table_name))
+        return error.ChangefeedResynchronizationRequired;
+    return .{
+        .namespace = predecessor.namespace,
+        .root_generation = generation,
+        .transition = split.transition_id,
+        .attempt = split.attempt_epoch,
+        .successor_group = split.destination_group_id,
+        .boundary = @import("antfly_local_sources").storage_committed_history.frame.digest(boundary),
+    };
+}
+
 pub const Captured = struct {
     allocator: A,
     session: catalog_api.RoutingSession,
@@ -113,6 +138,29 @@ test "history root discovery validates the complete installed route vector" {
     routes[1].namespace = @splat(3);
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(&planned));
 }
+test "history root discovery qualifies the exact finalized split predecessor" {
+    var predecessor: Root = .{ .namespace = @splat(1), .table_name = "docs", .table_binding = @splat(2), .fence = undefined };
+    predecessor.fence.route = .{ .group_id = 7, .range_id = 9, .identity_namespace = .{ .table_id = 5, .shard_id = 8, .range_id = 9 } };
+    var split: SplitTransition = .{
+        .transition_id = 19,
+        .attempt_epoch = 2,
+        .source_group_id = 7,
+        .destination_group_id = 10,
+        .phase = .finalized,
+        .split_key = "m",
+        .table_contract = .{ .table_id = 5, .table_name = "docs", .source_identity = .{ .shard_id = 8, .range_id = 9 } },
+    };
+    const request = try splitCutRequest(predecessor, 3, split);
+    try std.testing.expectEqual(@as(u64, 2), request.attempt);
+    try std.testing.expectEqual(@as(u64, 3), request.root_generation);
+    try std.testing.expectEqual(@as(u64, 10), request.successor_group);
+    split.phase = .prepare;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, splitCutRequest(predecessor, 3, split));
+    split.phase = .finalized;
+    split.table_contract.source_identity.range_id += 1;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, splitCutRequest(predecessor, 3, split));
+}
+
 pub const Source = struct {
     artifact_owners: ?@import("history_owner_operations.zig").Port = null,
     split_cut: ?@import("split_history_operations.zig").Port = null,
@@ -122,6 +170,13 @@ pub const Source = struct {
     pages: @import("history_page_operations.zig").Port,
     bootstrap_pages: ?@import("history_page_operations.zig").Bootstrap.Port = null,
     grants: @import("history_grant_operations.zig").Port,
+    pub fn readSplitCut(self: Source, a: A, predecessor: Root, generation: u64, split: SplitTransition, context: Context) !SplitCut {
+        const port = self.split_cut orelse return error.ChangefeedCapabilityUnsupported;
+        const request = try splitCutRequest(predecessor, generation, split);
+        return (try port.read(a, predecessor.fence, predecessor.table_name, request, context)) orelse
+            error.ChangefeedResynchronizationRequired;
+    }
+
     /// Authorization must precede capture. Returned locators borrow the owned
     /// generation, so they remain valid even after the publisher retires it.
     pub fn capture(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
