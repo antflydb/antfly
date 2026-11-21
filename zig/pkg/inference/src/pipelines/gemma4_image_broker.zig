@@ -456,8 +456,8 @@ test "embeddinggemma2 prepared broker accounts mixed and video groups before dec
     // Invalid coded payloads have not entered decode or acquired device scratch.
     const parts = [_]grouped.Part{ .{ .video = "coded bytes" }, .{ .text = "caption" } };
     try std.testing.expectError(error.InvalidVideoReaderSelection, groupShape(.{ .content = &parts }));
-    var items = [_]@import("embedding_gemma2_video.zig").PixelInspection{.{ .bytes = parts[0].video, .pixels = 320 * 240 }};
-    const metadata = grouped.GroupMedia{ .videos = .{ .items = &items } };
+    const inspection = @import("embedding_gemma2_video.zig").PixelInspection{ .bytes = parts[0].video, .pixels = 320 * 240 };
+    const metadata = grouped.GroupMedia{ .videos = .{ .items = &.{&inspection} } };
     const video = try groupShape(.{ .content = &parts, .media = &metadata });
     try std.testing.expectEqual(@as(u64, 320 * 240), video.pixels);
     try std.testing.expectEqual(@as(usize, 8192), video.tokens);

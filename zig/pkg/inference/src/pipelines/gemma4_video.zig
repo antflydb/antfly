@@ -49,9 +49,9 @@ pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8, control: Control
     try control.check();
     const adapter = control.imageWorkControl();
     const media_control = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
-    if (bytes.len > video.packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
+    if (bytes.len > video.packet_sampling.reference_max_input_bytes) return error.VideoInputTooLarge;
     if (media.transport_stream.isTransportStream(bytes)) {
-        return clockAllowance(try media.transport_stream.probeSampleClock(a, bytes, .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes, .max_packets = video.mp4_coded.limits.max_samples }, media_control));
+        return clockAllowance(try media.transport_stream.probeSampleClock(a, bytes, .{ .max_bytes = video.packet_sampling.reference_max_input_bytes, .max_packets = video.mp4_coded.limits.max_samples }, media_control));
     }
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = inspection_bytes } };
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-prompt-clock", .control = media_control, .admission_pool = &pool, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
@@ -195,7 +195,7 @@ pub fn reservationControlled(bytes: []const u8, control: Control) !Reservation {
 }
 
 pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
-    if (bytes.len > video.packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
+    if (bytes.len > video.packet_sampling.reference_max_input_bytes) return error.VideoInputTooLarge;
     if (cb.kind() == .cuda) {
         // NVDEC takes a narrower set of clips than the catalog advertises, and
         // some rejections only surface mid-bitstream. Portable decoding decides

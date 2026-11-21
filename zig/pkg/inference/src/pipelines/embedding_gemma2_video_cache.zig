@@ -16,7 +16,7 @@
 //! Request-local exact video projections. No borrowed compute-wrapper tensors.
 const std = @import("std");
 const Session = @import("../backends/session.zig").Session;
-const Permit = @import("../backends/session.zig").RunPermit;
+const MediaLease = Session.RetainedMediaLease;
 const ops = @import("../ops/ops.zig");
 const metal = @import("../ops/metal_compute.zig").MetalCompute;
 const enabled = @import("build_options").enable_metal;
@@ -24,8 +24,8 @@ const Device = if (enabled) @import("../backends/metal_tensor.zig").MetalTensor 
 pub const Key = struct { clip: [32]u8, picture: usize };
 pub const Stats = struct { hits: usize = 0, stored: usize = 0, evicted: usize = 0, denied: usize = 0, unsupported: usize = 0 };
 const Value = union(enum) { cpu: []f32, device: Device };
-const Entry = struct { value: Value, tokens: usize, bytes: usize, permit: ?Permit = null, allocation: ?usize = null };
-const Allocation = struct { handle: ?*anyopaque = null, references: usize = 0, bytes: usize = 0, permit: ?Permit = null };
+const Entry = struct { value: Value, tokens: usize, bytes: usize, permit: ?*MediaLease = null, allocation: ?usize = null };
+const Allocation = struct { handle: ?*anyopaque = null, references: usize = 0, bytes: usize = 0, permit: ?*MediaLease = null };
 const Slot = struct { key: Key = undefined, age: u64 = 0, entry: ?Entry = null, borrowed: bool = false };
 /// A ticket moves ownership without touching Metal's confined buffer refcount.
 /// Producers may borrow entries; only the model consumer imports device tensors.
@@ -51,7 +51,7 @@ pub const Pins = struct {
         self.binding_count += 1;
     }
     pub fn get(self: *const Pins, key: Key) ?Ticket {
-        for (self.tickets, 0..) |ticket, index| if (ticket) |value| {
+        for (&self.tickets, 0..) |*ticket, index| if (ticket.*) |value| {
             if (Cache.equal(self.keys[index], key)) return value;
         };
         return null;
@@ -114,12 +114,27 @@ pub const Cache = struct {
         slot.borrowed = false;
         slot.entry = ticket.entry;
     }
+    // Cache slots and producer tickets stay small even when all 128 are live.
+    // Each physical allocation owns at most one admitted lease.
+    fn admit(self: *Cache, host: usize, device: usize) !?*MediaLease {
+        var lease = try self.session.admitRetainedMediaLease(host, device) orelse return null;
+        errdefer lease.deinit();
+        const retained = try self.allocator.create(MediaLease);
+        retained.* = lease;
+        return retained;
+    }
+    fn releasePermit(self: *Cache, permit: ?*MediaLease) void {
+        if (permit) |held| {
+            held.deinit();
+            self.allocator.destroy(held);
+        }
+    }
     fn drop(self: *Cache, entry: *Entry) void {
         switch (entry.value) {
             .cpu => |values| self.allocator.free(values),
             .device => |*value| if (comptime enabled) value.deinit(),
         }
-        if (entry.permit) |*permit| permit.deinit();
+        self.releasePermit(entry.permit);
         if (entry.allocation) |index| self.releaseAllocation(index);
         self.bytes -= entry.bytes;
     }
@@ -128,7 +143,7 @@ pub const Cache = struct {
         std.debug.assert(allocation.references != 0);
         allocation.references -= 1;
         if (allocation.references == 0) {
-            allocation.permit.?.deinit();
+            self.releasePermit(allocation.permit);
             self.bytes -= allocation.bytes;
             allocation.* = .{};
         }
@@ -147,11 +162,11 @@ pub const Cache = struct {
     }
     fn reserve(self: *Cache, key: Key, bytes: usize) ?usize {
         if (bytes > self.limit) return null;
-        for (self.slots) |slot| if ((slot.borrowed or slot.entry != null) and equal(slot.key, key)) return null;
+        for (&self.slots) |*slot| if ((slot.borrowed or slot.entry != null) and equal(slot.key, key)) return null;
         while (true) {
             var free: ?usize = null;
             var oldest: ?usize = null;
-            for (self.slots, 0..) |slot, i| {
+            for (&self.slots, 0..) |*slot, i| {
                 if (slot.borrowed) continue;
                 if (slot.entry == null) {
                     free = i;
@@ -172,12 +187,12 @@ pub const Cache = struct {
         defer self.mutex.unlock();
         const bytes = values.len * @sizeOf(f32);
         const slot = self.reserve(key, bytes) orelse return;
-        var permit = self.session.admitRetainedMedia(bytes, 0) catch {
+        const permit = self.admit(bytes, 0) catch {
             self.stats.denied += 1;
             return;
         };
         const owned = self.allocator.dupe(f32, values) catch {
-            permit.deinit();
+            self.releasePermit(permit);
             self.stats.denied += 1;
             return;
         };
@@ -213,7 +228,7 @@ pub const Cache = struct {
             return;
         };
         var shared: ?usize = null;
-        for (self.allocations, 0..) |allocation, index| if (allocation.references != 0 and allocation.handle == handle and allocation.bytes == retained.retainedAllocationBytes()) {
+        for (&self.allocations, 0..) |*allocation, index| if (allocation.references != 0 and allocation.handle == handle and allocation.bytes == retained.retainedAllocationBytes()) {
             shared = index;
             break;
         };
@@ -226,7 +241,7 @@ pub const Cache = struct {
             return;
         };
         if (shared == null) {
-            const permit = self.session.admitRetainedMedia(0, bytes) catch {
+            const permit = self.admit(0, bytes) catch {
                 retained.deinit();
                 self.stats.denied += 1;
                 return;
@@ -308,14 +323,16 @@ test "embeddinggemma2 video cache shared admission denies additional request own
 test "embeddinggemma2 video cache allocation denial returns the retained lease" {
     var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
     var marker: u8 = 0;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var cache = Cache{ .allocator = failing.allocator(), .session = testSession(&controller, &marker, 4096) };
-    defer cache.deinit();
-    const values: [512]f32 = @splat(2);
-    cache.storeCpu(.{ .clip = @splat(0), .picture = 0 }, &values, 1);
-    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
-    try std.testing.expectEqual(@as(usize, 1), cache.stats.denied);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    for (0..2) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var cache = Cache{ .allocator = failing.allocator(), .session = testSession(&controller, &marker, 4096) };
+        defer cache.deinit();
+        const values: [512]f32 = @splat(2);
+        cache.storeCpu(.{ .clip = @splat(0), .picture = 0 }, &values, 1);
+        try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+        try std.testing.expectEqual(@as(usize, 1), cache.stats.denied);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    }
 }
 
 test "embeddinggemma2 Metal video cache survives compute wrappers without intermediate downloads" {

@@ -46,7 +46,8 @@ pub const Limits = struct {
     max_reads: usize = 100_000,
 };
 pub const Range = struct {
-    /// Opt in when callbacks and their allocator support simultaneous reads.
+    /// Opt in when callbacks can run simultaneously. Callbacks that allocate
+    /// from the source backing must use its rangeAllocator() for that work.
     concurrent: bool = false,
     /// Content digest or immutable object/version binding. Providers supplying
     /// this must validate that every returned range belongs to that snapshot.
@@ -197,7 +198,7 @@ pub const Source = struct {
     /// Coordinate their buffers, scratch and lease releases with the physical source.
     /// Borrowed storage promises immutable bytes but makes no allocator guarantee.
     pub fn rangeAllocator(self: *Source) std.mem.Allocator {
-        if (self.allocator.vtable == &RangeAllocator.vtable or (self.storage == .range and self.storage.range.concurrent)) return self.allocator;
+        if (self.allocator.vtable == &RangeAllocator.vtable) return self.allocator;
         return .{ .ptr = self, .vtable = &RangeAllocator.vtable };
     }
 
@@ -578,9 +579,18 @@ test "waiting for a serialized range honors cancellation without charging a call
     };
     var provider = Provider{};
     var source = Source{ .allocator = std.testing.allocator, .identity = "busy", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = 1 } } };
-    source.provider_busy.store(1, .release);
-    var worker = source.view(source.allocator, null, .{ .context = &provider, .check_fn = Provider.check });
-    try std.testing.expectError(error.Cancelled, worker.read(0, 1));
-    try std.testing.expectEqual(@as(usize, 0), source.reads);
-    try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
+    // Model a sibling allocating a range buffer. Even a concurrent provider
+    // must wait when allocating through an independently supplied worker arena.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |concurrent| {
+        provider.checks = 0;
+        source.storage.range.concurrent = concurrent;
+        source.provider_busy.store(1, .release);
+        var worker = source.view(arena.allocator(), null, .{ .context = &provider, .check_fn = Provider.check });
+        try std.testing.expectError(error.Cancelled, worker.read(0, 1));
+        try std.testing.expectEqual(@as(usize, 0), source.reads);
+        try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
+        source.unlockProvider();
+    }
 }

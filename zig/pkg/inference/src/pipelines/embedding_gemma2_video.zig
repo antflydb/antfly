@@ -59,10 +59,13 @@ pub const Encoded = struct {
 /// Sample logical presentation frames, then map them to decode packet indexes.
 /// The FPS policy matches HF; timestamp selection remains a separate video API.
 pub const Sampling = video.packet_sampling.Sampling;
-pub const embedding_max_input_bytes = 64 * 1024 * 1024;
+pub const group_max_input_bytes = 64 * 1024 * 1024;
 
 fn inputByteLimit(sampling: Sampling) usize {
-    return if (sampling == .gemma4) video.packet_sampling.gemma4_max_input_bytes else embedding_max_input_bytes;
+    return switch (sampling) {
+        .reference, .gemma4 => video.packet_sampling.reference_max_input_bytes,
+        .timestamps, .source_timestamps => group_max_input_bytes,
+    };
 }
 
 fn validateInputSize(len: usize, sampling: Sampling) !void {
@@ -131,10 +134,10 @@ pub const WebmDecoderContinuation = struct {
     }
 };
 pub const AdmittedVideos = struct {
-    items: []PixelInspection,
+    items: []const *const PixelInspection,
 
     pub fn find(self: AdmittedVideos, bytes: []const u8, sampling: Sampling) ?*const PixelInspection {
-        for (self.items) |*item| if (item.matches(bytes) and std.meta.eql(item.sampling, sampling)) return item;
+        for (self.items) |item| if (item.matches(bytes) and std.meta.eql(item.sampling, sampling)) return item;
         return null;
     }
 };
@@ -288,6 +291,29 @@ pub const Inspection = struct {
             self.plan = try inspectSelectedPacketPlan(a, &self.reader, control, true, self.selected.?, self.configurations, self.presentation);
         }
     }
+    // Each use of an inspected encoded clip owns the remaining replay budget
+    // and its decoder allocator. External readers keep their physical quotas.
+    const ExecutionInput = struct {
+        wire: media.source.Source = undefined,
+        transport: video.transport_seek.View = undefined,
+
+        fn bind(self: *@This(), entry: *const Inspection, source: *media.source.Source) void {
+            const original = if (entry.webm) entry.webm_reader.input else entry.reader.input;
+            if (entry.borrowed != null or entry.configuration.webm != null) {
+                source.* = original.view(source.allocator, source.admission_pool, source.control);
+                return;
+            }
+            if (entry.packet_input) |input| if (input.transport) |ts| {
+                self.wire = source.*;
+                self.wire.limits = ts.view.wire.remaining();
+                self.transport = .{ .wire = &self.wire, .map = ts.view.map };
+                source.* = self.transport.source(original.identity, original.remaining());
+                return;
+            };
+            source.limits = original.remaining();
+        }
+    };
+
     fn selectPackets(self: *Inspection, a: std.mem.Allocator, configuration: Configuration) !void {
         if (configuration.sampling == .gemma4) {
             self.gemma4_plan = if (configuration.selection) |selection| selection.gemma4_plan orelse return error.InvalidVideoReaderSelection else try video.packet_sampling.gemma4PortablePlan(a, &self.reader, self.configurations);
@@ -1127,6 +1153,28 @@ pub const PixelInspection = struct {
     }
 };
 
+test "embeddinggemma2 video replay shares indexes and gives each encoded clip occurrence independent read credits" {
+    inline for (.{ "codecs/h264.mp4", "closed.ts", "vp9.webm" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name);
+        var item = PixelInspection{};
+        defer item.deinit();
+        _ = try item.inspect(bytes, .{}, .reference);
+        const entry = item.portable.?;
+        const reads = entry.source.reads;
+        const packet_offset = if (entry.webm) entry.webm_reader.packets[0].offset else entry.reader.packets[0].offset;
+        for (0..2) |_| {
+            var source = media.source.Source{ .allocator = std.testing.allocator, .identity = "worker", .storage = .{ .borrowed = bytes } };
+            var replay = Inspection.ExecutionInput{};
+            replay.bind(entry, &source);
+            source.limits.max_reads = 1;
+            var lease = try source.read(packet_offset, 1);
+            defer lease.deinit();
+            try std.testing.expectError(error.ResourceLimitExceeded, source.read(packet_offset, 1));
+        }
+        try std.testing.expectEqual(reads, entry.source.reads);
+    }
+}
+
 test "embeddinggemma2 video pixel admission keeps distinct AV1 clips out of each other's projection cache" {
     const a = std.testing.allocator;
     const bytes = @embedFile("../testdata/video/codecs/av1.mp4");
@@ -1360,6 +1408,9 @@ fn sampledPacketBytes(reader: *const media.mp4.Reader, sampling: Sampling) ![]co
         if (packet.offset > reader.input.length() or packet.size > reader.input.length() - packet.offset) return error.UnexpectedEndOfSource;
         total = try std.math.add(u64, total, packet.size);
     }
+    // A caller-supplied packet window has the grouped media ceiling. The larger
+    // reference envelope applies to a standalone encoded clip.
+    if (sampling != .gemma4 and total > group_max_input_bytes) return error.ResourceLimitExceeded;
     try validateInputSize(std.math.cast(usize, total) orelse return error.ResourceLimitExceeded, sampling);
     return switch (reader.input.storage) {
         .borrowed => |bytes| bytes,
@@ -1792,9 +1843,9 @@ pub const Prefetch = struct {
         const webm = if (inspection) |owner| owner.webm else self.webm_input != null or (opened != null and opened.? == .webm);
         var webm_reader: media.webm.Reader = undefined;
         var reader: media.mp4.Reader = undefined;
+        var execution_input = Inspection.ExecutionInput{};
         if (inspection) |owner| {
-            const original = if (webm) owner.webm_reader.input else owner.reader.input;
-            source = original.view(source.allocator, source.admission_pool, source.control);
+            execution_input.bind(owner, &source);
             if (webm) {
                 webm_reader = owner.webm_reader;
                 webm_reader.input = &source;
@@ -2288,9 +2339,9 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     const webm = if (inspection) |owner| owner.webm else webm_input != null or (opened != null and opened.? == .webm);
     var webm_reader: media.webm.Reader = undefined;
     var reader: media.mp4.Reader = undefined;
+    var execution_input = Inspection.ExecutionInput{};
     if (inspection) |owner| {
-        const original = if (webm) owner.webm_reader.input else owner.reader.input;
-        source = original.view(source.allocator, source.admission_pool, source.control);
+        execution_input.bind(owner, &source);
         if (webm) {
             webm_reader = owner.webm_reader;
             webm_reader.input = &source;

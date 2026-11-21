@@ -3125,11 +3125,25 @@ pub const Session = struct {
     /// Owned media cache allocations can outlive a single execution permit.
     /// Charge them independently until eviction, including full device buffers
     /// retained by views rather than only their logical tensor payload.
+    pub const RetainedMediaLease = struct {
+        lease: memory.AdmissionLease,
+        resource_pin: ?ModelLifetime.ResourcePin,
+
+        pub fn deinit(self: *@This()) void {
+            self.lease.release();
+            if (self.resource_pin) |pin| pin.releaseWithBoundary(null);
+        }
+    };
+
+    pub fn admitRetainedMediaLease(self: Session, host_bytes: usize, device_bytes: usize) !?RetainedMediaLease {
+        const admission = self.run_admission orelse return null;
+        const lease = try admission.acquireAmounts(.{ .host_scratch_bytes = host_bytes, .backend_scratch_bytes = device_bytes });
+        return .{ .lease = lease, .resource_pin = if (self.resourcePin()) |pin| pin.retain() else null };
+    }
+
     pub fn admitRetainedMedia(self: Session, host_bytes: usize, device_bytes: usize) !RunPermit {
-        return self.retainPermit(.{ .session = self, .lease = if (self.run_admission) |admission|
-            try admission.acquireAmounts(.{ .host_scratch_bytes = host_bytes, .backend_scratch_bytes = device_bytes })
-        else
-            null });
+        const media = try self.admitRetainedMediaLease(host_bytes, device_bytes) orelse return .{ .session = self, .lease = null };
+        return .{ .session = self, .lease = media.lease, .resource_pin = media.resource_pin };
     }
 
     /// Request-retained decoder banks use the KV quota independently of

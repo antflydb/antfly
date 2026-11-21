@@ -22,7 +22,7 @@ const sampling_mod = @import("sampling.zig");
 
 pub const Av1FrameUnits = @import("codecs/av1_headers.zig").FrameUnits;
 pub const Sampling = union(enum) { reference, timestamps: sampling_mod.TimestampPolicy, source_timestamps: sampling_mod.TimestampPolicy, gemma4 };
-pub const gemma4_max_input_bytes = 256 * 1024 * 1024;
+pub const reference_max_input_bytes = 256 * 1024 * 1024;
 pub const gemma4_max_frames = (sampling_mod.TimestampPolicy{}).max_frames;
 
 pub fn presentationUs(pts: i64, origin: i64, scale: u32) !i64 {

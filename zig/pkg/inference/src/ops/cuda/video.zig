@@ -64,7 +64,7 @@ pub const EmbeddingProbe = struct { sequence: Sequence, samples: u6 = 0, unique_
 
 pub fn probeMp4Sequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation) !Sequence {
     try validateProbe(ctx, control, preparation);
-    if (bytes.len > packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
+    if (bytes.len > packet_sampling.reference_max_input_bytes) return error.VideoInputTooLarge;
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video-probe", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
     var reader = try media.mp4.Reader.init(allocator, &source, decodeLimits(.gemma4));
     defer reader.deinit();
@@ -560,7 +560,7 @@ pub const PreparedEmbedding = struct {
     }
 
     pub fn initWithSharedPlan(self: *PreparedEmbedding, allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control, shared: ?*const ReferencePlan) !void {
-        if (bytes.len > packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
+        if (bytes.len > packet_sampling.reference_max_input_bytes) return error.VideoInputTooLarge;
         self.source = .{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
         const limits = decodeLimits(.embedding_gemma2);
         const original: ?*const media.mp4.Reader = if (shared) |plan| try plan.readerFor(bytes, limits, control) else null;
@@ -966,7 +966,7 @@ pub fn decodeMp4(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes:
 
 pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, consumer: Consumer, sampling: Sampling) !Stats {
     if (!build_options.enable_cuda or builtin.os.tag != .linux) return error.UnsupportedVideoBackend;
-    if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
+    if (bytes.len > packet_sampling.reference_max_input_bytes) return error.VideoInputTooLarge;
     var state = DecodeState{ .ctx = ctx, .consumer = consumer };
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = .{ .context = &state, .check_fn = sourceCheck } };
     var reader = try media.mp4.Reader.init(allocator, &source, decodeLimits(sampling));

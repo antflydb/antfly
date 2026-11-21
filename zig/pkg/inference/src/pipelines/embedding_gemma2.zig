@@ -770,7 +770,7 @@ fn admitGroupMetadata(session: Session, group: Group, control: Control) !?RunPer
     const videos = group.admittedVideos() orelse return null;
     const admission = session.run_admission orelse return null;
     var uncovered: usize = 0;
-    for (videos.items) |*item| {
+    for (videos.items) |item| {
         const admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(item.memory.backing);
         const funded = if (admitted) |owner| try owner.ownedHostBytesFor(admission.controller) else 0;
         uncovered = try std.math.add(usize, uncovered, item.memory.live -| funded);
@@ -4426,7 +4426,8 @@ fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bo
     // any is present, every supplied media item must be referenced exactly
     // once; generated wrapper tokens remain forbidden in caller text.
     if (image_markers + audio_markers > 0 and (image_markers != images or audio_markers != audios)) return error.MediaPlaceholderMismatch;
-    if (bytes > (if (group.content.len == 1 and Group.referenceVideo(group.content[0]) != null) @as(usize, 256 * 1024 * 1024) else 64 * 1024 * 1024) or raster_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
+    const encoded_limit: usize = if (group.content.len == 1 and Group.referenceVideo(group.content[0]) != null) @import("antfly_video").packet_sampling.reference_max_input_bytes else @import("embedding_gemma2_video.zig").group_max_input_bytes;
+    if (bytes > encoded_limit or raster_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
     if (group.title) |title| if (!has_text or !std.mem.eql(u8, options.task_type, "RETRIEVAL_DOCUMENT") or !std.unicode.utf8ValidateSlice(title) or title.len > 8192 or std.mem.indexOf(u8, title, "<") != null) return error.InvalidEmbeddingTitle;
 }
 
@@ -5086,7 +5087,7 @@ test "embeddinggemma2 native video borrows admitted packet and WebM plans for mi
         var item = pipeline.PixelInspection{};
         defer item.deinit();
         const pixels = try item.inspect(bytes, .{}, .reference);
-        const metadata = GroupMedia{ .videos = .{ .items = (&item)[0..1] } };
+        const metadata = GroupMedia{ .videos = .{ .items = &.{&item} } };
         const group = Group{ .content = &.{ .{ .text = "caption" }, .{ .video = bytes } }, .media = &metadata };
         try std.testing.expectEqual(0, try preflightHostBytes(group));
         const entry = item.portable.?;

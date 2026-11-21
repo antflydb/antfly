@@ -18003,8 +18003,9 @@ fn allocUnpinnedDeviceBufferUnlocked(self: *CudaCompute, len: usize, seq: usize,
 /// reclaimed. Active tensors and existing graph slots retain their addresses.
 fn allocFreshTempBufferUnlocked(self: *CudaCompute, len: usize, policy: TempAllocPolicy) !buffer_mod.DeviceBuffer {
     return buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |err| {
+        if (policy == .optional) return err;
         if (err == error.CudaMemoryLimitExceeded) self.prefill_cache_pressure.store(true, .release);
-        if (policy == .optional or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return err;
+        if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return err;
         if (err != error.CudaMemoryLimitExceeded and self.deferred_device_frees.items.len == 0) return err;
         const owner = self.ctx.device_allocations.snapshot();
         const process = @import("allocation_budget.zig").process_device_allocations.snapshot();
@@ -61891,7 +61892,9 @@ test "Gemma4 CUDA projector optional scratch leaves graph slots available after 
     const before = budget.snapshot();
     try budget.setLimit(before.live);
     try std.testing.expectError(error.CudaMemoryLimitExceeded, allocDeviceBufferOrdinaryWithPolicy(&compute, 1024, .optional));
+    try std.testing.expect(!compute.prefill_cache_pressure.load(.acquire));
     try std.testing.expectError(error.CudaMemoryLimitExceeded, allocDeviceBufferOrdinaryWithPolicy(&compute, 1024, .required));
+    try std.testing.expect(compute.prefill_cache_pressure.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
     defer budget.setLimit(before.limit) catch unreachable;
     var required = try allocDeviceBufferOrdinaryWithPolicy(&compute, 256, .required);
