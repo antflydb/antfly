@@ -346,6 +346,7 @@ test "pending readback owns download lookahead and real KV reservation across ac
         trace: [16]Event = undefined,
         count: usize = 0,
         fail_finish: bool = false,
+        resolve_before_reservation: bool = false,
         unsupported: bool = false,
         fn note(self: *@This(), event: Event) void {
             self.trace[self.count] = event;
@@ -359,7 +360,7 @@ test "pending readback owns download lookahead and real KV reservation across ac
         }
         fn finish(raw: *anyopaque, pending: ops.PendingI32ScalarDownload) !i32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (pending.handle != 11 or self.state.total_tokens != 5) return error.InvalidTestReservationOrder;
+            if (pending.handle != 11 or self.state.total_tokens != (if (self.resolve_before_reservation) @as(usize, 4) else 5)) return error.InvalidTestReservationOrder;
             self.note(.finish);
             if (self.fail_finish) return error.InjectedReadbackFailure;
             return 7;
@@ -380,11 +381,11 @@ test "pending readback owns download lookahead and real KV reservation across ac
             self.note(.free);
         }
     };
-    for (0..4) |mode| {
+    for (0..7) |mode| {
         var state = state_mod.NativeDecodeState.initContiguous(std.testing.allocator);
         defer state.deinit();
         try state.notePrefill(4);
-        var probe = Probe{ .state = &state, .fail_finish = mode == 2 };
+        var probe = Probe{ .state = &state, .fail_finish = mode == 2 or mode == 5, .resolve_before_reservation = mode >= 4 };
         var table = @import("../ops/native_compute.zig").vtable_impl;
         table.beginI32ScalarDownload = Probe.begin;
         table.finishI32ScalarDownload = Probe.finish;
@@ -395,6 +396,27 @@ test "pending readback owns download lookahead and real KV reservation across ac
         const config = model_mod.Config{};
         var step = (try Readback.begin(.{ .allocator = std.testing.allocator, .backend = &backend, .model = &config, .state = &state }, @ptrFromInt(8))).?;
         defer step.deinit();
+        if (mode >= 4) {
+            // Resolve before reserving/submitting a continuation: an EOS or
+            // failed readback leaves the actual cursor and KV owners untouched.
+            if (mode == 5) {
+                try std.testing.expectError(error.InjectedReadbackFailure, step.resolve());
+            } else {
+                try std.testing.expectEqual(@as(usize, 7), try step.resolve());
+            }
+            try std.testing.expectEqual(@as(usize, 4), state.total_tokens);
+            if (mode == 6) {
+                _ = try step.reservePosition();
+                try step.retainLookahead(@ptrFromInt(16));
+                try step.commit();
+                backend.free(step.takeLookahead().?);
+            }
+            step.deinit();
+            try std.testing.expectEqual(@as(usize, if (mode == 6) 5 else 4), state.total_tokens);
+            const expected: []const Event = if (mode == 4) &.{ .begin, .finish } else if (mode == 5) &.{ .begin, .finish, .cancel } else &.{ .begin, .finish, .free };
+            try std.testing.expectEqualSlices(Event, expected, probe.trace[0..probe.count]);
+            continue;
+        }
         try std.testing.expectEqual(@as(usize, 5), try step.reservePosition());
         try step.retainLookahead(@ptrFromInt(16));
         if (mode == 0) {

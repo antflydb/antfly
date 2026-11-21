@@ -1608,8 +1608,9 @@ const metalFinalHiddenFrameOwnsResidentPrefix = decoder_forward.metalFinalHidden
 
 const cudaReplayLastLogitsEnabled = decoder_forward.cudaReplayLastLogitsEnabled;
 
-// Promoted default: pending-token readback overlaps the previous token's D2H
-// copy with the next decode step. Exact-output; still guarded by
+// Promoted default: pending-token readback retains resident token handoff.
+// Resolve EOS before the next submission, then overlap publication with GPU
+// work for a continuing sequence. Exact-output; still guarded by
 // shouldUseCudaPendingTokenReadback (CUDA, pure-greedy, no grammar/speculation
 // /graph runtime). Explicit env values override both ways.
 fn enableCudaGreedyPendingTokenReadback() bool {
@@ -4076,8 +4077,8 @@ pub const NativeGenerationPipeline = struct {
         try penalty_state.seedFromHistory(allocator, token_ids[0..seq_len]);
 
         // Pending token readback consumes the prefill result itself, keeps the
-        // token resident, and launches the next decode graph before waiting
-        // for the current 4-byte token download. Do not materialize the first
+        // token resident, and resolves EOS before submitting the next graph.
+        // Do not materialize the first
         // token through the ordinary prefill shortcut first: doing so advances
         // `tokens_generated` to one and permanently bypasses the pipelined
         // path for the rest of the request.
@@ -6305,10 +6306,21 @@ pub const NativeGenerationPipeline = struct {
             };
             defer pending.deinit();
 
-            token_ids[seq_len.*] = 0;
+            // The current token remains resident for the following graph, but
+            // its readback must establish continuation before any future KV
+            // write. Otherwise EOS launches one whole unused decode step and
+            // request retirement waits for it inside the first device free.
+            const token = try pending.resolve();
+            if (self.shouldStopOnEos(config, token, work_trace)) {
+                candidate_token.clear();
+                finish_reason = "stop";
+                break;
+            }
+
+            token_ids[seq_len.*] = @intCast(token);
             seq_len.* += 1;
-            var appended_placeholder = true;
-            errdefer if (appended_placeholder) {
+            var uncommitted_cursor = true;
+            errdefer if (uncommitted_cursor) {
                 seq_len.* -= 1;
             };
             _ = try pending.reservePosition();
@@ -6331,20 +6343,8 @@ pub const NativeGenerationPipeline = struct {
                 try pending.retainLookahead(next);
             }
 
-            const token = try pending.resolve();
-            if (self.shouldStopOnEos(config, token, work_trace)) {
-                pending.discardLookahead();
-                candidate_token.clear();
-                seq_len.* -= 1;
-                appended_placeholder = false;
-                try pending.rollback();
-                finish_reason = "stop";
-                break;
-            }
-
-            token_ids[seq_len.* - 1] = @intCast(token);
-            appended_placeholder = false;
             try pending.commit();
+            uncommitted_cursor = false;
             tokens_generated += 1;
             try penalty_state.noteToken(allocator, @intCast(token));
             self.noteDecodeProgressNoMicrobatch(tokens_generated);
