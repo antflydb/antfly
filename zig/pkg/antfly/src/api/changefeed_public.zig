@@ -729,7 +729,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
         try policy.authorize(state.value, internal);
         try stageVisibleSplits(&client, a, source, &catalog_routes, &state, selection.after, internal);
-        try enrollOneSplitSuccessor(&client, a, source, &catalog_routes, state.value, selection.after, internal);
+        try progressSplitSuccessor(&client, a, source, &catalog_routes, state.value, selection.after, internal);
         return executeIceberg(&client, a, selection, limits, &policy, .{ .source = source, .captured = &catalog_routes }, internal);
     }
     var captured = try source.capturePhysical(a, definition, internal);
@@ -739,7 +739,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
     try policy.authorize(state.value, internal);
     try stageVisibleSplits(&client, a, source, &captured, &state, selection.after, internal);
-    try enrollOneSplitSuccessor(&client, a, source, &captured, state.value, selection.after, internal);
+    try progressSplitSuccessor(&client, a, source, &captured, state.value, selection.after, internal);
     var provider: native.ScheduledProvider(roots.Routed, RoutedFactory, Policy) = .{ .factory = .{ .source = source, .captured = &captured }, .policy = &policy };
     if (limits) |bounds|
         return .{ .page = try delivery.pull(&client, &provider, a, selection.id, selection.after, bounds, internal) };
@@ -812,13 +812,22 @@ fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Source, r
     try routes.validateInstalledRoutes(parsed.value);
 }
 
-fn enrollOneSplitSuccessor(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, state: control.State, cursor: control.Digest, request: Context) !void {
+fn progressSplitSuccessor(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, state: control.State, cursor: control.Digest, request: Context) !void {
     for (state.roots) |root| {
-        if (state.phase != .streaming or root.split_handoff == null or root.split_consumer_epoch != null) continue;
+        const handoff = root.split_handoff orelse continue;
+        if (state.phase != .streaming) continue;
         _ = try state.contextAt(cursor);
         if (state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return error.ChangefeedLeaseExpired;
-        const mutation = try source.enrollSplitSuccessor(a, routes, state, root, request);
-        return change(client, a, state, mutation, request);
+        if (root.split_consumer_epoch == null) {
+            const mutation = try source.enrollSplitSuccessor(a, routes, state, root, request);
+            return change(client, a, state, mutation, request);
+        }
+        if (state.cursors.len != 0 or root.pending_control != null or handoff.cut.reserved_bytes != 0 or
+            root.acknowledged.order(.{ .sequence = handoff.cut.latest }) != .eq) continue;
+        return change(client, a, state, .{ .activate_split_successor = .{
+            .namespace = root.namespace,
+            .grant_sequence = root.split_grant_sequence.?,
+        } }, request);
     }
 }
 
@@ -1655,12 +1664,16 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
     if (state.phase == .streaming) {
         if (state.renewal_pending and !state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) {
             try requireMaintenancePrincipal(request);
-            var captured = try source.capture(a, state.definition.?, request);
+            var captured = try source.capturePhysical(a, state.definition.?, request);
             defer captured.deinit();
             try captured.validateInstalledRoutes(state);
             var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .renewing = true };
-            for (captured.roots) |route| {
-                const item = state.roots[try state.rootIndex(route.namespace)];
+            for (state.roots) |item| {
+                const catalog_root = for (state.definition.?.tables) |table| {
+                    if (table.contract == .writable_iceberg_rows and same(item.namespace, control.catalogRootNamespace(table))) break true;
+                } else false;
+                if (catalog_root) continue;
+                const route = try captured.findInstalled(item);
                 if (item.renewed_through < state.expires_at) try source_api.renewRoot(&client, &policy, a, state, route, request);
             }
             return;
@@ -1672,10 +1685,10 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
         for (state.roots) |item| {
             if (item.snapshot == null or item.snapshot_released) continue;
             try requireMaintenancePrincipal(request);
-            var captured = try source.capture(a, state.definition.?, request);
+            var captured = try source.capturePhysical(a, state.definition.?, request);
             defer captured.deinit();
             var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a };
-            return releaseStreamingSnapshot(&client, &policy, a, state, try captured.find(item.namespace), request);
+            return releaseStreamingSnapshot(&client, &policy, a, state, try captured.findInstalled(item), request);
         }
         return;
     }
@@ -1776,9 +1789,9 @@ pub fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.S
     };
     try policy.authorizeRoot(state, item.namespace, request);
     const source = policy.source;
-    var discovered = try source.capture(a, definition, request);
+    var discovered = try source.capturePhysical(a, definition, request);
     defer discovered.deinit();
-    const root = try discovered.find(item.namespace);
+    const root = try discovered.findInstalled(item);
     if (item.pending_control) |pending| {
         if (pending.stage != .prepared) {
             const observation = @import("../metadata/root_control_observation.zig");
@@ -1794,7 +1807,7 @@ pub fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.S
                 const command: @import("history_control_operations.zig").wire.Request = .{
                     .version = 1,
                     .operation = .submit,
-                    .command = .{ .collect = .{ .namespace = item.namespace, .authority = state.authority, .max_frames = max_frames } },
+                    .command = .{ .collect = .{ .namespace = item.storageNamespace(), .authority = state.authority, .max_frames = max_frames } },
                 };
                 const result = try source.controls.execute(a, frozen.value, pending.payload.table, command, request);
                 try result.validate(command);
@@ -1820,7 +1833,7 @@ pub fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.S
         .version = 1,
         .operation = .submit,
         .command = .{ .retire = .{
-            .namespace = item.namespace,
+            .namespace = item.storageNamespace(),
             .authority = state.authority,
             .consumer = state.consumerId(),
             .definition = definition.identity(),

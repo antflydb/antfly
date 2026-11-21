@@ -104,8 +104,9 @@ pub const Captured = struct {
     pub fn findInstalled(self: *const Captured, root: control.Root) !Root {
         const physical = root.physical orelse return self.find(root.namespace);
         const table = std.mem.readInt(u64, root.namespace[0..8], .big);
-        const route = try self.findPhysical(table, physical.group_id, physical.range_id);
-        if (!std.mem.eql(u8, &route.namespace, &root.namespace)) return error.ChangefeedResynchronizationRequired;
+        var route = try self.findPhysical(table, physical.group_id, physical.range_id);
+        if (!std.mem.eql(u8, &route.namespace, &root.storageNamespace())) return error.ChangefeedResynchronizationRequired;
+        route.namespace = root.namespace;
         return route;
     }
 
@@ -138,7 +139,7 @@ pub const Captured = struct {
             covered_routes += 1;
             if (root.split_handoff) |handoff| {
                 const successor = try self.findPhysical(table_id, handoff.successor.group_id, handoff.successor.range_id);
-                if (!std.mem.eql(u8, &successor.namespace, &root.namespace)) return error.ChangefeedResynchronizationRequired;
+                if (!std.mem.eql(u8, &successor.namespace, &root.storageNamespace())) return error.ChangefeedResynchronizationRequired;
                 covered_routes += 1;
             }
         }
@@ -226,7 +227,7 @@ pub const Source = struct {
         const boundary = split.split_key orelse return error.ChangefeedResynchronizationRequired;
         const successor_index = captured.session.group_indexes.get(successor.fence.route.group_id) orelse return error.TopologyChanged;
         const successor_range = captured.session.snapshot.value.ranges[successor_index];
-        if (!std.mem.eql(u8, &stored.namespace, &predecessor.namespace) or
+        if (!std.mem.eql(u8, &stored.storageNamespace(), &predecessor.namespace) or
             !std.mem.eql(u8, &predecessor.namespace, &successor.namespace) or
             !std.mem.eql(u8, boundary, successor_range.start_key))
             return error.ChangefeedResynchronizationRequired;
@@ -268,10 +269,10 @@ pub const Source = struct {
             if (candidate.table_id == table_id) break candidate;
         } else return error.ChangefeedResynchronizationRequired;
         const successor = try captured.findPhysical(table_id, handoff.successor.group_id, handoff.successor.range_id);
-        if (!std.mem.eql(u8, &successor.namespace, &root.namespace)) return error.ChangefeedResynchronizationRequired;
+        if (!std.mem.eql(u8, &successor.namespace, &root.storageNamespace())) return error.ChangefeedResynchronizationRequired;
         const wire = @import("history_control_operations.zig").wire;
         const inspect: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .inspect_policy = .{
-            .namespace = root.namespace,
+            .namespace = root.storageNamespace(),
             .authority = state.authority,
         } } };
         const observed = try self.controls.execute(a, successor.fence, successor.table_name, inspect, context);
@@ -279,7 +280,7 @@ pub const Source = struct {
         if (observed.outcome.? == .rejected) return observed.outcome.?.rejected.asError();
         const policy = observed.outcome.?.applied.policy orelse return error.HistoryCorrupt;
         const command: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .enroll = .{
-            .namespace = root.namespace,
+            .namespace = root.storageNamespace(),
             .authority = state.authority,
             .sequence = grant_sequence,
             .consumer = state.consumerId(),
@@ -486,10 +487,10 @@ pub const Source = struct {
     /// A changed leader is transport discovery; a changed namespace is resync.
     pub fn validate(self: Source, a: A, state: control.State, namespace: control.Namespace, frozen: metadata.CatalogRouteFence, table_name: []const u8, context: Context) !void {
         try state.validate();
-        _ = try state.rootIndex(namespace);
-        var current = try self.capture(a, state.definition.?, context);
+        const item = state.roots[try state.rootIndex(namespace)];
+        var current = try self.capturePhysical(a, state.definition.?, context);
         defer current.deinit();
-        const root = try current.find(namespace);
+        const root = try current.findInstalled(item);
         if (!std.mem.eql(u8, root.table_name, table_name) or !std.meta.eql(root.fence.route, frozen.route) or root.fence.table_id != frozen.table_id or root.fence.metadata_group_id != frozen.metadata_group_id or !std.meta.eql(root.fence.metadata_incarnation, frozen.metadata_incarnation) or root.fence.topology_epoch != frozen.topology_epoch) return error.ChangefeedResynchronizationRequired;
     }
 };
@@ -572,7 +573,7 @@ pub fn renewRoot(client: *MetadataClient, policy: anytype, a: A, expected: contr
             if (candidate.table_id == root.fence.table_id) break candidate;
         } else return error.ChangefeedResynchronizationRequired;
         const query: @import("history_grant_operations.zig").Request = .{ .version = 1, .identity = .{
-            .namespace = root.namespace,
+            .namespace = item.storageNamespace(),
             .authority = state.authority,
             .consumer = state.consumerId(),
             .definition = definition.identity(),
@@ -621,7 +622,7 @@ pub fn flushAcknowledged(client: *MetadataClient, policy: anytype, a: A, confirm
             return error.ChangefeedResynchronizationRequired;
         const item = state.roots[try state.rootIndex(root.namespace)];
         const reference: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Reference = .{
-            .namespace = root.namespace,
+            .namespace = item.storageNamespace(),
             .authority = state.authority,
             .consumer = state.consumerId(),
             .epoch = item.consumer_epoch,

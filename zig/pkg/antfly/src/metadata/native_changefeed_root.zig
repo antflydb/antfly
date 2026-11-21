@@ -173,9 +173,6 @@ pub const Routed = struct {
     }
 
     pub fn initForRoot(source: roots.Source, captured: *const roots.Captured, namespace: control.Namespace) !Routed {
-        for (captured.roots) |candidate| {
-            if (same(candidate.namespace, namespace)) break;
-        } else return error.ChangefeedResynchronizationRequired;
         return .{ .namespace = namespace, .source = source, .captured = captured };
     }
 
@@ -256,14 +253,17 @@ pub const Routed = struct {
                 .caught_up = true,
             };
         }
-        const completion_roots = try a.alloc(control.Namespace, if (project_completion) positions.len else 0);
+        const shared_storage = for (positions) |position| {
+            if (position.storage_namespace != null) break true;
+        } else false;
+        const completion_roots = try a.alloc(control.Namespace, if (project_completion and !shared_storage) positions.len else 0);
         defer a.free(completion_roots);
         for (completion_roots, positions[0..completion_roots.len]) |*namespace, position| namespace.* = position.namespace;
         var page = try self.source.pages.read(a, selected.fence, selected.table_name, .{
             .version = 1,
             .request = .{
                 .reference = .{
-                    .namespace = self.namespace,
+                    .namespace = root.storageNamespace(),
                     .authority = state.authority,
                     .consumer = state.consumerId(),
                     .epoch = root.consumer_epoch,
@@ -285,7 +285,10 @@ pub const Routed = struct {
             page.caught_up = page.next.sequence == handoff.cut.latest and page.next.event == 0;
         }
         if (page.header) |header| {
-            if (header.transaction_scope == .coordinated and page.completion == null) return error.ReadUnavailable;
+            if (header.transaction_scope == .coordinated) {
+                if (shared_storage and project_completion) return error.ChangefeedCapabilityUnsupported;
+                if (page.completion == null) return error.ReadUnavailable;
+            }
         }
         try request.ensureActive();
         return page;

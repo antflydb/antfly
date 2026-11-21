@@ -28,7 +28,7 @@ fn same(a: anytype, b: @TypeOf(a)) bool {
 }
 fn reference(state: control.State, item: control.Root, value: root.Reference) !void {
     try value.validate();
-    if (!same(value.namespace, item.namespace) or !same(value.authority, state.authority) or !same(value.consumer, state.consumerId()) or !same(value.definition, state.definition.?.identity()) or value.grant != item.grant_sequence or value.epoch != item.consumer_epoch) return error.ChangefeedConflict;
+    if (!same(value.namespace, item.storageNamespace()) or !same(value.authority, state.authority) or !same(value.consumer, state.consumerId()) or !same(value.definition, state.definition.?.identity()) or value.grant != item.grant_sequence or value.epoch != item.consumer_epoch) return error.ChangefeedConflict;
 }
 pub const ValidatedRequest = struct { input: wire.Request, policy_revision: u64 };
 /// Validate the complete immutable scope before preparing or dispatching a
@@ -50,7 +50,7 @@ fn validateRequestWithCeiling(a: std.mem.Allocator, state: control.State, namesp
     try payload.validate();
     const item = state.roots[try state.rootIndex(namespace)];
     if (item.released or state.phase == .empty or state.phase == .deleted) return error.ChangefeedConflict;
-    const input = wire.decodeRequest(a, payload.command, namespace) catch |err| return if (err == error.OutOfMemory) err else error.ChangefeedCorrupt;
+    const input = wire.decodeRequest(a, payload.command, item.storageNamespace()) catch |err| return if (err == error.OutOfMemory) err else error.ChangefeedCorrupt;
     if (input.operation != .submit) return error.ChangefeedConflict;
     var route = std.json.parseFromSlice(metadata.CatalogRouteFence, a, payload.fence, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.ChangefeedCorrupt;
     defer route.deinit();
@@ -60,7 +60,7 @@ fn validateRequestWithCeiling(a: std.mem.Allocator, state: control.State, namesp
     std.mem.writeInt(u64, expected_namespace[0..8], identity.table_id, .big);
     std.mem.writeInt(u64, expected_namespace[8..16], identity.shard_id, .big);
     std.mem.writeInt(u64, expected_namespace[16..24], identity.range_id, .big);
-    if (!same(namespace, expected_namespace)) return error.ChangefeedConflict;
+    if (!same(item.storageNamespace(), expected_namespace) or (item.physical != null and item.physical.?.group_id != route.value.route.group_id)) return error.ChangefeedConflict;
     if (item.pending_control) |pending| if (pending.retirement_fence and input.command != .retire) return error.ChangefeedConflict;
     const table = for (state.definition.?.tables) |table| {
         if (table.table_id == identity.table_id) break table;

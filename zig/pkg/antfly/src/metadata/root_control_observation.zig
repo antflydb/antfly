@@ -29,7 +29,7 @@ pub fn request(a: std.mem.Allocator, state: control.State, namespace: control.Na
     const pending = item.pending_control orelse return error.ChangefeedConflict;
     if (pending.stage == .prepared) return error.ChangefeedConflict;
     const validated = try outcome.validateRequest(a, state, namespace, pending.payload);
-    return .{ .version = 1, .identity = .{ .namespace = namespace, .authority = state.authority, .consumer = state.consumerId(), .definition = state.definition.?.identity(), .sequence = item.grant_sequence, .policy_revision = validated.policy_revision, .include_bootstrap = validated.input.command == .capture_bootstrap } };
+    return .{ .version = 1, .identity = .{ .namespace = item.storageNamespace(), .authority = state.authority, .consumer = state.consumerId(), .definition = state.definition.?.identity(), .sequence = item.grant_sequence, .policy_revision = validated.policy_revision, .include_bootstrap = validated.input.command == .capture_bootstrap } };
 }
 pub fn resolve(a: std.mem.Allocator, state: control.State, namespace: control.Namespace, observed: native.GrantObservation) !?intent.Reconciliation {
     const input = try request(a, state, namespace);

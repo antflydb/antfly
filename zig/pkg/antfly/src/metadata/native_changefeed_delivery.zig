@@ -380,7 +380,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
             const transaction_identity = if (completion != null)
                 control.hash(.{ .domain = "antfly:feed-coordinated-transaction:v1", .scope = scope(state), .transaction = header.transaction_id })
             else
-                control.hash(.{ .domain = "antfly:feed-transaction:v1", .scope = scope(state), .namespace = header.namespace, .transaction = header.transaction_id, .sequence = header.sequence });
+                control.hash(.{ .domain = "antfly:feed-transaction:v1", .scope = scope(state), .namespace = roots[index].namespace, .transaction = header.transaction_id, .sequence = header.sequence });
             const transaction_id = try hex(a, transaction_identity);
             const distributed = completion != null and roots.len > 1;
             if (coordinated) |active| {
@@ -408,12 +408,12 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                 if (effect) |value| {
                     const ordinal = page.first_ordinal + @as(u32, @intCast(ordinal_in_page));
                     const event: Event = .{
-                        .event_id = try hex(a, control.hash(.{ .domain = "antfly:feed-event:v1", .scope = scope(state), .namespace = header.namespace, .sequence = header.sequence, .ordinal = ordinal })),
+                        .event_id = try hex(a, control.hash(.{ .domain = "antfly:feed-event:v1", .scope = scope(state), .namespace = roots[index].namespace, .sequence = header.sequence, .ordinal = ordinal })),
                         .transaction_id = transaction_id,
                         .table_id = table_id,
                         .key = try key(a, document),
                         .operation = value.operation,
-                        .version = try hex(a, control.hash(.{ .domain = "antfly:feed-version:v1", .scope = scope(state), .namespace = header.namespace, .sequence = header.sequence, .ordinal = ordinal, .key = document })),
+                        .version = try hex(a, control.hash(.{ .domain = "antfly:feed-version:v1", .scope = scope(state), .namespace = roots[index].namespace, .sequence = header.sequence, .ordinal = ordinal, .key = document })),
                         .before = if (value.before) |v| .{ .a = a, .value = v } else null,
                         .after = if (value.after) |v| .{ .a = a, .value = v } else null,
                     };

@@ -88,7 +88,7 @@ pub fn prepareRetirementFence(svc: anytype, policy: anytype, a: A, id: control.I
     if (state.phase != .closing and state.phase != .reset_required) return error.ChangefeedConflict;
     const item = state.roots[try state.rootIndex(namespace)];
     const previous = item.pending_control orelse return error.ChangefeedConflict;
-    const input: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .retire = .{ .namespace = namespace, .authority = state.authority, .consumer = state.consumerId(), .definition = state.definition.?.identity(), .grant = item.grant_sequence, .sequence = state.authority_sequence } } };
+    const input: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .retire = .{ .namespace = item.storageNamespace(), .authority = state.authority, .consumer = state.consumerId(), .definition = state.definition.?.identity(), .grant = item.grant_sequence, .sequence = state.authority_sequence } } };
     const body = try std.json.Stringify.valueAlloc(a, input, .{});
     defer a.free(body);
     const payload: intent.Payload = .{ .command = body, .fence = previous.payload.fence, .table = previous.payload.table };
