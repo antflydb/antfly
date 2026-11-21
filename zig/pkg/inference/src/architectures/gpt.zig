@@ -13686,6 +13686,15 @@ pub fn computePleVectorsFromTokenTensor(
     return try computePleVectorsFromTokenPath(cb, allocator, config, token_embd_raw, hidden, total, ple_dim, num_layers, ple_total_dim);
 }
 
+/// The offline qualification executable can observe the exact context-projection
+/// input and select its baseline epsilon. Serving builds fold this to the model constant.
+pub fn gemmaPleProjectionEpsilon(cb: *const ComputeBackend, hidden: CT, rows: usize, config: Config) !f32 {
+    const root = @import("root");
+    if (comptime @hasDecl(root, "qualifyGemmaPleProjection"))
+        return root.qualifyGemmaPleProjection(cb, hidden, rows, config);
+    return config.pleProjectionNormEps();
+}
+
 fn computePleVectorsFromTokenEmbeddingTensorPath(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -13704,7 +13713,9 @@ fn computePleVectorsFromTokenEmbeddingTensorPath(
         else => return err,
     };
     defer cb.free(proj_w);
+    const projection_epsilon = try gemmaPleProjectionEpsilon(cb, hidden, total, config);
     const model_proj_raw = try cb.linearNoBias(hidden, proj_w, total, config.hidden_size, ple_total_dim);
+    defer cb.free(model_proj_raw);
 
     const proj_norm_base_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_proj_norm.weight") catch |err| switch (err) {
         error.MissingWeight => try getModelWeight(cb, config, "model.per_layer_projection_norm.weight"),
@@ -13716,16 +13727,14 @@ fn computePleVectorsFromTokenEmbeddingTensorPath(
 
     const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
     const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
-    if (try cb.rmsNormAddWeightedEmbeddingTensor(model_proj_raw, proj_norm_w, token_w, input_token, total, num_layers, ple_dim, config.pleProjectionNormEps(), embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
-        cb.free(model_proj_raw);
+    if (try cb.rmsNormAddWeightedEmbeddingTensor(model_proj_raw, proj_norm_w, token_w, input_token, total, num_layers, ple_dim, projection_epsilon, embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
         return fused;
     }
 
     if (try cb.reshape2d(model_proj_raw, total * num_layers, ple_dim)) |reshaped| {
-        defer cb.free(model_proj_raw);
         defer cb.free(reshaped);
 
-        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.pleProjectionNormEps());
+        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, projection_epsilon);
         defer cb.free(normed_flat);
 
         const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse
@@ -13735,7 +13744,6 @@ fn computePleVectorsFromTokenEmbeddingTensorPath(
         return try cb.addWeightedEmbeddingTensor(token_w, input_token, normed_proj, total, ple_total_dim, embed_scale_val * combine_scale_val, combine_scale_val);
     }
 
-    cb.free(model_proj_raw);
     return null;
 }
 
@@ -13758,7 +13766,9 @@ fn computePleVectorsFromTokenPath(
         else => return err,
     };
     defer cb.free(proj_w);
+    const projection_epsilon = try gemmaPleProjectionEpsilon(cb, hidden, total, config);
     const model_proj_raw = try cb.linearNoBias(hidden, proj_w, total, config.hidden_size, ple_total_dim);
+    defer cb.free(model_proj_raw);
 
     // RMSNorm the projection on ple_dim-sized chunks (before combining with token path).
     // Metal fused rms_norm requires weight size == last dim. Reshape
@@ -13774,10 +13784,9 @@ fn computePleVectorsFromTokenPath(
 
     // GPU-native path: reshape → rmsNorm → reshape back → scale/combine on GPU.
     if (try cb.reshape2d(model_proj_raw, total * num_layers, ple_dim)) |reshaped| {
-        defer cb.free(model_proj_raw);
         defer cb.free(reshaped);
 
-        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.pleProjectionNormEps());
+        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, projection_epsilon);
         defer cb.free(normed_flat);
 
         const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse
@@ -13812,8 +13821,7 @@ fn computePleVectorsFromTokenPath(
     }
 
     // CPU fallback (native path): rmsNorm handles chunked dim natively.
-    defer cb.free(model_proj_raw);
-    const normed_proj = try cb.rmsNorm(model_proj_raw, proj_norm_w, ple_dim, config.pleProjectionNormEps());
+    const normed_proj = try cb.rmsNorm(model_proj_raw, proj_norm_w, ple_dim, projection_epsilon);
     defer cb.free(normed_proj);
 
     const token_data = try cb.toFloat32(token_embd_raw, allocator);
