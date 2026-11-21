@@ -390,7 +390,6 @@ pub const Inspection = struct {
             self.selected = if (self.gemma4_plan) |*plan| try a.dupe(usize, plan.ids()) else try selectWebm(a, self.webm_index.?, configuration.sampling, self.source.control, configuration.webm);
             self.plan = try inspectSelectedWebmPlan(&self.webm_reader, self.webm_index.?, true, self.selected.?);
             if (!webmApplePreflight(configuration.webm)) {
-                self.plan.source_apple_surface_bytes = self.plan.apple_surface_bytes;
                 self.plan.apple_surface_bytes = 0;
             }
         } else {
@@ -1881,6 +1880,9 @@ pub const Plan = struct {
     preparation_bytes: usize = 0,
     vision_workspace_bytes: usize = 0,
     apple_surface_bytes: usize = 0,
+    // A WebM index has one Apple-compatible format. Keep its per-surface
+    // cost even when the unfiltered selection exceeds the native limit.
+    webm_apple_surface_slot: ?u64 = null,
     // Preserve the unfiltered envelope when a precomputed plan is admitted
     // again under a different cache owner. A past hit is not a future pin.
     source_apple_surface_bytes: ?usize = null,
@@ -2181,6 +2183,12 @@ pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp
     // surfaces. The original maximum geometry/depth still bounds every miss.
     result.source_apple_surface_bytes = original.source_apple_surface_bytes orelse original.apple_surface_bytes;
     result.apple_surface_bytes = if (decode_count == 0 or (configuration.webm != null and !projected_cache and !webmApplePreflight(configuration.webm))) 0 else if (original.apple_surfaces_fixed) result.source_apple_surface_bytes.? else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(decode_count)) + 24);
+    if (original.webm_apple_surface_slot) |slot| {
+        result.apple_surface_bytes = if (original.metal_preparation and configuration.decoder.policy != .portable and (projected_cache or webmApplePreflight(configuration.webm)))
+            try webmAppleSurfaceReservation(slot, @intCast(decode_count))
+        else
+            0;
+    }
     if (projected_cache and configuration.decoder.policy != .portable) if (configuration.webm) |input| if (input.window) |window| {
         var misses: [32]usize = undefined;
         var count: usize = 0;
@@ -2213,7 +2221,6 @@ fn inspectWebmPlan(a: std.mem.Allocator, input: WebmInput, sampling: Sampling, m
     defer a.free(selected);
     var plan = try inspectSelectedWebmPlan(input.reader, input.index.*, metal, selected);
     if (!webmApplePreflight(input)) {
-        plan.source_apple_surface_bytes = plan.apple_surface_bytes;
         plan.apple_surface_bytes = 0;
     }
     return plan;
@@ -2237,13 +2244,28 @@ fn inspectSelectedWebmPlan(reader: *const media.webm.Reader, index: video.webm_p
         const picture = index.pictures[id];
         const preparation = try webmFramePolicy(reader.track, picture);
         try plan.picture(picture.width, picture.height, preparation);
-        if (apple_eligible and reader.track.codec != .vp8 and picture.chroma_format == 1 and (picture.bit_depth == 8 or picture.bit_depth == 10)) {
-            const estimate = try video.apple.surfaceAdmissionBytesForDepth(picture.width, picture.height, selected.len, picture.bit_depth);
-            if (estimate <= 512 * 1024 * 1024) plan.apple_surface_bytes = @max(plan.apple_surface_bytes, @as(usize, @intCast(estimate)));
+    }
+    if (apple_eligible) {
+        const shape = index.pictures[0];
+        const slot = try video.apple.surfacePayloadBytesForDepth(shape.width, shape.height, shape.bit_depth);
+        plan.webm_apple_surface_slot = slot;
+        var unique: usize = 0;
+        for (selected, 0..) |id, index_in_selection| {
+            if (std.mem.indexOfScalar(usize, selected[0..index_in_selection], id) == null) unique += 1;
         }
+        plan.apple_surface_bytes = try webmAppleSurfaceReservation(slot, unique);
     }
     return plan;
 }
+
+const webm_apple_surface_limit = (video.apple.Options{}).max_surface_bytes;
+
+fn webmAppleSurfaceReservation(slot: u64, count: usize) !usize {
+    if (count == 0) return 0;
+    const bytes = try std.math.mul(u64, slot, try std.math.add(u64, count, 24));
+    return if (bytes <= webm_apple_surface_limit) @intCast(bytes) else 0;
+}
+
 pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool) !Plan {
     try validateInputSize(bytes.len, sampling);
     const adapter = control.imageWorkControl();
@@ -2655,6 +2677,7 @@ pub const Prefetch = struct {
         try self.put(.{ .header = selected });
         var misses: [32]usize = undefined;
         var miss_slots: [32]usize = undefined;
+        var unreserved_hits: usize = 0;
         var missing: usize = 0;
         for (selected, 0..) |id, slot| {
             if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) continue;
@@ -2664,6 +2687,7 @@ pub const Prefetch = struct {
                 continue;
             };
             if (self.cache) |cache| if (cache.take(key)) |ticket| {
+                unreserved_hits += 1;
                 self.put(.{ .cached = .{ .slot = slot, .ticket = ticket } }) catch |err| {
                     cache.restore(ticket);
                     return err;
@@ -2693,7 +2717,7 @@ pub const Prefetch = struct {
         if (self.preparer) |*preparer| try configureOutputSlab(preparer, pool, try selectionOutputBytes(presentation, prepare_packets[0..prepare_count], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
         capture.decode_slots = miss_slots[0..missing];
         if (webm) {
-            try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, self.webm_input, self.cache_pins);
+            try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], missing + unreserved_hits, &capture, self.webm_input, self.cache_pins);
         } else try decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     }
 
@@ -3214,6 +3238,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     };
     var misses: [32]usize = undefined;
     var miss_slots: [32]usize = undefined;
+    var unreserved_hits: usize = 0;
     var missing: usize = 0;
     for (selected, 0..) |id, slot| {
         if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) continue;
@@ -3223,6 +3248,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
             continue;
         };
         if (cache) |shared| if (shared.take(key)) |ticket| {
+            unreserved_hits += 1;
             defer shared.restore(ticket);
             try capture.loadCached(slot, ticket);
             continue;
@@ -3253,7 +3279,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         }
         break :reuse @as(anyerror!void, {});
     } else if (missing == 0) {} else if (webm)
-        decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, webm_input, cache_pins)
+        decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], missing + unreserved_hits, &capture, webm_input, cache_pins)
     else
         decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     const decode_error: ?anyerror = if (decoded) |_| null else |err| err;
@@ -3371,7 +3397,7 @@ fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: vi
     };
     return video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null, .replay_budget = budget }, .{ .context = capture, .accept = Capture.publishAppleWebm });
 }
-fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput, pins: ?*const CachePins) !void {
+fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, admitted_count: usize, capture: *Capture, input: ?WebmInput, pins: ?*const CachePins) !void {
     if (capture.prefetch) |producer| try producer.waitForDecoder();
     const window = if (input) |bound| bound.window else null;
     var budget = if (window) |value| try webmReplayForMisses(indexed, selected, value.replay) else null;
@@ -3379,12 +3405,16 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
         owner.webmApple(.{ .index = value.index, .policy = value.policy }) orelse value.apple_possible
     else
         value.apple_possible else true;
-    const estimate = if (indexed.pictures.len != 0) try video.apple.surfaceAdmissionBytesForDepth(indexed.pictures[0].width, indexed.pictures[0].height, selected.len, indexed.pictures[0].bit_depth) else 0;
+    // Only pins can reduce the admitted envelope. A hit discovered by the
+    // worker cannot switch an over-limit request to an unreserved Apple path.
+    const shape = indexed.pictures[0];
+    const slot = try video.apple.surfacePayloadBytesForDepth(shape.width, shape.height, shape.bit_depth);
+    const surface_bytes = try webmAppleSurfaceReservation(slot, admitted_count);
     if (capture.decoder.policy == .apple and !admitted_apple) {
         return if (@import("builtin").os.tag != .macos) error.UnsupportedVideoBackend else error.UnsupportedVideoProfile;
     }
-    if (capture.decoder.policy == .apple and estimate > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
-    const apple_possible = admitted_apple and estimate <= 512 * 1024 * 1024;
+    if (capture.decoder.policy == .apple and surface_bytes == 0) return error.ResourceLimitExceeded;
+    const apple_possible = admitted_apple and surface_bytes != 0;
     if (capture.decoder.policy == .automatic and !apple_possible) capture.decoder.fallback();
     if (capture.decoder.policy != .portable and (capture.decoder.policy == .apple or apple_possible)) {
         const bytes_before = reader.input.total_bytes;
@@ -5817,6 +5847,21 @@ test "embeddinggemma2 video cache admission removes only pinned unique preparati
     try std.testing.expect(partial.commands < original.commands);
     try std.testing.expect(partial.patch_output_bytes < original.patch_output_bytes);
     try std.testing.expect(try partial.deviceBytes() < try original.deviceBytes());
+    // Pinning a frame can bring an otherwise over-limit WebM selection below
+    // the native cap. The resulting device envelope must fund those misses.
+    var webm_plan = original;
+    const slot = webm_apple_surface_limit / (original.pictures + 24) + 1;
+    webm_plan.webm_apple_surface_slot = slot;
+    webm_plan.apple_surface_bytes = try webmAppleSurfaceReservation(slot, original.pictures);
+    try std.testing.expectEqual(@as(usize, 0), webm_plan.apple_surface_bytes);
+    const pinned_webm = try pinCachedPlan(webm_plan, bytes, null, .{}, configuration);
+    try std.testing.expectEqual(@as(usize, @intCast(slot * (original.pictures + 23))), pinned_webm.apple_surface_bytes);
+    const portable_webm = try pinCachedPlan(webm_plan, bytes, null, .{}, .{
+        .sampling = sampling,
+        .cache_pins = &pins,
+        .decoder = .{ .policy = .portable },
+    });
+    try std.testing.expectEqual(@as(usize, 0), portable_webm.apple_surface_bytes);
     for (original.picture_indexes[0..original.pictures]) |id| cache.storeCpu(.{ .clip = hash, .picture = @intCast(id) }, &values, 1);
     const cached = try inspectConfiguredPlan(a, bytes, null, .{}, configuration, true);
     var fixed_miss_cache = FrameCache{ .allocator = a, .session = session };

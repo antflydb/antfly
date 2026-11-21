@@ -1247,6 +1247,13 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     // Admission/compatibility can decline before ordinary producers start.
     // A running later row must not retain the decoder lease during fallback.
     errdefer if (cohort) releaseVideoBatchPreparations(items, &.{});
+    var parts: [4][2]Part = undefined;
+    var groups: [4]Group = undefined;
+    for (items, 0..) |item, index| {
+        parts[index] = .{ .{ .sampled_video = item.movie }, .{ .text = item.caption orelse "" } };
+        groups[index] = .{ .content = parts[index][0..if (item.caption != null) 2 else 1] };
+        try validateGroupContentControlled(groups[index], options, true, control);
+    }
     for (items) |item| {
         const movie = item.movie;
         try control.check();
@@ -1351,6 +1358,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         cb: *const ComputeBackend,
         tokenizer: Tokenizer,
         items: []const VideoBatchItem,
+        groups: []const Group,
         options: Options,
         control: Control,
         pool: *media_admission.Pool,
@@ -1363,13 +1371,10 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         }
         fn prepare(self: *@This(), index: usize, encoded: ?*video_model.Encoded) !void {
             const item = self.items[index];
-            const parts = [_]Part{ .{ .sampled_video = item.movie }, .{ .text = item.caption orelse "" } };
-            const group = Group{ .content = parts[0..if (item.caption != null) 2 else 1] };
-            try validateGroupContentControlled(group, self.options, true, self.control);
             var row_options = self.options;
             row_options.video_encoded = encoded;
             row_options.video_prepared_frames = item.prepared_frames;
-            self.rows[index] = try prepareGroupWithBudget(self.a, self.cb, self.tokenizer, group, row_options, self.control, self.pool, if (encoded == null and item.ahead != null) item.ahead.?.producer else null, self.cache);
+            self.rows[index] = try prepareGroupWithBudget(self.a, self.cb, self.tokenizer, self.groups[index], row_options, self.control, self.pool, if (encoded == null and item.ahead != null) item.ahead.?.producer else null, self.cache);
             self.prepared[index] = true;
             if (self.options.video_composition) |owner| {
                 owner.order[owner.count] = index;
@@ -1384,7 +1389,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             }
         }
     };
-    var composer = Composer{ .a = a, .cb = cb, .tokenizer = tokenizer, .items = items, .options = options, .control = control, .pool = &pool, .cache = cache, .rows = &rows, .prepared = &prepared };
+    var composer = Composer{ .a = a, .cb = cb, .tokenizer = tokenizer, .items = items, .groups = groups[0..items.len], .options = options, .control = control, .pool = &pool, .cache = cache, .rows = &rows, .prepared = &prepared };
     var encoded_rows: [4]video_model.Encoded = @splat(.{});
     defer for (encoded_rows[0..items.len]) |encoded| encoded.deinit(a);
     const shared_vision_batches = if (cohort) try video_model.Prefetch.encodeCohortReady(a, cb, producers[0..producer_count], encoded_rows[0..producer_count], .{ .context = &composer, .ready = Composer.ready }) else 0;
