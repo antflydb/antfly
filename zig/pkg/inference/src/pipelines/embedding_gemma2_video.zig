@@ -179,7 +179,7 @@ pub const WebmDecoderContinuation = struct {
             .allocator = capture.a,
             .pool = capture.pool,
             .device_surfaces = capture.metal != null,
-        }, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| {
+        }, .{ .context = capture, .accept = Capture.publishAppleWebm, .before_decode = releasePortableWebm }) catch |err| {
             if (err == error.AppleReferenceAdmissionExceeded) {
                 // Retention is optional. The window can still take the
                 // separately admitted transient Apple path.
@@ -560,12 +560,14 @@ pub const Inspection = struct {
 };
 pub const PreparedFrame = struct { patches: []const f32, options: video.preparation.Options };
 
+pub const DecoderDependencies = [4]?*Prefetch;
+
 pub const Configuration = struct {
     prepared_frames: ?[]const PreparedFrame = null,
     observer: ?video.preparation.FrameObserver = null,
     observe_only: bool = false,
     /// Serialize coded preparation within a cohort to preserve warm DPB order.
-    predecessor: ?*Prefetch = null,
+    decoder_dependencies: DecoderDependencies = @splat(null),
     coefficients: ?*const video.preparation.CoefficientCache = null,
     /// Explicit pipeline handoff; generic container/preflight callers never
     /// inspect a model backend before their metadata admission succeeds.
@@ -2517,14 +2519,14 @@ pub const Prefetch = struct {
     aborted: std.atomic.Value(bool) = .init(false),
     published: std.atomic.Value(usize) = .init(0),
     wake: std.atomic.Value(?*std.Io.Event) = .init(null),
-    predecessor: ?*Prefetch = null,
+    decoder_dependencies: DecoderDependencies = @splat(null),
     finished: std.Io.Event = .unset,
 
     pub fn start(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !*Prefetch {
         return startCached(a, io, device, bytes, control, sampling, pool, null);
     }
     pub fn startCached(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !*Prefetch {
-        return startInput(a, io, device, bytes, null, control, sampling, pool, cache, null, .{}, null, null, null, null, null);
+        return startInput(a, io, device, bytes, null, control, sampling, pool, cache, null, .{}, null, null, null, null, @splat(null));
     }
     pub fn startReader(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !*Prefetch {
         return startReaderWithSelection(a, io, device, reader, control, sampling, pool, null);
@@ -2533,7 +2535,7 @@ pub const Prefetch = struct {
         return startReaderCachedWithSelection(a, io, device, reader, control, sampling, pool, selection, null);
     }
     pub fn startReaderCachedWithSelection(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection, cache: ?*FrameCache) !*Prefetch {
-        return startInput(a, io, device, try sampledPacketBytes(reader, sampling, selection, control), reader, control, sampling, pool, cache, selection, .{}, null, null, null, null, null);
+        return startInput(a, io, device, try sampledPacketBytes(reader, sampling, selection, control), reader, control, sampling, pool, cache, selection, .{}, null, null, null, null, @splat(null));
     }
     pub fn startConfigured(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration) !*Prefetch {
         if (configuration.inspection_scope) |scope| if (scope.find(bytes, reader, configuration) == null) {
@@ -2542,15 +2544,15 @@ pub const Prefetch = struct {
             _ = try scope.inspect(bytes, reader, control, configuration, device != null);
         };
         const inspection = if (configuration.inspection_scope) |scope| scope.find(bytes, reader, configuration) else null;
-        return startInput(a, io, device, if (inspection) |owner| owner.validated_bytes else if (reader) |r| try sampledPacketBytes(r, configuration.sampling, configuration.selection, control) else bytes, reader, control, configuration.sampling, configuration.pool, configuration.cache, configuration.selection, configuration.decoder, configuration.webm, configuration.cache_pins, inspection, configuration.coefficients, configuration.predecessor);
+        return startInput(a, io, device, if (inspection) |owner| owner.validated_bytes else if (reader) |r| try sampledPacketBytes(r, configuration.sampling, configuration.selection, control) else bytes, reader, control, configuration.sampling, configuration.pool, configuration.cache, configuration.selection, configuration.decoder, configuration.webm, configuration.cache_pins, inspection, configuration.coefficients, configuration.decoder_dependencies);
     }
-    fn startInput(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, requested_cache: ?*FrameCache, selection: ?*const ReaderSelection, decoder: video.decoding.Options, webm_input: ?WebmInput, cache_pins: ?*CachePins, inspection: ?*const Inspection, coefficients: ?*const video.preparation.CoefficientCache, predecessor: ?*Prefetch) !*Prefetch {
+    fn startInput(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, requested_cache: ?*FrameCache, selection: ?*const ReaderSelection, decoder: video.decoding.Options, webm_input: ?WebmInput, cache_pins: ?*CachePins, inspection: ?*const Inspection, coefficients: ?*const video.preparation.CoefficientCache, decoder_dependencies: DecoderDependencies) !*Prefetch {
         try checkInputControl(reader, webm_input);
         try control.check();
         const self = try a.create(Prefetch);
         errdefer a.destroy(self);
         const cache = try projectionCache(reader, webm_input, selection, requested_cache, cache_pins);
-        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .webm_input = webm_input, .control = control, .sampling = sampling, .pool = pool, .cache = cache, .cache_pins = if (cache != null) cache_pins else null, .inspection = inspection, .decoder = decoder, .coefficients = coefficients, .predecessor = predecessor };
+        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .webm_input = webm_input, .control = control, .sampling = sampling, .pool = pool, .cache = cache, .cache_pins = if (cache != null) cache_pins else null, .inspection = inspection, .decoder = decoder, .coefficients = coefficients, .decoder_dependencies = decoder_dependencies };
         if (cache != null and selection == null) {
             const adapter = control.imageWorkControl();
             self.clip_hash = try clipBinding(bytes, reader, webm_input, .{ .context = adapter.context, .check_fn = adapter.check_fn }, cache_pins, .execution);
@@ -2751,20 +2753,19 @@ pub const Prefetch = struct {
     }
 
     fn waitForDecoder(self: *Prefetch) !void {
-        var predecessor = self.predecessor;
-        // A cache-only predecessor can finish without entering the decoder.
-        // Its earlier dependencies still own their scratch until they finish.
-        while (predecessor) |previous| : (predecessor = previous.predecessor) {
-            while (true) {
-                try check(self);
-                previous.finished.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
-                    error.Timeout => continue,
-                    else => return err,
-                };
-                break;
-            }
-        }
+        for (self.decoder_dependencies) |dependency| if (dependency) |producer| try self.waitForProducer(producer);
         try check(self);
+    }
+
+    fn waitForProducer(self: *Prefetch, producer: *Prefetch) !void {
+        while (true) {
+            try check(self);
+            producer.finished.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+            return;
+        }
     }
 
     fn jobOptions(job: Job) video.preparation.Options {
@@ -3164,7 +3165,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         const device = if (cb.kind() == .metal) try MetalCompute.videoDevice(cb) else null;
         try stage.pause();
         defer stage.cleanup();
-        const producer = try Prefetch.startInput(a, io, device, bytes, borrowed, control, sampling, pool, cache, selection, decoder, webm_input, cache_pins, inspection, coefficients, null);
+        const producer = try Prefetch.startInput(a, io, device, bytes, borrowed, control, sampling, pool, cache, selection, decoder, webm_input, cache_pins, inspection, coefficients, @splat(null));
         defer producer.deinit();
         try stage.acquire();
         return producer.encodeAllocStaged(a, cb, stage);
@@ -3235,7 +3236,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
             .configurations = configurations,
             .presentation = presentation,
         };
-        const producer = try Prefetch.startInput(a, io, try MetalCompute.videoDevice(cb), bytes, borrowed, control, sampling, pool, cache, selection, decoder, webm_input, cache_pins, inspection orelse &prepared, coefficients, null);
+        const producer = try Prefetch.startInput(a, io, try MetalCompute.videoDevice(cb), bytes, borrowed, control, sampling, pool, cache, selection, decoder, webm_input, cache_pins, inspection orelse &prepared, coefficients, @splat(null));
         defer producer.deinit();
         return producer.encodeAllocStaged(a, cb, null);
     };
@@ -3424,11 +3425,16 @@ fn decodeAppleHevc(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
     capture.decoder.record(if (receipt.hardware) .apple_hardware else .apple_software);
     return true;
 }
+fn releasePortableWebm(raw: *anyopaque) void {
+    const capture: *Capture = @ptrCast(@alignCast(raw));
+    if (capture.webm_portable) |owner| owner.deinit();
+}
 fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput, budget: ?video.webm_pictures.ReplayBudget) !video.apple_webm.Receipt {
+    capture.webm_portable = if (input) |bound| bound.continuation else null;
     if (input) |bound| if (bound.apple_continuation) |owner| {
         if (try owner.decode(reader, indexed, selected, capture, budget)) |value| return value;
     };
-    return video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null, .replay_budget = budget }, .{ .context = capture, .accept = Capture.publishAppleWebm });
+    return video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null, .replay_budget = budget }, .{ .context = capture, .accept = Capture.publishAppleWebm, .before_decode = releasePortableWebm });
 }
 fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, admitted_count: usize, capture: *Capture, input: ?WebmInput, pins: ?*const CachePins) !void {
     if (capture.prefetch) |producer| try producer.waitForDecoder();
@@ -3468,6 +3474,7 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
             return;
         }
     }
+    if (input) |bound| if (bound.apple_continuation) |owner| owner.deinit();
     capture.decoder.record(.portable);
     var options = webmDecodeOptions(reader.input.control, capture.pool);
     options.replay_budget = budget;
@@ -3689,6 +3696,7 @@ const Capture = struct {
     native_limit: usize = 1,
     claimed: [128]bool = @splat(false),
     apple_published: usize = 0,
+    webm_portable: ?*video.webm_pictures.Continuation = null,
     last_prepared: bool = false,
     observed: [32]bool = @splat(false),
     fn recordCohort(self: *Capture, jobs: anytype) void {
@@ -6609,7 +6617,7 @@ test "embeddinggemma2 video ordered cohort publishes headers before waiting for 
     // polling deadline. Wake storage outlives every joined producer.
     try Ready.wait(first, &first_wake, 9);
     var next = configuration;
-    next.predecessor = first;
+    next.decoder_dependencies[0] = first;
     second = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, next);
     var header: [1]Prefetch.Job = undefined;
     try Ready.wait(second.?, &second_wake, 1);
@@ -6762,7 +6770,7 @@ test "embeddinggemma2 video admission follows pinned prepared raw and decoder pa
     // remains unfinished. A deadline makes regressions fail instead of hang.
     var predecessor = Prefetch{ .a = a, .io = std.testing.io, .bytes = &.{}, .control = .{}, .sampling = .reference, .pool = null, .device = null };
     var producer = predecessor;
-    producer.predecessor = &predecessor;
+    producer.decoder_dependencies[0] = &predecessor;
     producer.control.deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
     producer.queue = .init(&producer.storage);
     var counts = [_]usize{0};
@@ -6841,7 +6849,7 @@ test "embeddinggemma2 video decoder dependency uses continuation identity and wa
     try std.testing.expect(!sharesDecoder(null, null, null, null));
     var predecessor = Prefetch{ .a = std.testing.allocator, .io = std.testing.io, .bytes = &.{}, .control = .{}, .sampling = .reference, .pool = null, .device = null };
     var waiter = predecessor;
-    waiter.predecessor = &predecessor;
+    waiter.decoder_dependencies[0] = &predecessor;
     waiter.aborted.store(true, .release);
     try std.testing.expectError(error.Cancelled, waiter.waitForDecoder());
     waiter.aborted.store(false, .release);

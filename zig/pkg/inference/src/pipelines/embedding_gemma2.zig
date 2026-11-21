@@ -259,7 +259,9 @@ pub const VideoAhead = struct {
         const io = control.io orelse context.io orelse return null;
         const a = workspaceBackingAllocator(session.backend());
         const available = request_pool.limits.host_bytes -| request_pool.snapshot().host_bytes;
-        const host: usize = @intCast(@min(256 * 1024 * 1024, available));
+        const clip_owned_webm_decoder = if (movie.webm) |webm| webm.continuation != null and webm.reader.input.admission_pool == request_pool else false;
+        const inspection_limit: usize = if (clip_owned_webm_decoder) 64 * 1024 * 1024 else 256 * 1024 * 1024;
+        const host: usize = @intCast(@min(inspection_limit, available));
         if (host < 32 * 1024 * 1024) return null;
         const pins = try a.create(@import("embedding_gemma2_video.zig").CachePins);
         pins.* = .{ .cache = cache };
@@ -285,7 +287,12 @@ pub const VideoAhead = struct {
             try inspection_scope.retainPreflight(&preflight);
             break :blk plan;
         };
-        const runtime_host = try plan.hostBytes();
+        // Reader-backed portable replay funds codec state from the clip pool.
+        // The speculative window owns only preprocessing and Apple outputs.
+        const runtime_host = if (clip_owned_webm_decoder)
+            try std.math.add(usize, try plan.otherHostBytes(), plan.webm_apple_host_bytes)
+        else
+            try plan.hostBytes();
         try request_reservation.resize(.{ .host_bytes = try std.math.add(usize, runtime_host, inspection_scope.retainedBytes()) });
         inspection_allocator.limit = inspection_allocator.live;
         const device = if (session.backend() == .metal) try plan.deviceBytes() else 0;
@@ -1208,6 +1215,28 @@ fn releaseVideoBatchPreparations(items: []const VideoBatchItem, producers: []con
         if (item.ahead) |ahead| ahead.release() else if (index < producers.len) producers[index].deinit();
     }
 }
+fn concurrentDecoderHostBytes(dependencies: [4]u4, bytes: [4]usize) !usize {
+    // At most four rows. A simultaneous set cannot contain a row and one
+    // of its ancestors. Enumerate those sets, including branches and joins.
+    var peak: usize = 0;
+    for (1..16) |candidate| {
+        const set: u4 = @intCast(candidate);
+        var total: usize = 0;
+        for (dependencies, bytes, 0..) |ancestors, row_bytes, row| {
+            if (set & (@as(u4, 1) << @intCast(row)) == 0) continue;
+            if (set & ancestors != 0) break;
+            total = try std.math.add(usize, total, row_bytes);
+        } else peak = @max(peak, total);
+    }
+    return peak;
+}
+
+test "embeddinggemma2 video decoder dependency budgets branches and joins" {
+    try std.testing.expectEqual(@as(usize, 8), try concurrentDecoderHostBytes(.{ 0, 1, 1, 7 }, .{ 5, 4, 4, 6 }));
+    try std.testing.expectEqual(@as(usize, 9), try concurrentDecoderHostBytes(.{ 0, 0, 3, 7 }, .{ 5, 4, 4, 6 }));
+    try std.testing.expectEqual(@as(usize, 6), try concurrentDecoderHostBytes(.{ 0, 1, 3, 7 }, .{ 5, 4, 4, 6 }));
+}
+
 pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, items: []const VideoBatchItem, input_options: Options, lock: ?*std.atomic.Mutex, control: Control, cache: ?*FrameCache) !VideoBatchResult {
     var pins = @import("embedding_gemma2_video.zig").CachePins{ .cache = cache };
     defer pins.deinit();
@@ -1248,9 +1277,8 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     // A running later row must not retain the decoder lease during fallback.
     errdefer if (cohort) releaseVideoBatchPreparations(items, &.{});
     const video_model = @import("embedding_gemma2_video.zig");
-    var predecessors: [4]?usize = @splat(null);
-    var decoder_chain: [4]usize = undefined;
-    var decoder_host_peaks: [4]usize = @splat(0);
+    var dependencies: [4]u4 = @splat(0);
+    var decoder_host_bytes: [4]usize = @splat(0);
     var parts: [4][2]Part = undefined;
     var groups: [4]Group = undefined;
     for (items, 0..) |item, index| {
@@ -1261,18 +1289,12 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     for (items, 0..) |item, index| {
         const movie = item.movie;
         try control.check();
-        if (cohort and item.ahead == null) {
-            var previous = index;
-            while (previous != 0) {
-                previous -= 1;
-                const candidate = items[previous].movie;
-                if (video_model.sharesDecoder(movie.selection, movie.webm, candidate.selection, candidate.webm)) {
-                    predecessors[index] = previous;
-                    break;
-                }
-            }
-        }
-        decoder_chain[index] = if (predecessors[index]) |previous| decoder_chain[previous] else index;
+        if (cohort) for (items[0..index], 0..) |candidate, previous| {
+            if (!video_model.sharesDecoder(movie.selection, movie.webm, candidate.movie.selection, candidate.movie.webm)) continue;
+            // A producer already running cannot be retrofitted with a wait.
+            if (item.ahead != null) return error.BatchIncompatible;
+            dependencies[index] |= (@as(u4, 1) << @intCast(previous)) | dependencies[previous];
+        };
         if (item.ahead) |ahead| if (ahead.released or !ahead.matches(movie, options.video_decoder, session, cache)) return error.InvalidVideoReaderSelection;
         const plan = if (item.ahead) |ahead| ahead.plan else if (item.plan) |plan| try @import("embedding_gemma2_video.zig").pinCachedPlan(plan.*, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins }) else try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope }, session.backend() == .metal);
         // UTF-8 byte length bounds caption token count conservatively; exact
@@ -1289,13 +1311,12 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
                 // Queued work can coexist. Decoder scratch is reused only
                 // across producers ordered by the same dependency chain.
                 host = try std.math.add(usize, host, try plan.otherHostBytes());
-                const peak = &decoder_host_peaks[decoder_chain[index]];
-                peak.* = @max(peak.*, plan.decoderHostBytes());
+                decoder_host_bytes[index] = plan.decoderHostBytes();
             } else host = @max(host, try plan.hostBytes());
         }
         vision_workspace = @max(vision_workspace, plan.vision_workspace_bytes);
     }
-    for (decoder_host_peaks) |peak| host = try std.math.add(usize, host, peak);
+    host = try std.math.add(usize, host, try concurrentDecoderHostBytes(dependencies, decoder_host_bytes));
     // Avoid padding-heavy cohorts. The runner falls back to independent calls.
     const compact_policy = encoder.compactRowsEnabled(session.backend() == .metal);
     if (compact_policy) {
@@ -1338,8 +1359,11 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         };
         for (items, 0..) |item, index| {
             const movie = item.movie;
-            const predecessor = if (predecessors[index]) |previous| producers[previous] else null;
-            producers[index] = if (item.ahead) |ahead| ahead.producer.? else try video_model.Prefetch.startConfigured(a, cohort_io.?, context.device, movie.bytes, movie.reader, control, .{ .predecessor = predecessor, .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins, .inspection_scope = &inspection_scope, .pool = &pool, .cache = cache, .coefficients = context.coefficients });
+            var waits: video_model.DecoderDependencies = @splat(null);
+            for (producers[0..index], 0..) |producer, previous| {
+                if (dependencies[index] & (@as(u4, 1) << @intCast(previous)) != 0) waits[previous] = producer;
+            }
+            producers[index] = if (item.ahead) |ahead| ahead.producer.? else try video_model.Prefetch.startConfigured(a, cohort_io.?, context.device, movie.bytes, movie.reader, control, .{ .decoder_dependencies = waits, .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins, .inspection_scope = &inspection_scope, .pool = &pool, .cache = cache, .coefficients = context.coefficients });
             producer_count += 1;
         }
     }

@@ -1171,9 +1171,6 @@ pub const Runner = struct {
             for (payloads[0..count], 0..) |*payload, i| payload.* = slots[(active + i) % slots.len].payload;
             const outputs: ?[]Output = if (count > 1) self.executor.embed_video_batch.?(self.executor.context, self.allocator, payloads[0..count]) catch |err| blk: {
                 if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err) and err != error.BatchIncompatible and (!self.request.allow_partial or abort(err))) return err;
-                // Compatibility rejection precedes projection and leaves
-                // the current producer usable by independent execution.
-                if (err == error.BatchIncompatible) break :blk null;
                 schedule.join();
                 // A following producer cannot remain active while an earlier
                 // dependency span is replayed against the shared source/codec.

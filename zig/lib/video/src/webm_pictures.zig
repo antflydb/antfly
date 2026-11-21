@@ -419,7 +419,13 @@ pub const Continuation = struct {
         config.admission_pool = self.reader.input.admission_pool;
         config.control = .{};
         if (self.configured) |previous| if (!std.meta.eql(previous, config)) return error.InvalidDecodeOptions;
-        if (first < self.logical) return walkIndexed(self.allocator, self.reader, options, indexed, selected, context, accept);
+        if (first < self.logical) {
+            if (config.admission_pool == null)
+                return walkIndexed(self.allocator, self.reader, options, indexed, selected, context, accept);
+            // A budgeted clip owns one portable reference bank. Rewind that
+            // bank before replay so overlapping windows cannot duplicate it.
+            self.deinit();
+        }
         var restart = Restart{ .packet = self.packet, .logical = self.logical };
         var warm = self.vp8_session != null or self.session != null;
         if (warm) if (options.replay_budget) |budget| {

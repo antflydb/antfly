@@ -43,6 +43,7 @@ pub const ReferenceAdmission = struct {
 pub const Receipt = struct { hardware: bool, submitted_packets: usize };
 pub const Sink = struct {
     context: *anyopaque,
+    before_decode: ?*const fn (*anyopaque) void = null,
     accept: *const fn (*anyopaque, usize, *const apple.Surface, pictures.Picture) anyerror!void,
 };
 pub const Configuration = struct { bytes: [12]u8 = @splat(0), len: usize, format: apple.Format };
@@ -321,6 +322,7 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     const seen = try a.alloc(bool, selected.len);
     defer a.free(seen);
     @memset(seen, false);
+    if (sink.before_decode) |before| before(sink.context);
     if (retained_owner != null and !warm) if (options.reference_admission) |admission| {
         try admission.acquire(admission.context, try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth));
     };
