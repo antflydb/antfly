@@ -10538,7 +10538,7 @@ test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-docstore-empty-scope-barrier.aflite");
     defer allocator.free(path);
-    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = false, .io = std.testing.io });
     defer store.close();
     store.ride_along_idle_ns = 10 * std.time.ns_per_s;
 
@@ -10551,7 +10551,8 @@ test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
         try store.file.deleteIndexCatalogRecord(key);
         try store.file.commitTransactionWithDurability(false, null);
     }
-    const pending = store.file.committedSequence();
+    const pending = store.file.activeCheckpoint().commit_sequence;
+    try std.testing.expectEqual(native.NativeFile.IndexScopeDeletion.empty, try store.file.planIndexScopeDeletion(prefix, "/directory", 0));
     try std.testing.expect(store.file.durableSequence() < pending);
 
     try store.submitIndexTreeDeletion(prefix, "/directory");
