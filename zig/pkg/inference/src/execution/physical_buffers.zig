@@ -905,6 +905,15 @@ pub const Pool = struct {
         if (self.selection == null or node >= self.kernels.len or self.kernels[node] == null or self.plan.slotForNode(node) == null) return .{ .node = node, .allocation = buffers.invalid_allocation, .epoch = if (self.selection) |selected| selected.epoch else 0, .logical = .{}, .writable_bytes = 0 };
         return self.selection.?.output(self, node, bytes);
     }
+    /// Attest the retained bank used by admission and actual dispatch.
+    pub fn workspaceBank(self: *const Pool, backend_index: usize, bytes: usize, alignment: u32) ?buffers.AllocationId {
+        if (bytes == 0 or bytes % @sizeOf(f32) != 0 or backend_index >= self.workspace_allocations.len or backend_index >= self.backends.len) return null;
+        const id = self.workspace_allocations[backend_index];
+        const bank = self.plan.allocationById(id) orelse return null;
+        if (bank.id != id or bank.kind != .workspace or bank.storage == .host_dense or bank.backend != self.backends[backend_index].kind() or bank.byte_size < bytes or bank.alignment < alignment) return null;
+        return id;
+    }
+
     pub fn allocationForNode(self: *const Pool, node: NodeId) ?buffers.AllocationId {
         const slot = self.plan.slotForNode(node) orelse return null;
         return if (self.plan.allocationForSlot(slot.id)) |allocation| allocation.id else null;
@@ -2930,7 +2939,12 @@ pub const Frame = struct {
             result.slots[index] = output.slot;
         }
         if (installed.host_workspace_bytes > self.host_workspace.len) return error.PreparedRegionWorkspaceMismatch;
-        if (installed.workspace_bytes != 0 and (installed.workspace_allocation == buffers.invalid_allocation or installed.workspace_allocation >= self.pool.plan.allocations.len or installed.workspace_bytes % @sizeOf(f32) != 0 or installed.workspace_bytes > self.pool.plan.allocations[installed.workspace_allocation].byte_size)) return error.PreparedRegionWorkspaceMismatch;
+        if (installed.workspace_bytes != 0) {
+            const requirements = installed.owner.requirements;
+            const alignment = @max(requirements.dispatch_workspace.alignment, requirements.preparation_workspace.alignment);
+            const workspace = self.pool.workspaceBank(installed.backend_index, installed.workspace_bytes, alignment) orelse return error.PreparedRegionWorkspaceMismatch;
+            if (workspace != installed.workspace_allocation) return error.PreparedRegionWorkspaceMismatch;
+        }
         // No backing allocation, metadata CT, command encoder or driver call may
         // happen until all selected semantic/input/output facts have validated.
         try installed.owner.validate(.{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .policy_key = policy_key, .inputs = facts, .outputs = result.slots[0..installed.outputs.len], .payload_claim = if (self.region_claims[region_index]) |*claim| claim else null });
@@ -2947,7 +2961,6 @@ pub const Frame = struct {
             result.output_count += 1;
         }
         if (installed.workspace_bytes != 0) {
-            if (installed.workspace_allocation == buffers.invalid_allocation or installed.workspace_bytes % @sizeOf(f32) != 0) return error.PreparedRegionWorkspaceMismatch;
             const lease = (try self.storageFor(cb, installed.backend_index, installed.workspace_allocation)) orelse return error.PreparedRegionStorageUnavailable;
             // Scratch owns a real Frame allocation slot, independently of any
             // logical graph output. Bind its canonical full-bank provenance at
@@ -4274,17 +4287,17 @@ fn regionOnlyDeclaredStorageCase(a: std.mem.Allocator, covered_primitive: bool) 
         .{ .slot = .{ .node = 2, .allocation = 1, .epoch = 42, .logical = shape, .writable_bytes = 16 } },
     };
     const regions = [_]binding.Installed{.{ .owner = &owner, .key = 7, .backend_index = 0, .epoch = 42, .outputs = &outputs, .workspace_allocation = 2, .workspace_bytes = 24, .host_workspace_bytes = 32 }};
-    const allocations = [_]buffers.PhysicalAllocation{
+    var allocations = [_]buffers.PhysicalAllocation{
         .{ .id = 0, .kind = .tensor, .backend = .native, .storage = .host_f32, .byte_size = 16, .first_use = 0, .last_use = 2, .reusable = true },
         .{ .id = 1, .kind = .tensor, .backend = .native, .storage = .host_f32, .byte_size = 16, .first_use = 0, .last_use = 2, .reusable = true },
-        .{ .id = 2, .kind = .workspace, .backend = .native, .storage = .host_dense, .byte_size = 24, .first_use = 0, .last_use = 2, .reusable = true },
+        .{ .id = 2, .kind = .workspace, .backend = .native, .storage = .host_f32, .byte_size = 24, .alignment = 4, .first_use = 0, .last_use = 2, .reusable = true },
         .{ .id = 3, .kind = .workspace, .backend = .native, .storage = .host_dense, .byte_size = 32, .first_use = 0, .last_use = 2, .reusable = true },
     };
     const descriptor = kernels.Descriptor{ .operation = .{ .unary = .negate }, .output_shape = shape, .input_shapes = .{ shape, undefined, undefined }, .input_count = 1 };
     const primitive = [_]?KernelPlan{.{ .descriptor = descriptor, .inputs = @splat(ml.graph.null_node), .backend_index = 0, .output_allocation = 1, .workspace_bytes = 24 }};
     const backends = [_]ops.ComputeBackend{cb};
     const workspaces = [_]buffers.AllocationId{2};
-    var pool = Pool{ .allocator = a, .regions = @constCast(&regions), .plan = .{ .allocator = a, .slots = &.{}, .node_slots = &.{}, .node_positions = &.{}, .allocations = @constCast(&allocations), .transfers = &.{}, .transfer_index = .empty }, .kernels = if (covered_primitive) @constCast(&primitive) else &.{}, .transfers = &.{}, .backends = @constCast(&backends), .workspace_allocations = @constCast(&workspaces), .host_workspace_allocation = 3 };
+    var pool = Pool{ .allocator = a, .regions = @constCast(&regions), .plan = .{ .allocator = a, .slots = &.{}, .node_slots = &.{}, .node_positions = &.{}, .allocations = &allocations, .transfers = &.{}, .transfer_index = .empty }, .kernels = if (covered_primitive) @constCast(&primitive) else &.{}, .transfers = &.{}, .backends = @constCast(&backends), .workspace_allocations = @constCast(&workspaces), .host_workspace_allocation = 3 };
     const total = try pool.storageRequirement();
     defer a.free(pool.storage_requirement_bounds);
     try std.testing.expectEqual(@as(usize, 88), total.host_scratch_bytes);
@@ -4319,6 +4332,9 @@ fn regionOnlyDeclaredStorageCase(a: std.mem.Allocator, covered_primitive: bool) 
     const current = @import("cleanup_context.zig").Context{ .boundary = &epoch };
     const frame = try Frame.createWithAdmission(&pool, prepared.forDispatch(identity));
     defer frame.deinitWithCleanup(current);
+    allocations[2].alignment = 2;
+    try std.testing.expectError(error.PreparedRegionWorkspaceMismatch, frame.acquireRegionOutputs(&cb, &regions[0], &.{}, 11));
+    allocations[2].alignment = 4;
     var bound = try frame.acquireRegionOutputs(&cb, &regions[0], &.{}, 11);
     var bound_live = true;
     defer if (bound_live) bound.deinit();

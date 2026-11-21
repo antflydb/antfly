@@ -1847,7 +1847,7 @@ pub const MetalPartitionExecutor = struct {
         const synchronous_regions = usesSynchronousPhysicalRegions(options);
         const chunk_ops = frameChunkOpsForExecution(exec_ctx.options);
         const planned_primitives = if (exec_ctx.options) |opts| opts.planned_device_execution else false;
-        const owned_frame = if (exec_ctx.options) |options| if (options.physical_frame) |frame| frame.pool.completeOwnedPayload() != null and frame.pool.metal_frame_dispatch else false else false;
+        const owned_frame = if (options.physical_frame) |frame| frame.pool.completeOwnedPayload() != null and frame.pool.metal_frame_dispatch else false;
         if (owned_frame and !ownedFramePolicyAvailable()) return error.PreparedMetalFramePolicyChanged;
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         if (!owned_frame and !synchronous_regions and (reservePartitionGraphPlanForExecution(chunk_ops) or
