@@ -471,14 +471,13 @@ test "video resumed pages share content-verified restart candidates" {
     defer reader.deinit();
     var candidates: std.ArrayList(video.decode_plan.SeekCache.Candidate) = .empty;
     defer candidates.deinit(a);
-    for (reader.packets, 0..) |packet, i| if (packet.sync) {
-        try candidates.append(a, .{ .packet = i });
-    };
+    // Some containers advertise every sample as a sync candidate.
+    for (0..reader.packets.len) |i| try candidates.append(a, .{ .packet = i });
     for (0..2) |page| {
         var cache = video.decode_plan.SeekCache.forPage(a, &reader, &.{});
         cache.candidates = candidates.items;
         const before = src.reads;
-        var plan = try video.decode_plan.create(a, &reader, &.{19}, .{ .seek_cache = &cache, .headers_only = true, .portable_config = true });
+        var plan = try video.decode_plan.create(a, &reader, &.{19}, .{ .seek_cache = &cache, .headers_only = true, .portable_config = true, .max_search_steps = if (page == 0) 100 else 1 });
         defer plan.deinit();
         if (page == 0) try std.testing.expect(src.reads > before) else try std.testing.expectEqual(before, src.reads);
     }

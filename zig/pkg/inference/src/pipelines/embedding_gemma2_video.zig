@@ -184,7 +184,7 @@ pub const Inspection = struct {
     configuration: Configuration,
     reader: media.mp4.Reader = undefined,
     packet_input: ?PacketInput = null,
-    borrowed_hevc_config: ?[]u8 = null,
+    borrowed_hevc_config: BorrowedHevc = .{},
     webm_reader: media.webm.Reader = undefined,
     webm_index: ?video.webm_pictures.Index = null,
     webm: bool = false,
@@ -221,7 +221,7 @@ pub const Inspection = struct {
             self.source = source.view(self.source.allocator, self.source.admission_pool, self.source.control);
         } else try validateInputSize(bytes.len, configuration.sampling);
         self.validated_bytes = if (borrowed) |reader| try sampledPacketBytes(reader, configuration.sampling) else bytes;
-        const opened = if (configuration.webm == null and borrowed == null) try ContainerInput.openMode(a, &self.source, bytes, isWebm(bytes), configuration.sampling, video.mp4_coded.limits, .{}, true) else null;
+        const opened = if (configuration.webm == null and borrowed == null) try ContainerInput.openMode(a, &self.source, bytes, isWebm(bytes), configuration.sampling, video.mp4_coded.limits, .{}, true, null) else null;
         self.webm = configuration.webm != null or (opened != null and opened.? == .webm);
         if (self.webm) {
             self.webm_reader = if (configuration.webm) |input| input.reader.* else opened.?.webm;
@@ -285,7 +285,7 @@ pub const Inspection = struct {
         if (self.owns_webm_index) self.webm_index.?.deinit();
         if (self.owns_webm_reader) self.webm_reader.deinit();
         if (self.packet_input) |*input| input.deinit();
-        if (self.borrowed_hevc_config) |bytes| a.free(bytes);
+        self.borrowed_hevc_config.deinit(a);
         std.debug.assert(self.bounded.live == 0);
         std.debug.assert(std.meta.eql(self.pool.snapshot(), media.admission.Resources{}));
         self.backing.destroy(self);
@@ -829,14 +829,21 @@ pub const ContainerInput = union(enum) {
     }
 
     pub fn openLimited(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8, webm: bool, sampling: Sampling, mp4_limits: media.mp4.Limits, webm_limits: media.webm.Limits) !ContainerInput {
-        return openMode(a, source, bytes, webm, sampling, mp4_limits, webm_limits, false);
+        return openMode(a, source, bytes, webm, sampling, mp4_limits, webm_limits, false, null);
     }
 
-    fn openMode(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8, webm: bool, sampling: Sampling, mp4_limits: media.mp4.Limits, webm_limits: media.webm.Limits, planning_headers: bool) !ContainerInput {
+    fn openMode(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8, webm: bool, sampling: Sampling, mp4_limits: media.mp4.Limits, webm_limits: media.webm.Limits, planning_headers: bool, original: ?*?media.mp4.Reader) !ContainerInput {
         if (webm) return .{ .webm = try media.webm.Reader.init(a, source, webm_limits) };
         var packet = try PacketInput.initSampled(a, source, bytes, sampling, mp4_limits, planning_headers);
         errdefer packet.deinit();
-        if (packet.reader.track.codec == .av1) return .{ .webm = try video.mp4_coded.intoWebm(a, &packet.reader) };
+        if (packet.reader.track.codec == .av1) {
+            if (original) |slot| {
+                const adapted = try video.mp4_coded.borrowWebm(a, &packet.reader);
+                slot.* = packet.reader;
+                return .{ .webm = adapted };
+            }
+            return .{ .webm = try video.mp4_coded.intoWebm(a, &packet.reader) };
+        }
         return .{ .packets = packet };
     }
 
@@ -863,8 +870,23 @@ test "gemma4 video container routing checks cancellation while scanning top-leve
     try std.testing.expect(source.reads < 8);
 }
 
-fn normalizeHevc(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
-    return video.hevc_config.normalizeReader(a, reader) catch |err| return hevcInputError(err);
+const BorrowedHevc = struct {
+    packets: ?[]media.mp4.Packet = null,
+    config: ?[]u8 = null,
+    fn deinit(self: BorrowedHevc, a: std.mem.Allocator) void {
+        if (self.config) |bytes| a.free(bytes);
+        if (self.packets) |packets| a.free(packets);
+    }
+};
+fn normalizeHevc(a: std.mem.Allocator, reader: *media.mp4.Reader) !BorrowedHevc {
+    if (reader.track.codec != .hevc or reader.track.hevc_sync_validated) return .{};
+    const packets = try a.dupe(media.mp4.Packet, reader.packets);
+    errdefer a.free(packets);
+    var normalized = reader.*;
+    normalized.packets = packets;
+    const config = video.hevc_config.normalizeOwnedReader(a, &normalized) catch |err| return hevcInputError(err);
+    reader.* = normalized;
+    return .{ .packets = packets, .config = config };
 }
 
 fn hevcInputError(err: anyerror) anyerror {
@@ -987,12 +1009,26 @@ pub const PixelInspection = struct {
     pub const limit = 512 * 1024 * 1024;
     memory: @import("../runtime/bounded_allocator.zig").BoundedAllocator = .{ .backing = std.heap.page_allocator, .limit = limit },
     prepared: ?@import("../ops/cuda/video.zig").PreparedEmbedding = null,
+    original_av1: ?media.mp4.Reader = null,
+    portable_source: media.source.Source = undefined,
+    portable_pool: media.admission.Pool = .{ .limits = .{ .host_bytes = limit } },
+    adapted: ?struct {
+        reader: media.webm.Reader,
+        index: video.webm_pictures.Index,
+        selection: @import("../ops/cuda/video.zig").Av1ReferencePlan,
+    } = null,
     cuda_error: ?anyerror = null,
     bytes: []const u8 = &.{},
     pixels: u64 = 0,
 
     pub fn deinit(self: *PixelInspection) void {
+        if (self.adapted) |*owner| {
+            owner.index.deinit();
+            owner.reader.deinit();
+        }
         if (self.prepared) |*prepared| prepared.deinit();
+        if (self.original_av1) |*reader| reader.deinit();
+        std.debug.assert(std.meta.eql(self.portable_pool.snapshot(), media.admission.Resources{}));
         std.debug.assert(self.memory.live == 0);
         self.* = .{};
     }
@@ -1000,9 +1036,8 @@ pub const PixelInspection = struct {
     pub fn inspect(self: *PixelInspection, bytes: []const u8, control: Control, sampling: Sampling) !u64 {
         std.debug.assert(self.prepared == null and self.bytes.len == 0);
         self.bytes = bytes;
-        var pool = media.admission.Pool{ .limits = .{ .host_bytes = limit } };
-        defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
-        const portable = inspectPlan(self.memory.allocator(), bytes, control, sampling, &pool, false);
+        const portable = inspectPlanShared(self.memory.allocator(), bytes, control, sampling, &self.portable_pool, false, self);
+        self.portable_source.control = .{};
         var missing_portable = false;
         const pixels = if (portable) |plan| plan.pixels else |err| blk: {
             if (err != error.UnsupportedVideoCodec or sampling != .reference)
@@ -1014,7 +1049,8 @@ pub const PixelInspection = struct {
         if (sampling != .reference) return pixels;
         const adapter = control.imageWorkControl();
         self.prepared = @as(@import("../ops/cuda/video.zig").PreparedEmbedding, undefined);
-        self.prepared.?.init(self.memory.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch |err| {
+        const shared = if (self.adapted) |*av1| &av1.selection else null;
+        self.prepared.?.initWithSharedPlan(self.memory.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn }, shared) catch |err| {
             self.prepared = null;
             self.cuda_error = err;
             try control.check();
@@ -1044,6 +1080,10 @@ test "embeddinggemma2 video pixel admission retains the execution packet reader"
     try std.testing.expect(inspection.matches(bytes));
     try std.testing.expect(!inspection.matches(bytes[1..]));
     try std.testing.expect(prepared.reader.input == &prepared.source);
+    try std.testing.expect(!prepared.owns_reader);
+    try std.testing.expect(prepared.reader.packets.ptr == inspection.original_av1.?.packets.ptr);
+    try std.testing.expect(inspection.adapted.?.index.reader == &inspection.adapted.?.reader);
+    try std.testing.expectEqual(@as(usize, 0), prepared.source.reads);
     try std.testing.expect(inspection.memory.live >= std.mem.sliceAsBytes(prepared.reader.packets).len);
     try std.testing.expectEqual(@as(u64, prepared.inspection.frames) * prepared.inspection.width * prepared.inspection.height, pixels);
 }
@@ -1255,7 +1295,7 @@ pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const med
     var reader = borrowed.*;
     reader.input = &source;
     const normalized = try normalizeHevc(a, &reader);
-    defer if (normalized) |config_bytes| a.free(config_bytes);
+    defer normalized.deinit(a);
     return inspectPacketPlan(a, &reader, control, sampling, metal, selection);
 }
 pub fn inspectConfiguredPlan(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration, metal: bool) !Plan {
@@ -1352,16 +1392,41 @@ fn inspectSelectedWebmPlan(reader: *const media.webm.Reader, index: video.webm_p
     return plan;
 }
 pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool) !Plan {
+    return inspectPlanShared(a, bytes, control, sampling, pool, metal, null);
+}
+fn inspectPlanShared(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool, owner: ?*PixelInspection) !Plan {
     try validateInputSize(bytes.len, sampling);
     const adapter = control.imageWorkControl();
-    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
-    var opened = try ContainerInput.open(a, &source, bytes, sampling);
-    defer opened.deinit();
+    var local: media.source.Source = undefined;
+    const source = if (owner) |o| &o.portable_source else &local;
+    source.* = .{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
+    const original = if (owner != null and sampling == .reference) &owner.?.original_av1 else null;
+    var opened = try ContainerInput.openMode(a, source, bytes, isWebm(bytes), sampling, video.mp4_coded.limits, .{}, false, original);
+    var adopted = false;
+    defer if (!adopted) opened.deinit();
     if (opened == .webm) {
         const reader = &opened.webm;
         var index = try video.webm_pictures.index(a, reader, webmDecodeOptions(source.control, pool));
-        defer index.deinit();
-        return inspectWebmPlan(a, reader, index, sampling, metal, null);
+        defer if (!adopted) index.deinit();
+        const selected = try selectWebm(a, index, sampling, source.control, null);
+        defer a.free(selected);
+        const plan = try inspectSelectedWebmPlan(reader, index, metal, selected);
+        if (owner) |cached| if (cached.original_av1 != null) {
+            var display = @import("../ops/cuda/video.zig").DisplayPlan{ .visible_count = index.pictures.len };
+            display.pictures.len = selected.len;
+            for (selected, 0..) |ordinal, i| {
+                display.visible_ordinals[i] = ordinal;
+                display.pictures.packet_ids[i] = index.pictures[ordinal].packet_index orelse return error.InvalidVideoIndex;
+            }
+            cached.adapted = .{
+                .reader = reader.*,
+                .index = index,
+                .selection = .{ .original = &cached.original_av1.?, .frame_units = index.frame_units, .largest_picture = index.largest_picture, .plan = display },
+            };
+            cached.adapted.?.index.reader = &cached.adapted.?.reader;
+            adopted = true;
+        };
+        return plan;
     }
     const input = &opened.packets;
     return inspectPacketPlan(a, &input.reader, control, sampling, metal, null);
@@ -1695,8 +1760,8 @@ pub const Prefetch = struct {
         } else {
             reader = opened.?.packets.reader;
         }
-        const normalized_hevc = if (webm) null else try normalizeHevc(a, &reader);
-        defer if (normalized_hevc) |bytes_owned| a.free(bytes_owned);
+        const normalized_hevc: BorrowedHevc = if (webm) .{} else try normalizeHevc(a, &reader);
+        defer normalized_hevc.deinit(a);
         var webm_index: ?video.webm_pictures.Index = if (inspection) |owner| owner.webm_index else if (self.webm_input) |input| input.index.* else if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
         if (webm_index) |*index| index.reader = &webm_reader;
         defer if (inspection == null and self.webm_input == null) {
@@ -2196,8 +2261,8 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     } else {
         reader = opened.?.packets.reader;
     }
-    const normalized_hevc = if (webm) null else try normalizeHevc(a, &reader);
-    defer if (normalized_hevc) |bytes_owned| a.free(bytes_owned);
+    const normalized_hevc: BorrowedHevc = if (webm) .{} else try normalizeHevc(a, &reader);
+    defer normalized_hevc.deinit(a);
     var webm_index: ?video.webm_pictures.Index = if (inspection) |owner| owner.webm_index else if (webm_input) |input| input.index.* else if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
     if (webm_index) |*index| index.reader = &webm_reader;
     defer if (inspection == null and webm_input == null) {

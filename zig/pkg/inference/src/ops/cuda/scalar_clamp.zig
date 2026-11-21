@@ -21,6 +21,7 @@ pub const Kernel = struct {
     module: driver.CUmodule = null,
     function: driver.CUfunction = null,
     widen: driver.CUfunction = null,
+    split: driver.CUfunction = null,
 
     pub fn deinit(self: *Kernel, ctx: *context.CudaContext) void {
         if (self.module != null) {
@@ -40,8 +41,22 @@ pub const Kernel = struct {
             try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, "scalar_clamp"));
             var widen: driver.CUfunction = null;
             try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&widen, module, "widen_16bit"));
-            self.* = .{ .module = module, .function = function, .widen = widen };
+            var split: driver.CUfunction = null;
+            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&split, module, "split_bf16_terms"));
+            self.* = .{ .module = module, .function = function, .widen = widen, .split = split };
         }
+    }
+
+    pub fn splitBf16(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, outputs: [3]driver.CUdeviceptr, count: usize) !void {
+        if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        if (count == 0) return;
+        try self.init(ctx);
+        var src = input;
+        var planes = outputs;
+        var n: u32 = @intCast(count);
+        var args = [_]?*anyopaque{ &src, &planes[0], &planes[1], &planes[2], &n };
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.split, @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        ctx.noteKernelLaunch();
     }
 
     pub fn widen16Bit(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, output: driver.CUdeviceptr, count: usize, bf16: bool) !void {

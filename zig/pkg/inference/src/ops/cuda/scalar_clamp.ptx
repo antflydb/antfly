@@ -71,3 +71,58 @@ done:
 done:
     ret;
 }
+
+// Split a float into non-overlapping BF16 terms toward zero. Finite terms
+// cannot overflow, even at FLT_MAX. The optional third term carries the tail.
+.visible .entry split_bf16_terms(.param .u64 input, .param .u64 high,
+    .param .u64 low, .param .u64 tail, .param .u32 count) {
+    .reg .pred p;
+    .reg .b32 i, block, size, tid, n, bits, wide;
+    .reg .b64 src, hi, lo, last, offset;
+    .reg .b16 part;
+    .reg .f32 value, rounded;
+    ld.param.u64 src, [input];
+    ld.param.u64 hi, [high];
+    ld.param.u64 lo, [low];
+    ld.param.u64 last, [tail];
+    ld.param.u32 n, [count];
+    mov.u32 block, %ctaid.x;
+    mov.u32 size, %ntid.x;
+    mov.u32 tid, %tid.x;
+    mad.lo.u32 i, block, size, tid;
+    setp.ge.u32 p, i, n;
+    @p bra done;
+    mul.wide.u32 offset, i, 4;
+    add.u64 src, src, offset;
+    ld.global.f32 value, [src];
+    mul.wide.u32 offset, i, 2;
+    add.u64 hi, hi, offset;
+    add.u64 lo, lo, offset;
+    mov.b32 bits, value;
+    and.b32 wide, bits, 0xffff0000;
+    shr.u32 bits, bits, 16;
+    cvt.u16.u32 part, bits;
+    setp.nan.f32 p, value, value;
+    @p mov.b16 part, 0x7fc0;
+    st.global.b16 [hi], part;
+    mov.b32 rounded, wide;
+    sub.rn.f32 value, value, rounded;
+    testp.finite.f32 p, rounded;
+    @!p mov.f32 value, 0f00000000;
+    mov.b32 bits, value;
+    and.b32 wide, bits, 0xffff0000;
+    shr.u32 bits, bits, 16;
+    cvt.u16.u32 part, bits;
+    st.global.b16 [lo], part;
+    setp.eq.u64 p, last, 0;
+    @p bra done;
+    add.u64 last, last, offset;
+    mov.b32 rounded, wide;
+    sub.rn.f32 value, value, rounded;
+    mov.b32 bits, value;
+    shr.u32 bits, bits, 16;
+    cvt.u16.u32 part, bits;
+    st.global.b16 [last], part;
+done:
+    ret;
+}

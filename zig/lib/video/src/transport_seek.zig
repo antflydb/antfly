@@ -69,6 +69,9 @@ const Extents = struct {
     run: ?usize = null,
 
     fn next(self: *Extents) ?WireSpan {
+        return self.nextSpan(false);
+    }
+    fn nextSpan(self: *Extents, coalesce_headers: bool) ?WireSpan {
         while (self.id <= self.last) {
             const nal = self.map.nals[self.id];
             const base = nal.logical + 4;
@@ -83,21 +86,22 @@ const Extents = struct {
             const k = self.run orelse containing(Run, self.map.runs, "elementary", es);
             const run = self.map.runs[k];
             const rel = es - run.elementary;
-            const n = @min(stop - self.pos, run.len - rel, 184 - rel % 184);
+            const within_run = @min(stop - self.pos, run.len - rel);
+            const n = if (coalesce_headers) within_run else @min(within_run, 184 - rel % 184);
             const wire = run.offset(rel);
             self.pos += n;
             self.run = if (rel + n == run.len) k + 1 else k;
-            return .{ .start = wire, .end = wire + n };
+            return .{ .start = wire, .end = run.offset(rel + n - 1) + 1 };
         }
         return null;
     }
 
-    fn fits(self: Extents, capacity: usize, budget: media.source.Limits, control: media.source.Control) !bool {
+    fn fits(self: Extents, coalesce_headers: bool, capacity: usize, budget: media.source.Limits, control: media.source.Control) !bool {
         if (capacity == 0) return false;
         var iter = self;
         var calls: u64 = 0;
         var bytes: u64 = 0;
-        while (iter.next()) |span| {
+        while (iter.nextSpan(coalesce_headers)) |span| {
             if (calls % 256 == 0) try control.check();
             calls += try std.math.divCeil(u64, span.size(), capacity);
             bytes += span.size();
@@ -378,9 +382,17 @@ pub const View = struct {
                             // Keep regular 184-byte TS strides coalesced. Count
                             // sparse extents before spending bytes on multiplex
                             // gaps, or when even the full wire span cannot fit.
-                            separate = (!whole_span_fits or (wide and (calls_tight or remaining < self.wire.length()))) and try extents.fits(capacity, limits, control);
+                            separate = (!whole_span_fits or (wide and (calls_tight or remaining < self.wire.length()))) and (try extents.fits(true, capacity, limits, control) or try extents.fits(false, capacity, limits, control));
                         }
-                        if (separate.?) break :physical @intCast(@min(capacity, stop - pos, run.len - relative, 184 - relative % 184));
+                        if (separate.?) {
+                            // A run contains only four-byte TS headers between payloads.
+                            // Spend spare bytes on those headers without reading multiplex gaps.
+                            const synthetic = 4 * (final_id - id) -| (final.logical + 4 -| end);
+                            const spare = remaining -| (end - pos - synthetic);
+                            const first_stride = 184 - relative % 184;
+                            const n = @min(stop - pos, run.len - relative, first_stride +| (spare / 4 *| 184));
+                            break :physical @intCast(@min(capacity, run.offset(relative + n - 1) + 1 - wire));
+                        }
                         if (whole_span_fits and limits.max_reads == 1 and final_wire - wire <= capacity) break :physical @intCast(final_wire - wire);
                         // A dense span that fits both budgets can use the
                         // streaming coalescer without allocating a range plan.
@@ -666,6 +678,20 @@ test "seekable transport coalesces prefixes and TS headers under one exact read"
     defer payload.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 9, 0, 0, 0, 1, 10 }, payload.bytes);
     try std.testing.expectEqual(@as(usize, 1), wire.reads);
+}
+
+test "seekable transport coalesces dense strides on both sides of a multiplex gap" {
+    const payload = 184 * 32;
+    var bytes: [32768]u8 = @splat(1);
+    for ([_]usize{ 2, 128 }) |max_reads| {
+        var wire = media.source.Source{ .allocator = std.testing.allocator, .storage = .{ .borrowed = &bytes }, .identity = "strides", .limits = .{ .max_reads = max_reads, .max_total_bytes = 2 * 188 * 32, .max_read_bytes = 8192 } };
+        var view = View{ .wire = &wire, .map = .{ .len = 4 + 2 * payload, .nals = &.{.{ .logical = 0, .elementary = 0, .size = 2 * payload }}, .runs = &.{ .{ .elementary = 0, .wire = 0, .len = payload }, .{ .elementary = payload, .wire = 24576, .len = payload } } } };
+        var source = view.source("mapped", .{});
+        var gathered = try source.read(4, 2 * payload);
+        defer gathered.deinit();
+        try std.testing.expect(std.mem.allEqual(u8, gathered.bytes, 1));
+        try std.testing.expectEqual(@as(usize, 2), wire.reads);
+    }
 }
 
 test "seekable transport budgets read calls across multiplex gaps" {

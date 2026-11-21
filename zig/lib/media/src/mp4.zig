@@ -78,6 +78,8 @@ pub const Packet = struct {
     duration: u32,
     /// Set by the AVC window planner on verified non-IDR reset pictures.
     avc_epoch_start: bool = false,
+    /// A coded HEVC reference with pic_output_flag cleared.
+    hidden: bool = false,
     /// Container sync hint, not proof that an open GOP can start here.
     sync: bool,
 };

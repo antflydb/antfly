@@ -47,6 +47,8 @@ pub const Index = struct {
     restarts: []Restart = &.{},
     reader: ?*const media.webm.Reader = null,
     apple_packet_layout: bool = false,
+    frame_units: usize = 0,
+    largest_picture: u64 = 0,
     operating_point: u5 = 0,
     all_layers: bool = true,
     reservation: media.admission.Token = .{},
@@ -149,6 +151,8 @@ const Collect = struct {
     restarts: std.ArrayList(Restart) = .empty,
     restart_limit: usize = 8192,
     apple_packet_layout: bool = true,
+    frame_units: usize = 0,
+    largest_picture: u64 = 0,
     fn restart(self: *Collect, value: Restart) !void {
         if (self.restarts.items.len >= self.restart_limit) return error.ResourceLimitExceeded;
         if (self.restarts.items.len == self.restarts.capacity) {
@@ -198,7 +202,7 @@ fn buildIndex(a: std.mem.Allocator, decoder_allocator: std.mem.Allocator, reader
     errdefer a.free(pictures);
     const restarts = try collector.restarts.toOwnedSlice(a);
     errdefer a.free(restarts);
-    return .{ .allocator = a, .pictures = pictures, .restarts = restarts, .reader = reader, .apple_packet_layout = options.strategy == .headers and collector.apple_packet_layout, .operating_point = options.decoder.av1_operating_point, .all_layers = options.decoder.av1_all_layers, .duration_seconds = reader.duration_seconds };
+    return .{ .allocator = a, .pictures = pictures, .restarts = restarts, .reader = reader, .frame_units = collector.frame_units, .largest_picture = collector.largest_picture, .apple_packet_layout = options.strategy == .headers and collector.apple_packet_layout, .operating_point = options.decoder.av1_operating_point, .all_layers = options.decoder.av1_all_layers, .duration_seconds = reader.duration_seconds };
 }
 /// Header indexing validates visible-picture geometry/reference metadata. Pixel
 /// reconstruction and entropy validity remain the selected replay's responsibility.
@@ -264,7 +268,11 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
             }
         }
     }
-    if (av1) |session| try session.finish();
+    if (av1) |session| {
+        try session.finish();
+        collector.frame_units = session.frame_units;
+        collector.largest_picture = session.largest_picture;
+    }
 }
 fn appendHeader(collector: *Collect, packet: media.webm.Packet, packet_id: usize, geometry: @import("codecs/vp9_header.zig").Geometry) !void {
     try collector.push(.{ .pts = packet.pts, .duration = packet.duration_ns, .width = geometry.width, .height = geometry.height, .bit_depth = geometry.bit_depth, .chroma_format = geometry.chroma_format, .packet_index = packet_id, .color = geometry.color, .profile = geometry.profile, .av1_config = geometry.av1_config, .apple_compatible = geometry.apple_compatible });

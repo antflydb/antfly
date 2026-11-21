@@ -195,7 +195,7 @@ pub const Owner = struct {
                 }
             } else {
                 for (timed, reader.packets) |*dest, packet| {
-                    dest.* = .{ .pts = packet.pts, .duration = packet.duration };
+                    dest.* = .{ .pts = packet.pts, .duration = packet.duration, .hidden = packet.hidden };
                 }
             }
             break :build video.sampling.Timeline.initEdited(scratch, timed, reader.input.control, reader.track.edit) catch |err| return if (err == error.OutOfMemory) memory.denied orelse err else err;

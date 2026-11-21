@@ -25,7 +25,7 @@ comptime {
     _ = @import("av1/tables.zig");
 }
 const Geometry = @import("vp9_header.zig").Geometry;
-pub const Options = struct { max_pixels: usize, operating_point: u5 = 0, all_layers: bool = true, control: media.source.Control = .{} };
+pub const Options = struct { max_frame_units: usize = std.math.maxInt(usize), max_pixels: usize, operating_point: u5 = 0, all_layers: bool = true, control: media.source.Control = .{} };
 const Obu = struct {
     kind: u4,
     temporal: u3 = 0,
@@ -93,6 +93,8 @@ pub const Session = struct {
     current: grammar.Dav1dFrameHeader = .{},
     references: [8]grammar.Dav1dFrameHeader = @splat(.{}),
     have_sequence: bool = false,
+    frame_units: usize = 0,
+    largest_picture: u64 = 0,
     pending: bool = false,
     next_tile: usize = 0,
     failed: bool = false,
@@ -148,6 +150,12 @@ pub const Session = struct {
             const temporal = obu.temporal;
             const spatial = obu.spatial;
             const payload = obu.payload;
+            // NVDEC receives every submitted frame header, including hidden
+            // references and layers outside the selected operating point.
+            if (kind == 3 or kind == 6) {
+                if (self.frame_units >= self.options.max_frame_units) return error.DecoderEnvelopeExceeded;
+                self.frame_units += 1;
+            }
             if (self.have_sequence and kind != 1 and kind != 2 and self.context.operating_point_idc != 0) {
                 const idc = self.context.operating_point_idc;
                 if (idc & (@as(u32, 1) << temporal) == 0 or idc & (@as(u32, 1) << (@as(u5, spatial) + 8)) == 0) continue;
@@ -238,11 +246,12 @@ pub const Session = struct {
         const spatial_mask = idc >> 8;
         self.context.max_spatial_id = if (spatial_mask != 0) @intCast(std.math.log2_int(u32, spatial_mask)) else 0;
     }
-    fn pictureGeometry(self: *const Session, frame: grammar.Dav1dFrameHeader) !Geometry {
+    fn pictureGeometry(self: *Session, frame: grammar.Dav1dFrameHeader) !Geometry {
         if (frame.width[1] <= 0 or frame.height <= 0) return error.InvalidVideoData;
         const width: u32 = @intCast(frame.width[1]);
         const height: u32 = @intCast(frame.height);
         if (width > 16384 or height > 16384 or @as(u64, width) * height > self.options.max_pixels) return error.ResourceLimitExceeded;
+        self.largest_picture = @max(self.largest_picture, @as(u64, width) * height);
         const s = self.sequence;
         const op = s.operating_points[self.options.operating_point];
         const depth: u8 = @intCast(8 + 2 * s.hbd);

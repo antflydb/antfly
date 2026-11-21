@@ -30,7 +30,7 @@ extern fn antfly_nvdec_open(*?*anyopaque, ?*anyopaque, *anyopaque, Callback) c_i
 const ParserPacket = enum(c_int) { configuration, end_of_stream, sample };
 extern fn antfly_nvdec_packet(*anyopaque, ?[*]const u8, u32, i64, ParserPacket) c_int;
 extern fn antfly_nvdec_close(*anyopaque) void;
-extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32, c_int) c_int;
+extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32, c_int, c_uint) c_int;
 extern fn antfly_nvdec_finish(*anyopaque) void;
 
 extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
@@ -273,18 +273,28 @@ pub const PreparedEmbedding = struct {
     source: media.source.Source,
     reader: media.mp4.Reader,
     normalized: ?[]u8,
+    owns_reader: bool,
     inspection: EmbeddingInspection,
 
     pub fn init(self: *PreparedEmbedding, allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control) !void {
+        return self.initWithSharedPlan(allocator, bytes, control, null);
+    }
+
+    pub fn initWithSharedPlan(self: *PreparedEmbedding, allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control, shared: ?*const Av1ReferencePlan) !void {
         if (bytes.len > packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
         self.source = .{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
-        self.reader = try media.mp4.Reader.init(allocator, &self.source, decodeLimits(.embedding_gemma2));
-        errdefer self.reader.deinit();
+        const limits = decodeLimits(.embedding_gemma2);
+        const original: ?*const media.mp4.Reader = if (shared) |plan| try plan.readerFor(bytes, limits, control) else null;
+        self.owns_reader = original == null;
+        self.reader = if (original) |reader| reader.* else try media.mp4.Reader.init(allocator, &self.source, limits);
+        self.reader.input = &self.source;
+        self.reader.limits = limits;
+        errdefer if (self.owns_reader) self.reader.deinit();
         const reader = &self.reader;
         try validateTrack(reader.track);
         self.normalized = try normalizeDecoderTrack(allocator, reader);
         errdefer if (self.normalized) |config| allocator.free(config);
-        const selection = try embeddingSelection(allocator, reader);
+        const selection = if (original != null) try shared.?.selectionFor(reader) else try embeddingSelection(allocator, reader);
         const frame = Frame{ .device = 0, .pitch = 0, .width = reader.track.width, .height = reader.track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = try quarterTurns(reader.track.display_matrix), .sar = try displayAspect(allocator, reader.track) };
         const display = try frame.displaySize();
         self.inspection = .{ .width = reader.track.width, .height = reader.track.height, .frames = selection.pictures.len, .selection = selection, .codec = reader.track.codec, .display_width = display[0], .display_height = display[1] };
@@ -294,7 +304,7 @@ pub const PreparedEmbedding = struct {
     }
     pub fn deinit(self: *PreparedEmbedding) void {
         if (self.normalized) |config| self.reader.allocator.free(config);
-        self.reader.deinit();
+        if (self.owns_reader) self.reader.deinit();
     }
 };
 
@@ -306,7 +316,7 @@ pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control
 }
 
 fn normalizeDecoderTrack(allocator: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
-    return @import("antfly_video").hevc_config.normalizeReader(allocator, reader) catch |err| return switch (err) {
+    return @import("antfly_video").hevc_config.normalizeOwnedReader(allocator, reader) catch |err| return switch (err) {
         error.UnsupportedVideoProfile => error.UnsupportedVideoFormat,
         else => err,
     };
@@ -399,6 +409,18 @@ fn gemma4Av1DisplayPlan(allocator: std.mem.Allocator, reader: *media.mp4.Reader,
     return display;
 }
 
+test "Gemma4 CUDA AV1 charges each coded unit in a grouped MP4 sample" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../../testdata/video/codecs/av1.mp4") }, .identity = "unit-limit" };
+    var reader = try media.mp4.Reader.init(a, &source, mp4Limits(true));
+    defer reader.deinit();
+    var grouped = reader;
+    const packets = try groupFirstTwoAv1Packets(a, &reader);
+    defer a.free(packets);
+    grouped.packets = packets[0..1];
+    try std.testing.expectError(error.DecoderEnvelopeExceeded, packet_sampling.av1OutputCountsLimited(a, &grouped, 1));
+}
+
 test "Gemma4 CUDA AV1 selects identical displays when two frames share one packet" {
     const a = std.testing.allocator;
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../../testdata/video/codecs/av1.mp4") }, .identity = "visible-ordinals" };
@@ -435,7 +457,7 @@ fn groupFirstTwoAv1Packets(a: std.mem.Allocator, reader: *const media.mp4.Reader
 fn embeddingSelection(a: std.mem.Allocator, reader: *media.mp4.Reader) !DisplayPlan {
     try validateDecodeSpan(reader.track, reader.packets);
     if (reader.track.codec != .av1) return referenceSelection(a, reader, reader.packets);
-    const counts = packet_sampling.av1OutputCounts(a, reader) catch |err| switch (err) {
+    const counts = packet_sampling.av1OutputCountsLimited(a, reader, nvdec_max_samples) catch |err| switch (err) {
         error.UnsupportedVideoProfile, error.InvalidVideoData => return error.UnsupportedVideoFormat,
         else => return err,
     };
@@ -486,6 +508,36 @@ pub const DisplayPlan = struct {
     pictures: packet_sampling.Gemma4Plan = .{},
     visible_count: ?usize = null,
     visible_ordinals: [32]usize = undefined,
+};
+/// Selection from the portable AV1 header walk of the same immutable MP4.
+pub const Av1ReferencePlan = struct {
+    original: *const media.mp4.Reader,
+    frame_units: usize,
+    largest_picture: u64,
+    plan: DisplayPlan,
+
+    fn readerFor(self: *const Av1ReferencePlan, bytes: []const u8, limits: media.mp4.Limits, control: media.source.Control) !?*const media.mp4.Reader {
+        const source = self.original.input.storage;
+        if (source != .borrowed or source.borrowed.ptr != bytes.ptr or source.borrowed.len != bytes.len) return error.InvalidVideoReaderSelection;
+        // The route may select another track or reject dimensions in another
+        // sample description. Check the CUDA policy without expanding tables.
+        const track = try media.mp4.probeTrack(bytes, limits, control);
+        if (track.codec != .av1 or track.id != self.original.track.id) return null;
+        if (self.original.packets.len > limits.max_samples) return limits.track_limit_error;
+        return self.original;
+    }
+
+    fn selectionFor(self: *const Av1ReferencePlan, reader: *media.mp4.Reader) !DisplayPlan {
+        try validateDecodeSpan(reader.track, reader.packets);
+        if (self.frame_units > nvdec_max_samples or self.plan.visible_count.? > nvdec_max_samples or self.largest_picture > 4096 * 4096) return error.DecoderEnvelopeExceeded;
+        var plan = self.plan;
+        for (plan.pictures.ids(), 0..) |packet_id, i| {
+            if (packet_id >= reader.packets.len or (i != 0 and plan.visible_ordinals[i] < plan.visible_ordinals[i - 1])) return error.UnsupportedVideoFormat;
+            const pts = reader.packets[packet_id].pts;
+            plan.pictures.timestamps_us[i] = try timestampUs(if (reader.track.edit.source_duration != null) @max(pts, reader.track.edit.source_start) else pts, reader.track.timescale);
+        }
+        return plan;
+    }
 };
 const SelectedPackets = struct {
     plan: DisplayPlan,
@@ -609,6 +661,7 @@ fn checkStatusCode(status: c_int) !void {
         2 => error.UnsupportedVideoFormat,
         4 => error.VideoConsumerFailed,
         5 => error.OutOfMemory,
+        7 => error.DecoderEnvelopeExceeded,
         else => error.VideoDecodeFailed,
     };
 }
@@ -658,7 +711,7 @@ fn decodeReader(allocator: std.mem.Allocator, state: *DecodeState, reader: *medi
     // Validate the one-picture-per-sample contract against the display callbacks.
     if (sampling == .gemma4) {
         const plan: DisplayPlan = if (track.codec == .av1) av1: {
-            const counts = packet_sampling.av1OutputCounts(allocator, reader) catch |err| switch (err) {
+            const counts = packet_sampling.av1OutputCountsLimited(allocator, reader, nvdec_max_samples) catch |err| switch (err) {
                 error.UnsupportedVideoProfile, error.InvalidVideoData => return error.UnsupportedVideoFormat,
                 else => return err,
             };
@@ -692,7 +745,7 @@ fn decodeReader(allocator: std.mem.Allocator, state: *DecodeState, reader: *medi
             ctx.video_decoder_cache = null;
         }
     }
-    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, state.sar.horizontal, state.sar.vertical, @intFromBool(track.pixel_aspect_declared)));
+    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, state.sar.horizontal, state.sar.vertical, @intFromBool(track.pixel_aspect_declared), nvdec_max_samples));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
     switch (track.codec) {

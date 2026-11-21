@@ -39,6 +39,17 @@ const adapted_sample_bytes = @sizeOf(media.webm.Packet) + @sizeOf(media.webm.Sou
 
 /// Consumes the MP4 owner on success; errors preserve it for caller cleanup.
 pub fn intoWebm(a: std.mem.Allocator, reader: *media.mp4.Reader) !media.webm.Reader {
+    var adapted = try borrowWebm(a, reader);
+    adapted.metadata = reader.metadata;
+    reader.allocator.free(reader.packets);
+    reader.index_reservation.deinit();
+    reader.* = undefined;
+    return adapted;
+}
+
+/// The caller retains the original MP4 reader (including its codec metadata)
+/// until the adapted reader has been released.
+pub fn borrowWebm(a: std.mem.Allocator, reader: *const media.mp4.Reader) !media.webm.Reader {
     try reader.input.control.check();
     if (reader.track.codec != .av1) return error.UnsupportedVideoCodec;
     if (reader.track.timescale == 0) return error.InvalidTimebase;
@@ -77,7 +88,7 @@ pub fn intoWebm(a: std.mem.Allocator, reader: *media.mp4.Reader) !media.webm.Rea
     const result = media.webm.Reader{
         .allocator = a,
         .input = reader.input,
-        .metadata = reader.metadata,
+        .metadata = .{ .source = null, .bytes = &.{} },
         .index_reservation = replacement,
         .track = track,
         .packets = packets,
@@ -86,9 +97,6 @@ pub fn intoWebm(a: std.mem.Allocator, reader: *media.mp4.Reader) !media.webm.Rea
         .duration_seconds = span,
         .source_timeline = .{ .timescale = reader.track.timescale, .edit = reader.track.edit, .samples = samples },
     };
-    reader.allocator.free(reader.packets);
-    reader.index_reservation.deinit();
-    reader.* = undefined;
     return result;
 }
 

@@ -57,25 +57,38 @@ pub fn embeddingGemma2(allocator: std.mem.Allocator, metadata: Metadata, options
     return output;
 }
 
+pub fn hidden(pic: anytype) bool {
+    return @hasField(@TypeOf(pic), "hidden") and pic.hidden;
+}
+
 // An undated presentation ends at the next distinct visible PTS. All outputs
 // tied at the preceding PTS share that interval, including across an edit.
 fn precedingHold(pictures: anytype, edit: media.timeline.Edit, control: media.source.Control) !?i64 {
-    if (edit.source_duration == null or @typeInfo(@TypeOf(pictures[0].duration)) != .optional) return null;
+    if (edit.source_duration == null) return null;
+    var latest_undated: ?i64 = null;
     var preceding: ?i64 = null;
+    var active: ?i64 = null;
     for (pictures, 0..) |pic, i| {
         if (i % 256 == 0) try control.check();
+        if (hidden(pic)) continue;
         if (pic.pts == edit.source_start) return null;
-        if (pic.pts < edit.source_start) preceding = @max(preceding orelse pic.pts, pic.pts);
+        if (pic.pts < edit.source_start) {
+            preceding = @max(preceding orelse pic.pts, pic.pts);
+            if (@as(?u64, pic.duration)) |d| {
+                if (@as(i128, pic.pts) + d > edit.source_start) active = @max(active orelse pic.pts, pic.pts);
+            } else latest_undated = @max(latest_undated orelse pic.pts, pic.pts);
+        }
     }
-    return preceding;
+    // An undated hold ends at the next distinct picture, even if it expired.
+    if (latest_undated != null and latest_undated == preceding) return preceding;
+    return active;
 }
 
 fn visibleInEdit(pts: i64, duration: ?u64, edit: media.timeline.Edit, preceding: ?i64) bool {
     const length = edit.source_duration orelse return true;
     if (pts >= @as(i128, edit.source_start) + length) return false;
     if (pts >= edit.source_start) return true;
-    if (duration) |d| return @as(i128, pts) + d > edit.source_start;
-    return pts == preceding;
+    return pts == preceding and (duration == null or @as(i128, pts) + duration.? > edit.source_start);
 }
 
 /// Return original picture ordinals in the reference processor's presentation
@@ -89,7 +102,7 @@ pub fn referencePictures(a: std.mem.Allocator, pictures: anytype, scale: u32, ed
     const preceding = try precedingHold(pictures, edit, control);
     for (pictures, 0..) |picture, id| {
         if (id % 256 == 0) try control.check();
-        if (!visibleInEdit(picture.pts, picture.duration, edit, preceding)) continue;
+        if (hidden(picture) or !visibleInEdit(picture.pts, picture.duration, edit, preceding)) continue;
         bounds.include(picture.pts, picture.duration);
         order[count] = id;
         count += 1;
@@ -132,7 +145,7 @@ pub fn timestamps(allocator: std.mem.Allocator, packets: []const media.mp4.Packe
         var chosen: ?usize = null;
         for (packets, 0..) |packet, i| {
             if (i % 256 == 0) try control.check();
-            if (packet.pts < target or packet.pts >= interval.end) continue;
+            if (packet.hidden or packet.pts < target or packet.pts >= interval.end) continue;
             if (chosen == null or packet.pts < packets[chosen.?].pts) chosen = i;
         }
         if (chosen) |index| {
@@ -156,7 +169,7 @@ pub const TimestampPolicy = struct {
         if (self.start_ns < 0 or self.step_ns == 0 or self.max_frames == 0 or self.max_frames > 32 or (self.end_ns != null and self.end_ns.? <= self.start_ns)) return error.InvalidSamplingPolicy;
     }
 };
-pub const TimedPicture = struct { pts: i64, duration: ?u64 };
+pub const TimedPicture = struct { pts: i64, duration: ?u64, hidden: bool = false };
 /// Presentation bounds for reordered pictures, including a trailing picture
 /// whose duration can be inferred from the preceding distinct timestamp.
 pub const Bounds = struct {
@@ -210,14 +223,14 @@ pub const Timeline = struct {
     pub fn initEdited(a: std.mem.Allocator, pictures: []const TimedPicture, control: media.source.Control, edit: media.timeline.Edit) !Timeline {
         const stop: ?i128 = if (edit.source_duration) |d| @as(i128, edit.source_start) + d else null;
         const preceding = try precedingHold(pictures, edit, control);
-        const count = if (stop != null) blk: {
+        const count = blk: {
             var n: usize = 0;
             for (pictures, 0..) |pic, i| {
                 if (i % 256 == 0) try control.check();
-                if (visibleInEdit(pic.pts, pic.duration, edit, preceding)) n += 1;
+                if (!hidden(pic) and visibleInEdit(pic.pts, pic.duration, edit, preceding)) n += 1;
             }
             break :blk n;
-        } else pictures.len;
+        };
         if (count == 0) return error.EmptyVideo;
         const entries = try a.alloc(Entry, count);
         errdefer a.free(entries);
@@ -225,7 +238,7 @@ pub const Timeline = struct {
         var i: usize = 0;
         for (pictures, 0..) |picture, id| {
             if (id % 256 == 0) try control.check();
-            if (!visibleInEdit(picture.pts, picture.duration, edit, preceding)) continue;
+            if (hidden(picture) or !visibleInEdit(picture.pts, picture.duration, edit, preceding)) continue;
             bounds.include(picture.pts, picture.duration);
             entries[i] = .{ .id = id, .pts = picture.pts, .stop = @min(stop orelse std.math.maxInt(i128), if (picture.duration) |d| @as(i128, picture.pts) + d else std.math.maxInt(i128)) };
             i += 1;
@@ -346,8 +359,10 @@ fn cappedAtOrigin(a: std.mem.Allocator, pictures: []const TimedPicture, timescal
     var bounds = Bounds{};
     for (pictures, 0..) |picture, i| {
         if (i % 256 == 0) try control.check();
+        if (picture.hidden) continue;
         bounds.include(picture.pts, picture.duration);
     }
+    if (bounds.latest == null) return error.EmptyVideo;
     const first = if (relative) bounds.first else 0;
     const last = bounds.end(null);
     const inferred = @divFloor((last - first) * 1_000_000_000 + timescale - 1, timescale);
@@ -367,6 +382,7 @@ fn cappedAtOrigin(a: std.mem.Allocator, pictures: []const TimedPicture, timescal
             var unknown: ?usize = null;
             for (pictures, 0..) |picture, id| {
                 if (id % 256 == 0) try control.check();
+                if (picture.hidden) continue;
                 const time = (@as(i128, picture.pts) - first) * std.time.ns_per_s;
                 if (time > target * timescale) continue;
                 latest = @max(latest orelse picture.pts, picture.pts);
@@ -387,6 +403,7 @@ fn cappedAtOrigin(a: std.mem.Allocator, pictures: []const TimedPicture, timescal
         }
         for (pictures, 0..) |picture, id| {
             if (id % 256 == 0) try control.check();
+            if (picture.hidden) continue;
             const time = (@as(i128, picture.pts) - first) * 1_000_000_000;
             if (time < target * timescale or time >= end * timescale) continue;
             if (chosen == null or picture.pts < pictures[chosen.?].pts) chosen = id;

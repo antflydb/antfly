@@ -87,6 +87,8 @@ pub const SeekCache = struct {
     pub const Candidate = struct {
         packet: usize,
         verified: std.atomic.Value(Status) = .init(.unknown),
+        /// Published only after every intervening hint was conclusively rejected.
+        predecessor: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
 
         const Status = enum(u32) { unknown, probing, idr, rejected };
 
@@ -235,18 +237,29 @@ const Builder = struct {
                 const mid = lo + (hi - lo) / 2;
                 if (candidates[mid].packet <= selected) lo = mid + 1 else hi = mid;
             }
+            const end = lo;
+            var first_unresolved = lo;
+            var anchor: usize = 0;
             while (lo > 0) {
                 lo -= 1;
                 if (self.search_steps >= self.options.max_search_steps) return error.ResourceLimitExceeded;
                 self.search_steps += 1;
                 try self.reader.input.control.check();
                 const candidate = &candidates[lo];
-                if (!try candidate.isIdr(self)) continue;
-                cache.remember(candidate.packet, selected, candidate.packet);
-                return candidate.packet;
+                const known = candidate.predecessor.load(.acquire);
+                if (known != std.math.maxInt(usize)) {
+                    anchor = known;
+                    break;
+                }
+                first_unresolved = lo;
+                if (try candidate.isIdr(self)) {
+                    anchor = candidate.packet;
+                    break;
+                }
             }
-            cache.remember(0, selected, 0);
-            return 0;
+            for (candidates[first_unresolved..end]) |*candidate| candidate.predecessor.store(anchor, .release);
+            cache.remember(anchor, selected, anchor);
+            return anchor;
         };
         while (true) {
             if (self.search_steps >= self.options.max_search_steps) return error.ResourceLimitExceeded;

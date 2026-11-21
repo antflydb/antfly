@@ -37,6 +37,7 @@ typedef struct {
     frame_callback frame;
     unsigned width, height, matrix, full_range, coded_width, coded_height, bit_depth, transfer;
     int failed, sequence_seen;
+    unsigned remaining_pictures;
     unsigned surfaces, expected_width, expected_height;
     cudaVideoCodec codec, expected_codec;
     int display_left, display_top, matrix_override, range_override, transfer_override, primaries_override;
@@ -152,6 +153,8 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
 }
 static int decode(void *opaque, CUVIDPICPARAMS *picture) {
     Decoder *d = opaque;
+    if (!d->remaining_pictures) { d->failed = 7; return 0; }
+    --d->remaining_pictures;
     // Parser timestamps are presentation clocks. They can be reassigned when
     // the input numbers are opaque packet IDs and B pictures are reordered.
     // Associate an access unit with the decoder surface it actually produced.
@@ -223,13 +226,14 @@ int antfly_nvdec_open(Decoder **out, void *stream, void *user, frame_callback ca
 }
 // The previous request must have drained EOS before reuse. A new parser owns
 // the new stream's reference-picture state; compatible decoder surfaces persist.
-int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int codec, int matrix, int range, int transfer, int primaries, unsigned sar_h, unsigned sar_v, int aspect_declared) {
+int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int codec, int matrix, int range, int transfer, int primaries, unsigned sar_h, unsigned sar_v, int aspect_declared, unsigned picture_limit) {
     if (d->parser) return 3;
     if (codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC && codec != cudaVideoCodec_AV1) return 2;
     d->stream = stream; d->user = user; d->frame = callback;
     d->failed = 0; d->sequence_seen = 0; d->tagged_surfaces = 0;
     d->expected_width = width; d->expected_height = height; d->matrix_override = matrix; d->range_override = range;
     d->transfer_override = transfer; d->primaries_override = primaries; d->sar_h = sar_h; d->sar_v = sar_v; d->aspect_declared = aspect_declared;
+    d->remaining_pictures = picture_limit;
     d->expected_codec = codec;
     CUVIDPARSERPARAMS p = {0};
     p.CodecType = codec; p.ulMaxNumDecodeSurfaces = 1;

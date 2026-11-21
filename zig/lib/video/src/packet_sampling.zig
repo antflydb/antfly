@@ -53,7 +53,11 @@ pub fn gemma4Av1FromCounts(_: std.mem.Allocator, reader: *media.mp4.Reader, coun
 }
 
 pub fn av1OutputCounts(a: std.mem.Allocator, reader: *media.mp4.Reader) ![]usize {
-    const headers = try @import("codecs/av1_headers.zig").Session.create(a, .{ .max_pixels = 4096 * 4096, .all_layers = false, .control = reader.input.control });
+    return av1OutputCountsLimited(a, reader, std.math.maxInt(usize));
+}
+
+pub fn av1OutputCountsLimited(a: std.mem.Allocator, reader: *media.mp4.Reader, max_units: usize) ![]usize {
+    const headers = try @import("codecs/av1_headers.zig").Session.create(a, .{ .max_frame_units = max_units, .max_pixels = 4096 * 4096, .all_layers = false, .control = reader.input.control });
     defer headers.deinit();
     try headers.configuration(reader.track.codec_config);
     const counts = try a.alloc(usize, reader.packets.len);
@@ -123,6 +127,7 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
         var end: i128 = std.math.minInt(i64);
         for (pictures, 0..) |pic, i| {
             if (i % 256 == 0) try control.check();
+            if (sampling_mod.hidden(pic)) continue;
             if (visible) |mask| if (mask[i] == 0) continue;
             const time = try pictureTime(pic, samples);
             origin = @min(origin, time.pts);
@@ -138,6 +143,7 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
     var held_pts: i64 = std.math.minInt(i64);
     for (pictures, 0..) |pic, id| {
         if (id % 256 == 0) try control.check();
+        if (sampling_mod.hidden(pic)) continue;
         if (visible) |mask| if (mask[id] == 0) continue;
         const time = try pictureTime(pic, samples);
         const pts = time.pts;
@@ -284,7 +290,7 @@ pub fn selectConfigured(a: std.mem.Allocator, reader: *const media.mp4.Reader, s
     if (sampling != .reference) {
         const metadata = try a.alloc(sampling_mod.TimedPicture, reader.packets.len);
         defer a.free(metadata);
-        for (reader.packets, metadata) |packet, *item| item.* = .{ .pts = packet.pts, .duration = packet.duration };
+        for (reader.packets, metadata) |packet, *item| item.* = .{ .pts = packet.pts, .duration = packet.duration, .hidden = packet.hidden };
         return selectTimestampEdit(a, metadata, reader.track, sampling, reader.input.control);
     }
     return sampling_mod.referencePictures(a, reader.packets, reader.track.timescale, reader.track.edit, reader.input.control);
@@ -320,6 +326,24 @@ test "edited opening hold precedes the next target and yields to an exact bounda
     times[1].pts = 5;
     plan = try planPictures(10, edit, &times, null, null, .{});
     try std.testing.expectEqualSlices(usize, &.{1}, plan.ids());
+}
+
+test "explicit opening hold yields to exact edit and ignores hidden reference packets" {
+    const a = std.testing.allocator;
+    const pictures = [_]sampling_mod.TimedPicture{
+        .{ .pts = 5, .duration = 10 },
+        .{ .pts = 10, .duration = 10, .hidden = true },
+        .{ .pts = 10, .duration = 10 },
+    };
+    const edit = media.timeline.Edit{ .source_start = 10, .source_duration = 10 };
+    const reference = try sampling_mod.referencePictures(a, &pictures, 10, edit, .{});
+    defer a.free(reference);
+    try std.testing.expectEqualSlices(usize, &.{2}, reference);
+    var plan = try planPictures(10, edit, &pictures, null, null, .{});
+    try std.testing.expectEqualSlices(usize, &.{2}, plan.ids());
+    const hold = try sampling_mod.referencePictures(a, pictures[0..2], 10, edit, .{});
+    defer a.free(hold);
+    try std.testing.expectEqualSlices(usize, &.{0}, hold);
 }
 
 test "reference sampling includes longest presentation even with earlier PTS" {

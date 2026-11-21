@@ -6061,8 +6061,9 @@ pub const CudaCompute = struct {
         self.gemma4_chunked_upload = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_CHUNKED_UPLOAD", true);
         self.gemma4_temp_lru = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_TEMP_LRU", true);
         self.gemma4_projector_cache_enabled = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_CACHE", true);
-        self.gemma4_projector_lossless_f16 = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_LOSSLESS_F16", false);
-        self.gemma4_projector_residual = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL", false);
+        const projector_supported = self.gemma4_e4b_sm89_qualified or (qualified and e4b and self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1);
+        self.gemma4_projector_lossless_f16 = projector_supported and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_LOSSLESS_F16", false);
+        self.gemma4_projector_residual = projector_supported and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL", false);
         if (self.gemma4_projector_residual) {
             self.gemma4_projector_residual_terms = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL_TERMS") orelse 3;
             if (self.gemma4_projector_residual_terms != 2 and self.gemma4_projector_residual_terms != 3) return error.InvalidShape;
@@ -7300,7 +7301,9 @@ pub const CudaCompute = struct {
         // The upload and in-place conversion share one stream and one allocation.
         // Keep the mapped source alive through the final fence, including errors.
         errdefer self.ctx.synchronize() catch {};
-        const lossless_f16 = self.gemma4_projector_lossless_f16 and !self.resident_training_cache and tensor.dtype == .bf16 and
+        // Residual tensor-core GEMMs consume BF16 weights directly. Converting
+        // them to F16 here would force the scalar widening kernel on every call.
+        const lossless_f16 = self.gemma4_projector_lossless_f16 and !self.gemma4_projector_residual and !self.resident_training_cache and tensor.dtype == .bf16 and
             @import("projector_precision.zig").bf16TensorFitsF16(tensor.data) and
             try self.kernels.convertBf16ToF16InPlace(&self.ctx, device, count);
         try synchronizeAndDrainDeferredDeviceFrees(self);
@@ -12515,43 +12518,25 @@ fn tryCublasLtProjectorResidualLinear(
     if (input.dtype != .f32 or input.elem_count != count) return false;
     const terms = self.gemma4_projector_residual_terms;
     const output_count = try checkedMul(rows, out_dim);
-    const f32_bytes = try checkedMul(count, 4);
-    const f16_bytes = try checkedMul(count, 2);
-    // Widening and correction never overlap. Similarly the low term can
-    // overwrite the staged high term after the first product on this stream.
-    // Put both cuBLASLt operands at 256-byte aligned addresses.
-    const work_bytes = try checkedMul(@max(count, output_count), 4);
-    const low_offset = (try std.math.add(usize, try std.math.add(usize, work_bytes, f32_bytes), 255)) & ~@as(usize, 255);
-    const bytes = try std.math.add(usize, low_offset, f16_bytes);
+    const plane_bytes = try checkedMul(count, 2);
+    const stride = (try std.math.add(usize, plane_bytes, 255)) & ~@as(usize, 255);
+    const products_offset = try checkedMul(stride, terms);
+    const product_bytes = try checkedMul(output_count, 4);
+    const bytes = try std.math.add(usize, products_offset, product_bytes);
     var storage = allocDeviceBufferOrdinaryWithPolicy(self, bytes, .optional) catch |err| switch (err) {
         error.CudaMemoryLimitExceeded, error.ResourceLimitExceeded => return false,
         else => return err,
     };
     defer releaseDeviceBuffer(self, &storage);
-    const rounded = buffer_mod.DeviceBuffer{ .ptr = storage.ptr, .len = f32_bytes };
-    const correction = buffer_mod.DeviceBuffer{ .ptr = storage.ptr, .len = try checkedMul(output_count, 4) };
-    const residual = buffer_mod.DeviceBuffer{ .ptr = storage.ptr + work_bytes, .len = f32_bytes };
-    const low = buffer_mod.DeviceBuffer{ .ptr = storage.ptr + low_offset, .len = f16_bytes };
-    const high = if (input.bf16_mirror.ptr != 0 and input.bf16_mirror.len >= f16_bytes) mirror: {
-        self.stats.bf16_cublaslt_activation_mirror_hits += 1;
-        break :mirror input.bf16_mirror;
-    } else staged: {
-        try self.kernels.launchF32ToBf16(&self.ctx, low, input.buffer, count);
-        self.stats.bf16_cublaslt_activation_staging_calls += 1;
-        break :staged low;
-    };
-    try self.scalar_clamp_kernel.widen16Bit(&self.ctx, high.ptr, rounded.ptr, count, true);
-    try self.kernels.launchElementwiseF32(&self.ctx, residual, input.buffer, rounded, count, .subtract);
+    const planes = [3]driver_mod.CUdeviceptr{ storage.ptr, storage.ptr + stride, if (terms == 3) storage.ptr + 2 * stride else 0 };
+    const correction = buffer_mod.DeviceBuffer{ .ptr = storage.ptr + products_offset, .len = product_bytes };
+    try self.scalar_clamp_kernel.splitBf16(&self.ctx, input.buffer.ptr, planes, count);
+    self.stats.bf16_cublaslt_activation_staging_calls += 1;
     const workspace = cublasLtWorkspace(self);
-    blas.matmulBf16WeightF32Out(&self.ctx, dst, high, weight, workspace, rows, in_dim, out_dim) catch return false;
-    for (1..terms) |term| {
-        try self.kernels.launchF32ToBf16(&self.ctx, low, residual, count);
-        blas.matmulBf16WeightF32Out(&self.ctx, correction, low, weight, workspace, rows, in_dim, out_dim) catch return false;
-        try self.kernels.launchElementwiseF32(&self.ctx, dst, dst, correction, rows * out_dim, .add);
-        if (term + 1 < terms) {
-            try self.scalar_clamp_kernel.widen16Bit(&self.ctx, low.ptr, rounded.ptr, count, true);
-            try self.kernels.launchElementwiseF32(&self.ctx, residual, residual, rounded, count, .subtract);
-        }
+    for (planes[0..terms], 0..) |ptr, term| {
+        const operand = buffer_mod.DeviceBuffer{ .ptr = ptr, .len = plane_bytes };
+        blas.matmulBf16WeightF32Out(&self.ctx, if (term == 0) dst else correction, operand, weight, workspace, rows, in_dim, out_dim) catch return false;
+        if (term != 0) try self.kernels.launchElementwiseF32(&self.ctx, dst, dst, correction, output_count, .add);
     }
     self.stats.bf16_cublaslt_linear_calls += terms;
     self.stats.gemma4_projector_residual_calls += 1;
@@ -39780,7 +39765,6 @@ test "Gemma4 CUDA projector fits the weight-only budget and falls back under res
     var compute = try CudaCompute.initWithKernelJitForProfile(a, .{}, .gemma4);
     defer compute.deinit();
     compute.gemma4_projector_lossless_f16 = true;
-    compute.gemma4_projector_residual = true;
     const cb = compute.computeBackend();
     const budget = &compute.ctx.device_allocations;
     const initial = budget.snapshot();
@@ -39796,7 +39780,11 @@ test "Gemma4 CUDA projector fits the weight-only budget and falls back under res
     try std.testing.expectEqualSlices(u16, &.{ 0x3c00, 0xb800, 1, 0x8000 }, &actual);
 
     try budget.setLimit(initial.limit);
-    // One non-representable BF16 element keeps this matrix on its BF16 path.
+    compute.gemma4_projector_residual = true;
+    const compact = try compute.uploadProjectorWeight(&source);
+    defer cb.free(compact);
+    try std.testing.expectEqual(tensor_mod.DType.bf16, tensorFromCt(compact).dtype);
+    // A native BF16 matrix uses the same path.
     bits = .{ 0x3f80, 0x4000, 0x0001, 0xbf80 };
     const weight = try compute.uploadProjectorWeight(&source);
     defer cb.free(weight);
@@ -39842,7 +39830,7 @@ test "Gemma4 CUDA projector residual workspace preserves two and three term rect
         const values = try a.alloc(f32, rows * in_dim);
         defer a.free(values);
         for (values, 0..) |*v, n| v.* = @sin(@as(f32, @floatFromInt(n)) * 0.1234);
-        if (!bf16) values[0] = 70000;
+        values[0] = if (bf16) std.math.floatMax(f32) else 70000;
         const input = try cb.fromFloat32Shape(values, &.{ rows, @intCast(in_dim) });
         defer cb.free(input);
         compute.gemma4_projector_residual = true;
@@ -39855,7 +39843,10 @@ test "Gemma4 CUDA projector residual workspace preserves two and three term rect
             const actual = try cb.toFloat32(result, a);
             defer a.free(actual);
             for (0..rows) |r| for (0..out_dim) |c| {
-                try std.testing.expectApproxEqAbs(values[r * in_dim + c % in_dim], actual[r * out_dim + c], 0.00002);
+                const expected = values[r * in_dim + c % in_dim];
+                if (expected == std.math.floatMax(f32)) {
+                    if (terms == 3) try std.testing.expectEqual(expected, actual[r * out_dim + c]) else try std.testing.expectApproxEqRel(expected, actual[r * out_dim + c], 0.00002);
+                } else try std.testing.expectApproxEqAbs(expected, actual[r * out_dim + c], 0.00002);
             };
         }
     }
