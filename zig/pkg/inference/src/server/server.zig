@@ -15898,7 +15898,7 @@ pub const Node = struct {
         // is separate from per-window model scratch and buffered result ownership.
         var source_permit = try self.model_manager.admitHostPreflight(request.native_transport_bytes);
         defer source_permit.release();
-        var runner = try chunks.Runner.init(bounded_source.allocator(), request, .{ .context = &adapter, .model = .{ .planning_identity = planning_identity, .context_tokens = capacity, .max_text_bytes = contract.batch.max_text_bytes_per_item orelse 16 * 1024 * 1024, .min_audio_ns = if (manifest.embedding_style == .embedding_gemma2) 11 * std.time.ns_per_ms else 0 }, .describe = Adapter.describe, .count_text = Adapter.count, .count_overlap = Adapter.overlap, .audio_tokens = Adapter.audioTokens, .preflight = Adapter.preflight, .embed = Adapter.embed, .embed_video_batch = if (manifest.embedding_style == .embedding_gemma2) Adapter.embedVideoBatch else null, .prepare_video_outputs = if (observe_frames) MediaOutputExecution.prepareVideo else null, .start_video = if (!observe_frames) Adapter.startVideo else null }, control, sink);
+        var runner = try chunks.Runner.init(bounded_source.allocator(), request, .{ .context = &adapter, .video_session = if (loaded) |model| model.session else null, .model = .{ .planning_identity = planning_identity, .context_tokens = capacity, .max_text_bytes = contract.batch.max_text_bytes_per_item orelse 16 * 1024 * 1024, .min_audio_ns = if (manifest.embedding_style == .embedding_gemma2) 11 * std.time.ns_per_ms else 0 }, .describe = Adapter.describe, .count_text = Adapter.count, .count_overlap = Adapter.overlap, .audio_tokens = Adapter.audioTokens, .preflight = Adapter.preflight, .embed = Adapter.embed, .embed_video_batch = if (manifest.embedding_style == .embedding_gemma2) Adapter.embedVideoBatch else null, .prepare_video_outputs = if (observe_frames) MediaOutputExecution.prepareVideo else null, .start_video = if (!observe_frames) Adapter.startVideo else null }, control, sink);
         var failure: ?anyerror = null;
         const summary = runner.run() catch |err| blk: {
             failure = if (err == error.OutOfMemory and bounded_source.denied) error.ChunkWorkingBudgetExceeded else if (err == error.OutOfMemory) admitted_source.admission_error orelse err else err;
@@ -50507,12 +50507,6 @@ const ChunkEmbeddingAdapter = struct {
         const adapter: *@This() = @ptrCast(@alignCast(raw));
         if (adapter.manifest.embedding_style != .embedding_gemma2 or payload != .video) return null;
         const movie = payload.video;
-        if (movie.selection) |selection| if (selection.continuation) |continuation| {
-            continuation.session = adapter.model.?.session;
-        };
-        if (movie.webm) |webm| if (webm.apple_continuation) |continuation| {
-            continuation.session = adapter.model.?.session;
-        };
         return grouped.VideoAhead.start(adapter.model.?.session, .{ .bytes = movie.bytes, .reader = movie.reader, .sampling = if (movie.source_timestamps) .{ .source_timestamps = movie.policy } else .{ .timestamps = movie.policy }, .selection = movie.selection, .webm = movie.webm }, adapter.control, adapter.cache, pool, .{});
     }
     fn embedVideoBatch(raw: *anyopaque, out: std.mem.Allocator, payloads: []const chunks.Payload) ![]chunks.Output {
@@ -50526,12 +50520,6 @@ const ChunkEmbeddingAdapter = struct {
         for (payloads, movies[0..payloads.len]) |payload, *movie| {
             if (payload != .video) return error.InvalidInputShape;
             const value = payload.video;
-            if (value.selection) |selection| if (selection.continuation) |continuation| {
-                continuation.session = adapter.model.?.session;
-            };
-            if (value.webm) |webm| if (webm.apple_continuation) |continuation| {
-                continuation.session = adapter.model.?.session;
-            };
             const shared: ?*MediaOutputExecution.FrameWindow = if (value.prepared_outputs) |prepared| @ptrCast(@alignCast(prepared.context)) else null;
             movie.* = .{ .prepared_frames = if (shared) |window| window.primary[0..window.count] else null, .plan = value.plan, .ahead = value.ahead, .movie = .{ .bytes = value.bytes, .reader = value.reader, .sampling = if (value.source_timestamps) .{ .source_timestamps = value.policy } else .{ .timestamps = value.policy }, .selection = value.selection, .webm = value.webm } };
         }
@@ -50571,12 +50559,6 @@ const ChunkEmbeddingAdapter = struct {
                         .text => |text| .{ .text = text },
                         .raster => |raster| .{ .raster = raster },
                         .video => |movie| configured: {
-                            if (movie.selection) |selection| if (selection.continuation) |continuation| {
-                                continuation.session = adapter.model.?.session;
-                            };
-                            if (movie.webm) |webm| if (webm.apple_continuation) |continuation| {
-                                continuation.session = adapter.model.?.session;
-                            };
                             break :configured .{ .sampled_video = .{ .bytes = if (movie.reader != null) &.{} else movie.bytes, .reader = movie.reader, .sampling = if (movie.source_timestamps) .{ .source_timestamps = movie.policy } else .{ .timestamps = movie.policy }, .selection = movie.selection, .webm = movie.webm } };
                         },
                         .pcm => unreachable,

@@ -348,6 +348,7 @@ pub const Inspection = struct {
         if (!metal) {
             plan.metal_preparation = false;
             plan.apple_surface_bytes = 0;
+            plan.source_apple_surface_bytes = 0;
             plan.apple_surfaces_fixed = false;
         }
         return plan;
@@ -388,7 +389,10 @@ pub const Inspection = struct {
             self.gemma4_plan = try webmGemma4Plan(self.webm_index.?, configuration.sampling, self.source.control);
             self.selected = if (self.gemma4_plan) |*plan| try a.dupe(usize, plan.ids()) else try selectWebm(a, self.webm_index.?, configuration.sampling, self.source.control, configuration.webm);
             self.plan = try inspectSelectedWebmPlan(&self.webm_reader, self.webm_index.?, true, self.selected.?);
-            if (!webmApplePreflight(configuration.webm)) self.plan.apple_surface_bytes = 0;
+            if (!webmApplePreflight(configuration.webm)) {
+                self.plan.source_apple_surface_bytes = self.plan.apple_surface_bytes;
+                self.plan.apple_surface_bytes = 0;
+            }
         } else {
             if (borrowed) |reader| {
                 self.reader = reader.*;
@@ -2054,20 +2058,34 @@ pub fn planWebmWindow(input: WebmInput, timestamp_policy: video.sampling.Timesta
     const total = try std.math.add(usize, payload, if (restart.sequence) |sequence| sequence.size else 0);
     if (total > limit) return error.ResourceLimitExceeded;
     const replay = video.webm_pictures.ReplayBudget{ .restart = restart, .packet_stop = packet_stop, .coded_bytes = total };
-    var apple_possible = false;
-    if (@import("builtin").os.tag == .macos and index.apple_packet_layout and (index.apple_index_eligible orelse true)) {
-        const published = if (input.apple_continuation) |owner| owner.apple_cursor.load(.acquire) else std.math.maxInt(usize);
-        const cursor = if (published == std.math.maxInt(usize)) null else published;
-        if (video.apple_webm.planReplay(input.reader, index, selected, .{ .decode = .{ .max_decode_packets = 8192 }, .replay_budget = replay }, cursor)) |_| {
-            apple_possible = true;
-        } else |err| switch (err) {
-            error.AppleReplayPacketLimit => {},
-            else => return err,
-        }
-    }
+    const apple_possible = try appleReplayPossible(input, index, selected, replay);
     var result = input;
     result.window = .{ .index = input.index, .policy = timestamp_policy, .count = selected.len, .replay = replay, .apple_possible = apple_possible };
     @memcpy(result.window.?.ids[0..selected.len], selected);
+    return result;
+}
+
+fn appleReplayPossible(input: WebmInput, index: video.webm_pictures.Index, selected: []const usize, replay: video.webm_pictures.ReplayBudget) !bool {
+    if (@import("builtin").os.tag != .macos or !index.apple_packet_layout or !(index.apple_index_eligible orelse true)) return false;
+    const published = if (input.apple_continuation) |owner| owner.apple_cursor.load(.acquire) else std.math.maxInt(usize);
+    const cursor = if (published == std.math.maxInt(usize)) null else published;
+    _ = video.apple_webm.planReplay(input.reader, index, selected, .{ .decode = .{ .max_decode_packets = 8192 }, .replay_budget = replay }, cursor) catch |err| switch (err) {
+        error.AppleReplayPacketLimit => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn webmReplayForMisses(index: video.webm_pictures.Index, selected: []const usize, budget: video.webm_pictures.ReplayBudget) !video.webm_pictures.ReplayBudget {
+    var stop: usize = 0;
+    for (selected) |id| {
+        if (id >= index.pictures.len) return error.InvalidVideoIndex;
+        const packet = index.pictures[id].packet_index orelse return error.InvalidVideoIndex;
+        if (packet >= budget.packet_stop) return error.InvalidVideoIndex;
+        stop = @max(stop, packet + 1);
+    }
+    var result = budget;
+    result.packet_stop = stop;
     return result;
 }
 
@@ -2102,7 +2120,10 @@ pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const med
 }
 pub fn inspectConfiguredPlan(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration, metal: bool) !Plan {
     var plan = if (configuration.inspection_scope) |scope| try scope.inspect(bytes, reader, control, configuration, metal) else if (configuration.webm) |input| try inspectWebmPlan(a, input, configuration.sampling, metal, control) else if (reader) |r| try inspectReaderPlanWithSelection(a, r, control, configuration.sampling, configuration.pool, metal, configuration.selection) else try inspectPlan(a, bytes, control, configuration.sampling, configuration.pool, metal);
-    if (configuration.decoder.policy == .portable) plan.apple_surface_bytes = 0;
+    if (configuration.decoder.policy == .portable) {
+        plan.apple_surface_bytes = 0;
+        plan.source_apple_surface_bytes = 0;
+    }
     return pinCachedPlan(plan, bytes, reader, control, configuration);
 }
 /// Sequence/presentation metadata stays intact; preparation is charged only for
@@ -2159,7 +2180,23 @@ pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp
     // Retain all 24 decoder/reference slots, reducing only selected-output
     // surfaces. The original maximum geometry/depth still bounds every miss.
     result.source_apple_surface_bytes = original.source_apple_surface_bytes orelse original.apple_surface_bytes;
-    result.apple_surface_bytes = if (decode_count == 0) 0 else if (original.apple_surfaces_fixed) result.source_apple_surface_bytes.? else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(decode_count)) + 24);
+    result.apple_surface_bytes = if (decode_count == 0 or (configuration.webm != null and !projected_cache and !webmApplePreflight(configuration.webm))) 0 else if (original.apple_surfaces_fixed) result.source_apple_surface_bytes.? else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(decode_count)) + 24);
+    if (projected_cache and configuration.decoder.policy != .portable) if (configuration.webm) |input| if (input.window) |window| {
+        var misses: [32]usize = undefined;
+        var count: usize = 0;
+        for (paths[0..original.pictures], selected[0..original.pictures]) |path, id| {
+            if (path != .decode) continue;
+            misses[count] = id;
+            count += 1;
+        }
+        const key = .{ .index = input.index, .policy = window.policy };
+        const possible = pins.?.webmApple(key) orelse (if (count != 0)
+            try appleReplayPossible(input, input.index.*, misses[0..count], try webmReplayForMisses(input.index.*, misses[0..count], window.replay))
+        else
+            false);
+        const recorded = pins.?.rememberWebmApple(key, possible);
+        if (!(if (recorded) possible else window.apple_possible)) result.apple_surface_bytes = 0;
+    };
     return result;
 }
 /// Only AVC currently consumes these pins. Never discount a decoder path
@@ -2175,7 +2212,10 @@ fn inspectWebmPlan(a: std.mem.Allocator, input: WebmInput, sampling: Sampling, m
     const selected = try selectWebm(a, try input.boundIndex(), sampling, .{ .context = adapter.context, .check_fn = adapter.check_fn }, input);
     defer a.free(selected);
     var plan = try inspectSelectedWebmPlan(input.reader, input.index.*, metal, selected);
-    if (!webmApplePreflight(input)) plan.apple_surface_bytes = 0;
+    if (!webmApplePreflight(input)) {
+        plan.source_apple_surface_bytes = plan.apple_surface_bytes;
+        plan.apple_surface_bytes = 0;
+    }
     return plan;
 }
 fn webmApplePreflight(input: ?WebmInput) bool {
@@ -2653,7 +2693,7 @@ pub const Prefetch = struct {
         if (self.preparer) |*preparer| try configureOutputSlab(preparer, pool, try selectionOutputBytes(presentation, prepare_packets[0..prepare_count], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
         capture.decode_slots = miss_slots[0..missing];
         if (webm) {
-            try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, self.webm_input);
+            try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, self.webm_input, self.cache_pins);
         } else try decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     }
 
@@ -3213,7 +3253,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         }
         break :reuse @as(anyerror!void, {});
     } else if (missing == 0) {} else if (webm)
-        decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, webm_input)
+        decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, webm_input, cache_pins)
     else
         decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     const decode_error: ?anyerror = if (decoded) |_| null else |err| err;
@@ -3331,22 +3371,20 @@ fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: vi
     };
     return video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null, .replay_budget = budget }, .{ .context = capture, .accept = Capture.publishAppleWebm });
 }
-fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput) !void {
+fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput, pins: ?*const CachePins) !void {
     if (capture.prefetch) |producer| try producer.waitForDecoder();
-    var budget = if (input) |bound| if (bound.window) |window| blk: {
-        var replay = window.replay;
-        var stop: usize = 0;
-        for (selected) |id| {
-            if (id >= indexed.pictures.len) return error.InvalidVideoIndex;
-            const packet = indexed.pictures[id].packet_index orelse return error.InvalidVideoIndex;
-            if (packet >= replay.packet_stop) return error.InvalidVideoIndex;
-            stop = @max(stop, packet + 1);
-        }
-        replay.packet_stop = stop;
-        break :blk replay;
-    } else null else null;
+    const window = if (input) |bound| bound.window else null;
+    var budget = if (window) |value| try webmReplayForMisses(indexed, selected, value.replay) else null;
+    const admitted_apple = if (window) |value| if (pins) |owner|
+        owner.webmApple(.{ .index = value.index, .policy = value.policy }) orelse value.apple_possible
+    else
+        value.apple_possible else true;
     const estimate = if (indexed.pictures.len != 0) try video.apple.surfaceAdmissionBytesForDepth(indexed.pictures[0].width, indexed.pictures[0].height, selected.len, indexed.pictures[0].bit_depth) else 0;
-    const apple_possible = webmApplePreflight(input) and estimate <= 512 * 1024 * 1024;
+    if (capture.decoder.policy == .apple and !admitted_apple) {
+        return if (@import("builtin").os.tag != .macos) error.UnsupportedVideoBackend else error.UnsupportedVideoProfile;
+    }
+    if (capture.decoder.policy == .apple and estimate > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
+    const apple_possible = admitted_apple and estimate <= 512 * 1024 * 1024;
     if (capture.decoder.policy == .automatic and !apple_possible) capture.decoder.fallback();
     if (capture.decoder.policy != .portable and (capture.decoder.policy == .apple or apple_possible)) {
         const bytes_before = reader.input.total_bytes;

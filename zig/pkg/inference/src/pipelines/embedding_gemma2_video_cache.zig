@@ -41,6 +41,26 @@ pub const Pins = struct {
     // shortcut around validating mutable/unverified sources on a new request.
     bindings: [128]struct { input: [32]u8, clip: [32]u8 } = undefined,
     binding_count: usize = 0,
+    webm_windows: [64]struct { key: WindowKey, apple: bool } = undefined,
+    webm_window_count: usize = 0,
+
+    const WindowKey = struct { index: *const anyopaque, policy: @import("antfly_video").sampling.TimestampPolicy };
+
+    pub fn webmApple(self: *const Pins, key: WindowKey) ?bool {
+        for (self.webm_windows[0..self.webm_window_count]) |entry| {
+            if (std.meta.eql(entry.key, key)) return entry.apple;
+        }
+        return null;
+    }
+
+    pub fn rememberWebmApple(self: *Pins, key: WindowKey, apple: bool) bool {
+        if (self.webmApple(key)) |existing| return existing;
+        if (self.webm_window_count == self.webm_windows.len) return false;
+        self.webm_windows[self.webm_window_count] = .{ .key = key, .apple = apple };
+        self.webm_window_count += 1;
+        return true;
+    }
+
     pub fn binding(self: *const Pins, input: [32]u8) ?[32]u8 {
         for (self.bindings[0..self.binding_count]) |value| if (std.mem.eql(u8, &input, &value.input)) return value.clip;
         return null;
@@ -66,6 +86,7 @@ pub const Pins = struct {
     }
     pub fn deinit(self: *Pins) void {
         self.binding_count = 0;
+        self.webm_window_count = 0;
         for (&self.tickets) |*ticket| if (ticket.*) |value| {
             self.cache.?.restore(value);
             ticket.* = null;

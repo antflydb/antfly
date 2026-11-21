@@ -46,6 +46,7 @@ pub const EmbeddingContext = struct { model: []const u8, model_identity: [64]u8,
 pub const Executor = struct {
     context: *anyopaque,
     model: planning.Model,
+    video_session: ?@import("../backends/session.zig").Session = null,
     describe: ?*const fn (*anyopaque) EmbeddingContext = null,
     count_text: *const fn (*anyopaque, []const u8) anyerror!usize,
     preflight: ?*const fn (*anyopaque, Payload) anyerror!Preflight = null,
@@ -986,7 +987,7 @@ pub const Runner = struct {
         const timeline = &snapshot.timeline;
         var continuation = video.webm_pictures.Continuation{ .allocator = self.allocator, .reader = reader };
         defer continuation.deinit();
-        var apple_continuation = @import("embedding_gemma2_video.zig").WebmDecoderContinuation{ .allocator = self.allocator, .reader = reader };
+        var apple_continuation = @import("embedding_gemma2_video.zig").WebmDecoderContinuation{ .allocator = self.allocator, .reader = reader, .session = self.executor.video_session };
         defer apple_continuation.deinit();
         var binding = @import("embedding_gemma2_video.zig").WebmProjectionBinding{ .reader = reader };
         try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, .{ .reader = reader, .index = &indexed, .timeline = .{ .index = &indexed, .value = timeline }, .projection_binding = &binding, .continuation = &continuation, .apple_continuation = &apple_continuation });
@@ -1225,6 +1226,7 @@ pub const Runner = struct {
         }
     }
     fn videoWindows(self: *Runner, bytes: []const u8, reader: ?*const media.mp4.Reader, duration: i128, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput) !void {
+        if (owner) |state| state.continuation.session = self.executor.video_session;
         const source = VideoSource{ .bytes = bytes, .reader = reader, .origin = origin, .timescale = timescale, .owner = owner, .webm = webm };
         const end = std.math.cast(i64, duration) orelse return error.TimestampOverflow;
         var cursor = planning.Temporal{ .kind = .video, .end_ns = end, .policy = self.request.policy, .model = self.executor.model, .picture_tokens = 142 };
