@@ -61,15 +61,49 @@ const DeviceBufferRef = struct {
     handle: *anyopaque,
     runtime: *anyopaque,
     byte_len: usize,
-    ref_count: usize,
+    ref_count: std.atomic.Value(usize),
     released: bool,
     release_on_drop: bool,
+    /// Exact SDK-root reference; aliases share this Ref and register once.
+    /// Borrowed tagged buffers own one extra SDK retain, independently of
+    /// cache/provider lifetime. Fits the existing flag padding.
+    workspace_reference: bool = false,
     /// An owned retain of external/runtime storage is not an allocation lease.
     /// Its final release must never make that storage available to the pool.
     recycle_on_drop: bool = true,
+    // Only exported legacy allocations with a successfully installed charge
+    // witness bypass pooling. Ordinary kernel intermediate reuse is unchanged.
+    retirement_witnessed: std.atomic.Value(bool) = .init(false),
     /// Legacy wrappers retain the C allocator. Strict bounded callers may
     /// supply an owner that outlives every retained view of this buffer.
     allocator: std.mem.Allocator = std.heap.c_allocator,
+    /// Only leased views carry this reference. The allocation's original
+    /// owner has no back-reference, so there is no ownership cycle. Retained
+    /// views share this record and release the bank pin with their last view.
+    physical_lease: ?*@import("../ops/physical_storage.zig").Lease = null,
+    write_generation: std.atomic.Value(u64) = .init(0),
+    // A leased view's strong Lease pin keeps this canonical allocation Ref
+    // alive. Ordinary aliases share their Ref; there is no owning back-edge.
+    write_owner: ?*DeviceBufferRef = null,
+
+    fn generation(self: *const DeviceBufferRef) ?u64 {
+        const owner = self.write_owner orelse self;
+        // A retained/borrowed external handle cannot prove all its writers.
+        if (!owner.release_on_drop or !owner.recycle_on_drop) return null;
+        const value = owner.write_generation.load(.acquire);
+        // Exhaustion permanently withdraws proof rather than recycling an old
+        // version. The bytes remain usable through the unknown-source route.
+        return if (value == std.math.maxInt(u64)) null else value;
+    }
+    fn noteMutation(self: *DeviceBufferRef) void {
+        const owner = self.write_owner orelse self;
+        var value = owner.write_generation.load(.acquire);
+        while (value != std.math.maxInt(u64)) {
+            if (owner.write_generation.cmpxchgWeak(value, value + 1, .acq_rel, .acquire)) |observed| {
+                value = observed;
+            } else return;
+        }
+    }
 };
 
 pub const MemoryStats = struct {
@@ -104,24 +138,48 @@ pub const MemoryStats = struct {
 /// Request-thread transfer audit. GPU execution is asynchronous, but all
 /// host copies/accesses enter these synchronous APIs on the dispatch thread.
 /// Independent sessions on other threads cannot contaminate these counters.
-pub const TransferAudit = struct {
-    upload_bytes: u64 = 0,
-    download_bytes: u64 = 0,
-    host_accesses: u64 = 0,
-    upload_calls: u64 = 0,
-    download_calls: u64 = 0,
-};
-threadlocal var transfer_audit: ?*TransferAudit = null;
-pub fn beginTransferAudit(audit: *TransferAudit) !void {
-    if (transfer_audit != null) return error.MetalTransferAuditAlreadyActive;
-    transfer_audit = audit;
+const transfer_audit = @import("../execution/transfer_audit.zig");
+pub const TransferAudit = transfer_audit.Audit;
+pub const beginTransferAudit = transfer_audit.begin;
+pub const endTransferAudit = transfer_audit.end;
+
+// Process-wide diagnostic totals: outputs from independent providers can
+// retire concurrently. These counters never grant storage/admission authority.
+// Snapshots are race-free monotonic samples, not a transaction across fields.
+const MemoryField = std.meta.FieldEnum(MemoryStats);
+const memory_field_count = @typeInfo(MemoryStats).@"struct".field_names.len;
+var memory_counters: [memory_field_count]std.atomic.Value(u64) = @splat(.init(0));
+fn memoryCounter(comptime field: MemoryField) *std.atomic.Value(u64) {
+    return &memory_counters[@backingInt(field)];
 }
-pub fn endTransferAudit() void {
-    transfer_audit = null;
+fn memoryLoad(comptime field: MemoryField) u64 {
+    return memoryCounter(field).load(.monotonic);
+}
+fn memoryAddAndRead(comptime field: MemoryField, value: u64) u64 {
+    return memoryCounter(field).fetchAdd(value, .monotonic) + value;
+}
+fn memoryAdd(comptime field: MemoryField, value: u64) void {
+    _ = memoryAddAndRead(field, value);
+}
+fn memorySubtract(comptime field: MemoryField, value: u64) void {
+    const counter = memoryCounter(field);
+    var old = counter.load(.monotonic);
+    while (true) {
+        if (counter.cmpxchgWeak(old, old -| value, .monotonic, .monotonic)) |observed| old = observed else return;
+    }
+}
+fn memoryPeak(comptime field: MemoryField, value: u64) void {
+    _ = memoryCounter(field).fetchMax(value, .monotonic);
+}
+// Only the optional allocation-record diagnostic needs a consistent table.
+// Disabled allocation tracing never takes this lock. No SDK operation runs
+// while it is held; it cannot participate in provider/residency lock ordering.
+var record_mutex: std.atomic.Mutex = .unlocked;
+fn lockRecords() void {
+    while (!record_mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
-var memory_stats = MemoryStats{};
-var to_host_trace_count: usize = 0;
+var to_host_trace_count: std.atomic.Value(usize) = .init(0);
 var owned_alloc_trace_count: usize = 0;
 const owned_peak_snapshot_capacity: usize = 16384;
 const owned_peak_snapshot_label_len: usize = 96;
@@ -147,7 +205,7 @@ var owned_allocation_sequence: u64 = 0;
 var owned_allocation_live_record_count: usize = 0;
 var owned_allocation_lost_record_count: u64 = 0;
 var owned_peak_snapshot_print_count: usize = 0;
-var owned_alloc_context: []const u8 = "";
+threadlocal var owned_alloc_context: []const u8 = "";
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
@@ -193,11 +251,12 @@ fn ownedPeakSnapshotMinBytes() u64 {
 // Cached because the environment is constant for the process lifetime; the cache
 // is a file-scope var so resetMemoryStats can clear it, keeping the recording
 // gate consistent with the (live-evaluated) print gate across test resets.
-var owned_allocation_recording_enabled_cache: ?bool = null;
+var owned_allocation_recording_enabled_cache: std.atomic.Value(u8) = .init(0);
 fn ownedAllocationRecordingEnabled() bool {
-    if (owned_allocation_recording_enabled_cache) |c| return c;
+    const cached = owned_allocation_recording_enabled_cache.load(.monotonic);
+    if (cached != 0) return cached == 2;
     const enabled = ownedPeakSnapshotTop() > 0 or traceOwnedAllocLimit() > 0;
-    owned_allocation_recording_enabled_cache = enabled;
+    owned_allocation_recording_enabled_cache.store(if (enabled) 2 else 1, .monotonic);
     return enabled;
 }
 
@@ -284,7 +343,7 @@ fn maybeRecordTop(top: []OwnedAllocationRecord, used: *usize, record: OwnedAlloc
 fn printOwnedPeakSnapshot() void {
     const top_n = ownedPeakSnapshotTop();
     if (top_n == 0) return;
-    if (memory_stats.device_owned_peak_live_bytes < ownedPeakSnapshotMinBytes()) return;
+    if (memoryLoad(.device_owned_peak_live_bytes) < ownedPeakSnapshotMinBytes()) return;
     if (owned_peak_snapshot_print_count >= ownedPeakSnapshotLimit()) return;
     owned_peak_snapshot_print_count += 1;
 
@@ -300,7 +359,7 @@ fn printOwnedPeakSnapshot() void {
     std.debug.print(
         "metal_owned_peak_snapshot: peak={d} live={d} live_records={d} tracked_live_records={d} lost_records={d} top={d}\n",
         .{
-            memory_stats.device_owned_peak_live_bytes,
+            memoryLoad(.device_owned_peak_live_bytes),
             live_bytes,
             owned_allocation_live_record_count,
             used,
@@ -324,52 +383,55 @@ fn printOwnedPeakSnapshot() void {
 fn updateOwnedCreateBucket(byte_len: usize) void {
     const bytes: u64 = @intCast(byte_len);
     if (byte_len < 256 * 1024) {
-        memory_stats.device_owned_live_lt_256kb_bytes += bytes;
-        memory_stats.device_owned_peak_lt_256kb_bytes = @max(memory_stats.device_owned_peak_lt_256kb_bytes, memory_stats.device_owned_live_lt_256kb_bytes);
+        const bucket_live = memoryAddAndRead(.device_owned_live_lt_256kb_bytes, bytes);
+        memoryPeak(.device_owned_peak_lt_256kb_bytes, bucket_live);
     } else if (byte_len < 1024 * 1024) {
-        memory_stats.device_owned_live_256kb_1mb_bytes += bytes;
-        memory_stats.device_owned_peak_256kb_1mb_bytes = @max(memory_stats.device_owned_peak_256kb_1mb_bytes, memory_stats.device_owned_live_256kb_1mb_bytes);
+        const bucket_live = memoryAddAndRead(.device_owned_live_256kb_1mb_bytes, bytes);
+        memoryPeak(.device_owned_peak_256kb_1mb_bytes, bucket_live);
     } else if (byte_len < 4 * 1024 * 1024) {
-        memory_stats.device_owned_live_1mb_4mb_bytes += bytes;
-        memory_stats.device_owned_peak_1mb_4mb_bytes = @max(memory_stats.device_owned_peak_1mb_4mb_bytes, memory_stats.device_owned_live_1mb_4mb_bytes);
+        const bucket_live = memoryAddAndRead(.device_owned_live_1mb_4mb_bytes, bytes);
+        memoryPeak(.device_owned_peak_1mb_4mb_bytes, bucket_live);
     } else if (byte_len < 16 * 1024 * 1024) {
-        memory_stats.device_owned_live_4mb_16mb_bytes += bytes;
-        memory_stats.device_owned_peak_4mb_16mb_bytes = @max(memory_stats.device_owned_peak_4mb_16mb_bytes, memory_stats.device_owned_live_4mb_16mb_bytes);
+        const bucket_live = memoryAddAndRead(.device_owned_live_4mb_16mb_bytes, bytes);
+        memoryPeak(.device_owned_peak_4mb_16mb_bytes, bucket_live);
     } else {
-        memory_stats.device_owned_live_ge_16mb_bytes += bytes;
-        memory_stats.device_owned_peak_ge_16mb_bytes = @max(memory_stats.device_owned_peak_ge_16mb_bytes, memory_stats.device_owned_live_ge_16mb_bytes);
+        const bucket_live = memoryAddAndRead(.device_owned_live_ge_16mb_bytes, bytes);
+        memoryPeak(.device_owned_peak_ge_16mb_bytes, bucket_live);
     }
 }
 
 fn updateOwnedReleaseBucket(byte_len: usize) void {
     const bytes: u64 = @intCast(byte_len);
     if (byte_len < 256 * 1024) {
-        memory_stats.device_owned_live_lt_256kb_bytes -|= bytes;
+        memorySubtract(.device_owned_live_lt_256kb_bytes, bytes);
     } else if (byte_len < 1024 * 1024) {
-        memory_stats.device_owned_live_256kb_1mb_bytes -|= bytes;
+        memorySubtract(.device_owned_live_256kb_1mb_bytes, bytes);
     } else if (byte_len < 4 * 1024 * 1024) {
-        memory_stats.device_owned_live_1mb_4mb_bytes -|= bytes;
+        memorySubtract(.device_owned_live_1mb_4mb_bytes, bytes);
     } else if (byte_len < 16 * 1024 * 1024) {
-        memory_stats.device_owned_live_4mb_16mb_bytes -|= bytes;
+        memorySubtract(.device_owned_live_4mb_16mb_bytes, bytes);
     } else {
-        memory_stats.device_owned_live_ge_16mb_bytes -|= bytes;
+        memorySubtract(.device_owned_live_ge_16mb_bytes, bytes);
     }
 }
 
 fn noteDeviceOwnedCreate(handle: *anyopaque, byte_len: usize, dims: []const i32) void {
-    memory_stats.device_owned_buffers_created += 1;
-    memory_stats.device_owned_bytes_created += @intCast(byte_len);
-    memory_stats.device_owned_live_bytes += @intCast(byte_len);
+    const recording = ownedAllocationRecordingEnabled();
+    if (recording) lockRecords();
+    defer if (recording) record_mutex.unlock();
+    memoryAdd(.device_owned_buffers_created, 1);
+    memoryAdd(.device_owned_bytes_created, @intCast(byte_len));
+    const live_bytes = memoryAddAndRead(.device_owned_live_bytes, @intCast(byte_len));
     updateOwnedCreateBucket(byte_len);
     noteOwnedAllocationRecord(handle, byte_len, dims);
-    const previous_peak = memory_stats.device_owned_peak_live_bytes;
-    memory_stats.device_owned_peak_live_bytes = @max(memory_stats.device_owned_peak_live_bytes, memory_stats.device_owned_live_bytes);
+    const previous_peak = memoryLoad(.device_owned_peak_live_bytes);
+    memoryPeak(.device_owned_peak_live_bytes, live_bytes);
     const limit = traceOwnedAllocLimit();
     if (limit > 0 and owned_alloc_trace_count < limit and byte_len >= traceOwnedAllocMinBytes()) {
         owned_alloc_trace_count += 1;
         std.debug.print(
             "metal_owned_alloc_trace: bytes={d} live={d} peak={d} new_peak={} dims=[",
-            .{ byte_len, memory_stats.device_owned_live_bytes, memory_stats.device_owned_peak_live_bytes, memory_stats.device_owned_peak_live_bytes > previous_peak },
+            .{ byte_len, memoryLoad(.device_owned_live_bytes), memoryLoad(.device_owned_peak_live_bytes), memoryLoad(.device_owned_peak_live_bytes) > previous_peak },
         );
         for (dims, 0..) |dim, i| {
             if (i != 0) std.debug.print(",", .{});
@@ -377,35 +439,47 @@ fn noteDeviceOwnedCreate(handle: *anyopaque, byte_len: usize, dims: []const i32)
         }
         std.debug.print("]\n", .{});
     }
-    if (memory_stats.device_owned_peak_live_bytes > previous_peak) printOwnedPeakSnapshot();
+    if (memoryLoad(.device_owned_peak_live_bytes) > previous_peak) printOwnedPeakSnapshot();
 }
 
 fn noteDeviceOwnedRelease(handle: *anyopaque, byte_len: usize) void {
-    memory_stats.device_owned_buffers_released += 1;
-    memory_stats.device_owned_bytes_released += @intCast(byte_len);
-    memory_stats.device_owned_live_bytes -|= @intCast(byte_len);
+    const recording = ownedAllocationRecordingEnabled();
+    if (recording) lockRecords();
+    defer if (recording) record_mutex.unlock();
+    memoryAdd(.device_owned_buffers_released, 1);
+    memoryAdd(.device_owned_bytes_released, @intCast(byte_len));
+    memorySubtract(.device_owned_live_bytes, @intCast(byte_len));
     updateOwnedReleaseBucket(byte_len);
     forgetOwnedAllocationRecord(handle);
 }
 
 fn noteHostMirrorAlloc(byte_len: usize) void {
-    memory_stats.host_mirror_allocations += 1;
-    memory_stats.host_mirror_download_bytes += @intCast(byte_len);
-    memory_stats.host_mirror_live_bytes += @intCast(byte_len);
-    memory_stats.host_mirror_peak_live_bytes = @max(memory_stats.host_mirror_peak_live_bytes, memory_stats.host_mirror_live_bytes);
+    memoryAdd(.host_mirror_allocations, 1);
+    memoryAdd(.host_mirror_download_bytes, @intCast(byte_len));
+    const live_bytes = memoryAddAndRead(.host_mirror_live_bytes, @intCast(byte_len));
+    memoryPeak(.host_mirror_peak_live_bytes, live_bytes);
 }
 
 fn noteHostMirrorFree(byte_len: usize) void {
-    memory_stats.host_mirror_frees += 1;
-    memory_stats.host_mirror_live_bytes -|= @intCast(byte_len);
+    memoryAdd(.host_mirror_frees, 1);
+    memorySubtract(.host_mirror_live_bytes, @intCast(byte_len));
 }
 
 pub fn memoryStatsSnapshot() MemoryStats {
-    return memory_stats;
+    var result: MemoryStats = .{};
+    inline for (@typeInfo(MemoryStats).@"struct".field_names, 0..) |field, index| {
+        @field(result, field) = memory_counters[index].load(.monotonic);
+    }
+    return result;
 }
 
+/// Reset diagnostic history only while all writers are quiescent. The
+/// recording gate and its table must start the same new history together.
 pub fn resetMemoryStats() void {
-    memory_stats = .{};
+    lockRecords();
+    defer record_mutex.unlock();
+    for (&memory_counters) |*counter| counter.store(0, .monotonic);
+    to_host_trace_count.store(0, .monotonic);
     owned_alloc_trace_count = 0;
     owned_peak_snapshot_print_count = 0;
     owned_allocation_next_slot = 0;
@@ -413,7 +487,7 @@ pub fn resetMemoryStats() void {
     owned_allocation_live_record_count = 0;
     owned_allocation_lost_record_count = 0;
     owned_alloc_context = "";
-    owned_allocation_recording_enabled_cache = null;
+    owned_allocation_recording_enabled_cache.store(0, .monotonic);
     owned_allocation_records = @as([owned_peak_snapshot_capacity]OwnedAllocationRecord, @splat(.{}));
 }
 
@@ -426,6 +500,7 @@ pub const DeviceStorage = struct {
     /// When present, the host fields (`data`/`len`) point to this cached
     /// mirror. `mirror_owned` tracks whether deinit must free it.
     mirror_owned: bool = false,
+    mirror_generation: u64 = 0,
 };
 
 extern fn termite_metal_buffer_alloc(
@@ -438,8 +513,21 @@ extern fn termite_metal_buffer_alloc_fresh(
     length: usize,
     storage_mode: c_int,
 ) ?*anyopaque;
+extern fn termite_metal_buffer_allocated_size(handle: *anyopaque) usize;
 extern fn termite_metal_buffer_release(handle: *anyopaque) void;
+extern fn antfly_metal_workspace_retain_reference(handle: *anyopaque, owns_handle: c_int) c_int;
+extern fn antfly_metal_workspace_validate_reference_release(handle: *anyopaque, current: *const @import("../execution/cleanup_context.zig").Context, accepted: *const anyopaque) c_int;
+extern fn antfly_metal_workspace_begin_reference_release(handle: *anyopaque, current: *const @import("../execution/cleanup_context.zig").Context) ?*anyopaque;
+extern fn antfly_metal_workspace_finish_reference_release(reference: *anyopaque, current: *const @import("../execution/cleanup_context.zig").Context) c_int;
+extern fn antfly_metal_workspace_begin_runtime_use(reference: *anyopaque, runtime: *anyopaque, endpoint_use: *?*@import("metal_runtime_lifetime.zig").Lifetime) c_int;
+extern fn antfly_metal_decode_runtime_release_workspace_buffer(runtime: *anyopaque, handle: *anyopaque, current: *const @import("../execution/cleanup_context.zig").Context) void;
+fn registerWorkspaceReference(handle: *anyopaque, owns_handle: bool) bool {
+    const result = antfly_metal_workspace_retain_reference(handle, @intFromBool(owns_handle));
+    if (result < 0) @import("antfly_platform").inference_process_supervisor.restartWorker();
+    return result != 0;
+}
 extern fn termite_metal_decode_runtime_release_buffer(runtime: *anyopaque, handle: *anyopaque) void;
+extern fn antfly_metal_decode_runtime_release_charged_buffer(runtime: *anyopaque, handle: *anyopaque) void;
 extern fn termite_metal_buffer_contents(handle: *anyopaque) ?*anyopaque;
 extern fn termite_metal_buffer_download(
     runtime: *anyopaque,
@@ -448,6 +536,11 @@ extern fn termite_metal_buffer_download(
     dst: *anyopaque,
     length: usize,
 ) c_int;
+fn downloadBuffer(runtime: *anyopaque, handle: *anyopaque, offset: usize, output: *anyopaque, bytes: usize) !void {
+    try transfer_audit.checkDeviceHostAccess();
+    if (termite_metal_buffer_download(runtime, handle, offset, output, bytes) != 0) return error.MetalBufferDownloadFailed;
+    transfer_audit.download(bytes);
+}
 extern fn termite_metal_decode_runtime_flush_active_frame(runtime: *anyopaque) c_int;
 extern fn termite_metal_decode_runtime_has_active_frame(runtime: *anyopaque) c_int;
 extern fn termite_metal_decode_runtime_retain_active_frame_buffer(runtime: *anyopaque, handle: *anyopaque) c_int;
@@ -468,6 +561,12 @@ extern fn termite_metal_buffer_copy(
 ) c_int;
 
 pub const MetalTensor = struct {
+    /// Null means this foreign backing cannot prove all writers. Caches may
+    /// borrow it for this invocation but cannot reuse a snapshot next time.
+    pub fn storageVersion(self: *const MetalTensor) ?u64 {
+        return if (self.device) |device| device.ref.generation() else if (self.owned_by_c_allocator) @as(?u64, 0) else null;
+    }
+
     shape_buf: [max_dims]i32 = @as([max_dims]i32, @splat(0)),
     shape_len: u8 = 0,
     dtype: DType = .f32,
@@ -484,6 +583,14 @@ pub const MetalTensor = struct {
     /// alias the Shared-storage contents pointer (zero-copy) or be a cached
     /// host mirror (populated by `toHostSlice`).
     device: ?DeviceStorage = null,
+
+    /// Empty owner used when a multi-stage operation may decline before all
+    /// of its intermediates are initialized. Always safe to deinit.
+    pub const empty: MetalTensor = .{
+        .data = @ptrFromInt(@alignOf(f32)),
+        .len = 0,
+        .owned_by_c_allocator = false,
+    };
 
     pub fn borrowed(data: [*]f32, len: usize, dims: []const i32) MetalTensor {
         std.debug.assert(dims.len <= max_dims);
@@ -573,6 +680,20 @@ pub const MetalTensor = struct {
         byte_len: usize,
         dims: []const i32,
     ) MetalTensor {
+        return deviceBorrowedChecked(runtime, handle, byte_offset, byte_len, dims) catch @panic("Metal buffer ref alloc failed");
+    }
+
+    pub fn deviceReferenceMetadataBytes() usize {
+        return @sizeOf(DeviceBufferRef);
+    }
+
+    pub fn deviceBorrowedChecked(
+        runtime: *anyopaque,
+        handle: *anyopaque,
+        byte_offset: usize,
+        byte_len: usize,
+        dims: []const i32,
+    ) !MetalTensor {
         std.debug.assert(dims.len <= max_dims);
         var t = MetalTensor{
             .shape_len = @intCast(dims.len),
@@ -580,50 +701,156 @@ pub const MetalTensor = struct {
             .len = 0,
             .owned_by_c_allocator = false,
             .device = .{
-                .ref = createDeviceBufferRef(runtime, handle, false, byte_len),
+                .ref = try createDeviceBufferRefChecked(runtime, handle, false, byte_len),
                 .byte_offset = byte_offset,
                 .byte_len = byte_len,
             },
         };
-        memory_stats.device_borrowed_tensors_created += 1;
+        memoryAdd(.device_borrowed_tensors_created, 1);
         for (dims, 0..) |axis_dim, i| t.shape_buf[i] = axis_dim;
         return t;
     }
 
+    /// A view pins the plan's backing lease, and every retained metadata view
+    /// shares that pin. The original backing reference remains independent.
+    /// Allocate the ownership record before taking the pin so OOM is atomic.
+    pub fn deviceLeasedView(allocator: std.mem.Allocator, source: *const MetalTensor, lease: *@import("../ops/physical_storage.zig").Lease, dims: []const i32) !MetalTensor {
+        const device = source.device orelse return error.UnsupportedTensorType;
+        const handle = source.deviceHandle() orelse return error.ReleasedDeviceBuffer;
+        if (source.dtype != .f32 or dims.len > max_dims) return error.UnsupportedTensorType;
+        var elements: usize = 1;
+        for (dims) |extent| {
+            if (extent < 0) return error.InvalidTensorShape;
+            elements = try std.math.mul(usize, elements, @intCast(extent));
+        }
+        const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+        if (bytes > device.byte_len) return error.InvalidTensorShape;
+        const ref = try allocator.create(DeviceBufferRef);
+        ref.* = .{
+            .handle = handle,
+            .runtime = device.ref.runtime,
+            .byte_len = bytes,
+            .ref_count = .init(1),
+            .released = false,
+            .release_on_drop = false,
+            .recycle_on_drop = false,
+            .allocator = allocator,
+            .physical_lease = lease,
+            .write_owner = device.ref.write_owner orelse device.ref,
+        };
+        lease.retain();
+        memoryAdd(.device_borrowed_tensors_created, 1);
+        return deviceView(ref, device.byte_offset, bytes, dims, .f32);
+    }
+
+    /// True only for storage whose execution-plan lease pins every view and
+    /// prevents frame reuse while any published value remains alive.
+    pub fn hasWorkspaceReference(self: *const MetalTensor) bool {
+        return if (self.device) |device| device.ref.workspace_reference else false;
+    }
+
+    /// Private synchronous leaf-use lookup. The actual owning Ref holds the
+    /// SDK/tag/Root metadata throughout this call. Descriptor acceptance is
+    /// checked in C BEFORE returning a typed Root; no retain-count guessing.
+    pub fn workspaceRootForUse(self: *const MetalTensor) !?*@import("metal_workspace_ownership.zig").Root {
+        const device = self.device orelse return null;
+        if (device.ref.released or device.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
+        if (!device.ref.workspace_reference) return null;
+        const ownership = @import("metal_workspace_ownership.zig");
+        var root: ?*ownership.Root = null;
+        const status = antfly_metal_workspace_root_for_use(device.ref.handle, &ownership.RootOperations.canonical, &root);
+        if (status < 0) return error.UnsupportedWorkspaceRoot;
+        return root;
+    }
+    pub fn hasPhysicalLease(self: *const MetalTensor) bool {
+        const device = self.device orelse return false;
+        return !device.ref.released and device.ref.ref_count.load(.acquire) != 0 and device.ref.physical_lease != null;
+    }
+
     fn createDeviceBufferRef(runtime: *anyopaque, handle: *anyopaque, release_on_drop: bool, byte_len: usize) *DeviceBufferRef {
-        const ref = std.heap.c_allocator.create(DeviceBufferRef) catch @panic("Metal buffer ref alloc failed");
+        return createDeviceBufferRefChecked(runtime, handle, release_on_drop, byte_len) catch @panic("Metal buffer ref alloc failed");
+    }
+
+    fn createDeviceBufferRefChecked(runtime: *anyopaque, handle: *anyopaque, release_on_drop: bool, byte_len: usize) !*DeviceBufferRef {
+        const ref = try std.heap.c_allocator.create(DeviceBufferRef);
         ref.* = .{
             .handle = handle,
             .runtime = runtime,
             .byte_len = byte_len,
-            .ref_count = 1,
+            .ref_count = .init(1),
             .released = false,
             .release_on_drop = release_on_drop,
+            .workspace_reference = registerWorkspaceReference(handle, release_on_drop),
         };
         return ref;
     }
 
     fn retainDeviceBuffer(ref: *DeviceBufferRef) !*DeviceBufferRef {
-        if (ref.released or ref.ref_count == 0) return error.ReleasedDeviceBuffer;
-        ref.ref_count += 1;
-        memory_stats.retained_device_views_created += 1;
+        if (ref.released or ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
+        const previous = ref.ref_count.fetchAdd(1, .monotonic);
+        std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
+        memoryAdd(.retained_device_views_created, 1);
         return ref;
     }
 
     fn releaseDeviceBuffer(ref: *DeviceBufferRef) void {
-        if (ref.ref_count == 0) return;
-        ref.ref_count -= 1;
-        if (ref.ref_count == 0 and ref.release_on_drop and !ref.released) {
-            if (ref.recycle_on_drop)
-                termite_metal_decode_runtime_release_buffer(ref.runtime, ref.handle)
-            else
-                termite_metal_buffer_release(ref.handle);
+        releaseDeviceBufferWithBoundary(ref, null);
+    }
+
+    fn releaseDeviceBufferWithBoundary(ref: *DeviceBufferRef, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        releaseDeviceBufferWithCleanup(ref, .{ .boundary = boundary });
+    }
+    fn validateDeviceBufferCleanup(ref: *const DeviceBufferRef, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+        if (ref.ref_count.load(.acquire) == 0) return; // existing stale diagnostic
+        if (ref.workspace_reference and antfly_metal_workspace_validate_reference_release(ref.handle, &cleanup, &@import("metal_workspace_ownership.zig").RootOperations.canonical) != 0)
+            return error.UnregisteredWorkspaceUse;
+    }
+    fn releaseDeviceBufferWithCleanup(ref: *DeviceBufferRef, cleanup: @import("../execution/cleanup_context.zig").Context) void {
+        validateDeviceBufferCleanup(ref, cleanup) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        releaseDeviceBufferWithValidatedCleanup(ref, cleanup);
+    }
+    fn releaseDeviceBufferWithValidatedCleanup(ref: *DeviceBufferRef, cleanup: @import("../execution/cleanup_context.zig").Context) void {
+        // Preserve stale-handle diagnostics: their fixture owns a zero-count
+        // record directly and must not dispatch a driver release.
+        if (ref.ref_count.load(.acquire) == 0) return;
+        const previous = ref.ref_count.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
+        if (previous != 1) return;
+        // Validate explicit cleanup BEFORE releasing any actual SDK ownership.
+        // The retained object below is PURE witness metadata, not MTLBuffer.
+        const workspace_release = if (ref.workspace_reference)
+            antfly_metal_workspace_begin_reference_release(ref.handle, &cleanup) orelse @import("antfly_platform").inference_process_supervisor.restartWorker()
+        else
+            null;
+        var endpoint_use: ?*@import("metal_runtime_lifetime.zig").Lifetime = null;
+        const endpoint_open = if (workspace_release) |metadata| antfly_metal_workspace_begin_runtime_use(metadata, ref.runtime, &endpoint_use) != 0 else true;
+        if (ref.release_on_drop and !ref.released) {
+            // A charged SDK root can outlive its provider. Once the pure
+            // endpoint pin closes, release our actual SDK handle directly.
+            // An open endpoint NEVER changes charged allowReuse=false policy.
+            if (ref.recycle_on_drop and endpoint_open) {
+                if (workspace_release != null)
+                    antfly_metal_decode_runtime_release_workspace_buffer(ref.runtime, ref.handle, &cleanup)
+                else if (ref.retirement_witnessed.load(.acquire))
+                    antfly_metal_decode_runtime_release_charged_buffer(ref.runtime, ref.handle)
+                else
+                    termite_metal_decode_runtime_release_buffer(ref.runtime, ref.handle);
+            } else termite_metal_buffer_release(ref.handle);
             ref.released = true;
             noteDeviceOwnedRelease(ref.handle, ref.byte_len);
         }
-        if (ref.ref_count == 0) {
-            ref.allocator.destroy(ref);
+        // A borrowed tagged view owns a separate SDK retain but remains a
+        // borrowed diagnostic allocation; do not decrement owned-byte stats.
+        if (ref.workspace_reference and !ref.release_on_drop and !ref.released)
+            termite_metal_buffer_release(ref.handle);
+        if (workspace_release) |metadata| {
+            if (endpoint_use) |pin| pin.endUse();
+            if (antfly_metal_workspace_finish_reference_release(metadata, &cleanup) != 0)
+                @import("antfly_platform").inference_process_supervisor.restartWorker();
         }
+        const lease = ref.physical_lease;
+        ref.allocator.destroy(ref);
+        if (lease) |owner| owner.releaseWithCleanup(cleanup);
     }
 
     /// Allocate a device buffer of `byte_len` bytes on the runtime's Metal
@@ -687,6 +914,19 @@ pub const MetalTensor = struct {
         return deviceAllocateChecked(allocator, runtime, try std.math.mul(usize, count, dtype.byteSize()), mode, dims, false, dtype);
     }
 
+    /// Physical bank allocation installs nonrecycling authority before any
+    /// SDK object can escape through active command-buffer retention.
+    pub fn deviceAllocatePhysicalWithAllocator(
+        allocator: std.mem.Allocator,
+        runtime: *anyopaque,
+        byte_len: usize,
+        mode: StorageMode,
+        dims: []const i32,
+        admitted: bool,
+    ) !MetalTensor {
+        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, true, .f32, admitted);
+    }
+
     fn deviceAllocateChecked(
         allocator: std.mem.Allocator,
         runtime: *anyopaque,
@@ -695,6 +935,19 @@ pub const MetalTensor = struct {
         dims: []const i32,
         fresh: bool,
         dtype: DType,
+    ) !MetalTensor {
+        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, fresh, dtype, false);
+    }
+
+    fn deviceAllocateCheckedImpl(
+        allocator: std.mem.Allocator,
+        runtime: *anyopaque,
+        byte_len: usize,
+        mode: StorageMode,
+        dims: []const i32,
+        fresh: bool,
+        dtype: DType,
+        admitted: bool,
     ) !MetalTensor {
         if (dims.len > max_dims) return error.InvalidTensorShape;
         var elements: usize = 1;
@@ -720,9 +973,11 @@ pub const MetalTensor = struct {
             .handle = handle,
             .runtime = runtime,
             .byte_len = byte_len,
-            .ref_count = 1,
+            .ref_count = .init(1),
             .released = false,
             .release_on_drop = true,
+            .retirement_witnessed = .init(admitted),
+            .workspace_reference = registerWorkspaceReference(handle, true),
             .allocator = allocator,
         };
         var result = deviceView(ref, 0, byte_len, dims, dtype);
@@ -748,6 +1003,27 @@ pub const MetalTensor = struct {
         errdefer tensor.deinit();
         try tensor.retainForActiveFrame();
         return tensor;
+    }
+
+    /// Read within the source's scope without copying host payloads. Device
+    /// views retain storage and own any mirror they later materialize; callers
+    /// must deinit the view. Host views borrow their source's lifetime.
+    pub fn readView(self: *const MetalTensor) !MetalTensor {
+        if (self.device) |d| {
+            var view = deviceView(try retainDeviceBuffer(d.ref), d.byte_offset, d.byte_len, self.shape(), self.dtype);
+            // Reuse an existing cache while its source is alive. Private
+            // caches still refresh after a frame flush, but the view never
+            // frees the source's allocation.
+            if (self.len != 0) {
+                view.data = self.data;
+                view.len = self.len;
+                view.device.?.mirror_owned = d.mirror_owned;
+                view.device.?.mirror_generation = d.mirror_generation;
+            }
+            return view;
+        }
+        if (self.dtype != .f32) return error.UnsupportedTensorType;
+        return borrowed(self.data, self.len, self.shape());
     }
 
     pub fn retainedCopy(self: *const MetalTensor) !MetalTensor {
@@ -826,6 +1102,7 @@ pub const MetalTensor = struct {
             if (termite_metal_buffer_copy(d.ref.runtime, d.ref.handle, d.byte_offset + byte_offset_delta, copied, 0, byte_len) != 0) {
                 return error.MetalBufferCopyFailed;
             }
+            transfer_audit.deviceCopy(byte_len);
             var result = deviceOwned(d.ref.runtime, copied, 0, byte_len, dims);
             result.dtype = self.dtype;
             return result;
@@ -838,13 +1115,28 @@ pub const MetalTensor = struct {
     }
 
     pub fn deinit(self: *MetalTensor) void {
+        self.deinitWithCleanup(.{ .outside_execution = true });
+    }
+
+    /// Forward only the current actual destruction boundary. A nonfinal view
+    /// drop stores no epoch for later destruction by a different owner.
+    pub fn deinitWithBoundary(self: *MetalTensor, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        self.deinitWithCleanup(.{ .boundary = boundary });
+    }
+    pub fn deinitWithCleanup(self: *MetalTensor, cleanup: @import("../execution/cleanup_context.zig").Context) void {
+        self.deinitWithCleanupChecked(cleanup) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+    /// Failure-atomic authority check precedes host mirror, shared Ref and SDK
+    /// mutation. The caller holds its actual B through this synchronous drop.
+    pub fn deinitWithCleanupChecked(self: *MetalTensor, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
         if (self.device) |*d| {
+            try validateDeviceBufferCleanup(d.ref, cleanup);
             // If the host view was a c_allocator-owned mirror, free it.
             if (d.mirror_owned and self.owned_by_c_allocator) {
                 noteHostMirrorFree(self.len * @sizeOf(f32));
                 std.heap.c_allocator.free(self.data[0..self.len]);
             }
-            releaseDeviceBuffer(d.ref);
+            releaseDeviceBufferWithValidatedCleanup(d.ref, cleanup);
         } else if (self.owned_by_c_allocator) {
             std.heap.c_allocator.free(self.data[0..self.len]);
         }
@@ -881,15 +1173,34 @@ pub const MetalTensor = struct {
         return self.device != null;
     }
 
+    /// An allocating Ref on the exact model-pinned shared runtime can outlive
+    /// its request Engine without any byte copy. External/frame aliases and
+    /// physical Lease roots need a separate backend-lifetime proof and decline.
+    fn hasStatelessProcessMetadata(allocator: std.mem.Allocator) bool {
+        // These exact implementations ignore ptr and own process-global state.
+        // Never inspect ptr: the standard stateless allocators leave it undefined.
+        // Compare PageAllocator directly; std.heap.page_allocator can be overridden
+        // by a root allocator which has an independent owner lifetime.
+        if (comptime @import("builtin").link_libc) if (allocator.vtable == std.heap.c_allocator.vtable) return true;
+        return allocator.vtable == &std.heap.PageAllocator.vtable or allocator.vtable == &std.heap.SmpAllocator.vtable;
+    }
+    pub fn canDetachDenseF32Allocation(self: *const MetalTensor, runtime: *anyopaque) bool {
+        const device = self.device orelse return false;
+        const ref = device.ref;
+        return hasStatelessProcessMetadata(ref.allocator) and self.dtype == .f32 and ref.runtime == runtime and !ref.released and
+            ref.ref_count.load(.acquire) != 0 and ref.release_on_drop and ref.recycle_on_drop and
+            ref.physical_lease == null and ref.write_owner == null;
+    }
+
     pub fn isOwnedDeviceBuffer(self: *const MetalTensor) bool {
         const d = self.device orelse return false;
-        if (d.ref.released or d.ref.ref_count == 0) return false;
+        if (d.ref.released or d.ref.ref_count.load(.acquire) == 0) return false;
         return d.ref.release_on_drop;
     }
 
     pub fn deviceHandle(self: *const MetalTensor) ?*anyopaque {
         if (self.device) |d| {
-            if (d.ref.released or d.ref.ref_count == 0) return null;
+            if (d.ref.released or d.ref.ref_count.load(.acquire) == 0) return null;
             return d.ref.handle;
         }
         return null;
@@ -898,6 +1209,30 @@ pub const MetalTensor = struct {
     pub fn deviceByteOffset(self: *const MetalTensor) usize {
         if (self.device) |d| return d.byte_offset;
         return 0;
+    }
+
+    /// Actual rounded MTLResource span retained by every view of this buffer.
+    /// This is allocated address space, not physical device residency.
+    /// Actual legacy allocation origin, not device interoperability. Admitted
+    /// physical banks keep their independent reservation through all leased
+    /// views, so retaining a second whole run lease would duplicate charge.
+    pub fn retirementBacking(self: *const MetalTensor) ?struct { runtime: *anyopaque, handle: *anyopaque } {
+        const device = self.device orelse return null;
+        if (device.ref.physical_lease) |lease| if (lease.admission != null) return null;
+        const ref = device.ref.write_owner orelse device.ref;
+        if (!ref.release_on_drop or !ref.recycle_on_drop) return null;
+        return .{ .runtime = ref.runtime, .handle = ref.handle };
+    }
+
+    pub fn noteRetirementWitnessed(self: *const MetalTensor) void {
+        const device = self.device orelse return;
+        const ref = device.ref.write_owner orelse device.ref;
+        ref.retirement_witnessed.store(true, .release);
+    }
+
+    pub fn allocatedDeviceBytes(self: *const MetalTensor) ?usize {
+        const handle = self.deviceHandle() orelse return null;
+        return termite_metal_buffer_allocated_size(handle);
     }
 
     /// Physical allocation retained by a view, for lifetime admission.
@@ -918,8 +1253,85 @@ pub const MetalTensor = struct {
         if (rc != 0) return error.MetalFrameRetainFailed;
     }
 
+    pub fn isReadOnlyPhysical(self: *const MetalTensor) bool {
+        const device = self.device orelse return false;
+        const lease = device.ref.physical_lease orelse return false;
+        return lease.isReadOnly();
+    }
+    pub fn physicalLease(self: *const MetalTensor) ?*@import("../ops/physical_storage.zig").Lease {
+        const device = self.device orelse return null;
+        return device.ref.physical_lease;
+    }
+
+    // Draft method in MetalTensor. The compute adapter can layer logical strided
+    // view metadata from Buf without changing this owner's backing identities.
+    pub fn storageOwnership(self: *const MetalTensor, visitor: @import("../execution/storage_ownership.zig").Visitor) anyerror!@import("../execution/storage_ownership.zig").Coverage {
+        const ownership = @import("../execution/storage_ownership.zig");
+        const contracts = @import("../graph/backend_contracts.zig");
+        const ml = @import("ml");
+        const dev = self.device orelse return .unknown;
+        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
+        const owner = dev.ref.write_owner orelse dev.ref;
+        const lease = dev.ref.physical_lease;
+        const allocation_owned = owner.release_on_drop and owner.recycle_on_drop;
+        const identity = ownership.Identity{ .kind = .metal, .context = owner.runtime, .base = @intFromPtr(owner.handle) };
+        const backing_bytes = self.allocatedDeviceBytes();
+        var span = ownership.Span{
+            .identity = identity,
+            .domain = .backend,
+            .requested_bytes = if (allocation_owned) owner.byte_len else null,
+            .backing_bytes = backing_bytes,
+            .ownership = if (allocation_owned or lease != null) .allocation else .unknown,
+            .access = if (lease) |physical| (if (physical.accounting_class == .constant) .read_only else .writable) else (if (allocation_owned) .writable else .unknown),
+        };
+        if (lease) |physical| {
+            if (physical.admission) |reserved| span.charged = .{ .identity = reserved.identity, .bytes = physical.admittedBytes() };
+        }
+        try visitor.emit(.{ .backing = span });
+        const bytes = backing_bytes orelse return .unknown;
+        if (dev.byte_offset > bytes or dev.byte_len > bytes - dev.byte_offset) return .unknown;
+        var dimensions: [max_dims]i64 = undefined;
+        for (self.shape(), 0..) |dimension, axis| dimensions[axis] = dimension;
+        const dtype: ml.graph.DType = switch (self.dtype) {
+            inline else => |tag| @field(ml.graph.DType, @tagName(tag)),
+        };
+        var descriptor = contracts.TensorDesc.init(ml.graph.Shape.init(dtype, dimensions[0..self.ndim()]), .metal_buffer);
+        descriptor.current_backend = .metal;
+        descriptor.resident_backend = .metal;
+        try visitor.emit(.{
+            .plane = .{
+                .descriptor = descriptor,
+                .role = .primary,
+                .backing = identity,
+                .byte_offset = dev.byte_offset,
+                .logical_bytes = dev.byte_len,
+                .readable_bytes = dev.byte_len,
+                // No padded writable tail is inferred from MTLBuffer.allocatedSize.
+                .writable = null,
+            },
+        });
+        if (dev.mirror_owned) {
+            if (!self.owned_by_c_allocator) return .unknown; // scoped source loan
+            const mirror_bytes = try std.math.mul(usize, self.len, @sizeOf(f32));
+            const mirror_identity = ownership.Identity{ .kind = .host, .base = @intFromPtr(self.data) };
+            try visitor.emit(.{ .backing = .{
+                .identity = mirror_identity,
+                .domain = .host,
+                .requested_bytes = mirror_bytes,
+                .backing_bytes = mirror_bytes,
+                .ownership = .allocation,
+                .access = .writable,
+            } });
+            var mirror_descriptor = contracts.TensorDesc.init(descriptor.shape, .host_f32);
+            mirror_descriptor.current_backend = .native;
+            try visitor.emit(.{ .plane = .{ .descriptor = mirror_descriptor, .role = .host_mirror, .backing = mirror_identity, .byte_offset = 0, .logical_bytes = mirror_bytes, .readable_bytes = mirror_bytes } });
+        }
+        return if (allocation_owned or lease != null) .complete else .unknown;
+    }
+
     pub fn invalidateHostMirror(self: *MetalTensor) void {
         if (self.device) |*d| {
+            d.ref.noteMutation();
             if (d.mirror_owned and self.owned_by_c_allocator) {
                 noteHostMirrorFree(self.len * @sizeOf(f32));
                 std.heap.c_allocator.free(self.data[0..self.len]);
@@ -932,16 +1344,17 @@ pub const MetalTensor = struct {
     }
 
     pub fn copyInto(self: *const MetalTensor, dst: *MetalTensor) !void {
+        if (dst.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
         if (self.dtype != dst.dtype) return error.UnsupportedTensorType;
         const dst_dev = dst.device orelse return error.UnsupportedTensorType;
-        if (dst_dev.ref.released or dst_dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (dst_dev.ref.released or dst_dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
         const byte_len = self.deviceByteLen();
         if (byte_len != dst.deviceByteLen()) return error.InvalidTensorShape;
 
         dst.invalidateHostMirror();
 
         if (self.device) |src_dev| {
-            if (src_dev.ref.released or src_dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+            if (src_dev.ref.released or src_dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
             const rc = termite_metal_buffer_copy(
                 dst_dev.ref.runtime,
                 src_dev.ref.handle,
@@ -951,6 +1364,7 @@ pub const MetalTensor = struct {
                 byte_len,
             );
             if (rc != 0) return error.MetalBufferCopyFailed;
+            transfer_audit.deviceCopy(byte_len);
             return;
         }
 
@@ -963,10 +1377,7 @@ pub const MetalTensor = struct {
             byte_len,
         );
         if (rc != 0) return error.MetalBufferUploadFailed;
-        if (transfer_audit) |audit| {
-            audit.upload_bytes += byte_len;
-            audit.upload_calls += 1;
-        }
+        transfer_audit.upload(byte_len);
     }
 
     /// Explicit bounded readback into caller-owned memory. No persistent host
@@ -980,28 +1391,21 @@ pub const MetalTensor = struct {
     /// passing through an f32 host mirror or mutating resident storage.
     pub fn downloadBytesInto(self: *const MetalTensor, output: []u8) !void {
         const dev = self.device orelse return error.UnsupportedTensorType;
-        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
         if (output.len != dev.byte_len) return error.InvalidTensorShape;
         if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) return error.MetalFrameSyncFailed;
-        if (termite_metal_buffer_download(dev.ref.runtime, dev.ref.handle, dev.byte_offset, @ptrCast(output.ptr), dev.byte_len) != 0)
-            return error.MetalBufferDownloadFailed;
-        if (transfer_audit) |audit| {
-            audit.download_bytes += output.len;
-            audit.download_calls += 1;
-        }
+        try downloadBuffer(dev.ref.runtime, dev.ref.handle, dev.byte_offset, @ptrCast(output.ptr), dev.byte_len);
     }
 
     pub fn uploadBytes(self: *MetalTensor, input: []const u8) !void {
+        if (self.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
         const dev = self.device orelse return error.UnsupportedTensorType;
-        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
         if (input.len != dev.byte_len) return error.InvalidTensorShape;
         self.invalidateHostMirror();
         if (termite_metal_buffer_upload(dev.ref.runtime, dev.ref.handle, dev.byte_offset, input.ptr, input.len) != 0)
             return error.MetalBufferUploadFailed;
-        if (transfer_audit) |audit| {
-            audit.upload_bytes += input.len;
-            audit.upload_calls += 1;
-        }
+        transfer_audit.upload(input.len);
     }
 
     /// Return a host-backed `[]f32` view. For pure host tensors this is
@@ -1009,24 +1413,22 @@ pub const MetalTensor = struct {
     /// if present, otherwise aliases the Shared-storage contents pointer
     /// when available, or allocates + downloads from Private storage.
     pub fn toHostSlice(self: *MetalTensor) ![]f32 {
-        if (self.isDevice()) if (transfer_audit) |audit| {
-            audit.host_accesses += 1;
-        };
+        if (self.device) |device| try transfer_audit.hostAccess(device.byte_len);
         if (self.dtype != .f32) return error.UnsupportedTensorType;
-        memory_stats.to_host_calls += 1;
+        memoryAdd(.to_host_calls, 1);
         if (self.device == null) return self.data[0..self.len];
-        memory_stats.to_host_device_calls += 1;
+        memoryAdd(.to_host_device_calls, 1);
         const dev = &self.device.?;
-        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
         const count = dev.byte_len / @sizeOf(f32);
         const trace_limit = traceToHostLimit();
-        if (to_host_trace_count < trace_limit) {
-            to_host_trace_count += 1;
+        const trace_index = if (trace_limit != 0) to_host_trace_count.fetchAdd(1, .monotonic) else trace_limit;
+        if (trace_index < trace_limit) {
             std.debug.print(
                 "metal_tensor_to_host: caller=0x{x} bytes={d} shape={any} cached_len={d}\n",
                 .{ @returnAddress(), dev.byte_len, self.shape(), self.len },
             );
-            if (to_host_trace_count <= traceToHostStackLimit()) {
+            if (trace_index < traceToHostStackLimit()) {
                 std.debug.dumpCurrentStackTrace(.{
                     .first_address = @returnAddress(),
                     .allow_unsafe_unwind = false,
@@ -1047,20 +1449,21 @@ pub const MetalTensor = struct {
             if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
                 return error.MetalFrameSyncFailed;
             }
-            if (frame_was_active and dev.mirror_owned) {
+            const generation = dev.ref.generation();
+            if (dev.mirror_owned and (frame_was_active or generation == null or dev.mirror_generation != generation.?)) {
                 // Owned mirrors are Private-storage snapshots (Shared
                 // mirrors alias device memory and are coherent after the
                 // flush). Refresh the snapshot so writes queued since it was
                 // taken become visible.
-                const rc = termite_metal_buffer_download(
+                try downloadBuffer(
                     dev.ref.runtime,
                     dev.ref.handle,
                     dev.byte_offset,
                     @ptrCast(self.data),
                     dev.byte_len,
                 );
-                if (rc != 0) return error.MetalBufferDownloadFailed;
             }
+            dev.mirror_generation = dev.ref.generation() orelse 0;
             return self.data[0..self.len];
         }
 
@@ -1080,25 +1483,26 @@ pub const MetalTensor = struct {
             self.len = count;
             self.owned_by_c_allocator = false;
             dev.mirror_owned = false;
-            memory_stats.shared_host_aliases += 1;
+            memoryAdd(.shared_host_aliases, 1);
+            dev.mirror_generation = dev.ref.generation() orelse 0;
             return self.data[0..self.len];
         }
 
         // Fallback: allocate a c_allocator mirror and download Private bytes.
         const buf = try std.heap.c_allocator.alloc(f32, count);
         errdefer std.heap.c_allocator.free(buf);
-        const rc = termite_metal_buffer_download(
+        try downloadBuffer(
             dev.ref.runtime,
             dev.ref.handle,
             dev.byte_offset,
             @ptrCast(buf.ptr),
             dev.byte_len,
         );
-        if (rc != 0) return error.MetalBufferDownloadFailed;
         self.data = buf.ptr;
         self.len = buf.len;
         self.owned_by_c_allocator = true;
         dev.mirror_owned = true;
+        dev.mirror_generation = dev.ref.generation() orelse 0;
         noteHostMirrorAlloc(dev.byte_len);
         return buf;
     }
@@ -1114,20 +1518,19 @@ pub const MetalTensor = struct {
     /// scope (graph outputs read after the owning frame completed).
     pub fn syncHostMirror(self: *MetalTensor) !void {
         if (self.device) |*dev| {
-            if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+            if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
             if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
                 return error.MetalFrameSyncFailed;
             }
             const count = dev.byte_len / @sizeOf(f32);
             if (self.len == count and dev.mirror_owned) {
-                const rc = termite_metal_buffer_download(
+                try downloadBuffer(
                     dev.ref.runtime,
                     dev.ref.handle,
                     dev.byte_offset,
                     @ptrCast(self.data),
                     dev.byte_len,
                 );
-                if (rc != 0) return error.MetalBufferDownloadFailed;
             }
         }
     }
@@ -1141,21 +1544,20 @@ pub const MetalTensor = struct {
             for (self.data[0..self.len]) |v| acc += @abs(v);
             return acc;
         };
-        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
         if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
             return error.MetalFrameSyncFailed;
         }
         const count = dev.byte_len / @sizeOf(f32);
         const buf = try std.heap.c_allocator.alloc(f32, count);
         defer std.heap.c_allocator.free(buf);
-        const rc = termite_metal_buffer_download(
+        try downloadBuffer(
             dev.ref.runtime,
             dev.ref.handle,
             dev.byte_offset,
             @ptrCast(buf.ptr),
             dev.byte_len,
         );
-        if (rc != 0) return error.MetalBufferDownloadFailed;
         var acc: f64 = 0;
         for (buf) |v| acc += @abs(v);
         return acc;
@@ -1167,7 +1569,7 @@ pub const MetalTensor = struct {
     /// the reduce kernel's output.
     pub fn debugRawDeviceRowSumAbs(self: *MetalTensor, row_count: usize, row_width: usize) !f64 {
         const dev = if (self.device) |*d| d else return error.UnsupportedTensorType;
-        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (dev.ref.released or dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
         if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
             return error.MetalFrameSyncFailed;
         }
@@ -1175,14 +1577,13 @@ pub const MetalTensor = struct {
         if (row_count * row_width > count) return error.InvalidTensorShape;
         const buf = try std.heap.c_allocator.alloc(f32, count);
         defer std.heap.c_allocator.free(buf);
-        const rc = termite_metal_buffer_download(
+        try downloadBuffer(
             dev.ref.runtime,
             dev.ref.handle,
             dev.byte_offset,
             @ptrCast(buf.ptr),
             dev.byte_len,
         );
-        if (rc != 0) return error.MetalBufferDownloadFailed;
         var acc: f64 = 0;
         for (0..row_count) |r| {
             var row_sum: f64 = 0;
@@ -1224,7 +1625,7 @@ test "MetalTensor retainedCopy reports stale device refs without aborting" {
         .handle = @ptrFromInt(@alignOf(f32)),
         .runtime = @ptrFromInt(@alignOf(f32)),
         .byte_len = 4 * @sizeOf(f32),
-        .ref_count = 0,
+        .ref_count = .init(0),
         .released = true,
         .release_on_drop = true,
     };
@@ -1233,4 +1634,185 @@ test "MetalTensor retainedCopy reports stale device refs without aborting" {
     defer stale.deinit();
 
     try std.testing.expectError(error.ReleasedDeviceBuffer, stale.retainedCopy());
+}
+
+test "Metal source write versions become permanently unknown at exhaustion through aliases" {
+    var owner = DeviceBufferRef{
+        .handle = @ptrFromInt(@alignOf(f32)),
+        .runtime = @ptrFromInt(@alignOf(f32)),
+        .byte_len = 4,
+        .ref_count = .init(1),
+        .released = false,
+        .release_on_drop = true,
+        .write_generation = .init(std.math.maxInt(u64) - 2),
+    };
+    var alias = DeviceBufferRef{
+        .handle = owner.handle,
+        .runtime = owner.runtime,
+        .byte_len = 4,
+        .ref_count = .init(1),
+        .released = false,
+        .release_on_drop = false,
+        .write_owner = &owner,
+    };
+    alias.noteMutation();
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64) - 1), owner.generation());
+    try std.testing.expectEqual(owner.generation(), alias.generation());
+    owner.noteMutation();
+    try std.testing.expectEqual(@as(?u64, null), alias.generation());
+    for (0..16) |_| {
+        alias.noteMutation();
+        owner.noteMutation();
+    }
+    try std.testing.expectEqual(std.math.maxInt(u64), owner.write_generation.load(.acquire));
+    try std.testing.expectEqual(@as(?u64, null), owner.generation());
+}
+
+test "dense detached Ref metadata accepts exact stateless process allocators and declines owner allocators" {
+    const runtime: *anyopaque = @ptrFromInt(16);
+    var ref = DeviceBufferRef{ .handle = @ptrFromInt(32), .runtime = runtime, .byte_len = 16, .ref_count = .init(1), .released = false, .release_on_drop = true };
+    const tensor = MetalTensor.deviceView(&ref, 0, 16, &.{4}, .f32);
+    try std.testing.expect(tensor.canDetachDenseF32Allocation(runtime));
+    ref.allocator = .{ .ptr = undefined, .vtable = &std.heap.PageAllocator.vtable };
+    try std.testing.expect(tensor.canDetachDenseF32Allocation(runtime));
+    ref.allocator = std.heap.smp_allocator;
+    try std.testing.expect(tensor.canDetachDenseF32Allocation(runtime));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    ref.allocator = arena.allocator();
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(runtime));
+    ref.allocator = std.testing.allocator;
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(runtime));
+    ref.allocator = std.heap.c_allocator;
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(@ptrFromInt(64)));
+    ref.recycle_on_drop = false;
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(runtime));
+    ref.recycle_on_drop = true;
+    ref.release_on_drop = false;
+    try std.testing.expect(!tensor.canDetachDenseF32Allocation(runtime));
+}
+
+extern fn antfly_metal_workspace_root_for_use(handle: *anyopaque, accepted: *const @import("metal_workspace_ownership.zig").RootOperations, root: *?*@import("metal_workspace_ownership.zig").Root) c_int;
+
+test "Metal nonfinal workspace alias refuses unregistered actual B before mirror Ref or SDK mutation" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const runtime_mod = @import("metal_runtime.zig");
+    if (!runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const ownership = @import("metal_workspace_ownership.zig");
+    const Fence = @import("metal_workspace_fence.zig").Fence;
+    const R = @import("../execution/resource_retirement.zig");
+    const Sink = @import("../execution/retirement_sink.zig");
+    const memory = @import("../runtime/tier/memory.zig");
+    const storage = @import("../execution/storage_admission.zig");
+    const Probe = struct {
+        sdk_refs: std.atomic.Value(usize) = .init(0),
+        deaths: usize = 0,
+        fn retain(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.sdk_refs.fetchAdd(1, .monotonic);
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.sdk_refs.fetchSub(1, .release);
+        }
+        fn metadata(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.sdk_refs.load(.acquire) == 0);
+            self.deaths += 1;
+        }
+        extern fn antfly_metal_workspace_witness_tag(*anyopaque, *ownership.Root, *const ownership.RootOperations) c_int;
+    };
+    var probe: Probe = .{};
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    var reservation: ?storage.Reservation = .{ .identity = .{ .controller = &controller, .backend_class = .gpu }, .leases = .{ try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 4096 }, false), null }, .domain = .backend };
+    var domain: ?@import("../runtime/tier/admission_domain.zig").Pin = null;
+    const charge = try R.Charge.createReservation(&reservation, &domain);
+    var root: ownership.Root = undefined;
+    root.init(charge, .{ .context = &probe, .release = Probe.metadata });
+    var creator_live = true;
+    defer if (creator_live) root.releaseCreator(.{ .outside_execution = true }) catch unreachable;
+    // Actual fixture retains pure metadata until every real SDK owner is gone;
+    // SDK callbacks merely change atomics, never quota or Root metadata.
+    const sdk_pin = root.retainSnapshot();
+    var sdk_pin_live = true;
+    defer if (sdk_pin_live) sdk_pin.release(sdk_pin.context);
+    const initial = try Fence.prepare();
+    defer initial.deinitOutsideExecution();
+    const receiver = try Fence.prepare();
+    defer receiver.deinitOutsideExecution();
+    var source = try Sink.Ref.create();
+    defer source.release();
+    var origin = try source.enter();
+    defer origin.finish();
+    var foreign = try source.enter();
+    defer foreign.finish();
+    var a = try origin.retainEpoch();
+    defer a.release();
+    var b = try foreign.retainEpoch();
+    defer b.release();
+    try initial.bindInitialBackingBeforePublication(&root.backing);
+    try initial.retire(.{ .boundary = &a }); // actual fresh use registered BEFORE SDK
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    var provider_live = true;
+    defer if (provider_live) provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.ExpectedActualMetalRuntime;
+    const handle = runtime_mod.termite_metal_buffer_alloc_fresh(runtime, 512, 1) orelse return error.OutOfMemory;
+    var raw_live = true;
+    defer if (raw_live) runtime_mod.termite_metal_buffer_release(handle);
+    const zeros: [128]f32 = @splat(0);
+    try std.testing.expectEqual(@as(c_int, 0), runtime_mod.termite_metal_buffer_upload(runtime, handle, 0, &zeros, @sizeOf(@TypeOf(zeros))));
+    const handles = [_]*anyopaque{handle};
+    var witness_metadata = try R.BackendPreparation.prepare(std.testing.allocator, .metal, 1, 1);
+    defer witness_metadata.deinit(std.testing.allocator);
+    const witnesses = try witness_metadata.armMetal(null, &handles, R.Payload{ .context = &probe, .retain_fn = Probe.retain, .release_fn = Probe.release });
+    var witnesses_live = true;
+    defer if (witnesses_live) runtime_mod.antfly_metal_discard_retirement_witnesses(witnesses);
+    try std.testing.expectEqual(@as(c_int, 0), Probe.antfly_metal_workspace_witness_tag(witnesses, &root, &ownership.RootOperations.canonical));
+    try std.testing.expectEqual(@as(c_int, 0), runtime_mod.antfly_metal_buffer_retirement_attach(witnesses));
+    var tensor = MetalTensor.deviceOwned(@ptrCast(runtime), handle, 0, 512, &.{128});
+    raw_live = false;
+    var tensor_live = true;
+    defer if (tensor_live) tensor.deinitWithCleanup(.{ .outside_execution = true });
+    var alias = try tensor.retainedCopy();
+    var alias_live = true;
+    defer if (alias_live) alias.deinitWithCleanup(.{ .outside_execution = true });
+    const mirror = try alias.toHostSlice();
+    try std.testing.expect(alias.device.?.mirror_owned and alias.owned_by_c_allocator);
+    const ref = alias.device.?.ref;
+    try std.testing.expectEqual(@as(usize, 2), ref.ref_count.load(.acquire));
+    const logical_before = root.logical_references.load(.acquire);
+    const before = runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expectError(error.UnregisteredWorkspaceUse, alias.deinitWithCleanupChecked(.{ .boundary = &b }));
+    try std.testing.expect(alias.device.?.ref == ref and alias.data == mirror.ptr and alias.device.?.mirror_owned and alias.owned_by_c_allocator);
+    try std.testing.expectEqual(@as(usize, 2), ref.ref_count.load(.acquire));
+    try std.testing.expectEqual(logical_before, root.logical_references.load(.acquire));
+    try std.testing.expectEqualDeep(before, runtime_mod.runtimeMemorySnapshot(runtime));
+    // An independently prepared receiving cell makes exactly B legal, while
+    // A remains independently registered; one cannot substitute for the other.
+    try receiver.bindBackingOutsideExecution(&root.backing);
+    try receiver.retire(.{ .boundary = &b });
+    try alias.deinitWithCleanupChecked(.{ .boundary = &b });
+    alias_live = false;
+    try std.testing.expectEqual(@as(usize, 1), ref.ref_count.load(.acquire));
+    try std.testing.expectEqual(logical_before, root.logical_references.load(.acquire)); // nonfinal shared Ref did not drop physical Root
+    try root.releaseCreator(.{ .boundary = &a });
+    creator_live = false;
+    try tensor.deinitWithCleanupChecked(.{ .boundary = &a });
+    tensor_live = false;
+    // Checked provider teardown also drains SDK queue/autorelease custody.
+    // The pure use cells/Root remain valid after that actual provider closes.
+    provider.deinitOwned();
+    provider_live = false;
+    runtime_mod.antfly_metal_discard_retirement_witnesses(witnesses);
+    witnesses_live = false;
+    try std.testing.expectEqual(@as(usize, 0), probe.sdk_refs.load(.acquire));
+    sdk_pin.release(sdk_pin.context);
+    sdk_pin_live = false;
+    origin.finish();
+    try std.testing.expectEqual(@as(usize, 4096), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), probe.deaths);
+    foreign.finish();
+    try std.testing.expectEqual(@as(usize, 1), probe.deaths);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
 }

@@ -386,6 +386,15 @@ const run_usage_options =
     \\options:
     \\  --host <address>                    Listen address (default: 127.0.0.1)
     \\  --port <port>                       Listen port (default: 8090)
+    \\  --pjrt-device <cpu|cuda>             Provider (CUDA needs explicit capacities)
+    \\  --pjrt-capacity-bytes <n>            PJRT allocator capacity
+    \\  --pjrt-device-bytes <n>              Physical CUDA capacity
+    \\  --pjrt-unified-memory <true|false>   Shared-memory accounting
+    \\  --pjrt-precision <f32|bf16>          Tensor publication policy
+    \\  --pjrt-gemm <profile>                 provider_default, vendor, vendor_deterministic
+    \\  --pjrt-extraction-batch-size <1..8>  Compiled request batch limit
+    \\  --pjrt-media-bucket-rows <0..256>    Media-prefix shape reuse
+    \\  --pjrt-decoder-cache <auto|true|false> Resident decoder state (default auto)
     \\  --models-dir <path>                 AI model directory
     \\  --ml-dir <path>                     Predictor model directory
     \\  --config <path>                     JSON run configuration
@@ -471,6 +480,8 @@ fn consumeParsedMaxLoadedModelsOption(args: []const []const u8, index: *usize) b
 pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
+    var pjrt_options = inference.pjrt_options.Options{};
+    var pjrt_configured = false;
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(allocator);
@@ -493,7 +504,11 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
+        if (std.mem.startsWith(u8, args[i], "--pjrt-")) {
+            if (i + 1 >= args.len or !try pjrt_options.parse(args[i], args[i + 1])) return error.InvalidArguments;
+            pjrt_configured = true;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
             host = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
@@ -556,6 +571,9 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
             allow_insecure_public_bind = true;
         } else if (std.mem.eql(u8, args[i], "--allow-unknown-models")) {
             allow_unknown_models = true;
+        } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
+            print("{s}", .{run_usage_options});
+            return;
         } else {
             return error.InvalidArguments;
         }
@@ -606,7 +624,14 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         "process memory policy operator_source={s} configured_limit_bytes={d}",
         .{ if (process_memory_resolution.value_mib == null and resource_policy.memory.max_bytes != 0) "config" else @tagName(process_memory_resolution.source), process_memory_limit_bytes },
     );
+    const pjrt_policy = if (pjrt_configured) try pjrt_options.sessionOptions() else null;
     var node_cfg = inference.server.NodeConfig{
+        .pjrt_memory_policy = if (pjrt_policy) |policy| policy.memory_policy else null,
+        .pjrt_precision = pjrt_options.precision,
+        .pjrt_gemm = pjrt_options.gemm,
+        .pjrt_extraction_batch_size = pjrt_options.extraction_batch_size,
+        .pjrt_media_bucket_rows = pjrt_options.media_bucket_rows,
+        .pjrt_decoder_cache = pjrt_options.decoder_cache,
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .generation_budget_overrides = .{

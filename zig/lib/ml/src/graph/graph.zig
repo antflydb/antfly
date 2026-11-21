@@ -58,6 +58,12 @@ pub const Graph = struct {
     /// Deduplicates scalar constants.
     constant_cache: ConstantCache,
 
+    // Content keys retain offsets, so growing the pool cannot invalidate them.
+    constant_blob_heads: std.AutoHashMapUnmanaged(u64, usize) = .{},
+    constant_blobs: std.ArrayListUnmanaged(ConstantBlob) = .empty,
+
+    const ConstantBlob = struct { offset: u32, byte_len: u32, next: ?usize };
+
     pub fn init(allocator: std.mem.Allocator) Graph {
         return .{
             .allocator = allocator,
@@ -77,6 +83,8 @@ pub const Graph = struct {
         self.outputs.deinit(self.allocator);
         self.parameters.deinit(self.allocator);
         self.constant_cache.deinit(self.allocator);
+        self.constant_blob_heads.deinit(self.allocator);
+        self.constant_blobs.deinit(self.allocator);
     }
 
     /// Append a node and return its ID (index).
@@ -147,19 +155,47 @@ pub const Graph = struct {
         return self.internConstantBytes(std.mem.sliceAsBytes(data), .f32);
     }
 
-    /// Generic intern. Stores raw bytes for any supported dtype after
-    /// aligning the pool. The dtype is taken at runtime so a single
-    /// function covers every element type without a comptime
-    /// dispatch. The byte length must be an exact multiple of the
-    /// dtype's element size; the returned `len` is the element count.
+    fn checkedConstantLoc(pool_len: usize, byte_len: usize, dtype: DType) !ConstantLoc {
+        const maximum = std.math.maxInt(u32);
+        if (pool_len > maximum - (constant_pool_alignment_bytes - 1)) return error.Overflow;
+        const offset = std.mem.alignForward(usize, pool_len, constant_pool_alignment_bytes);
+        if (byte_len > maximum - offset) return error.Overflow;
+        return .{ .offset = @intCast(offset), .len = @intCast(byte_len / dtype.byteSize()) };
+    }
+
+    /// Intern aligned, typed bytes; data_len remains an element count.
+    /// Equal immutable byte blobs share storage. Constant nodes keep their
+    /// independent dtype, shape and binding identity; collisions compare bytes.
     pub fn internConstantBytes(self: *Graph, bytes: []const u8, dtype: DType) !ConstantLoc {
         const elem_size = dtype.byteSize();
         std.debug.assert(elem_size > 0);
         std.debug.assert(bytes.len % elem_size == 0);
+        if (bytes.len > std.math.maxInt(u32)) return error.Overflow;
+        const hash = std.hash.Wyhash.hash(0, bytes);
+        var candidate = self.constant_blob_heads.get(hash);
+        while (candidate) |index| {
+            const blob = self.constant_blobs.items[index];
+            if (blob.byte_len == bytes.len and std.mem.eql(u8, self.constant_pool.items[blob.offset..][0..blob.byte_len], bytes)) {
+                return .{ .offset = blob.offset, .len = @intCast(bytes.len / elem_size) };
+            }
+            candidate = blob.next;
+        }
+        const loc = try checkedConstantLoc(self.constant_pool.items.len, bytes.len, dtype);
+        try self.constant_blob_heads.ensureUnusedCapacity(self.allocator, 1);
+        try self.constant_blobs.ensureUnusedCapacity(self.allocator, 1);
+        // An unindexed cloned pool can itself supply this payload. Preserve
+        // that slice before padding or appending reallocates the pool.
+        const start = @intFromPtr(bytes.ptr);
+        const pool_start = @intFromPtr(self.constant_pool.items.ptr);
+        const aliases_pool = bytes.len != 0 and start >= pool_start and start - pool_start < self.constant_pool.items.len;
+        const owned = if (aliases_pool) try self.allocator.dupe(u8, bytes) else null;
+        defer if (owned) |copy| self.allocator.free(copy);
         try self.alignConstantPool();
-        const offset: u32 = @intCast(self.constant_pool.items.len);
-        try self.constant_pool.appendSlice(self.allocator, bytes);
-        return .{ .offset = offset, .len = @intCast(@divExact(bytes.len, elem_size)) };
+        try self.constant_pool.appendSlice(self.allocator, owned orelse bytes);
+        const index = self.constant_blobs.items.len;
+        self.constant_blobs.appendAssumeCapacity(.{ .offset = loc.offset, .byte_len = @intCast(bytes.len), .next = self.constant_blob_heads.get(hash) });
+        self.constant_blob_heads.putAssumeCapacity(hash, index);
+        return loc;
     }
 
     /// Read constant data back as `[]const f32`. Equivalent to the
@@ -401,4 +437,79 @@ test "Graph constant cache deduplication" {
 
     // Different value should miss
     try std.testing.expectEqual(@as(?u32, null), g.constant_cache.getScalar(.f32, 2.0));
+}
+
+test "constant pool offsets reject overflow before allocating or narrowing" {
+    const maximum: usize = std.math.maxInt(u32);
+    const loc = try Graph.checkedConstantLoc(maximum - 7, 4, .f32);
+    try std.testing.expectEqual(@as(u32, @intCast(maximum - 7)), loc.offset);
+    try std.testing.expectEqual(@as(u32, 1), loc.len);
+    try std.testing.expectError(error.Overflow, Graph.checkedConstantLoc(maximum - 7, 8, .f32));
+    try std.testing.expectError(error.Overflow, Graph.checkedConstantLoc(maximum - 1, 0, .f32));
+    if (comptime @bitSizeOf(usize) > 32) try std.testing.expectError(error.Overflow, Graph.checkedConstantLoc(0, maximum + 1, .u8));
+}
+
+test "constant blobs share exact bytes across shapes and element types" {
+    var g = Graph.init(std.testing.allocator);
+    defer g.deinit();
+    // Preserve signed zero and distinct NaN payloads without float equality.
+    const values = [_]u32{ 0x3f800000, 0x80000000, 0x7fc01234, 0 };
+    const first = try g.internConstantBytes(std.mem.sliceAsBytes(&values), .f32);
+    const size = g.constant_pool.items.len;
+    const second = try g.internConstantBytes(std.mem.sliceAsBytes(&values), .f32);
+    const raw = try g.internConstantBytes(std.mem.sliceAsBytes(&values), .u8);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(first.offset, raw.offset);
+    try std.testing.expectEqual(@as(u32, @sizeOf(@TypeOf(values))), raw.len);
+    try std.testing.expectEqual(size, g.constant_pool.items.len);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&values), g.constantBytes(second.offset, @sizeOf(@TypeOf(values))));
+    var distinct = values;
+    distinct[2] ^= 1;
+    const other = try g.internConstantBytes(std.mem.sliceAsBytes(&distinct), .f32);
+    try std.testing.expect(first.offset != other.offset);
+}
+
+test "constant blob hash collisions compare payloads before sharing" {
+    var g = Graph.init(std.testing.allocator);
+    defer g.deinit();
+    const first = try g.internConstantBytes(&.{ 1, 2, 3, 4 }, .u8);
+    const other = [_]u8{ 5, 6, 7, 8 };
+    // Force the second payload into the first payload's collision chain.
+    try g.constant_blob_heads.put(g.allocator, std.hash.Wyhash.hash(0, &other), 0);
+    const second = try g.internConstantBytes(&other, .u8);
+    try std.testing.expect(first.offset != second.offset);
+    const repeated = try g.internConstantBytes(&other, .u8);
+    try std.testing.expectEqual(second, repeated);
+    try std.testing.expectEqualSlices(u8, &other, g.constantBytes(second.offset, second.len));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, g.constantBytes(first.offset, first.len));
+}
+
+test "constant blob append preserves aliases from an unindexed cloned pool" {
+    var g = Graph.init(std.testing.allocator);
+    defer g.deinit();
+    const original = [_]f32{ 1, 2, 3, 4 };
+    const first = try g.internConstant(&original);
+    // Cloning copies payload bytes, but an initially empty index is valid.
+    g.constant_blob_heads.clearRetainingCapacity();
+    g.constant_blobs.clearRetainingCapacity();
+    try g.constant_pool.resize(g.allocator, g.constant_pool.capacity);
+    const source = g.constantBytes(first.offset, @sizeOf(@TypeOf(original)));
+    const repeated = try g.internConstantBytes(source, .f32);
+    try std.testing.expectEqualSlices(f32, &original, g.constantData(repeated.offset, repeated.len));
+}
+
+test "constant blob interning releases partial allocations on failure" {
+    const Probe = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var g = Graph.init(a);
+            defer g.deinit();
+            const original = try g.internConstantBytes(&.{ 1, 2, 3, 4 }, .u8);
+            _ = try g.internConstantBytes(&.{ 5, 6, 7, 8 }, .u8);
+            g.constant_blob_heads.clearRetainingCapacity();
+            g.constant_blobs.clearRetainingCapacity();
+            try g.constant_pool.resize(a, g.constant_pool.capacity);
+            _ = try g.internConstantBytes(g.constantBytes(original.offset, original.len), .u8);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }

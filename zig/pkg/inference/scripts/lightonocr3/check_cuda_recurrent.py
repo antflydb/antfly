@@ -15,7 +15,7 @@
 
 """Qualify the default-off CUDA recurrent candidate with a stdlib CPU oracle.
 
-Compile prototypes/lighton_qwen35_recurrent.cu with nvcc -cubin -arch=sm_121
+Compile prototypes/gated_delta_recurrent.cu with nvcc -cubin -arch=sm_121
 -O3 --fmad=false. This checks F32 state, short-prefix history, continuation,
 reset and output canaries. It is not an end-to-end throughput benchmark.
 """
@@ -266,7 +266,7 @@ def main():
                     if args.parallel_prefix
                     else "lighton_conv_cached_gates"
                     if args.cached_gates
-                    else "lighton_conv",
+                    else "antfly_gdn_causal_conv",
                     ((channels + 127) // 128, seq if args.parallel_prefix else 1),
                     128,
                     *conv_args,

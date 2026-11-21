@@ -20,7 +20,7 @@
 // in order, threading the graph through each pass.
 //
 // Pre-defined pipelines:
-//   default: const_fold → fuse → cse   (standard optimization)
+//   default: const_fold → cse → fuse → dce → cse (fixed point)
 //   cleanup: dce only                   (minimal cleanup)
 
 const std = @import("std");
@@ -43,8 +43,12 @@ pub const Pass = enum {
 pub const PipelineResult = struct {
     graph: Graph,
     stats: Stats,
+    /// Original node IDs to final IDs; null_node denotes an eliminated value.
+    /// Includes rewrites, so external input/output/weight bindings stay valid.
+    id_map: []NodeId,
 
     pub fn deinit(self: *PipelineResult) void {
+        self.graph.allocator.free(self.id_map);
         self.graph.deinit();
     }
 };
@@ -94,10 +98,13 @@ pub const Pipeline = struct {
     pub fn run(self: Pipeline, allocator: std.mem.Allocator, input: *const Graph) !PipelineResult {
         var current = try cloneGraph(allocator, input);
         errdefer current.deinit();
+        const id_map = try allocator.alloc(NodeId, input.nodeCount());
+        errdefer allocator.free(id_map);
+        for (id_map, 0..) |*id, i| id.* = @intCast(i);
         var stats = Stats{};
 
         if (self.passes.len == 0) {
-            return .{ .graph = current, .stats = stats };
+            return .{ .graph = current, .stats = stats, .id_map = id_map };
         }
 
         var iter: u32 = 0;
@@ -110,6 +117,7 @@ pub const Pipeline = struct {
                         const result = try const_fold_mod.fold(allocator, &current);
                         if (result.num_folded > 0) any_rewrite = true;
                         stats.num_folded += result.num_folded;
+                        composeMappings(id_map, result.id_map);
                         allocator.free(result.id_map);
                         current.deinit();
                         current = result.graph;
@@ -118,6 +126,7 @@ pub const Pipeline = struct {
                         const result = try fuse_mod.fuse(allocator, &current);
                         if (result.num_rewrites > 0) any_rewrite = true;
                         stats.num_fused += result.num_rewrites;
+                        composeMappings(id_map, result.id_map);
                         allocator.free(result.id_map);
                         current.deinit();
                         current = result.graph;
@@ -126,6 +135,7 @@ pub const Pipeline = struct {
                         const result = try cse_mod.eliminate(allocator, &current);
                         if (result.num_eliminated > 0) any_rewrite = true;
                         stats.num_cse += result.num_eliminated;
+                        composeMappings(id_map, result.id_map);
                         allocator.free(result.id_map);
                         current.deinit();
                         current = result.graph;
@@ -136,6 +146,7 @@ pub const Pipeline = struct {
                         const removed = old_count - result.graph.nodeCount();
                         if (removed > 0) any_rewrite = true;
                         stats.num_dce += removed;
+                        composeMappings(id_map, result.id_map);
                         allocator.free(result.id_map);
                         current.deinit();
                         current = result.graph;
@@ -145,9 +156,16 @@ pub const Pipeline = struct {
             if (!any_rewrite) break;
         }
 
-        return .{ .graph = current, .stats = stats };
+        return .{ .graph = current, .stats = stats, .id_map = id_map };
     }
 };
+
+/// Compose in place, without an allocation for every optimization pass.
+fn composeMappings(prior: []NodeId, next: []const NodeId) void {
+    for (prior) |*id| {
+        id.* = if (id.* < next.len) next[id.*] else @import("../node.zig").null_node;
+    }
+}
 
 fn cloneGraph(allocator: std.mem.Allocator, src: *const Graph) !Graph {
     var dst = Graph.init(allocator);
@@ -274,4 +292,130 @@ test "pipeline runs to fixed point" {
     try std.testing.expect(result.stats.num_iterations <= 8);
     // The whole subgraph collapses to a single constant.
     try std.testing.expectEqual(@as(u32, 1), result.graph.nodeCount());
+}
+
+test "pipeline composes redirected bindings and eliminated nodes" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const dead = try b.parameter("unused", Shape.scalar(.f32));
+    const input = try b.parameter("input", Shape.scalar(.f32));
+    const weight = try b.parameter("weight", Shape.scalar(.f32));
+    const two = try b.scalarConst(.f32, 2);
+    const four = try b.mul(two, two);
+    const a = try b.mul(input, weight);
+    const duplicate = try b.mul(input, weight);
+    const output = try b.add(a, duplicate);
+    try graph.markOutput(output);
+    try graph.markOutput(four);
+    try graph.markOutput(duplicate);
+    var result = try Pipeline.default.run(allocator, &graph);
+    defer result.deinit();
+    try std.testing.expectEqual(@import("../node.zig").null_node, result.id_map[dead]);
+    try std.testing.expectEqualStrings("input", result.graph.parameterName(result.graph.node(result.id_map[input])));
+    try std.testing.expectEqualStrings("weight", result.graph.parameterName(result.graph.node(result.id_map[weight])));
+    for (graph.outputs.items, result.graph.outputs.items) |original, final| try std.testing.expectEqual(final, result.id_map[original]);
+    try std.testing.expectEqual(result.id_map[a], result.id_map[duplicate]);
+}
+
+test "pipeline exposes attention after primitive softmax recognition" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    // Build the decomposed SDPA pattern manually:
+    // Q, K, V are [B*H, S, D] = [2, 4, 8]
+    const q = try b.parameter("Q", Shape.init(.f32, &.{ 2, 4, 8 }));
+    const k = try b.parameter("K", Shape.init(.f32, &.{ 2, 4, 8 }));
+    const v = try b.parameter("V", Shape.init(.f32, &.{ 2, 4, 8 }));
+
+    // 1. K^T = transpose(K, [0, 2, 1]) -> [2, 8, 4]
+    const k_t = try b.transpose(k, &.{ 0, 2, 1 });
+
+    // 2. scores = Q @ K^T -> [2, 4, 4]
+    const scores = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 1,
+        } },
+        .output_shape = Shape.init(.f32, &.{ 2, 4, 4 }),
+        .inputs = .{ q, k_t, @import("../node.zig").null_node, @import("../node.zig").null_node },
+        .num_inputs = 2,
+    });
+
+    // 3. scale = scores * (1/sqrt(8))
+    const scale = try b.scalarConst(.f32, 1.0 / @sqrt(8.0));
+    const scaled = try b.mul(scores, scale);
+
+    // 4. probs = softmax(scaled)
+    const in_shape = g.node(scaled).output_shape;
+    const max_val = try g.addNode(.{
+        .op = .{ .reduce_max = .{ .axes = .{ 2, 0, 0, 0, 0, 0, 0, 0 }, .num_axes = 1 } },
+        .output_shape = Shape.init(.f32, &.{ 2, 4, 1 }),
+        .inputs = .{ scaled, @import("../node.zig").null_node, @import("../node.zig").null_node, @import("../node.zig").null_node },
+        .num_inputs = 1,
+    });
+    const max_bc = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = .{ .target_shape = in_shape } },
+        .output_shape = in_shape,
+        .inputs = .{ max_val, @import("../node.zig").null_node, @import("../node.zig").null_node, @import("../node.zig").null_node },
+        .num_inputs = 1,
+    });
+    const shifted = try b.sub(scaled, max_bc);
+    const exp_v = try b.expOp(shifted);
+    const sum_v = try g.addNode(.{
+        .op = .{ .reduce_sum = .{ .axes = .{ 2, 0, 0, 0, 0, 0, 0, 0 }, .num_axes = 1 } },
+        .output_shape = Shape.init(.f32, &.{ 2, 4, 1 }),
+        .inputs = .{ exp_v, @import("../node.zig").null_node, @import("../node.zig").null_node, @import("../node.zig").null_node },
+        .num_inputs = 1,
+    });
+    const sum_bc = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = .{ .target_shape = in_shape } },
+        .output_shape = in_shape,
+        .inputs = .{ sum_v, @import("../node.zig").null_node, @import("../node.zig").null_node, @import("../node.zig").null_node },
+        .num_inputs = 1,
+    });
+    const probs = try b.div(exp_v, sum_bc);
+
+    // 5. output = probs @ V -> [2, 4, 8]
+    const output = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 1,
+        } },
+        .output_shape = Shape.init(.f32, &.{ 2, 4, 8 }),
+        .inputs = .{ probs, v, @import("../node.zig").null_node, @import("../node.zig").null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(output);
+
+    var result = try Pipeline.default.run(allocator, &g);
+    defer result.deinit();
+
+    // Should detect and fuse the SDPA pattern.
+    try std.testing.expect(result.stats.num_iterations >= 2);
+    try std.testing.expectEqual(result.graph.outputs.items[0], result.id_map[output]);
+    var found_sdpa = false;
+    for (0..result.graph.nodeCount()) |idx| {
+        if (std.meta.activeTag(result.graph.node(@intCast(idx)).op) == .fused_sdpa) {
+            const attrs = result.graph.node(@intCast(idx)).op.fused_sdpa;
+            try std.testing.expectEqual(@as(u32, 1), attrs.batch);
+            try std.testing.expectEqual(@as(u32, 2), attrs.num_heads);
+            try std.testing.expectEqual(@as(u32, 4), attrs.seq_len);
+            try std.testing.expectEqual(@as(u32, 8), attrs.head_dim);
+            found_sdpa = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_sdpa);
 }

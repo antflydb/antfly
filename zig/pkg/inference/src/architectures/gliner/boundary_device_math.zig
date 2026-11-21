@@ -426,7 +426,7 @@ pub const Context = struct {
     /// before allocating or dispatching so the caller can use three linears.
     pub fn linearQkv(self: *Context, input: CT, rows: usize, hidden: usize, layer: usize) !?device.PackedQkvResult {
         if (!self.packed_qkv_enabled or !self.resident_weights or self.encoder_precision != .f32 or self.cb.kind() != .metal or
-            self.cb.vtable.glinerBoundaryPackedQkv == null) return null;
+            self.cb.vtable.regions.relative_boundary.packedQkv == null) return null;
         if (layer > std.math.maxInt(u32)) return error.InvalidBoundaryDeviceShape;
         var names: [3][192]u8 = undefined;
         const projections = [_][]const u8{ "query_proj", "key_proj", "value_proj" };

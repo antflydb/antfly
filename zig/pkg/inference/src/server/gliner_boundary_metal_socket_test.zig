@@ -196,8 +196,8 @@ fn inspectBackend(node: *Node, directory: []const u8) !void {
     var managed = try factory.getManagedComputeBackend(loaded.session, budget.allocator(), null, control);
     defer managed.deinit();
     try std.testing.expectEqual(.metal, managed.backend.kind());
-    try std.testing.expect(managed.backend.vtable.glinerBoundaryDevice != null);
-    try std.testing.expect(managed.backend.vtable.glinerBoundaryDownload != null);
+    try std.testing.expect(managed.backend.vtable.regions.relative_boundary.device != null);
+    try std.testing.expect(managed.backend.vtable.regions.relative_boundary.download != null);
     try std.testing.expect(managed.backend.decoderRuntimeReady());
     try std.testing.expect(!managed.backend.decoderRuntimeHasActiveFrame());
     const stats = managed.backend.debugTimingSnapshot();

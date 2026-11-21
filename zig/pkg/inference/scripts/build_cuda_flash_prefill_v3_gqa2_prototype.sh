@@ -24,14 +24,13 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 inference_dir="$(cd -- "${script_dir}/.." && pwd)"
 repo_dir="$(cd -- "${inference_dir}/../../.." && pwd)"
-output_dir="${1:-/tmp/antfly-cuda-flash-prefill-v3-gqa2}"
+output_dir="${1:-${repo_dir}/.benchmark-assets/antfly-cuda-flash-prefill-v3-gqa2}"
 min_blocks_per_sm="${ANTFLY_FLASH_V3_MIN_BLOCKS_PER_SM:-0}"
 cuda_root="${CUDA_HOME:-/usr/local/cuda}"
-nvcc="${cuda_root}/bin/nvcc"
-cuobjdump="${cuda_root}/bin/cuobjdump"
+nvcc="${NVCC:-${cuda_root}/bin/nvcc}"
+cuobjdump="${CUOBJDUMP:-${cuda_root}/bin/cuobjdump}"
 zig="${ANTFLY_ZIG:-${repo_dir}/.tools/zig-x86_64-linux-0.17.0/zig}"
 cuda_source="${inference_dir}/src/ops/cuda/prototypes/gqa_flash_prefill_v3_gqa2_sm89.cu"
-harness_source="${inference_dir}/src/quant_kernel_cuda_flash_prefill_prototype.zig"
 summarizer="${inference_dir}/scripts/summarize_cuda_flash_prefill_v2.py"
 cubin="${output_dir}/gqa_flash_prefill_v3_gqa2_sm89.cubin"
 harness="${output_dir}/antfly-cuda-flash-prefill-v3-gqa2-prototype"
@@ -51,7 +50,7 @@ for executable in "${nvcc}" "${cuobjdump}" "${zig}"; do
         exit 1
     fi
 done
-for source in "${cuda_source}" "${harness_source}" "${summarizer}" "${canonical_cubin}"; do
+for source in "${cuda_source}" "${summarizer}" "${canonical_cubin}"; do
     if [[ ! -r "${source}" ]]; then
         echo "required input is not readable: ${source}" >&2
         exit 1
@@ -82,20 +81,12 @@ if ! grep -q "HMMA\.16816\.F32" "${sass}"; then
     exit 1
 fi
 
-"${zig}" test \
-    -lc \
-    "${harness_source}" \
-    -O safe \
-    --cache-dir "${output_dir}/zig-cache" \
-    --global-cache-dir "${output_dir}/zig-global-cache"
-
-"${zig}" build-exe \
-    -lc \
-    "${harness_source}" \
-    -O safe \
-    -femit-bin="${harness}" \
-    --cache-dir "${output_dir}/zig-cache" \
-    --global-cache-dir "${output_dir}/zig-global-cache"
+ZIG_LOCAL_CACHE_DIR="${repo_dir}/.zig-cache/inference" \
+ZIG_GLOBAL_CACHE_DIR="${repo_dir}/.zig-cache/global" \
+"${zig}" build --build-file "${inference_dir}/build.zig" \
+    --prefix "${repo_dir}/zig-out" \
+    -Doptimize=ReleaseSafe test-cuda-flash-prefill-prototype build-cuda-flash-prefill-prototype
+cp "${repo_dir}/zig-out/bin/antfly-cuda-flash-prefill-prototype" "${harness}"
 
 echo "prototype: q16 k16 grouped_heads=2 concurrent warp partition"
 if [[ "${min_blocks_per_sm}" == 0 ]]; then

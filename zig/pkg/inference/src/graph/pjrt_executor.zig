@@ -19,9 +19,9 @@
 //! PJRT LoadedExecutable, converts between host ComputeBackend CTs and
 //! PJRT buffers, and runs the compiled HLO on the target device.
 //!
-//! The executor runs on a single PJRT device (CPU or TPU). Input CTs are
-//! converted to f32, uploaded to device memory as PJRT buffers, executed,
-//! and output f32 data is wrapped back into host CTs.
+//! The provider selects CPU, CUDA or TPU execution. Integer inputs and state
+//! retain their physical types. Model-owned immutable operands are uploaded
+//! once, shared across shape specializations and borrowed by invocation frames.
 
 const std = @import("std");
 const ml = @import("ml");
@@ -53,6 +53,41 @@ fn shouldLogPjrtInput(index: usize, total: usize) bool {
     return index < 8 or index + 8 >= total or index % 32 == 0;
 }
 
+fn bufferType(dtype: ml.graph.DType) pjrt_lib.c_types.BufferType {
+    return switch (dtype) {
+        .f32 => .float32,
+        .f16 => .float16,
+        .bf16 => .bfloat16,
+        .f64 => .float64,
+        .i8 => .int8,
+        .i16 => .int16,
+        .i32 => .int32,
+        .i64 => .int64,
+        .u8 => .uint8,
+        .bool_ => .pred,
+    };
+}
+fn downloadTypedOutput(buffer: *const pjrt_lib.pjrt.Buffer, backend: *const ComputeBackend, dtype: ml.graph.DType, shape: []const i64, allocator: Allocator) !CT {
+    return switch (dtype) {
+        inline .i8, .i16, .i32, .i64, .u8, .bool_, .f64, .f16, .bf16 => |tag| output: {
+            const T = switch (tag) {
+                .i8 => i8,
+                .i16 => i16,
+                .f16, .bf16 => u16,
+                .i32 => i32,
+                .i64 => i64,
+                .u8, .bool_ => u8,
+                .f64 => f64,
+                else => unreachable,
+            };
+            const data = try buffer.toTypedWithShapeAndScratch(T, bufferType(tag), allocator, allocator, shape);
+            defer allocator.free(data);
+            break :output (try backend.fromConstantBytes(std.mem.sliceAsBytes(data), tag, shape)) orelse error.UnsupportedPjrtOutputType;
+        },
+        else => error.UnsupportedPjrtOutputType,
+    };
+}
+
 // ── PjrtExecutor ───────────────────────────────────────────────────
 
 pub const PjrtExecutor = struct {
@@ -73,6 +108,16 @@ pub const PjrtExecutor = struct {
     output_shapes: [][]i64,
     /// Input shapes for buffer uploads.
     input_shapes_: [][]i64 = &.{},
+    input_dtypes: []ml.graph.DType = &.{},
+    output_dtypes: []ml.graph.DType = &.{},
+    retained_parameters: []?pjrt_lib.pjrt.Buffer = &.{},
+    resident_output_start: ?usize = null,
+    resident_capacity: usize = 0,
+    resident_query_rows: usize = 0,
+    resident_dynamic_rows: bool = false,
+    resident_prefill_only: bool = false,
+    resident_initial: bool = false,
+    parameters_shared: bool = false,
     /// Inline PartitionExecutor for stable pointer access.
     pe: PartitionExecutor = undefined,
 
@@ -102,7 +147,101 @@ pub const PjrtExecutor = struct {
         retained_cache: ?*const PjrtRetainedBufferCache,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
     ) ![]pjrt_lib.pjrt.Buffer {
-        return self.executeToBuffersWithAllocators(values, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings);
+        return self.executeToBuffersWithAllocators(values, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings, null);
+    }
+
+    /// Borrow request-owned inputs without donating them. Publication belongs
+    /// to the request transaction after synchronization and logits readback.
+    pub fn executeWithResidentState(self: *PjrtExecutor, values: []?CT, backend: *const ComputeBackend, state: []const pjrt_lib.pjrt.Buffer, allocator: Allocator) ![]pjrt_lib.pjrt.Buffer {
+        if (self.resident_output_start == null) return error.NotResidentDecoder;
+        return self.executeToBuffersWithAllocators(values, .{ .backend = backend }, allocator, allocator, null, &.{}, state);
+    }
+
+    fn uploadTensor(self: *PjrtExecutor, backend: *const ComputeBackend, value: CT, index: usize, allocator: Allocator) !pjrt_lib.pjrt.Buffer {
+        const dtype = if (self.input_dtypes.len == 0) ml.graph.DType.f32 else self.input_dtypes[index];
+        const expected: @import("../backends/tensor.zig").DType = switch (dtype) {
+            inline else => |tag| @field(@import("../backends/tensor.zig").DType, @tagName(tag)),
+        };
+        // Preserve an already-typed checkpoint/activation without a full F32
+        // staging copy. Other floating operands are converted once on upload.
+        const matching_half = (dtype == .f16 or dtype == .bf16) and
+            (try backend.tensorDType(value)) == expected;
+        if ((dtype == .f32 or dtype == .f16 or dtype == .bf16) and !matching_half) {
+            // Contiguous host operands already have the transfer's required
+            // representation. PJRT's upload completes its host-buffer lease
+            // before returning, so neither F32 upload nor narrowing needs an
+            // additional full-size F32 staging allocation. Device tensors and
+            // strided/quantized views retain the backend materialization path.
+            var owned: ?[]f32 = null;
+            defer if (owned) |data| allocator.free(data);
+            const data = (try backend.hostFloat32Read(value)) orelse materialize: {
+                owned = try backend.toFloat32(value, allocator);
+                break :materialize owned.?;
+            };
+            const shape = try resolveUploadShapeFromTensor(allocator, backend, value, self.input_shapes_[index], data.len);
+            defer allocator.free(shape);
+            if (dtype == .f32) return self.client.bufferFromHostFloat32(data, shape);
+            const narrow = try allocator.alloc(u16, data.len);
+            defer allocator.free(narrow);
+            for (data, narrow) |element, *bits| bits.* = if (dtype == .bf16) @truncate(@as(u32, @bitCast(@import("antfly_tile").fexpr.roundBf16Value(element))) >> 16) else @bitCast(@as(f16, @floatCast(element)));
+            return self.client.bufferFromHostBytes(std.mem.sliceAsBytes(narrow), bufferType(dtype), shape);
+        }
+        const exported = (try backend.exportTensorData(value, allocator)) orelse return error.UnsupportedPjrtInputType;
+        const bytes = switch (exported.payload) {
+            .bytes => |data| data,
+            .quantized_f32 => |quantized| {
+                allocator.free(quantized.raw_bytes);
+                allocator.free(quantized.shape);
+                return error.UnsupportedPjrtInputType;
+            },
+        };
+        defer allocator.free(bytes);
+        if (exported.dtype != expected or bytes.len % dtype.byteSize() != 0) return error.UnsupportedPjrtInputType;
+        const shape = try resolveUploadShapeFromElementCount(allocator, self.input_shapes_[index], bytes.len / dtype.byteSize());
+        defer allocator.free(shape);
+        const kind = bufferType(dtype);
+        return self.client.bufferFromHostBytes(bytes, kind, shape);
+    }
+
+    /// Immutable model operands are transferred once, outside invocation frames.
+    /// The compiled executable owns its device buffers through eviction/close.
+    fn retainParameters(self: *PjrtExecutor, graph: *const Graph, source: *const ComputeBackend, mutable: []const bool, shared: ?*@import("pjrt_parameters.zig").Store) !void {
+        if (mutable.len != graph.nodeCount()) return error.InvalidMutableParameterTable;
+        self.retained_parameters = try self.allocator.alloc(?pjrt_lib.pjrt.Buffer, self.input_bindings.len);
+        @memset(self.retained_parameters, null);
+        self.parameters_shared = shared != null;
+        for (self.input_bindings, 0..) |binding, index| switch (binding) {
+            .graph_node => |node_id| {
+                const node = graph.node(node_id);
+                if (node.op != .parameter or mutable[node_id]) continue;
+                const name = graph.parameterName(node);
+                if (shared) |store| {
+                    if (store.client != self.client) return error.ForeignCompiledProvider;
+                    if (try store.get(name, self.input_dtypes[index], self.input_shapes_[index])) |buffer| {
+                        self.retained_parameters[index] = buffer;
+                        continue;
+                    }
+                    @import("antfly_platform").sync.lockYielding(&store.upload_mutex);
+                    defer store.upload_mutex.unlock();
+                    if (try store.get(name, self.input_dtypes[index], self.input_shapes_[index])) |buffer| {
+                        self.retained_parameters[index] = buffer;
+                        continue;
+                    }
+                    const value = try source.getWeight(name);
+                    defer source.free(value);
+                    var uploaded = try self.uploadTensor(source, value, index, self.allocator);
+                    self.retained_parameters[index] = store.publish(name, self.input_dtypes[index], self.input_shapes_[index], uploaded) catch |err| {
+                        uploaded.deinit();
+                        return err;
+                    };
+                } else {
+                    const value = try source.getWeight(name);
+                    defer source.free(value);
+                    self.retained_parameters[index] = try self.uploadTensor(source, value, index, self.allocator);
+                }
+            },
+            else => {},
+        };
     }
 
     fn executeToBuffersWithAllocators(
@@ -113,7 +252,9 @@ pub const PjrtExecutor = struct {
         transfer_allocator: Allocator,
         retained_cache: ?*const PjrtRetainedBufferCache,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
+        resident_inputs: ?[]const pjrt_lib.pjrt.Buffer,
     ) ![]pjrt_lib.pjrt.Buffer {
+        if (self.resident_output_start != null and resident_inputs == null) return error.MissingResidentState;
         const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(transfer_allocator);
         const num_inputs = self.input_bindings.len;
         const debug = pjrtExecDebugEnabled();
@@ -134,7 +275,17 @@ pub const PjrtExecutor = struct {
         };
 
         var semantic_inputs = try SemanticInputCursor.init(semantic_input_bindings, num_inputs);
+        var resident_index: usize = 0;
         for (self.input_bindings, 0..) |binding, i| {
+            if (resident_inputs) |buffers| if (binding == .semantic_past_graph_node) {
+                if (resident_index >= buffers.len) return error.MissingResidentState;
+                const buffer = buffers[resident_index];
+                if (!try buffer.matchesFloat32Shape(self.input_shapes_[i])) return error.InvalidResidentState;
+                input_bufs[i] = buffer;
+                resident_index += 1;
+                input_bufs_initialized += 1;
+                continue;
+            };
             if (semantic_inputs.at(i)) |semantic_binding| {
                 const cache = retained_cache orelse {
                     if (debug) {
@@ -175,48 +326,12 @@ pub const PjrtExecutor = struct {
             } else {
                 input_bufs[i] = switch (binding) {
                     .graph_node => |nid| blk: {
-                        const ct = values[@intCast(nid)] orelse {
-                            if (debug) {
-                                std.log.warn(
-                                    "PJRT execute input[{d}/{d}] missing graph node value node={d}",
-                                    .{ i + 1, num_inputs, nid },
-                                );
-                            }
-                            return error.MissingValue;
+                        if (self.retained_parameters.len != 0) if (self.retained_parameters[i]) |buffer| {
+                            owned_input_bufs[i] = false;
+                            break :blk buffer;
                         };
-                        const f32_data = try self.host_backend.toFloat32(ct, staging_allocator);
-                        defer staging_allocator.free(f32_data);
-                        const upload_shape = resolveUploadShapeFromTensor(
-                            allocator,
-                            self.host_backend,
-                            ct,
-                            self.input_shapes_[i],
-                            f32_data.len,
-                        ) catch |err| {
-                            if (debug) {
-                                std.log.warn(
-                                    "PJRT execute input[{d}/{d}] cannot resolve upload shape node={d} expected_shape={any} elems={d} err={s}",
-                                    .{ i + 1, num_inputs, nid, self.input_shapes_[i], f32_data.len, @errorName(err) },
-                                );
-                            }
-                            return err;
-                        };
-                        defer allocator.free(upload_shape);
-                        if (debug and shouldLogPjrtInput(i, num_inputs)) {
-                            std.log.info(
-                                "PJRT execute input[{d}/{d}] upload graph_node={d} dtype=f32 elems={d} shape={any}",
-                                .{ i + 1, num_inputs, nid, f32_data.len, upload_shape },
-                            );
-                        }
-                        break :blk self.client.bufferFromHostFloat32(f32_data, upload_shape) catch |err| {
-                            if (debug) {
-                                std.log.warn(
-                                    "PJRT execute input[{d}/{d}] upload graph_node={d} failed shape={any} elems={d} err={s}",
-                                    .{ i + 1, num_inputs, nid, upload_shape, f32_data.len, @errorName(err) },
-                                );
-                            }
-                            return err;
-                        };
+                        const value = values[nid] orelse return error.MissingValue;
+                        break :blk try self.uploadTensor(exec_ctx.backend orelse self.host_backend, value, i, staging_allocator);
                     },
                     .semantic_past_graph_node => |nid| blk: {
                         const ct = values[@intCast(nid)] orelse {
@@ -228,11 +343,11 @@ pub const PjrtExecutor = struct {
                             }
                             return error.MissingValue;
                         };
-                        const f32_data = try self.host_backend.toFloat32(ct, staging_allocator);
+                        const f32_data = try (exec_ctx.backend orelse self.host_backend).toFloat32(ct, staging_allocator);
                         defer staging_allocator.free(f32_data);
                         const upload_shape = resolveUploadShapeFromTensor(
                             allocator,
-                            self.host_backend,
+                            exec_ctx.backend orelse self.host_backend,
                             ct,
                             self.input_shapes_[i],
                             f32_data.len,
@@ -302,7 +417,7 @@ pub const PjrtExecutor = struct {
                         };
                     },
                 };
-                owned_input_bufs[i] = true;
+                owned_input_bufs[i] = !(binding == .graph_node and self.retained_parameters.len != 0 and self.retained_parameters[i] != null);
             }
             input_bufs_initialized += 1;
         }
@@ -310,6 +425,7 @@ pub const PjrtExecutor = struct {
         // ── 2. Execute ──────────────────────────────────────────
 
         if (debug) std.log.info("PJRT execute calling LoadedExecutable.Execute", .{});
+        if (resident_inputs) |buffers| if (resident_index != buffers.len) return error.InvalidResidentState;
         const outputs = try self.executable.execute(input_bufs[0..num_inputs], allocator);
         if (debug) std.log.info("PJRT execute completed outputs={d}", .{outputs.len});
         return outputs;
@@ -333,9 +449,20 @@ pub const PjrtExecutor = struct {
         // ── 2. Convert outputs to host CTs ──────────────────────
 
         for (self.output_node_ids, 0..) |nid, i| {
-            const f32_data = try outputs[i].toFloat32(self.allocator);
+            const dtype = if (self.output_dtypes.len == 0) ml.graph.DType.f32 else self.output_dtypes[i];
+            const backend = exec_ctx.backend orelse self.host_backend;
+            if (dtype != .f32) {
+                const value = try downloadTypedOutput(&outputs[i], backend, dtype, self.output_shapes[i], self.allocator);
+                values[@intCast(nid)] = value;
+                value_device[@intCast(nid)] = device_id;
+                continue;
+            }
+            const f32_data = try outputs[i].toFloat32WithShape(self.allocator, self.output_shapes[i]);
             defer self.allocator.free(f32_data);
-            const ct = try self.host_backend.fromFloat32(f32_data);
+            if (self.output_shapes[i].len > 8) return error.UnsupportedShape;
+            var dims: [8]i32 = @splat(0);
+            for (self.output_shapes[i], 0..) |dim, axis| dims[axis] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
+            const ct = try (exec_ctx.backend orelse self.host_backend).fromFloat32Shape(f32_data, dims[0..self.output_shapes[i].len]);
             values[@intCast(nid)] = ct;
             value_device[@intCast(nid)] = device_id;
         }
@@ -344,10 +471,14 @@ pub const PjrtExecutor = struct {
     fn deinitFn(ctx: *anyopaque) void {
         const self: *PjrtExecutor = @ptrCast(@alignCast(ctx));
         self.executable.deinit();
+        if (!self.parameters_shared) for (self.retained_parameters) |*buffer| if (buffer.*) |*value| value.deinit();
+        self.allocator.free(self.retained_parameters);
         for (self.output_shapes) |s| self.allocator.free(s);
         self.allocator.free(self.output_shapes);
         for (self.input_shapes_) |s| self.allocator.free(s);
         self.allocator.free(self.input_shapes_);
+        self.allocator.free(self.input_dtypes);
+        self.allocator.free(self.output_dtypes);
         self.allocator.free(self.input_bindings);
         self.allocator.free(self.input_node_ids);
         self.allocator.free(self.output_node_ids);
@@ -369,15 +500,59 @@ pub fn createExecutor(
     host_backend: *const ComputeBackend,
     client: *pjrt_lib.pjrt.Client,
 ) !*PjrtExecutor {
+    return createExecutorWithOptions(allocator, graph, part, cb, host_backend, client, .{}, null);
+}
+
+pub fn createExecutorWithOptions(
+    allocator: Allocator,
+    graph: *const Graph,
+    part: *const Partition,
+    cb: *const ComputeBackend,
+    host_backend: *const ComputeBackend,
+    client: *pjrt_lib.pjrt.Client,
+    options: compiler.CompileOptions,
+    shared_parameters: ?*@import("pjrt_parameters.zig").Store,
+) !*PjrtExecutor {
     // 1. Compile partition to HLO bytes
-    var result = try compiler.compilePartition(allocator, graph, part, cb);
+    var compile_options = options;
+    if (compile_options.mutable_parameters != null) compile_options.parameter_inputs = true;
+    // Single-query CUDA F32 LayerNorm lost full-model parity under fusion.
+    // Widen only its small reductions; keep matrix and storage policies intact.
+    if (options.resident_capacity != 0 and std.ascii.eqlIgnoreCase(try client.platformName(), "cuda")) {
+        compile_options.wide_single_row_norm = true;
+        compile_options.wide_rotary_trig = options.precision == .bf16;
+        compile_options.reduce_single_row_linear = options.precision == .bf16 and client.compile_options.gpu_gemm == .provider_default;
+    }
+    var program_options = client.compile_options;
+    if (options.resident_capacity != 0) {
+        const requested: @import("../execution/precision.zig").Gemm = switch (program_options.gpu_gemm) {
+            .provider_default => .provider_default,
+            .vendor => .vendor,
+            .vendor_deterministic => .vendor_deterministic,
+        };
+        program_options.gpu_gemm = switch (@import("../execution/precision.zig").residentGemm(std.ascii.eqlIgnoreCase(try client.platformName(), "cuda"), options.precision, requested)) {
+            .provider_default => .provider_default,
+            .vendor => .vendor,
+            .vendor_deterministic => .vendor_deterministic,
+        };
+    }
+    var result = try compiler.compilePartitionWithOptions(allocator, graph, part, cb, compile_options);
     defer result.deinit();
 
     // 2. Compile HLO via PJRT
-    var executable = try client.compile(result.hlo_bytes, result.output_node_ids.len);
-    errdefer executable.deinit();
+    // Precision fixes publication boundaries and accumulation types. Let the
+    // provider choose its tuned GEMM/fusion schedule outside the qualified
+    // resident BF16 boundary. That boundary resolves its deterministic vendor
+    // schedule independently, without mutating the client. Explicit BF16
+    // conversions remain intact; qualify model accuracy independently.
+    var executable = if (result.entry_layout_options) |layouts|
+        try client.compileWithEntryLayoutsAndOptions(result.hlo_bytes, result.output_node_ids.len, client.device, layouts, program_options, allocator)
+    else
+        try client.compileForDevice(result.hlo_bytes, result.output_node_ids.len, client.device);
+    var executable_owned = true;
+    errdefer if (executable_owned) executable.deinit();
 
-    return createExecutorFromLoadedExecutable(
+    const executor = try createExecutorFromLoadedExecutable(
         allocator,
         graph,
         executable,
@@ -388,6 +563,16 @@ pub fn createExecutor(
         host_backend,
         client,
     );
+    executable_owned = false;
+    executor.resident_output_start = result.resident_output_start;
+    executor.resident_capacity = options.resident_capacity;
+    executor.resident_query_rows = result.resident_query_rows;
+    executor.resident_dynamic_rows = result.resident_dynamic_rows;
+    executor.resident_prefill_only = options.resident_initial or options.resident_visibility != null;
+    executor.resident_initial = options.resident_initial;
+    errdefer executor.partitionExecutor().deinitExecutor();
+    if (options.mutable_parameters) |flags| try executor.retainParameters(graph, cb, flags, shared_parameters);
+    return executor;
 }
 
 pub fn createExecutorFromHlo(
@@ -575,7 +760,15 @@ fn createExecutorFromLoadedExecutable(
         output_shapes_initialized += 1;
     }
 
-    try executable.validateOutputShapes(output_shapes);
+    const output_dtypes = try allocator.alloc(ml.graph.DType, num_outputs);
+    errdefer allocator.free(output_dtypes);
+    const output_types = try allocator.alloc(pjrt_lib.c_types.BufferType, num_outputs);
+    defer allocator.free(output_types);
+    for (output_node_ids_source, output_dtypes, output_types) |node_id, *dtype, *kind| {
+        dtype.* = graph.node(node_id).output_shape.dtype;
+        kind.* = bufferType(dtype.*);
+    }
+    try executable.validateOutputSignature(output_shapes, output_types);
 
     var input_node_ids_list = std.ArrayListUnmanaged(NodeId).empty;
     errdefer input_node_ids_list.deinit(allocator);
@@ -594,6 +787,13 @@ fn createExecutorFromLoadedExecutable(
     const input_node_ids = try input_node_ids_list.toOwnedSlice(allocator);
     errdefer allocator.free(input_node_ids);
 
+    const input_dtypes = try allocator.alloc(ml.graph.DType, num_inputs);
+    errdefer allocator.free(input_dtypes);
+    for (input_bindings_source, input_dtypes) |binding, *dtype| dtype.* = switch (binding) {
+        .graph_node => |node| graph.node(node).output_shape.dtype,
+        .embedding_ids => .i64,
+        .semantic_past_graph_node => .f32,
+    };
     const exec = try allocator.create(PjrtExecutor);
     exec.* = .{
         .allocator = allocator,
@@ -605,6 +805,8 @@ fn createExecutorFromLoadedExecutable(
         .output_node_ids = output_node_ids,
         .output_shapes = output_shapes,
         .input_shapes_ = input_shapes,
+        .input_dtypes = input_dtypes,
+        .output_dtypes = output_dtypes,
     };
     exec.pe = .{ .ptr = exec, .vtable = &PjrtExecutor.vtable };
     return exec;
@@ -1172,6 +1374,7 @@ const PjrtModelRuntime = struct {
             allocator,
             &self.retained_buffers,
             phase.semantic_input_bindings,
+            null,
         );
         defer bookkeeping.free(outputs);
         const debug = pjrtExecDebugEnabled();
@@ -1240,6 +1443,10 @@ const PjrtModelRuntime = struct {
                 .graph_node => |node_id| {
                     if (node_id >= values.len) return error.MissingArtifactMetadata;
                     if (values[@intCast(node_id)] != null) continue;
+                    // Immutable operands are already retained by the executor.
+                    // Reopening them here can dequantize an entire checkpoint
+                    // again even though execution never consumes the host CT.
+                    if (phase.executor.retained_parameters.len != 0 and phase.executor.retained_parameters[input_index] != null) continue;
                     const node = self.graph.node(node_id);
                     if (node.op != .parameter) return error.MissingValue;
                     const name = self.graph.parameterName(node);
@@ -1293,7 +1500,20 @@ pub fn createModelExecutor(
     host_backend: *const ComputeBackend,
     client: *pjrt_lib.pjrt.Client,
 ) !*PjrtModelExecutor {
-    const partition_exec = try createExecutor(allocator, graph, part, cb, host_backend, client);
+    return createModelExecutorWithOptions(allocator, graph, part, cb, host_backend, client, .{}, null);
+}
+
+pub fn createModelExecutorWithOptions(
+    allocator: Allocator,
+    graph: *const Graph,
+    part: *const Partition,
+    cb: *const ComputeBackend,
+    host_backend: *const ComputeBackend,
+    client: *pjrt_lib.pjrt.Client,
+    options: compiler.CompileOptions,
+    shared_parameters: ?*@import("pjrt_parameters.zig").Store,
+) !*PjrtModelExecutor {
+    const partition_exec = try createExecutorWithOptions(allocator, graph, part, cb, host_backend, client, options, shared_parameters);
     errdefer partition_exec.partitionExecutor().deinitExecutor();
 
     const exec = try allocator.create(PjrtModelExecutor);
@@ -2121,6 +2341,64 @@ test "PJRT runtime capabilities keep decode enabled for host-assisted package ph
     try std.testing.expectEqual(model_runtime.RuntimeStateOwnership.host_assisted_inputs, caps.state_ownership);
 }
 
+test "PJRT host uploads borrow contiguous F32 and materialize unsupported views" {
+    const a = std.testing.allocator;
+    var client = pjrt_lib.pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var input: [4096]f32 = undefined;
+    for (&input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 129)) - 64)) / 127.0;
+    const tensor = try cb.fromBorrowedFloat32Shape(&input, &.{4096});
+    defer cb.free(tensor);
+    var shape = [_]i64{4096};
+    var shapes = [_][]i64{&shape};
+    var dtypes = [_]ml.graph.DType{.f32};
+    var executor: PjrtExecutor = undefined;
+    executor.client = &client;
+    executor.input_shapes_ = &shapes;
+    executor.input_dtypes = &dtypes;
+    // Enough for the narrow payload and shape, never a second F32 payload.
+    // Failure here detects accidental reintroduction of full-size staging.
+    var scratch: [input.len * 2 + 64]u8 = undefined;
+    for ([_]ml.graph.DType{ .f32, .bf16, .f16 }) |dtype| {
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        dtypes[0] = dtype;
+        var buffer = try executor.uploadTensor(&cb, tensor, 0, fixed.allocator());
+        defer buffer.deinit();
+        if (dtype == .f32) {
+            const actual = try buffer.toFloat32WithShape(a, &shape);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, &input, actual);
+        } else {
+            const actual = try buffer.toTypedWithShapeAndScratch(u16, bufferType(dtype), a, a, &shape);
+            defer a.free(actual);
+            for (input, actual) |value, bits| {
+                const expected: u16 = if (dtype == .bf16) @truncate(@as(u32, @bitCast(@import("antfly_tile").fexpr.roundBf16Value(value))) >> 16) else @bitCast(@as(f16, @floatCast(value)));
+                try std.testing.expectEqual(expected, bits);
+            }
+        }
+    }
+    // Backends without a contiguous host read still materialize through their
+    // own conversion, preserving the existing device/strided/quantized path.
+    var fallback_vtable = cb.vtable.*;
+    fallback_vtable.hostFloat32Read = null;
+    var fallback = cb;
+    fallback.vtable = &fallback_vtable;
+    dtypes[0] = .f32;
+    var buffer = try executor.uploadTensor(&fallback, tensor, 0, a);
+    defer buffer.deinit();
+    const actual = try buffer.toFloat32WithShape(a, &shape);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &input, actual);
+}
+
 test "PJRT upload shape resolver fills one dynamic dimension from element count" {
     const shape = try resolveUploadShapeFromElementCount(std.testing.allocator, &.{ -1, 1536 }, 3072);
     defer std.testing.allocator.free(shape);
@@ -2322,4 +2600,41 @@ test "PJRT whole-model caches permuted logits mappings and finds sparse decode p
         try std.testing.expectEqual(@as(?usize, 0), phase.logits_index);
     }
     for ([_]usize{ 0, 2, 4, 127, 129 }) |seq_len| try std.testing.expect(runtime.decodePhaseForSeqLen(seq_len) == null);
+}
+
+test "PJRT publication retains device weights without host rematerialization" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const weight = try builder.parameter("absent.host.weight", ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var bindings = [_]compiler.InputBinding{.{ .graph_node = weight }};
+    // Only the optional tag is inspected. These handles are never submitted
+    // or destroyed; attempting host weight acquisition fails on the empty store.
+    var retained = [_]?pjrt_lib.pjrt.Buffer{.{ .api = undefined, .handle = undefined }};
+    var executor: PjrtExecutor = undefined;
+    executor.input_bindings = &bindings;
+    executor.retained_parameters = &retained;
+    var runtime = PjrtModelRuntime{
+        .allocator = a,
+        .graph = &graph,
+        .executor = &executor,
+        .host_backend = &cb,
+        .input_materialization = .host_assisted_graph_inputs,
+        .retained_buffers = PjrtRetainedBufferCache.init(a),
+        .semantic_input_bindings = &.{},
+        .semantic_output_bindings = &.{},
+        .decode_variants = &.{},
+    };
+    defer runtime.retained_buffers.deinit();
+    const values = try a.alloc(?CT, graph.nodeCount());
+    defer a.free(values);
+    @memset(values, null);
+    try runtime.materializeGraphInputs(values, runtime.prefillPhase());
+    try std.testing.expect(values[weight] == null);
 }
