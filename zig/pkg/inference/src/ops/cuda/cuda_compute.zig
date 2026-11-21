@@ -3895,8 +3895,12 @@ pub const CudaCompute = struct {
             }
             const phase = owner.phase;
             if (phase == .disabled) return error.InvalidExecutionPlan;
-            var scope = @import("execution_arena.zig").Scope{ .plan = owner.plan.?, .base = if (phase == .capture) owner.arena.ptr else 0 };
+            const WorkspaceScope = @import("../../execution/stream_workspace.zig").Scope;
             const capture = phase == .capture;
+            var scope = if (capture)
+                try WorkspaceScope.bind(owner.plan.?, try owner.arenaLayout(), owner.arena.ptr, owner.arena.len)
+            else
+                WorkspaceScope{ .plan = owner.plan.? };
             var capture_active = false;
             errdefer {
                 std.log.warn("LightOn decoder graph aborted: phase={s} event={d}/{d}", .{ @tagName(phase), scope.cursor, owner.plan.?.event_count });
@@ -4215,7 +4219,7 @@ pub const CudaCompute = struct {
         if (owner.phase == .disabled) return .unsupported;
         if (owner.phase == .capture and owner.arena.ptr == 0) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
-            if (owner.plan == null or !owner.plan.?.valid or owner.plan.?.peak == 0 or owner.plan.?.peak > @import("execution_arena.zig").limit) return error.InvalidExecutionPlan;
+            _ = try owner.arenaLayout();
             phase.mode = .arena;
             return .outside;
         }
@@ -6304,7 +6308,7 @@ pub const CudaCompute = struct {
     embedding_gemma2_constant_misses: u64 = 0,
     audio_plans: @import("audio_execution_plan.zig").Cache = .{},
     audio_execution_active: bool = false,
-    execution_scope: ?*@import("execution_arena.zig").Scope = null,
+    execution_scope: ?*@import("../../execution/stream_workspace.zig").Scope = null,
     bounded_decode_graph: @import("bounded_decode_graph.zig").Module = .{},
     captured_cache_roots: ?*CapturedCacheRoots = null,
     // Armed only by real managed cold publication after legacy roots upgraded.
@@ -7899,8 +7903,7 @@ pub const CudaCompute = struct {
         }
         return .{ .key = hash.final(), .input_bytes = input_bytes };
     }
-    fn audioArenaRequestFromPlan(self: *const CudaCompute, base: AudioCacheBase, plan: *const @import("audio_execution_plan.zig").Plan) !CacheFunding.Request {
-        const bytes = try checkedAdd(base.input_bytes, plan.peak);
+    fn audioArenaRequestFromPlan(self: *const CudaCompute, base: AudioCacheBase, plan: *const @import("audio_execution_plan.zig").Plan, storage: @import("../../execution/stream_workspace.zig").Layout) CacheFunding.Request {
         var layout = std.hash.Wyhash.init(base.key);
         for (plan.events[0..plan.event_count]) |event| {
             layout.update(std.mem.asBytes(&event.slot));
@@ -7910,7 +7913,7 @@ pub const CudaCompute = struct {
             layout.update(std.mem.asBytes(&allocation.bytes));
             layout.update(std.mem.asBytes(&allocation.offset));
         }
-        return .{ .arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .grid_x = @intCast(layout.final()), .sizes = .{ bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
+        return .{ .arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .grid_x = @intCast(layout.final()), .sizes = .{ storage.bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
     }
     /// Read the SAME already learned allocation/event layout without creating a
     /// cache entry, touching its LRU, or replaying numerical work for planning.
@@ -7920,8 +7923,9 @@ pub const CudaCompute = struct {
         if (base.input_bytes > 128 * 1024 * 1024) return null;
         for (self.audio_plans.entries) |entry| if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled) {
             const plan = entry.plan orelse return null;
-            if (try checkedAdd(base.input_bytes, plan.peak) > @import("audio_execution_plan.zig").limit) return null;
-            return try self.audioArenaRequestFromPlan(base, plan);
+            const storage = plan.layout(base.input_bytes) catch return null;
+            if (storage.output == null) return null;
+            return self.audioArenaRequestFromPlan(base, plan, storage);
         };
         return null;
     }
@@ -20630,11 +20634,14 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         return out;
     }
     const plan = entry.plan.?;
-    const bytes = try std.math.add(usize, input_bytes, plan.peak);
-    if (bytes > plan_mod.limit) return null;
+    const storage = plan.layout(input_bytes) catch return null;
+    const output = storage.output orelse return null;
+    const t = tensorFromCt(inputs[0]);
+    const output_bytes = t.elem_count * @sizeOf(f32);
+    if (output_bytes > output.bytes) return null;
     // The same complete event ABI drives preflight and actual arena lookup.
-    const cache_request = try self.audioArenaRequestFromPlan(cache_base, plan);
-    const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), bytes)) orelse return null;
+    const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
+    const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), storage.bytes)) orelse return null;
     defer arena.noteUse(&self.ctx);
     var stable: [20]CT = undefined;
     var count: usize = 0;
@@ -20675,7 +20682,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         // invocation. Complete its queued producer and retire it BEFORE the
         // bounded arena host body, especially before CUDA capture starts.
         try prepareSourceLinearArenaScope(self);
-        var scope = plan_mod.Scope{ .plan = plan, .base = arena.buffers[0].ptr + input_bytes };
+        var scope = try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
         const capture = arena.graph == null and !arena.disabled;
         if (capture) self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED) catch {
             arena.disabled = true;
@@ -20692,12 +20699,12 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             arena.captureFailed(err);
             entry.disabled = err != error.Cancelled and err != error.Timeout;
             if (err == error.Cancelled or err == error.Timeout) return err;
-            if (!capture and err != error.AudioPlanChanged and err != error.CudaGraphCaptureUnsafeHostCopy) return err;
+            if (!capture) return err;
             return null;
         };
         self.execution_scope = null;
         const result_tensor = tensorFromCt(result);
-        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.valid and scope.cursor == plan.event_count and result_tensor.buffer.ptr == scope.base + plan.allocations[plan.output].offset;
+        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.valid and scope.cursor == storage.events and result_tensor.buffer.ptr == arena.buffers[0].ptr + output.offset;
         result_tensor.owns_buffer = false;
         freeTensor(self, result);
         if (!matches) {
@@ -20705,6 +20712,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
                 if (self.ctx.endStreamCapture()) |g| self.ctx.destroyGraph(g) else |_| {}
             }
             entry.disabled = true;
+            // The ordinary callback may already have submitted numerical work.
+            if (!capture) return error.AudioPlanChanged;
             return null;
         }
         if (capture) {
@@ -20725,11 +20734,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         try self.ctx.recordProfileEnd(pair);
         arena.timing_replay = if (capture_sample) null else replay;
     };
-    const t = tensorFromCt(inputs[0]);
     const out = try self.createEmbeddingGemma2Tensor(t.shape, .f32);
     errdefer freeTensor(self, out);
-    const result = try audioBufferView(arena.buffers[0], input_bytes + plan.allocations[plan.output].offset, t.elem_count * 4);
-    try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, t.elem_count * 4);
+    const result = try audioBufferView(arena.buffers[0], output.offset, output_bytes);
+    try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
     return out;
 }
 fn audioBatchLayoutsEnabledOp(ctx: *anyopaque) bool {
@@ -38846,7 +38854,7 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined) == null);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.evictEmbeddingGemma2Caches());
     var plan: @import("audio_execution_plan.zig").Plan = undefined;
-    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 1 };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 1 };
     compute.execution_scope = &scope;
     var bytes = [_]u8{0};
     const device = buffer_mod.DeviceBuffer{ .ptr = 1, .len = bytes.len };
@@ -44639,7 +44647,7 @@ test "LightOnOCR3 CUDA wide graph head has independent admission and never enter
     const head_pointer = owner.head.ptr;
     const cached = compute.temp_buffers.buffers.items.len;
     for ([_]usize{ 0, 0x1000 }) |base| {
-        var scope = @import("execution_arena.zig").Scope{
+        var scope = @import("../../execution/stream_workspace.zig").Scope{
             .plan = owner.plan.?,
             .base = base,
             .output_ptr = owner.head.ptr,
@@ -59585,11 +59593,11 @@ test "source linear bank metadata reuses only its audio owner or exact captured 
     }
     // The real graph-plan allocator owns one complete bank interval; source
     // slices never become independent free events or claimed output slots.
-    var plan: @import("execution_arena.zig").Plan = .{};
+    var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
     plan.allocate(layout.bytes, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
     var captured = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
@@ -59817,11 +59825,11 @@ test "source local relative temporary follows the actual learned and captured ba
         try std.testing.expect(q.ptr + q.len <= ws.ptr);
     }
     try std.testing.expect(!compute.source_linear_scratch.in_use);
-    var plan: @import("execution_arena.zig").Plan = .{};
+    var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
     plan.allocate(layout.bytes, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
     var temporary = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
@@ -59883,11 +59891,11 @@ test "source local relative actual external capture rejects before module or out
     try std.testing.expectEqual(@as(usize, 4), Fake.queries);
     // Actual capture with a funded arena keeps the exact bank lease and does
     // not consume the independently assigned output or allocate another bank.
-    var plan: @import("execution_arena.zig").Plan = .{};
+    var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
     plan.allocate(256, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = 256 };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = 256 };
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{};
     compute.embedding_gemma2 = null;
@@ -60004,8 +60012,10 @@ test "source bias workspace policy isolates audio warm and arena plan identities
     // The old plan would overflow funding if inspected under the new policy.
     try std.testing.expect((try compute.audioCacheRequest(42, &inputs)) == null);
     var plan: @import("audio_execution_plan.zig").Plan = .{};
-    const old_arena = try compute.audioArenaRequestFromPlan(original, &plan);
-    const new_arena = try compute.audioArenaRequestFromPlan(candidate, &plan);
+    plan.allocate(1024, 0x1000);
+    try std.testing.expect(plan.finish(0x1000));
+    const old_arena = compute.audioArenaRequestFromPlan(original, &plan, try plan.layout(original.input_bytes));
+    const new_arena = compute.audioArenaRequestFromPlan(candidate, &plan, try plan.layout(candidate.input_bytes));
     try std.testing.expect(old_arena.arena.grid_x != new_arena.arena.grid_x);
 }
 
