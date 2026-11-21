@@ -660,6 +660,9 @@ pub const OpenOptions = struct {
     /// schema predates the durable root. Historical Raft apply may retain the
     /// newer schema while replaying an older entry's mutation.
     reject_stale_schema_before_index_load: bool = false,
+    /// Replaying a descriptor with the installed version must not attempt
+    /// another schema publication on a topology-fenced physical owner.
+    preserve_same_version_schema_before_index_load: bool = false,
     identity_namespace: ?doc_identity.Namespace = null,
     /// Immutable authenticated deployment ownership, not selected by a source
     /// request. Decoders/library opens may leave this unset.
@@ -4268,6 +4271,10 @@ pub const DB = struct {
                     std.log.debug("owner open retains newer durable schema path={s} durable_version={d} descriptor_version={d}", .{
                         path, db.core.schema.?.version, prepared_schema.runtime_schema.version,
                     });
+                } else if (opts.preserve_same_version_schema_before_index_load and db.core.schema != null and
+                    db.core.schema.?.version == prepared_schema.runtime_schema.version)
+                {
+                    // The ordered mutation borrows the installed schema.
                 } else if (try childGenerationSourcePinsSchema(db.core, prepared_schema.runtime_schema.version)) {
                     // Parent ACKs precede the metadata child descriptor cut.
                     // A cold owner may reopen in that interval, but the

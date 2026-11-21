@@ -3922,6 +3922,7 @@ pub fn storageOwnerOpen(
         },
         .schema_before_index_load = prepared_schema,
         .reject_stale_schema_before_index_load = request.historical_raft_apply == 0 and restore_bootstrap == null,
+        .preserve_same_version_schema_before_index_load = request.historical_raft_apply != 0,
         .lsm_cache = if (owner_context) |context| &context.resources.lsm_cache else null,
         .hbc_cache = if (owner_context) |context| &context.resources.hbc_cache else null,
         .lsm_root_generation = request.lsm_root_generation,
