@@ -208,9 +208,15 @@ fn storeJournalCreditLedger(txn: anytype, ledger: internal_keys.JournalCreditLed
 
 /// The credit ledger a scan of every lane entry reproduces: what the base
 /// revision's journal is charged when it is upgraded in place.
-fn scanReplayJournalLedger(txn: anytype) !internal_keys.JournalCreditLedger {
-    var ledger: internal_keys.JournalCreditLedger = .{};
-    for (replay_credit_lanes) |kind| {
+const ReplayCreditScan = struct {
+    ledger: internal_keys.JournalCreditLedger = .{},
+    heads: ReplayCreditLaneHeads = @splat(0),
+};
+
+fn scanReplayJournalCredits(txn: anytype) !ReplayCreditScan {
+    var scan: ReplayCreditScan = .{};
+    for (replay_credit_lanes, 0..) |kind, i| {
+        const head = scan.heads[i * 8 ..][0..8];
         var cursor = try txn.openCursor();
         defer cursor.close();
         const lower = internal_keys.replayRangeLower(kind, 0);
@@ -220,11 +226,12 @@ fn scanReplayJournalLedger(txn: anytype) !internal_keys.JournalCreditLedger {
         while (entry) |current| : (entry = try cursor.next()) {
             // Bounded by key as well: not every cursor honors the upper bound.
             if (current.key.len < 2 or current.key[0] != internal_keys.replay_namespace or current.key[1] != kind) break;
-            if (current.key.len != internal_keys.replay_key_len) continue;
-            ledger = ledger.charged(replay_journal_format.entryCharge(current.key.len, current.value.len), 1);
+            const seq = internal_keys.parseReplayEntrySequence(current.key, kind) orelse continue;
+            if (std.mem.readInt(u64, head, .little) == 0) std.mem.writeInt(u64, head, seq + 1, .little);
+            scan.ledger = scan.ledger.charged(replay_journal_format.entryCharge(current.key.len, current.value.len), 1);
         }
     }
-    return ledger;
+    return scan;
 }
 
 /// Brings a journal the base revision initialized up to the current format
@@ -242,11 +249,13 @@ const ReplayCreditLaneHeads = [replay_credit_lanes.len * 8]u8;
 
 fn readReplayCreditLaneHeads(txn: anytype) !ReplayCreditLaneHeads {
     var heads: ReplayCreditLaneHeads = @splat(0);
-    var cursor = try txn.openCursor();
-    defer cursor.close();
-    cursor.setKeysOnly();
     for (replay_credit_lanes, 0..) |kind, i| {
         const lower = internal_keys.replayRangeLower(kind, 0);
+        const upper = internal_keys.replayRangeUpper(kind);
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        cursor.setKeysOnly();
+        cursor.setUpperBound(&upper);
         const entry = (try cursor.seekAtOrAfter(&lower)) orelse continue;
         const seq = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse continue;
         std.mem.writeInt(u64, heads[i * 8 ..][0..8], seq + 1, .little);
@@ -271,11 +280,9 @@ fn replayCreditsNeedRepair(txn: anytype) !bool {
 }
 
 fn upgradeLegacyReplayJournal(txn: anytype, keep_base_layout: bool) !void {
-    try replay_journal_format.upgrade(txn, try scanReplayJournalLedger(txn), &replay_hint_ordinals, keep_base_layout);
-    if (keep_base_layout) {
-        const heads = try readReplayCreditLaneHeads(txn);
-        try txn.put(&internal_keys.journal_credit_lane_heads_key, &heads);
-    }
+    const scan = try scanReplayJournalCredits(txn);
+    try replay_journal_format.upgrade(txn, scan.ledger, &replay_hint_ordinals, keep_base_layout);
+    if (keep_base_layout) try txn.put(&internal_keys.journal_credit_lane_heads_key, &scan.heads);
 }
 
 /// Whether this store's appends keep the base revision's layout (every hint
@@ -1398,9 +1405,13 @@ pub const DocStore = struct {
             }
 
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
-                var physical = try self.runtime.?.openCursor();
+                var physical = try self.openPhysicalCursorAdapter();
                 errdefer physical.close();
                 return try wrapPayloadCursor(self.alloc, physical, self.payload_session, false);
+            }
+
+            fn openPhysicalCursorAdapter(self: @This()) !backend_erased.Cursor {
+                return self.runtime.?.openCursor();
             }
 
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
@@ -1701,13 +1712,25 @@ pub const DocStore = struct {
             else => return err,
         };
         errdefer batch.abort();
-        if (try replay_journal_format.state(batch.asTxn()) == .current and
-            (!keep_base_layout or !try replayCreditsNeedRepair(batch.asTxn())))
-        {
-            batch.abort();
-            return;
+        const txn = batch.asTxn();
+        if (try replay_journal_format.state(txn) == .current) {
+            if (!keep_base_layout or !try replayCreditsNeedRepair(txn)) {
+                batch.abort();
+                return;
+            }
+            if (try replay_journal_format.baseWroteSince(txn)) {
+                try upgradeLegacyReplayJournal(txn, keep_base_layout);
+            } else {
+                // Bootstrapping the witness or reconciling a retirement
+                // changes accounting only. The remaining hint lanes retain
+                // their existing coverage.
+                const credits = try scanReplayJournalCredits(txn);
+                try storeJournalCreditLedger(txn, credits.ledger);
+                try txn.put(&internal_keys.journal_credit_lane_heads_key, &credits.heads);
+            }
+        } else {
+            try upgradeLegacyReplayJournal(txn, keep_base_layout);
         }
-        try upgradeLegacyReplayJournal(batch.asTxn(), keep_base_layout);
         batch.commit() catch |err| switch (err) {
             error.ReadOnly => {
                 batch.abort();
@@ -7704,6 +7727,28 @@ test "docstore reconciles rows a base binary retired after the upgrade" {
     const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 1), ledger.records);
     try std.testing.expectEqual(@as(u64, internal_keys.replay_key_len + "replay:1".len), ledger.bytes);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
+}
+
+test "docstore installs a credit witness without advancing hint coverage" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.putBatchWithReplay(null, &.{}, &.{}, .{ .sequence = 1, .payload = "replay:1" });
+        // Simulate a current-format journal written before the witness was added.
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.delete(&internal_keys.journal_credit_lane_heads_key);
+        try batch.commit();
+    }
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try std.testing.expectEqual(@as(?bool, false), try store.replayHintRecordBetween(.enrichment, 0, 1));
     var read = try store.beginReadTxn();
     defer read.abort();
     try std.testing.expect(!try replayCreditsNeedRepair(&read));
