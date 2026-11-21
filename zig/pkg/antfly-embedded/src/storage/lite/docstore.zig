@@ -4377,7 +4377,8 @@ pub const Store = struct {
         // entirely in that case -- this is exactly equivalent to the
         // previous unconditional check, not a new heuristic.
         const cheap_already_due = self.maintenance_policy.options.enabled and
-            self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
+            (self.needsProtectedRedoUpgrade() or
+                self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes);
         if (!cheap_already_due) {
             const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
             // §9 (redo retirement signal): back on the full, redo-aware
@@ -4495,6 +4496,10 @@ pub const Store = struct {
         }
     }
 
+    fn needsProtectedRedoUpgrade(self: *const Store) bool {
+        return self.file.header.redo_log_capacity != 0 and !self.file.header.protected_redo and !self.file.no_sync;
+    }
+
     // Adoption discards the cached ledger. This probe can therefore replay a
     // whole allocator snapshot; it must share the worker's cancellation fence
     // even though the preceding maintenance cycle has restored its token.
@@ -4608,6 +4613,7 @@ pub const Store = struct {
         var assessed_size: u64 = undefined;
         var assessed_indexed: bool = undefined;
         var assessed_generation: u64 = undefined;
+        var upgrade_redo = false;
         {
             if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
@@ -4633,7 +4639,12 @@ pub const Store = struct {
             // via `fixed_overhead`) need this file's own fixed redo-log
             // reservation subtracted; see `Policy.worthwhile`'s own doc
             // comment (Bug 3, perf/lwa-budget-tail, §9.7a).
-            if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
+            // The initial maintenance pass in openWithOptions services
+            // existing debt. Defer format migration until the owner may
+            // schedule background work or calls maintenance explicitly.
+            upgrade_redo = (!self.maintenance_start_suppressed or self.file.externally_locked) and self.needsProtectedRedoUpgrade();
+            const upgrade_due = upgrade_redo and self.maintenance_policy.rewrite_retry_at_ns == null;
+            if (!force and !self.maintenance_policy.due(size) and !retry_due and !upgrade_due) return;
             if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
             assessed_checkpoint = self.file.activeCheckpoint();
@@ -4690,7 +4701,7 @@ pub const Store = struct {
             self.maintenance_policy.status.state = .idle;
             self.maintenance_policy.status.reason = .none;
             self.maintenance_policy.status.last_error = null;
-            if (!due) {
+            if (!due and !upgrade_redo) {
                 self.maintenance_policy.rewrite_retry_at_ns = null;
                 break :blk false;
             }
@@ -11204,6 +11215,32 @@ test "lite online vacuum retires generations without waiting for pinned readers"
     defer fresh.abort();
     try std.testing.expectEqualStrings("new", try fresh.get("doc"));
     try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite maintenance upgrades a v11 redo file without reclamation debt" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "maintenance-protected-redo.aflite");
+    defer alloc.free(path);
+    {
+        var legacy = try native.NativeFile.createWithRedoLog(alloc, io, path, .{ .no_sync = true, .indexed_reclamation = true }, 64 * 1024);
+        defer legacy.close();
+        try legacy.beginTransaction();
+        try legacy.putDocument("doc", "old");
+        try legacy.commitTransaction();
+        try legacy.file.sync(io);
+    }
+
+    var store = try Store.openWithOptions(alloc, path, .{ .io = io });
+    defer store.close();
+    try std.testing.expectEqual(native.format_version, store.file.header.diskFormatVersion());
+    try store.maintainOnce(false);
+    try std.testing.expectEqual(native.protected_redo_format_version, store.file.header.diskFormatVersion());
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("old", try read.get("doc"));
 }
 
 // Regression: `NativeFile.prepareVacuum`/`replaceWithPreparedGeneration`

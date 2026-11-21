@@ -1855,9 +1855,10 @@ referenced pages and requires reopening before another write.
 The idle checkpointer publishes the folded checkpoint before recycling
 the redo extent, and reader pins can defer that recycle. Each restart
 assigns a new salt. Vacuum creates a fresh protected extent and an empty
-frontier covered by its checkpoint. Existing v11 redo files keep their
-legacy format until vacuum replaces them. New durable redo files use
-v12 at creation. A v11-only binary refuses to open a v12 file.
+frontier covered by its checkpoint. Owners with maintenance enabled
+schedule the v11 rewrite through the ordinary vacuum admission path,
+including its disk headroom and workspace checks. A manual vacuum can
+also upgrade a legacy file. New durable redo files use v12 at creation. A v11-only binary refuses to open a v12 file.
 
 Recovery becomes: open the on-disk checkpoint (still the v8/v9 slot
 mechanism's job -- `recoverActiveCheckpoint`, native.zig:15357-15420,
