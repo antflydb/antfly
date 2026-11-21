@@ -6011,7 +6011,7 @@ pub const ModelManager = struct {
         defer lease.deinit(io);
         var artifacts = try PublishedArtifacts.initForSelectedArtifacts(self.allocator, io, model_dir, .{ .publication = manifest.managed_publication }, control);
         defer artifacts.deinit();
-        return self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest, control, include_unavailable, &artifacts);
+        return self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest, control, include_unavailable, null, &artifacts);
     }
 
     pub fn declaredEmbeddingRevisionsFromArtifacts(
@@ -6020,8 +6020,9 @@ pub const ModelManager = struct {
         manifest: manifest_mod.ModelManifest,
         control: InferenceExecutionControl,
         artifacts: *const PublishedArtifacts,
+        expected: ?[32]u8,
     ) !EmbeddingRevisions {
-        return self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest, control, false, artifacts);
+        return self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest, control, false, expected, artifacts);
     }
 
     fn embeddingRevisionCandidatesFromArtifacts(
@@ -6030,6 +6031,7 @@ pub const ModelManager = struct {
         manifest: manifest_mod.ModelManifest,
         control: InferenceExecutionControl,
         include_unavailable: bool,
+        expected: ?[32]u8,
         artifacts: *const PublishedArtifacts,
     ) !EmbeddingRevisions {
         var result: EmbeddingRevisions = .{};
@@ -6059,7 +6061,22 @@ pub const ModelManager = struct {
             manager.requiredBackendCandidates(load_policy.preferred_backends, &required) catch return result
         else
             effective;
-        for (candidates) |backend| {
+        // On an exact request the non-CUDA recipes are known without
+        // entering the CUDA driver or waiting for another GPU probe.
+        var ordered: backends.BackendOrderBuffer = undefined;
+        var count: usize = 0;
+        if (expected != null and manifest.embedding_style == .embedding_gemma2) {
+            for (candidates) |backend| {
+                if (backend == .cuda) continue;
+                ordered[count] = backend;
+                count += 1;
+            }
+            if (std.mem.indexOfScalar(backends.BackendType, candidates, .cuda) != null) {
+                ordered[count] = .cuda;
+                count += 1;
+            }
+        }
+        for (if (expected != null and manifest.embedding_style == .embedding_gemma2) ordered[0..count] else candidates) |backend| {
             if (!backend.available() or !backend.supportsDirectSessionLoad()) continue;
             if (modelBackendPolicyError(manifest, backend, load_policy.cache_policy.a4b_request) != null) continue;
             if (!modelBackendMeetsJitPolicy(manager, manifest, backend)) continue;
@@ -6070,6 +6087,9 @@ pub const ModelManager = struct {
             if (backend == .wasm and manifest.onnx_path == null) continue;
             if (std.mem.indexOfScalar(backends.BackendType, result.backends[0..result.len], backend) != null) continue;
             const revision = if (backend == .cuda and manifest.embedding_style == .embedding_gemma2) resolved: {
+                if (expected) |pin| {
+                    if (result.contains(pin)) continue;
+                }
                 if (try self.residentCudaEmbeddingRevision(model_dir, artifacts.installation, load_policy.cache_policy)) |resident|
                     break :resolved resident;
                 const policy = (self.cuda_gemma_policy.resolve(self.allocator, artifacts.io, control) catch |err| switch (err) {
@@ -6151,7 +6171,7 @@ pub const ModelManager = struct {
         const construction = try prepared.prepareConstruction(io, model_dir, installation, control);
         try managed_receipt.requireInstallation(self.allocator, io, model_dir, installation);
         const manifest = try construction.loadManifest();
-        const declared = try self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest.*, control, true, &construction.artifacts);
+        const declared = try self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest.*, control, true, expected, &construction.artifacts);
         var compatible: [EmbeddingRevisions.max_backends]backends.BackendType = undefined;
         var count: usize = 0;
         var known_recipe = false;
@@ -6162,7 +6182,9 @@ pub const ModelManager = struct {
             if (!std.mem.eql(u8, &revision, &expected)) continue;
             known_recipe = true;
             if (self.pinnedBackendIsUnavailable(model_dir, installation, backend)) continue;
-            if (backend == .cuda and !try backends.probeCudaDeviceWithControl(control)) continue;
+            // Gemma candidate discovery already resolved the actual CUDA
+            // providers. Loading the session authoritatively checks them again.
+            if (backend == .cuda and manifest.embedding_style != .embedding_gemma2 and !try backends.probeCudaDeviceWithControl(control)) continue;
             // Classify absent or truncated selected files before the
             // architecture-specific metadata and admission parsers run.
             const primary_path = if (artifactCandidateForBackend(manifest.*, backend)) |candidate| switch (candidate) {
@@ -12306,7 +12328,7 @@ test "embeddinggemma2 preflight shares host capacity before model load and prese
     try std.testing.expectEqual(@as(usize, 0), manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
 }
 
-test "durable embedding revision transfers request preparation and verifies cold construction bytes" {
+test "model selection durable embedding revision transfers request preparation and verifies cold construction bytes" {
     if (!backends.BackendType.native.available()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -12340,8 +12362,19 @@ test "durable embedding revision transfers request preparation and verifies cold
     defer prepared.deinit();
     _ = try prepared.capture(io, path, null, null, .{});
     const manifest = try prepared.construction.?.loadManifest();
-    const revisions = try manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, .{ .io = io }, &prepared.construction.?.artifacts);
+    const revisions = try manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, .{ .io = io }, &prepared.construction.?.artifacts, null);
     try std.testing.expectEqual(@as(usize, 1), revisions.len);
+    if (comptime build_options.enable_cuda) {
+        const original = manager.session_manager;
+        defer manager.session_manager = original;
+        manager.session_manager.required_backend = null;
+        manager.session_manager.preferred_backends = &.{ .cuda, .native };
+        manager.session_manager.process_termination_available = true;
+        // CUDA is selectable, but this request has no hard-cancellation
+        // boundary. It can succeed only by resolving its native pin first.
+        const exact = try manager.embeddingRevisionCandidatesFromArtifacts(path, manifest.*, .{ .io = io }, true, revisions.revisions[0], &prepared.construction.?.artifacts);
+        try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, exact.backends[0..exact.len]);
+    }
 
     // Keep the size and receipt unchanged. The construction task must
     // authenticate the bytes even though request preparation already passed.

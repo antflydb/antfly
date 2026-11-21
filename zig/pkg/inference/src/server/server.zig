@@ -27913,8 +27913,15 @@ pub const Node = struct {
                     if (scoped_publication) |*scope| (if (scope.inspection_valid) scope else null) else null
                 else
                     null;
+                const expected_pin: ?[32]u8 = if (embedding and requested_revision != null) pin: {
+                    const required = requested_revision.?;
+                    var requested: [32]u8 = undefined;
+                    if (required.len != 64) return embeddingRevisionFailureResponse(ctx);
+                    _ = std.fmt.hexToBytes(&requested, required) catch return embeddingRevisionFailureResponse(ctx);
+                    break :pin requested;
+                } else null;
                 var declared = if (pin_scope) |scope|
-                    self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, &scope.artifacts) catch |err| {
+                    self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, &scope.artifacts, if (include_revisions) null else expected_pin) catch |err| {
                         if (isPinnedCatalogArtifactFailure(err)) {
                             // A checksum refusal can arrive after discovery
                             // captured healthy-looking size and path stamps.
@@ -27966,10 +27973,7 @@ pub const Node = struct {
                     }
                     if (alternatives.items.len > 1) try info.object.put(catalog_allocator, "model_revisions", .{ .array = alternatives });
                 }
-                if (embedding) if (requested_revision) |required| {
-                    var requested: [32]u8 = undefined;
-                    if (required.len != 64) return embeddingRevisionFailureResponse(ctx);
-                    _ = std.fmt.hexToBytes(&requested, required) catch return embeddingRevisionFailureResponse(ctx);
+                if (expected_pin) |requested| {
                     if (rejected.contains(requested) and !declared.contains(requested)) return embeddingArtifactFailureResponse(ctx);
                     if (!std.meta.eql(durable_revision, @as(?[32]u8, requested)) and !declared.contains(requested)) {
                         if (declared.cuda_probe_refused) return (try pinnedEmbeddingPreflightFailure(ctx, requested, error.PinnedEmbeddingBackendUnavailable)).?;
@@ -27977,7 +27981,7 @@ pub const Node = struct {
                     }
                     durable_revision = requested;
                     revision = requested;
-                };
+                }
                 const hex = if (revision) |value| std.fmt.bytesToHex(value, .lower) else undefined;
                 if (revision != null) {
                     try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
