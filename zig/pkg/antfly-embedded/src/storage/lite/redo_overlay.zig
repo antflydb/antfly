@@ -277,7 +277,7 @@ pub const SharedRedoOverlay = struct {
     replayed_sequence: [3]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0) },
     /// Highest sequence of any index-catalog version per index scope (the
     /// native catalog sink's key scope), under `mutex`. Keys are owned.
-    scope_latest: std.StringHashMapUnmanaged(u64) = .empty,
+    scope_latest: std.StringHashMapUnmanaged(ScopeSequences) = .empty,
     /// Sequences whose scope could not be recorded (allocation failure).
     /// Every scope reads at least this, so a fence fails closed.
     scope_untracked: u64 = 0,
@@ -588,8 +588,13 @@ pub const SharedRedoOverlay = struct {
     const index_root: u8 = 1;
     const catalog_key_prefix = "\x00ncat/";
 
+    const ScopeSequences = struct {
+        latest: u64 = 0,
+        latest_put: u64 = 0,
+    };
+
     /// Caller holds `mutex` (or populates before the overlay is shared).
-    fn noteScopeLocked(self: *SharedRedoOverlay, root: u8, key: []const u8, sequence: u64) void {
+    fn noteScopeLocked(self: *SharedRedoOverlay, root: u8, key: []const u8, sequence: u64, is_delete: bool) void {
         if (root != index_root or !std.mem.startsWith(u8, key, catalog_key_prefix)) return;
         const rest = key[catalog_key_prefix.len..];
         const scope = rest[0 .. std.mem.indexOfScalar(u8, rest, 0) orelse return];
@@ -603,9 +608,10 @@ pub const SharedRedoOverlay = struct {
                 self.scope_untracked = @max(self.scope_untracked, sequence);
                 return;
             };
-            gop.value_ptr.* = 0;
+            gop.value_ptr.* = .{};
         }
-        gop.value_ptr.* = @max(gop.value_ptr.*, sequence);
+        gop.value_ptr.latest = @max(gop.value_ptr.latest, sequence);
+        if (!is_delete) gop.value_ptr.latest_put = @max(gop.value_ptr.latest_put, sequence);
     }
 
     /// Highest sequence of any version under one index scope, from this
@@ -613,7 +619,7 @@ pub const SharedRedoOverlay = struct {
     pub fn scopeLatestSequence(self: *SharedRedoOverlay, io: std.Io, scope: []const u8) u64 {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return @max(self.scope_latest.get(scope) orelse 0, self.scope_untracked);
+        return @max((self.scope_latest.get(scope) orelse ScopeSequences{}).latest, self.scope_untracked);
     }
 
     pub fn replayedSequence(self: *const SharedRedoOverlay, root: u8) u64 {
@@ -644,7 +650,7 @@ pub const SharedRedoOverlay = struct {
         // inside the same lock -- never race this one.
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.noteScopeLocked(root, key, sequence);
+        self.noteScopeLocked(root, key, sequence, is_delete);
         const node = try self.entry_pool.create(allocator);
         errdefer self.entry_pool.destroy(node);
         node.* = .{
@@ -762,6 +768,21 @@ pub const SharedRedoOverlay = struct {
         std.debug.assert(root < 3);
         if (exact) |key| {
             if (self.resolveDeletion(io, root, key, mark, floor) == false) return true;
+        }
+
+        // Native catalog scopes already track their newest put. If that
+        // put is folded, no matching tombstone can hide a live overlay
+        // entry above the fold. Untracked writes force the ordinary scan.
+        if (root == index_root and std.mem.startsWith(u8, prefix, catalog_key_prefix)) {
+            const rest = prefix[catalog_key_prefix.len..];
+            if (std.mem.indexOfScalar(u8, rest, 0)) |end| {
+                if (end + 1 == rest.len) {
+                    self.mutex.lockUncancelable(io);
+                    defer self.mutex.unlock(io);
+                    const sequence = (self.scope_latest.get(rest[0..end]) orelse ScopeSequences{}).latest_put;
+                    if (@max(sequence, self.scope_untracked) <= floor) return false;
+                }
+            }
         }
 
         const keys_per_slice = 64;
@@ -1315,7 +1336,7 @@ pub const SharedRedoOverlay = struct {
             // still the only valid source of a `VersionedOverlayEntry` node:
             // `destroyChain`'s `pool.destroy` elsewhere would otherwise be
             // handed a pointer the pool's own free list does not own.
-            self.noteScopeLocked(root, key, sequence);
+            self.noteScopeLocked(root, key, sequence, decoded.is_delete);
             const gop = try self.maps[root].getOrPut(allocator, key);
             _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
             // A catch-up replays records this overlay may already hold, or
@@ -1612,6 +1633,23 @@ test "redo overlay live prefix probe crosses bounded tombstone slices" {
     try overlay.appendVersion(alloc, io, 1, "p/last", 132, try owned_allocator.dupe(u8, "live"), false, 0, 0);
     try std.testing.expect(try overlay.hasLivePrefix(alloc, io, 1, "p/", null, 132, 0));
     try std.testing.expect(!try overlay.hasLivePrefix(alloc, io, 1, "p/", null, 132, 132));
+}
+
+test "redo overlay scope probe preserves puts around tombstones and the fold frontier" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(alloc);
+
+    const prefix = "\x00ncat/scope\x00";
+    const key = prefix ++ "\x00record";
+    try overlay.appendVersion(alloc, io, 1, key, 1, try owned_allocator.dupe(u8, "value"), false, 0, 0);
+    try overlay.appendVersion(alloc, io, 1, key, 2, try owned_allocator.dupe(u8, ""), true, 0, 0);
+    try std.testing.expect(try overlay.hasLivePrefix(alloc, io, 1, prefix, null, 1, 0));
+    try std.testing.expect(!try overlay.hasLivePrefix(alloc, io, 1, prefix, null, 2, 1));
+    try std.testing.expectEqual(@as(u64, 2), overlay.scopeLatestSequence(io, "scope"));
+    try overlay.appendVersion(alloc, io, 1, key, 3, try owned_allocator.dupe(u8, "new"), false, 0, 0);
+    try std.testing.expect(try overlay.hasLivePrefix(alloc, io, 1, prefix, null, 3, 1));
 }
 
 test "redo overlay ordered index: a prefix scan never crosses into a neighboring prefix's keys" {
