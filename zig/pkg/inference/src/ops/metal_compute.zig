@@ -55031,6 +55031,10 @@ const PreparedDenseRegionFixture = struct {
         try selected.validateWithClaims(&.{activation}, &claims);
         var result = try executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_claims = &claims, .region_execution_profile = &profile, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
         defer result.deinit(&executable.runtime);
+        if (profile.profile == .synchronous) {
+            try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_slots_reserved);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_bytes_reserved);
+        }
         try std.testing.expect(claims.closed);
         // This counter increments at the real Frame.executeRegion seam, and
         // the synchronous executor returns before legacy node/fusion dispatch.

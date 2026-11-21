@@ -39866,7 +39866,7 @@ fn runAssignedDenseAttention(self: *CudaCompute, request: ops.kernel_descriptor.
     if (bytes != 0) {
         const workspace = tensorFromCt(request.workspace orelse return error.MissingAssignedWorkspace);
         if (workspace.physical_lease == null or workspace.dtype != .f32 or workspace.buffer.len < bytes or cudaTensorReadOnly(workspace)) return error.InvalidShape;
-        const alignment = if (plan.grouped) @alignOf(f32) else @alignOf(i64);
+        const alignment: usize = if (plan.grouped) @alignOf(f32) else @alignOf(i64);
         if (workspace.buffer.ptr % alignment != 0) return error.UnsupportedPhysicalWorkspaceAlignment;
         scratch = .{ .ptr = workspace.buffer.ptr, .len = bytes };
         if (kernel_geometry.byteRangesOverlap(scratch.ptr, bytes, output.buffer.ptr, try checkedMul(output.elem_count, 4))) return error.InvalidAssignedAlias;
