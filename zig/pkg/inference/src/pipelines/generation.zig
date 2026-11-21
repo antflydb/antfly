@@ -148,11 +148,32 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
 /// Audio expansion is measured after projection because its token count varies
 /// with the clip and projector metadata.
 pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
-    var allowance: usize = if (config.mm_tokens_per_image == 0) 0 else nativeGenerationImageCount(messages) *| (@as(usize, config.mm_tokens_per_image) + 1);
+    // Gemma 4 declares dynamic image geometry rather than mm_tokens_per_image.
+    // Fund its expanded decoder rows before selecting a scratch/chunk budget;
+    // a text-only estimate otherwise turns each image into many tiny chunks.
+    const image_rows: usize = if (config.usesGemma4Channels())
+        gemma4_projector.default_max_image_tokens
+    else
+        config.mm_tokens_per_image;
+    var allowance: usize = if (image_rows == 0) 0 else nativeGenerationImageCount(messages) *| (image_rows +| 1);
     for (messages) |message| if (message.video_bytes != null) {
         allowance +|= 60 * (70 + 10);
     };
     return allowance;
+}
+
+test "dynamic image admission funds expanded rows without shortening the text window" {
+    const images = [_][]const u8{ "first", "second" };
+    const messages = [_]Message{.{ .role = "user", .content = "describe", .image_bytes = &images }};
+    const config: gpt_mod.Config = .{ .family = .gemma, .gemma4_channel_protocol = true, .max_position_embeddings = 1024 };
+    try std.testing.expectEqual(@as(usize, 562), nativeGenerationMediaTokenAllowance(&messages, config));
+    try std.testing.expectEqual(@as(usize, 0), nativeGenerationPreliminaryMediaTokenAllowance(&messages, config));
+    const admission = try nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, config, .generic, null);
+    try std.testing.expectEqual(@as(usize, 585), try estimateNativeGenerationPromptTokenCount(23, admission.token_allowance, config, null, 32, 0));
+    // The estimate is a reservation bound, not a rejection of a valid smaller
+    // actual expansion close to the window. The expanded prompt is checked later.
+    try std.testing.expectEqual(@as(usize, 992), try estimateNativeGenerationPromptTokenCount(900, admission.token_allowance, config, null, 32, 0));
+    try std.testing.expectEqual(@as(usize, 0), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma }));
 }
 
 test "video prompt allowance is independent of the image token setting" {
@@ -324,7 +345,7 @@ pub fn nativeGenerationAdmissionMediaTokenAllowance(
 /// Media allowance that can safely constrain the text-only encode before
 /// dynamic image preprocessing determines the exact expanded prompt length.
 pub fn nativeGenerationPreliminaryMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
-    if (config.family == .qwen3_5 or config.family == .qwen3_vl) return 0;
+    if (config.family == .qwen3_5 or config.family == .qwen3_vl or config.usesGemma4Channels()) return 0;
     // Video's sixty-frame allowance is an admission bound, not the clip's
     // actual expansion. The fully expanded prompt is validated before KV use.
     for (messages) |message| if (message.video_bytes != null) return 0;

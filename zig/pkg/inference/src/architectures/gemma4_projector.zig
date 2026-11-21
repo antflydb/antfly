@@ -46,7 +46,9 @@ fn cudaNativePlanSelected(cb: *const ComputeBackend) bool {
 const default_spatial_merge_size: usize = @intCast(
     projector_format_mod.gemma4_spatial_merge_size,
 );
-const default_max_image_tokens: usize = 280;
+/// Maximum pooled image rows produced by the ordinary image processor.
+/// Scheduling uses the same bound before decoding or projecting the image.
+pub const default_max_image_tokens: usize = 280;
 const default_max_direct_audio_tokens: usize = 16_384;
 
 pub const ProjectedImages = struct {
