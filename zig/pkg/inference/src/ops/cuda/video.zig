@@ -673,6 +673,7 @@ pub const Preprocessor = struct {
     module: driver.CUmodule,
     function: driver.CUfunction,
     rgb_function: driver.CUfunction,
+    rgb_swscale601_function: driver.CUfunction,
     pub fn init(a: std.mem.Allocator, ctx: *context.CudaContext) !Preprocessor {
         _ = a;
         try ctx.makeCurrent();
@@ -683,13 +684,29 @@ pub const Preprocessor = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, "video_patches"));
         var rgb_function: driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rgb_function, module, "video_rgb8"));
-        return .{ .ctx = ctx, .module = module, .function = function, .rgb_function = rgb_function };
+        var rgb_swscale601_function: driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rgb_swscale601_function, module, "video_rgb8_swscale601"));
+        return .{ .ctx = ctx, .module = module, .function = function, .rgb_function = rgb_function, .rgb_swscale601_function = rgb_swscale601_function };
     }
     pub fn deinit(self: *Preprocessor) void {
         self.ctx.makeCurrent() catch {};
         _ = self.ctx.driver.fns.cuModuleUnload(self.module);
     }
     pub fn rgb8(self: *Preprocessor, compute: *cuda.CudaCompute, frame: Frame) !ops.CT {
+        return self.rgb8UsingFunction(compute, frame, self.rgb_function);
+    }
+    /// Optional upstream RGB8 rounding for SDR limited-range BT.601 only.
+    /// Other matrices/depths/ranges retain the existing portable color policy.
+    pub fn rgb8Gemma4(self: *Preprocessor, compute: *cuda.CudaCompute, frame: Frame) !ops.CT {
+        const enabled = @import("antfly_platform").env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_SWSCALE_RGB", false);
+        return self.rgb8Gemma4UsingPolicy(compute, frame, enabled);
+    }
+    fn rgb8Gemma4UsingPolicy(self: *Preprocessor, compute: *cuda.CudaCompute, frame: Frame, enabled: bool) !ops.CT {
+        const supported = frame.high_depth == 0 and frame.tone == 0 and frame.full_range == 0 and
+            (frame.matrix == 2 or frame.matrix == 5 or frame.matrix == 6);
+        return self.rgb8UsingFunction(compute, frame, if (enabled and supported) self.rgb_swscale601_function else self.rgb_function);
+    }
+    fn rgb8UsingFunction(self: *Preprocessor, compute: *cuda.CudaCompute, frame: Frame, function: driver.CUfunction) !ops.CT {
         if (frame.device == 0 or frame.width == 0 or frame.height == 0 or frame.width > 4096 or frame.height > 4096 or frame.pitch < frame.width or frame.width % 2 != 0 or frame.height % 2 != 0) return error.InvalidVideoGeometry;
         const raster = frame.rasterSize();
         const output = try compute.createEmbeddingGemma2Tensor(&.{ raster[1], raster[0], 3 }, .u8);
@@ -703,7 +720,7 @@ pub const Preprocessor = struct {
         args[0] = &src;
         args[1] = &dst;
         for (&sizes, 2..) |*value, i| args[i] = value;
-        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(self.rgb_function, (frame.width * frame.height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
+        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(function, (frame.width * frame.height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
         self.ctx.noteKernelLaunch();
         return output;
     }
@@ -728,6 +745,125 @@ pub const Preprocessor = struct {
         return output;
     }
 };
+
+test "gemma4 video RGB matches independent PyAV BT601 fixture and preserves fallback" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const nv12 = @embedFile("../../testdata/video/gemma4-rgb601.nv12");
+    const expected = @embedFile("../../testdata/video/gemma4-rgb601.rgb");
+    const width = 32;
+    const height = 16;
+    var compute = try cuda.CudaCompute.initWithKernelJitForProfile(a, .{}, .gemma4);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var preprocess = try Preprocessor.init(a, &compute.ctx);
+    defer preprocess.deinit();
+    var buffer = try @import("buffer.zig").DeviceBuffer.alloc(&compute.ctx, nv12.len);
+    defer buffer.free(&compute.ctx);
+    try buffer.copyFromHost(&compute.ctx, nv12);
+    for ([_]u32{ 2, 5, 6 }) |matrix| for (0..4) |rotation| {
+        const frame: Frame = .{ .device = buffer.ptr, .pitch = width, .width = width, .height = height, .timestamp_us = 0, .matrix = matrix, .full_range = 0, .rotation = @intCast(rotation) };
+        const before = cb.trainingRuntimeStats();
+        const rgb = try preprocess.rgb8Gemma4UsingPolicy(&compute, frame, true);
+        defer cb.free(rgb);
+        try std.testing.expectEqual(before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
+        const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(rgb));
+        var actual: [width * height * 3]u8 = undefined;
+        try tensor.buffer.copyToHost(&compute.ctx, &actual);
+        const raster = frame.rasterSize();
+        for (0..raster[1]) |y| for (0..raster[0]) |x| {
+            const source_x = switch (rotation) {
+                1 => y,
+                2 => width - 1 - x,
+                3 => width - 1 - y,
+                else => x,
+            };
+            const source_y = switch (rotation) {
+                1 => height - 1 - x,
+                2 => height - 1 - y,
+                3 => x,
+                else => y,
+            };
+            const i = (y * raster[0] + x) * 3;
+            const j = (source_y * width + source_x) * 3;
+            try std.testing.expectEqualSlices(u8, expected[j..][0..3], actual[i..][0..3]);
+        };
+    };
+    for ([_]Frame{
+        .{ .device = buffer.ptr, .pitch = width, .width = width, .height = height, .timestamp_us = 0, .matrix = 1, .full_range = 0 },
+        .{ .device = buffer.ptr, .pitch = width, .width = width, .height = height, .timestamp_us = 0, .matrix = 6, .full_range = 1 },
+        .{ .device = buffer.ptr, .pitch = width, .width = width, .height = height, .timestamp_us = 0, .matrix = 9, .full_range = 0, .tone = 1 },
+    }) |frame| {
+        const original = try preprocess.rgb8(&compute, frame);
+        defer cb.free(original);
+        const fallback = try preprocess.rgb8Gemma4UsingPolicy(&compute, frame, true);
+        defer cb.free(fallback);
+        const disabled = try preprocess.rgb8Gemma4UsingPolicy(&compute, frame, false);
+        defer cb.free(disabled);
+        var bytes: [3][width * height * 3]u8 = undefined;
+        for ([_]ops.CT{ original, fallback, disabled }, 0..) |value, i| {
+            const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(value));
+            try tensor.buffer.copyToHost(&compute.ctx, &bytes[i]);
+        }
+        try std.testing.expectEqualSlices(u8, &bytes[0], &bytes[1]);
+        try std.testing.expectEqualSlices(u8, &bytes[0], &bytes[2]);
+    }
+}
+
+test "gemma4 real video exports decoded RGB parity fixture" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const env = @import("antfly_platform").env;
+    const path = env.getenv("ANTFLY_GEMMA4_VIDEO_PARITY_INPUT") orelse return error.SkipZigTest;
+    const output = env.getenv("ANTFLY_GEMMA4_VIDEO_PARITY_OUTPUT") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const compat = @import("../../io/compat.zig");
+    const bytes = try compat.cwd().readFileAlloc(compat.io(), path, a, .limited(64 * 1024 * 1024));
+    defer a.free(bytes);
+    var compute = try cuda.CudaCompute.initWithKernelJitForProfile(a, .{}, .gemma4);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var preprocess = try Preprocessor.init(a, &compute.ctx);
+    defer preprocess.deinit();
+    const CaptureFrames = struct {
+        compute: *cuda.CudaCompute,
+        cb: *const ops.ComputeBackend,
+        preprocess: *Preprocessor,
+        output: []const u8,
+        count: usize = 0,
+        fn consume(raw: *anyopaque, frame: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const rgb = try self.preprocess.rgb8Gemma4(self.compute, frame);
+            defer self.cb.free(rgb);
+            const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(rgb));
+            const values = try std.testing.allocator.alloc(u8, @as(usize, frame.width) * frame.height * 3);
+            defer std.testing.allocator.free(values);
+            try tensor.buffer.copyToHost(&self.compute.ctx, values);
+            const nv12 = try std.testing.allocator.alloc(u8, @as(usize, frame.pitch) * frame.height * 3 / 2);
+            defer std.testing.allocator.free(nv12);
+            const source: @import("buffer.zig").DeviceBuffer = .{ .ptr = frame.device, .len = nv12.len };
+            try source.copyToHost(&self.compute.ctx, nv12);
+            try self.compute.ctx.synchronize();
+            const frame_base = try std.fmt.allocPrint(std.testing.allocator, "{s}/{d}", .{ self.output, self.count });
+            defer std.testing.allocator.free(frame_base);
+            const rgb_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.rgb", .{frame_base});
+            defer std.testing.allocator.free(rgb_path);
+            const nv12_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.nv12", .{frame_base});
+            defer std.testing.allocator.free(nv12_path);
+            const metadata_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.json", .{frame_base});
+            defer std.testing.allocator.free(metadata_path);
+            const meta = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .width = frame.width, .height = frame.height, .pitch = frame.pitch, .matrix = frame.matrix, .full_range = frame.full_range, .high_depth = frame.high_depth, .tone = frame.tone, .timestamp_us = frame.timestamp_us }, .{});
+            defer std.testing.allocator.free(meta);
+            try compat.cwd().writeFile(compat.io(), .{ .sub_path = rgb_path, .data = values });
+            try compat.cwd().writeFile(compat.io(), .{ .sub_path = nv12_path, .data = nv12 });
+            try compat.cwd().writeFile(compat.io(), .{ .sub_path = metadata_path, .data = meta });
+            self.count += 1;
+        }
+    };
+    var capture = CaptureFrames{ .compute = &compute, .cb = &cb, .preprocess = &preprocess, .output = output };
+    const stats = try decodeMp4(a, &compute.ctx, bytes, .{ .context = &capture, .consume = CaptureFrames.consume });
+    try std.testing.expect(capture.count > 0);
+    try std.testing.expectEqual(stats.selected_frames, capture.count);
+}
 
 test "video CUDA scalar clamps preserve bounds without host transfers" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
@@ -1298,6 +1434,19 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
                 const index = ((gy * (size[0] / 16) + gx) * 256 + py * 16 + px) * 3 + c;
                 const expected = 2 * (reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px] - 0.5);
                 try std.testing.expectEqual(expected, actual[index]);
+            };
+            compute.capability_profile = .gemma4;
+            const gemma_before = cb.trainingRuntimeStats();
+            const gemma = try compute.preprocessGemma4ResidentRgb(resident_rgb, width, height, size[0], size[1]);
+            defer cb.free(gemma);
+            compute.capability_profile = .embedding_gemma2;
+            try std.testing.expectEqual(gemma_before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
+            const gemma_actual = try cb.toFloat32(gemma, a);
+            defer a.free(gemma_actual);
+            for (0..size[1] / 16) |gy| for (0..size[0] / 16) |gx| for (0..16) |py| for (0..16) |px| for (0..3) |c| {
+                const index = ((gy * (size[0] / 16) + gx) * 3 + c) * 256 + py * 16 + px;
+                const expected = reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px];
+                try std.testing.expectApproxEqAbs(expected, gemma_actual[index], 1e-7);
             };
         }
     };

@@ -3761,6 +3761,21 @@ test "system catalog relation namespace transaction FK generation publication be
         .child_fences = &.{child_fence},
         .parents = &.{.{ .table = parent, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{derived[0].transition} }},
     };
+    {
+        var stale_plan = plan;
+        stale_plan.expected_incarnation = "22222222222222222222222222222222".*;
+        const stale = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.Command{
+            .plan_id = id,
+            .child_table_id = child.table_id,
+            .expected_revision = 0,
+            .action = .begin,
+            .plan = stale_plan,
+        }, .{});
+        defer alloc.free(stale);
+        try std.testing.expectError(error.CatalogGenerationChanged, store.requireMetadataIncarnation(group_id, stale_plan.expected_incarnation));
+        try store.applyStandaloneCommand(group_id, .{ .apply_fk_generation_publication = stale });
+        try std.testing.expectError(error.GenerationPublicationNotFound, store.fkGenerationPublicationStatusJson(alloc, group_id, child.table_id));
+    }
     var altered_index_plan = plan;
     altered_index_plan.child_after.indexes_json = "{\"unexpected\":{}}";
     try std.testing.expectError(error.InvalidGenerationPublication, altered_index_plan.validate(alloc));
@@ -4436,6 +4451,22 @@ test "system catalog relation namespace transaction FK generation publication in
         .namespace_id = system_catalog.default_namespace_id,
         .parents = &.{.{ .table = parent, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{derived[0].transition} }},
     };
+    {
+        var stale_plan = plan;
+        stale_plan.expected_incarnation = "22222222222222222222222222222222".*;
+        const stale = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{
+            .plan_id = id,
+            .child_table_id = candidate.child.table_id,
+            .expected_revision = 0,
+            .action = .begin,
+            .plan = stale_plan,
+        }, .{});
+        defer alloc.free(stale);
+        try std.testing.expectError(error.CatalogGenerationChanged, store.requireMetadataIncarnation(group_id, stale_plan.expected_incarnation));
+        try std.testing.expectError(error.GenerationPublicationChanged, store.preflightFkInitialCreateCommand(group_id, stale));
+        try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = stale });
+        try std.testing.expectError(error.GenerationPublicationNotFound, store.fkInitialCreateStatusJson(alloc, group_id, candidate.child.table_id));
+    }
     const hidden_proof: fk_generation_publication.InitialPlacementProof = .{
         .plan_id = plan.id,
         .plan_digest = try plan.digest(alloc),
@@ -5490,6 +5521,7 @@ test "initial partial support begin survives restart and cancellation before chi
             .logical_name = "child",
             .namespace_id = system_catalog.default_namespace_id,
             .support_pending = true,
+            .support_schema_format = .lineage_v1,
             .parents = &.{.{
                 .table = parent_before,
                 .ranges = &.{parent_range},
@@ -5500,6 +5532,28 @@ test "initial partial support begin survives restart and cancellation before chi
             }},
         };
         try plan.validate(a);
+        // An old log contains the unstamped parent delta and no format field.
+        // Decode, validate and reserialize it without changing the receipt digest.
+        var legacy = plan;
+        legacy.support_schema_format = .legacy;
+        // A protocol-96 binary could already have published a stamped plan
+        // without the discriminator. Preserve that plan's original digest too.
+        try legacy.validate(a);
+        try std.testing.expect(fk_generation_publication.hasStampedSupport(legacy.parents));
+        var legacy_parent = plan.parents[0];
+        const next_indexes = try std.json.parseFromSliceLeaky(std.json.Value, a, parent_after.indexes_json, .{});
+        const token = @import("antfly_local_sources").api_coverage_policy.incarnation(next_indexes.object.get("full_text_index_v2").?).?;
+        legacy_parent.support_after = try @import("../../api/tables.zig").reconstructSchemaUpdateRecord(a, &parent_before, support_json, token, .legacy);
+        legacy.parents = &.{legacy_parent};
+        const historical = try std.json.Stringify.valueAlloc(a, legacy, .{});
+        try std.testing.expect(std.mem.indexOf(u8, historical, "support_schema_format") == null);
+        try std.testing.expect(std.mem.indexOf(u8, historical, "x-antfly-column-lineage") == null);
+        const replay = try std.json.parseFromSliceLeaky(fk_generation_publication.InitialCreatePlan, a, historical, .{});
+        var old_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(historical, &old_digest, .{});
+        try std.testing.expectEqual(old_digest, try replay.digest(a));
+        legacy.support_schema_format = .lineage_v1;
+        try std.testing.expectError(error.InvalidGenerationPublication, legacy.validate(a));
         var forged = plan;
         var forged_parent = plan.parents[0];
         var forged_after = parent_after;
@@ -5828,7 +5882,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "15";
+const derived_catalog_index_version = "17";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -8254,6 +8308,18 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
             var decoded = (try decodeTransitionCommand(alloc, wire)).?;
             defer decoded.deinit(alloc);
             try std.testing.expectEqualDeep(command, decoded);
+            {
+                var stale = draft;
+                stale.expected_incarnation = "22222222222222222222222222222222".*;
+                const bytes = try std.json.Stringify.valueAlloc(alloc, stale, .{});
+                defer alloc.free(bytes);
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                try applyRestoreTransitionForTest(&store, &txn, group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = bytes } });
+                var buf: [256]u8 = undefined;
+                try std.testing.expectError(error.NotFound, txn.get(try restoreJobKeyForGroup(&buf, group, user_key)));
+                try std.testing.expectError(error.NotFound, txn.get(try restore_staging.jobKey(&buf, group, id)));
+            }
             {
                 var cancelled_txn = try store.store.beginWriteTxn();
                 defer cancelled_txn.abort();
@@ -11686,7 +11752,7 @@ pub const RaftApplyStore = struct {
             if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
             var hash: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-            try system_catalog_storage.applyPolicyCommand(self.alloc, &txn, group_id, command, hash);
+            try system_catalog_storage.applyPolicyCommand(self.alloc, &txn, group_id, command, hash, .reject);
             const observed = try system_catalog_storage.readMeta(self.alloc, &txn, group_id);
             if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &hash)) return error.CatalogGenerationChanged;
         }
@@ -11921,6 +11987,23 @@ pub const RaftApplyStore = struct {
         _ = self.projection_listeners.orderedRemove(projection_index.?);
         _ = self.committed_key_listeners.orderedRemove(committed_key_index.?);
         return true;
+    }
+
+    fn metadataIncarnationMatchesTxn(txn: anytype, group: u64, expected: ?[32]u8) !bool {
+        const incarnation = expected orelse return true;
+        var buf: [160]u8 = undefined;
+        const raw = txn.get(try metadataIncarnationKeyForGroup(&buf, group)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(raw)).incarnation, &incarnation);
+    }
+
+    pub fn requireMetadataIncarnation(self: *RaftApplyStore, group: u64, expected: ?[32]u8) !void {
+        if (expected == null) return;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        if (!try metadataIncarnationMatchesTxn(&txn, group, expected)) return error.CatalogGenerationChanged;
     }
 
     pub fn getMetadataIncarnation(
@@ -12535,6 +12618,12 @@ pub const RaftApplyStore = struct {
         return .{ .present = id != null and id.? == request.graph_id };
     }
 
+    pub fn policyDefinitionRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: system_catalog.PolicyRead) ![]u8 {
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        return system_catalog_storage.readPolicyDefinition(alloc, &txn, group, request);
+    }
+
     pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
@@ -12860,15 +12949,27 @@ pub const RaftApplyStore = struct {
         if (table_id == 0) return error.InvalidRowPolicyPublication;
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        const stamp = (try system_catalog_storage.loadPolicyPublicationStamp(alloc, &txn, group_id, table_id)) orelse {
+        const stamp = try self.policyStampTxn(alloc, &txn, group_id, table_id);
+        return std.json.Stringify.valueAlloc(alloc, stamp, .{});
+    }
+
+    fn policyStampTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !?sql_policies.PublicationStamp {
+        const stamp = (try system_catalog_storage.loadPolicyPublicationStamp(alloc, txn, group_id, table_id)) orelse {
             // Absence is data, not an unsupported capability or a stale fence.
             // A publication without its transactionally written stamp is corrupt.
-            if (try system_catalog_storage.loadPolicyPublication(alloc, &txn, group_id, table_id)) |publication| {
+            if (try system_catalog_storage.loadPolicyPublication(alloc, txn, group_id, table_id)) |publication| {
                 publication.deinit();
                 return error.RowPolicyCatalogChanged;
             }
-            return alloc.dupe(u8, "null");
+            return null;
         };
+        // Disabled owners still owe their final acknowledgements after promotion.
+        // Once those are durable the historical stamp no longer governs reads.
+        // Keep the publication record so a later enable advances its generation.
+        if (stamp.phase == .disabled) {
+            if (try system_catalog_storage.hasPolicyPublicationWork(alloc, txn, group_id, table_id)) return error.RowPolicyCatalogChanged;
+            return null;
+        }
         if (stamp.topology_generation != 0 and
             !std.mem.eql(u8, &stamp.schema_record_digest, &(@as([32]u8, @splat(0)))))
         {
@@ -12877,13 +12978,13 @@ pub const RaftApplyStore = struct {
             // per-request proof read O(1) in shard count. Begin validates the
             // physical owner cut; later ACKs and promotion validate its
             // transactionally maintained topology and schema fences.
-            try self.validatePolicyOwnerStampTxn(&txn, group_id, stamp);
+            try self.validatePolicyOwnerStampTxn(txn, group_id, stamp);
         } else {
-            var publication = (try system_catalog_storage.loadPolicyPublication(alloc, &txn, group_id, table_id)) orelse return error.RowPolicyCatalogChanged;
+            var publication = (try system_catalog_storage.loadPolicyPublication(alloc, txn, group_id, table_id)) orelse return error.RowPolicyCatalogChanged;
             defer publication.deinit();
-            try self.validatePolicyOwnerCutTxn(&txn, group_id, publication.value);
+            try self.validatePolicyOwnerCutTxn(txn, group_id, publication.value);
         }
-        return std.json.Stringify.valueAlloc(alloc, stamp, .{});
+        return stamp;
     }
 
     pub fn sqlPolicyPublicationWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_table_id: u64) ![]u8 {
@@ -12949,6 +13050,7 @@ pub const RaftApplyStore = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
+        if (!try boundIncarnationMatches(&txn, group_id, request.expected_incarnation)) return error.CatalogGenerationChanged;
         if (meta.revision != request.expected_revision) return error.RowPolicyCatalogChanged;
         if (try backupCohortLocksTableTxn(&txn, group_id, request.table_id) or
             try restoreStagingLocksTableTxn(&txn, group_id, request.table_id) or
@@ -13018,7 +13120,7 @@ pub const RaftApplyStore = struct {
             .acknowledged_owners = &.{},
         };
         try publication.validateShape();
-        return std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = meta.revision, .change = .{ .begin = publication } }, .{});
+        return std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = meta.revision, .expected_incarnation = request.expected_incarnation, .change = .{ .begin = publication } }, .{});
     }
 
     fn policyTableSchemaTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !struct { version: u32, digest: [32]u8, record_digest: [32]u8, has_indexes: bool, has_schema_search: bool } {
@@ -13052,14 +13154,45 @@ pub const RaftApplyStore = struct {
         return .{ .version = native.version, .digest = digest, .record_digest = record_digest, .has_indexes = has_indexes, .has_schema_search = has_schema_search };
     }
 
+    fn boundPolicyMatches(txn: anytype, group: u64, command: sql_policies.Command, alloc: std.mem.Allocator) !bool {
+        if (!try boundIncarnationMatches(txn, group, command.expected_incarnation)) return false;
+        const expected = command.expected_schema_version orelse return true;
+        if (command.change != .put or command.change.put.schema_version != expected) return false;
+        var key: [160]u8 = undefined;
+        const bytes = txn.get(try tableKeyForGroup(&key, group, command.change.put.table_id)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const table = try decodeTableRecord(arena.allocator(), bytes);
+        return try @import("../../api/tables.zig").schemaVersion(table.schema_json) == expected;
+    }
+
+    fn boundIncarnationMatches(txn: anytype, group: u64, expected: ?[16]u8) !bool {
+        const incarnation = expected orelse return true;
+        const epoch = try relationSourceEpochTxn(txn, group);
+        return std.mem.eql(u8, &epoch.incarnation, &incarnation);
+    }
+
+    pub fn policyCreateHasCapacity(self: *RaftApplyStore, group: u64) !bool {
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        return system_catalog_storage.policyCreateHasCapacity(&txn, group);
+    }
+
     fn applySqlPoliciesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
         var parsed = try std.json.parseFromSlice(sql_policies.Command, self.alloc, bytes, .{});
         defer parsed.deinit();
+        if (!try boundPolicyMatches(txn, group_id, parsed.value, self.alloc)) return;
+        _ = try self.ensureDerivedCatalogIndexesTxn(txn, group_id);
         const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-        try system_catalog_storage.applyPolicyCommand(self.alloc, txn, group_id, parsed.value, hash);
+        // Repeat capacity admission in the apply transaction. A create that
+        // loses a race leaves the catalog revision and receipt unchanged.
+        try system_catalog_storage.applyPolicyCommand(self.alloc, txn, group_id, parsed.value, hash, .skip);
         const observed = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
         if (observed.revision != previous.revision) self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
     }
@@ -13069,6 +13202,7 @@ pub const RaftApplyStore = struct {
         var parsed = try std.json.parseFromSlice(sql_policies.PublicationCommand, self.alloc, bytes, .{});
         defer parsed.deinit();
         const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
+        if (!try boundIncarnationMatches(txn, group_id, parsed.value.expected_incarnation)) return;
         // Re-evaluate the exact owner cut inside the metadata apply
         // transaction. A receipt from an owner split or replaced since begin
         // can never promote the old policy generation.
@@ -14131,8 +14265,9 @@ pub const RaftApplyStore = struct {
         const source_tracked = try relation_reconciliation.readSourceRevision(txn, group_id) != 0;
         var previous_source_digest: ?[32]u8 = null;
         if (command.action == .begin) {
-            if (prior != null) return error.GenerationPublicationChanged;
             const plan = command.plan.?;
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, plan.expected_incarnation)) return error.GenerationPublicationChanged;
+            if (prior != null) return error.GenerationPublicationChanged;
             const digest = try plan.digest(a);
             const meta = try system_catalog_storage.readMeta(a, txn, group_id);
             if (plan.catalog_id != meta.next_id or plan.expected_catalog_revision != meta.revision or
@@ -14234,6 +14369,7 @@ pub const RaftApplyStore = struct {
             // apply retains immutable plan/receipt slices from the previous
             // value. Keep them in the transaction arena through serialization.
             const previous = try std.json.parseFromSliceLeaky(fk_generation_publication.InitialPublication, a, prior orelse return error.GenerationPublicationNotFound, .{});
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, previous.plan.expected_incarnation)) return error.StaleInitialFkCreateCommand;
             if (source_tracked) previous_source_digest = try relationInitialSourceDigest(previous, command.child_table_id);
             if (command.action == .seal_support) {
                 const sealed = command.plan orelse return error.InvalidGenerationPublication;
@@ -14575,6 +14711,7 @@ pub const RaftApplyStore = struct {
         var previous: ?std.json.Parsed(fk_generation_publication.Publication) = null;
         defer if (previous) |*value| value.deinit();
         if (command.action == .begin) {
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, command.plan.?.expected_incarnation)) return;
             var completion_buf: [200]u8 = undefined;
             const retired = txn.get(try fk_generation_publication.completionKey(&completion_buf, group_id, .{ .child_table_id = table_id, .publication_id = command.plan_id })) catch |err| switch (err) {
                 error.NotFound => null,
@@ -14607,6 +14744,7 @@ pub const RaftApplyStore = struct {
             publication = .{ .plan = plan, .plan_digest = plan_digest, .child_identity = try plan.childIdentity(alloc), .revision = 1, .phase = .fencing_child };
         } else {
             previous = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, existing orelse return error.GenerationPublicationNotFound, .{ .allocate = .alloc_always });
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, previous.?.value.plan.expected_incarnation)) return;
             if (source_tracked) previous_source_digest = try relationFkSourceDigest(previous.?.value, table_id);
             publication = try previous.?.value.apply(alloc, command);
             if (command.action == .publish_child) {
@@ -14704,6 +14842,7 @@ pub const RaftApplyStore = struct {
     pub fn systemCatalogAdmission(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Mutation) !CatalogAdmission {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
+        if (!try boundIncarnationMatches(&txn, group_id, request.expected_incarnation)) return error.CatalogGenerationChanged;
         const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
         var result: CatalogAdmission = .{ .meta = meta };
         if (request.kind == .table and (request.action == .create or request.action == .set_tablespace)) {
@@ -14782,6 +14921,8 @@ pub const RaftApplyStore = struct {
     pub fn resolveSystemCatalogIdentitiesWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany, context: @import("antfly_local_sources").api_operation.RequestContext) !system_catalog.ResolvedMany {
         try context.ensureActive();
         if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len or request.relations.len > 256 - request.targets.len - request.storage_names.len) return error.CatalogCommandTooLarge;
+        if (request.cursor_catalog_cut != null and request.cursor_bindings.len == 0) return error.InvalidCatalogMutation;
+        if (request.cursor_bindings.len != 0 and (request.cursor_bindings.len > 256 or request.targets.len != 0 or request.storage_names.len != 0 or request.relations.len != 0 or !request.include_source_epoch or request.include_query_definitions or request.name_allocation)) return error.InvalidCatalogMutation;
         if (request.expected_relation_epoch != null and request.relations.len == 0) return error.InvalidCatalogMutation;
         for (request.relations) |target| try target.validate();
         var txn = try self.beginQueryCatalogReadTxn(group_id);
@@ -14799,6 +14940,41 @@ pub const RaftApplyStore = struct {
             null;
         if (live) |value| if (!value.root.epoch.eql(try relationSourceEpochTxn(&txn, group_id))) return error.CatalogGenerationChanged;
         if (request.expected_relation_epoch) |expected| if (!live.?.root.epoch.eql(expected)) return error.CatalogGenerationChanged;
+        const source_epoch = if (request.include_source_epoch)
+            relationSourceEpochTxn(&txn, group_id) catch |err| switch (err) {
+                error.CatalogSourceUntracked, error.InvalidMetadataIncarnation => null,
+                else => return err,
+            }
+        else
+            null;
+        if (request.cursor_bindings.len != 0) {
+            // The catalog and physical source revisions jointly fence names and
+            // schemas. Policy promotion and owner fencing are checked on every read.
+            const same_catalog = if (request.cursor_catalog_cut) |cut| cut.revision == meta.revision and source_epoch != null and cut.epoch.eql(source_epoch.?) else false;
+            var hash = std.crypto.hash.Blake3.init(.{});
+            var protected = false;
+            for (request.cursor_bindings) |binding| {
+                try context.ensureActive();
+                if (!same_catalog) {
+                    if (binding.target) |target| {
+                        const row = (try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, alloc, &txn, group_id, target)) orelse return error.CatalogGenerationChanged;
+                        defer row.deinit(alloc);
+                        if (row.table_id != binding.id or !std.mem.eql(u8, row.name, binding.physical)) return error.CatalogGenerationChanged;
+                        var buf: [160]u8 = undefined;
+                        const projection = try borrowTableProjection(try txn.get(try tableKeyForGroup(&buf, group_id, row.table_id)), .schema);
+                        if (try @import("../../api/tables.zig").schemaVersionAlloc(alloc, projection.query_definition.?.schema_json) != binding.version) return error.CatalogGenerationChanged;
+                    } else {
+                        if (!try system_catalog_storage.graphRevisionMatches(alloc, &txn, group_id, binding)) return error.CatalogGenerationChanged;
+                    }
+                }
+                try system_catalog.CursorPolicies.observe(&hash, &protected, binding, if (binding.target != null) try self.policyStampTxn(alloc, &txn, group_id, binding.id) else null);
+            }
+            return .{ .tables = &.{}, .revision = meta.revision, .source_epoch = source_epoch, .cursor_policies = .{ .protected = protected, .digest = digest: {
+                var digest: [32]u8 = undefined;
+                hash.final(&digest);
+                break :digest digest;
+            } } };
+        }
         const tables = try alloc.alloc(?system_catalog.ResolvedTable, request.targets.len);
         var initialized: usize = 0;
         errdefer {
@@ -14851,7 +15027,7 @@ pub const RaftApplyStore = struct {
             }
             slot.* = .{ .owner = owner, .table = table, .logical_table = try alloc.dupe(u8, logical_name) };
         }
-        return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
+        return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .source_epoch = source_epoch, .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
     }
 
     /// Name selection can precede registry adoption. Read the complete source
@@ -15048,6 +15224,7 @@ pub const RaftApplyStore = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const meta = try system_catalog_storage.readMeta(a, txn, group_id);
+        if (!try boundIncarnationMatches(txn, group_id, command.mutation.expected_incarnation)) return;
         if (meta.revision != command.expected_revision) return;
         if (command.mutation.kind == .table and command.mutation.action == .create) {
             const namespace = if (std.mem.eql(u8, command.mutation.namespace, system_catalog.default_namespace_name) and
@@ -22452,6 +22629,7 @@ pub const RaftApplyStore = struct {
             if (job_bytes.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging;
             var job = try std.json.parseFromSlice(restore_staging.Job, alloc, job_bytes, .{});
             defer job.deinit();
+            if (!try metadataIncarnationMatchesTxn(&txn, group_id, job.value.plan.expected_incarnation)) continue;
             try overlayRestoreStagingProgressTxn(&txn, alloc, group_id, id, &job.value);
             // Drafts reserve identities and live source definitions, but may
             // not create target owners until immutable source cuts are bound.
@@ -22560,6 +22738,7 @@ pub const RaftApplyStore = struct {
         const bytes = (try stagingGet(&txn, try restore_staging.jobKey(&key_buf, group_id, id))) orelse return null;
         var job = try std.json.parseFromSlice(restore_staging.Job, alloc, bytes, .{ .allocate = .alloc_always });
         errdefer job.deinit();
+        if (!try metadataIncarnationMatchesTxn(&txn, group_id, job.value.plan.expected_incarnation)) return error.CatalogGenerationChanged;
         try overlayRestoreStagingProgressTxn(&txn, alloc, group_id, id, &job.value);
         if (job.value.plan.preparing_sources) {
             const arena = job.arena.allocator();
@@ -22918,6 +23097,7 @@ pub const RaftApplyStore = struct {
             if (current != null) return; // Immutable identity; callers verify plan digest after apply.
             if (try stagingGet(txn, progress_key) != null) return; // Canceled before admission.
             const plan = command.plan.?;
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, plan.expected_incarnation)) return;
             _ = restoreCatalogDeltaTxn(catalog_arena.allocator(), txn, group_id, plan) catch |err| {
                 if (err == error.InvalidRestoreStaging) return;
                 return err;
@@ -22991,6 +23171,7 @@ pub const RaftApplyStore = struct {
             const existing = current orelse return;
             var job = try std.json.parseFromSlice(restore_staging.Job, self.alloc, existing, .{});
             defer job.deinit();
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, job.value.plan.expected_incarnation)) return;
             if (source_tracked) previous_source_digest = try relationRestoreSourceDigest(job.value.plan);
             const progress_bytes = (try stagingGet(txn, progress_key)) orelse return error.InvalidRestoreStaging;
             var progress = try std.json.parseFromSlice(restore_staging.Progress, self.alloc, progress_bytes, .{});
@@ -23033,6 +23214,7 @@ pub const RaftApplyStore = struct {
                 .freeze_rewrite => {
                     if (next.state != .preparing_sources or !job.value.plan.preparing_sources or next.completed_owners != total) return;
                     const frozen = command.plan.?;
+                    if (!std.meta.eql(frozen.expected_incarnation, job.value.plan.expected_incarnation)) return;
                     const previous_digest = try job.value.plan.rewriteIntentDigest(self.alloc);
                     const frozen_digest = try frozen.rewriteIntentDigest(self.alloc);
                     if (!std.mem.eql(u8, &previous_digest, &frozen_digest)) return;
@@ -23839,21 +24021,37 @@ pub const RaftApplyStore = struct {
     ) !void {
         try guard.validate();
         if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
-        const activation = try self.standbyRelationActivationTxn(txn, group_id);
-        if (activation.version < topology_protocol.relation_mutation_version) return error.TableTopologyProtocolUpgradeRequired;
-        const epoch = try relationSourceEpochTxn(txn, group_id);
-        if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
-        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogPublicationProofPending;
-        if (!live.root.epoch.eql(epoch)) return error.CatalogGenerationChanged;
-        const namespace_id = (try resolveSystemCatalogNamespaceTxn(self.alloc, txn, group_id, guard.target.database, guard.target.namespace)) orelse return error.CatalogGenerationChanged;
-        const owner = (try live.getClaim(.{ .namespace_id = namespace_id, .name = guard.target.name })) orelse return error.CatalogGenerationChanged;
-        if (!owner.eql(guard.owner)) return error.CatalogGenerationChanged;
-        var binding = try system_catalog_storage.getById(self.alloc, txn, group_id, .table, owner.table_id);
-        defer if (binding) |*value| value.deinit();
-        if (binding) |value| {
-            if (value.value.parent_id != namespace_id or !std.mem.eql(u8, value.value.name, guard.logical_table) or
-                !std.mem.eql(u8, value.value.storage_name, expected.name)) return error.CatalogGenerationChanged;
-        } else if (namespace_id != system_catalog.default_namespace_id or !std.mem.eql(u8, expected.name, guard.logical_table)) return error.CatalogGenerationChanged;
+        if (guard.qualified_table) {
+            if (!std.mem.allEqual(u8, &guard.incarnation, 0)) {
+                const epoch = try relationSourceEpochTxn(txn, group_id);
+                if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
+            }
+            const bound = (try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, self.alloc, txn, group_id, .{
+                .database = guard.target.database,
+                .namespace = guard.target.namespace,
+                .table = guard.target.name,
+            })) orelse return error.CatalogGenerationChanged;
+            defer bound.deinit(self.alloc);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(expected.schema_json, &digest, .{});
+            if (bound.table_id != expected.table_id or !std.mem.eql(u8, bound.name, expected.name) or !std.mem.eql(u8, &digest, &guard.owner.schema_digest)) return error.CatalogGenerationChanged;
+        } else {
+            const activation = try self.standbyRelationActivationTxn(txn, group_id);
+            if (activation.version < topology_protocol.relation_mutation_version) return error.TableTopologyProtocolUpgradeRequired;
+            const epoch = try relationSourceEpochTxn(txn, group_id);
+            if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
+            var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogPublicationProofPending;
+            if (!live.root.epoch.eql(epoch)) return error.CatalogGenerationChanged;
+            const namespace_id = (try resolveSystemCatalogNamespaceTxn(self.alloc, txn, group_id, guard.target.database, guard.target.namespace)) orelse return error.CatalogGenerationChanged;
+            const owner = (try live.getClaim(.{ .namespace_id = namespace_id, .name = guard.target.name })) orelse return error.CatalogGenerationChanged;
+            if (!owner.eql(guard.owner)) return error.CatalogGenerationChanged;
+            var binding = try system_catalog_storage.getById(self.alloc, txn, group_id, .table, owner.table_id);
+            defer if (binding) |*value| value.deinit();
+            if (binding) |value| {
+                if (value.value.parent_id != namespace_id or !std.mem.eql(u8, value.value.name, guard.logical_table) or
+                    !std.mem.eql(u8, value.value.storage_name, expected.name)) return error.CatalogGenerationChanged;
+            } else if (namespace_id != system_catalog.default_namespace_id or !std.mem.eql(u8, expected.name, guard.logical_table)) return error.CatalogGenerationChanged;
+        }
         // Extension ownership is independently mutable. Recheck its exact
         // table-local index in this write transaction, not a preflight snapshot.
         var prefix_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
@@ -39648,7 +39846,7 @@ test "SQL settings apply through Raft and survive catalog restart" {
     }
 }
 
-test "inert SQL policy definitions survive standalone replay, snapshot, and restart" {
+test "system catalog inert SQL policy definitions survive standalone replay, snapshot, and restart" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -39691,6 +39889,48 @@ test "inert SQL policy definitions survive standalone replay, snapshot, and rest
         var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
         defer store.deinit();
         try store.updateStandaloneCatalog(group, 0, .{ .tables = &.{table}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = 8, .resources = &.{binding} } });
+        {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const capped_root = try std.fmt.allocPrint(a, "{s}-capacity", .{root});
+            var capped_store = try RaftApplyStore.init(alloc, .{ .root_dir = capped_root });
+            defer capped_store.deinit();
+            const existing = try a.alloc(sql_policies.Record, 1024);
+            for (existing, 0..) |*row, index| {
+                row.* = record;
+                row.id += index;
+                row.name = try std.fmt.allocPrint(a, "policy_{d}", .{index});
+            }
+            const next_id = record.id + existing.len;
+            try capped_store.updateStandaloneCatalog(group, 0, .{ .tables = &.{table}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = next_id, .resources = &.{binding}, .policies = existing } });
+            var create = command;
+            create.version = sql_policies.capacity_checked_version;
+            create.change.put.id = next_id;
+            try std.testing.expect(!try capped_store.policyCreateHasCapacity(group));
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, create, .{}) });
+            try std.testing.expectEqual(@as(u64, 1), (try capped_store.systemCatalogMeta(a, group)).revision);
+            var update = command;
+            update.change.put = existing[0];
+            update.change.put.generation += 1;
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, update, .{}) });
+            const drop: sql_policies.Command = .{ .expected_revision = 2, .change = .{ .drop = .{ .id = record.id, .generation = 2, .table_id = record.table_id } } };
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, drop, .{}) });
+            try std.testing.expect(try capped_store.policyCreateHasCapacity(group));
+            create.expected_revision = 3;
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, create, .{}) });
+            try std.testing.expectEqual(@as(u64, 4), (try capped_store.systemCatalogMeta(a, group)).revision);
+            try std.testing.expect(!try capped_store.policyCreateHasCapacity(group));
+            create.version = 1;
+            create.expected_revision = 4;
+            create.change.put.id += 1;
+            create.change.put.name = "historical_last_policy";
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, create, .{}) });
+            var legacy = try capped_store.systemCatalogSnapshot(a, group);
+            defer legacy.deinit();
+            try std.testing.expectEqual(@as(usize, 1025), legacy.value.policies.len);
+            try std.testing.expect(!try capped_store.policyCreateHasCapacity(group));
+        }
         try store.applyStandaloneCommand(group, .{ .apply_sql_policies = bytes });
         try store.applyStandaloneCommand(group, .{ .apply_sql_policies = bytes });
         const stale: sql_policies.Command = .{ .expected_revision = 1, .change = .{ .drop = .{ .id = 8, .generation = 1, .table_id = 7 } } };
@@ -39706,6 +39946,16 @@ test "inert SQL policy definitions survive standalone replay, snapshot, and rest
         var portable = try std.json.parseFromSlice(@import("../../system_catalog/projection.zig").Export, alloc, portable_bytes, .{});
         defer portable.deinit();
         try std.testing.expectEqual(@as(usize, 1), portable.value.system_catalog.policies.len);
+
+        // A version 15 store has the policy record but no derived policy names.
+        const prefix = try system_catalog_storage.namePrefixAlloc(alloc, group);
+        defer alloc.free(prefix);
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.deleteDerivedPrefixTxn(&txn, prefix);
+        var version_buf: [160]u8 = undefined;
+        try txn.put(try derivedCatalogIndexVersionKey(&version_buf, group), "15");
+        try txn.commit();
     }
     {
         var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
@@ -39715,6 +39965,18 @@ test "inert SQL policy definitions survive standalone replay, snapshot, and rest
         try std.testing.expectEqual(@as(usize, 1), state.value.policies.len);
         try std.testing.expectEqualStrings("owner_filter", state.value.policies[0].name);
         try std.testing.expectEqual(@as(u64, 1), state.value.policies[0].generation);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const lookup: system_catalog.PolicyRead = .{ .table_id = 7, .name = "OWNER_FILTER" };
+        const response = try reopened.policyDefinitionRead(a, group, lookup);
+        const named = try std.json.parseFromSliceLeaky(system_catalog.State, a, response, .{});
+        try std.testing.expectEqual(@as(usize, 1), named.policies.len);
+        try std.testing.expectEqual(record.id, named.policies[0].id);
+        const drop: sql_policies.Command = .{ .expected_revision = named.revision, .change = .{ .drop = .{ .id = record.id, .generation = record.generation, .table_id = record.table_id } } };
+        try reopened.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, drop, .{}) });
+        const missing = try reopened.policyDefinitionRead(a, group, lookup);
+        try std.testing.expectEqual(@as(usize, 0), (try std.json.parseFromSliceLeaky(system_catalog.State, a, missing, .{})).policies.len);
     }
 }
 
@@ -39781,6 +40043,26 @@ test "row-policy publication persists exact owner ACKs and leader install cut" {
 
         try std.testing.expectError(error.RowPolicyCatalogChanged, store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = false, .expected_revision = 2 }));
         try std.testing.expectError(error.RowPolicyCatalogChanged, store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = true, .expected_revision = 1 }));
+        // Keep the logical revision, physical table and owner cut identical
+        // while replacing the metadata identity between resolution and begin.
+        {
+            var identity_txn = try store.store.beginWriteTxn();
+            errdefer identity_txn.abort();
+            try writeMetadataIncarnationRecordTxn(&identity_txn, group, .{ .incarnation = "22222222222222222222222222222222".* });
+            try relation_reconciliation.advanceSource(&identity_txn, group);
+            try identity_txn.commit();
+        }
+        try std.testing.expectError(error.CatalogGenerationChanged, store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = false, .expected_revision = 2, .expected_incarnation = @splat(0x11) }));
+        const stale_begin = try store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = true, .expected_revision = 2, .expected_incarnation = @splat(0x22) });
+        defer alloc.free(stale_begin);
+        {
+            var restored = try store.store.beginWriteTxn();
+            errdefer restored.abort();
+            try writeMetadataIncarnationRecordTxn(&restored, group, .{ .incarnation = "33333333333333333333333333333333".* });
+            try restored.commit();
+        }
+        try store.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = stale_begin });
+        try std.testing.expectEqual(@as(u64, 2), (try store.systemCatalogMeta(alloc, group)).revision);
         var forged_publication = publication;
         forged_publication.schema_digest = @splat(9);
         const forged_begin = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = 2, .change = .{ .begin = forged_publication } }, .{});
@@ -40029,6 +40311,57 @@ test "row-policy publication persists exact owner ACKs and leader install cut" {
         const stale_ack = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = 9, .change = .{ .acknowledge = .{ .table_id = 7, .generation = 2, .receipt = receipt } } }, .{});
         defer alloc.free(stale_ack);
         try std.testing.expectError(error.RowPolicyCatalogChanged, reopened.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = stale_ack }));
+        // Finish the replacement, then disable through each real owner ACK.
+        // The final ACK releases the old schema fence for new cursors.
+        var revision: u64 = 9;
+        var generation: u64 = 2;
+        var epoch: u64 = 9;
+        for ([_]sql_policies.Publication.Phase{ .pending_install, .serving_install, .pending_disable, .serving_disable, .disabled }) |phase| {
+            if (phase == .pending_disable) {
+                const disable = try reopened.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = false, .expected_revision = revision });
+                defer alloc.free(disable);
+                try reopened.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = disable });
+                revision += 1;
+                generation += 1;
+                epoch = revision;
+            }
+            if (phase == .disabled) try std.testing.expectError(error.RowPolicyCatalogChanged, reopened.sqlPolicyPublicationStatusJson(alloc, group, 7));
+            const bundle = try reopened.sqlPolicyInstallSnapshotJson(alloc, group, .{ .table_id = 7, .expected_generation = generation, .expected_catalog_epoch = epoch, .expected_phase = phase, .owner_group_id = owner.group_id, .expected_descriptor_digest = owner.descriptor_digest });
+            defer alloc.free(bundle);
+            var ack = receipt;
+            ack.phase = phase;
+            ack.catalog_epoch = epoch;
+            ack.applied_index += revision;
+            std.crypto.hash.sha2.Sha256.hash(bundle, &ack.bundle_digest, .{});
+            const ack_bytes = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = revision, .change = .{ .acknowledge = .{ .table_id = 7, .generation = generation, .receipt = ack } } }, .{});
+            defer alloc.free(ack_bytes);
+            try reopened.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = ack_bytes });
+            revision += 1;
+            const next: sql_policies.Publication.Phase = switch (phase) {
+                .pending_install => .serving_install,
+                .serving_install => .active,
+                .pending_disable => .serving_disable,
+                .serving_disable => .disabled,
+                .disabled => break,
+                .active => unreachable,
+            };
+            const promote_bytes = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = revision, .change = .{ .promote = .{ .table_id = 7, .generation = generation, .phase = next } } }, .{});
+            defer alloc.free(promote_bytes);
+            try reopened.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = promote_bytes });
+            revision += 1;
+        }
+        var updated = table;
+        updated.schema_json = try @import("../../api/tables.zig").normalizeSchemaVersion(alloc, table.schema_json, 2);
+        defer alloc.free(updated.schema_json);
+        try reopened.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = updated } });
+        const observed = (try reopened.getTable(alloc, group, 7)).?;
+        defer metadata_table_manager.freeTable(alloc, observed);
+        try std.testing.expectEqualStrings(updated.schema_json, observed.schema_json);
+        const disabled_status = try reopened.sqlPolicyPublicationStatusJson(alloc, group, 7);
+        defer alloc.free(disabled_status);
+        try std.testing.expectEqualStrings("null", disabled_status);
+        const read = try reopened.resolveSystemCatalogIdentities(alloc, group, .{ .cursor_bindings = &.{.{ .target = .{ .database = "default", .namespace = "public", .table = binding.name }, .physical = table.name, .id = 7, .version = 2 }}, .include_source_epoch = true });
+        try std.testing.expect(!read.cursor_policies.?.protected);
         const fence = try reopened.getTableTransitionFence(group, table.table_id);
         try reopened.applyStandaloneCommand(group, .{ .apply_table_topology = .{ .drop = .{
             .table_id = table.table_id,
@@ -40542,6 +40875,7 @@ test "system catalog normalized store reports preserve clocks duplicates migrati
     }
     const payload_page_key = try RaftApplyStore.reportPageKey(a, 21, 20, 0, false);
     const payload = try store.store.get(a, payload_page_key);
+    const expected_report_ref = try store.store.get(a, payload_key);
     const before = store.snapshotWriteStats().wal_append_bytes;
     {
         var txn = try store.store.beginWriteTxn();
@@ -40591,8 +40925,8 @@ test "system catalog normalized store reports preserve clocks duplicates migrati
         try txn.commit();
     }
     try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, 21, 1, snapshot));
-    try std.testing.expectError(error.NotFound, store.store.get(a, payload_key));
-    try store.ensureDerivedCatalogIndexes(21);
+    // Installation atomically rebuilds the report index and its payload pages.
+    try std.testing.expectEqualSlices(u8, expected_report_ref, try store.store.get(a, payload_key));
     const restored = try store.listStores(a, 21);
     try std.testing.expectEqual(@as(u64, 30), restored[0].node_id);
     try std.testing.expectEqual(@as(u64, 50), restored[0].reporter_incarnation);
@@ -43193,6 +43527,16 @@ test "system catalog graph authority probes use bounded indexed identities acros
         try system_catalog_storage.applyDelta(alloc, &txn, 21, .{ .next_id = 8, .upserts = @constCast(&[_]system_catalog.Resource{graph}), .removes = &.{} }, .{}, @splat(0));
         try txn.commit();
     }
+    const binding: system_catalog.CursorBinding = .{ .id = 7, .physical = "g", .version = graph.graph_revision };
+    const cursor: system_catalog.ResolveMany = .{ .cursor_bindings = &.{binding}, .include_source_epoch = true };
+    {
+        const reply = try store.resolveSystemCatalogIdentities(alloc, 21, cursor);
+        defer reply.deinit(alloc);
+        try std.testing.expect(!reply.cursor_policies.?.protected);
+        var stale = binding;
+        stale.version += 1;
+        try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(alloc, 21, .{ .cursor_bindings = &.{stale}, .include_source_epoch = true }));
+    }
     const first = try store.graphAuthority(alloc, 21, .{ .name = "g", .graph_id = 7 });
     try std.testing.expect(first.present);
     var buffer: [4096]u8 = undefined;
@@ -43207,6 +43551,7 @@ test "system catalog graph authority probes use bounded indexed identities acros
         try system_catalog_storage.applyDelta(alloc, &txn, 21, .{ .next_id = 8, .removes = @constCast(&[_]system_catalog.Resource{graph}), .upserts = &.{} }, .{ .revision = 1, .next_id = 8 }, @splat(0));
         try txn.commit();
     }
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(alloc, 21, cursor));
     bounded.reset();
     try std.testing.expect(!(try store.graphAuthority(bounded.allocator(), 21, .{ .name = "g", .graph_id = 7 })).present);
     // A replacement may reuse an old revision. It cannot reuse cached presence.

@@ -126,7 +126,19 @@ const std = @import("std");
 /// Version 93 separates immutable restore inputs from mutable checkpoints.
 /// Version 94 retains distributed restore admission ownership on ranges.
 pub const pinned_restore_job_version: u16 = 94;
-pub const current_version: u16 = pinned_restore_job_version;
+/// Catalog apply checks the physical identity captured by pgwire Bind.
+pub const bound_ddl_version: u16 = 95;
+/// Bound catalog and policy commands carry guards verified by every applying replica.
+pub const bound_catalog_incarnation_version: u16 = 96;
+/// Version 97 versions FK witness-schema reconstruction and fences policy publication begin.
+pub const guarded_publication_version: u16 = 97;
+/// Generation plans can bind a catalog incarnation and policy creates can enforce capacity at apply.
+pub const guarded_generation_admission_version: u16 = 98;
+/// Catalog CREATE can require the destination namespace or database observed at Bind.
+pub const bound_create_parent_version: u16 = 99;
+/// Every prospective metadata session owner can recover incarnation-bound staged work.
+pub const bound_session_version: u16 = 100;
+pub const current_version: u16 = bound_session_version;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);

@@ -16,6 +16,7 @@
 // Model registry: discovers local models and downloads from HuggingFace Hub.
 
 const std = @import("std");
+const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const lightonocr3 = @import("../readers/lightonocr3.zig");
 const ascii_compat = @import("../util/ascii_compat.zig");
 const Io = std.Io;
@@ -423,23 +424,27 @@ pub const ModelRegistry = struct {
 
     /// Discover models in the models directory.
     pub fn discover(self: *ModelRegistry, io: Io) ![]ModelEntry {
-        return self.discoverWithKindMode(io, .manifest);
+        return self.discoverWithKindMode(io, .manifest, .{});
     }
 
     /// Discover model paths without loading manifests to classify model kind.
     /// Callers that already load manifests should prefer this to avoid parsing
     /// every manifest twice on listing-style paths.
     pub fn discoverShallow(self: *ModelRegistry, io: Io) ![]ModelEntry {
-        return self.discoverWithKindMode(io, .path);
+        return self.discoverWithKindMode(io, .path, .{});
     }
 
     /// Enumerate installation paths using literal storage names. Public
     /// selector ownership is derived separately, without parsing architecture.
     pub fn discoverInstallations(self: *ModelRegistry, io: Io) ![]ModelEntry {
-        return self.discoverWithKindMode(io, .installations);
+        return self.discoverInstallationsWithControl(io, .{});
     }
 
-    fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode) ![]ModelEntry {
+    pub fn discoverInstallationsWithControl(self: *ModelRegistry, io: Io, control: ExecutionControl) ![]ModelEntry {
+        return self.discoverWithKindMode(io, .installations, control);
+    }
+
+    fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode, control: ExecutionControl) ![]ModelEntry {
         var entries = std.ArrayListUnmanaged(ModelEntry).empty;
         errdefer {
             for (entries.items) |entry| {
@@ -455,8 +460,8 @@ pub const ModelRegistry = struct {
             seen.deinit(self.allocator);
         }
 
-        try self.discoverFlat(io, &entries, &seen, kind_mode);
-        try self.discoverLegacy(io, &entries, &seen, kind_mode);
+        try self.discoverFlat(io, &entries, &seen, kind_mode, control);
+        try self.discoverLegacy(io, &entries, &seen, kind_mode, control);
 
         return try entries.toOwnedSlice(self.allocator);
     }
@@ -467,6 +472,7 @@ pub const ModelRegistry = struct {
         entries: *std.ArrayListUnmanaged(ModelEntry),
         seen: *std.StringHashMapUnmanaged(void),
         kind_mode: DiscoverKindMode,
+        control: ExecutionControl,
     ) !void {
         var dir = Dir.cwd().openDir(io, self.models_dir, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return,
@@ -476,6 +482,7 @@ pub const ModelRegistry = struct {
 
         var iter = dir.iterate();
         while (try iter.next(io)) |entry| {
+            try control.check();
             if (entry.name.len == 0 or entry.name[0] == '.') continue;
             const entry_kind = resolvedEntryKind(dir, io, entry) catch |err| switch (err) {
                 error.FileNotFound => continue,
@@ -500,6 +507,7 @@ pub const ModelRegistry = struct {
 
             var owner_iter = owner_dir.iterate();
             while (try owner_iter.next(io)) |model_entry| {
+                try control.check();
                 if (model_entry.name.len == 0 or model_entry.name[0] == '.') continue;
                 const model_entry_kind = resolvedEntryKind(owner_dir, io, model_entry) catch |err| switch (err) {
                     error.FileNotFound => continue,
@@ -522,6 +530,7 @@ pub const ModelRegistry = struct {
         entries: *std.ArrayListUnmanaged(ModelEntry),
         seen: *std.StringHashMapUnmanaged(void),
         kind_mode: DiscoverKindMode,
+        control: ExecutionControl,
     ) !void {
         const subdirs = [_]struct { dir: []const u8, kind: ModelKind }{
             .{ .dir = "embedders", .kind = .embedder },
@@ -536,6 +545,7 @@ pub const ModelRegistry = struct {
         };
 
         for (subdirs) |subdir| {
+            try control.check();
             const path = try std.fs.path.join(self.allocator, &.{ self.models_dir, subdir.dir });
             defer self.allocator.free(path);
 
@@ -547,6 +557,7 @@ pub const ModelRegistry = struct {
 
             var iter = dir.iterate();
             while (try iter.next(io)) |entry| {
+                try control.check();
                 if (entry.name.len == 0 or entry.name[0] == '.') continue;
                 const entry_kind = resolvedEntryKind(dir, io, entry) catch |err| switch (err) {
                     error.FileNotFound => continue,
@@ -566,6 +577,7 @@ pub const ModelRegistry = struct {
 
                         var owner_iter = owner_dir.iterate();
                         while (try owner_iter.next(io)) |model_entry| {
+                            try control.check();
                             if (model_entry.name.len == 0 or model_entry.name[0] == '.') continue;
                             const model_entry_kind = resolvedEntryKind(owner_dir, io, model_entry) catch |err| switch (err) {
                                 error.FileNotFound => continue,

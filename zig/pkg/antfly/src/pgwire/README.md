@@ -35,8 +35,9 @@ buffered rows retain a small authorization capsule. Every fetch rechecks current
 credentials, scoped table identities, read grants and row filters. Held rows
 survive later transaction boundaries, not disconnect or node restart. Rollback
 to a savepoint closes cursors created after that savepoint without rewinding
-earlier cursor positions. Blocking plans without a native pull stream remain
-unsupported for SQL DECLARE.
+earlier cursor positions. Blocking SELECT plans materialize once under the same
+cursor quotas. Both paths pin the serving SQL row-policy generation and check
+role membership and effective row filters before releasing buffered rows.
 
 `SET [SESSION|LOCAL] statement_timeout`, `SHOW statement_timeout`, and
 `RESET statement_timeout` work with both simple and extended queries. Values
@@ -55,8 +56,8 @@ namespace's read permission and existence before installing the entire path.
 An unqualified relation binds to the first matching table; authorization,
 catalog-generation, and other failures never trigger fallback. Table operations
 still authorize their own scoped resources. Lookup scope is separate from the
-immutable durable transaction-owner scope. Existing SQL prepared statements,
-Parse/Bind portals and cursors retain their original complete path. `$user`
+immutable durable transaction-owner scope. Each new Bind or SQL EXECUTE uses the
+current path. Bound portals and declared cursors retain their complete path. `$user`
 expansion remains unsupported. Other session settings are not
 acknowledged as no-ops. `SET CONSTRAINTS` is a native durable transaction command,
 not a connection setting.
@@ -120,10 +121,33 @@ proxy's login into an unbounded, cached grant or retry a canceled mutation.
   Execute suspends/resumes the same snapshot/result
   without replaying a statement or mutation. A statement can be closed
   independently of its portals. Opaque backend continuation tokens are rejected.
-- Cached statements recompile before Bind and before an unstarted Execute, using
-  their fixed parameter types and saved namespace/search path. Compatible DDL,
-  including an added unselected column or index, transparently refreshes the
-  catalog guard. Changed result types fail with `0A000` and PostgreSQL's
+- New bindings use the current ordered search path. A bound portal retains its
+  namespace, path and physical relation identities through Execute. Graph scans
+  also pin the graph definition revision and label tables. Destructive DDL
+  checks its bound targets again during mutation admission. A bound
+  `DROP TABLE IF EXISTS` cannot remove a table created after Bind observed
+  its absence. Clustered catalog mutations carrying a bound resource ID
+  require metadata topology protocol 95. A bound catalog incarnation raises
+  the requirement to 96. Enabling or disabling row security with a bound
+  incarnation requires protocol 97. Policy DDL pins the policy ID
+  and generation, and foreign-key and tablespace changes pin their named
+  destination. An initial `MATCH PARTIAL` foreign key that installs a parent
+  witness index requires protocol 97 for versioned witness schemas. Protocol
+  98 fences incarnation-bound FK generation plans and restore staging, and
+  supports policy capacity checks during apply. Bound CREATE TABLE and CREATE
+  SCHEMA pin their destination namespace and database respectively. Catalog
+  commands carrying that parent ID require protocol 99. Column and constraint edits pin the
+  owning schema version.
+  A prepared DROP INDEX follows the index across unrelated column changes
+  and rejects a dropped and recreated index. The metadata owner assigns
+  index birth versions when it commits a schema, including for HTTP edits.
+- Warm Describe reuses the validated shape while its catalog and authorization
+  generations match. Descriptions that consulted no catalog objects, such as
+  `SELECT 1`, need only the credential check. Rebinding checks parameter
+  types, result types and field names. Table replacement or graph remapping
+  rejects an already bound portal with `40001`. Compatible changes, including
+  an added unselected column, refresh the guard. Changed result types fail
+  with `0A000` and PostgreSQL's
   `cached plan must not change result type` message before reading or mutation
   admission. Rebinding also refreshes the settings epoch; execution validates
   that fresh epoch to fence concurrent setting catalog changes.

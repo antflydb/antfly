@@ -5789,7 +5789,96 @@ pub const SparseIndex = struct {
         return @intCast(doc_num);
     }
 
+    /// Confirm live physical ordinals against authoritative primary keys in a
+    /// sorted page. A collision or missing reverse record needs key lookup.
+    pub fn tryProveProjectionDocNums(
+        alloc: Allocator,
+        txn: *backend_erased.ReadTxn,
+        ordinals: []const u32,
+        primary_keys: []const ?[]const u8,
+        proven: []bool,
+        control: @import("../search/query.zig").ExecutionControl,
+    ) !bool {
+        // Release proof scratch before the caller starts key-based lookup.
+        var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer scratch.deinit();
+        proveProjectionDocNums(scratch.allocator(), txn, ordinals, primary_keys, proven, control) catch |err| switch (err) {
+            error.OutOfMemory,
+            error.StorageReadTemporarilyUnavailable,
+            error.InvalidData,
+            error.InvalidSegment,
+            error.InvalidTableFile,
+            error.CorruptInput,
+            error.CrcMismatch,
+            error.TableBlockChecksumMismatch,
+            error.InputOutput,
+            error.FileNotFound,
+            error.WouldBlock,
+            error.EndOfStream,
+            error.Unsupported,
+            => {
+                @memset(proven, false);
+                return false;
+            },
+            else => return err,
+        };
+        return true;
+    }
+
+    fn proveProjectionDocNums(
+        alloc: Allocator,
+        txn: *backend_erased.ReadTxn,
+        ordinals: []const u32,
+        primary_keys: []const ?[]const u8,
+        proven: []bool,
+        control: @import("../search/query.zig").ExecutionControl,
+    ) !void {
+        var storage: [256][9]u8 = undefined;
+        var keys: [256][]const u8 = undefined;
+        var values: [256]?[]const u8 = undefined;
+        std.debug.assert(ordinals.len <= storage.len and ordinals.len == primary_keys.len and proven.len == ordinals.len);
+        @memset(proven, false);
+        var positions: [256]usize = undefined;
+        var present: usize = 0;
+        for (ordinals, primary_keys, 0..) |ordinal, key, i| {
+            if (key == null) continue;
+            positions[present] = i;
+            keys[present] = revKey(&storage[present], ordinal);
+            present += 1;
+        }
+        if (present == 0) return;
+        try control.check();
+        var reads = try txn.openReadScope(alloc);
+        defer reads.close();
+        try reads.getManySorted(keys[0..present], values[0..present]);
+        var count: usize = 0;
+        for (positions[0..present], values[0..present]) |position, physical| {
+            if (physical) |key| {
+                if (!std.mem.eql(u8, primary_keys[position].?, key)) continue;
+                positions[count] = position;
+                count += 1;
+            }
+        }
+        if (count == 0) return;
+        try control.check();
+        try reads.reset();
+        for (positions[0..count], 0..) |position, i| keys[i] = docTombstoneKey(&storage[i], ordinals[position]);
+        try reads.getManySorted(keys[0..count], values[0..count]);
+        for (positions[0..count], values[0..count]) |position, tombstone| proven[position] = tombstone == null;
+    }
+
     pub fn docNumsForDocIdsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_ids: []const []const u8) ![]const u32 {
+        return try self.docNumsForDocIdsDeferredAlloc(alloc, txn, doc_ids, null, .{});
+    }
+
+    pub fn docNumsForDocIdsDeferredAlloc(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        doc_ids: []const []const u8,
+        deferred_keys: ?struct { keys: *std.StringHashMapUnmanaged(void), allocator: Allocator },
+        control: @import("../search/query.zig").ExecutionControl,
+    ) ![]const u32 {
         if (doc_ids.len == 0) return &.{};
         const complete = try completeLocatorMap(txn);
         var wanted = std.StringHashMapUnmanaged(void).empty;
@@ -5800,49 +5889,95 @@ pub const SparseIndex = struct {
         defer seen.deinit(alloc);
 
         for (doc_ids) |doc_id| {
+            try control.check();
             const gop = try wanted.getOrPut(alloc, doc_id);
             if (gop.found_existing) continue;
-            var key_buf: [256]u8 = undefined;
-            const forward_key = try fwdKeyWithScratch(alloc, &key_buf, doc_id);
-            defer if (forward_key.ptr != &key_buf) alloc.free(forward_key);
-            if (txnGet(txn, self.dbi, forward_key)) |fwd_data| {
-                const doc_num_u64 = try decodeFwdDocNum(fwd_data);
-                if (doc_num_u64 <= std.math.maxInt(u32) and !try self.docNumDeletedChecked(txn, doc_num_u64)) {
-                    const doc_num: u32 = @intCast(doc_num_u64);
-                    const seen_gop = try seen.getOrPut(alloc, doc_num);
-                    if (!seen_gop.found_existing) try out.append(alloc, doc_num);
-                }
-                _ = wanted.remove(doc_id);
-            } else |err| {
-                if (err != error.NotFound) return err;
-                if (try readLocator(alloc, txn, doc_id)) |locator| {
-                    if (!try self.docNumDeletedChecked(txn, locator.num)) {
-                        const num = std.math.cast(u32, locator.num) orelse return error.DocNumOverflow;
-                        const found = try seen.getOrPut(alloc, num);
-                        if (!found.found_existing) try out.append(alloc, num);
-                    }
+            switch (try self.lookupProjectionDocNum(alloc, txn, doc_id, complete)) {
+                .needs_scan => {},
+                .absent => _ = wanted.remove(doc_id),
+                .found => |doc_num| {
+                    const slot = try seen.getOrPut(alloc, doc_num);
+                    if (!slot.found_existing) try out.append(alloc, doc_num);
                     _ = wanted.remove(doc_id);
-                } else if (complete) _ = wanted.remove(doc_id);
+                },
             }
         }
         if (wanted.count() == 0) return try out.toOwnedSlice(alloc);
 
+        if (deferred_keys) |deferred| {
+            var missing = wanted.keyIterator();
+            while (missing.next()) |key| {
+                try control.check();
+                try deferProjectionKey(deferred.allocator, deferred.keys, key.*);
+            }
+        } else {
+            try self.appendUnmappedDocNums(alloc, txn, &wanted, null, &seen, &out, control);
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn deferProjectionKey(alloc: Allocator, deferred: *std.StringHashMapUnmanaged(void), key: []const u8) !void {
+        if (deferred.contains(key)) return;
+        const copy = try alloc.dupe(u8, key);
+        errdefer alloc.free(copy);
+        try deferred.put(alloc, copy, {});
+    }
+
+    pub fn projectionHasCompleteLocatorMap(txn: anytype) !bool {
+        return completeLocatorMap(txn);
+    }
+
+    pub fn lookupProjectionDocNum(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_id: []const u8, complete: bool) !union(enum) {
+        found: u32,
+        absent,
+        needs_scan,
+    } {
+        var key_buf: [256]u8 = undefined;
+        const key = try fwdKeyWithScratch(alloc, &key_buf, doc_id);
+        defer if (key.ptr != &key_buf) alloc.free(key);
+        if (txnGet(txn, self.dbi, key)) |raw| {
+            const number = try decodeFwdDocNum(raw);
+            if (number > std.math.maxInt(u32) or try self.docNumDeletedChecked(txn, number)) return .absent;
+            return .{ .found = @intCast(number) };
+        } else |err| if (err != error.NotFound) return err;
+        if (try readLocator(alloc, txn, doc_id)) |locator| {
+            if (try self.docNumDeletedChecked(txn, locator.num)) return .absent;
+            return .{ .found = std.math.cast(u32, locator.num) orelse return error.DocNumOverflow };
+        }
+        return if (complete) .absent else .needs_scan;
+    }
+
+    pub fn appendUnmappedDocNums(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        wanted: *std.StringHashMapUnmanaged(void),
+        owned_key_allocator: ?Allocator,
+        seen: *std.AutoHashMapUnmanaged(u32, void),
+        out: *std.ArrayListUnmanaged(u32),
+        control: @import("../search/query.zig").ExecutionControl,
+    ) !void {
+        if (wanted.count() == 0) return;
         const LookupContext = struct {
             alloc: Allocator,
             index: *SparseIndex,
             txn: @TypeOf(txn),
             wanted: *std.StringHashMapUnmanaged(void),
+            owned_key_allocator: ?Allocator,
             seen: *std.AutoHashMapUnmanaged(u32, void),
             out: *std.ArrayListUnmanaged(u32),
+            control: @import("../search/query.zig").ExecutionControl,
 
             fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                try ctx.control.check();
                 if (!ctx.wanted.contains(entry.doc_id) or try ctx.index.docNumDeletedChecked(ctx.txn, entry.doc_num)) return false;
                 if (entry.doc_num <= std.math.maxInt(u32)) {
                     const doc_num: u32 = @intCast(entry.doc_num);
                     const seen_gop = try ctx.seen.getOrPut(ctx.alloc, doc_num);
                     if (!seen_gop.found_existing) try ctx.out.append(ctx.alloc, doc_num);
                 }
-                _ = ctx.wanted.remove(entry.doc_id);
+                const removed = ctx.wanted.fetchRemove(entry.doc_id).?;
+                if (ctx.owned_key_allocator) |key_alloc| key_alloc.free(removed.key);
                 return ctx.wanted.count() == 0;
             }
         };
@@ -5851,20 +5986,21 @@ pub const SparseIndex = struct {
         defer cur.close();
         var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
         while (maybe_entry) |entry| {
+            try control.check();
             if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
             var ctx = LookupContext{
                 .alloc = alloc,
                 .index = self,
                 .txn = txn,
-                .wanted = &wanted,
-                .seen = &seen,
-                .out = &out,
+                .wanted = wanted,
+                .owned_key_allocator = owned_key_allocator,
+                .seen = seen,
+                .out = out,
+                .control = control,
             };
             if (try forEachCurrentDocMapEntry(txn, entry.key, entry.value, &ctx, LookupContext.visit)) break;
             maybe_entry = try cur.next();
         }
-
-        return try out.toOwnedSlice(alloc);
     }
 
     pub fn docNumsForOrdinalDocNumsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, ordinals: []const u32) !OrdinalDocNumLookup {
@@ -7465,6 +7601,83 @@ const NoDocMapRead = struct {
         return error.UnexpectedDocMapScan;
     }
 };
+
+test "optional numeric range sparse projection proves only aligned live physical ordinals" {
+    const alloc = std.testing.allocator;
+    var index = try SparseIndex.open(alloc, "unused", .{ .backend = .mem });
+    defer index.close();
+    try index.batchWithOptions(&.{
+        .{ .doc_id = "aligned", .doc_num = 1, .vec = .{ .indices = &.{1}, .values = &.{2} } },
+        .{ .doc_id = "other", .doc_num = 2, .vec = .{ .indices = &.{1}, .values = &.{2} } },
+        .{ .doc_id = "removed", .doc_num = 3, .vec = .{ .indices = &.{1}, .values = &.{2} } },
+    }, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try index.batchWithOptions(&.{}, &.{"removed"}, .{});
+    var txn = try index.beginReadTxn();
+    defer txn.abort();
+    var aligned: [5]bool = undefined;
+    try std.testing.expect(try SparseIndex.tryProveProjectionDocNums(alloc, &txn, &.{ 0, 1, 2, 3, 4 }, &.{ null, "aligned", "collision", "removed", "missing" }, &aligned, .{}));
+    try std.testing.expectEqual([5]bool{ false, true, false, false, false }, aligned);
+}
+
+test "optional numeric range sparse proof falls back on transient reads and propagates cancellation" {
+    const Failure = struct {
+        err: anyerror = error.StorageReadTemporarilyUnavailable,
+        multiple_blocks: bool = false,
+
+        fn openScope(alloc: Allocator, ptr: *anyopaque) anyerror!backend_erased.ReadScope {
+            const failure: *@This() = @ptrCast(@alignCast(ptr));
+            _ = try alloc.alloc(u8, 64);
+            if (failure.multiple_blocks) {
+                _ = try alloc.alloc(u8, 2048);
+                _ = try alloc.alloc(u8, 8192);
+            }
+            return .{ .allocator = alloc, .ptr = ptr, .vtable = &.{ .close = abort, .get = read } };
+        }
+        fn read(ptr: *anyopaque, _: []const u8) anyerror![]const u8 {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).err;
+        }
+        fn abort(_: Allocator, _: *anyopaque) void {}
+        fn get(_: *anyopaque, _: []const u8) anyerror![]const u8 {
+            unreachable;
+        }
+        fn cursor(_: Allocator, _: *anyopaque) anyerror!backend_erased.Cursor {
+            unreachable;
+        }
+    };
+    var buffer: [1024]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var memory = std.heap.FixedBufferAllocator.init(&buffer);
+    const alloc = memory.allocator();
+    var failure: Failure = .{};
+    var txn: backend_erased.ReadTxn = .{
+        .allocator = alloc,
+        .ptr = &failure,
+        .vtable = &.{ .abort = Failure.abort, .get = Failure.get, .open_cursor = Failure.cursor, .open_read_scope = Failure.openScope },
+    };
+    defer txn.abort();
+    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.InvalidTableFile, error.CorruptInput, error.TableBlockChecksumMismatch, error.EndOfStream, error.InputOutput, error.FileNotFound, error.WouldBlock, error.OutOfMemory }) |err| {
+        failure.err = err;
+        var proven = [_]bool{true};
+        try std.testing.expect(!try SparseIndex.tryProveProjectionDocNums(alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
+        try std.testing.expectEqual([1]bool{false}, proven);
+        try std.testing.expectEqual(@as(usize, 0), memory.end_index);
+    }
+    var proven = [_]bool{true};
+    failure.err = error.Canceled;
+    try std.testing.expectError(error.Canceled, SparseIndex.tryProveProjectionDocNums(alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
+    try std.testing.expectEqual(@as(usize, 0), memory.end_index);
+
+    var tracking: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    var query_arena = std.heap.ArenaAllocator.init(tracking.allocator());
+    defer query_arena.deinit();
+    const query_alloc = query_arena.allocator();
+    const retained = try query_alloc.alloc(u8, 32);
+    @memset(retained, 42);
+    const live = tracking.allocated_bytes - tracking.freed_bytes;
+    failure = .{ .err = error.OutOfMemory, .multiple_blocks = true };
+    try std.testing.expect(!try SparseIndex.tryProveProjectionDocNums(query_alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
+    try std.testing.expectEqual(live, tracking.allocated_bytes - tracking.freed_bytes);
+    try std.testing.expectEqual(@as(u8, 42), retained[0]);
+}
 
 test "sparse locator backfill refuses corrupt roots and future incarnations" {
     const a = std.testing.allocator;

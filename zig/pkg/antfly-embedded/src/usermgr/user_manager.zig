@@ -521,7 +521,15 @@ pub const UserManager = struct {
     // not a distributed revocation oracle: already admitted statements have
     // a bounded lease, while subsequent admissions pin the new graph.
     role_revision: u64 = 1,
+    // Local to this manager. Publish under the same lock as every credential
+    // or policy write, including a multi-step write that fails partway through.
+    authorization_revision: std.atomic.Value(u64) = .init(1),
     lifecycle_hook: ?AuthLifecycleHook = null,
+
+    fn finishAuthorizationWrite(self: *UserManager, io: std.Io) void {
+        _ = self.authorization_revision.fetchAdd(1, .release);
+        self.mutation_mutex.unlock(io);
+    }
 
     pub fn setLifecycleHook(self: *UserManager, hook: ?AuthLifecycleHook) void {
         self.lifecycle_hook = hook;
@@ -653,7 +661,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.createUserWithMetadataUnlocked(username, password, initial_policies, metadata_json);
     }
 
@@ -788,7 +796,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         const existing = self.users.getPtr(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
         const new_hash = try hashPassword(self.alloc, io, new_password);
@@ -810,7 +818,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         const instance_id = self.user_instances.get(username) orelse return error.UserNotFound;
         if (self.personal_grant_revoker) |revoker| {
             if (!revoker.revoke_fn(revoker.ptr, instance_id)) return error.PersonalGrantRevocationFailed;
@@ -869,7 +877,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.addPermissionToSubjectUnlocked(subject, permission);
     }
 
@@ -887,7 +895,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.addPermissionToSubjectUnlocked(username, permission);
     }
@@ -901,7 +909,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         const removed = if (std.mem.eql(u8, resource_name, "*"))
             try self.enforcer.removeFilteredPolicy(0, &.{ username, resource_type.slice() })
@@ -1006,7 +1014,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.addRoleToSubjectUnlocked(subject, role);
     }
 
@@ -1020,7 +1028,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.addRoleToSubjectUnlocked(username, role);
     }
@@ -1029,7 +1037,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.removeRoleFromSubjectUnlocked(subject, role);
     }
 
@@ -1043,7 +1051,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.removeRoleFromSubjectUnlocked(username, role);
     }
@@ -1102,6 +1110,42 @@ pub const UserManager = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn roleLess(_: void, left: []const u8, right: []const u8) bool {
+        return std.mem.lessThan(u8, left, right);
+    }
+
+    fn sortedRoleDigest(roles: []const []const u8) [32]u8 {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        for (roles) |role| {
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, role.len, .little);
+            hash.update(&size);
+            hash.update(role);
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+
+    pub fn roleDigest(alloc: Allocator, roles: []const []const u8) ![32]u8 {
+        if (std.sort.isSorted([]const u8, roles, {}, roleLess)) return sortedRoleDigest(roles);
+        const sorted = try alloc.dupe([]const u8, roles);
+        defer alloc.free(sorted);
+        std.mem.sort([]const u8, sorted, {}, roleLess);
+        return sortedRoleDigest(sorted);
+    }
+
+    pub fn validateRoleRevision(self: *UserManager, username: []const u8, admitted_roles: []const []const u8, previous: ?u64) !u64 {
+        var lease = try self.acquireSnapshotLease();
+        defer lease.release();
+        if (self.role_revision != previous) {
+            const roles = try self.getRolesForUser(username);
+            defer freeOwnedStrings(self.alloc, roles);
+            if (!std.meta.eql(try roleDigest(self.alloc, roles), try roleDigest(self.alloc, admitted_roles))) return error.Forbidden;
+        }
+        return self.role_revision;
+    }
+
     /// Revision of the role authority, captured under the mutation mutex.
     pub fn rowPolicyRoleRevision(self: *UserManager) u64 {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
@@ -1126,6 +1170,22 @@ pub const UserManager = struct {
         issuer: []const u8,
         scope: @import("row_policy_authority.zig").Scope,
         now_seconds: i64,
+    ) ![]u8 {
+        return self.signBoundRowPolicyRoles(alloc, authenticated_username, credential_principal, logical_table, permission_type, secret, issuer, scope, now_seconds, null);
+    }
+
+    pub fn signBoundRowPolicyRoles(
+        self: *UserManager,
+        alloc: Allocator,
+        authenticated_username: []const u8,
+        credential_principal: []const u8,
+        logical_table: []const u8,
+        permission_type: PermissionType,
+        secret: []const u8,
+        issuer: []const u8,
+        scope: @import("row_policy_authority.zig").Scope,
+        now_seconds: i64,
+        expected_roles: ?[32]u8,
     ) ![]u8 {
         const authority = @import("row_policy_authority.zig");
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
@@ -1159,17 +1219,11 @@ pub const UserManager = struct {
         if (!allowed) return error.Forbidden;
         const roles = try self.getRolesForUser(authenticated_username);
         defer freeOwnedStrings(self.alloc, roles);
-        const role_views = try alloc.alloc([]const u8, roles.len);
-        defer alloc.free(role_views);
-        for (roles, 0..) |role, index| role_views[index] = role;
-        std.mem.sort([]const u8, role_views, {}, struct {
-            fn less(_: void, left: []const u8, right: []const u8) bool {
-                return std.mem.order(u8, left, right) == .lt;
-            }
-        }.less);
+        std.mem.sort([]u8, roles, {}, roleLess);
+        if (expected_roles) |digest| if (!std.meta.eql(digest, sortedRoleDigest(roles))) return error.Forbidden;
         return authority.sign(alloc, secret, issuer, .{
             .principal = authenticated_username,
-            .roles = role_views,
+            .roles = roles,
             .auth_revision = self.role_revision,
         }, scope, now_seconds);
     }
@@ -1226,7 +1280,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.setSubjectRowFilterUnlocked(subject, table, filter_json);
     }
 
@@ -1242,7 +1296,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.setSubjectRowFilterUnlocked(username, table, filter_json);
     }
@@ -1251,7 +1305,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.removeSubjectRowFilterUnlocked(subject, table);
     }
 
@@ -1265,7 +1319,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.removeSubjectRowFilterUnlocked(username, table);
     }
@@ -1349,7 +1403,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
 
         for (permissions) |perm| {
@@ -1553,7 +1607,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.deleteApiKeyUnlocked(username, key_id);
     }
 
@@ -2214,6 +2268,9 @@ test "usermgr roles inherit permissions and row filters" {
     try std.testing.expectEqual(@as(usize, 2), pinned.value.roles.len);
     pinned.deinit();
     try manager.removeRoleFromSubject("role:tenant_reader", "group:eng");
+    const admitted_digest = try UserManager.roleDigest(alloc, roles);
+    try std.testing.expectError(error.Forbidden, manager.validateRoleRevision("alice", roles, null));
+    try std.testing.expectError(error.Forbidden, manager.signBoundRowPolicyRoles(alloc, "alice", "basic:alice", "docs", .read, role_key, "cluster-a", scope, 101, admitted_digest));
     const after_revocation = try manager.signRowPolicyRolesAuthorized(alloc, "alice", "basic:alice", "docs", .read, role_key, "cluster-a", scope, 101);
     defer alloc.free(after_revocation);
     var updated = try row_authority.verify(alloc, role_key, "cluster-a", scope, 101, after_revocation);

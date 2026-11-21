@@ -82,7 +82,7 @@ pub fn resolveDenseIndexEstimate(
         .sparse = false,
         .doc_count = entry.index.stats().active_count,
         .dims = entry.dims,
-        .chunk_backed = entry.chunk_name != null,
+        .chunk_backed = entry.memberBacked(),
     };
 }
 
@@ -137,7 +137,7 @@ pub fn appendDenseQueryCost(
     dense: types.DenseKnnQuery,
 ) !void {
     const entry = core.denseIndex(index_name) orelse return error.IndexNotFound;
-    const chunk_backed = entry.chunk_name != null;
+    const chunk_backed = entry.memberBacked();
     const group_chunk_parents = query_search.shouldGroupChunkParents(req, chunk_backed);
     const effective_k: u64 = if (group_chunk_parents)
         entry.index.metadata.active_count

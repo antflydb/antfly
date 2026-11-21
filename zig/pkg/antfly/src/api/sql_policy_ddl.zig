@@ -56,6 +56,34 @@ fn commandScope(command: @FieldType(ast.PolicyDdl, "command")) policies.CommandS
 }
 
 pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.PolicyDdl) !catalog.DdlOutcome {
+    return executeBound(server, identity, context, database, namespace, alloc, ddl, null);
+}
+
+const DdlGuard = @import("sql_ddl_binding.zig").Guard;
+
+pub fn definitionCut(server: *server_mod.ApiHttpServer, a: std.mem.Allocator, context: operation.RequestContext, request: domain.PolicyRead) !domain.State {
+    var authorized = context;
+    authorized.setting_admin = true;
+    const bytes = server.source.systemCatalog(a, authorized, .{ .policy_definition_read = request }) catch |err| switch (err) {
+        error.UnsupportedOperation => try server.source.systemCatalog(a, context, .snapshot),
+        else => return err,
+    };
+    return request.select(try std.json.parseFromSliceLeaky(domain.State, a, bytes, .{ .allocate = .alloc_always }));
+}
+
+fn findPolicy(state: domain.State, table_id: u64, name: []const u8) ?policies.Record {
+    for (state.policies) |record| {
+        if (record.table_id == table_id and std.ascii.eqlIgnoreCase(record.name, name)) return record;
+    }
+    return null;
+}
+
+pub fn policyIdentity(state: domain.State, table_id: u64, name: []const u8) DdlGuard.Policy {
+    return if (findPolicy(state, table_id, name)) |p| .{ .id = p.id, .generation = p.generation } else .{ .id = 0, .generation = 0 };
+}
+
+pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.PolicyDdl, bound: ?DdlGuard.Objects) !catalog.DdlOutcome {
+    const expected_id = if (bound) |objects| (try objects.table(1, 0)).id else null;
     try context.ensureActive();
     const target: domain.Target = .{ .database = ddl.table.database orelse database, .namespace = ddl.table.namespace orelse namespace, .table = ddl.table.table };
     try target.validate();
@@ -67,24 +95,28 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     // Publication is a separate topology-fenced operation; never turn a
     // definition mutation into a serving-generation switch implicitly.
     if (ddl.action == .enable or ddl.action == .disable) {
-        try server.beginRowPolicyPublication(alloc, context, target, ddl.action == .enable);
+        try server.beginRowPolicyPublication(alloc, context, target, ddl.action == .enable, expected_id);
         return .{ .mutation_outcome = .committed_pending };
     }
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const state_bytes = try server.source.systemCatalog(a, context, .snapshot);
-    const state = try std.json.parseFromSliceLeaky(domain.State, a, state_bytes, .{ .allocate = .alloc_always });
-    const resolved_bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true, .expected_revision = state.revision } });
+    const resolved_bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true, .include_source_epoch = context.bound_catalog_incarnation != null } });
     const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, resolved_bytes, .{ .allocate = .alloc_always });
-    if (resolved.revision != state.revision or resolved.tables.len != 1) return error.CatalogGenerationChanged;
+    try context.checkCatalogIncarnation(resolved.source_epoch);
+    if (resolved.tables.len != 1) return error.InvalidSqlBackendResponse;
+    if (expected_id) |id| if (id != (if (resolved.tables[0]) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
     const physical = resolved.tables[0] orelse return error.TableNotFound;
+    const known = if (bound) |objects| objects.policy else null;
+    const state = try definitionCut(server, a, context, .{ .table_id = physical.table_id, .name = ddl.name, .id = if (known) |p| if (p.id != 0) p.id else null else null });
+    if (resolved.revision != state.revision) return error.CatalogGenerationChanged;
     const definition = physical.query_definition orelse return error.InvalidSqlBackendResponse;
     if (definition.table_id != physical.table_id) return error.InvalidSqlBackendResponse;
     var parsed_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, definition.schema_json);
     defer parsed_schema.deinit(a);
     const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed_schema);
+    if (bound) |objects| if (objects.schema_version) |version| if (version != native.version) return error.CatalogGenerationChanged;
     if (native.storage_mode != .relational) return error.UnsupportedSqlShape;
     const layout = try @import("antfly_local_sources").storage_schema.serializeSchema(a, native);
     var schema_digest: [32]u8 = undefined;
@@ -92,9 +124,10 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const table = try server.sql_schema_cache.resolve(server.sqlPlanCacheIo(), a, definition.schema_json, physical.table_id, physical.name);
     if (table.schema_version != native.version) return error.CatalogGenerationChanged;
 
-    const prior: ?policies.Record = for (state.policies) |record| {
-        if (record.table_id == physical.table_id and std.ascii.eqlIgnoreCase(record.name, ddl.name)) break record;
-    } else null;
+    const prior = findPolicy(state, physical.table_id, ddl.name);
+    if (bound) |objects| if (objects.policy) |expected| {
+        if (expected.id != (if (prior) |p| p.id else 0) or expected.generation != (if (prior) |p| p.generation else 0)) return error.CatalogGenerationChanged;
+    };
     // Policy records borrow compiled instruction slices until the synchronous
     // catalog callback serializes the command. Keep their arenas alive through
     // that callback, rather than releasing them on leaving the switch arm.
@@ -102,7 +135,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     defer if (using_program) |*program| program.deinit();
     var check_program: ?scalar.Program = null;
     defer if (check_program) |*program| program.deinit();
-    const change: policies.Command = switch (ddl.action) {
+    var change: policies.Command = switch (ddl.action) {
         .enable, .disable => unreachable,
         .drop => blk: {
             const record = prior orelse {
@@ -143,6 +176,8 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             break :blk .{ .expected_revision = state.revision, .change = .{ .put = record } };
         },
     };
+    change.expected_incarnation = context.bound_catalog_incarnation;
+    if (bound) |objects| change.expected_schema_version = objects.schema_version;
     var internal_context = context;
     internal_context.setting_admin = true;
     _ = try server.source.systemCatalog(a, internal_context, .{ .policy_definition_mutate = change });
@@ -164,9 +199,14 @@ test "SQL policy DDL writes a durable draft only and never publishes it" {
         fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return switch (call) {
-                .snapshot => alloc.dupe(u8, "{\"revision\":7,\"next_id\":42}"),
+                .policy_definition_read => |r| blk: {
+                    try std.testing.expect(context.setting_admin);
+                    try std.testing.expectEqual(@as(u64, 17), r.table_id);
+                    break :blk alloc.dupe(u8, "{\"revision\":7,\"next_id\":42}");
+                },
                 .resolve_many => |request| blk: {
-                    if (request.include_query_definitions) try std.testing.expectEqual(@as(?u64, 7), request.expected_revision);
+                    try std.testing.expectEqual(@as(usize, 1), request.targets.len);
+                    try std.testing.expectEqualStrings("accounts", request.targets[0].table);
                     break :blk std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 7, .tables = &.{.{ .table_id = 17, .name = "table:immutable-17", .query_definition = .{ .table_id = 17, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } }} }, .{});
                 },
                 .setting_snapshot => |scope| std.json.Stringify.valueAlloc(alloc, settings.RawSnapshot{ .scope = scope, .epoch = 1, .definitions = &.{} }, .{}),

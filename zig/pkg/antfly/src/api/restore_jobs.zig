@@ -182,6 +182,7 @@ pub const StartRequest = struct {
     /// duplicated into the compact public job record.
     rewrite_plan_json: ?[]const u8 = null,
     generation_plan_json: ?[]const u8 = null,
+    expected_incarnation: ?[32]u8 = null,
 };
 
 pub const ListBatch = struct {
@@ -1322,6 +1323,7 @@ pub const Store = struct {
                     replicated.createWithStaging(alloc, key, proposal, plan, self.replicated_leadership_term)
                 else
                     replicated.create(alloc, key, proposal, self.replicated_leadership_term)) catch |err| switch (err) {
+                    error.CatalogGenerationChanged,
                     error.TableTopologyProtocolUpgradeRequired,
                     error.MetadataTopologyCommandTooLarge,
                     error.RestoreJobRecordTooLarge,
@@ -3409,6 +3411,7 @@ fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
     if (req.source_kind == .cluster_cohort) hash.update("antfly:restore:cluster-cohort:v1\x00");
     if (req.source_kind == .schema_rewrite) hash.update("antfly:restore:schema-rewrite:v1\x00");
     if (req.source_kind == .empty_generation) hash.update("antfly:restore:empty-generation:v1\x00");
+    if (req.expected_incarnation) |expected| hash.update(&expected);
     hash.update(canonical);
     hash.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
