@@ -216,6 +216,14 @@ their original replay behavior; readiness detects an insufficient legacy binding
 and causes the worker to submit an upgrade. Duplicate current activations retain
 the existing epoch and do not invalidate in-flight work.
 
+Durable index pinning is opt-in. Set `embedder.model_revision` when creating a
+managed dense embedding index to bind its document and query embeddings to that
+revision. For the Antfly provider, `model@<64-digit-hex-revision>` is shorthand
+for the same pin. If both forms are provided, they must specify the same
+revision. An alias-only index follows the configured model alias. A revision
+discovered for an individual inference request can fence that execution without
+becoming part of the stored index configuration.
+
 Remote embedding catalogs advertise `model_revision_pinning` when their executor
 supports an immutable generation fence. Native runtimes scope pins to a checksummed
 managed publication and a compatible execution recipe. A cold catalog reads

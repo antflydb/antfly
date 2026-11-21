@@ -4100,6 +4100,43 @@ fn normalizeGoogleEmbeddingDefaultsJson(alloc: std.mem.Allocator, value: std.jso
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
+/// Parse the public shorthand without allocating so admission can detect the
+/// pin before resolving dimensions or contacting inference.
+pub fn embeddingModelRevisionSuffix(embedder: std.json.ObjectMap) !?struct { model: []const u8, revision: [32]u8 } {
+    const provider = embedder.get("provider") orelse return null;
+    if (provider != .string or !std.mem.eql(u8, provider.string, "antfly")) return null;
+    const model = embedder.get("model") orelse return null;
+    if (model != .string) return null;
+    const separator = std.mem.indexOfScalar(u8, model.string, '@') orelse return null;
+    const suffix = model.string[separator + 1 ..];
+    if (separator == 0 or suffix.len != 64) return error.InvalidEmbeddingArtifactProducer;
+    var revision: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&revision, suffix) catch return error.InvalidEmbeddingArtifactProducer;
+    if (try @import("../storage/db/types.zig").embeddingProducerModelRevision(embedder)) |explicit| {
+        if (!std.mem.eql(u8, &explicit, &revision)) return error.InvalidEmbeddingArtifactProducer;
+    }
+    return .{ .model = model.string[0..separator], .revision = revision };
+}
+
+fn normalizeEmbeddingModelRevisionSuffix(alloc: std.mem.Allocator, value: std.json.Value) !?[]u8 {
+    if (value != .object) return null;
+    const kind = value.object.get("type") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "embeddings")) return null;
+    const embedder = value.object.get("embedder") orelse return null;
+    if (embedder != .object) return null;
+    const suffix = (embeddingModelRevisionSuffix(embedder.object) catch return error.InvalidCreateTableRequest) orelse return null;
+
+    const raw = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const config = &parsed.value.object.getPtr("embedder").?.object;
+    const revision = std.fmt.bytesToHex(suffix.revision, .lower);
+    try config.put(parsed.arena.allocator(), "model", .{ .string = suffix.model });
+    try config.put(parsed.arena.allocator(), "model_revision", .{ .string = &revision });
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
 fn normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(
     alloc: std.mem.Allocator,
     index_name: []const u8,
@@ -4109,6 +4146,16 @@ fn normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(
     owner_already_admitted: bool,
 ) !?[]u8 {
     if (!owner_already_admitted) {
+        if (try normalizeEmbeddingModelRevisionSuffix(alloc, value)) |raw| {
+            errdefer alloc.free(raw);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+            defer parsed.deinit();
+            if (try normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(alloc, index_name, parsed.value, catalog_root, options, false)) |normalized| {
+                alloc.free(raw);
+                return normalized;
+            }
+            return raw;
+        }
         if (try normalizeGoogleEmbeddingDefaultsJson(alloc, value)) |raw| {
             errdefer alloc.free(raw);
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
@@ -4726,7 +4773,9 @@ fn validateCatalogOwnerSemanticIdentity(
     defer embedder_cfg.deinit(alloc);
     const identity_revision = try @import("../storage/db/types.zig").embeddingProducerModelRevision(parsed_identity.value.object);
     const configured_revision = try @import("../storage/db/types.zig").embeddingProducerModelRevision(embedder_value.object);
-    if (configured_revision != null and !std.meta.eql(identity_revision, configured_revision))
+    // The durable producer mirrors the index's explicit opt-in. It cannot
+    // supply a revision on behalf of an alias-only index.
+    if (!std.meta.eql(identity_revision, configured_revision))
         return error.InvalidEmbeddingArtifactProducer;
     const provider = parseEmbedderProvider(embedder_cfg) catch
         return error.InvalidEmbeddingArtifactProducer;
@@ -13772,6 +13821,29 @@ test "managed embedder commit requirements sparse discovery carries caller conte
     try testSparseCacheRevision();
 }
 
+test "managed embedder model revision suffix canonicalizes the index model" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"acme/demo:gguf:Q4_0@AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","url":"http://127.0.0.1:1/ai/v1"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const normalized = (try normalizeEmbeddingModelRevisionSuffix(alloc, parsed.value)).?;
+    defer alloc.free(normalized);
+    var canonical = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer canonical.deinit();
+    const embedder = canonical.value.object.get("embedder").?.object;
+    try std.testing.expectEqualStrings("acme/demo:gguf:Q4_0", embedder.get("model").?.string);
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", embedder.get("model_revision").?.string);
+    try std.testing.expect((try normalizeEmbeddingModelRevisionSuffix(alloc, canonical.value)) == null);
+
+    const config = &parsed.value.object.getPtr("embedder").?.object;
+    try config.put(parsed.arena.allocator(), "model_revision", .{ .string = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
+    try std.testing.expectError(error.InvalidCreateTableRequest, normalizeEmbeddingModelRevisionSuffix(alloc, parsed.value));
+    try config.put(parsed.arena.allocator(), "model", .{ .string = "acme/demo@invalid" });
+    try std.testing.expectError(error.InvalidCreateTableRequest, normalizeEmbeddingModelRevisionSuffix(alloc, parsed.value));
+}
+
 test "managed embedder model revision survives durable producer normalization and runtime translation" {
     const alloc = std.testing.allocator;
     const raw =
@@ -13796,4 +13868,18 @@ test "managed embedder model revision survives durable producer normalization an
     defer runtime.deinit();
     try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(0x11))), runtime.queryModelRevision("semantic"));
     try std.testing.expectEqual(runtime.queryModelRevision("semantic"), runtime.findArtifactEntry("semantic").?.required_model_revision);
+
+    // An internal producer cannot turn an alias into a durable pin.
+    try std.testing.expect(admitted.value.object.getPtr("embedder").?.object.orderedRemove("model_revision"));
+    try std.testing.expectError(error.InvalidEmbeddingArtifactProducer, normalizeEmbeddingCatalogSemanticProducerJsonWithOptions(alloc, admitted.value, .{}));
+
+    try std.testing.expect(admitted.value.object.orderedRemove("semantic_producer"));
+    const alias = (try normalizeEmbeddingCatalogSemanticProducerJsonWithOptions(alloc, admitted.value, .{})).?;
+    defer alloc.free(alias);
+    const alias_indexes = try std.fmt.allocPrint(alloc, "{{\"semantic\":{s}}}", .{alias});
+    defer alloc.free(alias_indexes);
+    var alias_runtime = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, alias_indexes, .{});
+    defer alias_runtime.deinit();
+    try std.testing.expectEqual(@as(?[32]u8, null), alias_runtime.queryModelRevision("semantic"));
+    try std.testing.expectEqual(@as(?[32]u8, null), alias_runtime.findArtifactEntry("semantic").?.required_model_revision);
 }

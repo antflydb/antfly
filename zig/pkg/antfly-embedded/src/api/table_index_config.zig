@@ -255,6 +255,7 @@ pub fn indexModelRevision(alloc: std.mem.Allocator, value: std.json.Value) !?[32
     if (kind != .string or !std.mem.eql(u8, kind.string, "embeddings")) return null;
     if (value.object.get("embedder")) |embedder| {
         if (embedder == .object) {
+            if (try managed_embedder.embeddingModelRevisionSuffix(embedder.object)) |suffix| return suffix.revision;
             if (try db_types.embeddingProducerModelRevision(embedder.object)) |revision| return revision;
         }
     }
@@ -288,7 +289,7 @@ pub fn validateModelRevisionMutation(alloc: std.mem.Allocator, before: []const u
 
 /// Fast rejection for legacy catalog values, including escaped JSON keys.
 pub fn mayContainModelRevision(raw: []const u8) bool {
-    return std.mem.indexOf(u8, raw, "model_revision") != null or std.mem.indexOf(u8, raw, "\\u") != null;
+    return std.mem.indexOf(u8, raw, "model_revision") != null or std.mem.indexOfScalar(u8, raw, '@') != null or std.mem.indexOf(u8, raw, "\\u") != null;
 }
 
 pub fn hasModelRevisionPin(alloc: std.mem.Allocator, raw: []const u8, catalog: bool) !bool {
@@ -577,4 +578,13 @@ test "chatgpt personal grant is rejected in durable enrichment chains" {
     , .{});
     defer parsed.deinit();
     try std.testing.expectError(error.ChatGPTInteractiveOnly, rejectPersonalGenerator(parsed.value));
+}
+
+test "managed embedder model revision suffix is detected before index normalization" {
+    const alloc = std.testing.allocator;
+    const index =
+        \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"google/embeddinggemma-2@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+    ;
+    try std.testing.expect(try hasModelRevisionPin(alloc, index, false));
+    try std.testing.expect(try hasModelRevisionPin(alloc, "{\"semantic\":" ++ index ++ "}", true));
 }
