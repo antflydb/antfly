@@ -122,21 +122,36 @@ published in the shared lock region tells a process cheaply that an index moved
 
 ## Merges
 
-A merge builds its output segments from its inputs off the write path. For an
-index with a complete doc map, its publication decides each output document's
-fate from the doc map rather than carrying tombstones from memory: a document is
-live exactly when its key's entry names one of the merge's inputs and the output
-holds a single copy of it; it is repointed to its output location. Every other
-copy (deleted or rewritten since the merge read its inputs, by any process) is
-tombstoned in the output. Two copies of a live key abort the merge.
+A merge builds its output segments from its inputs off the write path. What
+depends on the current records is decided inside the merge's commit, at the
+tip, under writer authority: the merge stages a resolver
+(`native_catalog_backend.Resolver`) as the commit's first mutation, and the
+Lite sink runs it while applying the commit, reading the scope as of that
+point (earlier members of the same group commit and every other process's
+commits included). For an index with a complete doc map the resolver:
 
-Those doc map reads are guarded. The publication carries the index scope's
-sequence as read (`native_catalog_backend.scopeGuard`); the Lite sink checks it
-under writer authority at the file's tip and refuses the commit
-(`error.IndexScopeChanged`) when any commit changed the scope since. The merge
-scheduler treats that as a stale merge and plans it again. Guarded commits never
-take the deferred ride-along path, so a refusal is seen before the mirror swaps.
-The segment counter advances in the same commit.
+- refuses the merge (`error.IndexScopeChanged`) when an input is no longer
+  active, because another process merged it away;
+- decides each output document from the doc map: live exactly when its key's
+  entry names one of the merge's inputs and the output holds a single copy of
+  it (the entry is repointed to its output location); every other copy,
+  deleted or rewritten since the merge read its inputs, by any process, is
+  tombstoned in the output. Two copies of a live key refuse the merge;
+- raises `meta/next_seg_id` past the outputs.
+
+The decided tombstones are installed in memory once the commit is durable.
+Writes to the index never invalidate a merge: an inline write in another
+process either commits first (the resolver sees its doc map entries) or
+after (its own tip reads see the merge's). The scheduler treats a refusal as
+a stale merge and plans it again. Resolving commits never take the deferred
+ride-along path, so a refusal is seen before the mirror swaps, and the
+resolver's decisions join the mirror only once the commit succeeds.
+
+Merge output ids are reserved at the tip, in a small commit of their own,
+before the merge publishes (`reserveSegmentIdRange`), so a process whose
+counter is behind another's never reuses an id. Every other background
+counter write raises the counter at the tip and never lowers it
+(`SegmentCounterFloor`).
 
 ## Upgrade
 
@@ -177,8 +192,10 @@ authoritative mirror) and algebraic (HLL sketches split into register blocks).
 3. Done for the inline path: an upgraded index's inline write finds old
    versions, tombstones and segment ids at the tip; in-memory tombstones are set
    only after durability.
-4. Done. Merges decide tombstones from the doc map at a guarded tip.
-5. Next. The replay worker's deletes on the same records (guarded).
+4. Done. Merges decide doc map entries, tombstones and the counter at the
+   tip, inside their commit; output ids are reserved at the tip.
+5. Next. The replay worker's deletes and segment ids on the same records,
+   decided at the tip the same way.
 6. Incremental cross-process refresh; remove the full reopen after a foreign
    index commit.
 7. Prepare/stage/install split; no index guard or writer lease across the fsync.

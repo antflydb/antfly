@@ -86,12 +86,55 @@ fn decodeAlloc(allocator: Allocator, scope: []const u8, full_key: []const u8, va
     };
 }
 
-fn checkScopeGuard(file: *native.NativeFile, scope: []const u8, value: []const u8) !void {
-    if (value.len != 8) return error.InvalidIndexScopeGuard;
-    const expected = std.mem.readInt(u64, value[0..8], .little);
-    const redo = if (file.redo) |*redo| redo else return error.IndexScopeChanged;
-    if (redo.shared.scopeLatestSequence(file.runtime(), scope) != expected) return error.IndexScopeChanged;
+/// Applies one commit's mutations to `file`, inside its open transaction.
+/// A `Resolver` runs here, under writer authority, reading `scope` at this
+/// point of the transaction (earlier group members and other processes'
+/// commits included); its decisions apply in its place.
+fn applyMutations(allocator: Allocator, file: *native.NativeFile, scope: []const u8, mutations: []const native_catalog_backend.Mutation) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var batch = try std.ArrayListUnmanaged(native.CatalogMutation).initCapacity(a, mutations.len);
+    for (mutations) |m| {
+        if (native_catalog_backend.isResolution(m.namespace)) {
+            try file.putIndexCatalogBatch(batch.items);
+            batch.clearRetainingCapacity();
+            const resolver = try native_catalog_backend.resolverOf(m);
+            var reader: TipReader = .{ .file = file, .scope = scope };
+            try resolver.run(.{ .ptr = &reader, .getFn = TipReader.get });
+            for (resolver.outputs.items) |out| try batch.append(a, .{
+                .key = try durableKeyAlloc(a, scope, out.namespace, out.key),
+                .value = out.value,
+                .is_delete = out.is_delete,
+            });
+            continue;
+        }
+        try batch.append(a, .{
+            .key = try durableKeyAlloc(a, scope, m.namespace, m.key),
+            .value = m.value,
+            .is_delete = m.is_delete,
+        });
+    }
+    // One call: every mutation this transaction accumulated lands in the
+    // same native commit (one `syncData`/checkpoint publication) as
+    // whatever else `submitIndexMutation`'s group-commit queue already
+    // batched with it.
+    try file.putIndexCatalogBatch(batch.items);
 }
+
+/// `native_catalog_backend.TipReader` over the open transaction.
+const TipReader = struct {
+    file: *native.NativeFile,
+    scope: []const u8,
+
+    fn get(ptr: *anyopaque, allocator: Allocator, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+        const self: *TipReader = @ptrCast(@alignCast(ptr));
+        const durable_key = try durableKeyAlloc(allocator, self.scope, namespace, key);
+        defer allocator.free(durable_key);
+        return try self.file.getIndexCatalogRecordAlloc(allocator, durable_key);
+    }
+};
 
 const ApplyCtx = struct {
     scope: []const u8,
@@ -100,30 +143,7 @@ const ApplyCtx = struct {
 
     fn apply(ptr: *anyopaque, file: *native.NativeFile) anyerror!void {
         const self: *ApplyCtx = @ptrCast(@alignCast(ptr));
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        var batch = try std.ArrayListUnmanaged(native.CatalogMutation).initCapacity(a, self.mutations.len);
-        for (self.mutations) |m| {
-            // A scope guard is checked here, under writer authority at the
-            // file's tip, and never written: the commit applies only if no
-            // commit has changed this scope since the guarded reads.
-            if (native_catalog_backend.isGuard(m.namespace)) {
-                try checkScopeGuard(file, self.scope, m.value);
-                continue;
-            }
-            batch.appendAssumeCapacity(.{
-                .key = try durableKeyAlloc(a, self.scope, m.namespace, m.key),
-                .value = m.value,
-                .is_delete = m.is_delete,
-            });
-        }
-        // One call: every mutation this transaction accumulated lands in the
-        // same native commit (one `syncData`/checkpoint publication) as
-        // whatever else `submitIndexMutation`'s group-commit queue already
-        // batched with it.
-        try file.putIndexCatalogBatch(batch.items);
+        try applyMutations(self.allocator, file, self.scope, self.mutations);
     }
 };
 
@@ -179,26 +199,10 @@ const DeferredApplyCtx = struct {
 
     fn apply(ptr: *anyopaque, file: *native.NativeFile) anyerror!void {
         const self: *DeferredApplyCtx = @ptrCast(@alignCast(ptr));
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        var batch = try std.ArrayListUnmanaged(native.CatalogMutation).initCapacity(a, self.mutations.len);
-        for (self.mutations) |m| {
-            // A scope guard is checked here, under writer authority at the
-            // file's tip, and never written: the commit applies only if no
-            // commit has changed this scope since the guarded reads.
-            if (native_catalog_backend.isGuard(m.namespace)) {
-                try checkScopeGuard(file, self.scope, m.value);
-                continue;
-            }
-            batch.appendAssumeCapacity(.{
-                .key = try durableKeyAlloc(a, self.scope, m.namespace, m.key),
-                .value = m.value,
-                .is_delete = m.is_delete,
-            });
-        }
-        try file.putIndexCatalogBatch(batch.items);
+        // A resolving commit is never deferred (its resolver dies with the
+        // caller's frame).
+        for (self.mutations) |m| if (native_catalog_backend.isResolution(m.namespace)) return error.InvalidResolver;
+        try applyMutations(self.allocator, file, self.scope, self.mutations);
     }
 
     /// `native_catalog_backend.Pending.waitFn`: waits for this ride-along
@@ -226,7 +230,7 @@ pub const Sink = struct {
             .submit = submit,
             .loadAllAlloc = loadAllAlloc,
             .loadOneAlloc = loadOneAlloc,
-            .scopeSequence = scopeSequence,
+            .resolves = true,
             .submitDeferred = submitDeferred,
             .pauseMaintenance = pauseMaintenance,
             .resumeMaintenance = resumeMaintenance,
@@ -346,12 +350,6 @@ pub const Sink = struct {
             }
         }
         return try result.toOwnedSlice(allocator);
-    }
-
-    fn scopeSequence(ptr: *anyopaque, scope: []const u8) ?u64 {
-        const self: *Sink = @ptrCast(@alignCast(ptr));
-        const redo = if (self.store.file.redo) |*redo| redo else return null;
-        return redo.shared.scopeLatestSequence(self.store.file.runtime(), scope);
     }
 
     /// One committed record, read from the file at its current tip.

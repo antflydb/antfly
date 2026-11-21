@@ -8538,9 +8538,11 @@ test "capi native separate writer processes keep full-text deletes at full_index
     defer for (&result_fds) |*fds| {
         _ = std.posix.system.close(fds[0]);
     };
+    // Every write commits at full_index and merges land concurrently: a
+    // Debug build on a loaded host needs minutes, not seconds.
     for (&result_fds) |*fds| {
         var report: [1]u8 = undefined;
-        try xprocReadBounded(fds[0], &report, 120_000);
+        try xprocReadBounded(fds[0], &report, 600_000);
         try std.testing.expectEqual(@as(u8, 0), report[0]);
     }
 

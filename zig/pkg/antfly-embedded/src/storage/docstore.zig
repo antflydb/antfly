@@ -282,7 +282,10 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     if (previous) |raw| {
         if (raw.len != 8) return error.CorruptReplayMetadata;
         previous_fixed = raw[0..8].*;
-        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) return error.InvalidBatchRequest;
+        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) {
+            std.log.warn("replay append below the committed cut: sequence={d} next_sequence={d}", .{ sequence, std.mem.readInt(u64, raw[0..8], .little) });
+            return error.InvalidBatchRequest;
+        }
     }
 
     // WS5: this append is charged against the journal credit ledger in the

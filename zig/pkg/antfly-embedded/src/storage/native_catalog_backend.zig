@@ -111,10 +111,10 @@ pub const Sink = struct {
     /// this backend's mirror. With it, the `tip_namespace` records stay out of
     /// the mirror and are always read this way (see `tip_namespace`).
     loadOneAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
-    /// Optional: a value that grows whenever any commit changes `scope`'s
-    /// records, from any process, or null when the sink cannot say. See
-    /// `scopeGuard`.
-    scopeSequence: ?*const fn (ptr: *anyopaque, scope: []const u8) ?u64 = null,
+    /// Whether `submit` runs a commit's `Resolver`s itself, while applying
+    /// the commit at the file's tip. When false, the backend resolves them
+    /// against its own view before submitting (a single-process sink).
+    resolves: bool = false,
     /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
     /// fakes below): like `submit`, but for `durable = false` only, and
     /// never blocks waiting for the underlying group commit to apply --
@@ -152,20 +152,82 @@ pub const Sink = struct {
 /// docs/design/lite-performance/lite-full-text-storage.md.
 pub const tip_namespace = "docmap";
 
-/// A commit carrying a `scopeGuard` mutation applies only if its scope has
-/// not changed since the guarded value was read (`Sink.scopeSequence`); the
-/// sink checks it under writer authority and refuses with
-/// `error.IndexScopeChanged`. The guard is never stored or mirrored. Lets a
-/// publication computed from reads at the tip (a merge's doc map checks)
-/// commit only if those reads are still the tip.
-pub const guard_namespace = "\x00guard";
+/// A decision a commit makes at the tip, while it is applied under writer
+/// authority, from reads of its own scope at that point: the commit's
+/// earlier group members and every other process's commits included. A
+/// background publication (a merge) prepares its work off the write path
+/// and decides what depends on the current records (doc map entries,
+/// tombstones, the segment counter) here, so it never acts on a stale view
+/// and never has to be refused because the scope moved.
+///
+/// It reads the scope as of its position in the commit: staged first, it
+/// sees nothing of the commit's own changes. `resolve` appends its mutations to
+/// `outputs` (allocated from `arena`); they apply right after it, and the
+/// backend applies them to its mirror once the commit succeeds. Returning
+/// an error refuses the commit (`error.IndexScopeChanged` for a stale
+/// publication). It may run more than once for one commit; each run starts
+/// with `outputs` empty. Never stored or mirrored itself.
+pub const Resolver = struct {
+    ptr: *anyopaque,
+    resolve: *const fn (ptr: *anyopaque, tip: TipReader, resolver: *Resolver) anyerror!void,
+    arena: std.heap.ArenaAllocator,
+    outputs: std.ArrayListUnmanaged(Mutation) = .empty,
 
-pub fn scopeGuard(expected: *const [8]u8) Mutation {
-    return .{ .namespace = guard_namespace, .key = "scope_sequence", .value = expected };
+    pub fn init(allocator: Allocator, ptr: *anyopaque, resolve: *const fn (ptr: *anyopaque, tip: TipReader, resolver: *Resolver) anyerror!void) Resolver {
+        return .{ .ptr = ptr, .resolve = resolve, .arena = .init(allocator) };
+    }
+
+    pub fn deinit(self: *Resolver) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Runs `resolve` from a clean output list.
+    pub fn run(self: *Resolver, tip: TipReader) !void {
+        self.outputs = .empty;
+        _ = self.arena.reset(.retain_capacity);
+        try self.resolve(self.ptr, tip, self);
+    }
+
+    pub fn put(self: *Resolver, namespace: ?[]const u8, key: []const u8, value: []const u8) !void {
+        const a = self.arena.allocator();
+        try self.outputs.append(a, .{ .namespace = try dupeOpt(a, namespace), .key = try a.dupe(u8, key), .value = try a.dupe(u8, value) });
+    }
+
+    pub fn delete(self: *Resolver, namespace: ?[]const u8, key: []const u8) !void {
+        const a = self.arena.allocator();
+        try self.outputs.append(a, .{ .namespace = try dupeOpt(a, namespace), .key = try a.dupe(u8, key), .is_delete = true });
+    }
+};
+
+/// One record of the resolving commit's scope, as of the point the resolver
+/// runs; null when absent.
+pub const TipReader = struct {
+    ptr: *anyopaque,
+    getFn: *const fn (ptr: *anyopaque, allocator: Allocator, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8,
+
+    pub fn get(self: TipReader, allocator: Allocator, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+        return self.getFn(self.ptr, allocator, namespace, key);
+    }
+};
+
+pub const resolve_namespace = "\x00resolve";
+
+/// The mutation that stages `resolver`. Its value names the resolver in this
+/// process; it never reaches the file or the mirror.
+pub fn resolution(resolver: *Resolver) [8]u8 {
+    return std.mem.toBytes(@as(u64, @intFromPtr(resolver)));
 }
 
-pub fn isGuard(namespace: ?[]const u8) bool {
-    return if (namespace) |name| std.mem.eql(u8, name, guard_namespace) else false;
+pub fn isResolution(namespace: ?[]const u8) bool {
+    return if (namespace) |name| std.mem.eql(u8, name, resolve_namespace) else false;
+}
+
+pub fn resolverOf(m: Mutation) !*Resolver {
+    if (!isResolution(m.namespace) or m.value.len != 8) return error.InvalidResolver;
+    const address = std.mem.bytesToValue(u64, m.value[0..8]);
+    if (address == 0) return error.InvalidResolver;
+    return @ptrFromInt(@as(usize, @intCast(address)));
 }
 
 fn isTipNamespace(namespace: ?[]const u8) bool {
@@ -174,7 +236,7 @@ fn isTipNamespace(namespace: ?[]const u8) bool {
 
 /// Staged only: never mirrored.
 fn isStagedOnly(namespace: ?[]const u8) bool {
-    return isGuard(namespace);
+    return isResolution(namespace);
 }
 
 /// Durably removes every entry currently committed under `scope`, so a
@@ -605,12 +667,6 @@ pub const Backend = struct {
         return self.sink.loadOneAlloc != null;
     }
 
-    /// See `Sink.scopeSequence`.
-    pub fn scopeSequence(self: *const Backend) ?u64 {
-        const scope_sequence = self.sink.scopeSequence orelse return null;
-        return scope_sequence(self.sink.ptr, self.scope);
-    }
-
     pub fn invalidateMirror(self: *Backend) void {
         self.mirror_invalid.store(true, .release);
     }
@@ -806,9 +862,11 @@ pub const Backend = struct {
                 // old always-blocking `submit` for a `Sink` with no deferred
                 // path (every current fake/test `Sink`), which keeps this
                 // exactly as correct -- just not as fast -- as before.
-                // A guarded commit can be refused; it must not be deferred,
-                // or the refusal would surface after this mirror swap.
-                if (!self.durable and self.backend.sink.submitDeferred != null and !self.hasGuard()) {
+                // A resolving commit can be refused and must return its
+                // resolutions before the mirror swap: never deferred.
+                const resolving = self.hasResolver();
+                if (resolving and !self.backend.sink.resolves) try self.resolveLocally();
+                if (!self.durable and self.backend.sink.submitDeferred != null and !resolving) {
                     const pending = try self.backend.sink.submitDeferred.?(self.backend.sink.ptr, self.backend.scope, self.pending.items);
                     try self.backend.enqueuePendingRideAlong(pending);
                 } else {
@@ -833,6 +891,12 @@ pub const Backend = struct {
                 // publishes, and that publish is what gets counted.
             }
 
+            // The sink resolved at the tip: its decisions join the mirror.
+            if (self.backend.sink.resolves) for (self.pending.items) |m| {
+                if (!isResolution(m.namespace)) continue;
+                try self.mirrorResolved(try resolverOf(m));
+            };
+
             lockBackend(self.backend);
             const old = self.backend.state;
             self.backend.state = rc;
@@ -844,16 +908,69 @@ pub const Backend = struct {
             self.pending_arena.deinit();
         }
 
+        /// Stages `resolver` (see `Resolver`); the caller keeps it alive
+        /// until the commit returns.
+        pub fn stageResolver(self: *NamespaceTxn, resolver: *Resolver) !void {
+            if (self.read_only) return error.ReadOnly;
+            const bytes = resolution(resolver);
+            try self.stage(.{ .name = resolve_namespace }, "resolver", &bytes, false);
+        }
+
+        fn hasResolver(self: *const NamespaceTxn) bool {
+            for (self.pending.items) |m| if (isResolution(m.namespace)) return true;
+            return false;
+        }
+
+        fn mirrorResolved(self: *NamespaceTxn, resolver: *Resolver) !void {
+            for (resolver.outputs.items) |m| {
+                if ((self.backend.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
+                if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
+                const namespace: backend_types.Namespace = .{ .name = m.namespace };
+                self.replaceTree(if (m.is_delete)
+                    try self.rc.?.state.tree.remove(self.allocator, namespace.name, m.key)
+                else
+                    try self.rc.?.state.tree.put(self.allocator, namespace.name, m.key, m.value));
+            }
+        }
+
+        /// For a sink that does not resolve: runs each resolver against the
+        /// state this transaction started from (the committed mirror, and
+        /// the file for `tip_namespace`) and replaces it with its decisions.
+        fn resolveLocally(self: *NamespaceTxn) !void {
+            const Reader = struct {
+                txn: *NamespaceTxn,
+                fn get(ptr: *anyopaque, allocator: Allocator, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+                    const r: *@This() = @ptrCast(@alignCast(ptr));
+                    const backend = r.txn.backend;
+                    if (backend.tipReads() and isTipNamespace(namespace)) return backend.sink.loadOneAlloc.?(backend.sink.ptr, allocator, backend.scope, namespace, key);
+                    lockBackend(backend);
+                    defer backend.mutex.unlock();
+                    const value = backend.state.state.get(.{ .name = namespace }, key) catch return null;
+                    return try allocator.dupe(u8, value);
+                }
+            };
+            var reader: Reader = .{ .txn = self };
+            const tip: TipReader = .{ .ptr = &reader, .getFn = Reader.get };
+            const arena = self.pending_arena.allocator();
+            var resolved = std.ArrayListUnmanaged(Mutation).empty;
+            for (self.pending.items) |m| {
+                if (!isResolution(m.namespace)) {
+                    try resolved.append(arena, m);
+                    continue;
+                }
+                const resolver = try resolverOf(m);
+                try resolver.run(tip);
+                try resolved.appendSlice(arena, resolver.outputs.items);
+                try self.mirrorResolved(resolver);
+            }
+            self.pending = resolved;
+        }
+
         pub fn get(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
             if (self.backend.tipReads() and isTipNamespace(namespace.name)) return self.getAtTip(namespace, key);
             const value = try self.rc.?.state.get(namespace, key);
             self.read_since_write = true;
             return value;
-        }
-
-        fn hasGuard(self: *const NamespaceTxn) bool {
-            for (self.pending.items) |m| if (isGuard(m.namespace)) return true;
-            return false;
         }
 
         /// A `tip_namespace` read: this transaction's latest staged write,

@@ -9192,6 +9192,7 @@ pub const DB = struct {
         var tracked = opts;
         tracked.primary_committed = opts.primary_committed orelse &committed;
         self.batchInternalWithVisibility(req, profile, tracked) catch |err| {
+            if (tracked.primary_committed.?.*) std.log.warn("batch visibility failed after the primary write committed: {s}", .{@errorName(err)});
             if (tracked.primary_committed.?.*) switch (err) {
                 error.TextMergeBackpressureTimeout,
                 error.TextMergeRuntimeShutdown,
