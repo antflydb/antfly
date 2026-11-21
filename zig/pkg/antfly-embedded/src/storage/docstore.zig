@@ -1858,6 +1858,11 @@ pub const DocStore = struct {
     /// single-record credit encoding. Older binaries cannot write it.
     pub fn enableProtectedReplayCredit(self: *DocStore) !void {
         if (self.sharedReplayLane()) return error.Unsupported;
+        {
+            var probe = try self.beginProbeTxn();
+            defer probe.abort();
+            if (try replay_journal_format.state(&probe) == .protected_credit) return;
+        }
         var batch = try self.beginWriteBatchWithOptions(.{ .block_cache_admission = .transient });
         errdefer batch.abort();
         const txn = batch.asTxn();
