@@ -995,7 +995,7 @@ pub fn compatibilitySummaryForBackend(
     return compatibilitySummaryForBackendWithControl(allocator, model_dir, man, backend, .{});
 }
 
-fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model_dir: []const u8, man: *const manifest_mod.ModelManifest, backend: backends.BackendType, control: InferenceExecutionControl) !?CompatibilitySummary {
+pub fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model_dir: []const u8, man: *const manifest_mod.ModelManifest, backend: backends.BackendType, control: InferenceExecutionControl) !?CompatibilitySummary {
     try control.check();
     const candidate = artifactCandidateForBackend(man.*, backend) orelse return null;
 
@@ -1208,7 +1208,7 @@ pub fn compatibilitySummaryForBackendsWithControl(allocator: std.mem.Allocator, 
     };
 }
 
-fn selectBetterCompatibility(
+pub fn selectBetterCompatibility(
     current: ?CompatibilitySummary,
     candidate: CompatibilitySummary,
 ) CompatibilitySummary {

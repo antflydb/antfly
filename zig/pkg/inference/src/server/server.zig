@@ -27083,7 +27083,7 @@ pub const Node = struct {
                     model_manager_mod.ModelManager.EmbeddingRevisions{};
                 const rejected = if (scoped_publication) |*captured|
                     if (captured.inspection_valid)
-                        captured.borrow.filterEmbeddingRevisions(&captured.artifacts, manifest, &declared, control) catch |err| return modelLoadFailureResponse(ctx, err)
+                        captured.borrow.filterEmbeddingRevisions(&captured.artifacts, &declared, self.config.allow_unknown_models, control) catch |err| return modelLoadFailureResponse(ctx, err)
                     else
                         model_manager_mod.ModelManager.EmbeddingRevisions{}
                 else
@@ -27293,7 +27293,7 @@ pub const Node = struct {
                 const captured = &scoped_publication.?.*.?;
                 var required_scratch: [1]backends_mod.BackendType = undefined;
                 const backend_order = try compatibilityBackendsForSessionManager(&self.session_manager, &required_scratch);
-                if (captured.borrow.compatibility(&captured.artifacts, entry.path, &manifest, backend_order, control)) |summary| {
+                if (captured.borrow.compatibility(&captured.artifacts, entry.path, backend_order, control)) |summary| {
                     captured.inspection_valid = true;
                     break :scoped summary;
                 } else |err| {
@@ -51283,22 +51283,28 @@ test "model selection reuses the verified resident installation for embedding re
 }
 
 test "scoped model discovery reuses compatibility and refuses a truncated extensionless shard" {
-    try testScopedShardedDiscovery(false, .sharded);
+    try testScopedShardedDiscovery(.none, .sharded);
 }
 
 test "scoped model discovery keeps native revisions when an alternate ONNX dependency is invalid" {
-    try testScopedShardedDiscovery(true, .sharded);
+    try testScopedShardedDiscovery(.primary, .sharded);
+}
+
+test "scoped model discovery caches an unavailable auxiliary ONNX dependency" {
+    try testScopedShardedDiscovery(.auxiliary, .sharded);
 }
 
 test "scoped model discovery withholds revision pinning for sharded EmbeddingGemma 2" {
-    try testScopedShardedDiscovery(false, .gemma_sharded);
+    try testScopedShardedDiscovery(.none, .gemma_sharded);
 }
 
 test "scoped model discovery refuses an EmbeddingGemma 2 pin with missing recipe sidecars" {
-    try testScopedShardedDiscovery(false, .gemma_incomplete);
+    try testScopedShardedDiscovery(.none, .gemma_incomplete);
 }
 
-fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime fixture: enum { sharded, gemma_sharded, gemma_incomplete }) !void {
+const scoped_catalog_test_safetensors = "\x4e\x00\x00\x00\x00\x00\x00\x00{\"model.embed_tokens.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+
+fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxiliary }, comptime fixture: enum { sharded, gemma_sharded, gemma_incomplete }) !void {
     const gemma = fixture != .sharded;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -51310,7 +51316,7 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime fixture: enum {
     const index_path = "model.safetensors.index.json";
     const config = if (gemma) @embedFile("../architectures/embedding_gemma2_config.json") else "{\"model_type\":\"bert\",\"architectures\":[\"BertModel\"],\"hidden_size\":32,\"num_attention_heads\":2,\"num_hidden_layers\":2,\"intermediate_size\":64}";
     const index = "{\"weight_map\":{\"model.embed_tokens.weight\":\"" ++ shard_path ++ "\"}}";
-    const weights = "scoped catalog shard fixture";
+    const weights = scoped_catalog_test_safetensors ++ "\x00\x00\x00\x00";
     try tmp.dir.createDirPath(io, path ++ "/parts");
     const dir = try tmp.dir.openDir(io, path, .{});
     defer dir.close(io);
@@ -51327,7 +51333,8 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime fixture: enum {
         }
     else
         .{ .{ "config.json", config }, .{ index_path, index }, .{ shard_path, weights } };
-    const files = if (with_onnx) native_files ++ .{ .{ "model.onnx", graph }, .{ "tensors.bin", "tensor data" } } else native_files;
+    const graph_name = if (graph_role == .auxiliary) "visual_model.onnx" else "model.onnx";
+    const files = if (graph_role != .none) native_files ++ .{ .{ graph_name, graph }, .{ "tensors.bin", "tensor data" } } else native_files;
     var entries: [files.len]managed.ArtifactReceipt = undefined;
     var sums: [files.len][64]u8 = undefined;
     inline for (files, 0..) |file, i| {
@@ -51347,6 +51354,12 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime fixture: enum {
 
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
+    if (graph_role == .auxiliary) {
+        const model_dir = try std.fs.path.join(a, &.{ root, path });
+        defer a.free(model_dir);
+        try testScopedAuxiliaryFailure(a, io, dir, model_dir);
+        return;
+    }
     var node = try Node.init(a, .{ .models_dir = root });
     defer node.deinit();
     try node.attachIo(io);
@@ -51374,7 +51387,7 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime fixture: enum {
 
     if (gemma) return;
 
-    if (with_onnx) {
+    if (graph_role == .primary) {
         const model_dir = try std.fs.path.join(a, &.{ root, path });
         defer a.free(model_dir);
         const control = InferenceExecutionControl{ .io = io };
@@ -51383,11 +51396,9 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime fixture: enum {
         defer cache.deinit();
         var publication = (try ScopedCatalogPublication.open(&cache, a, a, io, model_dir, model_publication, control)).?;
         defer publication.deinit();
-        var listing = try manifest_mod.loadFromPublishedArtifacts(a, model_dir, &publication.artifacts, true);
-        defer listing.deinit();
         var required: [1]backends_mod.BackendType = undefined;
         const order = try compatibilityBackendsForSessionManager(&node.session_manager, &required);
-        _ = try publication.borrow.compatibility(&publication.artifacts, model_dir, &listing, order, control);
+        _ = try publication.borrow.compatibility(&publication.artifacts, model_dir, order, control);
         const manifest = publication.borrow.executionManifest().?;
         try std.testing.expect(manifest.onnx_path != null);
         const Probe = struct {
@@ -51414,7 +51425,8 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime fixture: enum {
             candidates.backends[0..2].* = .{ .wasm, .native };
             candidates.revisions[0..2].* = .{ @splat(1), @splat(2) };
             candidates.len = 2;
-            const rejected = try publication.borrow.filterEmbeddingRevisions(&counted_artifacts, manifest, &candidates, control);
+            var observed = publication.borrow;
+            const rejected = try observed.filterEmbeddingRevisions(&counted_artifacts, &candidates, true, control);
             try std.testing.expectEqual(@as(usize, 1), candidates.len);
             try std.testing.expect(candidates.contains(@splat(2)));
             try std.testing.expect(rejected.contains(@splat(1)));
@@ -51481,18 +51493,74 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime fixture: enum {
     try std.testing.expectEqual(@as(u16, 200), repaired.status.code);
 }
 
-test "scoped model discovery isolates a damaged Jina adapter from CPU GGUF" {
+fn testScopedAuxiliaryFailure(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, model_dir: []const u8) !void {
+    const managed = @import("../registry/managed_receipt.zig");
+    const Probe = struct {
+        var graph_stats: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirStatFile") = undefined;
+
+        fn stat(raw: ?*anyopaque, directory: std.Io.Dir, path: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+            if (std.mem.endsWith(u8, path, "/visual_model.onnx")) graph_stats += 1;
+            return original(raw, directory, path, options);
+        }
+    };
+    var table = io.vtable.*;
+    Probe.original = table.dirStatFile;
+    table.dirStatFile = Probe.stat;
+    const counted_io: std.Io = .{ .userdata = io.userdata, .vtable = &table };
+    const control = InferenceExecutionControl{ .io = counted_io };
+    var cache: ScopedCatalogCache = .{};
+    defer cache.deinit();
+    try dir.deleteFile(io, "tensors.bin");
+    var publication = (try ScopedCatalogPublication.open(&cache, a, a, counted_io, model_dir, try managed.publicationGeneration(a, io, model_dir), control)).?;
+    defer publication.deinit();
+    for (0..2) |attempt| {
+        Probe.graph_stats = 0;
+        try std.testing.expectError(error.CatalogArtifactUnavailable, publication.borrow.compatibility(&publication.artifacts, model_dir, &.{.native}, control));
+        try std.testing.expectEqual(attempt == 0, Probe.graph_stats > 0);
+    }
+    // The tensor is present again. Reopen the graph and detect the preexisting
+    // invalid offset instead of returning the old unavailable-member result.
+    try dir.writeFile(io, .{ .sub_path = "tensors.bin", .data = "tensor data" });
+    Probe.graph_stats = 0;
+    try std.testing.expectError(error.InvalidManagedDownload, publication.borrow.compatibility(&publication.artifacts, model_dir, &.{.native}, control));
+    try std.testing.expect(Probe.graph_stats > 0);
+}
+
+test "scoped model discovery isolates a missing or malformed Jina adapter from CPU GGUF" {
+    try testScopedJinaAdapter(false);
+    try testScopedJinaAdapter(true);
+}
+
+fn testScopedJinaAdapter(comptime missing_weights: bool) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const managed = @import("../registry/managed_receipt.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "adapters/retrieval");
+    const writer = @import("../gguf/writer.zig");
+    const tensors = [_]writer.TensorSpec{
+        .{ .name = "token_embd.weight", .dimensions = &.{ 32, 1 }, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "output_norm.weight", .dimensions = &.{32}, .tensor_type = .{ .known = .F32 } },
+    };
+    var layout = try writer.buildLayout(a, &.{
+        .{ .key = "general.architecture", .value = .{ .string = "qwen2" } },
+        .{ .key = "qwen2.block_count", .value = .{ .u32 = 0 } },
+        .{ .key = "qwen2.embedding_length", .value = .{ .u32 = 32 } },
+        .{ .key = "qwen2.attention.head_count", .value = .{ .u32 = 1 } },
+    }, &tensors);
+    defer layout.deinit(a);
+    const offset = std.mem.alignForward(usize, layout.header_bytes.len, @intCast(layout.alignment));
+    const gguf = try a.alloc(u8, offset + @as(usize, @intCast(layout.offsets[1])) + 32 * @sizeOf(f32));
+    defer a.free(gguf);
+    @memset(gguf, 0);
+    @memcpy(gguf[0..layout.header_bytes.len], layout.header_bytes);
     const files = .{
-        .{ "config.json", "{\"model_type\":\"jina_embeddings_v5\",\"architectures\":[\"JinaEmbeddingsV5Model\"],\"hidden_size\":32}" },
-        .{ "model.gguf", "metadata-only GGUF fixture" },
-        .{ "adapters/retrieval/adapter_config.json", "{}" },
-        .{ "adapters/retrieval/adapter_model.safetensors", "adapter fixture" },
+        .{ "config.json", "{\"model_type\":\"jina_embeddings_v5\",\"architectures\":[\"JinaEmbeddingsV5Model\"],\"hidden_size\":32,\"num_hidden_layers\":0}" },
+        .{ "model.gguf", gguf },
+        .{ "adapters/retrieval/adapter_config.json", if (missing_weights) "{}" else "[]" },
+        .{ "adapters/retrieval/adapter_model.safetensors", scoped_catalog_test_safetensors ++ "\x00\x00\x00\x00" },
     };
     var artifacts: [files.len]managed.ArtifactReceipt = undefined;
     var hashes: [files.len][64]u8 = undefined;
@@ -51510,7 +51578,7 @@ test "scoped model discovery isolates a damaged Jina adapter from CPU GGUF" {
     }, .{});
     defer a.free(receipt_bytes);
     try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = receipt_bytes });
-    try tmp.dir.deleteFile(io, "adapters/retrieval/adapter_model.safetensors");
+    if (missing_weights) try tmp.dir.deleteFile(io, "adapters/retrieval/adapter_model.safetensors");
 
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
@@ -51519,9 +51587,7 @@ test "scoped model discovery isolates a damaged Jina adapter from CPU GGUF" {
     const control = InferenceExecutionControl{ .io = io };
     var publication = (try ScopedCatalogPublication.open(&cache, a, a, io, root, try managed.publicationGeneration(a, io, root), control)).?;
     defer publication.deinit();
-    var listing = try manifest_mod.loadFromPublishedArtifacts(a, root, &publication.artifacts, true);
-    defer listing.deinit();
-    _ = try publication.borrow.compatibility(&publication.artifacts, root, &listing, &.{.native}, control);
+    _ = try publication.borrow.compatibility(&publication.artifacts, root, &.{.native}, control);
     const manifest = publication.borrow.executionManifest().?;
     try std.testing.expectEqualStrings("jina_embeddings_v5", manifest.config_model_arch);
     try std.testing.expectEqual(manifest_mod.NativeWeightArtifactKind.gguf, manifest.nativeWeightArtifactKind().?);
@@ -51531,7 +51597,7 @@ test "scoped model discovery isolates a damaged Jina adapter from CPU GGUF" {
     candidates.backends[0..2].* = .{ .metal, .native };
     candidates.revisions[0..2].* = .{ @splat(1), @splat(2) };
     candidates.len = 2;
-    const rejected = try publication.borrow.filterEmbeddingRevisions(&publication.artifacts, manifest, &candidates, control);
+    const rejected = try publication.borrow.filterEmbeddingRevisions(&publication.artifacts, &candidates, true, control);
     try std.testing.expectEqual(@as(usize, 1), candidates.len);
     try std.testing.expect(candidates.contains(@splat(2)));
     try std.testing.expect(rejected.contains(@splat(1)));
@@ -51563,7 +51629,7 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     });
     const managed = @import("../registry/managed_receipt.zig");
     const config = @embedFile("../architectures/embedding_gemma2_config.json");
-    const weights = "second metadata-only fixture";
+    const weights = scoped_catalog_test_safetensors ++ "\x00\x00\x00\x00";
     var config_digest: [32]u8 = undefined;
     var weights_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(config, &config_digest, .{});
@@ -51647,8 +51713,8 @@ test "scoped model discovery resolves dense geometry without loading weights" {
 
     // Declared metadata remains cheap on cold replicas. The execution path
     // still has to authenticate the bytes before it can acknowledge the pin.
-    var corrupt: [weights.len]u8 = @splat('x');
-    corrupt[0] = 'y';
+    var corrupt = weights[0..weights.len].*;
+    corrupt[corrupt.len - 1] = 1;
     try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/model.safetensors", .data = &corrupt });
     var managed_request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fother&task=embed");
     defer managed_request.deinit();
@@ -51776,7 +51842,7 @@ test "scoped model discovery resolves dense geometry without loading weights" {
 
     // Publish a new receipt at the same selector. A populated digest and
     // compatibility cache must still describe the replacement installation.
-    const replacement_weights = "replacement managed weights";
+    const replacement_weights = scoped_catalog_test_safetensors ++ "\x00\x00\x00\x02";
     std.crypto.hash.sha2.Sha256.hash(replacement_weights, &weights_digest, .{});
     const replacement_hex = std.fmt.bytesToHex(weights_digest, .lower);
     members[0] = .{ .path = "model.safetensors", .size = replacement_weights.len, .sha256 = &replacement_hex };

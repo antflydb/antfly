@@ -30,6 +30,17 @@ const max_cached_adapter_bytes: usize = 64 * 1024;
 const gemma_identity = @import("../models/embedding_gemma2_identity.zig");
 const safetensors = @import("../models/safetensors.zig");
 const revalidate_after_ns = 60 * std.time.ns_per_s;
+const CompatibilitySummary = model_manager.CompatibilitySummary;
+const no_compatible_backend: CompatibilitySummary = .{
+    .level = .incompatible,
+    .code = .unsupported_backend,
+    .message = "no configured backend accepts an artifact in this model bundle",
+};
+const unavailable_dependency: CompatibilitySummary = .{
+    .level = .incompatible,
+    .code = .artifact_unreadable,
+    .message = "a required model dependency is unavailable",
+};
 const dependency_retry_ns = std.time.ns_per_s;
 
 pub const Cache = struct {
@@ -106,6 +117,14 @@ pub const Cache = struct {
                 return record.size;
             }
 
+            fn verify(self: *MemberCollector, members: []const Member, control: ExecutionControl) !void {
+                for (members) |member| {
+                    try control.check();
+                    const current = try self.stamp(member.path);
+                    if (!std.meta.eql(member.stamp, current)) return error.ModelArtifactsChanging;
+                }
+            }
+
             fn freeze(self: *const MemberCollector) ![]const Member {
                 const checks = try self.allocator.alloc(Member, self.members.count());
                 var it = self.members.iterator();
@@ -116,6 +135,32 @@ pub const Cache = struct {
                 return checks;
             }
         };
+        const FailedMember = struct {
+            path: []const u8,
+            reason: anyerror,
+
+            fn capture(collector: *const MemberCollector, owner: std.mem.Allocator, reason: anyerror) !?FailedMember {
+                const path = collector.failed_member orelse return null;
+                if (path.len > 4096) return null;
+                return .{ .path = try owner.dupe(u8, path), .reason = reason };
+            }
+
+            fn recheck(self: *?FailedMember, owner: std.mem.Allocator, artifacts: *const PublishedArtifacts) !void {
+                if (self.*) |failure| {
+                    _ = artifacts.requireCatalogMember(failure.path) catch |err| switch (err) {
+                        error.ChecksumMismatch, error.CatalogArtifactUnavailable => return failure.reason,
+                        else => return err,
+                    };
+                    owner.free(failure.path);
+                    self.* = null;
+                }
+            }
+
+            fn deinit(self: ?FailedMember, owner: std.mem.Allocator) void {
+                if (self) |failure| owner.free(failure.path);
+            }
+        };
+
         const Dependency = enum { native, onnx, jina_adapter };
         const DependencyCache = struct {
             const Stamps = struct {
@@ -131,7 +176,7 @@ pub const Cache = struct {
             available: std.atomic.Value(?*Stamps) = .init(null),
             // Protected by build. Recheck only this member until it recovers;
             // an ONNX graph may be large and have many healthy dependencies.
-            failed_member: ?[]const u8 = null,
+            failure: ?FailedMember = null,
             retry_at: ?std.Io.Timestamp = null,
 
             fn check(self: *DependencyCache, owner: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, dependency: Dependency, control: ExecutionControl) !bool {
@@ -145,14 +190,10 @@ pub const Cache = struct {
                     try validate(cached.members, artifacts, control);
                     return true;
                 }
-                if (self.failed_member) |path| {
-                    _ = artifacts.requireCatalogMember(path) catch |err| switch (err) {
-                        error.ChecksumMismatch, error.CatalogArtifactUnavailable => return false,
-                        else => return err,
-                    };
-                    owner.free(path);
-                    self.failed_member = null;
-                }
+                FailedMember.recheck(&self.failure, owner, artifacts) catch |err| switch (err) {
+                    error.ChecksumMismatch, error.CatalogArtifactUnavailable => return false,
+                    else => return err,
+                };
                 if (self.retry_at) |retry| {
                     if (std.Io.Timestamp.now(artifacts.io, .awake).nanoseconds < retry.nanoseconds) return false;
                 }
@@ -164,11 +205,7 @@ pub const Cache = struct {
                 var collector = MemberCollector{ .allocator = current.arena.allocator(), .artifacts = artifacts };
                 collectDependencyMembers(&collector, manifest, dependency, control) catch |err| return self.reject(owner, collector, err);
                 current.members = try collector.freeze();
-                for (current.members) |member| {
-                    try control.check();
-                    const stamp = collector.stamp(member.path) catch |err| return self.reject(owner, collector, err);
-                    if (!std.meta.eql(member.stamp, stamp)) return error.ModelArtifactsChanging;
-                }
+                collector.verify(current.members, control) catch |err| return self.reject(owner, collector, err);
                 if (current.arena.queryCapacity() <= if (dependency == .jina_adapter) max_cached_adapter_bytes else max_cached_primary_bytes) {
                     retained = true;
                     self.available.store(current, .release);
@@ -181,48 +218,81 @@ pub const Cache = struct {
                     error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled, error.ModelArtifactsChanging => return err,
                     else => {},
                 }
-                if (collector.failed_member) |path| {
-                    if (path.len <= 4096) {
-                        self.failed_member = try owner.dupe(u8, path);
-                        self.retry_at = null;
-                        return false;
-                    }
+                self.failure = try FailedMember.capture(&collector, owner, err);
+                if (self.failure != null) {
+                    self.retry_at = null;
+                    return false;
                 }
                 self.retry_at = .{ .nanoseconds = std.Io.Timestamp.now(collector.artifacts.io, .awake).nanoseconds + dependency_retry_ns };
                 return false;
             }
         };
+        const BackendAssessment = struct {
+            lock: std.Io.Mutex = .init,
+            available: std.atomic.Value(bool) = .init(false),
+            summary: CompatibilitySummary = undefined,
+        };
+
         arena: std.heap.ArenaAllocator,
         members: []const Member,
         dependencies_by_role: [std.enums.values(Dependency).len]DependencyCache,
-        backend_order: []const backends.BackendType,
+        backends_by_type: [std.enums.values(backends.BackendType).len]BackendAssessment,
         execution_manifest: manifest_mod.ModelManifest,
-        summary: model_manager.CompatibilitySummary,
 
-        fn create(owner: std.mem.Allocator, artifacts: *const PublishedArtifacts, path: []const u8, manifest: *const manifest_mod.ModelManifest, backend_order: []const backends.BackendType, control: ExecutionControl) !*Inspection {
+        fn create(owner: std.mem.Allocator, artifacts: *const PublishedArtifacts, path: []const u8, failure: *?FailedMember, control: ExecutionControl) !*Inspection {
             const result = try owner.create(Inspection);
             errdefer owner.destroy(result);
             result.arena = .init(owner);
             errdefer result.arena.deinit();
             const a = result.arena.allocator();
             const execution_manifest = try manifest_mod.loadFromPublishedArtifacts(a, path, artifacts, false);
-            const checks = try collectCommon(a, artifacts, &execution_manifest, control);
-            result.dependencies_by_role = @splat(.{});
-            const order = try a.dupe(backends.BackendType, backend_order);
-            const summary = model_manager.compatibilitySummaryForBackendsWithControl(artifacts.allocator, path, manifest, backend_order, control) catch |err| switch (err) {
-                error.OutOfMemory, error.Timeout, error.Cancelled, error.Canceled => return err,
-                else => model_manager.CompatibilitySummary{ .level = .unknown, .code = .artifact_unreadable, .message = "model compatibility could not be determined" },
+            var collector = MemberCollector{ .allocator = a, .artifacts = artifacts };
+            collectCommon(&collector, &execution_manifest, control) catch |err| {
+                failure.* = try FailedMember.capture(&collector, owner, err);
+                return err;
             };
-            try validate(checks, artifacts, control);
-            result.members = checks;
-            result.backend_order = order;
+            result.members = try collector.freeze();
+            collector.verify(result.members, control) catch |err| {
+                failure.* = try FailedMember.capture(&collector, owner, err);
+                return err;
+            };
+            result.dependencies_by_role = @splat(.{});
+            result.backends_by_type = @splat(.{});
             result.execution_manifest = execution_manifest;
-            result.summary = summary;
             return result;
         }
 
-        fn collectCommon(a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, control: ExecutionControl) ![]const Member {
-            var collector = MemberCollector{ .allocator = a, .artifacts = artifacts };
+        fn backendSummary(self: *Inspection, artifacts: *const PublishedArtifacts, path: []const u8, backend: backends.BackendType, roles: []const Dependency, control: ExecutionControl) !CompatibilitySummary {
+            const entry = &self.backends_by_type[@backingInt(backend)];
+            if (entry.available.load(.acquire)) return entry.summary;
+            try managed.lockVerification(control, &entry.lock, artifacts.io);
+            defer entry.lock.unlock(artifacts.io);
+            if (entry.available.load(.acquire)) return entry.summary;
+            const summary = (try model_manager.compatibilitySummaryForBackendWithControl(
+                artifacts.allocator,
+                path,
+                &self.execution_manifest,
+                backend,
+                control,
+            )) orelse no_compatible_backend;
+
+            // Publish an assessment only for the stamps checked before
+            // inspection. A repaired artifact must get a fresh assessment.
+            var cacheable = true;
+            for (roles) |role| {
+                if (self.dependencies_by_role[@backingInt(role)].available.load(.acquire)) |stamps| {
+                    try validate(stamps.members, artifacts, control);
+                } else cacheable = false;
+            }
+            try validate(self.members, artifacts, control);
+            if (cacheable) {
+                entry.summary = summary;
+                entry.available.store(true, .release);
+            }
+            return summary;
+        }
+
+        fn collectCommon(collector: *MemberCollector, manifest: *const manifest_mod.ModelManifest, control: ExecutionControl) !void {
             inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
                 if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest.*, field)) == ?[]const u8 and
                     !std.mem.eql(u8, field, "onnx_path") and !std.mem.eql(u8, field, "onnx_logical_path") and
@@ -247,9 +317,8 @@ pub const Cache = struct {
             for (components) |component| {
                 const graph = component orelse continue;
                 if (std.mem.endsWith(u8, graph, ".onnx"))
-                    try collectOnnx(&collector, graph, graph, control);
+                    try collectOnnx(collector, graph, graph, control);
             }
-            return collector.freeze();
         }
 
         fn collectDependencyMembers(collector: *MemberCollector, manifest: *const manifest_mod.ModelManifest, dependency: Dependency, control: ExecutionControl) !void {
@@ -331,7 +400,7 @@ pub const Cache = struct {
         fn destroy(self: *Inspection, owner: std.mem.Allocator) void {
             for (&self.dependencies_by_role) |*cache| {
                 if (cache.available.load(.monotonic)) |cached| cached.destroy(owner);
-                if (cache.failed_member) |path| owner.free(path);
+                FailedMember.deinit(cache.failure, owner);
             }
             self.arena.deinit();
             owner.destroy(self);
@@ -342,6 +411,7 @@ pub const Cache = struct {
         refs: std.atomic.Value(usize) = .init(1),
         artifacts: PublishedArtifacts,
         inspection_build: std.Io.Mutex = .init,
+        common_failure: ?Inspection.FailedMember = null,
         inspection: std.atomic.Value(?*Inspection) = .init(null),
         root_stamp: managed.ArtifactStamp,
         checked_at: std.Io.Timestamp,
@@ -351,6 +421,7 @@ pub const Cache = struct {
             const a = self.artifacts.allocator;
             const path = self.artifacts.root;
             if (self.inspection.load(.monotonic)) |inspection| inspection.destroy(a);
+            Inspection.FailedMember.deinit(self.common_failure, a);
             self.artifacts.deinit();
             a.free(path);
             a.destroy(self);
@@ -373,6 +444,7 @@ pub const Cache = struct {
         snapshot: *Snapshot,
         slot: *Slot,
         request_inspection: ?*Inspection = null,
+        checked_roles: [std.enums.values(Inspection.Dependency).len]?bool = @splat(null),
 
         /// These views are only used by read-only catalog consumers. All
         /// temporary allocations and I/O belong to the borrowing request.
@@ -383,36 +455,71 @@ pub const Cache = struct {
             return artifacts;
         }
 
-        pub fn compatibility(self: *Borrow, artifacts: *const PublishedArtifacts, path: []const u8, manifest: *const manifest_mod.ModelManifest, backend_order: []const backends.BackendType, control: ExecutionControl) !model_manager.CompatibilitySummary {
+        fn inspectionFor(self: *Borrow, artifacts: *const PublishedArtifacts, path: []const u8, control: ExecutionControl) !*Inspection {
             const snapshot = self.snapshot;
             if (snapshot.inspection.load(.acquire)) |cached| {
-                if (std.mem.eql(backends.BackendType, backend_order, cached.backend_order)) {
-                    Inspection.validate(cached.members, artifacts, control) catch |err| {
-                        if (err == error.ModelArtifactsChanging or err == error.InvalidManagedDownload or err == error.ChecksumMismatch or err == error.CatalogArtifactUnavailable) self.invalidate();
-                        return err;
-                    };
-                    return cached.summary;
-                }
+                try Inspection.validate(cached.members, artifacts, control);
+                return cached;
             }
             try managed.lockVerification(control, &snapshot.inspection_build, artifacts.io);
             defer snapshot.inspection_build.unlock(artifacts.io);
             if (snapshot.inspection.load(.acquire)) |cached| {
-                if (std.mem.eql(backends.BackendType, backend_order, cached.backend_order)) {
-                    Inspection.validate(cached.members, artifacts, control) catch |err| {
-                        if (err == error.ModelArtifactsChanging or err == error.InvalidManagedDownload or err == error.ChecksumMismatch or err == error.CatalogArtifactUnavailable) self.invalidate();
-                        return err;
-                    };
-                    return cached.summary;
-                }
+                try Inspection.validate(cached.members, artifacts, control);
+                return cached;
             }
             const owner = snapshot.artifacts.allocator;
-            const inspection = try Inspection.create(owner, artifacts, path, manifest, backend_order, control);
-            if (snapshot.inspection.load(.monotonic) == null and inspection.arena.queryCapacity() <= max_cached_bytes_per_slot - 2 * max_cached_primary_bytes - max_cached_adapter_bytes) {
+            try Inspection.FailedMember.recheck(&snapshot.common_failure, owner, artifacts);
+            const inspection = try Inspection.create(owner, artifacts, path, &snapshot.common_failure, control);
+            if (inspection.arena.queryCapacity() <= max_cached_bytes_per_slot - 2 * max_cached_primary_bytes - max_cached_adapter_bytes) {
                 snapshot.inspection.store(inspection, .release);
-                return inspection.summary;
+                return inspection;
             }
             self.request_inspection = inspection;
-            return inspection.summary;
+            return inspection;
+        }
+
+        pub fn compatibility(self: *Borrow, artifacts: *const PublishedArtifacts, path: []const u8, backend_order: []const backends.BackendType, control: ExecutionControl) !CompatibilitySummary {
+            const inspection = self.inspectionFor(artifacts, path, control) catch |err| {
+                if (err == error.ModelArtifactsChanging or self.snapshot.inspection.load(.acquire) != null and
+                    (err == error.InvalidManagedDownload or err == error.ChecksumMismatch or err == error.CatalogArtifactUnavailable)) self.invalidate();
+                return err;
+            };
+            var best: ?CompatibilitySummary = null;
+            for (backend_order) |backend| {
+                const summary = try self.checkBackend(inspection, artifacts, path, backend, control);
+                best = model_manager.selectBetterCompatibility(best, summary);
+                if (best.?.level == .compatible) break;
+            }
+            return best orelse no_compatible_backend;
+        }
+
+        fn checkBackend(self: *Borrow, inspection: *Inspection, artifacts: *const PublishedArtifacts, path: []const u8, backend: backends.BackendType, control: ExecutionControl) !CompatibilitySummary {
+            const manifest = &inspection.execution_manifest;
+            const primary: Inspection.Dependency = if (model_manager.embeddingBackendUsesOnnxPrimary(manifest.*, backend)) .onnx else .native;
+            const roles = [_]Inspection.Dependency{ primary, .jina_adapter };
+            const count: usize = if (model_manager.embeddingBackendUsesJinaAdapter(manifest.*, backend)) 2 else 1;
+            for (roles[0..count]) |dependency| {
+                const i = @backingInt(dependency);
+                if (self.checked_roles[i] == null) {
+                    const cache = &inspection.dependencies_by_role[i];
+                    self.checked_roles[i] = cache.check(self.snapshot.artifacts.allocator, artifacts, &inspection.execution_manifest, dependency, control) catch |err| switch (err) {
+                        error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                        else => invalid: {
+                            self.invalidate();
+                            break :invalid false;
+                        },
+                    };
+                }
+                if (!self.checked_roles[i].?) return unavailable_dependency;
+            }
+            return inspection.backendSummary(artifacts, path, backend, roles[0..count], control) catch |err| switch (err) {
+                error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                error.ModelArtifactsChanging, error.InvalidManagedDownload, error.ChecksumMismatch, error.CatalogArtifactUnavailable => {
+                    self.invalidate();
+                    return unavailable_dependency;
+                },
+                else => return .{ .level = .unknown, .code = .artifact_unreadable, .message = "model compatibility could not be determined" },
+            };
         }
 
         pub fn executionManifest(self: Borrow) ?*const manifest_mod.ModelManifest {
@@ -420,29 +527,17 @@ pub const Cache = struct {
             return &inspection.execution_manifest;
         }
 
-        pub fn filterEmbeddingRevisions(self: Borrow, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, revisions: *model_manager.ModelManager.EmbeddingRevisions, control: ExecutionControl) !model_manager.ModelManager.EmbeddingRevisions {
+        pub fn filterEmbeddingRevisions(self: *Borrow, artifacts: *const PublishedArtifacts, revisions: *model_manager.ModelManager.EmbeddingRevisions, allow_unknown: bool, control: ExecutionControl) !model_manager.ModelManager.EmbeddingRevisions {
             var rejected: model_manager.ModelManager.EmbeddingRevisions = .{};
             const inspection = self.request_inspection orelse self.snapshot.inspection.load(.acquire) orelse return rejected;
-            var verified: [std.enums.values(Inspection.Dependency).len]?bool = @splat(null);
             var kept: usize = 0;
             for (revisions.backends[0..revisions.len], revisions.revisions[0..revisions.len]) |backend, revision| {
-                const primary: Inspection.Dependency = if (model_manager.embeddingBackendUsesOnnxPrimary(manifest.*, backend)) .onnx else .native;
-                const required = [_]Inspection.Dependency{ primary, .jina_adapter };
-                const count: usize = if (model_manager.embeddingBackendUsesJinaAdapter(manifest.*, backend)) 2 else 1;
-                const available = for (required[0..count]) |dependency| {
-                    const i = @backingInt(dependency);
-                    if (verified[i] == null) {
-                        const cache = &inspection.dependencies_by_role[i];
-                        verified[i] = cache.check(self.snapshot.artifacts.allocator, artifacts, &inspection.execution_manifest, dependency, control) catch |err| switch (err) {
-                            error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
-                            else => invalid: {
-                                self.invalidate();
-                                break :invalid false;
-                            },
-                        };
-                    }
-                    if (!verified[i].?) break false;
-                } else true;
+                const summary = try self.checkBackend(inspection, artifacts, artifacts.root, backend, control);
+                const available = switch (summary.level) {
+                    .compatible => true,
+                    .unknown => allow_unknown,
+                    .incompatible => false,
+                };
                 if (available) {
                     revisions.backends[kept] = backend;
                     revisions.revisions[kept] = revision;
