@@ -972,12 +972,21 @@ pub fn resolvedDocSetForIdsAtGenerationWithPolicyTxn(
 pub fn fastStatsFromStore(store: *docstore_mod.DocStore) !Stats {
     var txn = try store.beginProbeTxn();
     defer txn.abort();
-    const next = try readNextOrdinalTxn(&txn);
+    return try fastStatsFromTxn(&txn);
+}
+
+/// Same as `fastStatsFromStore`, reading through an already-open probe/read
+/// transaction instead of opening (and aborting) its own. perf/lwa-write-
+/// overhead: lets a mutation's own prep phase share one transaction across
+/// this and its other read-only checks instead of paying a separate overlay
+/// pin/unpin for each.
+pub fn fastStatsFromTxn(txn: anytype) !Stats {
+    const next = try readNextOrdinalTxn(txn);
     var stats = Stats{
         .next_ordinal = next,
         .allocated_ordinals = if (next > 0) next - 1 else 0,
     };
-    if (try readVisibilitySummaryTxn(&txn)) |summary| {
+    if (try readVisibilitySummaryTxn(txn)) |summary| {
         stats.live_ordinals = summary.live_ordinals;
         stats.tombstone_ordinals = summary.tombstone_ordinals;
         stats.max_created_generation = summary.max_created_generation;

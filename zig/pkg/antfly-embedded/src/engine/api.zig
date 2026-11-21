@@ -1062,7 +1062,11 @@ test "embedded api openLite keeps full text index inside native aflite file" {
     defer alloc.free(path);
     const sidecar_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{path});
     defer alloc.free(sidecar_path);
-    const applied_sequence_checkpoint_path = try support.db.apply_state.checkpointPathAlloc(alloc, path);
+    // Progress v2 lives entirely inside the primary store; there is no
+    // external checkpoint-sidecar file for any backend to ever create. This
+    // computes the historical sidecar file name only to assert that nothing
+    // ever appears at it.
+    const applied_sequence_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/derived_apply.checkpoint", .{path});
     defer alloc.free(applied_sequence_checkpoint_path);
 
     {

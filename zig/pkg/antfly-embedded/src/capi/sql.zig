@@ -94,6 +94,16 @@ pub fn Adapter(comptime native: type) type {
         table_name: []const u8,
         read_only: bool = false,
         outcome_transaction_id: ?types.TxnId = null,
+        /// WS3: threads the capi writer lane's `HandleGuard.
+        /// releaseWriterLaneBeforeWait` hook (see `capi/db.zig`'s
+        /// `writerLaneHookFromGuard`/`trackedBatchWithWriterLaneHook`) through
+        /// to the single-table `mutate` commit path below, so a SQL write's
+        /// connection-level locks (the path gate's lease and the per-connection
+        /// call-serializing mutex) drop across its durability wait too, instead
+        /// of being held for the whole fsync like every write export other than
+        /// SQL already avoids. `null` for callers with no `HandleGuard` in scope
+        /// (e.g. `executeEmbeddedSql`'s table-scoped path).
+        writer_lane_hook: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook = null,
         graph_parameters: []const std.json.Value = &.{},
 
         pub fn backend(self: *Self) catalog.Backend {
@@ -101,7 +111,7 @@ pub fn Adapter(comptime native: type) type {
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
-            if (self.handle) |handle| return .{ .transaction = self.transaction, .handle = handle, .db = try @import("tables.zig").get(handle, name), .table_name = name, .read_only = self.read_only };
+            if (self.handle) |handle| return .{ .transaction = self.transaction, .handle = handle, .db = try @import("tables.zig").get(handle, name), .table_name = name, .read_only = self.read_only, .writer_lane_hook = self.writer_lane_hook };
             if (!std.mem.eql(u8, name, self.table_name)) return error.UndefinedTable;
             return self.*;
         }
@@ -482,10 +492,440 @@ pub fn Adapter(comptime native: type) type {
             return output;
         }
 
-        fn commitCoordinated(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
+        /// A single-table, single-process coordinated commit against
+        /// `self.db` directly. `mutate` below (and `sql_session.zig`'s
+        /// `commit`) route a coordinated write here instead of
+        /// `sql_commit.zig`'s cross-database two-phase coordinator
+        /// whenever the write touches exactly one table on a Lite single-
+        /// file store, which needs no cross-database decision record (every
+        /// table there already shares one physical commit domain) --
+        /// saving the recovery-hint write/clear, the root's own
+        /// coordinator-role transaction, and the extra per-participant
+        /// recovery round trip (lite-single-commit-write-path.md §3.3c).
+        ///
+        /// `commitCoordinatedLocal` below is the common case: one native
+        /// commit, no begin record, no durable intent record. This falls
+        /// back to the durable three-commit begin/write/commit sequence
+        /// (`commitCoordinatedTwoPhase`) only for requests
+        /// `commitCoordinatedLocal`'s single native batch cannot express --
+        /// row policy, restore staging, graph writes, range guards,
+        /// explicit repair, or the activation/retirement/index-maintenance
+        /// commands -- none of which an ordinary autocommit SQL INSERT/
+        /// UPDATE/DELETE or ordinary multi-statement session COMMIT needs.
+        /// `allow_local_decision` is false only for an explicit multi-
+        /// statement session's COMMIT (`sql_session.zig`): on an unknown
+        /// outcome, that caller's contract exposes a `transaction_id` so a
+        /// client can resolve ambiguity later (`capi SQL outcome COMMIT
+        /// decision failing inside publication is unknown with a
+        /// receipt`), and `commitCoordinatedLocal` has none to give --
+        /// there is no begin record, so there is nothing to resolve
+        /// against. An ordinary autocommit write (`mutate`'s two callers)
+        /// has no such contract (see the passing `capi SQL outcome
+        /// autocommit ...` cases), so it always gets the fused path when
+        /// eligible. Giving the session-COMMIT path the same transaction-
+        /// id-bearing ambiguity resolution as the fused path is follow-up
+        /// work, not done here.
+        pub fn commitCoordinated(self: *Self, alloc: std.mem.Allocator, request: contract.TableCommitRequest, allow_local_decision: bool) !catalog.MutationOutcome {
+            if (allow_local_decision and eligibleForLocalDecision(request)) return self.commitCoordinatedLocal(alloc, request);
+            return self.commitCoordinatedTwoPhase(request);
+        }
+
+        fn eligibleForLocalDecision(request: contract.TableCommitRequest) bool {
+            return request.row_policy_principal_proof.len == 0 and
+                request.restore_staging_scope == null and
+                request.restore_staging_plan_id == null and
+                request.relational_activation == null and
+                request.relational_retirement == null and
+                request.relational_index_maintenance == null and
+                request.integrity.len == 0 and
+                request.graph_writes.len == 0 and
+                request.graph_deletes.len == 0 and
+                !request.normalized_graph_rows and
+                request.range_guards.len == 0 and
+                !request.relational_repair;
+        }
+
+        /// lite-single-commit-write-path.md §3.3c: the primary row(s) plus
+        /// their UNIQUE-constraint integrity-catalog claims, validated and
+        /// written in one native commit (`DB.batchLocalCoordinated`, with
+        /// `BatchExecutionOptions.integrity_authority = .local_decision`).
+        /// No FK command ever reaches here: `eligibleForLocalDecision`
+        /// only lets through requests `prepareWithRepairAdmission` already
+        /// routed to a single physical table, and a `.foreign` generation
+        /// command is refused deeper in by `prepareLocalIntegrityDecision`
+        /// as a defense-in-depth check, never relied on to route correctly.
+        /// lite-single-commit-write-path.md §7.6: resolves a `Reference`'s
+        /// `child_table`/`child_key` to a durable existence check, so
+        /// `prepareLocalIntegrityDecision`'s own RESTRICT check can tell a
+        /// dangling Reference (the fused coordinator's ride-along `.attach`
+        /// landed without its leader's child row -- a non-atomicity window,
+        /// not a correctness bug on its own) apart from a genuinely live
+        /// one. Constructed fresh per call; `handle`/`alloc` are borrowed
+        /// for exactly that call's duration.
+        const ChildExistenceChecker = struct {
+            handle: *@import("handles.zig").Handle,
+            alloc: std.mem.Allocator,
+
+            fn exists(ptr: *anyopaque, child_table: []const u8, child_key: []const u8) anyerror!bool {
+                const self: *ChildExistenceChecker = @ptrCast(@alignCast(ptr));
+                const child_db = @import("tables.zig").get(self.handle, child_table) catch |err| switch (err) {
+                    // The child table itself is gone (dropped): nothing it
+                    // could still reference survives either.
+                    error.UndefinedTable => return false,
+                    else => return err,
+                };
+                var found = (try child_db.lookup(self.alloc, child_key, .{})) orelse return false;
+                found.deinit(self.alloc);
+                return true;
+            }
+        };
+
+        fn commitCoordinatedLocal(self: *Self, alloc: std.mem.Allocator, request: contract.TableCommitRequest) !catalog.MutationOutcome {
+            const outcomes = dependencies.sql_errors;
+            const coordinator = @import("sql_commit.zig");
+            // No separate begin record on this path: both of
+            // `commitCoordinatedTwoPhase`'s pre-decision boundaries
+            // (`test_before_store`, before any participant is admitted;
+            // `test_after_prepare`, after every participant is prepared)
+            // collapse to "before the one native batch below" here, since
+            // validation and the write are the SAME apply-locked call.
+            if (comptime @import("builtin").is_test) if (coordinator.test_before_store) |hook| {
+                coordinator.test_before_store = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_prepare) |hook| {
+                coordinator.test_after_prepare = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
+            const writes = try alloc.alloc(types.BatchWrite, request.writes.len);
+            for (request.writes, writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+            const req: types.BatchRequest = .{
+                .writes = writes,
+                .deletes = request.deletes,
+                .predicates = request.predicates,
+                .schema_version = request.schema_version,
+                .relational_schema_version = request.relational_schema_version,
+                .relational_integrity_generation_set = request.relational_integrity_generation_set,
+                .integrity_commands = request.integrity_commands,
+            };
+            // lite-single-commit-write-path.md §3.3c: this path has no
+            // separate durable decision record to resolve an ambiguous
+            // outcome against (unlike `commitCoordinatedTwoPhase`'s own
+            // `TxnId`), so it reuses `outcome_receipts.zig`'s bounded
+            // writer-keyed scheme instead -- the marker is just one more
+            // key in the same native batch, exactly like the UNIQUE
+            // claims `prepareLocalIntegrityDecision` already writes
+            // there. `Writer.retire` nulls the writer's id the instant it
+            // retires (the next marker gets a fresh random one), so the
+            // retired 16-byte id is already a one-shot token: it can
+            // double as `transaction_id` with no new storage and no
+            // format change, resolved by comparing
+            // `apply_receipts.readOutcomeMarker(writer)` against the
+            // sequence this call used -- see `DB.getTransactionStatus`'s
+            // fallback for an id that is not a recognized two-phase
+            // `TxnId`.
+            const receipts = @import("outcome_receipts.zig");
+            const writer = receipts.activeWriter();
+            const named = if (!std.mem.eql(u8, self.table_name, "default")) self.table_name else null;
+            const marker = if (writer) |w| w.next(named) else null;
+
+            var child_checker: ChildExistenceChecker = undefined;
+            const child_exists: ?dependencies.storage_db_relational_integrity.ChildExistenceCheck = if (self.handle) |handle| blk: {
+                child_checker = .{ .handle = handle, .alloc = alloc };
+                break :blk .{ .ptr = &child_checker, .exists = ChildExistenceChecker.exists };
+            } else null;
+
+            var primary_committed = false;
+            self.db.batchLocalCoordinated(req, &primary_committed, marker, child_exists) catch |err| {
+                // `primary_committed` is authoritative here (and reset by
+                // `batchInternalPreparedOwned` itself if the group-commit
+                // ticket wait ultimately fails): there is no separate
+                // decision commit whose own publication can be uncertain
+                // independently of the primary write's, so (unlike
+                // `commitCoordinatedTwoPhase`) there is no
+                // `publicationUncertain` check to add here.
+                if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;
+                if (outcomes.isUnknownOutcome(err)) {
+                    if (writer) |w| if (marker) |m| {
+                        w.retire(m, if (named) |name| .{ .name = name, .id = self.db.core.identity_namespace.table_id } else null);
+                        self.outcome_transaction_id = m.writer;
+                        // `antfly_db_get_transaction_status`'s fallback
+                        // needs the exact sequence to disambiguate; kept
+                        // on the Owner, not `self.db`, since it must
+                        // survive this connection's own post-ambiguous-
+                        // commit reconciliation -- see `Owner.
+                        // last_ambiguous_fused_marker`'s doc comment.
+                        // `self.handle` here is the per-generation catalog
+                        // root (what `WriterLane.checkout`/`connection.
+                        // refresh` hand back), not the stable, client-
+                        // facing wrapper that owns `lite_connection` --
+                        // `lite_connection_context` is the root's own
+                        // back-reference to the `Connection` currently
+                        // attached to it (`Connection.attach`/`detach`),
+                        // which every lane-managed write holds attached
+                        // for exactly this duration. Not every backend has
+                        // a Lite connection (a directory/LSM handle does
+                        // not); only Lite's own fused path needs this.
+                        if (self.handle) |handle| if (handle.lite_connection_context) |connection| {
+                            connection.owner.last_ambiguous_fused_marker = m;
+                        };
+                    };
+                    return error.SqlMutationOutcomeUnknown;
+                }
+                if (err == error.VersionConflict) return error.SqlWriteConflict;
+                return outcomes.notApplied(err);
+            };
+            // Equivalent of `test_after_decision`: the write is durable;
+            // simulate a post-decision step failing without losing it.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_decision) |hook| {
+                coordinator.test_after_decision = null;
+                hook.run(hook.ptr) catch return .committed_pending;
+            };
+            return .committed;
+        }
+
+        /// lite-single-commit-write-path.md §7.5: the shape
+        /// `commitCoordinatedFusedMultiTable` can drive -- exactly one
+        /// participant table with real row writes/deletes (the leader,
+        /// e.g. an FK child insert's own row), every other participant
+        /// pure integrity bookkeeping (no row writes/deletes of its own,
+        /// e.g. a parent's `.attach`/`.detach` Reference) and otherwise
+        /// eligible for the same fast path `eligibleForLocalDecision`
+        /// already gates for the single-table case. Lock-order safety
+        /// (every follower's `table_id` must be smaller than the
+        /// leader's) is checked once the tables are resolved to their
+        /// `*DB`s in `commitCoordinatedFusedMultiTable` itself, since
+        /// this only has the request shape, not real table identities.
+        fn eligibleForFusedMultiTable(tables: []const contract.TableCommitRequest) ?usize {
+            if (tables.len < 2 or tables.len > 64) return null;
+            var leader_index: ?usize = null;
+            for (tables, 0..) |table, i| {
+                if (!eligibleForLocalDecision(table)) return null;
+                if (table.writes.len != 0 or table.deletes.len != 0) {
+                    if (leader_index != null) return null;
+                    leader_index = i;
+                } else if (table.integrity_commands.len == 0) {
+                    // A participant with no row writes and no integrity
+                    // work to decide has no reason to be here.
+                    return null;
+                }
+            }
+            return leader_index;
+        }
+
+        /// One key this coordinator wrote for a non-leader (follower)
+        /// participant, and the bytes to restore there if the leader's
+        /// own commit (or a later follower's own validation) ultimately
+        /// fails. `prior_value = null` means the key did not exist before
+        /// (revert deletes it); otherwise revert restores exactly these
+        /// bytes.
+        const FollowerRevertEntry = struct { key: []const u8, prior_value: ?[]const u8 };
+
+        /// lite-single-commit-write-path.md §7.5's FK multi-table
+        /// coordinator. `tables` is `integrity.prepareWithRepairAdmission`'s
+        /// already-computed per-table split (one `TableCommitRequest` per
+        /// physical table the write touches); `leader_index` names the one
+        /// table with real row writes/deletes, as established by
+        /// `eligibleForFusedMultiTable`.
+        ///
+        /// Lock discipline: every OTHER (follower) participant's
+        /// `core.apply_mutex` is locked here, directly, in ascending
+        /// `table_id` order, before anything else happens; the leader's
+        /// own lock is never touched directly here -- `commitCoordinatedLocal`
+        /// below acquires and releases it internally, exactly as the
+        /// single-table fast path already does. This is only safe because
+        /// every follower's `table_id` is smaller than the leader's
+        /// (checked immediately below, falling back to the general
+        /// two-phase coordinator otherwise): the sequence of lock
+        /// acquisitions this call makes -- every follower (ascending),
+        /// then the leader (internally, strictly last and strictly
+        /// larger) -- is itself in ascending `table_id` order, matching
+        /// what a concurrent operation on the same table pair (e.g. a
+        /// parent DELETE's own single-table `commitCoordinatedLocal` call,
+        /// or another insert in the opposite FK direction that this same
+        /// check routes through the two-phase coordinator instead) also
+        /// follows, so no inversion -- and so no deadlock -- is possible.
+        ///
+        /// A follower's validated integrity effects are written through a
+        /// ride-along commit (`durability = .ride_along`) against that
+        /// follower's OWN `core.store`. Every table of one Lite single-
+        /// file backend shares one underlying `docstore.Store`, so a
+        /// ride-along entry is swept into the very next foreground commit
+        /// on ANY table of that store -- here, the leader's own
+        /// `commitCoordinatedLocal` call immediately below, landing both
+        /// in the same one fsync (lite-single-commit-write-path.md
+        /// §3.2a/§7.2's existing ride-along pattern, not a new commit
+        /// primitive). If the leader's commit then fails -- or a LATER
+        /// follower's own validation fails, with an EARLIER follower
+        /// already written -- every follower write already staged is
+        /// undone with an explicit, synchronous (foreground) revert
+        /// restoring the prior bytes (or deleting a key that did not
+        /// exist before): that revert's own commit forces the sync that
+        /// sweeps up the earlier, still-undurable ride-along entry
+        /// together with its own undo, netting to "as if nothing
+        /// happened" durably. This costs one extra commit only on the
+        /// (expected to be rare) failure path; the success path stays at
+        /// the leader's one fsync.
+        fn commitCoordinatedFusedMultiTable(
+            self: *Self,
+            alloc: std.mem.Allocator,
+            tables: []const contract.TableCommitRequest,
+            leader_index: usize,
+        ) !catalog.MutationOutcome {
+            const outcomes = dependencies.sql_errors;
+            const handle = self.handle orelse return error.UnsupportedSqlExecution;
+            if (tables.len > 64) return error.SqlProgramLimitExceeded;
+            var dbs: [64]*DB = undefined;
+            for (tables, 0..) |table, i| dbs[i] = @import("tables.zig").get(handle, table.table_name) catch |err| return outcomes.notApplied(err);
+            const db_slice: []const *DB = dbs[0..tables.len];
+            const leader_id = db_slice[leader_index].core.identity_namespace.table_id;
+            for (db_slice, 0..) |db, i| {
+                if (i == leader_index) continue;
+                // Lock-ordering safety (see the doc comment above): a
+                // follower with an id larger than the leader's cannot be
+                // driven safely by this call. Fall back to the general
+                // coordinator instead of risking an inverted lock order.
+                if (db.core.identity_namespace.table_id >= leader_id) return error.FusedMultiTableIneligible;
+            }
+            var follower_order: [64]usize = undefined;
+            var follower_count: usize = 0;
+            for (tables, 0..) |_, i| {
+                if (i == leader_index) continue;
+                follower_order[follower_count] = i;
+                follower_count += 1;
+            }
+            const followers = follower_order[0..follower_count];
+            std.mem.sort(usize, followers, db_slice, struct {
+                fn less(ctx: []const *DB, a: usize, b: usize) bool {
+                    return ctx[a].core.identity_namespace.table_id < ctx[b].core.identity_namespace.table_id;
+                }
+            }.less);
+            var follower_reverts: [64][]const FollowerRevertEntry = undefined;
+            for (follower_reverts[0..follower_count]) |*entry| entry.* = &.{};
+            var locked_count: usize = 0;
+            // Always unlock every follower this call locked, in reverse
+            // (descending table_id) order -- on every return path.
+            defer {
+                var i = locked_count;
+                while (i != 0) {
+                    i -= 1;
+                    db_slice[followers[i]].core.unlockApplyExclusive();
+                }
+            }
+            for (followers) |idx| {
+                db_slice[idx].core.lockApplyExclusive();
+                locked_count += 1;
+            }
+            // Preparing and staging follower writes (block-scoped so this
+            // errdefer never fires for the leader call below): only on an
+            // error return FROM THIS LOOP, undo every follower write
+            // already staged, in reverse order, while every lock above is
+            // still held.
+            {
+                var prepared_through: usize = 0;
+                errdefer {
+                    var i = prepared_through;
+                    while (i != 0) {
+                        i -= 1;
+                        revertFollower(db_slice[followers[i]], follower_reverts[i]) catch {};
+                    }
+                }
+                for (followers, 0..) |idx, pos| {
+                    const table = tables[idx];
+                    if (table.integrity_commands.len == 0) {
+                        prepared_through = pos + 1;
+                        continue;
+                    }
+                    const schema_version = table.relational_schema_version orelse table.schema_version;
+                    // A follower in this coordinator only ever carries
+                    // `.attach`/`.detach`-shaped bookkeeping (the leader is
+                    // always the table with the real row write), never a
+                    // `.release`/RESTRICT command, so the self-healing
+                    // child-existence check (§7.6) has nothing to do here.
+                    const intents = db_slice[idx].prepareLocalIntegrityDecision(alloc, schema_version, table.relational_integrity_generation_set, table.integrity_commands, null) catch |err| {
+                        if (err == error.VersionConflict) return error.SqlWriteConflict;
+                        return outcomes.notApplied(err);
+                    };
+                    if (intents.len == 0) {
+                        prepared_through = pos + 1;
+                        continue;
+                    }
+                    const reverts = try alloc.alloc(FollowerRevertEntry, intents.len);
+                    var batch = try db_slice[idx].core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
+                    errdefer batch.abort();
+                    for (intents, reverts) |intent, *revert| {
+                        const prior = batch.get(intent.key) catch |err| switch (err) {
+                            error.NotFound => null,
+                            else => return err,
+                        };
+                        revert.* = .{ .key = intent.key, .prior_value = if (prior) |p| try alloc.dupe(u8, p) else null };
+                        if (intent.value) |value| try batch.put(intent.key, value) else try batch.delete(intent.key);
+                    }
+                    try batch.commit();
+                    follower_reverts[pos] = reverts;
+                    prepared_through = pos + 1;
+                }
+            }
+            var leader_adapter = try self.selected(tables[leader_index].table_name);
+            defer self.outcome_transaction_id = leader_adapter.outcome_transaction_id;
+            return leader_adapter.commitCoordinatedLocal(alloc, tables[leader_index]) catch |err| {
+                // An ambiguous ("outcome unknown") failure here means the
+                // leader's own write MAY actually have become durable --
+                // reverting the follower in that case could durably erase
+                // a Reference whose child row is in fact live, trading a
+                // merely uncertain outcome for a definite, worse
+                // inconsistency (see the crash-sweep regression this
+                // fixes: `crash sweep: relational foreign-key child
+                // insert, child row and attach record are all-or-nothing`).
+                // Leave every follower write exactly as staged and
+                // propagate the same uncertainty outward instead; resolving
+                // it is this call's existing ambiguous-outcome contract,
+                // the same one `commitCoordinatedLocal` itself already has
+                // for its own single-table callers.
+                if (!outcomes.isUnknownOutcome(err)) {
+                    var i = follower_count;
+                    while (i != 0) {
+                        i -= 1;
+                        revertFollower(db_slice[followers[i]], follower_reverts[i]) catch {};
+                    }
+                }
+                return err;
+            };
+        }
+
+        /// Best-effort synchronous undo of `commitCoordinatedFusedMultiTable`'s
+        /// ride-along follower writes. Its own foreground (durable) commit
+        /// forces the sync that sweeps up the earlier, still-undurable
+        /// ride-along entries this reverts, together with their own undo,
+        /// in the SAME physical commit -- the net durable state is as if
+        /// those writes never happened, even though the original
+        /// ride-along commit already returned successfully.
+        fn revertFollower(db: *DB, reverts: []const FollowerRevertEntry) !void {
+            if (reverts.len == 0) return;
+            var batch = try db.core.store.beginWriteBatchWithOptions(.{});
+            errdefer batch.abort();
+            for (reverts) |revert| {
+                if (revert.prior_value) |value| try batch.put(revert.key, value) else try batch.delete(revert.key);
+            }
+            try batch.commit();
+        }
+
+        /// The durable three-commit path (begin, write the intents, resolve
+        /// them to real rows), kept for requests `commitCoordinatedLocal`
+        /// does not cover -- see `eligibleForLocalDecision`.
+        fn commitCoordinatedTwoPhase(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
             const io = self.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
             const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
             const outcomes = dependencies.sql_errors;
+            const coordinator = @import("sql_commit.zig");
+            // Nothing committed yet: the equivalent of `sql_commit.zig`'s
+            // `test_before_store` boundary, fired before this write's own
+            // `beginTransaction` instead of before the cross-database
+            // coordinator's recovery-hint record (this path has none).
+            if (comptime @import("builtin").is_test) if (coordinator.test_before_store) |hook| {
+                coordinator.test_before_store = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
             const txn_id = self.db.beginTransaction(now) catch |err| return outcomes.notApplied(err);
             self.outcome_transaction_id = txn_id;
             self.db.writeTransaction(txn_id, .{
@@ -505,10 +945,24 @@ pub fn Adapter(comptime native: type) type {
                 if (err == error.VersionConflict) return error.SqlWriteConflict;
                 return outcomes.notApplied(err);
             };
+            // Equivalent of `test_after_prepare`: every participant (here,
+            // the one table) is prepared; about to make the commit decision.
+            // Abandon exactly as the `writeTransaction` failure above does.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_prepare) |hook| {
+                coordinator.test_after_prepare = null;
+                hook.run(hook.ptr) catch |err| {
+                    self.db.abortTransaction(txn_id, now +| 1) catch {};
+                    self.outcome_transaction_id = null;
+                    return outcomes.notApplied(err);
+                };
+            };
             // Only durable status can classify a failure after commit starts.
             // Never abort/replay a possibly published mutation.
             self.db.commitTransaction(txn_id, now +| 1) catch |err| {
-                const status = self.db.getTransactionStatus(txn_id) catch return error.SqlMutationOutcomeUnknown;
+                const status = self.db.getTransactionStatus(txn_id) catch {
+                    if (self.handle) |handle| handle.sql_decision_uncertain = true;
+                    return error.SqlMutationOutcomeUnknown;
+                };
                 if (status == .committed) return switch (err) {
                     error.EnrichmentWorkerFailed => .committed_repair_required,
                     else => .committed_pending,
@@ -517,7 +971,44 @@ pub fn Adapter(comptime native: type) type {
                     self.outcome_transaction_id = null;
                     return error.SqlWriteConflict;
                 }
+                // `status == .pending`: durability is genuinely unknown only
+                // while the native checkpoint publication might still land
+                // (mirrors `sql_commit.zig`'s `commitLocked`). Otherwise the
+                // decision provably never became durable -- abort it so
+                // recovery can never commit it later, and report "not
+                // applied" instead of an unwarranted "unknown".
+                //
+                // Unlike `commitLocked`'s simple coordinator-decision commit,
+                // this commit also materializes the table's rows inline, and
+                // that path's own reconciliation can already have resolved
+                // (and cleared) `checkpoint_publication_uncertain` by the
+                // time it hands back an already-classified unknown-outcome
+                // error -- checking the flag at that point would wrongly see
+                // "resolved" and report "not applied" for a write whose
+                // recovery has not actually settled from this caller's
+                // perspective.
+                // Trust that classification first; fall back to the flag
+                // only for a plain error the lower layers never classified.
+                if (outcomes.isUnknownOutcome(err)) {
+                    if (self.handle) |handle| handle.sql_decision_uncertain = true;
+                    return error.SqlMutationOutcomeUnknown;
+                }
+                if (self.handle) |handle| {
+                    if (!coordinator.publicationUncertain(handle)) {
+                        self.db.abortTransaction(txn_id, now +| 2) catch {};
+                        self.outcome_transaction_id = null;
+                        return outcomes.notApplied(err);
+                    }
+                    handle.sql_decision_uncertain = true;
+                }
                 return error.SqlMutationOutcomeUnknown;
+            };
+            // Equivalent of `test_after_decision`: the decision is durable;
+            // simulate a post-decision step (participant resolution in the
+            // cross-database protocol) failing without losing the commit.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_decision) |hook| {
+                coordinator.test_after_decision = null;
+                hook.run(hook.ptr) catch return .committed_pending;
             };
             self.outcome_transaction_id = null;
             return .committed;
@@ -1127,9 +1618,53 @@ pub fn Adapter(comptime native: type) type {
                 const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
                 // Preparation only reads: any failure here is not applied.
                 prepared = integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
-                if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
+                // A Lite single-file database's "tables" are different
+                // identity namespaces inside the SAME physical native
+                // store (`tables.zig`'s `openTable` opens every table at
+                // `handle.embedded_path` when `owned_lite_backend != null`).
+                // A coordinated write that only ever touches one such table
+                // needs no cross-database two-phase decision: there is only
+                // one participant and one physical commit domain, so the
+                // single-store `commitCoordinated` path below already gives
+                // the same crash semantics without `sql_commit.zig`'s
+                // recovery-hint record, root coordinator-role transaction,
+                // and extra per-participant recovery round trip (lite-
+                // single-commit-write-path.md §3.3c). A write whose prepared
+                // plan spans more than one table (e.g. an FK child insert's
+                // own row plus the parent's `.attach` Reference bookkeeping)
+                // still stays on this store: `commitCoordinatedFusedMultiTable`
+                // below locks every participant table's `core.apply_mutex`
+                // in ascending `table_id` order and folds the non-leader
+                // participants' writes in as ride-along commits that share
+                // the leader's one foreground fsync (§7.5's FK coordinator).
+                // It only applies when exactly one table owns real row
+                // writes and every other participant is pure integrity
+                // bookkeeping with the leader's table_id the largest among
+                // them (the lock-ordering direction this call can safely
+                // drive without re-entering an already-locked table); any
+                // other shape -- or a plain multi-database handle -- still
+                // needs the general cross-database two-phase coordinator.
+                if (self.handle) |handle| {
+                    if (handle.owned_lite_backend != null and prepared.?.tables.len == 1 and std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) {
+                        return self.commitCoordinated(temporary, prepared.?.tables[0], true);
+                    }
+                    if (handle.owned_lite_backend != null) {
+                        if (eligibleForFusedMultiTable(prepared.?.tables)) |leader_index| {
+                            if (self.commitCoordinatedFusedMultiTable(temporary, prepared.?.tables, leader_index) catch |err| blk: {
+                                if (err == error.FusedMultiTableIneligible) break :blk null;
+                                return err;
+                            }) |outcome| return outcome;
+                            // Ineligible after all (e.g. an inverted
+                            // table_id order between leader and a
+                            // follower): fall through to the general
+                            // two-phase coordinator below, nothing was
+                            // written by the attempt above.
+                        }
+                    }
+                    return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
+                }
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
-                return self.commitCoordinated(prepared.?.tables[0]);
+                return self.commitCoordinated(temporary, prepared.?.tables[0], true);
             }
             // Classify by the batch's own state, not by error name: whether the
             // primary write became durable, and whether its publication was
@@ -1137,7 +1672,12 @@ pub fn Adapter(comptime native: type) type {
             var primary_committed = false;
             // Named tables commit to their own database, which holds the marker.
             const receipt_table: ?[]const u8 = if (self.handle != null) self.table_name else null;
-            @import("db.zig").trackedBatch(self.db, request, &primary_committed, receipt_table) catch |err| {
+            // WS3: thread the writer-lane hook through so a SQL write's
+            // connection-level locks release before this ticket's durability
+            // wait, exactly like the direct `antfly_db_batch`/`antfly_db_batch_json`
+            // writer exports already do (see the field comment on
+            // `writer_lane_hook` above).
+            @import("db.zig").trackedBatchWithWriterLaneHook(self.db, request, &primary_committed, receipt_table, self.writer_lane_hook) catch |err| {
                 // A confirmed primary write wins: later uncertainty in derived
                 // or control publication leaves it committed, not unknown.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;

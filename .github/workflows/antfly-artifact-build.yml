@@ -24,7 +24,7 @@ on:
         required: true
         type: string
       channel:
-        description: "auto, stable, next, or nightly"
+        description: "auto or a policy-defined release channel"
         required: true
         type: string
       build_controller_commit:
@@ -292,7 +292,7 @@ jobs:
             dist/antfly.rb dist/release-archives "$version"
 
       - name: Qualify in-place upgrade from released v0.2.5 data
-        if: ${{ inputs.release_line == '0.3' || inputs.release_line == 'nightly' }}
+        if: ${{ inputs.release_line == '0.3' || inputs.release_line == '0.4' || inputs.release_line == 'nightly' }}
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
         run: |
@@ -311,7 +311,7 @@ jobs:
             --work-dir "$stage/evidence"
 
       - name: Upload in-place upgrade evidence
-        if: ${{ always() && (inputs.release_line == '0.3' || inputs.release_line == 'nightly') }}
+        if: ${{ always() && (inputs.release_line == '0.3' || inputs.release_line == '0.4' || inputs.release_line == 'nightly') }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           retention-days: 14

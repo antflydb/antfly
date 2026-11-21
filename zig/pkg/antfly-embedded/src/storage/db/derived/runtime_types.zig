@@ -23,6 +23,31 @@ pub const RuntimeError = error{AsyncWorkerFailed};
 /// even when callbacks resume on another worker or share one cooperative thread.
 pub const ApplyFn = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken) anyerror!bool;
 pub const PersistFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) anyerror!bool;
+/// One consumer's target in a `PersistBatchFn` call.
+pub const PersistSnapshotArg = struct {
+    index_name: []const u8,
+    sequence: u64,
+};
+/// Batched variant of `PersistFn`: persist every consumer in `snapshots` as
+/// one forced-visibility flush instead of one call per consumer. Optional
+/// (a runtime with none set falls back to calling `PersistFn` once per
+/// consumer); wired today only for `waitForAllWithVisibilityWait`/
+/// `waitForIndexesWithVisibilityWait`'s own forced-persist pass, which is
+/// the one place that already collects every consumer needing a forced
+/// flush before persisting any of them -- see
+/// `io_threaded_runtime.zig:PersistSnapshot`. The bound implementation
+/// (`db.zig`'s `persistAppliedSequencesBatchAsync`) notes every consumer
+/// into the shared coalescer before flushing once, so this is always
+/// called with `force = true` today; it exists as a parameter (not
+/// hardcoded) only for symmetry with `PersistFn`.
+pub const PersistBatchFn = *const fn (ctx: *anyopaque, snapshots: []const PersistSnapshotArg, force: bool) anyerror!bool;
+/// Called from `derived_executor.ManualRuntime.waitForAll`/`waitForIndexes`
+/// once every worker has caught up to its target, with the minimum applied
+/// sequence across them. WS5: this runs on the foreground/ack path, so the
+/// bound function (`db.truncateReplaySequenceAsync`) only raises the
+/// journal-retirement watermark -- it never physically deletes. Physical
+/// retirement happens later, off this path, in the owner-only
+/// `DocStore.serviceRetirement`.
 pub const TruncateFn = *const fn (ctx: *anyopaque, sequence: u64) anyerror!void;
 pub const CatchUpSessionToken = struct {
     value: u64 = 0,

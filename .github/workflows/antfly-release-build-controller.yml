@@ -63,6 +63,7 @@ jobs:
           current_default_head="$(git rev-parse FETCH_HEAD)"
           policy_paths=(
             .github/workflows/antfly-release-build-controller.yml
+            scripts/release/channels.json
             scripts/release/release-lines.json
             scripts/release/release_lines.py
             scripts/release/release_channels.py

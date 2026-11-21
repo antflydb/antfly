@@ -349,8 +349,18 @@ pub fn advance(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan
             const selected = try a.dupe(u8, row.key);
             const revision = (try optionalRevision(&read, selected)).?;
             const witness = verifier.verify(a, &read, root, selected[prefix.len + 32 ..], node) catch |err| switch (err) {
-                // No producer validation state yet (e.g. a protocol-14 owner)
-                // is unresolved, not a failure: the sweep stays pending.
+                // A missing coverage-validation baseline (no protocol-16
+                // authority activation has run `artifact_producer_validation.begin`
+                // yet, e.g. a lower-protocol row with no witness to
+                // discover) is the same "not yet ready" shape as a pending
+                // publication, not a corruption: every other witness-style
+                // catch in this subsystem already tolerates it alongside
+                // these two (artifact_completion_progress.zig's `verify`/
+                // `discover` callers, artifact_chunk_publication.zig's
+                // fence binds, enrichment_runtime.zig's readiness checks).
+                // This was the one witness-pending catch site missing it,
+                // which turned an ordinary pending census into a hard
+                // failure instead of backing off.
                 error.ArtifactPublicationPending, error.ArtifactCoverageBaselinePending, error.EnrichmentSourceChanged => null,
                 else => return err,
             };

@@ -104,7 +104,7 @@ pub fn parseBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBa
 }
 /// Reserved graph-owner maintenance namespaces are part of admission, not an
 /// import of the storage key encoder or cleanup executor.
-fn isReservedControlKey(key: []const u8) bool {
+pub fn isReservedControlKey(key: []const u8) bool {
     for ([_][]const u8{
         "\x00\x00__metadata__:graph_owner_replay:v1:",
         "\x00\x00__metadata__:graph_endpoint_cleanup:v1:",

@@ -594,8 +594,8 @@ pub fn discoverNextAction(alloc: std.mem.Allocator, txn: anytype, root: u128, do
 /// resume calculation prevents large catalogs from starving requirements past
 /// the first page. Cached coverage uses point probes; physical preparation
 /// shares one sidecar lease and never runs inside a primary write transaction.
-pub fn refreshProjections(alloc: std.mem.Allocator, store: anytype, manager: *@import("catalog/index_manager.zig").IndexManager, checkpoint_path: ?[]const u8, root: u128, document: []const u8, snapshot: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot, limits: Limits) !void {
-    return refreshProjectionsWithAdoption(alloc, store, manager, checkpoint_path, root, document, snapshot, limits, null);
+pub fn refreshProjections(alloc: std.mem.Allocator, store: anytype, manager: *@import("catalog/index_manager.zig").IndexManager, root: u128, document: []const u8, snapshot: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot, limits: Limits) !void {
+    return refreshProjectionsWithAdoption(alloc, store, manager, root, document, snapshot, limits, null);
 }
 
 /// Borrowed ordinals into the pinned plan. Admission happens after releasing
@@ -612,7 +612,7 @@ pub const AdoptionRequests = struct {
     }
 };
 
-pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, manager: *@import("catalog/index_manager.zig").IndexManager, checkpoint_path: ?[]const u8, root: u128, document: []const u8, snapshot: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot, limits: Limits, adoption: ?*AdoptionRequests) !void {
+pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, manager: *@import("catalog/index_manager.zig").IndexManager, root: u128, document: []const u8, snapshot: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot, limits: Limits, adoption: ?*AdoptionRequests) !void {
     if (adoption) |requests| {
         requests.count = 0;
         requests.authority = null;
@@ -669,7 +669,7 @@ pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, 
         }
     }
     if (count == 0) return;
-    var projection = (try @import("derived/apply_state.zig").tryAcquireProjectionSnapshot(alloc, manager.checkpointIo(), store, checkpoint_path)) orelse return;
+    var projection = (try @import("derived/apply_state.zig").tryAcquireProjectionSnapshot(alloc, store)) orelse return;
     defer projection.deinit();
     if (!std.meta.eql(projection.authority, authority)) return error.ArtifactCatalogDrift;
     const deadline = if (limits.time_budget_ns) |budget| @import("antfly_platform").time.monotonicNs() +| budget else std.math.maxInt(u64);
@@ -829,7 +829,7 @@ test "ordered artifact inventory projection completion reconstructs independent 
     try std.testing.expect(source.root_incarnation != target.root_incarnation);
     var pin = try source.core.index_manager.acquireWritePlanSnapshot();
     defer pin.release();
-    try refreshProjections(alloc, source.core.store, source.core.index_manager, source.core.applied_sequence_checkpoint_path, source.root_incarnation, "doc", pin.plan(), .{ .time_budget_ns = null });
+    try refreshProjections(alloc, source.core.store, source.core.index_manager, source.root_incarnation, "doc", pin.plan(), .{ .time_budget_ns = null });
     var prepared = blk: {
         var read = try source.core.store.beginReadTxn();
         defer read.abort();

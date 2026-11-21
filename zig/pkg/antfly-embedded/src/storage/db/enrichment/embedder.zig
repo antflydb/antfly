@@ -824,7 +824,20 @@ pub const SparseEmbedder = struct {
 
     pub fn withGeneration(self: SparseEmbedder, generation: Generation) SparseEmbedder {
         var copy = self;
-        copy.captured_generation = if (generation.lease == null and generation.revision == null) null else generation;
+        // A lease is what makes execution "alias-bound" (the planned-batch
+        // call below consumes it to stamp one resolved generation across the
+        // whole batch); a bare revision is not. `captureGeneration`'s own
+        // legacy fallback (`captureUnpinnedRevision`, for a provider with
+        // only `cache_revision_fn`/`cache_revision_with_context_fn` and no
+        // `resolve_generation_fn`) only ever returns a revision, never a
+        // lease -- that generation is "unpinned" by name, and pinning it
+        // here anyway forced every such legacy provider through
+        // `embedPlannedBatch`, which then correctly, but wrongly for this
+        // case, rejected it with `error.CommitRequirementUnavailable` (no
+        // `sparse_embed_batch_planned_fn` to consume the lease that was
+        // never there). Mirrors `DenseEmbedder.withTextGeneration`, which
+        // pins on `generation.lease` alone for the same reason.
+        copy.captured_generation = if (generation.lease == null) null else generation;
         return copy;
     }
 
