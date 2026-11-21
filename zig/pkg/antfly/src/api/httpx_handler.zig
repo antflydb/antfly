@@ -8830,6 +8830,8 @@ pub const AntflyApiHandler = struct {
             }, .{});
             defer alloc.free(unknown_response);
             const accepted = self.api_server.submitFkInitialCreatePlan(plan_alloc, request_context, plan) catch |err| switch (err) {
+                error.UnsupportedArtifactIndexSources => return jsonErrorResponse(ctx, 400, "model revision pinning requires distributed ordered vector publication"),
+                error.ArtifactIndexSourcesTemporarilyUnavailable => return metadataMutationNotAdmittedTextResponse(ctx, "embedding revision pinning requires upgraded data stores"),
                 error.Forbidden => return jsonErrorResponse(ctx, 403, "initial foreign key publication requires admin permission on every affected parent"),
                 error.CatalogAlreadyExists,
                 error.TableAlreadyExists,

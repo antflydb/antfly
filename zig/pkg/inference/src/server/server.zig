@@ -27946,7 +27946,7 @@ pub const Node = struct {
                     lookup_revision = null;
                 };
                 if (declared.len == 0 and rejected.len != 0) return embeddingArtifactFailureResponse(ctx);
-                if (declared.len == 0 and declared.cuda_probe_refused) {
+                if (declared.len == 0 and declared.backend_refused) {
                     if (expected_pin) |requested| return (try pinnedEmbeddingPreflightFailure(ctx, requested, error.PinnedEmbeddingBackendUnavailable)).?;
                     return modelResourceBusyResponse(ctx);
                 }

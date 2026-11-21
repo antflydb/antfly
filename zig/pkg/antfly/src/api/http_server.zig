@@ -6509,6 +6509,13 @@ pub const ApiHttpServer = struct {
     /// SQL preallocates its public receipt from this immutable plan before the
     /// durable begin, so post-admission allocation failure cannot erase it.
     pub fn submitFkInitialCreatePlan(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, plan: @import("../metadata/fk_generation_publication.zig").InitialCreatePlan) !FkInitialCreateBegin {
+        if (try table_index_config.hasModelRevisionPin(alloc, plan.child.indexes_json, true)) {
+            var schema = try schema_mod.parseValidatedTableSchema(alloc, plan.child.schema_json);
+            defer schema.deinit(alloc);
+            if (self.cfg.deployment_mode != .distributed or schema.external_base_source != null or plan.child.storage.engine != .local)
+                return error.UnsupportedArtifactIndexSources;
+            try self.admitArtifactSourcesForModelPin(context, false, true);
+        }
         if (self.cfg.deployment_mode == .standalone) {
             // The local metadata journal and native owner ports use the same
             // immutable initial plan/receipts as hosted publication. Never

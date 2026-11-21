@@ -5972,7 +5972,7 @@ pub const ModelManager = struct {
         revisions: [max_backends][32]u8 = undefined,
         backends: [max_backends]backends.BackendType = undefined,
         len: usize = 0,
-        cuda_probe_refused: bool = false,
+        backend_refused: bool = false,
 
         pub fn values(self: *const EmbeddingRevisions) []const [32]u8 {
             return self.revisions[0..self.len];
@@ -6080,21 +6080,27 @@ pub const ModelManager = struct {
             if (!backend.available() or !backend.supportsDirectSessionLoad()) continue;
             if (modelBackendPolicyError(manifest, backend, load_policy.cache_policy.a4b_request) != null) continue;
             if (!modelBackendMeetsJitPolicy(manager, manifest, backend)) continue;
-            if (!include_unavailable and modelBackendIsUnhealthy(self, model_dir, artifacts.installation, backend)) continue;
             if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) continue;
             if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
             if (manifest.embedding_style == .embedding_gemma2 and backend != .native and backend != .metal and backend != .cuda) continue;
             if (backend == .wasm and manifest.onnx_path == null) continue;
             if (std.mem.indexOfScalar(backends.BackendType, result.backends[0..result.len], backend) != null) continue;
+            const quarantined = !include_unavailable and modelBackendIsUnhealthy(self, model_dir, artifacts.installation, backend);
             const revision = if (backend == .cuda and manifest.embedding_style == .embedding_gemma2) resolved: {
                 if (expected) |pin| {
                     if (result.contains(pin)) continue;
+                }
+                if (quarantined) {
+                    // Computing a nonresident Gemma CUDA revision requires a
+                    // device probe. A quarantined candidate cannot prove a miss.
+                    result.backend_refused = true;
+                    continue;
                 }
                 if (!include_unavailable) if (backends.knownCudaDeviceState()) |state| switch (state) {
                     .available => {},
                     .unavailable => continue,
                     .retryable => {
-                        result.cuda_probe_refused = true;
+                        result.backend_refused = true;
                         continue;
                     },
                 };
@@ -6102,7 +6108,7 @@ pub const ModelManager = struct {
                     break :resolved resident;
                 const policy = (self.cuda_gemma_policy.resolve(self.allocator, artifacts.io, control) catch |err| switch (err) {
                     error.PinnedEmbeddingBackendUnavailable => {
-                        result.cuda_probe_refused = true;
+                        result.backend_refused = true;
                         continue;
                     },
                     else => return err,
@@ -6111,6 +6117,10 @@ pub const ModelManager = struct {
             } else durableEmbeddingRevision(manifest, artifact_revision, backend);
             if (expected) |pin| {
                 if (!std.mem.eql(u8, &pin, &revision)) continue;
+            }
+            if (quarantined) {
+                result.backend_refused = true;
+                continue;
             }
             // A compiled CUDA backend is not evidence of an available device.
             // Probe only after resolving the exact recipe, so a CPU pin never
@@ -6124,7 +6134,7 @@ pub const ModelManager = struct {
                     .available => {},
                     .unavailable => continue,
                     .retryable => {
-                        result.cuda_probe_refused = true;
+                        result.backend_refused = true;
                         continue;
                     },
                 }
@@ -6235,7 +6245,7 @@ pub const ModelManager = struct {
         }
         if (count == 0) return if (refused_artifact)
             error.PinnedEmbeddingArtifactUnavailable
-        else if (known_recipe or declared.cuda_probe_refused)
+        else if (known_recipe or declared.backend_refused)
             error.PinnedEmbeddingBackendUnavailable
         else
             error.InferenceCapabilitiesStale;
@@ -12573,6 +12583,15 @@ test "capi resolver model identity uses receipt digests before load and survives
         try std.testing.expect(!modelBackendIsUnhealthy(&manager, first_path, null, .native));
         const unhealthy = try manager.declaredEmbeddingRevisions(first_path, bound_manifest, .{ .io = io });
         try std.testing.expectEqual(@as(usize, 0), unhealthy.len);
+        var artifacts = try PublishedArtifacts.initForSelectedArtifacts(a, io, first_path, .{ .publication = bound_manifest.managed_publication }, .{ .io = io });
+        defer artifacts.deinit();
+        const exact = try manager.declaredEmbeddingRevisionsFromArtifacts(first_path, bound_manifest, .{ .io = io }, &artifacts, initial.revisions[0]);
+        try std.testing.expectEqual(@as(usize, 0), exact.len);
+        try std.testing.expect(exact.backend_refused);
+        var absent = initial.revisions[0];
+        absent[0] ^= 1;
+        const mismatch = try manager.declaredEmbeddingRevisionsFromArtifacts(first_path, bound_manifest, .{ .io = io }, &artifacts, absent);
+        try std.testing.expect(!mismatch.backend_refused);
         const other = try manager.declaredEmbeddingRevisions(second_path, bound_manifest, .{ .io = io });
         try std.testing.expectEqual(initial.revisions[0], other.revisions[0]);
     }

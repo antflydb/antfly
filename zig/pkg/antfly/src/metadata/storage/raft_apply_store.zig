@@ -4042,10 +4042,18 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
     const logical_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
+    const pinned_indexes =
+        \\{"semantic":{"type":"embeddings","field":"id","dimension":2,"embedder":{"provider":"antfly","model":"embed","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+    ;
+    const legacy: metadata.StoreRecord = .{ .store_id = 80, .node_id = 80, .reporter_incarnation = 7, .status_generation = 1, .artifact_sources_protocol_version = 4 };
+    const legacy_bytes = try encodeStoreRecord(alloc, legacy);
+    defer alloc.free(legacy_bytes);
+    var legacy_buf: [160]u8 = undefined;
+    const legacy_key = try storeKeyForGroup(&legacy_buf, group_id, legacy.store_id);
     const prepared_json = try store.fkInitialCreatePrepareJson(alloc, group_id, .{
         .namespace_id = system_catalog.default_namespace_id,
         .logical_name = "nodes",
-        .candidate = .{ .table_id = 0, .name = "", .schema_json = logical_schema },
+        .candidate = .{ .table_id = 0, .name = "", .schema_json = logical_schema, .indexes_json = pinned_indexes },
     });
     defer alloc.free(prepared_json);
     var prepared = try std.json.parseFromSlice(fk_generation_publication.InitialCreatePrepare, alloc, prepared_json, .{});
@@ -4078,7 +4086,29 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
     try plan.validate(alloc);
     const begin = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }, .{});
     defer alloc.free(begin);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(legacy_key, legacy_bytes);
+        try txn.commit();
+    }
+    try std.testing.expectError(error.GenerationPublicationChanged, store.preflightFkInitialCreateCommand(group_id, begin));
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(legacy_key);
+        try txn.commit();
+    }
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = begin });
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expect(!try admitIndexAliasStoreTxn(&store, &txn, group_id, legacy));
+        try synchronizePinnedEmbeddingTableTxn(&txn, group_id, child.table_id, false);
+        try store.rebuildPinnedInitialCreateReservationsTxn(&txn, group_id);
+        try std.testing.expect(!try admitIndexAliasStoreTxn(&store, &txn, group_id, legacy));
+        try txn.commit();
+    }
     const hidden_group_id = prepared.value.child_ranges[0].group_id;
     try store.applyStandaloneCommand(group_id, .{ .register_node = .{ .node_id = 7, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
     try store.applyStandaloneCommand(group_id, .{ .upsert_replica_intent = .{
@@ -4205,6 +4235,26 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
     };
     var signals = PublicationSignals{ .child_id = child.table_id };
     try store.addProjectionListener(.{ .ptr = &signals, .vtable = &.{ .on_projection_signal = PublicationSignals.onProjection } });
+    {
+        // A legacy record can be present in a restored or predecessor snapshot.
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(legacy_key, legacy_bytes);
+        try txn.commit();
+    }
+    try std.testing.expectError(error.GenerationPublicationChanged, store.preflightFkInitialCreateCommand(group_id, published));
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = published });
+    try std.testing.expectEqual(@as(usize, 0), signals.table);
+    try std.testing.expectEqual(@as(usize, 0), signals.ranges);
+    try std.testing.expect((try store.resolveSystemCatalogIdentity(alloc, group_id, .{ .table = "nodes" })) == null);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var key_buf: [160]u8 = undefined;
+        try std.testing.expectError(error.NotFound, txn.get(try rangeKeyForGroup(&key_buf, group_id, hidden_group_id)));
+        try txn.delete(legacy_key);
+        try txn.commit();
+    }
     try store.preflightFkInitialCreateCommand(group_id, published);
     try std.testing.expectEqual(@as(usize, 0), signals.table);
     try std.testing.expectEqual(@as(usize, 0), signals.ranges);
@@ -14298,6 +14348,7 @@ pub const RaftApplyStore = struct {
             const plan = command.plan.?;
             if (!try metadataIncarnationMatchesTxn(txn, group_id, plan.expected_incarnation)) return error.GenerationPublicationChanged;
             if (prior != null) return error.GenerationPublicationChanged;
+            if (!try admitIndexAliasTableTxn(self, txn, group_id, plan.child)) return error.StaleInitialFkCreateCommand;
             const digest = try plan.digest(a);
             const meta = try system_catalog_storage.readMeta(a, txn, group_id);
             if (plan.catalog_id != meta.next_id or plan.expected_catalog_revision != meta.revision or
@@ -14384,6 +14435,7 @@ pub const RaftApplyStore = struct {
             try txn.put(try fk_generation_publication.initialNameKey(&name_buf, group_id, plan.namespace_id, plan.logical_name), &plan.id);
             try txn.put(try fk_generation_publication.initialPhysicalNameKey(&name_buf, group_id, plan.child.name), &plan.id);
             try txn.put(try fk_generation_publication.initialWorkKey(&name_buf, group_id, plan.child.table_id), &plan.id);
+            try self.setPinnedInitialCreateReservationTxn(txn, group_id, plan.child, true);
             for (plan.child_ranges) |range| {
                 const group_reservation = (fk_generation_publication.InitialGroupReservation{
                     .plan_id = plan.id,
@@ -14442,7 +14494,10 @@ pub const RaftApplyStore = struct {
                 // transaction; no user route can observe a partially ready
                 // child or a parent generation that is not yet accepted.
                 var table_key_buf: [160]u8 = undefined;
-                try self.putTableRecordTxnMode(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, publication.plan.child.table_id), publication.plan.child, true);
+                const child = (try self.admittedResolverProjectionTxn(a, txn, group_id, publication.plan.child)) orelse return error.StaleInitialFkCreateCommand;
+                if (!try admitIndexAliasTableTxn(self, txn, group_id, child)) return error.StaleInitialFkCreateCommand;
+                if (!try self.writeAdmittedTableRecordTxn(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, child.table_id), child, true))
+                    return error.StaleInitialFkCreateCommand;
                 var added: std.ArrayList(u64) = .empty;
                 defer added.deinit(a);
                 for (publication.plan.child_ranges) |range| {
@@ -14463,6 +14518,7 @@ pub const RaftApplyStore = struct {
                 try self.applySystemCatalogDeltaTxn(a, txn, group_id, .{ .upserts = &upserts, .removes = &empty, .next_id = @max(meta.next_id, next_id) }, meta, command_hash);
             }
             if (publication.phase == .published or publication.phase == .canceled) {
+                if (publication.phase == .canceled) try self.setPinnedInitialCreateReservationTxn(txn, group_id, publication.plan.child, false);
                 try self.terminalizeInitialFkReplicasTxn(txn, group_id, publication);
                 try self.preserveFkCompletionTxn(txn, group_id, publication.plan.child.table_id, publication.plan.id, true);
                 try self.setFkInitialTableLocksTxn(txn, group_id, publication.plan, false);
@@ -18320,6 +18376,7 @@ pub const RaftApplyStore = struct {
         }
 
         try self.rebuildPinnedRestoreReservationsTxn(txn, group_id);
+        try self.rebuildPinnedInitialCreateReservationsTxn(txn, group_id);
 
         var range_prefix_buf: [128]u8 = undefined;
         const range_rows = try docstore.DocStore.scanPrefixTxn(
@@ -23091,6 +23148,28 @@ pub const RaftApplyStore = struct {
             try upserts.append(alloc, binding);
         }
         return .{ .upserts = upserts.items, .removes = removes.items, .next_id = meta.next_id };
+    }
+
+    fn setPinnedInitialCreateReservationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, child: metadata.TableRecord, present: bool) !void {
+        if (try @import("antfly_local_sources").api_table_index_config.hasModelRevisionPin(self.alloc, child.indexes_json, true))
+            try synchronizePinnedEmbeddingTableTxn(txn, group_id, child.table_id, present);
+    }
+
+    fn rebuildPinnedInitialCreateReservationsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64) !void {
+        var prefix_buf: [160]u8 = undefined;
+        const prefix = try fk_generation_publication.initialWorkPrefixForGroup(&prefix_buf, group_id);
+        const rows = try docstore.DocStore.scanPrefixTxn(self.alloc, txn, prefix);
+        defer freeMetadataSnapshotRows(self.alloc, rows);
+        for (rows) |row| {
+            const table_id = (try relationInitialWorkTableId(row.key, group_id)) orelse break;
+            var key_buf: [160]u8 = undefined;
+            const raw = try txn.get(try fk_generation_publication.initialKey(&key_buf, group_id, table_id));
+            var publication = try std.json.parseFromSlice(fk_generation_publication.InitialPublication, self.alloc, raw, .{});
+            defer publication.deinit();
+            const plan = publication.value.plan;
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, plan.expected_incarnation)) continue;
+            try self.setPinnedInitialCreateReservationTxn(txn, group_id, plan.child, true);
+        }
     }
 
     fn setPinnedRestoreReservationsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: restore_staging.Plan, present: bool) !void {

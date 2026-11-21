@@ -3670,6 +3670,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
             if (parsed.value.mutation.kind == .graph) required = @max(required, metadata_topology_protocol.graph_definition_version);
         },
         .apply_fk_initial_create => |bytes| {
+            required = @max(required, try metadata_topology_protocol.pinnedEmbeddingDecoderVersion(a, bytes, true));
             const Parent = struct { support_after: ?struct { schema_json: []const u8 } = null };
             const Header = struct { plan: ?struct {
                 expected_incarnation: ?[32]u8 = null,
@@ -3794,7 +3795,7 @@ test "index alias decoder floor composes with table features and preserves CAS h
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .apply_system_catalog = envelope }, floor });
 }
 
-test "index alias and pinned embedding metadata changes enforce their own decoder floors" {
+test "relation mutation admission fences index aliases and pinned embedding metadata" {
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
     var pinned = plain;
     pinned.indexes_json =
@@ -3806,6 +3807,9 @@ test "index alias and pinned embedding metadata changes enforce their own decode
     const pin_envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = pinned } } }, .{});
     defer std.testing.allocator.free(pin_envelope);
     try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = pin_envelope }));
+    const initial = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .plan = .{ .child = pinned } }, .{});
+    defer std.testing.allocator.free(initial);
+    try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_fk_initial_create = initial }));
     const plan = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .targets = .{.{ .table = pinned }} }, .{});
     defer std.testing.allocator.free(plan);
     try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = plan } }));
