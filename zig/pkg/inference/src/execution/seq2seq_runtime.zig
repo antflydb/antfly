@@ -33,19 +33,26 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
     for (inputs, 0..) |info, index| {
         for (inputs[0..index]) |prior| if (std.mem.eql(u8, prior.name, info.name)) return false;
         if (std.mem.eql(u8, info.name, "input_ids")) {
-            if (info.dtype != .i64 or info.shape.len != 2 or info.shape[0] > 1 or info.shape[1] > 0) return false;
+            if (info.dtype != .i64 or info.shape.len != 2 or info.shape[0] == 0 or info.shape[0] > 1 or info.shape[1] >= 0) return false;
             ids = true;
         } else if (std.mem.eql(u8, info.name, "encoder_hidden_states")) {
-            if (info.dtype != .f32 or info.shape.len != 3 or info.shape[0] > 1) return false;
+            if (info.dtype != .f32 or info.shape.len != 3 or info.shape[0] == 0 or info.shape[0] > 1) return false;
             encoder = true;
         } else if (std.mem.eql(u8, info.name, "encoder_attention_mask")) {
-            if (info.dtype != .i64 or info.shape.len != 2 or info.shape[0] > 1) return false;
+            if (info.dtype != .i64 or info.shape.len != 2 or info.shape[0] == 0 or info.shape[0] > 1) return false;
         } else if (std.mem.eql(u8, info.name, "use_cache_branch")) {
             if (info.dtype != .bool_ or info.shape.len > 1 or (info.shape.len == 1 and info.shape[0] != 1)) return false;
             branch = true;
         } else if (kv.pastInputSuffix(info.name)) |suffix| {
-            if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] > 1 or info.shape[1] <= 0 or info.shape[2] > 0 or info.shape[3] <= 0) return false;
-            if (!kv.hasPresentOutputForPastInput(outputs, info.name)) return false;
+            if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1 or info.shape[1] <= 0 or info.shape[2] >= 0 or info.shape[3] <= 0) return false;
+            const present = for (outputs) |output| {
+                if (kv.presentNameMatchesPastInput(info.name, output.name)) break output;
+            } else return false;
+            if (present.shape.len != 4 or
+                (present.shape[1] >= 0 and present.shape[1] != info.shape[1]) or
+                (present.shape[3] >= 0 and present.shape[3] != info.shape[3])) return false;
+            const cross = std.mem.indexOf(u8, suffix, ".encoder.") != null;
+            if (!cross and present.shape[2] >= 0) return false;
             past_count += 1;
         } else return false;
     }
@@ -54,10 +61,10 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
     for (outputs, 0..) |info, index| {
         for (outputs[0..index]) |prior| if (std.mem.eql(u8, prior.name, info.name)) return false;
         if (std.mem.eql(u8, info.name, "logits")) {
-            if (info.dtype != .f32 or info.shape.len != 3 or info.shape[0] > 1) return false;
+            if (info.dtype != .f32 or info.shape.len != 3 or info.shape[0] == 0 or info.shape[0] > 1) return false;
             logits = true;
         } else if (kv.presentOutputSuffix(info.name)) |suffix| {
-            if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] > 1) return false;
+            if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1) return false;
             present_count += 1;
         } else return false;
     }
@@ -123,7 +130,7 @@ pub const State = struct {
     /// Encoder buffers and mask are pinned by the enclosing generation request.
     encoder: backends.Tensor,
     mask: []const i64,
-    processed: usize = 0,
+    committed_prefix: std.ArrayList(i64) = .empty,
     vocab_size: usize,
 
     pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: backends.Tensor, mask: []const i64, vocab_size: usize) !?State {
@@ -170,6 +177,7 @@ pub const State = struct {
         if (self.cached_outputs.len != 0) kv.freeTensorSlice(self.allocator, self.cached_outputs);
         self.allocator.free(self.inputs);
         self.allocator.free(self.roles);
+        self.committed_prefix.deinit(self.allocator);
     }
 
     fn borrow(self: *const State, info: backends.TensorInfo, shape: []const i64, data: []const u8) backends.Tensor {
@@ -180,14 +188,17 @@ pub const State = struct {
     /// prefill and incremental calls; no names or empty cache tensors are
     /// allocated at a token boundary.
     pub fn step(self: *State, prefix: []const i64, dispatch: anytype, control: ?Control) !backends.Tensor {
-        if (prefix.len <= self.processed) return error.InvalidDecoderPosition;
+        const processed = self.committed_prefix.items.len;
+        if (prefix.len <= processed or !std.mem.eql(i64, prefix[0..processed], self.committed_prefix.items))
+            return error.InvalidDecoderPosition;
         if (control) |active| try active.check();
         _ = self.session.compactExclusiveRows(self.allocator, self.cached_outputs, 64 * 1024, control) catch |err| switch (err) {
             error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => false,
             else => return err,
         };
-        const fresh = self.processed == 0;
-        const tokens = prefix[self.processed..];
+        const fresh = processed == 0;
+        const tokens = prefix[processed..];
+        try self.committed_prefix.ensureUnusedCapacity(self.allocator, tokens.len);
         const shape = [_]i64{ 1, @intCast(tokens.len) };
         const mask_shape = [_]i64{ 1, @intCast(self.mask.len) };
         const branch = [_]u8{@intFromBool(!fresh)};
@@ -246,7 +257,7 @@ pub const State = struct {
         }
         outputs[self.logits_index] = self.borrow(self.session.outputInfo()[self.logits_index], &.{}, &.{});
         self.cached_outputs = outputs;
-        self.processed = prefix.len;
+        self.committed_prefix.appendSliceAssumeCapacity(tokens);
         return logits;
     }
 
@@ -379,8 +390,8 @@ fn checkIncremental(allocator: std.mem.Allocator) !void {
     }
     try std.testing.expectEqual(@as(usize, 6), fake.calls);
     try std.testing.expectEqual(@as(usize, 6), fake.submitted_tokens); // Full-prefix replay would submit 12.
-    try std.testing.expectEqual(@as(usize, 3), first.processed);
-    try std.testing.expectEqual(@as(usize, 3), second.processed);
+    try std.testing.expectEqual(@as(usize, 3), first.committed_prefix.items.len);
+    try std.testing.expectEqual(@as(usize, 3), second.committed_prefix.items.len);
     try std.testing.expect(controller.snapshot().host_kv_bytes > 0);
 }
 
@@ -400,6 +411,9 @@ test "incremental seq2seq executes imported ONNX with empty and populated cache 
     const logits = try b.add(encoder, try b.add(token, cached));
     const current = try b.reshape(logits, ml.graph.Shape.init(.f32, &.{ 1, 1, 1, 4 }));
     const present = try b.concat(past, current, 2);
+    // The fixture exports a growing cache axis. The generic builder adds
+    // dimension sentinels arithmetically and would otherwise declare zero.
+    graph.nodes.items[present].output_shape.dims[2] = -1;
     try graph.markOutput(logits);
     try graph.markOutput(present);
     const model = try @import("onnx_graph").exportGraph(a, &graph, .{ .node_name_overrides = &.{
@@ -426,10 +440,14 @@ test "incremental seq2seq executes imported ONNX with empty and populated cache 
     const route = diagnostics.snapshot().?.report.?.decoder_route.?;
     try std.testing.expectEqual(.merged_incremental, route.selected);
     try std.testing.expectEqual(.host_tensor_dispatch, route.cache_custody);
-    var first = try decoder.step(&.{2}, null, null);
+    var prefix = [_]i64{ 2, 5 };
+    var first = try decoder.step(prefix[0..1], null, null);
     defer first.deinit();
     try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, first.logits);
-    var next = try decoder.step(&.{ 2, 5 }, null, null);
+    prefix[0] = 3;
+    try std.testing.expectError(error.InvalidDecoderPosition, decoder.step(&prefix, null, null));
+    prefix[0] = 2;
+    var next = try decoder.step(&prefix, null, null);
     defer next.deinit();
     try std.testing.expectEqualSlices(f32, &.{ 7, 8, 9, 10 }, next.logits);
     const state = if (decoder.incremental) |*value| value else return error.InvalidMergedDecoderFixture;
@@ -569,7 +587,7 @@ test "incremental seq2seq cancellation after forwarding does not publish or repl
     };
     try std.testing.expectError(error.Cancelled, state.step(&.{0}, null, .{ .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = Probe.check } }));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(usize, 0), state.processed);
+    try std.testing.expectEqual(@as(usize, 0), state.committed_prefix.items.len);
     try std.testing.expectEqual(@as(usize, 0), state.cached_outputs.len);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }

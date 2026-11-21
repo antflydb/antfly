@@ -13511,6 +13511,35 @@ test "model selection composite ignores unlisted merged decoders and preserves l
     try std.testing.expect(compatibility.get().considered_merged_decoder);
     try std.testing.expectEqual(.full_prefix, compatibility.get().decoder_execution);
     try manager.validateCompositeAssetsCurrent(&compatibility, root, &.{ paths.encoder, paths.decoder });
+
+    // A valid ONNX body with an incompatible cache geometry must also
+    // decline before the optional decoder can replace the ordinary route.
+    const wider_present = try b.concat(past, past, 1);
+    merged.outputs.items[1] = wider_present;
+    const mismatched_bytes = try onnx_graph.exportGraph(a, &merged, .{ .node_name_overrides = &.{
+        .{ .node_id = logits, .name = "logits" },
+        .{ .node_id = wider_present, .name = "present.0.decoder.key" },
+    } });
+    defer a.free(mismatched_bytes);
+    try @import("../registry/download.zig").writeFileAtomically(a, io, raw, mismatched_bytes);
+    const mismatched_signature = try backends.imported_onnx_session.inspectSignature(signature_arena.allocator(), raw);
+    try std.testing.expect(!@import("../execution/seq2seq_runtime.zig").qualifiedSignature(mismatched_signature.inputs, mismatched_signature.outputs));
+    std.crypto.hash.sha2.Sha256.hash(mismatched_bytes, &merged_digest, .{});
+    const mismatched_receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "seq2seq", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{
+        .{ .path = "encoder_model.onnx", .size = ordinary.len },
+        .{ .path = "decoder_model.onnx", .size = ordinary.len },
+        .{ .path = "decoder_model_merged.onnx", .size = mismatched_bytes.len, .sha256 = std.fmt.bytesToHex(merged_digest, .lower) },
+        .{ .path = "config.json", .size = config.len },
+        .{ .path = "tokenizer.json", .size = tokenizer.len },
+    } }, .{});
+    defer a.free(mismatched_receipt);
+    try @import("../registry/download.zig").writeFileAtomically(a, io, receipt_path, mismatched_receipt);
+    const mismatched = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    var fallback = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, mismatched.bind(InferenceExecutionControl{ .io = io, .request_owned = false, .native_call_policy = .in_process }));
+    defer fallback.release();
+    try std.testing.expect(fallback.get().considered_merged_decoder);
+    try std.testing.expectEqual(.full_prefix, fallback.get().decoder_execution);
+    try manager.validateCompositeAssetsCurrent(&fallback, root, &.{ paths.encoder, paths.decoder });
 }
 
 test "host admission reclaims idle VAD residency but preserves active owners" {
