@@ -138,7 +138,8 @@ pub const guarded_generation_admission_version: u16 = 98;
 pub const bound_create_parent_version: u16 = 99;
 /// Every prospective metadata session owner can recover incarnation-bound staged work.
 pub const bound_session_version: u16 = 100;
-pub const current_version: u16 = bound_session_version;
+pub const compact_session_compare_version: u16 = 101;
+pub const current_version: u16 = compact_session_compare_version;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);

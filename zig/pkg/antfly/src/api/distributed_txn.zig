@@ -1374,7 +1374,7 @@ fn executeMultiTableCommitOnce(
         if (err == error.TopologyChanged and rejected_table.len != 0 and (!options.retain_terminal or options.fresh_retained_id))
             return .{ .conflict = .{ .table_name = rejected_table, .key = "", .message = "topology changed", .phase = .begin, .retryable = true } };
         if ((!options.retain_terminal or options.fresh_retained_id) and err == error.CatalogGenerationChanged) return error.PreDispatchCatalogGenerationChanged;
-        if (err == error.CatalogRouteFenceUnsupported) {
+        if (err == error.CatalogRouteFenceUnsupported or err == error.CatalogRoutingSnapshotTimeout) {
             if (!options.retain_terminal or options.fresh_retained_id) return error.PreDispatchDecisionAdmissionUnavailable;
             return error.StorageReadTemporarilyUnavailable;
         }
@@ -6222,6 +6222,7 @@ fn consumerTests() type {
                 generation: *table_catalog.RoutingGeneration,
                 checks: usize = 0,
                 recheck_failure: ?anyerror = null,
+                initial_failure: ?anyerror = null,
                 reject_on_check: ?usize = null,
                 supports_batch: bool = true,
                 supports_single: bool = true,
@@ -6240,6 +6241,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(usize, 2), batch.tables.len);
                     try std.testing.expectEqual(@as(u64, if (self.checks == 0) 9 else 10), batch.verified_revision);
                     self.checks += 1;
+                    if (self.checks == 1) if (self.initial_failure) |err| return err;
                     if (self.checks == 2) if (self.recheck_failure) |err| return err;
                     const rejected = self.checks == self.reject_on_check;
                     return .{ .tables_checked = true, .stable = !rejected, .rejected_table_id = if (rejected) batch.tables[1].table_id else null, .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 10 };
@@ -6350,6 +6352,16 @@ fn consumerTests() type {
                     try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, recorder.resolves.items[recorder.resolves.items.len - 1].status);
                 }
             }
+            // Expiring the initial routing budget cannot dispatch BEGIN.
+            const before_timeout = recorder.begins.items.len;
+            for ([_]bool{ true, false }) |fresh| {
+                compact.checks = 0;
+                compact.initial_failure = error.CatalogRoutingSnapshotTimeout;
+                const timed_out = executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(9), 70_000, 70_001, &recheck_tables, .write, null, .{ .retain_terminal = true, .fresh_retained_id = fresh });
+                try std.testing.expectError(if (fresh) error.PreDispatchDecisionAdmissionUnavailable else error.StorageReadTemporarilyUnavailable, timed_out);
+            }
+            try std.testing.expectEqual(before_timeout, recorder.begins.items.len);
+            compact.initial_failure = null;
             compact.checks = 0;
             compact.recheck_failure = null;
             compact.reject_on_check = 2;

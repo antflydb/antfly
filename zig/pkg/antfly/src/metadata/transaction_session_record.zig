@@ -19,6 +19,7 @@ pub const count_key = "\x00session-count-v1";
 pub const session_prefix = "\x00\x00__api_txn_sessions__:";
 pub const bound_session_header = "{\"session_format\":2,";
 fn frameVersion(changes: []const Change) u8 {
+    for (changes) |change| if (change.expected_is_digest) return 3;
     for (changes) |change| {
         if (!std.mem.startsWith(u8, change.key, session_prefix)) continue;
         if (change.value) |value| if (std.mem.startsWith(u8, value, bound_session_header)) return 2;
@@ -28,7 +29,13 @@ fn frameVersion(changes: []const Change) u8 {
 
 pub const max_bytes = 32 << 20;
 pub const max_operations = 4096;
-pub const Change = struct { key: []const u8, expected: ?[]const u8, value: ?[]const u8 };
+const Digest = std.crypto.hash.Blake3;
+pub const Change = struct {
+    key: []const u8,
+    expected: ?[]const u8,
+    value: ?[]const u8,
+    expected_is_digest: bool = false,
+};
 pub const Record = struct { changes: []const Change, scan_epoch: ?u64 = null };
 pub fn prefixForGroup(buf: []u8, group: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__api_transaction_sessions__:{x:0>16}:", .{group});
@@ -112,13 +119,15 @@ pub fn encode(a: std.mem.Allocator, record: Record) ![]u8 {
     if (record.changes.len > max_operations) return error.TransactionTooLarge;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
-    try out.append(a, frameVersion(record.changes));
+    const version = frameVersion(record.changes);
+    try out.append(a, version);
     try appendInt(&out, a, u64, record.scan_epoch orelse std.math.maxInt(u64));
     try appendInt(&out, a, u32, @intCast(record.changes.len));
     for (record.changes) |change| {
         if (change.key.len == 0 or change.key.len > 512 or internalKey(change.key)) return error.InvalidTransactionSessionRecord;
         const size = change.key.len +| (if (change.expected) |value| value.len else 0) +| (if (change.value) |value| value.len else 0);
-        if (size +| out.items.len +| 12 > max_bytes) return error.TransactionTooLarge;
+        if (size +| out.items.len +| (if (version == 3) @as(usize, 13) else 12) > max_bytes) return error.TransactionTooLarge;
+        if (version == 3) try out.append(a, @intFromBool(change.expected_is_digest));
         try appendBytes(&out, a, change.key);
         try appendBytes(&out, a, change.expected);
         try appendBytes(&out, a, change.value);
@@ -147,17 +156,20 @@ pub fn decode(a: std.mem.Allocator, bytes: []const u8) !Record {
     if (bytes.len > max_bytes) return error.TransactionTooLarge;
     var reader: Decoder = .{ .bytes = bytes };
     const version = try reader.int(u8);
-    if (version != 1 and version != 2) return error.InvalidTransactionSessionRecord;
+    if (version != 1 and version != 2 and version != 3) return error.InvalidTransactionSessionRecord;
     const epoch = try reader.int(u64);
     const count = try reader.int(u32);
     if (count > max_operations) return error.TransactionTooLarge;
     const changes = try a.alloc(Change, count);
     errdefer a.free(changes);
     for (changes, 0..) |*change, i| {
+        const compare = if (version == 3) try reader.int(u8) else 0;
+        if (compare > 1) return error.InvalidTransactionSessionRecord;
         const key = (try reader.slice()) orelse return error.InvalidTransactionSessionRecord;
         if (key.len == 0 or key.len > 512 or internalKey(key)) return error.InvalidTransactionSessionRecord;
         for (changes[0..i]) |previous| if (std.mem.eql(u8, key, previous.key)) return error.InvalidTransactionSessionRecord;
-        change.* = .{ .key = key, .expected = try reader.slice(), .value = try reader.slice() };
+        change.* = .{ .key = key, .expected = try reader.slice(), .value = try reader.slice(), .expected_is_digest = compare == 1 };
+        if (change.expected_is_digest and (change.expected == null or change.expected.?.len != Digest.digest_length)) return error.InvalidTransactionSessionRecord;
     }
     if (version != frameVersion(changes) or reader.pos != bytes.len) return error.InvalidTransactionSessionRecord;
     return .{ .changes = changes, .scan_epoch = if (epoch == std.math.maxInt(u64)) null else epoch };
@@ -192,7 +204,12 @@ pub fn apply(txn: anytype, a: std.mem.Allocator, group: u64, bytes: []const u8) 
         // derived watermark was last maintained by a different binary.
         const actual = try optionalGet(txn, key);
         if (change.expected) |expected| {
-            if (actual == null or !std.mem.eql(u8, actual.?, expected)) return false;
+            const current = actual orelse return false;
+            if (change.expected_is_digest) {
+                var digest: [Digest.digest_length]u8 = undefined;
+                Digest.hash(current, &digest, .{});
+                if (!std.mem.eql(u8, &digest, expected)) return false;
+            } else if (!std.mem.eql(u8, current, expected)) return false;
         } else if (actual != null) return false;
     }
     if (record.changes.len == 0) return true;
@@ -288,6 +305,15 @@ test "replicated session compare and set rejects lost updates and scan phantoms 
     const lost = try encode(a, .{ .changes = &.{ .{ .key = "other", .expected = null, .value = "must not appear" }, .{ .key = "receipt", .expected = "stale", .value = "committed" } } });
     defer a.free(lost);
     try std.testing.expect(!try apply(&map, a, 7, lost));
+    var digest: [Digest.digest_length]u8 = undefined;
+    Digest.hash("pending", &digest, .{});
+    const compact = try encode(a, .{ .changes = &.{.{ .key = "receipt", .expected = &digest, .expected_is_digest = true, .value = "committed" }} });
+    defer a.free(compact);
+    try std.testing.expectEqual(@as(u8, 3), compact[0]);
+    try std.testing.expect(try apply(&map, a, 7, compact));
+    try std.testing.expect(!try apply(&map, a, 7, compact));
+    // Restore the fixture for the remaining epoch tests.
+    try map.put(key, "pending");
     const other = try keyAlloc(a, 7, "other");
     defer a.free(other);
     try std.testing.expectError(error.NotFound, map.get(other));
@@ -295,7 +321,7 @@ test "replicated session compare and set rejects lost updates and scan phantoms 
     const phantom = try encode(a, .{ .scan_epoch = 0, .changes = &.{.{ .key = "receipt", .expected = "pending", .value = "committed" }} });
     defer a.free(phantom);
     try std.testing.expect(!try apply(&map, a, 7, phantom));
-    const committed = try encode(a, .{ .scan_epoch = 1, .changes = &.{.{ .key = "receipt", .expected = "pending", .value = "committed" }} });
+    const committed = try encode(a, .{ .scan_epoch = 2, .changes = &.{.{ .key = "receipt", .expected = "pending", .value = "committed" }} });
     defer a.free(committed);
     try std.testing.expect(try apply(&map, a, 7, committed));
     try std.testing.expectEqualStrings("committed", try map.get(key));

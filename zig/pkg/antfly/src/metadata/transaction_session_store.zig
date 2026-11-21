@@ -32,7 +32,7 @@ pub const Store = struct {
     group: u64,
     gate: std.atomic.Mutex = .unlocked,
     pub fn runtime(self: *Store, a: A) erased.Store {
-        return .{ .allocator = a, .ptr = self, .write_gate = &self.gate, .vtable = &.{ .deinit = deinit, .capabilities = capabilities, .begin_read = beginRead, .begin_write = beginWrite, .begin_batch = beginBatch } };
+        return .{ .allocator = a, .ptr = self, .write_gate = &self.gate, .vtable = &.{ .deinit = deinit, .capabilities = capabilities, .begin_read = beginRead, .begin_probe = beginProbe, .begin_write = beginWrite, .begin_batch = beginBatch } };
     }
     fn cast(ptr: *anyopaque) *Store {
         return @ptrCast(@alignCast(ptr));
@@ -45,6 +45,11 @@ pub const Store = struct {
         const read = try Read.create(a, cast(ptr));
         return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope, .count_prefix = Read.countPrefix } };
     }
+    fn beginProbe(a: A, ptr: *anyopaque) !erased.ProbeTxn {
+        const read = try Read.create(a, cast(ptr));
+        return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .contains = Read.contains } };
+    }
+
     fn beginWrite(a: A, ptr: *anyopaque) !erased.WriteTxn {
         const self = cast(ptr);
         const term = self.host.term(self.host.ptr) orelse return error.NotLeader;
@@ -103,6 +108,19 @@ const Read = struct {
         if (record.internalKey(key)) return error.NotFound;
         return self.physical.get(try record.keyAlloc(self.arena.allocator(), self.store.group, key));
     }
+    fn contains(ptr: *anyopaque, key: []const u8) !bool {
+        if (record.internalKey(key)) return false;
+        const self = cast(ptr);
+        const a = self.arena.child_allocator;
+        const physical = try record.keyAlloc(a, self.store.group, key);
+        defer a.free(physical);
+        var probe = try self.physical.openCursor();
+        defer probe.close();
+        probe.setKeysOnly();
+        const entry = (try probe.seekAtOrAfter(physical)) orelse return false;
+        return std.mem.eql(u8, entry.key, physical);
+    }
+
     fn scope(a: A, ptr: *anyopaque) !erased.ReadScope {
         const self = cast(ptr);
         var physical = try self.physical.openReadScope(a);
@@ -181,7 +199,8 @@ const Write = struct {
             error.NotFound => null,
             else => return err,
         };
-        const expected = if (actual) |value| try self.own(value) else null;
+        // The physical read owns observed values until the write closes.
+        const expected = actual;
         var value = expected;
         if (std.mem.eql(u8, key, record.count_key)) {
             // A legacy writer can change membership without touching the
@@ -231,13 +250,32 @@ const Write = struct {
         self.scanned = true;
         return Cursor.create(a, self.read, self);
     }
+    fn encodeChanges(self: *Write) ![]const u8 {
+        const a = self.read.arena.allocator();
+        const epoch = if (self.scanned) self.epoch else null;
+        return record.encode(a, .{ .changes = self.changes.items, .scan_epoch = epoch }) catch |err| {
+            if (err != error.TransactionTooLarge) return err;
+            const compact = try a.dupe(record.Change, self.changes.items);
+            const Digest = std.crypto.hash.Blake3;
+            for (compact) |*change| {
+                const previous = change.expected orelse continue;
+                if (!std.mem.startsWith(u8, change.key, record.session_prefix) or previous.len <= Digest.digest_length) continue;
+                const digest = try a.alloc(u8, Digest.digest_length);
+                Digest.hash(previous, digest[0..Digest.digest_length], .{});
+                change.expected = digest;
+                change.expected_is_digest = true;
+            }
+            return record.encode(a, .{ .changes = compact, .scan_epoch = epoch });
+        };
+    }
+
     fn commit(a: A, ptr: *anyopaque) !void {
         const self = cast(ptr);
         if (self.refs.load(.acquire) != 1) return error.TransactionCursorActive;
         const store = self.read.store;
         if (store.host.term(store.host.ptr) != self.term) return error.SessionWriteNotLeaderBeforeProposal;
         if (self.changes.items.len != 0) {
-            const bytes = record.encode(self.read.arena.allocator(), .{ .changes = self.changes.items, .scan_epoch = if (self.scanned) self.epoch else null }) catch |err| return switch (err) {
+            const bytes = self.encodeChanges() catch |err| return switch (err) {
                 error.OutOfMemory => error.SessionWriteOutOfMemoryBeforeProposal,
                 else => err,
             };
@@ -279,7 +317,10 @@ const Cursor = struct {
         } else {
             _ = read.refs.fetchAdd(1, .monotonic);
         }
-        return .{ .allocator = a, .ptr = self, .vtable = &.{ .close = close, .first = first, .last = last, .next = next, .prev = prev, .seek_at_or_after = after, .seek_at_or_before = before } };
+        return .{ .allocator = a, .ptr = self, .vtable = &.{ .close = close, .first = first, .last = last, .next = next, .prev = prev, .seek_at_or_after = after, .seek_at_or_before = before, .set_keys_only = setKeysOnly } };
+    }
+    fn setKeysOnly(ptr: *anyopaque) void {
+        cast(ptr).physical.setKeysOnly();
     }
     fn close(a: A, ptr: *anyopaque) void {
         const self = cast(ptr);
@@ -362,6 +403,7 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         physical: *erased.Store,
         current_term: u64 = 1,
         lose_ack: bool = false,
+        last_frame: u8 = 0,
         fn cast(ptr: *anyopaque) *@This() {
             return @ptrCast(@alignCast(ptr));
         }
@@ -374,6 +416,7 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         fn propose(ptr: *anyopaque, bytes: []const u8, expected: u64) !void {
             const self = cast(ptr);
             if (self.current_term != expected) return error.NotLeader;
+            self.last_frame = bytes[0];
             var txn = try self.physical.beginWrite();
             var active = true;
             defer if (active) txn.abort();
@@ -425,7 +468,7 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         var txn = try logical.beginWrite();
         try txn.put("receipt", "must not commit");
         fixture.current_term = 2;
-        try std.testing.expectError(error.NotLeader, txn.commit());
+        try std.testing.expectError(error.SessionWriteNotLeaderBeforeProposal, txn.commit());
         txn.abort();
     }
     {
@@ -507,5 +550,32 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         try remote.commit();
         try std.testing.expectError(error.SessionLeaseLost, txn.commit());
         txn.abort();
+    }
+    {
+        const key = record.session_prefix ++ "legacy-large";
+        const payload = try a.alloc(u8, record.max_bytes / 2 + 1);
+        defer a.free(payload);
+        @memset(payload, 'x');
+        {
+            var txn = try logical.beginWrite();
+            errdefer txn.abort();
+            try txn.put(key, payload);
+            try txn.commit();
+            try std.testing.expectEqual(@as(u8, 1), fixture.last_frame);
+        }
+        {
+            var probe = try logical.beginProbe();
+            defer probe.abort();
+            try std.testing.expect(try probe.contains(key));
+            try std.testing.expect(!try probe.contains(key ++ "-absent"));
+        }
+        {
+            var txn = try logical.beginWrite();
+            errdefer txn.abort();
+            payload[payload.len - 1] = 'y';
+            try txn.put(key, payload);
+            try txn.commit();
+            try std.testing.expectEqual(@as(u8, 3), fixture.last_frame);
+        }
     }
 }

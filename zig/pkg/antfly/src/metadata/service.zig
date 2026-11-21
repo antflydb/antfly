@@ -3794,6 +3794,7 @@ test "relation mutation admission gates bound transaction sessions independently
     const a = std.testing.allocator;
     try std.testing.expectEqual(metadata_topology_protocol.transaction_sessions_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_transaction_sessions = &.{1} }));
     try std.testing.expectEqual(metadata_topology_protocol.bound_session_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_transaction_sessions = &.{2} }));
+    try std.testing.expectEqual(metadata_topology_protocol.compact_session_compare_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_transaction_sessions = &.{3} }));
 }
 
 fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
@@ -3829,6 +3830,7 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         return switch (frame[0]) {
             1 => metadata_topology_protocol.transaction_sessions_version,
             2 => metadata_topology_protocol.bound_session_version,
+            3 => metadata_topology_protocol.compact_session_compare_version,
             else => metadata_topology_protocol.current_version,
         };
     }

@@ -6620,12 +6620,6 @@ pub const ApiHttpServer = struct {
                     }) orelse continue;
                 },
                 .commit => |*commit| {
-                    const distributed_view = commit.request.distributedTables(self.alloc) catch |err| {
-                        std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        continue;
-                    };
-                    defer distributed_view.deinit();
-                    const distributed_tables = distributed_view.tables;
                     var execution_plan = if (commit.execution_plan) |bytes| transactions_api.parseExecutionPlan(self.alloc, bytes) catch |err| {
                         // A damaged durable plan is not permission to re-plan
                         // or discard a potentially committed transaction.
@@ -6633,11 +6627,16 @@ pub const ApiHttpServer = struct {
                         continue;
                     } else null;
                     defer if (execution_plan) |*plan| plan.deinit();
+                    var legacy_view = if (execution_plan == null) commit.request.distributedTables(self.alloc) catch |err| {
+                        std.log.err("invalid legacy stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                        continue;
+                    } else null;
+                    defer if (legacy_view) |*view| view.deinit();
                     const outcome = (source.commitTransactionWithId(
                         self.alloc,
                         txn_id,
                         commit.begin_timestamp,
-                        if (execution_plan) |plan| plan.value else distributed_tables,
+                        if (execution_plan) |plan| plan.value else legacy_view.?.tables,
                         // Proposal-only delivery is insufficient for recovery:
                         // a new leader may discard it before apply. Upgrade
                         // only the weakest level, preserving stronger caller
@@ -14495,15 +14494,12 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]transactions_api.SessionStatus {
-        const candidates = try self.txn_sessions.listStatusesForPrincipal(
-            self.alloc,
-            transactionPrincipal(authenticated_identity),
-        );
+        const candidates = try self.txn_sessions.listSessionIds(self.alloc);
         defer self.alloc.free(candidates);
         var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
         errdefer authorized.deinit(self.alloc);
-        for (candidates) |status| {
-            var details = (try self.authorizedTransactionSessionDetails(status.txn_id, authenticated_identity, true)) orelse continue;
+        for (candidates) |id| {
+            var details = (try self.authorizedTransactionSessionDetails(id, authenticated_identity, true)) orelse continue;
             defer details.deinit(self.alloc);
             try authorized.append(self.alloc, details.status);
         }

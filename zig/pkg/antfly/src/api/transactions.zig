@@ -1214,7 +1214,7 @@ pub const DurableSessionStore = struct {
         const limit = configured_limit orelse std.math.maxInt(usize);
         if (creating and session.graph_receipt) {
             if (size +| session.graph_admission_growth > @min(limit, self.graphRecordLimit())) return error.SessionRecordTooLarge;
-        } else if (size > limit) return error.SessionRecordTooLarge;
+        } else if (!session.graph_receipt and size > limit) return error.SessionRecordTooLarge;
     }
 
     fn graphRecordLimit(self: *DurableSessionStore) usize {
@@ -2244,6 +2244,24 @@ pub const DurableSessionStore = struct {
         return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = scan.next_after };
     }
 
+    fn listSessionIds(self: *DurableSessionStore, alloc: std.mem.Allocator) ![]db_mod.types.TxnId {
+        const Scan = struct {
+            alloc: std.mem.Allocator,
+            ids: std.ArrayList(db_mod.types.TxnId) = .empty,
+
+            fn visit(raw: *anyopaque, key: []const u8, _: []const u8) !bool {
+                const scan: *@This() = @ptrCast(@alignCast(raw));
+                const id = distributed_txn.parseTxnIdHex(key[session_prefix.len..]) catch return true;
+                try scan.ids.append(scan.alloc, id);
+                return true;
+            }
+        };
+        var scan: Scan = .{ .alloc = alloc };
+        errdefer scan.ids.deinit(alloc);
+        try self.scanPrefixFromWithContextMode(session_prefix, null, &scan, Scan.visit, true);
+        return scan.ids.toOwnedSlice(alloc);
+    }
+
     pub fn scanPrefixWithContext(
         self: *DurableSessionStore,
         prefix: []const u8,
@@ -2260,8 +2278,33 @@ pub const DurableSessionStore = struct {
         ctx: *anyopaque,
         callback: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!bool,
     ) !void {
+        return self.scanPrefixFromWithContextMode(prefix, start_after, ctx, callback, false);
+    }
+
+    fn scanPrefixFromWithContextMode(
+        self: *DurableSessionStore,
+        prefix: []const u8,
+        start_after: ?[]const u8,
+        ctx: *anyopaque,
+        callback: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!bool,
+        keys_only: bool,
+    ) !void {
         switch (self.backend) {
             .docstore => |store| {
+                if (keys_only) {
+                    var read = try store.beginReadTxn();
+                    defer read.abort();
+                    var cursor = try read.openPhysicalCursorAdapter();
+                    defer cursor.close();
+                    cursor.setKeysOnly();
+                    var entry = try cursor.seekAtOrAfter(start_after orelse prefix);
+                    while (entry) |row| : (entry = try cursor.next()) {
+                        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                        if (start_after) |start| if (std.mem.eql(u8, row.key, start)) continue;
+                        if (!(try callback(ctx, row.key, &.{}))) break;
+                    }
+                    return;
+                }
                 const Adapter = struct {
                     context: *anyopaque,
                     prefix: []const u8,
@@ -2283,6 +2326,7 @@ pub const DurableSessionStore = struct {
                 defer txn.abort();
                 var cursor = try txn.openCursor();
                 defer cursor.close();
+                if (keys_only) cursor.setKeysOnly();
                 var entry = try cursor.seekAtOrAfter(start_after orelse prefix);
                 while (entry) |row| : (entry = try cursor.next()) {
                     if (!std.mem.startsWith(u8, row.key, prefix)) break;
@@ -4160,6 +4204,16 @@ pub const SessionRegistry = struct {
             details.catalog_bindings = try bindings.toOwnedSlice(alloc);
         }
         return details;
+    }
+
+    pub fn listSessionIds(self: *SessionRegistry, alloc: std.mem.Allocator) ![]db_mod.types.TxnId {
+        if (self.durable) |durable| return durable.listSessionIds(alloc);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const ids = try alloc.alloc(db_mod.types.TxnId, self.sessions.count());
+        var keys = self.sessions.keyIterator();
+        for (ids) |*id| id.* = keys.next().?.*;
+        return ids;
     }
 
     pub fn listStatuses(self: *SessionRegistry, alloc: std.mem.Allocator) ![]SessionStatus {
