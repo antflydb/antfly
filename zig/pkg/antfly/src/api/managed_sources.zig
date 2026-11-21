@@ -28,13 +28,22 @@ const Input = struct {
 const Table = @import("../metadata/table_manager.zig").TableRecord;
 const Destination = @import("../metadata/source_control.zig").Destination;
 
+const Outbound = struct {
+    document_committed: bool = false,
+    snapshot_then_changes: bool = false,
+    artifact_published: bool = false,
+    publication_activated: bool = false,
+};
+
 const DestinationContract = struct {
     version: u8 = 1,
     adapter: ?Destination = null,
     input: enum { row_transactions, committed_snapshots, unavailable } = .unavailable,
     accepted_by: enum { native_transaction, iceberg_ingress, none } = .none,
     committed_by: enum { native_transaction, iceberg_catalog_snapshot, external_snapshot, none } = .none,
-    committed_history: enum { native_rows_when_enrolled, unavailable } = .unavailable,
+    transaction_scope: enum { native_transaction, iceberg_table, none } = .none,
+    committed_history: enum { native_rows_when_enrolled, iceberg_committed_wal, unavailable } = .unavailable,
+    outbound: Outbound = .{},
 };
 
 const DestinationStatus = struct {
@@ -45,13 +54,23 @@ const DestinationStatus = struct {
 fn destinationStatus(a: A, server: *api.ApiHttpServer, table: Table, hosted_iceberg: bool) !DestinationStatus {
     const runtime_supported = try server.source.replicationSourcesSupported();
     const runtime_reason = if (runtime_supported) "" else "The current runtime does not execute managed replication sources.";
+    const feeds = server.source.changefeeds != null;
+    const lake_activation = feeds and server.source.vtable.get_lake_index_lifecycle != null and
+        server.source.vtable.mutate_lake_index_lifecycle != null;
+    const native = if (table.storage.engine == .local) server.cfg.native_history_roots else null;
     if (table.storage.engine != .object) return .{
         .contract = .{
             .adapter = .native,
             .input = .row_transactions,
             .accepted_by = .native_transaction,
             .committed_by = .native_transaction,
-            .committed_history = if (server.cfg.native_history_roots != null and table.storage.engine == .local) .native_rows_when_enrolled else .unavailable,
+            .transaction_scope = .native_transaction,
+            .committed_history = if (native != null) .native_rows_when_enrolled else .unavailable,
+            .outbound = if (native) |roots| .{
+                .document_committed = feeds,
+                .snapshot_then_changes = feeds and roots.bootstrap_pages != null,
+                .artifact_published = feeds and roots.artifact_history != null and roots.artifact_owners != null,
+            } else .{},
         },
         .cdc_unsupported_reason = runtime_reason,
     };
@@ -61,12 +80,16 @@ fn destinationStatus(a: A, server: *api.ApiHttpServer, table: Table, hosted_iceb
     const external = binding.binding;
     if (external.format == .iceberg and external.write_policy == .iceberg_writer and external.row_identity != null) {
         try external.validateSupported();
+        const rows = feeds and external.catalog != null and (server.cfg.deployment_mode == .standalone or hosted_iceberg);
         return .{
             .contract = .{
                 .adapter = .writable_iceberg,
                 .input = .row_transactions,
                 .accepted_by = .iceberg_ingress,
                 .committed_by = .iceberg_catalog_snapshot,
+                .transaction_scope = .iceberg_table,
+                .committed_history = if (rows) .iceberg_committed_wal else .unavailable,
+                .outbound = .{ .document_committed = rows, .snapshot_then_changes = rows, .publication_activated = lake_activation },
             },
             .cdc_unsupported_reason = if (!runtime_supported) runtime_reason else if (server.cfg.deployment_mode == .standalone or hosted_iceberg) "" else "The metadata runtime has no configured Iceberg writer.",
         };
@@ -76,7 +99,7 @@ fn destinationStatus(a: A, server: *api.ApiHttpServer, table: Table, hosted_iceb
             local.serverless_query_lake_parquet_manifest.isManifest(external.source_uri));
     return .{
         .contract = if (committed_snapshot)
-            .{ .input = .committed_snapshots, .committed_by = .external_snapshot }
+            .{ .input = .committed_snapshots, .committed_by = .external_snapshot, .outbound = .{ .publication_activated = lake_activation } }
         else
             .{},
         .cdc_unsupported_reason = "The table has no qualified writable Iceberg binding.",
@@ -235,6 +258,13 @@ test "lake SQL managed source replacement checks native definition hash and tabl
     const distributed_iceberg_status = try status(a, &server, "hn", 7, null, .{});
     defer a.free(distributed_iceberg_status);
     try std.testing.expect(std.mem.indexOf(u8, distributed_iceberg_status, "\"cdc_supported\":false") != null);
+    server.source.changefeeds = .{ .ptr = &source, .read_fn = undefined, .mutate_fn = undefined, .authority_fn = undefined };
+    const hosted = try destinationStatus(a, &server, source.table[0], true);
+    try std.testing.expect(hosted.contract.transaction_scope == .iceberg_table);
+    try std.testing.expect(hosted.contract.committed_history == .iceberg_committed_wal);
+    try std.testing.expect(hosted.contract.outbound.document_committed);
+    try std.testing.expect(hosted.contract.outbound.snapshot_then_changes);
+    server.source.changefeeds = null;
     server.cfg.deployment_mode = .standalone;
     const standalone_iceberg_status = try status(a, &server, "hn", 7, null, .{});
     defer a.free(standalone_iceberg_status);

@@ -2540,6 +2540,12 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         )
         attached = call("GET", table + "/sources/managed")
         assert attached["cdc_supported"], attached
+        destination = attached["destination_contract"]
+        assert destination["transaction_scope"] == "iceberg_table"
+        if deployment != "standalone":
+            assert destination["committed_history"] == "iceberg_committed_wal"
+            assert destination["outbound"]["document_committed"]
+            assert destination["outbound"]["snapshot_then_changes"]
         call(
             "POST",
             table + "/sources/managed",

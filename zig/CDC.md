@@ -368,7 +368,11 @@ Writable Iceberg reports its ingress and catalog commit capability. External
 read-only Iceberg attachments report committed snapshots as their change
 authority. Index publication is a separate milestone across these contracts.
 The managed-source status reports the durable published generation and its
-base snapshot alongside pending or failed index generations.
+base snapshot alongside pending or failed index generations. Its
+`destination_contract` reports transaction scope, commit authority, and the
+outbound event and bootstrap capabilities available on that runtime.
+`cdc_supported` reports whether the runtime can run an inbound connector
+for that destination.
 See [destination integration](https://github.com/antflydb/antfly/issues/1698)
 and [committed history and changefeeds](https://github.com/antflydb/antfly/issues/1639).
 

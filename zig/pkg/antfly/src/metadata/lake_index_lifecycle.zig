@@ -842,7 +842,7 @@ test "external lake lifecycle command ownership unwinds every allocation failure
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{Mutation{ .checkpoint_collection = .{ .token = @splat(7), .previous = "previous", .progress = .{ .kind = .doc_values, .name = "checkpoint", .artifact_id = "artifact", .byte_len = 42, .checksum = "checksum" }, .now_ms = 100 } }});
 }
 
-test "lake lifecycle history records committed activation once across reopen" {
+test "external lake lifecycle history records committed activation once across reopen" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
