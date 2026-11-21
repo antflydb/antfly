@@ -360,10 +360,12 @@ permit, gate and cancellation contract, propagates its failures without serial
 replay, and rejects a foreign prepaid model permit on the serial path. Host
 outputs leave through the same prepared Source custody and retirement boundary.
 
-Decoder construction publishes the actual native, compiled, merged-graph or
-full-prefix state route and requested policy through the uniform report. Failed
-construction publishes an owned error and no numerical counters or completion
-claim. These are request-construction observations, not a backend memory census.
+Decoder construction publishes the selected route, encoder storage, cache
+owner, and requested policy through the uniform report. The generic merged ONNX
+route uses the host-tensor dispatch ABI. Its typed control, self K/V, and cross K/V
+remain available to the batching callback. Native and compiled resident caches
+report their actual runtime owner. Failed construction publishes the initiating
+error, with cache ownership and numerical counters unavailable.
 
 Metal reports the device's instantaneous worker-process allocation gauge alongside
 tracked project allocations. It includes vendor resources visible to the driver;

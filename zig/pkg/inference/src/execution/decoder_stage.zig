@@ -160,6 +160,13 @@ pub const Decoder = struct {
                 .host => .host,
                 .resident => .resident,
             },
+            .cache_custody = switch (selected) {
+                .failed => .unavailable,
+                .full_prefix => .none,
+                .merged_incremental => .host_tensor_dispatch,
+                .native_incremental => .native_runtime,
+                .compiled_incremental => .compiled_runtime,
+            },
             .native_allowed = options.allow_native,
             .merged_allowed = options.allow_merged,
             .compiled_cache_requested = options.compiled_cache,
@@ -266,6 +273,7 @@ test "decoder route retains actual host output rows without copies and cancels b
     const route = diagnostics.snapshot().?.report.?.decoder_route.?;
     try std.testing.expectEqual(@import("diagnostics.zig").DecoderRoute.Selection.full_prefix, route.selected);
     try std.testing.expectEqual(backends.BackendType.native, route.backend);
+    try std.testing.expectEqual(.none, route.cache_custody);
     try std.testing.expect(diagnostics.snapshot().?.execution == null);
     const missing = stages.EncoderOutputs{ .host = &.{} };
     try std.testing.expectError(error.NoEncoderOutput, Decoder.init(a, session, &missing, 2, &.{ 1, 1 }, 4, null));

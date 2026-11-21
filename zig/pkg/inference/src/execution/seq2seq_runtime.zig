@@ -412,18 +412,27 @@ test "incremental seq2seq executes imported ONNX with empty and populated cache 
     try directory.dir.writeFile(std.testing.io, .{ .sub_path = "merged.onnx", .data = model });
     const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "merged.onnx" });
     defer a.free(path);
-    const session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, path, .native, .{});
+    var session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, path, .native, .{});
+    var diagnostics = @import("diagnostics.zig").Diagnostics{};
+    diagnostics.configure(true);
+    session.invocation_diagnostics = .{ .diagnostics = &diagnostics };
     defer session.close();
     var hidden = try backends.Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 1, 4 }, &.{ 1, 2, 3, 4 });
     defer hidden.deinit();
-    var state = (try State.init(a, session, hidden, &.{1}, 4)) orelse return error.InvalidMergedDecoderFixture;
-    defer state.deinit();
-    var first = try state.step(&.{2}, null, null);
+    var values = [_]backends.Tensor{hidden};
+    var encoded = @import("encoder_decoder_runtime.zig").EncoderOutputs{ .host = &values };
+    var decoder = try @import("decoder_stage.zig").Decoder.init(a, session, &encoded, 1, &.{1}, 4, null);
+    defer decoder.deinit();
+    const route = diagnostics.snapshot().?.report.?.decoder_route.?;
+    try std.testing.expectEqual(.merged_incremental, route.selected);
+    try std.testing.expectEqual(.host_tensor_dispatch, route.cache_custody);
+    var first = try decoder.step(&.{2}, null, null);
     defer first.deinit();
-    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, first.asFloat32());
-    var next = try state.step(&.{ 2, 5 }, null, null);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, first.logits);
+    var next = try decoder.step(&.{ 2, 5 }, null, null);
     defer next.deinit();
-    try std.testing.expectEqualSlices(f32, &.{ 7, 8, 9, 10 }, next.asFloat32());
+    try std.testing.expectEqualSlices(f32, &.{ 7, 8, 9, 10 }, next.logits);
+    const state = if (decoder.incremental) |*value| value else return error.InvalidMergedDecoderFixture;
     try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6, 7, 8, 9, 10 }, state.cached_outputs[1].asFloat32());
 }
 

@@ -197,6 +197,9 @@ pub const DecoderRoute = struct {
     selected: Selection,
     backend: @import("../backends/backends.zig").BackendType,
     encoder_storage: enum { host, resident },
+    /// A provider-owned state may itself use host storage. This field names
+    /// the owner and makes the merged decoder's host-tensor ABI explicit.
+    cache_custody: enum { unavailable, none, host_tensor_dispatch, native_runtime, compiled_runtime },
     native_allowed: bool,
     merged_allowed: bool,
     compiled_cache_requested: ?bool,
