@@ -89,6 +89,8 @@ pub const WebmInput = struct {
     fn boundIndex(self: WebmInput) !video.webm_pictures.Index {
         if (self.index.reader != self.reader) return error.InvalidVideoIndex;
         if (self.timeline) |timeline| if (timeline.index != self.index) return error.InvalidVideoIndex;
+        if (self.continuation) |owner| if (owner.reader != self.reader) return error.InvalidVideoIndex;
+        if (self.apple_continuation) |owner| if (owner.reader != self.reader) return error.InvalidVideoIndex;
         return self.index.*;
     }
 };
@@ -194,7 +196,7 @@ pub const InspectionScope = struct {
     admitted: ?*const AdmittedVideos = null,
     entries: [64]?*Inspection = @splat(null),
     count: usize = 0,
-    origins: [64]struct { clip: *const Inspection, ticks: i64 } = undefined,
+    origins: [64]struct { key: OriginKey, ticks: i64 } = undefined,
     origin_count: usize = 0,
     permit: ?@import("../backends/session.zig").RunPermit = null,
     pub fn retainedBytes(self: *const InspectionScope) usize {
@@ -234,16 +236,25 @@ pub const InspectionScope = struct {
         self.count += 1;
         return entry.backendPlan(metal);
     }
+    const OriginKey = union(enum) {
+        inspection: *const Inspection,
+        borrowed_webm: *const video.webm_pictures.Index,
+    };
+
     fn presentationOrigin(self: *InspectionScope, clip: *const Inspection, control: media.source.Control) !i64 {
+        const key: OriginKey = if (clip.configuration.webm) |input| blk: {
+            if (input.timeline) |timeline| return timeline.value.first;
+            break :blk .{ .borrowed_webm = input.index };
+        } else .{ .inspection = clip };
         for (self.origins[0..self.origin_count]) |entry| {
-            if (entry.clip == clip) return entry.ticks;
+            if (std.meta.eql(entry.key, key)) return entry.ticks;
         }
         const ticks = if (clip.webm_index) |index|
             try webmOrigin(index, control)
         else
             try pictureOrigin(clip.reader.packets, control, clip.reader.track.edit);
         if (self.origin_count < self.origins.len) {
-            self.origins[self.origin_count] = .{ .clip = clip, .ticks = ticks };
+            self.origins[self.origin_count] = .{ .key = key, .ticks = ticks };
             self.origin_count += 1;
         }
         return ticks;
@@ -1520,6 +1531,37 @@ test "embeddinggemma2 video reader timestamps and cache binding survive independ
     wrong.index = &other_index;
     try std.testing.expectError(error.InvalidVideoIndex, wrong.boundIndex());
 
+    var portable_owner = video.webm_pictures.Continuation{ .allocator = a, .reader = &other_reader };
+    var apple_owner = WebmDecoderContinuation{ .allocator = a, .reader = &other_reader };
+    wrong = input;
+    wrong.continuation = &portable_owner;
+    try std.testing.expectError(error.InvalidVideoIndex, projectionCache(null, wrong, null, null, null));
+    wrong = input;
+    wrong.apple_continuation = &apple_owner;
+    try std.testing.expectError(error.InvalidVideoIndex, projectionCache(null, wrong, null, null, null));
+
+    var origins = InspectionScope{ .allocator = a };
+    defer origins.deinit();
+    var without_timeline = input;
+    without_timeline.timeline = null;
+    for ([_]Sampling{ .reference, .{ .timestamps = .{ .max_frames = 2 } } }) |sampling| {
+        const timestamps = try selectedConfiguredPresentationUs(a, &.{}, .{}, .{ .webm = without_timeline, .sampling = sampling, .inspection_scope = &origins });
+        a.free(timestamps);
+    }
+    try std.testing.expectEqual(@as(usize, 2), origins.count);
+    try std.testing.expectEqual(@as(usize, 1), origins.origin_count);
+
+    var producer: Prefetch = undefined;
+    producer.control = .{};
+    producer.packet_reader = null;
+    producer.webm_input = input;
+    producer.aborted = .init(false);
+    try Prefetch.check(&producer);
+    source.control = control;
+    counter = .{ .stop = 1 };
+    try std.testing.expectError(error.Cancelled, producer.put(.{ .header = &.{} }));
+    source.control = .{};
+
     var incompatible_index = index;
     incompatible_index.all_layers = !index.all_layers;
     var av1 = reader;
@@ -2217,6 +2259,7 @@ pub const Prefetch = struct {
     fn check(raw: ?*const anyopaque) !void {
         const self: *const Prefetch = @ptrCast(@alignCast(raw.?));
         try self.control.check();
+        try checkInputControl(self.packet_reader, self.webm_input);
         if (self.aborted.load(.acquire)) return error.Cancelled;
     }
     fn put(self: *Prefetch, job: Job) !void {
@@ -2605,6 +2648,9 @@ pub const Prefetch = struct {
             };
             const selected = readySelection(jobs[0..count], ready_mask[0..count], cb.kind() == .metal);
             if (cb.embedding_stage) |stage| try stage.acquire();
+            for (owners[0..count], selected[0..count]) |owner, use| {
+                if (use) try check(owner);
+            }
             if (jobs[first] == .cached) {
                 const value = jobs[first].cached;
                 try capture.loadCached(value.slot, value.ticket);
