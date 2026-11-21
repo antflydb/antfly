@@ -117,6 +117,11 @@ fn generation(txn: anytype, marker_key: []const u8, epoch: u64) !?u64 {
 
 pub fn cachedRange(scope: anytype, a: std.mem.Allocator, group: u64, key: []const u8, offset: u64, length: usize) !?[]const u8 {
     if (!std.mem.startsWith(u8, key, session_prefix) or offset > cached_prefix_bytes or length > cached_prefix_bytes - offset) return null;
+    const gen = (try cachedPrefixGeneration(scope, a, group)) orelse return null;
+    return cachedRangeForGeneration(scope, a, group, key, offset, length, gen);
+}
+
+pub fn cachedPrefixGeneration(scope: anytype, a: std.mem.Allocator, group: u64) !?u64 {
     const epoch_key_bytes = try keyAlloc(a, group, epoch_key);
     defer a.free(epoch_key_bytes);
     const epoch_bytes = (try optionalGet(scope, epoch_key_bytes)) orelse return null;
@@ -124,7 +129,12 @@ pub fn cachedRange(scope: anytype, a: std.mem.Allocator, group: u64, key: []cons
     const epoch = std.mem.readInt(u64, epoch_bytes[0..8], .little);
     const marker_key = try keyAlloc(a, group, watermark_key);
     defer a.free(marker_key);
-    const gen = (try generation(scope, marker_key, epoch)) orelse return null;
+    return generation(scope, marker_key, epoch);
+}
+
+/// The caller must obtain the generation from this same immutable read cut.
+pub fn cachedRangeForGeneration(scope: anytype, a: std.mem.Allocator, group: u64, key: []const u8, offset: u64, length: usize, gen: u64) !?[]const u8 {
+    if (!std.mem.startsWith(u8, key, session_prefix) or offset > cached_prefix_bytes or length > cached_prefix_bytes - offset) return null;
     const entry_key = try cacheKey(a, group, key);
     defer a.free(entry_key);
     const entry = (try optionalGet(scope, entry_key)) orelse return null;

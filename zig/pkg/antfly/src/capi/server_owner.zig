@@ -2862,15 +2862,26 @@ fn metadataSessionReadPrefixPage(read: *MetadataSessionRead, prefix: []const u8,
     defer bytes.deinit(read.alloc);
     var entry = try cursor.seekAtOrAfter(if (after.len == 0) prefix else after);
     if (entry != null and after.len != 0 and std.mem.eql(u8, entry.?.key, after)) entry = try cursor.next();
+    const session_record = @import("../metadata/transaction_session_record.zig");
+    var checked_generation = false;
+    var cache_generation: ?u64 = null;
     var count: usize = 0;
     while (entry) |row| {
         if (!std.mem.startsWith(u8, row.key, prefix)) break;
         const value = scope.getRange(row.key, 0, length) catch |err| switch (err) {
             error.EndOfStream, error.NotFound => &.{},
-            error.Unsupported => (@import("../metadata/transaction_session_record.zig").cachedRange(&scope, read.alloc, read.group, row.key[read.prefix.len..], 0, length) catch |cache_err| switch (cache_err) {
-                error.EndOfStream => null,
-                else => return cache_err,
-            }) orelse &.{},
+            error.Unsupported => cached: {
+                if (!checked_generation) {
+                    cache_generation = try session_record.cachedPrefixGeneration(&scope, read.alloc, read.group);
+                    checked_generation = true;
+                }
+                const generation = cache_generation orelse break :cached &.{};
+                const cached = session_record.cachedRangeForGeneration(&scope, read.alloc, read.group, row.key[read.prefix.len..], 0, length, generation) catch |cache_err| switch (cache_err) {
+                    error.EndOfStream => null,
+                    else => return cache_err,
+                };
+                break :cached cached orelse &.{};
+            },
             else => return err,
         };
         var lengths: [4]u8 = undefined;

@@ -324,7 +324,10 @@ const Write = struct {
             };
             var submitted = false;
             const applied = store.host.propose(store.host.ptr, bytes, self.term, &submitted) catch |err| {
-                if (submitted) return err;
+                if (submitted) {
+                    std.log.warn("transaction session proposal outcome unavailable err={s}", .{@errorName(err)});
+                    return error.SessionWriteOutcomeUnknown;
+                }
                 return switch (err) {
                     error.NotLeader => error.SessionWriteNotLeaderBeforeProposal,
                     error.OutOfMemory => error.SessionWriteOutOfMemoryBeforeProposal,
@@ -450,7 +453,8 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
     const Fixture = struct {
         physical: *erased.Store,
         current_term: u64 = 1,
-        lose_ack: bool = false,
+        reject_before_proposal: ?anyerror = null,
+        lose_ack: ?anyerror = null,
         last_frame: u8 = 0,
         fn cast(ptr: *anyopaque) *@This() {
             return @ptrCast(@alignCast(ptr));
@@ -464,6 +468,7 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         fn propose(ptr: *anyopaque, bytes: []const u8, expected: u64, submitted: *bool) !bool {
             const self = cast(ptr);
             if (self.current_term != expected) return error.NotLeader;
+            if (self.reject_before_proposal) |err| return err;
             self.last_frame = bytes[0];
             submitted.* = true;
             var txn = try self.physical.beginWrite();
@@ -472,7 +477,7 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
             const applied = try record.apply(&txn, std.testing.allocator, 7, bytes);
             try txn.commit();
             active = false;
-            if (self.lose_ack) return error.Unavailable;
+            if (self.lose_ack) |err| return err;
             return applied;
         }
     };
@@ -523,11 +528,19 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
     }
     {
         var txn = try logical.beginWrite();
+        defer txn.abort();
+        try txn.put("receipt", "must not commit");
+        fixture.reject_before_proposal = error.TransactionTooLarge;
+        defer fixture.reject_before_proposal = null;
+        try std.testing.expectError(error.TransactionTooLarge, txn.commit());
+    }
+    {
+        var txn = try logical.beginWrite();
         try txn.put("receipt", "acknowledgement lost");
-        fixture.lose_ack = true;
-        try std.testing.expectError(error.Unavailable, txn.commit());
+        fixture.lose_ack = error.TransactionTooLarge;
+        try std.testing.expectError(error.SessionWriteOutcomeUnknown, txn.commit());
         txn.abort();
-        fixture.lose_ack = false;
+        fixture.lose_ack = null;
     }
     {
         var read = try logical.beginRead();

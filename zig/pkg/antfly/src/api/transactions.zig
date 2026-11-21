@@ -2213,6 +2213,11 @@ pub const DurableSessionStore = struct {
                     continue;
                 },
             }
+            const may_need_work = recoveryPrefixMayNeedWork(&scope, row.key, id) catch |err| {
+                std.log.warn("legacy recovery status unreadable txn_id={x} err={s}", .{ id, @errorName(err) });
+                continue;
+            };
+            if (!may_need_work) continue;
             const raw = scope.get(row.key) catch |err| {
                 std.log.warn("legacy transaction recovery row unreadable txn_id={x} err={s}", .{ id, @errorName(err) });
                 continue;
@@ -7048,6 +7053,31 @@ fn readGraphStatus(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: 
         error.Unsupported, error.EndOfStream => return null,
         else => return err,
     };
+    return graphStatusFromPrefix(raw, id, filter);
+}
+
+fn recoveryPrefixMayNeedWork(scope: *backend_erased.ReadScope, key: []const u8, id: db_mod.types.TxnId) !bool {
+    const raw = scope.getRange(key, 0, graph_status_read_len) catch |err| switch (err) {
+        error.NotFound => return false,
+        error.Unsupported, error.EndOfStream => return true,
+        else => return err,
+    };
+    if (try graphStatusFromPrefix(raw, id, .all)) |projection| {
+        return switch (projection) {
+            .absent => false,
+            .found => |status| switch (status.disposition) {
+                .active, .aborted, .committed => false,
+                else => true,
+            },
+        };
+    }
+    for ([_][]const u8{ connection_field, sql_field }) |field| {
+        if (try parseSqlPrefix(raw, field)) |payload| return payload[0] & 6 != 0;
+    }
+    return true;
+}
+
+fn graphStatusFromPrefix(raw: []const u8, id: db_mod.types.TxnId, filter: SessionRegistry.StatusPrincipalFilter) !?GraphStatusLookup {
     const header: []const u8 = if (std.mem.startsWith(u8, raw, session_record.bound_session_header)) session_record.bound_session_header else "{";
     if (raw.len < graph_status_read_len or !std.mem.startsWith(u8, raw[header.len..], graph_status_field)) return null;
     const start = header.len + graph_status_field.len;
@@ -8219,6 +8249,8 @@ test "distributed txn graph admission distinguishes lost commit acknowledgments 
     try std.testing.expect(!txn.attempted);
     try std.testing.expectError(error.GraphReceiptAdmissionUnknown, DurableSessionStore.finishSessionWrite(&txn, true, true));
     try std.testing.expect(txn.attempted);
+    txn.failure = error.SessionWriteOutcomeUnknown;
+    try std.testing.expectError(error.GraphReceiptAdmissionUnknown, DurableSessionStore.finishSessionWrite(&txn, true, true));
     txn.failure = error.SessionWriteUnavailableBeforeProposal;
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, DurableSessionStore.finishSessionWrite(&txn, true, true));
     txn.failure = error.SessionWriteNotLeaderBeforeProposal;
