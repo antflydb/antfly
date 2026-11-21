@@ -49,7 +49,7 @@ async function fixture(persist) {
   );
   const app = await modules(
     appDir,
-    `import app,{Mailbox as Base}from'./mail-worker-entry.js';import{WorkerEntrypoint}from'cloudflare:workers';export class TestMailbox extends Base{constructor(ctx,env){${guard}super(ctx,env);}}export default class extends WorkerEntrypoint{fetch(request){return app.fetch(request,this.env,this.ctx);}async inject(to,from,raw){let rejected=null;await app.email({to,from,rawSize:new TextEncoder().encode(raw).length,raw:new Blob([raw]).stream(),setReject(value){rejected=value;}},this.env);return rejected??'accepted';}async duplicateQueued(){const messages=await this.env.MAIL_QUEUE.take();for(const body of messages){await this.env.MAIL_QUEUE.send(body);await this.env.MAIL_QUEUE.send(body);}return messages.length;}async flush(){const messages=await this.env.MAIL_QUEUE.take(),states=[];await app.queue({messages:messages.map(body=>({body,ack(){states.push('ack');},retry(){states.push('retry');}}))},this.env);return JSON.stringify(states);}}`
+    `import app,{Mailbox as Base}from'./mail-worker-entry.js';import{WorkerEntrypoint}from'cloudflare:workers';export class TestMailbox extends Base{constructor(ctx,env){${guard}super(ctx,env);}}export default class extends WorkerEntrypoint{fetch(request){return app.fetch(request,this.env,this.ctx);}async inject(to,from,raw){let rejected=null;await app.email({to,from,rawSize:new TextEncoder().encode(raw).length,raw:new Blob([raw]).stream(),setReject(value){rejected=value;}},this.env);return rejected??'accepted';}async duplicateQueued(){const messages=await this.env.MAIL_QUEUE.take();for(const body of messages){await this.env.MAIL_QUEUE.send(body);await this.env.MAIL_QUEUE.send(body);}return messages.length;}async objectKeys(){const listed=await this.env.MAIL_OBJECTS.list();return JSON.stringify(listed.objects.map(o=>o.key));}async flush(){const messages=await this.env.MAIL_QUEUE.take(),states=[];await app.queue({messages:messages.map(body=>({body,ack(){states.push('ack');},retry(){states.push('retry');}}))},this.env);return JSON.stringify(states);}}`
   );
   const capture = `import{WorkerEntrypoint}from'cloudflare:workers';export default class extends WorkerEntrypoint{async send(value){const id=crypto.randomUUID();await this.env.CAPTURE.put(id,JSON.stringify(value));return{messageId:id};}async take(){const objects=await this.env.CAPTURE.list({limit:1000}),values=[];for(const o of objects.objects){values.push(await(await this.env.CAPTURE.get(o.key)).json());await this.env.CAPTURE.delete(o.key);}return values;}async takeJSON(){return JSON.stringify(await this.take());}}`;
   const workers = [
@@ -92,10 +92,10 @@ test("actual workerd auth and mailbox isolation, native search, attachments and 
   const persist = await mkdtemp(resolve(cwd, "dist/mail-workerd-"));
   let mf = await fixture(persist);
   const cookies = {};
-  const call = async (path, body, user, ip = "127.0.0.1") => {
+  const call = async (path, body, user, ip = "127.0.0.1", method = body ? "POST" : "GET") => {
     const worker = await mf.getWorker("mail");
     return worker.fetch("http://localhost:3000" + path, {
-      method: body ? "POST" : "GET",
+      method,
       headers: {
         Origin: "http://localhost:3000",
         "CF-Connecting-IP": ip,
@@ -213,6 +213,34 @@ test("actual workerd auth and mailbox isolation, native search, attachments and 
     assert.equal((await json("/mail/outbox", null, "alice")).messages[0].id, outboxId);
     assert.equal((await json("/mail/outbox", null, "bob")).messages.length, 0);
     assert.equal((await call("/mail/outbox/" + outboxId, null, "bob")).status, 404);
+    // Deleting one of two identical deliveries removes only that delivery:
+    // its listing, lookup, search hit, attachment and R2 objects.
+    const doomed = repeated.messages.find((message) => message.id !== id).id;
+    const ownKeys = (keys, message) => keys.filter((key) => key.includes("/raw/" + message) || key.includes("/attachments/" + message + "/"));
+    const keysBefore = JSON.parse(await mail.objectKeys());
+    assert.equal(ownKeys(keysBefore, doomed).length, 2, "raw MIME and the attachment are stored per delivery");
+    assert.equal((await call("/mail/messages/" + doomed, null, "bob", "127.0.0.1", "DELETE")).status, 404, "another user cannot delete it");
+    const crossSite = await (await mf.getWorker("mail")).fetch("http://localhost:3000/mail/messages/" + doomed, {
+      method: "DELETE",
+      headers: { Origin: "https://attacker.test", Cookie: cookies.alice, "CF-Connecting-IP": "127.0.0.1" },
+    });
+    assert.equal(crossSite.status, 403);
+    const deleted = await call("/mail/messages/" + doomed, null, "alice", "127.0.0.1", "DELETE");
+    assert.equal(deleted.status, 200, await deleted.clone().text());
+    assert.deepEqual(await deleted.json(), { id: doomed, deleted: true });
+    assert.equal(await mail.flush(), '["ack"]', "the purge hint finds nothing left to do");
+    assert.deepEqual((await json("/mail/messages", null, "alice")).messages.map((message) => message.id), [id]);
+    assert.equal((await call("/mail/messages/" + doomed, null, "alice")).status, 404);
+    assert.equal((await call("/mail/messages/" + doomed + "/attachments/0", null, "alice")).status, 404);
+    assert.deepEqual((await json("/mail/search?q=needleword", null, "alice")).messages.map((message) => message.id), [id]);
+    const keysAfter = JSON.parse(await mail.objectKeys());
+    assert.deepEqual(ownKeys(keysAfter, doomed), [], "its objects are purged");
+    assert.equal(ownKeys(keysAfter, id).length, 2, "the identical delivery keeps its objects");
+    assert.equal((await call("/mail/messages/" + id + "/attachments/0", null, "alice")).status, 200);
+    const synced = await json("/mail/sync", null, "alice");
+    assert.deepEqual(synced.deleted, [doomed], "replicas receive a tombstone");
+    assert.ok(!synced.messages.some((message) => message.id === doomed));
+    assert.equal((await call("/mail/messages/" + doomed, null, "alice", "127.0.0.1", "DELETE")).status, 200, "deleting again is idempotent");
     const oversizedHeader = "From: customer@example.net\r\nX-Padding: " +
       "a".repeat(70000) + "\r\n\r\nbody";
     const excessiveParts = "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n" +
@@ -235,6 +263,7 @@ test("actual workerd auth and mailbox isolation, native search, attachments and 
     mf = await fixture(persist);
     assert.equal((await json("/api/me", null, "alice")).mailbox.id, alice.mailbox.id);
     assert.equal((await json("/mail/messages/" + id, null, "alice")).id, id);
+    assert.equal((await call("/mail/messages/" + doomed, null, "alice")).status, 404, "deletion survives a restart");
     await json("/api/auth/sign-out", {}, "alice");
     assert.equal((await call("/mail/messages", null, "alice")).status, 401);
   } finally {

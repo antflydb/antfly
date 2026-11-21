@@ -302,6 +302,15 @@ Other checks:
 - **Native and WASM:** a native embedded API test runs a hosted database
   through `HostFileStorage`; the WASM smoke test does the same through the
   real module and the pool.
+- **Message deletion:** `test/mailbox-actor.test.mjs` runs the real `Mailbox`
+  actor over in-memory store, R2 and engine fakes (Node module hooks stub its
+  WASM imports). It covers delete and purge, a failed purge completed by
+  retry, a delete racing an ingest (the late upsert is purged again under a
+  new operation id), and deletion before ingest. `test/mail-workerd.test.mjs`
+  adds the same checks on the native engine (cross-user and cross-site
+  refusal, object cleanup, sync tombstone, restart). It needs the serverless
+  WASM, whose build on `main` currently fails in the lake query code, so that
+  part has not run here.
 - **Mail example:** `test/mail-local.test.mjs` covers the sync log and reset,
   route scoping and model grants, CSP and caching, document and query shapes,
   model stripping, the opt-in UI, sign-out wipe and retry, offline start and
