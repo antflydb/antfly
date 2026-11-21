@@ -1242,6 +1242,14 @@ fn parseBatchRequestWithOptions(
         checkpoint_start = try alloc.dupe(u8, range_start);
         checkpoint_end = try alloc.dupe(u8, range_end);
         if (transition_id == 0 or attempt_epoch == 0) return error.InvalidBatchRequest;
+        const history_policy = if (object.get("history_policy")) |item| policy: {
+            const Policy = @import("../storage/committed_history.zig").Policy;
+            if (kind != .destination_complete or item != .string or item.string.len != Policy.encoded_size * 2)
+                return error.InvalidBatchRequest;
+            var raw: [Policy.encoded_size]u8 = undefined;
+            _ = std.fmt.hexToBytes(&raw, item.string) catch return error.InvalidBatchRequest;
+            break :policy Policy.decode(&raw) catch return error.InvalidBatchRequest;
+        } else null;
         break :checkpoint .{
             .kind = kind,
             .transition_id = transition_id,
@@ -1251,6 +1259,7 @@ fn parseBatchRequestWithOptions(
             .range_start = checkpoint_start.?,
             .range_end = checkpoint_end.?,
             .delta_sequence = delta_sequence,
+            .history_policy = history_policy,
         };
     };
 
@@ -2434,7 +2443,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeByte(']');
     }
     if (req.split_checkpoint) |checkpoint| {
-        try writer.print(",\"_split_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"range_start\":{f},\"range_end\":{f},\"delta_sequence\":\"{d}\"}}", .{
+        try writer.print(",\"_split_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"range_start\":{f},\"range_end\":{f},\"delta_sequence\":\"{d}\"", .{
             std.json.fmt(@tagName(checkpoint.kind), .{}),
             checkpoint.transition_id,
             checkpoint.attempt_epoch,
@@ -2444,6 +2453,11 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             std.json.fmt(checkpoint.range_end, .{}),
             checkpoint.delta_sequence,
         });
+        if (checkpoint.history_policy) |policy| {
+            if (checkpoint.kind != .destination_complete) return error.InvalidBatchRequest;
+            try writer.print(",\"history_policy\":\"{s}\"", .{std.fmt.bytesToHex(try policy.encode(), .lower)});
+        }
+        try writer.writeByte('}');
     }
     if (req.split_replication) |replication| {
         try writer.print(",\"_split_replication\":{{\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\",\"operation\":{f},\"sequence\":\"{d}\"", .{

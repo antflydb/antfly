@@ -478,6 +478,7 @@ fn consumerTests() type {
                     .range_start = "doc:m",
                     .range_end = "doc:z",
                     .delta_sequence = 7,
+                    .history_policy = .{ .namespace = @splat(1), .authority = @splat(2), .previous_revision = 0, .revision = 1, .limit = 128 * 1024 * 1024 },
                 },
             });
             defer std.testing.allocator.free(encoded);
@@ -492,6 +493,8 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("doc:m", checkpoint.range_start);
             try std.testing.expectEqualStrings("doc:z", checkpoint.range_end);
             try std.testing.expectEqual(@as(u64, 7), checkpoint.delta_sequence);
+            try std.testing.expectEqual(@as(u64, 1), checkpoint.history_policy.?.revision);
+            try std.testing.expectEqual(@as([32]u8, @splat(2)), checkpoint.history_policy.?.authority);
         }
 
         test "raft batch round trips internal split replication identity" {

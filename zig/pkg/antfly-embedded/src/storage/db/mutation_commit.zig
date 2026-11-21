@@ -3129,6 +3129,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (try @import("artifact_reconcile_intent.zig").validateCompletion(S.ownerField(self, "alloc").*, &read, command, entry.index)) try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").key);
                 try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
             }
+            const history = @import("../committed_history.zig");
+            var split_history_seed: ?history.SplitJournalSeed = null;
             var split_sequence_buf: [8]u8 = undefined;
             var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
             var persisted_range: ?types.ByteRange = null;
@@ -3145,6 +3147,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (req.split_checkpoint) |checkpoint| {
+                if (checkpoint.history_policy) |policy| {
+                    if (checkpoint.kind != .destination_complete or opts.ordered_apply_receipt == null)
+                        return error.InvalidHistoryAdmission;
+                    var read = try S.ownerField(self, "core").*.store.beginReadTxn();
+                    defer read.abort();
+                    const namespace = @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace);
+                    split_history_seed = try history.SplitJournalSeed.prepare(&read, policy, namespace);
+                    if (split_history_seed != null) {
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.state_key, .value = &split_history_seed.?.state });
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.policy_key, .value = &split_history_seed.?.policy });
+                    }
+                }
                 if (coordinated_handoff and checkpoint.kind == .destination_complete) {
                     const raw_catalog = (try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);

@@ -91,6 +91,7 @@ pub const SplitReplicationCheckpoint = struct {
     range_start: []const u8 = "",
     range_end: []const u8 = "",
     delta_sequence: u64,
+    history_policy: ?@import("../committed_history.zig").Policy = null,
 };
 
 /// Identity inherited by an unpublished split destination. Every replicated

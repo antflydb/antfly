@@ -249,6 +249,41 @@ pub fn configurePolicy(txn: anytype, value: Policy) !void {
     try txn.put(policy_key, &encoded);
 }
 
+/// Prepare a fresh history journal for the destination's atomic split checkpoint.
+pub const SplitJournalSeed = struct {
+    state: [state_size]u8,
+    policy: [Policy.encoded_size]u8,
+
+    pub fn prepare(txn: anytype, inherited: Policy, namespace: frame.Namespace) !?SplitJournalSeed {
+        if (!std.mem.eql(u8, &inherited.namespace, &namespace)) return error.HistoryResynchronizationRequired;
+        const previous = try loadPolicy(txn);
+        if (previous) |installed| {
+            if (!std.mem.eql(u8, &installed.namespace, &namespace) or
+                !std.mem.eql(u8, &installed.authority, &inherited.authority))
+                return error.HistoryResynchronizationRequired;
+            const current = (try load(txn)) orelse return error.HistoryCorrupt;
+            if (current.limit != installed.limit) return error.HistoryCorrupt;
+            try requireNamespace(txn, current, namespace);
+            return null;
+        }
+        if (try load(txn) != null) return error.HistoryResynchronizationRequired;
+        const state: State = .{
+            .namespace = namespace,
+            .limit = inherited.limit,
+            .retained_bytes = policy_key.len + Policy.encoded_size,
+        };
+        try requireNamespace(txn, state, namespace);
+        const policy: Policy = .{
+            .namespace = namespace,
+            .authority = inherited.authority,
+            .previous_revision = 0,
+            .revision = inherited.revision,
+            .limit = inherited.limit,
+        };
+        return .{ .state = encode(state), .policy = try policy.encode() };
+    }
+};
+
 pub const State = struct {
     namespace: frame.Namespace,
     latest: u64 = 0,

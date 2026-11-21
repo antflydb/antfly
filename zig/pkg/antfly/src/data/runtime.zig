@@ -13170,6 +13170,8 @@ pub const DataServer = struct {
     }
 
     pub fn requiredRaftBatchProtocolVersion(alloc: std.mem.Allocator, req: antfly.db.types.BatchRequest) !u16 {
+        if (req.split_checkpoint) |checkpoint| if (checkpoint.history_policy != null)
+            return @import("../common/data_raft_protocol.zig").batch_split_history_seed_protocol_version;
         if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(alloc, req)) |required| return required;
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
