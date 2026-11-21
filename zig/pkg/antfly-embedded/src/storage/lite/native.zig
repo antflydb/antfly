@@ -7320,6 +7320,12 @@ pub const NativeFile = struct {
     /// Rebinding an externally published header or inode clears the lineage.
     allocator_verification_base: ?Header = null,
     allocator_proof_window: ?*AllocatorProofWindow = null,
+    /// The thread whose proof installed `allocator_proof_window` (0: none).
+    /// Only that thread may read through the window: its buffer is refilled
+    /// by its reads and freed when its proof ends, so another thread reading
+    /// through it (background reclaim during a foreground proof) would get
+    /// the proof's bytes for the wrong page, or a freed buffer.
+    allocator_proof_window_owner: std.atomic.Value(u64) = .init(0),
     // Structural scaling assertions count page operations, independent of
     // filesystem speed and cache warmth. No counters exist in production.
     // Exact backing-file page reads, after shared and cursor-local caches.
@@ -13421,7 +13427,11 @@ pub const NativeFile = struct {
 
         fn initInto(self: *@This(), file: *NativeFile) void {
             self.* = .{ .file = file };
-            if (file.allocator_proof_window != null) return;
+            // One window per file: a proof running on another thread keeps
+            // its own; this one reads uncached.
+            if (file.allocator_proof_window_owner.cmpxchgStrong(0, currentThreadId(), .acq_rel, .acquire) != null) return;
+            var installed = false;
+            defer if (!installed) file.allocator_proof_window_owner.store(0, .release);
             const size = (file.file.stat(file.runtimeIo()) catch return).size;
             var capacity: usize = @intCast(@min(size, 1024 * 1024));
             if (file.page_cache.resource_manager) |manager| {
@@ -13439,12 +13449,14 @@ pub const NativeFile = struct {
             };
             self.limit = size;
             file.allocator_proof_window = self;
+            installed = true;
         }
 
         fn deinit(self: *@This()) void {
             if (self.buffer) |buffer| {
                 std.debug.assert(self.file.allocator_proof_window == self);
                 self.file.allocator_proof_window = null;
+                self.file.allocator_proof_window_owner.store(0, .release);
                 self.file.allocator.free(buffer);
             }
             if (self.reservation) |*reservation| reservation.release();
@@ -13556,8 +13568,16 @@ pub const NativeFile = struct {
                 // knew about multi-page windows at all.
             }
         }
-        if (self.allocator_proof_window) |window| if (try window.read(out, offset)) return;
+        // Owner first: another thread never touches the window, not even its
+        // pointer, which the owner sets and clears.
+        if (self.allocator_proof_window_owner.load(.acquire) == currentThreadId()) {
+            if (self.allocator_proof_window) |window| if (try window.read(out, offset)) return;
+        }
         try self.readBackingPagesUncached(out, offset);
+    }
+
+    fn currentThreadId() u64 {
+        return @intCast(std.Thread.getCurrentId());
     }
 
     fn readBackingPagesUncached(self: *NativeFile, out: []u8, offset: u64) !void {
