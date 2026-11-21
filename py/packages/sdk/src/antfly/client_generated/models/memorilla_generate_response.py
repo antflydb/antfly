@@ -17,6 +17,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.memorilla_citation import MemorillaCitation
+    from ..models.memorilla_diagnostics import MemorillaDiagnostics
     from ..models.memorilla_generate_usage import MemorillaGenerateUsage
 
 
@@ -38,7 +39,9 @@ class MemorillaGenerateResponse:
         memory_tokens (MemorillaGenerateResponseMemoryTokens): Memory slots used by the published answer. Sixteen for
             latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode
             still evaluates an initial memory candidate. hybrid_research reports 32 when the record gate opened (16 soft
-            rows then 16 record rows) and 16 when it closed (soft rows only).
+            rows then 16 record rows) and 16 when it closed (soft rows only); span-window bundles report 16 plus the
+            evidence window rows when it opened (48 for a 32-row window, 80 for the cascade's 64-row wide window) and 16
+            when it closed or read_mode is none.
         context_source (MemorillaGenerateResponseContextSource): supplied_documents is reported by encoder_lora_research
             and hybrid_research profiles, which encoded caller-supplied texts server-side.
         encoder_execution_identity (str):
@@ -87,6 +90,12 @@ class MemorillaGenerateResponse:
             was supplied by the caller; native embeddings are not recomputed to certify it.
         document_text_sha256s (list[str] | Unset): Source-verified mode only. SHA256 of each original UTF-8 source text,
             preserving row order; identifies supplied bytes, not source authority or selected supporting citations.
+        diagnostics (MemorillaDiagnostics | Unset): hybrid_research profiles with include_diagnostics only: how the span
+            hybrid read the request. Fields that do not apply are absent (never
+            null). Margins are score - null_score - the bundle's span gate
+            threshold; the cascade widens when the narrow margin is below
+            cascade_threshold, and the gate opens when margin >= gate_offset.
+            Research diagnostics, not a stable contract.
     """
 
     model: str
@@ -111,6 +120,7 @@ class MemorillaGenerateResponse:
     verification_status: MemorillaGenerateResponseVerificationStatus | Unset = UNSET
     source_alignment: MemorillaGenerateResponseSourceAlignment | Unset = UNSET
     document_text_sha256s: list[str] | Unset = UNSET
+    diagnostics: MemorillaDiagnostics | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         model = self.model
@@ -174,6 +184,10 @@ class MemorillaGenerateResponse:
         if not isinstance(self.document_text_sha256s, Unset):
             document_text_sha256s = self.document_text_sha256s
 
+        diagnostics: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.diagnostics, Unset):
+            diagnostics = self.diagnostics.to_dict()
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -213,12 +227,15 @@ class MemorillaGenerateResponse:
             field_dict["source_alignment"] = source_alignment
         if document_text_sha256s is not UNSET:
             field_dict["document_text_sha256s"] = document_text_sha256s
+        if diagnostics is not UNSET:
+            field_dict["diagnostics"] = diagnostics
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.memorilla_citation import MemorillaCitation
+        from ..models.memorilla_diagnostics import MemorillaDiagnostics
         from ..models.memorilla_generate_usage import MemorillaGenerateUsage
 
         d = dict(src_dict)
@@ -298,6 +315,13 @@ class MemorillaGenerateResponse:
 
         document_text_sha256s = cast(list[str], d.pop("document_text_sha256s", UNSET))
 
+        _diagnostics = d.pop("diagnostics", UNSET)
+        diagnostics: MemorillaDiagnostics | Unset
+        if isinstance(_diagnostics, Unset):
+            diagnostics = UNSET
+        else:
+            diagnostics = MemorillaDiagnostics.from_dict(_diagnostics)
+
         memorilla_generate_response = cls(
             model=model,
             text=text,
@@ -321,6 +345,7 @@ class MemorillaGenerateResponse:
             verification_status=verification_status,
             source_alignment=source_alignment,
             document_text_sha256s=document_text_sha256s,
+            diagnostics=diagnostics,
         )
 
         return memorilla_generate_response

@@ -2128,6 +2128,10 @@ fn createCudaSessionWithRequiredProfile(
     // The qualified managed path owns fresh KV and eager request state. The
     // generic SM121 capture defaults are for other serving profiles.
     if (model_manifest.memorilla_profile != null) cuda_compute.capture_gates = .{};
+    if (model_manifest.memorilla_profile != null and memorilla_qualification.researchFastPrefill()) {
+        cuda_compute.kernels.memorilla_research_fast_prefill = true;
+        std.log.info("memorilla_research_attention: cooperative f32 prefill (not a qualified identity) path={s}", .{model_path});
+    }
     if (model_manifest.memorilla_profile == .qwen3_decoder_f32_kv_f32_v1) {
         if (cuda_compute.cublaslt) |*blas| blas.memorilla_f32_prefill = true;
     }
@@ -2168,6 +2172,11 @@ fn createCudaSessionWithRequiredProfile(
         });
     }
     std.mem.sort(CudaResidentUpload, resident_uploads.items, {}, cudaResidentUploadLessThan);
+    // Research-only: Memorilla decoder-layer matrices stay BF16
+    // (`memorilla_qualification.researchBf16Matrices`).
+    const memorilla_bf16_matrices = model_manifest.memorilla_profile != null and memorilla_qualification.researchBf16Matrices();
+    if (memorilla_bf16_matrices) std.log.info("memorilla_research_precision: bf16 layer matrices (not a qualified identity) path={s}", .{model_path});
+    if (memorilla_bf16_matrices) cuda_compute.memorilla_research_bf16_mirror = true;
     const dense_upload_start_ns = platform.time.monotonicNs();
     var dense_mmap_weight_count: usize = 0;
     if (a4b_inference != null) {
@@ -2189,7 +2198,9 @@ fn createCudaSessionWithRequiredProfile(
         if (load_control) |active| try active.check();
         if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesSequential(bytes);
         const owned_key = try allocator.dupe(u8, upload.key);
-        uploadGlinerCudaWeight(&cuda_compute, owned_key, upload.loaded, gliner_precision) catch |err| {
+        const research_bf16 = model_manifest.memorilla_profile != null and memorilla_bf16_matrices and
+            memorilla_qualification.isResearchBf16Matrix(upload.key, upload.loaded.tensor.shape.len);
+        (if (research_bf16) uploadMemorillaBf16Matrix(&cuda_compute, owned_key, upload.loaded) else uploadGlinerCudaWeight(&cuda_compute, owned_key, upload.loaded, gliner_precision)) catch |err| {
             allocator.free(owned_key);
             return err;
         };
@@ -2232,7 +2243,8 @@ fn createCudaSessionWithRequiredProfile(
         const expected = if (memorilla_qualification.role(profile) == .encoder) memorilla_qualification.encoder_weight_bytes else memorilla_qualification.decoder_weight_bytes;
         if (!cuda_compute.strict_f32_weights or cuda_compute.lazy_host_store != null or
             cuda_compute.capture_gates.persistent_replay or cuda_compute.capture_gates.update_exec or cuda_compute.capture_gates.device_scalars or
-            upload_stats.resident_weight_bytes != expected or upload_stats.bf16_mirror_weight_count != 0)
+            (if (memorilla_bf16_matrices) upload_stats.resident_weight_bytes >= expected else upload_stats.resident_weight_bytes != expected) or
+            upload_stats.bf16_mirror_weight_count != 0)
             return error.UnsupportedMemorillaPrecision;
         const after = try memorilla_qualification.artifactGeneration(allocator, profile_io, model_path, profile, load_control orelse .{});
         if (!std.mem.eql(u8, &after, &profile_generation.?)) return error.ModelArtifactsChanging;
@@ -2296,6 +2308,17 @@ fn createCudaSessionWithRequiredProfile(
     }
     if (debug_cuda_session) std.log.info("cuda-session: return session path={s}", .{model_path});
     return .{ .ptr = impl, .vtable = &arch_vtable };
+}
+
+/// A BF16-source Memorilla layer matrix kept resident in BF16 (research
+/// mode). Widening then rounding to nearest even reproduces the source bits.
+fn uploadMemorillaBf16Matrix(compute: anytype, name: []const u8, loaded: *const LoadedWeight) !void {
+    if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedMemorillaPrecision;
+    if (loaded.tensor.dtype == .f32) return compute.insertBf16WeightFromF32Tensor(name, &loaded.tensor);
+    if (loaded.tensor.dtype != .bf16) return error.UnsupportedMemorillaPrecision;
+    var converted = try weight_source_mod.convertToF32(compute.allocator, &loaded.tensor);
+    defer converted.deinit();
+    return compute.insertBf16WeightFromF32Tensor(name, &converted);
 }
 
 fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const LoadedWeight, precision: GlinerCudaPrecision) !void {
@@ -8832,8 +8855,13 @@ pub fn requireMemorillaProfile(session: Session, expected: memorilla_qualificati
         compute.capability_profile != (if (encoder) CudaCapabilityProfile.qwen3_embedding else .qwen3_generation) or
         compute.resident_weights.count() != (if (encoder) @as(usize, 398) else 399))
         return error.UnsupportedMemorillaPrecision;
-    var iter = compute.resident_weights.valueIterator();
-    while (iter.next()) |weight| if (weight.dtype != .f32 or weight.quant_type != null) return error.UnsupportedMemorillaPrecision;
+    const bf16_matrices = memorilla_qualification.researchBf16Matrices();
+    var iter = compute.resident_weights.iterator();
+    while (iter.next()) |entry| {
+        const weight = entry.value_ptr;
+        const research_bf16 = bf16_matrices and weight.dtype == .bf16 and memorilla_qualification.isResearchBf16Matrix(entry.key_ptr.*, weight.shape.len);
+        if ((weight.dtype != .f32 and !research_bf16) or weight.quant_type != null) return error.UnsupportedMemorillaPrecision;
+    }
 }
 
 pub fn requireMemorillaDecoderF32(session: Session) !gpt_mod.Config {
@@ -8852,6 +8880,37 @@ pub fn requireMemorillaCudaExecution(backend: *const ops.ComputeBackend) !void {
         return error.UnsupportedMemorillaPrecision;
     try memorilla_qualification.requireCudaEnvironment();
     try memorilla_qualification.requireCudaExecutionStats(compute.snapshotStats());
+}
+
+/// Diagnostics only (`ANTFLY_INFERENCE_CUDA_PROFILE_PREFILL_OPS=1`): drain
+/// this session's CUDA op profile, log it under `label`, then clear it.
+/// Call only while no request holds the session's execution scope.
+pub fn logMemorillaOpProfile(session: Session, label: []const u8) void {
+    if (comptime !build_options.enable_cuda) return;
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda) return;
+    const compute = &self.backend_data.cuda.compute;
+    if (!compute.runtime_policy.prefill_profile) return;
+    cuda_compute_mod.drainCudaProfile(compute);
+    const s = &compute.stats;
+    std.log.info("memorilla_op_profile label={s} events={d} bf16_linear_us={d} bf16_qkv_us={d} bf16_pair_us={d} f16_linear_us={d} attention_us={d} staging_us={d} norm_us={d} rope_us={d} elementwise_us={d} embedding_us={d} kv_write_us={d}", .{
+        label,                             s.prefill_profile_events,     s.prefill_profile_bf16_linear_us, s.prefill_profile_bf16_qkv_us,      s.prefill_profile_bf16_pair_us,
+        s.prefill_profile_f16_linear_us,   s.prefill_profile_attention_us, s.prefill_profile_staging_us,   s.prefill_profile_norm_us,          s.prefill_profile_rope_us,
+        s.prefill_profile_elementwise_us,  s.prefill_profile_embedding_us, s.prefill_profile_kv_write_us,
+    });
+    s.prefill_profile_events = 0;
+    s.prefill_profile_bf16_qkv_us = 0;
+    s.prefill_profile_bf16_pair_us = 0;
+    s.prefill_profile_bf16_linear_us = 0;
+    s.prefill_profile_f16_linear_us = 0;
+    s.prefill_profile_attention_us = 0;
+    s.prefill_profile_staging_us = 0;
+    s.prefill_profile_norm_us = 0;
+    s.prefill_profile_rope_us = 0;
+    s.prefill_profile_elementwise_us = 0;
+    s.prefill_profile_embedding_us = 0;
+    s.prefill_profile_kv_write_us = 0;
 }
 
 pub fn requireMemorillaBackend(session: Session, expected: memorilla_qualification.Profile, backend: *const ops.ComputeBackend) !void {

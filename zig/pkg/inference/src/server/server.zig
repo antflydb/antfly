@@ -15891,12 +15891,20 @@ pub const Node = struct {
         const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
         if (hybrid) {
             // One resident encoder serves both the pooled and the per-token
-            // (run-time LoRA) passes.
-            var result = memorilla_hybrid_service.generate(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control, .{ .request_limits = self.config.request_limits }) catch |err|
+            // (run-time LoRA) passes. `read_mode` picks the span cascade's
+            // read, or (`none`) the soft rows alone.
+            var options: memorilla_hybrid_service.Options = .{ .request_limits = self.config.request_limits };
+            if (request.read_mode.value) |mode| switch (mode) {
+                .auto => options.span_read_mode = .auto,
+                .narrow => options.span_read_mode = .narrow,
+                .wide => options.span_read_mode = .wide,
+                .none => options.span_soft_only = true,
+            };
+            var result = memorilla_hybrid_service.generate(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control, options) catch |err|
                 return memorillaFailureResponse(ctx, err, false);
             defer result.deinit();
             control.check() catch |err| return inferenceFailureResponse(ctx, err);
-            return memorillaHybridResponse(ctx, scratch, profile.name, &result);
+            return memorillaHybridResponse(ctx, scratch, profile.name, &result, request.include_diagnostics);
         }
         if (research) {
             var result = memorilla_research_service.generate(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control, .{ .request_limits = self.config.request_limits }) catch |err|
@@ -31693,6 +31701,13 @@ fn memorillaFailureResponse(ctx: *httpx.Context, err: anyerror, input_preflight:
         return ctx.status(409).json(.{ .@"error" = "INCOMPATIBLE_MEMORILLA_PROFILE", .message = @errorName(err) });
     if (err == error.UnexpectedMemorillaEmbeddings)
         return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "document_embeddings is not accepted by an encoder_lora_research or hybrid_research profile; supply document_texts" });
+    // Request options the profile cannot take: read modes need a hybrid
+    // span bundle (auto, narrow and wide also a span cascade), diagnostics a
+    // hybrid profile. Found at preflight or once the bundle protocol is read.
+    if (err == error.UnsupportedMemorillaReadMode)
+        return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "read_mode requires a hybrid_research profile whose bundle supports it (auto, narrow and wide need a span read cascade; none a span bundle)" });
+    if (err == error.UnsupportedMemorillaDiagnostics)
+        return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "include_diagnostics is supported only by hybrid_research profiles" });
     if (input_preflight) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
     if (err == error.UnsupportedMemorillaArtifact or err == error.MemorillaManagedProducerRequired)
         return ctx.status(409).json(.{ .@"error" = "INCOMPATIBLE_MEMORILLA_PROFILE", .message = @errorName(err) });
@@ -33134,11 +33149,201 @@ fn memorillaResearchResponse(ctx: *httpx.Context, scratch: std.mem.Allocator, mo
     });
 }
 
+/// The body of a `hybrid_research` response (`MemorillaGenerateResponse`),
+/// fields in wire order. Serialized as a plain struct (explicit nulls kept).
+const MemorillaHybridBody = struct {
+    model: []const u8,
+    text: []const u8,
+    token_ids: ?[]i32,
+    finish_reason: []const u8,
+    input_documents: usize,
+    memory_tokens: usize,
+    context_source: []const u8,
+    answer_guard: []const u8,
+    record_gate: []const u8,
+    canonicalized: bool,
+    citations: []MemorillaCitationJson,
+    citations_unavailable: bool,
+    candidate_sha256: []const u8,
+    encoder_execution_identity: []const u8,
+    decoder_execution_identity: []const u8,
+    memory_module_sha256: []const u8,
+    soft_module_sha256: []const u8,
+    usage: struct {
+        encoder_query_tokens: usize,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
+};
+
+/// Writes a struct's fields in declaration order and leaves out optional
+/// fields that are null (OpenAPI absence inside `MemorillaDiagnostics`).
+fn writeFieldsOmittingNull(writer: anytype, value: anytype) !void {
+    try writer.beginObject();
+    const info = @typeInfo(@TypeOf(value)).@"struct";
+    inline for (info.field_names, info.field_types) |name, field_type| {
+        const item = @field(value, name);
+        if (@typeInfo(field_type) == .optional) {
+            if (item) |present| {
+                try writer.objectField(name);
+                try writer.write(present);
+            }
+        } else {
+            try writer.objectField(name);
+            try writer.write(item);
+        }
+    }
+    try writer.endObject();
+}
+
+/// `MemorillaDiagnosticRegion`: bytes `[start, end)` of `document_texts[document_index]`.
+const MemorillaDiagnosticRegionJson = struct {
+    document_index: usize,
+    start: usize,
+    end: usize,
+    text: []const u8,
+};
+
+const MemorillaDiagnosticWindowJson = struct {
+    /// The window's ids as the decoder would read them (padded with spaces
+    /// to `window_rows`), decoded.
+    text: []const u8,
+    regions: []MemorillaDiagnosticRegionJson,
+};
+
+const MemorillaDiagnosticTimingsJson = struct {
+    pooled: f64,
+    span_features: ?f64 = null,
+    span_head: ?f64 = null,
+    wide_features: ?f64 = null,
+    wide_head: ?f64 = null,
+    window: ?f64 = null,
+    soft_rows: f64,
+    generate: f64,
+    total: f64,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writeFieldsOmittingNull(writer, self);
+    }
+};
+
+/// `MemorillaDiagnostics` (`include_diagnostics`, hybrid_research only).
+/// Fields that do not apply to the request are absent.
+const MemorillaDiagnosticsJson = struct {
+    /// auto, narrow, wide (a cascade bundle), none (soft rows only) or all
+    /// (a span bundle without a cascade reads every document); absent for a
+    /// copy17 record bundle.
+    read_mode: ?[]const u8 = null,
+    read_pass: ?[]const u8 = null,
+    widened: ?bool = null,
+    cascade_threshold: ?f64 = null,
+    narrow_margin: ?f64 = null,
+    wide_margin: ?f64 = null,
+    narrow_unavailable: ?[]const u8 = null,
+    wide_unavailable: ?[]const u8 = null,
+    read_documents: ?usize = null,
+    read_tokens: ?usize = null,
+    read_budget_tokens: ?usize = null,
+    window_rows: ?usize = null,
+    score: ?f64 = null,
+    null_score: ?f64 = null,
+    margin: ?f64 = null,
+    gate_policy: ?[]const u8 = null,
+    gate_offset: ?f64 = null,
+    gate_profile: ?[]const u8 = null,
+    gate_open: bool,
+    span: ?MemorillaDiagnosticRegionJson = null,
+    window: ?MemorillaDiagnosticWindowJson = null,
+    raw_answer: []const u8,
+    timings_ms: ?MemorillaDiagnosticTimingsJson = null,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writeFieldsOmittingNull(writer, self);
+    }
+};
+
+const MemorillaHybridBodyWithDiagnostics = struct {
+    body: MemorillaHybridBody,
+    diagnostics: MemorillaDiagnosticsJson,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(MemorillaHybridBody).@"struct".field_names) |name| {
+            try writer.objectField(name);
+            try writer.write(@field(self.body, name));
+        }
+        try writer.objectField("diagnostics");
+        try writer.write(self.diagnostics);
+        try writer.endObject();
+    }
+};
+
+/// JSON numbers only: non-finite values (an `always` gate's -inf offset)
+/// are left out.
+fn finiteOrNull(value: f64) ?f64 {
+    return if (std.math.isFinite(value)) value else null;
+}
+
+fn memorillaRegionsJson(allocator: std.mem.Allocator, regions: ?memorilla_hybrid_service.Citations) ![]MemorillaDiagnosticRegionJson {
+    const items = if (regions) |found| found.items else &.{};
+    const out = try allocator.alloc(MemorillaDiagnosticRegionJson, items.len);
+    for (items, out) |item, *view| view.* = .{ .document_index = item.document_index, .start = item.start, .end = item.end, .text = item.text };
+    return out;
+}
+
+fn memorillaDiagnosticsJson(scratch: std.mem.Allocator, result: *const memorilla_hybrid_service.OwnedResult) !MemorillaDiagnosticsJson {
+    var out = MemorillaDiagnosticsJson{ .gate_open = result.record_gate == .open, .raw_answer = result.raw_text };
+    if (result.timings) |t| out.timings_ms = .{
+        .pooled = t.pooled_ms,
+        .span_features = if (result.soft_only) null else t.span_features_ms,
+        .span_head = if (result.soft_only) null else t.span_head_ms,
+        .wide_features = if (result.span != null and result.span.?.wide_margin != null) t.wide_features_ms else null,
+        .wide_head = if (result.span != null and result.span.?.wide_margin != null) t.wide_head_ms else null,
+        .window = if (result.soft_only) null else t.window_ms,
+        .soft_rows = t.soft_rows_ms,
+        .generate = t.generate_ms,
+        .total = t.total_ms,
+    };
+    if (result.soft_only) {
+        out.read_mode = "none";
+        return out;
+    }
+    const span = result.span orelse return out;
+    out.read_mode = if (span.read_mode) |mode| @tagName(mode) else "all";
+    if (span.read_mode) |mode| {
+        out.read_pass = if (span.read_pass) |pass| @tagName(pass) else null;
+        out.widened = mode == .auto and if (span.read_pass) |pass| pass == .wide else false;
+        out.cascade_threshold = span.cascade_threshold;
+    }
+    out.narrow_margin = if (span.narrow_margin) |m| finiteOrNull(m) else null;
+    out.wide_margin = if (span.wide_margin) |m| finiteOrNull(m) else null;
+    out.narrow_unavailable = span.narrow_unavailable;
+    out.wide_unavailable = span.wide_unavailable;
+    out.read_documents = span.read_documents;
+    out.read_tokens = span.read_tokens;
+    out.read_budget_tokens = if (span.read_budget_tokens == 0) null else span.read_budget_tokens;
+    out.window_rows = span.window_rows;
+    out.score = finiteOrNull(span.score);
+    out.null_score = finiteOrNull(span.null_score);
+    out.margin = finiteOrNull(span.margin);
+    out.gate_policy = @tagName(span.gate_policy);
+    out.gate_offset = finiteOrNull(span.gate_offset);
+    out.gate_profile = span.gate_profile;
+    if (result.span_regions) |regions| if (regions.items.len == 1) {
+        const item = regions.items[0];
+        out.span = .{ .document_index = item.document_index, .start = item.start, .end = item.end, .text = item.text };
+    };
+    out.window = .{ .text = result.record_text, .regions = try memorillaRegionsJson(scratch, result.window_regions) };
+    return out;
+}
+
 /// Buffered response of a `hybrid_research` profile: the research fields plus
 /// the gate, the canonicalization flag, the row count and the soft reader
-/// digest. `scratch` holds the citation views until the body is serialized.
-fn memorillaHybridResponse(ctx: *httpx.Context, scratch: std.mem.Allocator, model: []const u8, result: *const memorilla_hybrid_service.OwnedResult) !httpx.Response {
-    return ctx.json(.{
+/// digest, and (`include_diagnostics`) the `diagnostics` object last.
+/// `scratch` holds the citation and diagnostic views until the body is
+/// serialized. Without diagnostics the body is byte-for-byte the earlier one.
+fn memorillaHybridResponse(ctx: *httpx.Context, scratch: std.mem.Allocator, model: []const u8, result: *const memorilla_hybrid_service.OwnedResult, include_diagnostics: bool) !httpx.Response {
+    const body = MemorillaHybridBody{
         .model = model,
         .text = result.generation.text,
         .token_ids = result.generation.token_ids,
@@ -33161,7 +33366,9 @@ fn memorillaHybridResponse(ctx: *httpx.Context, scratch: std.mem.Allocator, mode
             .prompt_tokens = result.generation.prompt_tokens,
             .completion_tokens = result.generation.tokens_used,
         },
-    });
+    };
+    if (!include_diagnostics) return ctx.json(body);
+    return ctx.json(MemorillaHybridBodyWithDiagnostics{ .body = body, .diagnostics = try memorillaDiagnosticsJson(scratch, result) });
 }
 
 test "Memorilla HTTP hybrid response reports the gate rows canonicalization and both readers" {
@@ -33206,9 +33413,43 @@ test "Memorilla HTTP hybrid response reports the gate rows canonicalization and 
         defer request.deinit();
         var ctx = httpx.Context.init(a, std.testing.io, &request);
         defer ctx.deinit();
-        var response = try memorillaHybridResponse(&ctx, arena.allocator(), "hybrid", &result);
+        var response = try memorillaHybridResponse(&ctx, arena.allocator(), "hybrid", &result, false);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        // Without include_diagnostics the body is byte-for-byte the response
+        // written before the diagnostics existed.
+        {
+            var before_request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+            defer before_request.deinit();
+            var before_ctx = httpx.Context.init(a, std.testing.io, &before_request);
+            defer before_ctx.deinit();
+            var before = try before_ctx.json(.{
+                .model = @as([]const u8, "hybrid"),
+                .text = result.generation.text,
+                .token_ids = result.generation.token_ids,
+                .finish_reason = researchFinishReason(result.generation.finish_reason),
+                .input_documents = result.document_count,
+                .memory_tokens = result.memory_tokens,
+                .context_source = "supplied_documents",
+                .answer_guard = @tagName(result.answer_guard),
+                .record_gate = @tagName(result.record_gate),
+                .canonicalized = result.canonicalized,
+                .citations = try memorillaCitationsJson(arena.allocator(), result.citations.items),
+                .citations_unavailable = result.citations.unavailable,
+                .candidate_sha256 = @as([]const u8, &result.candidate_sha256),
+                .encoder_execution_identity = @as([]const u8, &result.encoder_execution_identity),
+                .decoder_execution_identity = @as([]const u8, &result.decoder_execution_identity),
+                .memory_module_sha256 = @as([]const u8, &result.module_sha256),
+                .soft_module_sha256 = @as([]const u8, &result.soft_module_sha256),
+                .usage = .{
+                    .encoder_query_tokens = result.question_tokens,
+                    .prompt_tokens = result.generation.prompt_tokens,
+                    .completion_tokens = result.generation.tokens_used,
+                },
+            });
+            defer before.deinit();
+            try std.testing.expectEqualStrings(before.body.?, response.body.?);
+        }
         var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
         defer parsed.deinit();
         const fields = parsed.value.object;
@@ -33227,7 +33468,209 @@ test "Memorilla HTTP hybrid response reports the gate rows canonicalization and 
             try std.testing.expectEqualStrings("case_insensitive", citations[0].object.get("match").?.string);
             try std.testing.expect(citations[0].object.get("slots") == null);
         }
+        try std.testing.expect(fields.get("diagnostics") == null);
     }
+}
+
+test "Memorilla HTTP hybrid diagnostics report the cascade, gate, span, window and timings" {
+    const a = std.testing.allocator;
+    // Document 1 holds the span and the window (byte offsets into document_texts[1]).
+    var span_text = "Kq9-0012".*;
+    var window_text = "Gate code Kq9-0012 opens the north yard".*;
+    var span_items = [_]memorilla_hybrid_service.Citation{
+        .{ .document_index = 1, .start = 10, .end = 18, .text = &span_text, .slots = .{ 0, 4 }, .supports_answer = false, .match = .none },
+    };
+    var window_items = [_]memorilla_hybrid_service.Citation{
+        .{ .document_index = 1, .start = 0, .end = 39, .text = &window_text, .slots = .{ 0, 9 }, .supports_answer = false, .match = .none },
+    };
+    var cited = window_text;
+    var citation_items = [_]memorilla_hybrid_service.Citation{
+        .{ .document_index = 1, .start = 0, .end = 39, .text = &cited, .slots = .{ 0, 9 }, .supports_answer = true, .match = .exact },
+    };
+    var token_ids = [_]i32{ 42, 7 };
+    var raw = "kq9-0012".*;
+    var record = " Gate code Kq9-0012 opens the north yard     ".*;
+    const identity: [64]u8 = @splat('a');
+    const soft: [64]u8 = @splat('b');
+    var result = memorilla_hybrid_service.OwnedResult{
+        .allocator = a,
+        .generation = .{ .text = "Kq9-0012", .token_ids = &token_ids, .prompt_tokens = 130, .tokens_used = 2, .finish_reason = "stop", .allocator = a },
+        .answer_guard = .accepted,
+        .record_gate = .open,
+        .canonicalized = true,
+        .memory_tokens = 80,
+        .encoder_execution_identity = identity,
+        .decoder_execution_identity = identity,
+        .module_sha256 = identity,
+        .soft_module_sha256 = soft,
+        .candidate_sha256 = identity,
+        .adapter_sha256 = identity,
+        .document_count = 8,
+        .soft_rows = 8,
+        .question_tokens = 9,
+        .citations = .{ .allocator = a, .items = &citation_items, .unavailable = false },
+        .record_text = &record,
+        .raw_text = &raw,
+        .min_snap_cosine = 1,
+        .span = .{
+            .start = 30,
+            .end = 33,
+            .window_lo = 27,
+            .window_hi = 36,
+            .score = 9.5,
+            .null_score = 2.0,
+            .margin = 2.5,
+            .gate_policy = .learned,
+            .gate_offset = -3,
+            .head_ms = 7.5,
+            .read_mode = .auto,
+            .read_pass = .wide,
+            .cascade_threshold = -4,
+            .narrow_margin = -6.25,
+            .wide_margin = 2.5,
+            .read_documents = 7,
+            .read_tokens = 448,
+            .read_budget_tokens = 452,
+            .window_rows = 64,
+        },
+        .span_regions = .{ .allocator = a, .items = &span_items, .unavailable = false },
+        .window_regions = .{ .allocator = a, .items = &window_items, .unavailable = false },
+        .timings = .{ .pooled_ms = 30, .span_features_ms = 60, .span_head_ms = 5, .wide_features_ms = 120, .wide_head_ms = 6, .window_ms = 2, .soft_rows_ms = 4, .generate_ms = 200, .total_ms = 440 },
+        .response_lease = .{ .controller = null, .amounts = .{}, .amounts_by_backend = @splat(.{}), .retain_backend_class = null, .live_reserved_bytes = 0 },
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const Body = struct {
+        fn get(allocator: std.mem.Allocator, owned: *const memorilla_hybrid_service.OwnedResult, scratch: std.mem.Allocator) !std.json.Parsed(std.json.Value) {
+            var request = try httpx.Request.init(allocator, .POST, "/ai/v1/memorilla/generate");
+            defer request.deinit();
+            var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try memorillaHybridResponse(&ctx, scratch, "hybrid", owned, true);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            return std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+        }
+    };
+
+    // A widened cascade request with an open gate.
+    {
+        var parsed = try Body.get(a, &result, arena.allocator());
+        defer parsed.deinit();
+        const top = parsed.value.object;
+        // The ordinary fields are unchanged and diagnostics come last.
+        try std.testing.expectEqualStrings("Kq9-0012", top.get("text").?.string);
+        try std.testing.expectEqual(@as(usize, 1), top.get("citations").?.array.items.len);
+        try std.testing.expectEqualStrings("diagnostics", top.keys()[top.count() - 1]);
+        const d = top.get("diagnostics").?.object;
+        try std.testing.expectEqualStrings("auto", d.get("read_mode").?.string);
+        try std.testing.expectEqualStrings("wide", d.get("read_pass").?.string);
+        try std.testing.expect(d.get("widened").?.bool);
+        try std.testing.expectEqual(@as(f64, -4), try memorillaTestNumber(d.get("cascade_threshold").?));
+        try std.testing.expectEqual(@as(f64, -6.25), try memorillaTestNumber(d.get("narrow_margin").?));
+        try std.testing.expectEqual(@as(f64, 2.5), try memorillaTestNumber(d.get("wide_margin").?));
+        try std.testing.expectEqual(@as(f64, 2.5), try memorillaTestNumber(d.get("margin").?));
+        try std.testing.expectEqual(@as(f64, 9.5), try memorillaTestNumber(d.get("score").?));
+        try std.testing.expectEqual(@as(f64, 2), try memorillaTestNumber(d.get("null_score").?));
+        try std.testing.expectEqual(@as(f64, -3), try memorillaTestNumber(d.get("gate_offset").?));
+        try std.testing.expectEqualStrings("learned", d.get("gate_policy").?.string);
+        try std.testing.expect(d.get("gate_open").?.bool);
+        try std.testing.expectEqual(@as(i64, 7), d.get("read_documents").?.integer);
+        try std.testing.expectEqual(@as(i64, 448), d.get("read_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 452), d.get("read_budget_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 64), d.get("window_rows").?.integer);
+        try std.testing.expectEqualStrings("kq9-0012", d.get("raw_answer").?.string);
+        // Absent rather than null when not applicable.
+        for ([_][]const u8{ "narrow_unavailable", "wide_unavailable", "gate_profile" }) |name|
+            try std.testing.expect(d.get(name) == null);
+        const span = d.get("span").?.object;
+        try std.testing.expectEqual(@as(i64, 1), span.get("document_index").?.integer);
+        try std.testing.expectEqual(@as(i64, 10), span.get("start").?.integer);
+        try std.testing.expectEqual(@as(i64, 18), span.get("end").?.integer);
+        try std.testing.expectEqualStrings("Kq9-0012", span.get("text").?.string);
+        const window = d.get("window").?.object;
+        try std.testing.expectEqualStrings(&record, window.get("text").?.string);
+        const regions = window.get("regions").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), regions.len);
+        try std.testing.expectEqual(@as(i64, 39), regions[0].object.get("end").?.integer);
+        try std.testing.expect(regions[0].object.get("supports_answer") == null);
+        const timings = d.get("timings_ms").?.object;
+        for ([_][]const u8{ "pooled", "span_features", "span_head", "wide_features", "wide_head", "window", "soft_rows", "generate", "total" }) |name|
+            try std.testing.expect(timings.get(name) != null);
+        try std.testing.expectEqual(@as(f64, 440), try memorillaTestNumber(timings.get("total").?));
+    }
+
+    // Kept narrow, gate closed, an `always` policy's infinite offset.
+    result.span.?.read_pass = .narrow;
+    result.span.?.wide_margin = null;
+    result.span.?.narrow_margin = -1.5;
+    result.span.?.gate_policy = .always;
+    result.span.?.gate_offset = -std.math.inf(f64);
+    result.span.?.wide_unavailable = "MemorillaEncoderBoundExceeded";
+    result.record_gate = .closed;
+    {
+        var parsed = try Body.get(a, &result, arena.allocator());
+        defer parsed.deinit();
+        const d = parsed.value.object.get("diagnostics").?.object;
+        try std.testing.expectEqualStrings("narrow", d.get("read_pass").?.string);
+        try std.testing.expect(!d.get("widened").?.bool);
+        try std.testing.expect(d.get("wide_margin") == null);
+        try std.testing.expect(d.get("gate_offset") == null);
+        try std.testing.expect(!d.get("gate_open").?.bool);
+        try std.testing.expectEqualStrings("MemorillaEncoderBoundExceeded", d.get("wide_unavailable").?.string);
+        const timings = d.get("timings_ms").?.object;
+        try std.testing.expect(timings.get("wide_features") == null);
+        try std.testing.expect(timings.get("wide_head") == null);
+        // The span and window are reported even though the decoder did not read them.
+        try std.testing.expect(d.get("span") != null);
+        try std.testing.expect(d.get("window") != null);
+    }
+
+    // A span bundle without a cascade reads every document.
+    result.span.?.read_mode = null;
+    result.span.?.read_pass = null;
+    result.span.?.cascade_threshold = null;
+    {
+        var parsed = try Body.get(a, &result, arena.allocator());
+        defer parsed.deinit();
+        const d = parsed.value.object.get("diagnostics").?.object;
+        try std.testing.expectEqualStrings("all", d.get("read_mode").?.string);
+        for ([_][]const u8{ "read_pass", "widened", "cascade_threshold" }) |name| try std.testing.expect(d.get(name) == null);
+    }
+
+    // read_mode none: soft rows only, no span pass.
+    result.span = null;
+    result.span_regions = null;
+    result.window_regions = null;
+    result.soft_only = true;
+    result.memory_tokens = 16;
+    result.canonicalized = false;
+    result.record_text = &.{};
+    result.citations.items = citation_items[0..0];
+    result.timings = .{ .pooled_ms = 30, .soft_rows_ms = 4, .generate_ms = 150, .total_ms = 200 };
+    {
+        var parsed = try Body.get(a, &result, arena.allocator());
+        defer parsed.deinit();
+        const top = parsed.value.object;
+        try std.testing.expectEqualStrings("closed", top.get("record_gate").?.string);
+        try std.testing.expectEqual(@as(i64, 16), top.get("memory_tokens").?.integer);
+        const d = top.get("diagnostics").?.object;
+        try std.testing.expectEqualStrings("none", d.get("read_mode").?.string);
+        try std.testing.expect(!d.get("gate_open").?.bool);
+        for ([_][]const u8{ "read_pass", "margin", "score", "span", "window", "read_documents", "gate_policy" }) |name|
+            try std.testing.expect(d.get(name) == null);
+        const timings = d.get("timings_ms").?.object;
+        for ([_][]const u8{ "span_features", "span_head", "wide_features", "window" }) |name| try std.testing.expect(timings.get(name) == null);
+        try std.testing.expectEqual(@as(f64, 150), try memorillaTestNumber(timings.get("generate").?));
+    }
+}
+
+fn memorillaTestNumber(value: std.json.Value) !f64 {
+    return switch (value) {
+        .float => |x| x,
+        .integer => |x| @floatFromInt(x),
+        else => error.TestUnexpectedResult,
+    };
 }
 
 test "Memorilla HTTP research response publishes citations with byte offsets into document_texts" {
@@ -33317,6 +33760,10 @@ test "Memorilla failure responses map research profile faults" {
         .{ .err = error.UnexpectedMemorillaEmbeddings, .preflight = true, .status = 400 },
         .{ .err = error.UnexpectedMemorillaEmbeddings, .preflight = false, .status = 400 },
         .{ .err = error.MemorillaSourceContextRequired, .preflight = true, .status = 400 },
+        // read_mode / include_diagnostics the profile or bundle cannot take.
+        .{ .err = error.UnsupportedMemorillaReadMode, .preflight = true, .status = 400 },
+        .{ .err = error.UnsupportedMemorillaReadMode, .preflight = false, .status = 400 },
+        .{ .err = error.UnsupportedMemorillaDiagnostics, .preflight = true, .status = 400 },
     };
     for (cases) |case| {
         var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");

@@ -1134,6 +1134,7 @@ from .inference_media_content_part import InferenceMediaContentPart
 from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_memorilla_generate_request import InferenceMemorillaGenerateRequest
 from .inference_memorilla_generate_request_context_mode import InferenceMemorillaGenerateRequestContextMode
+from .inference_memorilla_generate_request_read_mode import InferenceMemorillaGenerateRequestReadMode
 from .inference_memorilla_generate_response import InferenceMemorillaGenerateResponse
 from .inference_memorilla_generate_response_answer_guard import InferenceMemorillaGenerateResponseAnswerGuard
 from .inference_memorilla_generate_response_answer_path import InferenceMemorillaGenerateResponseAnswerPath
@@ -1344,8 +1345,16 @@ from .media_output_coverage_counts import MediaOutputCoverageCounts
 from .media_output_coverage_values import MediaOutputCoverageValues
 from .memorilla_citation import MemorillaCitation
 from .memorilla_citation_match import MemorillaCitationMatch
+from .memorilla_diagnostic_region import MemorillaDiagnosticRegion
+from .memorilla_diagnostic_timings import MemorillaDiagnosticTimings
+from .memorilla_diagnostic_window import MemorillaDiagnosticWindow
+from .memorilla_diagnostics import MemorillaDiagnostics
+from .memorilla_diagnostics_gate_policy import MemorillaDiagnosticsGatePolicy
+from .memorilla_diagnostics_read_mode import MemorillaDiagnosticsReadMode
+from .memorilla_diagnostics_read_pass import MemorillaDiagnosticsReadPass
 from .memorilla_generate_request import MemorillaGenerateRequest
 from .memorilla_generate_request_context_mode import MemorillaGenerateRequestContextMode
+from .memorilla_generate_request_read_mode import MemorillaGenerateRequestReadMode
 from .memorilla_generate_response import MemorillaGenerateResponse
 from .memorilla_generate_response_answer_guard import MemorillaGenerateResponseAnswerGuard
 from .memorilla_generate_response_answer_path import MemorillaGenerateResponseAnswerPath
@@ -3847,6 +3856,7 @@ __all__ = (
     "InferenceMediaContentPartType",
     "InferenceMemorillaGenerateRequest",
     "InferenceMemorillaGenerateRequestContextMode",
+    "InferenceMemorillaGenerateRequestReadMode",
     "InferenceMemorillaGenerateResponse",
     "InferenceMemorillaGenerateResponseAnswerGuard",
     "InferenceMemorillaGenerateResponseAnswerPath",
@@ -4055,8 +4065,16 @@ __all__ = (
     "MediaOutputCoverageValues",
     "MemorillaCitation",
     "MemorillaCitationMatch",
+    "MemorillaDiagnosticRegion",
+    "MemorillaDiagnostics",
+    "MemorillaDiagnosticsGatePolicy",
+    "MemorillaDiagnosticsReadMode",
+    "MemorillaDiagnosticsReadPass",
+    "MemorillaDiagnosticTimings",
+    "MemorillaDiagnosticWindow",
     "MemorillaGenerateRequest",
     "MemorillaGenerateRequestContextMode",
+    "MemorillaGenerateRequestReadMode",
     "MemorillaGenerateResponse",
     "MemorillaGenerateResponseAnswerGuard",
     "MemorillaGenerateResponseAnswerPath",

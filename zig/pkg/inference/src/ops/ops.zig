@@ -3287,6 +3287,12 @@ pub const ComputeBackend = struct {
         /// fuse gate/up projection, activation/multiply, and down projection.
         gatedFfnNoBias: ?*const fn (ctx: *anyopaque, request: *const GatedFfnNoBiasRequest) anyerror!?CT = null,
 
+        /// Rank-r adapter epilogue: `base + scale * down @ up^T` with F32
+        /// `base [rows, out_dim]`, `down [rows, rank]` and `up [out_dim, rank]`
+        /// into a new tensor (`base` is not modified). Null falls back to
+        /// the unfused linear, scale and add.
+        loraUpAdd: ?*const fn (ctx: *anyopaque, base: CT, down: CT, up: CT, rows: usize, rank: usize, out_dim: usize, scale: f32) anyerror!?CT = null,
+
         /// Execute a qLen=1 decoder attention step for the backend-owned
         /// path. Backends may return null to fall back to the ordinary
         /// attention path.
@@ -6119,6 +6125,11 @@ pub const ComputeBackend = struct {
         if (self.vtable.gatedFfnNoBias) |op| {
             return op(self.ptr, request);
         }
+        return null;
+    }
+
+    pub fn loraUpAdd(self: *const ComputeBackend, base: CT, down: CT, up: CT, rows: usize, rank: usize, out_dim: usize, scale: f32) !?CT {
+        if (self.vtable.loraUpAdd) |op| return op(self.ptr, base, down, up, rows, rank, out_dim, scale);
         return null;
     }
 

@@ -21,6 +21,7 @@
 const std = @import("std");
 const reader = @import("../models/memorilla_runtime.zig");
 const research = @import("../models/memorilla_research_runtime.zig");
+const span_head = @import("../models/memorilla_span_head_runtime.zig");
 const memory = @import("../runtime/root.zig").tier.memory;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
@@ -67,6 +68,8 @@ pub fn identity(a: A, io: std.Io, directory: []const u8, files: []const []const 
 
 pub const Cache = ReaderCache(reader.Owner);
 pub const ResearchCache = ReaderCache(research.Owner);
+/// The device-resident span head of a hybrid span-window bundle.
+pub const SpanHeadCache = ReaderCache(span_head.Owner);
 
 pub fn ReaderCache(comptime Owner: type) type {
     return struct {

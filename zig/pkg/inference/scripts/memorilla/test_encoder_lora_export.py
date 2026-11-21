@@ -656,3 +656,29 @@ def test_export_reader_can_pin_encoder_lora_for_run_time_adapters(tmp_path):
     )
     default = export.export_reader(candidate, tmp_path / "plain", config=CONFIG)
     assert "encoder-lora.safetensors" not in default["files"]
+
+
+def test_export_reader_pins_a_span_head_only_for_span_window_candidates(tmp_path):
+    candidate = tmp_path / "cand"
+    write_candidate(candidate)
+    with pytest.raises(ValueError, match="span-window"):
+        export.export_reader(candidate, tmp_path / "x", config=CONFIG, include_span_head=True)
+    head = candidate / "span-head.safetensors"
+    head.write_bytes(b"span head bytes")
+    protocol = json.loads((candidate / "protocol.json").read_text())
+    protocol["record_kind"] = "span-window"
+    (candidate / "protocol.json").write_text(json.dumps(protocol))
+    pinned = json.loads((candidate / "candidate.json").read_text())
+    pinned["protocol_sha256"] = exporter.sha256(candidate / "protocol.json")
+    pinned["span_head_sha256"] = "0" * 64
+    (candidate / "candidate.json").write_text(json.dumps(pinned))
+    with pytest.raises(ValueError, match="span-head"):
+        export.export_reader(candidate, tmp_path / "y", config=CONFIG, include_span_head=True)
+    pinned["span_head_sha256"] = exporter.sha256(head)
+    (candidate / "candidate.json").write_text(json.dumps(pinned))
+    output = tmp_path / "bundle"
+    manifest = export.export_reader(
+        candidate, output, config=CONFIG, include_encoder_lora=True, include_span_head=True
+    )
+    assert manifest["files"]["span-head.safetensors"]["sha256"] == exporter.sha256(head)
+    assert (output / "span-head.safetensors").read_bytes() == head.read_bytes()

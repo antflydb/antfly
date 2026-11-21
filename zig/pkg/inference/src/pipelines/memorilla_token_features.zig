@@ -40,6 +40,7 @@ const tok = @import("inference_tokenizer");
 const qualified = @import("../models/memorilla_qualification.zig");
 const encoder = @import("memorilla_encoder.zig");
 const copy = @import("memorilla_copy.zig");
+const span_window = @import("memorilla_span.zig");
 const A = std.mem.Allocator;
 
 pub const width: usize = qualified.width;
@@ -340,6 +341,40 @@ pub fn prepareBounded(a: A, tokenizer: tok.Tokenizer, documents: []const []const
     defer context.deinit();
     const sources = try sourceMap(a, tokenizer, documents, prefixed, &context);
     errdefer if (sources) |owned| a.free(owned);
+    var batch = try assembleBatchBounded(a, tokenizer, &context, question, bound);
+    batch.sources = sources;
+    return batch;
+}
+
+/// The span copy half's batch (`qwen_span_copy.span_features`): the same
+/// prefix, self-context and source map as `prepareBounded`, with every
+/// doubled document encoded after the question prefix
+/// (`memorilla_span.questionPrefix`); the kept tail ids are verified
+/// unchanged. The question row is still appended (its states are unused).
+pub fn prepareSpanBounded(a: A, tokenizer: tok.Tokenizer, documents: []const []const u8, question: []const u8, bound: usize) !Batch {
+    if (documents.len == 0 or documents.len > qualified.max_documents) return error.InvalidMemorillaDocumentCount;
+    const prefixed = try a.alloc([]u8, documents.len);
+    var built: usize = 0;
+    defer {
+        for (prefixed[0..built]) |text| a.free(text);
+        a.free(prefixed);
+    }
+    for (documents, prefixed) |document, *text| {
+        text.* = try prefixDocument(a, document);
+        built += 1;
+    }
+    var context = try selfContextTokens(a, tokenizer, prefixed);
+    defer context.deinit();
+    const sources = try sourceMap(a, tokenizer, documents, prefixed, &context);
+    errdefer if (sources) |owned| a.free(owned);
+    const prefix = try span_window.questionPrefix(a, question);
+    defer a.free(prefix);
+    const conditioned = try span_window.prefixDoubledTexts(a, tokenizer, context.texts, context.counts, prefix);
+    for (context.texts, conditioned) |*text, joined| {
+        a.free(text.*);
+        text.* = joined;
+    }
+    a.free(conditioned);
     var batch = try assembleBatchBounded(a, tokenizer, &context, question, bound);
     batch.sources = sources;
     return batch;
@@ -859,6 +894,35 @@ test "memorilla token features batch appends EOS, right pads and bounds the leng
     for (0..512) |index| huge_len += (try std.fmt.bufPrint(huge_buf[huge_len..], " w{d}", .{index})).len;
     // 512 words doubled -> 1024 ids + EOS = 1025 > 1024.
     try std.testing.expectError(error.MemorillaEncoderBoundExceeded, prepareBounded(a, tokenizer, &.{huge_buf[0..huge_len]}, "q", hybrid_max_padded_length));
+}
+
+test "memorilla token features span batch prefixes every doubled document with the question" {
+    const a = std.testing.allocator;
+    const tokenizer = WordTokenizer.handle();
+    var plain = try prepareBounded(a, tokenizer, &.{ "a b", " c" }, "q  r", hybrid_max_padded_length);
+    defer plain.deinit();
+    var prefixed = try prepareSpanBounded(a, tokenizer, &.{ "a b", " c" }, "q  r", hybrid_max_padded_length);
+    defer prefixed.deinit();
+    // Same copy sources, counts and source map; only the document rows grow.
+    try std.testing.expectEqualSlices(u32, plain.copy_ids, prefixed.copy_ids);
+    try std.testing.expectEqualSlices(usize, plain.counts, prefixed.counts);
+    try std.testing.expectEqual(plain.batch, prefixed.batch);
+    // The word tokenizer has no offsets, so neither batch carries a source map.
+    try std.testing.expectEqual(plain.sources == null, prefixed.sources == null);
+    if (plain.sources) |sources| {
+        try std.testing.expectEqual(sources.len, prefixed.sources.?.len);
+        for (sources, prefixed.sources.?) |x, y| try std.testing.expect(std.meta.eql(x, y));
+    }
+    // "Question: q r\nPassage:" adds the words "Question:" (initial), "q",
+    // "r\nPassage:" in front of each doubled document.
+    const head = [_]i64{ WordTokenizer.hash("Question:") + 100_000, WordTokenizer.hash("q"), WordTokenizer.hash("r\nPassage:") };
+    for (0..2) |row| {
+        const p_row = prefixed.input_ids[row * prefixed.seq_len ..][0..prefixed.active[row]];
+        const q_row = plain.input_ids[row * plain.seq_len ..][0..plain.active[row]];
+        try std.testing.expectEqual(q_row.len + head.len, p_row.len);
+        try std.testing.expectEqualSlices(i64, &head, p_row[0..head.len]);
+        try std.testing.expectEqualSlices(i64, q_row, p_row[head.len..]);
+    }
 }
 
 test "memorilla token features select the last n_i + 1 rows per document and the question EOS row" {

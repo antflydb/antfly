@@ -1,0 +1,48 @@
+{
+  "note": "Synthetic sample content: every site, company, person and code below is invented.",
+  "chunks": [
+    {
+      "title": "Harrow Quay Depot (site record)",
+      "text": "Site record: Harrow Quay Depot. Harrow Quay Depot is a riverside materials yard on the east bank of the Calder Reach, owned by Kestrel Civil Works Ltd and leased to the Northgate rail upgrade until March 2028. The site manager is Odile Brancaster, who signs off every delivery before 07:30. The key holder for the main gate and the cement store is Tobias Weringa; out of hours, call the Kestrel control room and ask for him by name. The main gate access code is Hq4-007315 and the alarm panel code for the cement store is 5521. Heavy goods vehicles must use the north entrance on Ferrow Lane, because the south ramp has a 7.5 tonne weight limit. The yard holds two silos of CEM I cement, a rebar bending shop and a fuel bowser with a capacity of 4,000 litres. Permit to dig PTD-2291 covers the drainage trench along the river wall. Hazards: soft ground near the slipway, overhead power lines above bay C, and flooding during spring tides. Visitors sign in at the cabin beside the weighbridge and must wear a hard hat, boots, gloves and a high-visibility vest at all times."
+    },
+    {
+      "title": "Bellmoor Cutting (site record)",
+      "text": "Site record: Bellmoor Cutting. Bellmoor Cutting is a deep railway cutting being widened for a second track, owned by Lindqvist and Rowe Infrastructure. The works run from the Pike Road bridge to the Hensham tunnel portal, a distance of about 1.8 kilometres. The site manager is Pradeep Allonby and the key holder for the compound and the explosives magazine is Marisol Teague, who keeps the only spare set of keys in the Lindqvist office in Dunmere. The compound gate code is Bc7-002964. The old gate on Pike Road, code Bc7-002946, was sealed in June and must not be used. The magazine alarm code is 8840 and is changed every month by the security contractor. Blasting takes place only between 11:00 and 14:00 on weekdays, after a siren sounds three times. Slope monitoring prisms are read twice a day and any movement above 5 millimetres stops all work in the cutting. Spoil is taken by dump truck to the tip at Carrow Farm. Hazards: rockfall from the upper benches, fly rock during blasts, and the live railway line beside the east fence."
+    },
+    {
+      "title": "Tamsin Reach Yard (site record)",
+      "text": "Site record: Tamsin Reach Yard. Tamsin Reach Yard is a pipe storage and welding yard for the coastal water main, owned by Corvane Utilities plc and operated under contract by Baltane Group. The site manager is Hollis Draycott. The key holder for the yard gate, the welding shed and the gas store is Anouk Fennimore; the deputy key holder, used only when she is on leave, is Casimir Oduya. The yard gate code is Tr2-008150 and the gas store alarm code is 3307. Steel pipe sections of 900 millimetre diameter are stacked no more than three high, chocked on timber bearers. Welding is permitted from 07:00 to 19:00, and every weld is radiographed before a section leaves the yard. Deliveries arrive by low-loader through the west gate on Saltings Road. Fire watch must continue for one hour after hot work stops. The yard floods at its southern edge during storm surges, so the gas cylinders are kept on the raised platform near the north fence. Hazards: rolling pipes, welding fumes, compressed gas and reversing low-loaders."
+    },
+    {
+      "title": "Ordway Viaduct worksite (site record)",
+      "text": "Site record: Ordway Viaduct worksite. The Ordway Viaduct worksite is where a nine-span concrete viaduct is being built across the Ordway valley. It is owned by the Ordway Crossing Partnership, a joint venture of Kestrel Civil Works Ltd and Baltane Group. The site manager is Ruairi Ostrander and the key holder for the main compound, the formwork store and the crane cabins is Greta Valcourt. The main compound gate code is Ov9-004407 and the alarm code for the formwork store is 6192. Two tower cranes serve the piers; they stop working when the wind speed at the jib exceeds 20 metres per second. Concrete for the piers is pumped from the batching plant at the north abutment, and every pour is logged with its slump, air temperature and cube references. Pier 5 sits on bored piles 24 metres deep because of a buried river channel. Access to the deck is by the stair tower at pier 2 only. Hazards: work at height, suspended loads, falling objects from the deck edge and the river at the valley floor."
+    },
+    {
+      "title": "Curing concrete (general)",
+      "text": "Concrete does not dry to gain strength; it hardens through hydration, a chemical reaction between cement and water. If the water in fresh concrete evaporates too early, hydration stops near the surface, and the slab is left weaker, more porous and prone to cracking and dusting. Curing means keeping the concrete moist and at a moderate temperature long enough for hydration to continue. Common methods are covering the surface with wet hessian or plastic sheeting, ponding or spraying water, and spraying a curing compound that forms a membrane to hold moisture in. For ordinary cement, at least seven days of curing is usual, although concrete keeps gaining strength for weeks and its design strength is normally specified at 28 days. Hot, dry and windy weather speeds up evaporation and makes curing more urgent. In cold weather the reaction slows down, and if fresh concrete freezes the expanding ice can damage it, so it is insulated or heated until it reaches a safe strength."
+    },
+    {
+      "title": "How tower cranes grow (general)",
+      "text": "A tower crane arrives on site in pieces and is assembled by a mobile crane: first the base, then a few mast sections, then the slewing unit, the operator's cab, the jib and the counter-jib with its concrete counterweights. To grow taller as the building rises, many tower cranes climb themselves. A climbing frame is fitted around the top of the mast, and a hydraulic ram in the frame jacks the whole upper part of the crane up by the height of one mast section. The crane then lifts a new section off the ground, slides it into the gap and bolts it in place, and the process repeats. Some cranes instead climb inside the building's core, moving up on collars fixed to the floors. The counterweights balance the load on the hook, and a load moment indicator stops lifts that would overload the crane. Cranes are taken out of service in high winds and left free to weathervane, turning with the wind so that the jib does not catch it side-on."
+    },
+    {
+      "title": "Tides (general)",
+      "text": "Tides are caused mainly by the Moon's gravity. The Moon pulls hardest on the side of the Earth facing it and least on the far side, and this difference stretches the oceans into two bulges, one under the Moon and one on the opposite side. As the Earth turns, most coasts pass through both bulges, so they see two high tides and two low tides a little more than a day apart in total, about every 12 hours and 25 minutes. The Sun also raises tides, about half as strong as the Moon's. When the Sun, Moon and Earth are in line, at new moon and full moon, the two effects add up and produce spring tides, with the highest highs and lowest lows. When the Sun and Moon are at right angles, at the quarter moons, they partly cancel and produce neap tides with a small range. The shape of coasts and the depth of the sea change the local tidal range a great deal."
+    },
+    {
+      "title": "The honeybee waggle dance (general)",
+      "text": "A honeybee forager that finds a rich patch of flowers returns to the hive and tells her nestmates where it is by dancing on the vertical comb. In the waggle dance she runs a short straight line while waggling her abdomen, then circles back to the start and repeats. The angle of the waggle run from vertical shows the direction of the food relative to the Sun: a run straight up the comb means fly towards the Sun, and a run 40 degrees to the right of vertical means fly 40 degrees to the right of the Sun. The duration of the waggle run encodes the distance, longer runs meaning food farther away. Bees that follow the dancer pick up the scent of the flowers and then fly out to search. For food very close to the hive the forager performs a round dance instead, which signals that food is nearby without giving a precise direction. The more rewarding the source, the more circuits a forager dances."
+    }
+  ],
+  "questions": [
+    "What is the main gate access code for Harrow Quay Depot?",
+    "Who is the key holder for Bellmoor Cutting?",
+    "Which company owns Tamsin Reach Yard?",
+    "What is the alarm code for the formwork store at the Ordway Viaduct worksite?",
+    "Who signs off deliveries at Harrow Quay Depot?",
+    "Why must fresh concrete be kept moist?",
+    "How does a tower crane make itself taller?",
+    "What causes spring tides?",
+    "How do honeybees tell other bees where flowers are?"
+  ]
+}

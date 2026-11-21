@@ -144,7 +144,72 @@ pub const Options = struct {
     trace: ?decode.Trace = null,
     teacher_forced_ids: ?[]const i64 = null,
     ignore_eos: bool = false,
+    /// Hybrid span-window bundles only: overrides the bundle protocol's gate
+    /// policy (`always` keeps the evidence window in every prompt, `learned`
+    /// only when the span outscores no-answer by the exported threshold).
+    span_gate_policy: ?@import("../pipelines/memorilla_span.zig").GatePolicy = null,
+    /// Hybrid span-window bundles with gate routes only: the request's task
+    /// profile (a row of `span_gate_routes.profiles`), whose offset gates the
+    /// window under any policy. Internal for now (plan 8.17); not decoded
+    /// from the HTTP request body.
+    span_gate_profile: ?[]const u8 = null,
+    /// Hybrid span-window bundles with `span_read_cascade` only (plan 8.32):
+    /// `narrow` (top two candidates, 32-row window), `wide` (candidates to
+    /// the cascade's token budget, its window) or `auto` (the cascade; the
+    /// default). A bundle without a cascade refuses any mode. Decoded from
+    /// the HTTP `read_mode` (`auto`, `narrow`, `wide`).
+    span_read_mode: ?@import("../pipelines/memorilla_span.zig").ReadMode = null,
+    /// Hybrid span-window bundles only (HTTP `read_mode: none`): skip the
+    /// span pass and answer from the 16 soft rows alone under the released
+    /// helpful prompt, exactly the closed-gate path (stock Memorilla over the
+    /// same pooled vectors). Exclusive with `span_read_mode`.
+    span_soft_only: bool = false,
+    /// Cascade `auto` requests: whether the wide pass reuses the narrow
+    /// pass's feature rows of the shared leading documents (null: the
+    /// `ANTFLY_MEMORILLA_SPAN_CASCADE_REUSE` default, on). Internal research
+    /// A/B switch; not decoded from HTTP.
+    span_cascade_reuse: ?bool = null,
+    /// The question's stored (retrieval-time) pooled vector: unit norm,
+    /// `qualified.width` wide, FP16-representable. When present the request
+    /// reuses it instead of encoding the question (the caller already embedded
+    /// the question to retrieve). Internal; not decoded from HTTP.
+    stored_question: ?[]const f32 = null,
+    /// Hybrid only: the collection's stored chunk vectors for the soft half
+    /// (as the native service reads them) instead of pooling the span
+    /// documents at request time. Internal; not decoded from HTTP.
+    stored_documents: ?[]const []const f32 = null,
+    /// Hybrid span-window bundles only (research parity with
+    /// `qwen_hybrid_eval.py paper-run --arms hybrid-bench`): the benchmark
+    /// prompt instead of the service's own. Internal; not decoded from HTTP.
+    span_bench_prompt: ?BenchPrompt = null,
 };
+
+/// `hybrid-bench`: `system` under either gate state (never merged with the
+/// bundle's exact-answer prompt) and the user turn
+/// `(question.strip() + user_suffix).strip()` (`memory_user_turn`).
+pub const BenchPrompt = struct {
+    system: []const u8,
+    user_suffix: []const u8 = "",
+};
+
+/// Validates stored unit-norm vectors (`validateInputs` rules) and returns
+/// them flattened as the reader's BF16-valued F32 inputs.
+pub fn storedRows(a: A, rows: []const []const f32, max_rows: usize) ![]f32 {
+    if (rows.len == 0) return error.EmptyMemorillaCollection;
+    if (rows.len > max_rows) return error.MemorillaCollectionBudgetExceeded;
+    const flat = try a.alloc(f32, rows.len * qualified.width);
+    errdefer a.free(flat);
+    for (rows, 0..) |row, i| {
+        if (row.len != qualified.width) return error.InvalidMemorillaFeatureWidth;
+        var norm: f64 = 0;
+        for (row, flat[i * qualified.width ..][0..qualified.width]) |value, *out| {
+            out.* = (try encoder.storedValue(value)).memory;
+            norm += @as(f64, value) * value;
+        }
+        if (@abs(@sqrt(norm) - 1) > 0.01) return error.UnnormalizedMemorillaFeature;
+    }
+    return flat;
+}
 
 pub const OwnedResult = struct {
     generation: generation.GenerationResult,
@@ -288,11 +353,18 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     const encoder_model = encoder_handle.get();
     try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
     try notify(options, .encoder_loaded, manager);
-    var features = try encoder.encodeQuestion(backing, &encoder_handle, canonical, limits, encoder_control);
-    defer features.deinit();
-    if (!std.mem.eql(u8, features.question_text, canonical)) return error.NonCanonicalMemorillaQuestion;
-    try encoder.requireProducer(features.producer, paths.encoder.publication.?, encoder.v1_profile);
-    if (options.question_features) |callback| try callback(options.context, &features);
+    // A stored question vector (from retrieval) replaces the question pass.
+    const stored_question: ?[]f32 = if (options.stored_question) |vector| try storedRows(backing, &.{vector}, 1) else null;
+    defer if (stored_question) |values| backing.free(values);
+    var encoded: ?encoder.Features = if (stored_question == null) try encoder.encodeQuestion(backing, &encoder_handle, canonical, limits, encoder_control) else null;
+    defer if (encoded) |*features| features.deinit();
+    if (encoded) |*features| {
+        if (!std.mem.eql(u8, features.question_text, canonical)) return error.NonCanonicalMemorillaQuestion;
+        try encoder.requireProducer(features.producer, paths.encoder.publication.?, encoder.v1_profile);
+        if (options.question_features) |callback| try callback(options.context, features);
+    }
+    const question_vector: []const f32 = if (stored_question) |values| values else encoded.?.question;
+    const question_tokens = if (encoded) |features| features.question_tokens else preflight_question_tokens;
     try notify(options, .question_encoded, manager);
     try control.check();
     try paths.encoder.verify(a, io);
@@ -345,7 +417,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
         }
         const docs = try reader_backend.fromFloat32Shape(flat, &.{ @intCast(documents.len), @intCast(qualified.width) });
         defer reader_backend.free(docs);
-        const query = try reader_backend.fromFloat32Shape(features.question, &.{ 1, @intCast(qualified.width) });
+        const query = try reader_backend.fromFloat32Shape(question_vector, &.{ 1, @intCast(qualified.width) });
         defer reader_backend.free(query);
         try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
         try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
@@ -376,9 +448,9 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     try control.check();
     try notify(options, .decoded, manager);
     try control.check();
-    if (features.question_tokens != preflight_question_tokens) return error.InvalidMemorillaTokens;
+    if (question_tokens != preflight_question_tokens) return error.InvalidMemorillaTokens;
     transfer_response = true;
-    return .{ .generation = result, .encoder_execution_identity = qualified.executionIdentity(.qwen3_encoder_f32_v1), .decoder_execution_identity = qualified.executionIdentity(.qwen3_decoder_f32_kv_f32_v1), .module_sha256 = module_sha256, .document_count = documents.len, .question_tokens = features.question_tokens, .response_lease = response_lease };
+    return .{ .generation = result, .encoder_execution_identity = qualified.executionIdentity(.qwen3_encoder_f32_v1), .decoder_execution_identity = qualified.executionIdentity(.qwen3_decoder_f32_kv_f32_v1), .module_sha256 = module_sha256, .document_count = documents.len, .question_tokens = question_tokens, .response_lease = response_lease };
 }
 
 fn preflightQuestion(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, canonical: []const u8, control: Control) !usize {

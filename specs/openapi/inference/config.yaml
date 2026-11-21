@@ -1158,7 +1158,30 @@ components:
             are split into sentence-greedy chunks of at most 128 tokens, one
             soft-memory vector each, at most 64 vectors) and encodes the
             per-token record batch with the run-time encoder LoRA (padded
-            batch rows of at most 1024 tokens).
+            batch rows of at most 1024 tokens). With a span read cascade the
+            texts are the ranked candidate list, best first: the soft half
+            pools every text and the span reads take leading texts.
+        read_mode:
+          type: string
+          enum: [auto, narrow, wide, none]
+          description: |
+            hybrid_research profiles only (400 for other kinds). Absent keeps
+            the bundle's default read (auto on a bundle with a span read
+            cascade; every text on a span bundle without one). auto, narrow
+            and wide need a bundle with a span read cascade (400 otherwise):
+            narrow reads the top two texts with a 32-token window; wide reads
+            texts in order while their encoder tokens stay within the
+            cascade's budget, with its wider window; auto reads narrow and
+            reads wide when the narrow margin is below the cascade threshold,
+            reusing the narrow pass's work. none needs a span bundle and skips
+            the span pass: the decoder reads the 16 soft rows alone under the
+            released helpful prompt, the closed-gate path, i.e. stock
+            Memorilla over the same pooled vectors (record_gate closed,
+            memory_tokens 16, no citations).
+        include_diagnostics:
+          type: boolean
+          default: false
+          description: hybrid_research profiles only (true is 400 for other kinds). Adds the diagnostics object to the response; the answer and every other field are unchanged.
     MemorillaGenerateUsage:
       type: object
       additionalProperties: false
@@ -1229,8 +1252,8 @@ components:
         input_documents: { type: integer, minimum: 1, maximum: 64 }
         memory_tokens:
           type: integer
-          enum: [0, 16, 32]
-          description: Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate. hybrid_research reports 32 when the record gate opened (16 soft rows then 16 record rows) and 16 when it closed (soft rows only).
+          enum: [0, 16, 32, 48, 80]
+          description: Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate. hybrid_research reports 32 when the record gate opened (16 soft rows then 16 record rows) and 16 when it closed (soft rows only); span-window bundles report 16 plus the evidence window rows when it opened (48 for a 32-row window, 80 for the cascade's 64-row wide window) and 16 when it closed or read_mode is none.
         context_source:
           type: string
           enum: [supplied_embeddings, supplied_embeddings_and_documents, supplied_documents]
@@ -1286,6 +1309,174 @@ components:
         memory_module_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
         usage:
           $ref: '#/components/schemas/MemorillaGenerateUsage'
+        diagnostics:
+          $ref: '#/components/schemas/MemorillaDiagnostics'
+    MemorillaDiagnosticRegion:
+      type: object
+      additionalProperties: false
+      required: [document_index, start, end, text]
+      description: A region of one caller document, mapped from encoder copy positions the way citations are.
+      properties:
+        document_index:
+          type: integer
+          minimum: 0
+          maximum: 63
+          description: Index into the request's document_texts.
+        start:
+          type: integer
+          minimum: 0
+          description: Inclusive UTF-8 byte offset into document_texts[document_index], on a character boundary.
+        end:
+          type: integer
+          minimum: 1
+          description: Exclusive UTF-8 byte offset; end > start.
+        text:
+          type: string
+          description: Exactly the bytes document_texts[document_index][start:end], surrounding whitespace trimmed.
+    MemorillaDiagnosticWindow:
+      type: object
+      additionalProperties: false
+      required: [text, regions]
+      properties:
+        text:
+          type: string
+          description: The evidence window as the decoder reads it when the gate opens (its tokens padded with spaces to window_rows), decoded.
+        regions:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/MemorillaDiagnosticRegion'
+          description: Where the window sits in document_texts, one region per document it touches (a window never crosses documents today). Empty when citations_unavailable.
+    MemorillaDiagnosticTimings:
+      type: object
+      additionalProperties: false
+      required: [pooled, soft_rows, generate, total]
+      description: |
+        Server-side stage times in milliseconds. Each stage is measured from
+        the end of the previous one, so it also carries the model-handle and
+        integrity checks done since. total spans the whole service call
+        (preflight, admission and every stage); queueing before it is not
+        included.
+      properties:
+        pooled:
+          type: number
+          minimum: 0
+          description: "Stock-encoder pooled vectors of the texts and the question."
+        span_features:
+          type: number
+          minimum: 0
+          description: "The first span pass's per-token encoder features (encoder LoRA at run time). Absent for read_mode none."
+        span_head:
+          type: number
+          minimum: 0
+          description: "The first pass's span head, including the decoder handle acquisition before it. Absent for read_mode none."
+        wide_features:
+          type: number
+          minimum: 0
+          description: "The cascade's wide pass features (reusing the narrow pass's leading rows). Present only when a wide pass ran after the first pass."
+        wide_head:
+          type: number
+          minimum: 0
+          description: "The wide pass's span head. Present only with wide_features."
+        window:
+          type: number
+          minimum: 0
+          description: "Read plan, evidence window, path checks and the window's embedding rows. Absent for read_mode none."
+        soft_rows:
+          type: number
+          minimum: 0
+          description: "The released reader's 16 soft rows."
+        generate:
+          type: number
+          minimum: 0
+          description: "Decoder prefill and greedy decoding."
+        total:
+          type: number
+          minimum: 0
+    MemorillaDiagnostics:
+      type: object
+      additionalProperties: false
+      required: [gate_open, raw_answer]
+      description: |
+        hybrid_research profiles with include_diagnostics only: how the span
+        hybrid read the request. Fields that do not apply are absent (never
+        null). Margins are score - null_score - the bundle's span gate
+        threshold; the cascade widens when the narrow margin is below
+        cascade_threshold, and the gate opens when margin >= gate_offset.
+        Research diagnostics, not a stable contract.
+      properties:
+        read_mode:
+          type: string
+          enum: [auto, narrow, wide, none, all]
+          description: The read the request ran. all is a span bundle without a cascade (every text is read). Absent for a copy-head (non-span) bundle.
+        read_pass:
+          type: string
+          enum: [narrow, wide]
+          description: Cascade only. The pass whose record the request used.
+        widened:
+          type: boolean
+          description: Cascade only. True when auto used the wide pass.
+        cascade_threshold:
+          type: number
+          description: Cascade only. The narrow margin below which auto reads wide.
+        narrow_margin:
+          type: number
+          description: Cascade only. Margin of the narrow pass; absent when it did not run.
+        wide_margin:
+          type: number
+          description: Cascade only. Margin of the wide pass; absent when it did not run.
+        narrow_unavailable:
+          type: string
+          description: Cascade only. Why the narrow read set was skipped at preflight (an error name); absent when usable.
+        wide_unavailable:
+          type: string
+          description: Cascade only. Why the wide read set was skipped at preflight; absent when usable.
+        read_documents:
+          type: integer
+          minimum: 1
+          description: Leading texts the used pass read.
+        read_tokens:
+          type: integer
+          minimum: 0
+          description: Copy tokens of the used pass's read set.
+        read_budget_tokens:
+          type: integer
+          minimum: 0
+          description: Encoder tokens the wide read budget summed; absent when no budget applied.
+        window_rows:
+          type: integer
+          minimum: 1
+          description: Evidence window rows of the used pass (32 narrow, the cascade's width wide).
+        score:
+          type: number
+          description: Best span score (start plus end logit).
+        null_score:
+          type: number
+          description: No-answer score.
+        margin:
+          type: number
+          description: Margin of the record used; the gate compares it with gate_offset.
+        gate_policy:
+          type: string
+          enum: [always, learned, routed]
+        gate_offset:
+          type: number
+          description: The offset the margin was compared with; absent for the always policy (the gate is always open).
+        gate_profile:
+          type: string
+          description: Routed or declared gate profile name, when one applied.
+        gate_open:
+          type: boolean
+          description: Equals record_gate open. When true the decoder read the soft rows then the window rows.
+        span:
+          $ref: '#/components/schemas/MemorillaDiagnosticRegion'
+        window:
+          $ref: '#/components/schemas/MemorillaDiagnosticWindow'
+        raw_answer:
+          type: string
+          description: The stripped decoder answer before canonicalization and the answer guard.
+        timings_ms:
+          $ref: '#/components/schemas/MemorillaDiagnosticTimings'
     GenerateRequest:
       type: object
       required:

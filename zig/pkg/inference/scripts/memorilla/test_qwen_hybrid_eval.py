@@ -42,6 +42,28 @@ from qwen_hybrid_eval import (
     generate_greedy_batch,
     paired_summary,
     read_rows,
+    CHOICE_TABLE,
+    PAPER_TARGETS,
+    choice_accuracy_from_correct,
+    choice_embedding_texts,
+    choice_row_correct,
+    clean_generation_text,
+    embed_pooled_texts,
+    file_sha256,
+    load_choice_table,
+    nonempty_choices,
+    paired_bootstrap_ci,
+    paper_arm_files,
+    case_name,
+    CUSTOM_TARGETS,
+    cases_split,
+    records_split,
+    paper_released_checkpoint,
+    per_row_scores,
+    save_choice_table,
+    score_arm,
+    text_key,
+    truncate_prompt_right,
     paper_arm_spec,
     paper_generation_limit,
     paper_memory_system,
@@ -464,10 +486,13 @@ class Benchmarks:
             self.max_new_tokens = max_new_tokens
 
     class _Benchmark:
-        def __init__(self, system, suffix, max_new_tokens, scoring, metrics, baseline):
+        def __init__(
+            self, system, suffix, max_new_tokens, scoring, metrics, baseline, length
+        ):
             self.system_prompt, self.suffix = system, suffix
             self.max_new_tokens, self.scoring = max_new_tokens, scoring
             self.metrics, self.baseline = metrics, baseline
+            self.max_length = length
 
     BENCHMARKS = {
         "triviaqa": _Benchmark(
@@ -477,6 +502,7 @@ class Benchmarks:
             "exact_match",
             ("exact_match", "f1"),
             _Baseline("You are a helpful assistant.", TRIVIA_SUFFIX, 64),
+            2048,
         ),
         "narrativeqa": _Benchmark(
             "You are a personalized AI assistant.",
@@ -485,6 +511,34 @@ class Benchmarks:
             "generation",
             ("rougeL", "f1"),
             _Baseline("Answer briefly.", "", 64),
+            8192,
+        ),
+        "pv4": _Benchmark(
+            "You are a personalized AI assistant.",
+            "",
+            256,
+            "choice",
+            ("accuracy", "accuracy_hard"),
+            _Baseline("You are a helpful assistant.", "", 256),
+            8192,
+        ),
+        "factkg": _Benchmark(
+            "You are a personalized AI assistant.",
+            "",
+            8,
+            "choice",
+            ("accuracy",),
+            _Baseline("Fact check.", "\n\nA:\n", 8),
+            2048,
+        ),
+        "lamp7": _Benchmark(
+            "You are a personalized AI assistant.",
+            "",
+            128,
+            "generation",
+            ("rouge1", "rougeL"),
+            _Baseline("Style.", "", 128),
+            1024,
         ),
     }
 
@@ -623,8 +677,9 @@ def test_paper_protocol_reads_the_upstream_registry():
     enwiki = paper_protocol("enwiki", Benchmarks)
     assert enwiki["system"] == Benchmarks.HELPFUL_PROMPT
     assert enwiki["max_new_tokens"] == 512 and enwiki["baseline"] is None
+    assert enwiki["max_length"] == 2048 and trivia["max_length"] == 2048
     with pytest.raises(ValueError):
-        paper_protocol("factkg", Benchmarks)
+        paper_protocol("squad", Benchmarks)
 
 
 def test_prompt_merging_with_benchmark_prompts():
@@ -768,6 +823,14 @@ def test_paper_argument_parsing(tmp_path):
     assert run.arms == ["soft", "hybrid", "rag-1", "rag-5"]
     assert run.truncations == [16] and run.record_top_k == 2
     assert run.record_gate_cosine == 0.85 and run.encoder_max_length == 2048
+    assert run.record_extractor == "candidate" and run.record_stride == 8
+    base = ["paper-run", "--target", "triviaqa", "--data-root", "x", "--assets", "x",
+            "--candidate", "x", "--cases", "x", "--output", "x", "--arms", "hybrid-bench"]
+    cheap = parse_paper_args([*base, "--record-extractor", "embed-window", "--record-stride", "4"])
+    assert cheap.record_extractor == "embed-window" and cheap.record_stride == 4
+    for bad in (["--record-extractor", "bm25"], ["--record-stride", "0"]):
+        with pytest.raises(SystemExit):
+            parse_paper_args([*base, *bad])
     with pytest.raises(ValueError):
         parse_paper_args(
             [
@@ -894,3 +957,356 @@ def test_batched_generation_is_greedy_and_padding_free():
         assert reason == ("eos" if expected[-1] in (151645, 151643) else "length")
     # Repeated runs agree (no sampling).
     assert generate_greedy_batch(model, prompts, 6)[0] == outputs
+
+
+# --------------------------------------------------- eight-benchmark protocol
+
+
+class Metrics:
+    """Stand-in for the upstream ``memorilla.metrics`` functions the choice
+    and polarity paths call (same semantics, numpy cosine over FP16)."""
+
+    @staticmethod
+    def clean_generation(text):
+        return clean_generation_text(text)
+
+    @staticmethod
+    def choice_predictions(prediction_embeddings, choice_embeddings, choices):
+        import numpy as np
+
+        selected = []
+        for vector, candidates, texts in zip(
+            prediction_embeddings, choice_embeddings, choices, strict=True
+        ):
+            vector = vector / (np.linalg.norm(vector) + 1e-8)
+            matrix = candidates / (
+                np.linalg.norm(candidates, axis=-1, keepdims=True) + 1e-8
+            )
+            sims = np.full(len(texts), -np.inf)
+            sims[[i for i, t in enumerate(texts) if t.strip()]] = vector @ matrix.T
+            selected.append(int(np.argmax(sims)))
+        return selected
+
+    @staticmethod
+    def choice_index(choices, reference):
+        stripped = [c.strip() for c in choices]
+        return stripped.index(reference.strip())
+
+    @staticmethod
+    def first_polarity(text):
+        head = text.strip().split()[0].rstrip(".,!?:;\"'").lower() if text else ""
+        return head if head in {"yes", "no", "maybe"} else None
+
+    @staticmethod
+    def normalize_answer(text):
+        return normalize_answer(text)
+
+    @staticmethod
+    def rouge(predictions, references):
+        return {"rougeL": float(predictions[0] == references[0])}
+
+
+def test_case_split_names_and_runs():
+    # The registered split keeps its names; another split names itself.
+    assert case_name("narrativeqa", "test", 7, 42) == "narrativeqa-00007-42"
+    assert case_name("narrativeqa", "validation", 7, 42) == "narrativeqa-validation-00007-42"
+    assert case_name("enwiki", "validation", 3, 1) == "enwiki-00003-1"
+    # paper-run reads the split from the cases (absent = registered).
+    assert cases_split("pv4", [{"row": 1}, {"row": 2}]) == "test"
+    fresh = [{"row": 1, "split": "validation"}, {"row": 2, "split": "validation"}]
+    assert cases_split("pv4", fresh) == "validation"
+    with pytest.raises(ValueError):
+        cases_split("pv4", [{"row": 1}, {"row": 2, "split": "validation"}])
+    # paper-choice-embed reads it back from the record names.
+    assert records_split("pv4", [{"name": "pv4-00001-6"}]) == "test"
+    assert records_split("pv4", [{"name": "pv4-validation-00001-6"}]) == "validation"
+    assert records_split("narrativeqa", [{"name": case_name("narrativeqa", "train", 1, 2)}]) == "train"
+    with pytest.raises(ValueError):
+        records_split("pv4", [{"name": "pv4-00001-6"}, {"name": "pv4-validation-00002-6"}])
+    base =["paper-prep", "--target", "factkg", "--data-root", "x", "--output", "x",
+            "--datasets-cache", "x"]
+    assert parse_paper_args(base).split == ""
+    assert parse_paper_args([*base, "--split", "validation"]).split == "validation"
+    with pytest.raises(SystemExit):
+        parse_paper_args([*base, "--split", "dev"])
+
+
+def test_eight_targets_budgets_and_lengths():
+    assert set(PAPER_TARGETS) == {
+        "pmv2",
+        "pv4",
+        "factkg",
+        "triviaqa",
+        "narrativeqa",
+        "pubmedqa",
+        "lamp4",
+        "lamp7",
+        "enwiki",
+        *CUSTOM_TARGETS,
+    }
+    # Plan 8.17's unseen task types: validation split, custom-config defaults.
+    for target in CUSTOM_TARGETS:
+        assert PAPER_TARGETS[target] == (target, "validation")
+        custom = paper_protocol(target, Benchmarks)
+        assert custom["system"] == Benchmarks.HELPFUL_PROMPT and custom["suffix"] == ""
+        assert custom["scoring"] == Benchmarks.GENERATION and custom["baseline"] is None
+        assert custom["max_new_tokens"] == custom["paper_max_new_tokens"] == 128
+        assert custom["max_length"] == 2048
+    pv4 = paper_protocol("pv4", Benchmarks)
+    assert pv4["scoring"] == "choice"
+    assert pv4["metrics"] == ("accuracy", "accuracy_hard")
+    assert pv4["max_new_tokens"] == pv4["paper_max_new_tokens"] == 256
+    assert pv4["max_length"] == 8192
+    factkg = paper_protocol("factkg", Benchmarks)
+    assert factkg["paper_max_new_tokens"] == 8 and factkg["suffix"] == ""
+    soft = paper_arm_spec("soft")
+    assert paper_generation_limit(factkg, soft) == 8
+    assert paper_truncations(factkg, soft, 8) == []
+    lamp7 = paper_protocol("lamp7", Benchmarks)
+    assert paper_generation_limit(lamp7, soft) == 128 and lamp7["max_length"] == 1024
+    # The memory turn of every new target is the stripped question alone.
+    assert memory_user_turn(" Claim? ", factkg["suffix"]) == "Claim?"
+
+
+def test_released_checkpoint_per_target(tmp_path):
+    stage3 = tmp_path / "checkpoints" / "stage3"
+    assert paper_released_checkpoint("pmv2", tmp_path, stage3) == (
+        tmp_path / "checkpoints" / "pmv2"
+    )
+    assert paper_released_checkpoint("pv4", tmp_path, stage3) == (
+        tmp_path / "checkpoints" / "pv4"
+    )
+    for target in ("factkg", "triviaqa", "narrativeqa", "pubmedqa", "lamp4", "lamp7"):
+        assert paper_released_checkpoint(target, tmp_path, stage3) == stage3
+    other = tmp_path / "x"
+    assert paper_released_checkpoint("pmv2", tmp_path, stage3, other) == other
+    (tmp_path / "f.bin").write_bytes(b"abc")
+    assert file_sha256(tmp_path / "f.bin", block=2) == (
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    )
+
+
+def test_prompt_right_truncation_mirrors_the_collator():
+    embeds = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    same, untruncated = truncate_prompt_right(embeds, 5)
+    assert untruncated is None and torch.equal(same, embeds)
+    assert truncate_prompt_right(embeds, None)[1] is None
+    cut, untruncated = truncate_prompt_right(embeds, 3)
+    assert untruncated == 5 and torch.equal(cut, embeds[:3])
+
+
+def test_choice_texts_follow_upstream_embedding_inputs():
+    assert clean_generation_text("  True<|im_end|> ") == "True"
+    assert clean_generation_text("<|im_start|>a<|endoftext|>b") == "ab"
+    assert nonempty_choices(["A", " ", "", " B "]) == ["A", " B "]
+    rows = [
+        {
+            "predictions": {"full": " True<|im_end|>", "4": "Tr"},
+            "choices": ["True", "False"],
+        },
+        {"predictions": {"full": "True"}, "choices": ["True", "False", "  "]},
+        {"predictions": {"full": ""}, "choices": [" Maybe "]},
+    ]
+    assert choice_embedding_texts(rows) == ["True", "Tr", "False", "", " Maybe "]
+    assert text_key("a") != text_key("a ")
+
+
+def test_choice_accuracy_aggregation():
+    scores = choice_accuracy_from_correct([True, False, True, True])
+    assert scores == {"accuracy": 0.75}
+    scores = choice_accuracy_from_correct(
+        [True, False, True], [False, True, True], want_hard=True
+    )
+    assert scores == {"accuracy": 2 / 3, "accuracy_hard": 0.5}
+    assert choice_accuracy_from_correct([True], [False], True)["accuracy_hard"] == 0.0
+    with pytest.raises(ValueError):
+        choice_accuracy_from_correct([True, False], [True], True)
+    with pytest.raises(ValueError):
+        choice_accuracy_from_correct([])
+
+
+def choice_rows_and_table():
+    import numpy as np
+
+    vectors = {
+        "True": [1.0, 0.0],
+        "False": [0.0, 1.0],
+        "true it is": [0.9, 0.1],
+        "no": [0.2, 0.8],
+        "": [0.6, 0.4],
+    }
+    keys = [text_key(t) for t in vectors]
+    table = (
+        {k: i for i, k in enumerate(keys)},
+        np.array(list(vectors.values()), dtype=np.float16),
+    )
+    rows = [
+        {
+            "name": "a",
+            "answer": "True",
+            "choices": ["True", "False"],
+            "hard": False,
+            "predictions": {"full": "true it is<|im_end|>"},
+        },
+        {
+            "name": "b",
+            "answer": "True",
+            "choices": ["True", "", "False"],
+            "hard": True,
+            "predictions": {"full": "no"},
+        },
+        {
+            "name": "c",
+            "answer": " False",
+            "choices": ["True", "False"],
+            "hard": True,
+            "predictions": {"full": " "},
+        },
+    ]
+    for row in rows:
+        row.update(generated_tokens=2, finish_reason="eos")
+    return rows, table, keys, vectors
+
+
+def test_choice_rows_use_upstream_selection_and_fail_closed():
+    rows, table, _, _ = choice_rows_and_table()
+    assert choice_row_correct(rows, "full", table, Metrics) == [True, False, False]
+    protocol = {
+        "target": "pv4",
+        "scoring": "choice",
+        "metrics": ("accuracy", "accuracy_hard"),
+    }
+    entry = score_arm(protocol, rows, "full", Metrics, table)
+    assert entry["metrics"] == {"accuracy": 33.33, "accuracy_hard": 0.0}
+    assert per_row_scores(protocol, rows, "full", Metrics, table) == {
+        "a": 1.0,
+        "b": 0.0,
+        "c": 0.0,
+    }
+    with pytest.raises(ValueError, match="paper-choice-embed"):
+        score_arm(protocol, rows, "full", Metrics, None)
+    missing = [dict(rows[0], predictions={"full": "unseen"})]
+    with pytest.raises(ValueError, match="paper-choice-embed"):
+        choice_row_correct(missing, "full", table, Metrics)
+    with pytest.raises(ValueError, match="no choices"):
+        choice_row_correct([dict(rows[0], choices=[])], "full", table, Metrics)
+
+
+def test_polarity_rows_skip_references_without_polarity():
+    protocol = {"target": "pubmedqa", "scoring": "polarity", "metrics": ("accuracy",)}
+    rows = [
+        {"name": "a", "answer": "Yes. Because.", "predictions": {"full": "yes, it"}},
+        {"name": "b", "answer": "No. Not.", "predictions": {"full": "Maybe."}},
+        {"name": "c", "answer": "Unclear.", "predictions": {"full": "Yes."}},
+    ]
+    assert per_row_scores(protocol, rows, "full", Metrics) == {"a": 1.0, "b": 0.0}
+
+
+def test_choice_table_round_trip_and_tamper_check(tmp_path):
+    _, table, keys, _ = choice_rows_and_table()
+    assert load_choice_table(tmp_path) == ({}, None, {})
+    save_choice_table(tmp_path, keys, table[1], {"encoder": "e"})
+    index, vectors, meta = load_choice_table(tmp_path)
+    assert index == table[0] and (vectors == table[1]).all()
+    assert meta["texts"] == 5 and meta["encoder"] == "e"
+    with pytest.raises(ValueError):
+        save_choice_table(tmp_path, keys[:2], table[1], {})
+    meta["vectors_sha256"] = "0" * 64
+    (tmp_path / f"{CHOICE_TABLE}.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="changed"):
+        load_choice_table(tmp_path)
+
+
+def test_paired_bootstrap_interval():
+    left = {str(i): float(i % 2) for i in range(200)}
+    same = paired_bootstrap_ci(left, left, resamples=500, seed=1)
+    assert same["mean_delta"] == same["ci_low"] == same["ci_high"] == 0.0
+    better = {k: 1.0 for k in left}
+    result = paired_bootstrap_ci(left, better, resamples=2000, seed=1)
+    assert result["rows"] == 200 and result["mean_delta"] == 50.0
+    assert 40.0 < result["ci_low"] < 50.0 < result["ci_high"] < 60.0
+    assert result == paired_bootstrap_ci(left, better, resamples=2000, seed=1)
+    assert paired_bootstrap_ci({}, better) == {"rows": 0}
+    with pytest.raises(ValueError):
+        paired_bootstrap_ci(left, better, resamples=0)
+
+
+def test_arm_files_skip_record_cache(tmp_path):
+    for name in ("soft", "hybrid", "records", "run-1"):
+        (tmp_path / f"{name}.jsonl").write_text("")
+    (tmp_path / "scores.json").write_text("{}")
+    assert paper_arm_files(tmp_path) == ["hybrid", "soft"]
+
+
+def test_pooled_text_embedding_takes_each_last_real_token():
+    class Tok:
+        def __call__(self, texts, padding=False, return_tensors=None):
+            if isinstance(texts, str):
+                return {"input_ids": [1] * (len(texts) + 1)}
+            longest = max(len(t) for t in texts) + 1
+            ids = [
+                [len(t) + 1] * (len(t) + 1) + [0] * (longest - len(t) - 1)
+                for t in texts
+            ]
+            mask = [[1] * (len(t) + 1) + [0] * (longest - len(t) - 1) for t in texts]
+            return _Batch(
+                input_ids=torch.tensor(ids), attention_mask=torch.tensor(mask)
+            )
+
+    class _Batch(dict):
+        def to(self, device):
+            return self
+
+    class Enc:
+        def __call__(self, input_ids, attention_mask, use_cache):
+            hidden = torch.zeros(*input_ids.shape, 2560)
+            hidden[..., 0] = input_ids.float()
+            hidden[..., 1] = 1.0
+            return type("Out", (), {"last_hidden_state": hidden.bfloat16()})()
+
+    vectors = embed_pooled_texts(Enc(), Tok(), ["abc", "a", "ab"], 2, 16, device="cpu")
+    assert vectors.dtype == torch.float16 and vectors.shape == (3, 2560)
+    # Last real token carries id len+1 in channel 0 (padding id 0 never pooled).
+    ratios = (vectors[:, 0].float() / vectors[:, 1].float()).round().tolist()
+    assert ratios == [4.0, 2.0, 3.0]
+    assert torch.allclose(vectors.float().norm(dim=1), torch.ones(3), atol=1e-2)
+    with pytest.raises(ValueError, match="tokens"):
+        embed_pooled_texts(Enc(), Tok(), ["x" * 20], 2, 16, device="cpu")
+
+
+def test_choice_embed_and_score_argument_parsing():
+    embed = parse_paper_args(
+        [
+            "paper-choice-embed",
+            "--target",
+            "pv4",
+            "--data-root",
+            "x",
+            "--output",
+            "o",
+            "--assets",
+            "a",
+            "--arms",
+            "soft,hybrid",
+        ]
+    )
+    assert embed.arms == ["soft", "hybrid"] and embed.batch_size == 32
+    assert embed.min_verify_cosine == 0.999
+    score = parse_paper_args(
+        ["paper-score", "--target", "factkg", "--data-root", "x", "--output", "o"]
+    )
+    assert score.bootstrap_resamples == 10_000 and score.bootstrap_seed == 23
+    with pytest.raises(SystemExit):
+        parse_paper_args(
+            [
+                "paper-score",
+                "--target",
+                "factkg",
+                "--data-root",
+                "x",
+                "--output",
+                "o",
+                "--bootstrap-resamples",
+                "0",
+            ]
+        )

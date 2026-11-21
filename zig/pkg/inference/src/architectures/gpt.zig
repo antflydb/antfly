@@ -346,6 +346,11 @@ pub const EncoderLora = struct {
         };
         const down = try cb.linearNoBias(input, down_weight, rows, in_dim, self.rank);
         defer cb.free(down);
+        // Fused epilogue when the backend has one (one pass over `base`).
+        if (try cb.loraUpAdd(base, down, up_weight, rows, self.rank, out_dim, self.scale)) |adapted| {
+            if (adapted != base) cb.free(base);
+            return adapted;
+        }
         const up = try cb.linearNoBias(down, up_weight, rows, self.rank, out_dim);
         defer cb.free(up);
         const scaled = (try cb.multiplyScalar(up, self.scale)) orelse return error.UnsupportedEncoderLora;
@@ -7611,9 +7616,16 @@ fn decoderBlockImpl(
         // Residual
         break :blk try cb.add(proj, hidden);
     };
+    // The attention residual is this block's own tensor until the FFN
+    // residual consumes it: an error in the FFN sublayer (for example an
+    // exhausted per-request device budget) must release it, or the request
+    // retires with a live device allocation.
+    var attn_res_owned = true;
+    errdefer if (attn_res_owned) cb.free(attn_res);
 
     if (trace_sink == null) {
         if (try tryLightOnFusedFfnBlock(cb, config, attn_res, total, layer, &name_buf)) |result| {
+            attn_res_owned = false;
             cb.free(attn_res);
             return result;
         }
@@ -7769,6 +7781,8 @@ fn decoderBlockImpl(
         free_ffn_out = false;
         break :blk ffn_out;
     } else try cb.add(ffn_out, attn_res);
+    errdefer cb.free(result);
+    attn_res_owned = false;
     cb.free(attn_res);
 
     try dumpLayerLastRowStats(cb, allocator, layer, result, hidden_size);
@@ -11072,6 +11086,22 @@ fn feedForward(
                     .hidden_size = hidden_size,
                     .intermediate_size = inter_size,
                     .activation = decoderRuntimeActivationKind(config.activation),
+                })) |fused| return fused;
+            }
+            // Multi-row CUDA SiLU FFNs offer the backend its fused gated FFN
+            // first (the Memorilla BF16-matrix research mode takes it; every
+            // other CUDA profile declines). The vision-contract OCR decoders
+            // keep their own guarded call above.
+            if (cb.kind() == .cuda and total > 1 and config.activation == .silu and !config.hasQwen35VisionArchitectureContract()) {
+                if (try cb.gatedFfnNoBias(&.{
+                    .input = input,
+                    .gate_weight = gate_w,
+                    .up_weight = up_w,
+                    .down_weight = down_w,
+                    .rows = total,
+                    .hidden_size = hidden_size,
+                    .intermediate_size = inter_size,
+                    .activation = .silu,
                 })) |fused| return fused;
             }
             debug_timing_stats.ffn_project_pair_calls += 1;
@@ -15175,7 +15205,7 @@ const EncoderLoraTestModel = struct {
     }
 
     fn adapter(which: EncoderLora.Projection, layer: usize, part: enum { a, b }, out: []f32) void {
-        fill(out, @intCast(1000 + layer * 10 + @as(usize, @intFromEnum(which)) * 4 + @as(usize, @intFromEnum(part))), 0.3);
+        fill(out, @intCast(1000 + layer * 10 + @as(usize, @backingInt(which)) * 4 + @as(usize, @backingInt(part))), 0.3);
     }
 
     /// `merged = true` stores `W + scale * B A` for q/v, the offline merge the
@@ -15308,4 +15338,71 @@ test "encoder LoRA at run time equals the merged q/v weights and leaves the plai
     var other = cfg;
     other.family = .llama;
     try std.testing.expectError(error.UnsupportedEncoderLora, hiddenForwardTappedWithLora(&stock, a, other, &ids, batch, seq_len, null, 1, &lora));
+}
+
+/// Native backend whose FFN projections fail (out_dim 16, the test layer's
+/// intermediate size), as a CUDA FFN fails when a request exhausts its device
+/// budget.
+const FailingFfnTestBackend = struct {
+    const vtable = blk: {
+        var vt = native_compute_mod.vtable_impl;
+        vt.linearNoBias = linearNoBias;
+        vt.linearNoBiasPair = null;
+        break :blk vt;
+    };
+
+    fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
+        if (out_dim == 16) return error.ResourceLimitExceeded;
+        return native_compute_mod.vtable_impl.linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+    }
+};
+
+test "dense decoder block releases its attention residual when the FFN fails" {
+    // A Qwen3-shaped layer on the native backend whose FFN projections fail
+    // after the attention residual exists. Plan 8.28: on CUDA a span batch
+    // exhausted its device budget in the FFN, the residual leaked and the
+    // request cleanup panicked. The testing allocator reports any leak.
+    const a = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    const config: Config = .{ .family = .qwen3, .hidden_size = 8, .intermediate_size = 16, .num_hidden_layers = 1, .num_attention_heads = 2, .num_key_value_heads = 1, .attention_head_dim = 4, .vocab_size = 16, .max_position_embeddings = 64, .norm_type = .rms_norm, .position_encoding = .rope, .activation = .silu };
+    const Weight = struct { name: []const u8, rows: i64, cols: i64 };
+    const weights = [_]Weight{
+        .{ .name = "model.layers.0.input_layernorm.weight", .rows = 8, .cols = 0 },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .rows = 8, .cols = 8 },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .rows = 4, .cols = 8 },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .rows = 4, .cols = 8 },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .rows = 8, .cols = 8 },
+        .{ .name = "model.layers.0.self_attn.q_norm.weight", .rows = 4, .cols = 0 },
+        .{ .name = "model.layers.0.self_attn.k_norm.weight", .rows = 4, .cols = 0 },
+        .{ .name = "model.layers.0.post_attention_layernorm.weight", .rows = 8, .cols = 0 },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .rows = 16, .cols = 8 },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .rows = 16, .cols = 8 },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .rows = 8, .cols = 16 },
+    };
+    var values: [16 * 16]f32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i64, @intCast((i * 7) % 13)) - 6)) / 16.0;
+    for (weights) |w| {
+        const count: usize = @intCast(if (w.cols == 0) w.rows else w.rows * w.cols);
+        if (w.cols == 0) {
+            try putDeepSeekV4TestWeight(a, &store, w.name, &.{w.rows}, values[0..count]);
+        } else {
+            try putDeepSeekV4TestWeight(a, &store, w.name, &.{ w.rows, w.cols }, values[0..count]);
+        }
+    }
+    var compute = native_compute_mod.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const hidden_values = values[0..24];
+    // The same layer runs on the plain native backend.
+    {
+        const cb = compute.computeBackend();
+        const hidden = try cb.fromFloat32Shape(hidden_values, &.{ 3, 8 });
+        defer cb.free(hidden);
+        const out = try debugDecoderBlockNoOverrides(&cb, a, config, hidden, 1, 3, 1, 4, 0, null, null);
+        cb.free(out);
+    }
+    const failing = ComputeBackend{ .ptr = &compute, .vtable = &FailingFfnTestBackend.vtable };
+    const hidden = try failing.fromFloat32Shape(hidden_values, &.{ 3, 8 });
+    defer failing.free(hidden);
+    try std.testing.expectError(error.ResourceLimitExceeded, debugDecoderBlockNoOverrides(&failing, a, config, hidden, 1, 3, 1, 4, 0, null, null));
 }

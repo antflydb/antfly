@@ -142,6 +142,14 @@ def sync_detailed(
     citations with its document_index and UTF-8 byte range [start, end)
     in that document_texts entry. This path is not qualified.
 
+    Profiles configured with reader_kind=hybrid_research also take
+    read_mode (auto, narrow or wide on a bundle with a span read cascade;
+    none on any span bundle answers from the soft rows alone, i.e. stock
+    Memorilla over the same pooled vectors) and include_diagnostics, which
+    adds a diagnostics object (cascade margins and decision, gate, span and
+    window as document byte ranges, the raw answer and stage timings).
+    Other profile kinds reject both fields with 400.
+
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
             stored document embeddings.
@@ -217,6 +225,14 @@ def sync(
     citations with its document_index and UTF-8 byte range [start, end)
     in that document_texts entry. This path is not qualified.
 
+    Profiles configured with reader_kind=hybrid_research also take
+    read_mode (auto, narrow or wide on a bundle with a span read cascade;
+    none on any span bundle answers from the soft rows alone, i.e. stock
+    Memorilla over the same pooled vectors) and include_diagnostics, which
+    adds a diagnostics object (cascade margins and decision, gate, span and
+    window as document byte ranges, the raw answer and stage timings).
+    Other profile kinds reject both fields with 400.
+
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
             stored document embeddings.
@@ -286,6 +302,14 @@ async def asyncio_detailed(
     answer_guard. Every span copied into the memory record is returned in
     citations with its document_index and UTF-8 byte range [start, end)
     in that document_texts entry. This path is not qualified.
+
+    Profiles configured with reader_kind=hybrid_research also take
+    read_mode (auto, narrow or wide on a bundle with a span read cascade;
+    none on any span bundle answers from the soft rows alone, i.e. stock
+    Memorilla over the same pooled vectors) and include_diagnostics, which
+    adds a diagnostics object (cascade margins and decision, gate, span and
+    window as document byte ranges, the raw answer and stage timings).
+    Other profile kinds reject both fields with 400.
 
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
@@ -359,6 +383,14 @@ async def asyncio(
     answer_guard. Every span copied into the memory record is returned in
     citations with its document_index and UTF-8 byte range [start, end)
     in that document_texts entry. This path is not qualified.
+
+    Profiles configured with reader_kind=hybrid_research also take
+    read_mode (auto, narrow or wide on a bundle with a span read cascade;
+    none on any span bundle answers from the soft rows alone, i.e. stock
+    Memorilla over the same pooled vectors) and include_diagnostics, which
+    adds a diagnostics object (cascade margins and decision, gate, span and
+    window as document byte ranges, the raw answer and stage timings).
+    Other profile kinds reject both fields with 400.
 
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied

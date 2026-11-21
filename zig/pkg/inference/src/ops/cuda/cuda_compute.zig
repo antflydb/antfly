@@ -4124,6 +4124,10 @@ pub const CudaCompute = struct {
 
     /// Laya parity requires FP32 execution even for reduced-storage source tensors.
     strict_f32_weights: bool = false,
+    /// Memorilla BF16-matrix research mode: hidden-width RMS norms also emit
+    /// the BF16 rounding of their F32 output, which the following BF16
+    /// cuBLASLt projections read instead of staging the same values again.
+    memorilla_research_bf16_mirror: bool = false,
     /// Artifact-qualified specialty span models retain FP32 attention even
     /// when global diagnostic environment switches request reduced precision.
     qualified_span_fp32: bool = false,
@@ -5840,6 +5844,24 @@ pub const CudaCompute = struct {
         const ceiling = @min(before.limit, try std.math.add(usize, baseline, request_bytes));
         try self.ctx.device_allocations.setLimit(ceiling);
         return .{ .compute = self, .previous_limit = before.limit, .baseline = baseline };
+    }
+
+    /// Memorilla span head: full (non-causal) F32 self-attention over
+    /// token-major `[seq, heads * 128]` q/k/v (one sequence), on the tiled
+    /// prefill kernel (`KernelModule.launchMemorillaFullAttentionF32`).
+    pub fn memorillaFullAttention(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT, seq_len: usize, num_heads: usize) !CT {
+        const count = try checkedMul(seq_len, try checkedMul(num_heads, 128));
+        for ([_]CT{ q_ct, k_ct, v_ct }) |value| {
+            try ensureF32(tensorFromCt(value));
+            try ensureCount(tensorFromCt(value), count);
+        }
+        const shape = try allocShape2(self.allocator, seq_len, num_heads * 128);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
+        errdefer device.free(&self.ctx);
+        try self.kernels.launchMemorillaFullAttentionF32(&self.ctx, device, tensorFromCt(q_ct).buffer, tensorFromCt(k_ct).buffer, tensorFromCt(v_ct).buffer, 1, seq_len, num_heads);
+        self.stats.launch_attention += 1;
+        return createTensor(self, device, shape, count);
     }
 
     /// The caller owns the complete model execution lane, has released every
@@ -10881,18 +10903,29 @@ const pinned_bulk_download_min_bytes: usize = 64 * 1024;
 const pinned_bulk_download_max_bytes: usize = 4 * 1024 * 1024;
 
 fn copyToPinnedBulkDownloadAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !bool {
-    if (bytes.len < pinned_bulk_download_min_bytes or bytes.len > pinned_bulk_download_max_bytes) return false;
+    if (bytes.len < pinned_bulk_download_min_bytes) return false;
+    if (bytes.len > device.len) return error.InvalidCudaState;
     if (self.debug_cuda_graph_capture_active) return false;
     if (self.pinned_bulk_download_buffer.ptr == null) {
         self.pinned_bulk_download_buffer = buffer_mod.HostBuffer.alloc(&self.ctx, pinned_bulk_download_max_bytes) catch return false;
     }
-    const staging = self.pinned_bulk_download_buffer.bytes()[0..bytes.len];
-    const logical = buffer_mod.DeviceBuffer{ .ptr = device.ptr, .len = bytes.len };
-    try logical.copyToHost(&self.ctx, staging);
-    try synchronizeAndDrainDeferredDeviceFrees(self);
-    @memcpy(bytes, staging);
+    // Downloads larger than the staging buffer go through it in chunks: the
+    // first chunk's sync waits for the producing work, the rest are plain
+    // DMA + memcpy. Pageable copies of multi-MB hidden states otherwise run at
+    // ~100-200 MB/s on this path (15 MB in 85-155 ms).
+    const capacity = self.pinned_bulk_download_buffer.bytes().len;
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const len = @min(capacity, bytes.len - offset);
+        const staging = self.pinned_bulk_download_buffer.bytes()[0..len];
+        const logical = buffer_mod.DeviceBuffer{ .ptr = device.ptr + offset, .len = len };
+        try logical.copyToHost(&self.ctx, staging);
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        @memcpy(bytes[offset..][0..len], staging);
+        self.stats.download_syncs += 1;
+        offset += len;
+    }
     self.stats.d2h_bytes += bytes.len;
-    self.stats.download_syncs += 1;
     self.stats.pinned_bulk_downloads += 1;
     return true;
 }
@@ -11700,8 +11733,104 @@ fn lightOnFfnBf16Down(self: *CudaCompute, sources: LightOnActivationSources, dow
     return createTensor(self, output, shape, rows * hidden);
 }
 
+/// `base + scale * down @ up^T` (F32) on the research cubin's fused adapter
+/// epilogue; null when the cubin is unavailable (callers keep the unfused
+/// linear, scale and add).
+fn loraUpAdd(ctx: *anyopaque, base: CT, down: CT, up: CT, rows: usize, rank: usize, out_dim: usize, scale: f32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!std.math.isFinite(scale)) return error.InvalidArgument;
+    if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+    const base_tensor = tensorFromCt(base);
+    const down_tensor = tensorFromCt(down);
+    const up_tensor = tensorFromCt(up);
+    if (base_tensor.dtype != .f32 or down_tensor.dtype != .f32 or up_tensor.dtype != .f32 or
+        base_tensor.quant_type != null or down_tensor.quant_type != null or up_tensor.quant_type != null) return null;
+    const count = try checkedMul(rows, out_dim);
+    try ensureCount(base_tensor, count);
+    try ensureCount(down_tensor, try checkedMul(rows, rank));
+    try ensureCount(up_tensor, try checkedMul(out_dim, rank));
+    const shape = try dupeShape(self.allocator, base_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+    errdefer device.free(&self.ctx);
+    var scope = beginPrefillProfile(self, .elementwise, rows);
+    defer if (scope) |*active| active.end();
+    if (!try self.kernels.launchMemorillaLoraUpAddF32(&self.ctx, device, base_tensor.buffer, down_tensor.buffer, up_tensor.buffer, scale, rows, out_dim, rank)) {
+        device.free(&self.ctx);
+        self.allocator.free(shape);
+        return null;
+    }
+    self.stats.launch_elementwise += 1;
+    return createTensor(self, device, shape, count);
+}
+
+/// Memorilla BF16-matrix research mode (`memorilla_research_bf16_mirror`):
+/// a multi-row gated SiLU FFN with BF16 activations between its projections,
+/// as the reference PyTorch model runs it: gate and up GEMMs with BF16
+/// outputs, SiLU(gate) * up in F32 rounded once to BF16, then the down GEMM
+/// with F32 output. Returns null (caller keeps the F32 pair path) for decode
+/// rows, non-SiLU activations, non-BF16 weights or without cuBLASLt.
+fn memorillaResearchGatedFfn(self: *CudaCompute, request: *const ops.GatedFfnNoBiasRequest) !?CT {
+    if (request.rows <= 1 or request.activation != .silu) return null;
+    if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+    if (!cudaCublasLtEnabled() or self.cublaslt == null or self.ctx.info.compute_major < 8) return null;
+    const rows = request.rows;
+    const hidden = request.hidden_size;
+    const intermediate = request.intermediate_size;
+    const input = tensorFromCt(request.input);
+    try ensureF32(input);
+    try ensureCount(input, try checkedMul(rows, hidden));
+    const gate = tensorFromCt(request.gate_weight);
+    const up = tensorFromCt(request.up_weight);
+    const down = tensorFromCt(request.down_weight);
+    const weight_count = try checkedMul(hidden, intermediate);
+    for ([_]*const CudaTensor{ gate, up, down }) |weight| {
+        if (!isBf16Weight(weight)) return null;
+        try ensureCount(weight, weight_count);
+        if (weight.buffer.len < try checkedMul(weight_count, 2)) return error.InvalidShape;
+    }
+    const narrow_count = try checkedMul(rows, hidden);
+    const wide_count = try checkedMul(rows, intermediate);
+    if (wide_count > std.math.maxInt(u32)) return null;
+    try self.lighton_activation.init(&self.ctx);
+    const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
+    var gate_values = try allocDeviceBuffer(self, try checkedMul(wide_count, 2));
+    defer releaseDeviceBuffer(self, &gate_values);
+    var up_values = try allocDeviceBuffer(self, try checkedMul(wide_count, 2));
+    defer releaseDeviceBuffer(self, &up_values);
+    var activated = try allocDeviceBuffer(self, try checkedMul(wide_count, 2));
+    defer releaseDeviceBuffer(self, &activated);
+    var output = try allocDeviceBuffer(self, try checkedMul(narrow_count, 4));
+    errdefer releaseDeviceBuffer(self, &output);
+    const shape = try allocShape2(self.allocator, rows, hidden);
+    errdefer self.allocator.free(shape);
+    errdefer self.ctx.synchronize() catch {};
+    const blas = &self.cublaslt.?;
+    const workspace = cublasLtWorkspace(self);
+    {
+        var scope = beginPrefillProfile(self, .bf16_pair, rows);
+        defer if (scope) |*active| active.end();
+        _ = try blas.matmulBf16WeightBf16OutWithTuning(&self.ctx, gate_values, staged, gate.buffer, workspace, rows, hidden, intermediate, .{});
+        _ = try blas.matmulBf16WeightBf16OutWithTuning(&self.ctx, up_values, staged, up.buffer, workspace, rows, hidden, intermediate, .{});
+    }
+    {
+        var scope = beginPrefillProfile(self, .elementwise, rows);
+        defer if (scope) |*active| active.end();
+        try self.lighton_activation.runSeparateBf16Inputs(&self.ctx, .{ activated.ptr, gate_values.ptr, up_values.ptr }, @intCast(wide_count));
+    }
+    {
+        var scope = beginPrefillProfile(self, .bf16_linear, rows);
+        defer if (scope) |*active| active.end();
+        _ = try blas.matmulBf16WeightF32OutWithTuning(&self.ctx, output, activated, down.buffer, workspace, rows, intermediate, hidden, .{});
+    }
+    self.stats.launch_elementwise += 1;
+    self.stats.bf16_cublaslt_linear_calls += 3;
+    return createTensor(self, output, shape, narrow_count);
+}
+
 fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequest) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.memorilla_research_bf16_mirror) return memorillaResearchGatedFfn(self, request);
     if ((!self.lighton_fused_ffn and !self.lighton_ffn_bf16_inputs) or self.capability_profile != .lightonocr3 or
         self.lazy_host_store != null or // Paired source addresses must remain immutable.
         !lightOnDevice(self).portableKernels() or
@@ -23067,7 +23196,7 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
     if (try tryRmsQ8Mirror(self, .norm, device, shape, input_tensor, weight_tensor, null, null, dim, eps)) |result| return result;
-    if (input_tensor.elem_count / dim > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
+    if (input_tensor.elem_count / dim > 1 and (cudaRmsNormBf16MirrorEnabled() or (self.memorilla_research_bf16_mirror and dim >= 1024)) and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
             const launched_mirror = blk: {
@@ -23192,7 +23321,7 @@ fn rmsNormAddTensor(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: u
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
     if (try tryRmsQ8Mirror(self, .add, device, shape, input_tensor, weight_tensor, residual_tensor, null, dim, eps)) |result| return result;
-    if (input_tensor.elem_count / dim > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
+    if (input_tensor.elem_count / dim > 1 and (cudaRmsNormBf16MirrorEnabled() or (self.memorilla_research_bf16_mirror and dim >= 1024)) and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
             const launched_mirror = blk: {
@@ -30862,6 +30991,7 @@ const vtable = ops.ComputeBackend.VTable{
     .florenceVisionTailSources = &florenceVisionTailSourcesOp,
     .florenceProjectImageFeatures = &florenceProjectImageFeaturesOp,
     .gatedFfnNoBias = &lightOnGatedFfnNoBias,
+    .loraUpAdd = &loraUpAdd,
     .sliceLastDim = &sliceLastDimOp,
     .cloneTensorShape = &cloneTensorShapeOp,
     .transposeOp = &transposeOp,

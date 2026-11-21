@@ -82,13 +82,66 @@ pub const forbidden_cuda_flags = [_][*:0]const u8{
     "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS",
 };
 
+/// Research-only opt-in, read once per check: with
+/// `ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES=1` the rank-2 decoder-layer
+/// matrices (`model.layers.*.weight`) of both Memorilla models and the
+/// decoder's LM head stay resident in their BF16 source precision and run as
+/// BF16 cuBLASLt GEMMs with F32 accumulation. Multi-row gated SiLU FFNs keep
+/// BF16 activations between their projections (as the PyTorch reference
+/// does); embeddings, norms, the KV cache and the residual stream stay F32. The execution identity changes with
+/// it, so no vector or pin of the qualified F32 identity can match a
+/// BF16-matrix producer. This is a latency experiment, not a qualification.
+pub const research_bf16_matrices_env = "ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES";
+
+pub fn researchBf16Matrices() bool {
+    if (@import("builtin").is_test) return false;
+    return @import("antfly_platform").env.getenvBool(research_bf16_matrices_env);
+}
+
+/// Research-only opt-in (`ANTFLY_MEMORILLA_RESEARCH_FAST_PREFILL=1`): dense
+/// multi-row F32 attention (the encoder passes and the decoder prefill) runs
+/// the cooperative per-(row, head) kernel with an online softmax instead of
+/// the scalar kernel that recomputes Q.K once per output dimension. Same F32
+/// precision, different summation order; it also changes the identity.
+pub const research_fast_prefill_env = "ANTFLY_MEMORILLA_RESEARCH_FAST_PREFILL";
+
+pub fn researchFastPrefill() bool {
+    if (@import("builtin").is_test) return false;
+    return @import("antfly_platform").env.getenvBool(research_fast_prefill_env);
+}
+
+/// Weights the BF16-matrix research mode keeps in BF16: rank-2 decoder-layer
+/// matrices (`model.layers.*` in the decoder, `layers.*` in the encoder) and
+/// the decoder's untied LM head.
+pub fn isResearchBf16Matrix(name: []const u8, rank: usize) bool {
+    if (rank == 2 and std.mem.eql(u8, name, "lm_head.weight")) return true;
+    const layer = std.mem.startsWith(u8, name, "model.layers.") or std.mem.startsWith(u8, name, "layers.");
+    return rank == 2 and layer and std.mem.endsWith(u8, name, ".weight");
+}
+
+test "Memorilla research BF16 matrices are the rank-2 layer weights of both models" {
+    try std.testing.expect(isResearchBf16Matrix("model.layers.3.mlp.down_proj.weight", 2));
+    try std.testing.expect(isResearchBf16Matrix("layers.0.self_attn.q_proj.weight", 2));
+    try std.testing.expect(!isResearchBf16Matrix("layers.0.input_layernorm.weight", 1));
+    try std.testing.expect(!isResearchBf16Matrix("model.embed_tokens.weight", 2));
+    try std.testing.expect(!isResearchBf16Matrix("embed_tokens.weight", 2));
+    try std.testing.expect(isResearchBf16Matrix("lm_head.weight", 2));
+    try std.testing.expect(!isResearchBf16Matrix("lm_head.weight", 1));
+    try std.testing.expect(!researchBf16Matrices() and !researchFastPrefill());
+}
+
 pub fn requireCudaExecutionStats(stats: anytype) !void {
     @setEvalBranchQuota(100_000);
+    const bf16_matrices = researchBf16Matrices();
     inline for (@typeInfo(@TypeOf(stats)).@"struct".field_names) |name| {
         if (comptime std.mem.startsWith(u8, name, "bf16_") or std.mem.startsWith(u8, name, "f16_") or
             std.mem.eql(u8, name, "rms_norm_bf16_mirror_hits") or std.mem.eql(u8, name, "fused_gate_up_bf16_hits"))
         {
-            if (@field(stats, name) != 0) return error.UnsupportedMemorillaPrecision;
+            // The research mode's BF16 routes, including the RMS-norm BF16
+            // mirror that feeds its BF16 projections.
+            const research_route = comptime (std.mem.startsWith(u8, name, "bf16_") and !std.mem.startsWith(u8, name, "bf16_mirror")) or
+                std.mem.eql(u8, name, "rms_norm_bf16_mirror_hits");
+            if (@field(stats, name) != 0 and !(bf16_matrices and research_route)) return error.UnsupportedMemorillaPrecision;
         }
     }
     if (stats.host_attention_fallbacks != 0 or stats.paged_attention_host_fallbacks != 0 or
@@ -211,7 +264,8 @@ pub fn executionIdentity(profile: Profile) [64]u8 {
     hash.update(canonicalManifest(profile));
     hash.update("\x00");
     if (isResearch(profile)) hash.update("research-lock-in-directory") else hash.update(lock_bytes);
-    hash.update("\x00bf16-source/f32-resident/f32-activations\x00sm_121\x00");
+    hash.update(if (researchBf16Matrices()) "\x00bf16-source/bf16-layer-matrices/f32-activations\x00sm_121\x00" else "\x00bf16-source/f32-resident/f32-activations\x00sm_121\x00");
+    if (researchFastPrefill()) hash.update("research-cooperative-f32-prefill-attention\x00");
     hash.update(question_recipe);
     return std.fmt.bytesToHex(hash.finalResult(), .lower);
 }

@@ -100,6 +100,44 @@ RECORD_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")
 RECORD_WORD_CHARS = set(string.ascii_letters + string.digits + "-")
 TAIL_MIN_CHARS = 3
 RECORD_GATE_COSINE = 0.85
+# ``--record-gate-mode learned`` (copy halves trained with a relevance gate,
+# ``qwen_copy_qa.py``): the record opens when the copy head copied a span and
+# its largest slot gate reaches this threshold. ``cosine`` (the default) is
+# the section 7.4 snap-cosine rule above.
+RECORD_GATE_MODES = ("cosine", "learned", "always")
+LEARNED_GATE_THRESHOLD = 0.5
+# Question-conditioned record encoding (copy halves trained with
+# ``qwen_copy_qa.py --question-prefix``, protocol key
+# ``document_question_prefix``): the question text precedes every
+# self-context document in the encoder input, so the causal encoder's document
+# states see the question. The kept rows (the second copy) keep their count
+# and ids; only their states change.
+QUESTION_PREFIX_TEMPLATES = {"question-passage-v1": "Question: {question}\nPassage:"}
+
+
+def question_prefix_text(question, name: str) -> str:
+    """The encoder-side prefix of one question (whitespace collapsed)."""
+    if name not in QUESTION_PREFIX_TEMPLATES:
+        raise ValueError("unknown question prefix: " + str(name))
+    return QUESTION_PREFIX_TEMPLATES[name].format(question=" ".join(str(question).split()))
+
+
+def question_prefixed_documents(tokenizer, doubled, counts, question, name) -> list[str]:
+    """Self-context doubled texts with the question prefix in front (``name``
+    None: unchanged). Each text's last ``counts[i]`` own ids must equal the
+    unprefixed text's, so the kept rows still align with the copy sources."""
+    if name is None:
+        return list(doubled)
+    prefix = question_prefix_text(question, name)
+    texts = []
+    for text, count in zip(doubled, counts, strict=True):
+        plain = tokenizer(text, add_special_tokens=False)["input_ids"]
+        joined = prefix + text
+        full = tokenizer(joined, add_special_tokens=False)["input_ids"]
+        if not 1 <= count <= len(plain) or list(full[-count:]) != list(plain[-count:]):
+            raise ValueError("question prefix changed the kept document ids")
+        texts.append(joined)
+    return texts
 
 
 # ----------------------------------------------------------------------------
@@ -115,15 +153,13 @@ def system_prompt_text(choice: str) -> str:
 def compose_memory_rows(
     soft: torch.Tensor, record: torch.Tensor, order: str = "soft-first"
 ) -> torch.Tensor:
-    """The 16 soft and 16 record rows -> [32, width] in the soft dtype; ``order``
-    puts the soft rows first (default) or the record rows first."""
+    """The 16 soft rows and the record rows (16 for copy17, the evidence
+    window's width for a span-window candidate) -> [16 + R, width] in the soft
+    dtype; ``order`` puts the soft rows first (default) or the record first."""
     if soft.ndim != 2 or record.ndim != 2 or soft.shape[1] != record.shape[1]:
         raise ValueError("memory rows must be [slots, width] with one width")
-    if (
-        soft.shape[0] != RELEASED_MEMORY_SLOTS
-        or record.shape[0] != RELEASED_MEMORY_SLOTS
-    ):
-        raise ValueError("hybrid composes two 16-slot memories")
+    if soft.shape[0] != RELEASED_MEMORY_SLOTS or record.shape[0] < 1:
+        raise ValueError("hybrid needs the 16-slot soft memory and a nonempty record")
     if order not in ROW_ORDERS:
         raise ValueError("row order must be one of " + ", ".join(ROW_ORDERS))
     record = record.to(soft.dtype)
@@ -145,6 +181,32 @@ def record_gate_open(spans, snap_top1_cosines, threshold=RECORD_GATE_COSINE) -> 
         if min(cosines[begin:end]) >= threshold:
             return True
     return False
+
+
+def learned_gate_open(spans, gates, threshold=LEARNED_GATE_THRESHOLD) -> bool:
+    """A copy half trained with a relevance gate: the record is trusted when
+    the copy head copied at least one span and the largest per-slot gate is at
+    least ``threshold``; otherwise only the soft rows go to the decoder."""
+    if not 0 <= threshold <= 1:
+        raise ValueError("learned gate threshold must lie in [0, 1]")
+    gates = [float(g) for g in gates]
+    return bool(spans) and bool(gates) and max(gates) >= threshold
+
+
+def record_gate_decision(
+    mode, spans, gates, snap_top1_cosines, cosine_threshold=RECORD_GATE_COSINE
+) -> bool:
+    """``cosine``: ``record_gate_open`` on the snap cosines (the default);
+    ``learned``: ``learned_gate_open`` on the copy head's slot gates;
+    ``always``: the record is always used (a span-window record still carries
+    the binding context the decoder needs to abstain)."""
+    if mode == "always":
+        return True
+    if mode == "cosine":
+        return record_gate_open(spans, snap_top1_cosines, cosine_threshold)
+    if mode == "learned":
+        return learned_gate_open(spans, gates)
+    raise ValueError("record gate mode must be one of " + ", ".join(RECORD_GATE_MODES))
 
 
 def hybrid_prompt(
@@ -545,7 +607,15 @@ class SoftMemory:
         return memory
 
 
-def record_memory(models, protocol, case, *, suffix, pad_id, max_length):
+def attach_span_head(models, candidate_dir, protocol) -> None:
+    """A span-window candidate (``qwen_span_copy.py``) loads its span head."""
+    if protocol.get("record_kind") == "span-window":
+        from qwen_span_copy import attach_span_head as attach
+
+        attach(models, candidate_dir, protocol)
+
+
+def record_memory(models, protocol, case, *, suffix, pad_id, max_length, window_policy=None):
     """copy17's snapped record for one case (the evaluator's path under
     ``--snap-memory all --copy-contiguous-runs --copy-complete-words``, as
     ``encoder_lora_export.run_case`` mirrors it) without the decoder step.
@@ -553,7 +623,27 @@ def record_memory(models, protocol, case, *, suffix, pad_id, max_length):
     Returns the final BF16 token rows [16, width] and the record diagnostics.
     ``max_length`` bounds the padded encoder batch (the evaluator's bound is
     128; squad/drop passages need more under self-context doubling).
+    ``window_policy`` (span-window candidates only, research): see
+    ``qwen_span_copy.span_record_memory``.
     """
+    if protocol.get("record_kind") == "span-window":
+        from qwen_span_copy import span_record_memory
+
+        if window_policy is None:
+            return span_record_memory(
+                models, protocol, case, suffix=suffix, pad_id=pad_id, max_length=max_length
+            )
+        return span_record_memory(
+            models,
+            protocol,
+            case,
+            suffix=suffix,
+            pad_id=pad_id,
+            max_length=max_length,
+            window_policy=window_policy,
+        )
+    if window_policy is not None:
+        raise ValueError("window policies need a span-window candidate")
     enc_tok, dec_tok = models["enc_tok"], models["dec_tok"]
     encoder, reader = models["encoder"], models["reader"]
     copy_head, snapper = models["copy_head"], models["snapper"]
@@ -562,6 +652,13 @@ def record_memory(models, protocol, case, *, suffix, pad_id, max_length):
         documents = prefixed_documents(case["documents"], True)
         doubled, counts, single_ids, fallbacks = self_context_documents(
             enc_tok, documents
+        )
+        doubled = question_prefixed_documents(
+            enc_tok,
+            doubled,
+            counts,
+            case["question"],
+            protocol.get("document_question_prefix"),
         )
         copy_ids = torch.cat(single_ids)
         tokens = enc_tok(
@@ -772,8 +869,10 @@ def run_set(args, models, protocol, soft, name, cases, *, suffix, pad_id, refere
             else:
                 gate = None
                 if args.record_gate:
-                    gate = record_gate_open(
+                    gate = record_gate_decision(
+                        getattr(args, "record_gate_mode", "cosine"),
                         [tuple(s) for s in record[1]["spans"]],
+                        record[1]["gate"],
                         record[1]["snap_top1_cosines"],
                         args.record_gate_cosine,
                     )
@@ -873,6 +972,11 @@ def run_set(args, models, protocol, soft, name, cases, *, suffix, pad_id, refere
             "row_order": args.row_order,
             "record_gate": args.record_gate,
             "record_gate_cosine": args.record_gate_cosine,
+            **(
+                {"record_gate_mode": args.record_gate_mode}
+                if args.record_gate_mode != "cosine"
+                else {}
+            ),
             "answer_canonicalize": args.answer_canonicalize,
             "released_checkpoint": str(args.released_checkpoint or paths_note(args)),
             "max_new_tokens": max_new,
@@ -910,6 +1014,12 @@ def parse_args(argv=None):
     p.add_argument("--row-order", choices=ROW_ORDERS, default="soft-first")
     p.add_argument("--record-gate", action="store_true")
     p.add_argument("--record-gate-cosine", type=float, default=RECORD_GATE_COSINE)
+    p.add_argument(
+        "--record-gate-mode",
+        choices=RECORD_GATE_MODES,
+        default="cosine",
+        help="with --record-gate: snap-cosine rule or the copy head's learned gate",
+    )
     p.add_argument("--answer-canonicalize", action="store_true")
     p.add_argument("--released-checkpoint", type=Path, help="released reader dir")
     p.add_argument("--max-new-tokens", type=int, default=48)
@@ -952,6 +1062,7 @@ def main(argv=None):
     cotenant = wait_for_gpu(args.cotenant_limit_mib)
     loading = time.perf_counter()
     models = load_models(args.candidate, protocol, paths)
+    attach_span_head(models, args.candidate, protocol)
     released = load_released_reader(
         paths, models["reader_config"], args.released_checkpoint
     )
@@ -977,6 +1088,11 @@ def main(argv=None):
         "row_order": args.row_order,
         "record_gate": args.record_gate,
         "record_gate_cosine": args.record_gate_cosine,
+        **(
+            {"record_gate_mode": args.record_gate_mode}
+            if args.record_gate_mode != "cosine"
+            else {}
+        ),
         "answer_canonicalize": args.answer_canonicalize,
         "released_checkpoint": str(args.released_checkpoint or paths["checkpoint"]),
         "gpu_cotenant_mib_at_start": cotenant,
@@ -1017,7 +1133,9 @@ def main(argv=None):
 
 
 # ----------------------------------------------------------------------------
-# paper protocol: the Memorilla benchmarks (TriviaQA, NarrativeQA, EnWiki)
+# paper protocol: the Memorilla benchmarks (the eight registered upstream
+# benchmarks pmv2, pv4, factkg, triviaqa, narrativeqa, pubmedqa, lamp4, lamp7,
+# plus EnWiki reconstruction)
 #
 # ``paper-prep`` (CPU, a venv with the upstream package's ``datasets`` /
 # ``rouge_score`` / ``nltk`` dependencies) selects the evaluated rows through
@@ -1025,19 +1143,73 @@ def main(argv=None):
 # stored-embedding digests, the cosine top-k chunk order of upstream
 # ``evaluate_baselines.retrieve`` and the top-k chunk texts. ``paper-run`` (GPU,
 # the CUDA venv) generates every arm in left-padded greedy batches from those
-# cases and the stored Qwen3-Embedding-4B vectors. ``paper-score`` (CPU, the
-# upstream venv) scores the rows with upstream ``memorilla.metrics``.
+# cases and the stored Qwen3-Embedding-4B vectors. ``paper-choice-embed`` (GPU,
+# the CUDA venv; choice-scored pmv2/pv4/factkg only) embeds every generation
+# and choice with the encoder for upstream's nearest-choice rule.
+# ``paper-score`` (CPU, the upstream venv) scores the rows with upstream
+# ``memorilla.metrics`` and adds paired bootstrap intervals for arm deltas.
 
-PAPER_COMMANDS = ("paper-prep", "paper-run", "paper-score")
+PAPER_COMMANDS = ("paper-prep", "paper-run", "paper-choice-embed", "paper-score")
+# The eight registered upstream benchmarks (``memorilla.benchmarks``, test
+# splits) plus EnWiki reconstruction (not registered).
 PAPER_TARGETS = {
+    "pmv2": ("pmv2", "test"),
+    "pv4": ("pv4", "test"),
+    "factkg": ("factkg", "test"),
     "triviaqa": ("triviaqa", "test"),
     "narrativeqa": ("narrativeqa", "test"),
+    "pubmedqa": ("pubmedqa", "test"),
+    "lamp4": ("lamp4", "test"),
+    "lamp7": ("lamp7", "test"),
     "enwiki": ("enwiki", "validation"),
 }
+# Unregistered Memorilla-Data configs (validation split), prompted and scored
+# with evaluate.py's custom-config defaults like EnWiki: helpful prompt, no
+# suffix, generation scoring, 128 new tokens (CUSTOM_MAX_NEW_TOKENS). Plan
+# 8.17 uses them as task types that have no gate profile.
+CUSTOM_TARGETS = (
+    "squad_v2",
+    "drop",
+    "coqa",
+    "quail",
+    "msmarco",
+    "samsum",
+    "dialogsum",
+    "cnn_dailymail",
+    "pwc",
+)
+CUSTOM_MAX_NEW_TOKENS = 128
+PAPER_TARGETS.update({t: (t, "validation") for t in CUSTOM_TARGETS})
 # Paper Table 3: 64 new tokens for QA, 512 for EnWiki reconstruction. The
 # released ``benchmarks.py`` gives NarrativeQA 32; the run generates the larger
-# budget and keeps the smaller one as a prefix (greedy decoding).
-PAPER_TABLE3_LIMITS = {"triviaqa": 64, "narrativeqa": 64, "enwiki": 512}
+# budget and keeps the smaller one as a prefix (greedy decoding). The other
+# registered benchmarks use their registered budget.
+PAPER_TABLE3_LIMITS = {
+    "pmv2": 256,
+    "pv4": 256,
+    "factkg": 8,
+    "triviaqa": 64,
+    "narrativeqa": 64,
+    "pubmedqa": 64,
+    "lamp4": 128,
+    "lamp7": 128,
+    "enwiki": 512,
+    **dict.fromkeys(CUSTOM_TARGETS, CUSTOM_MAX_NEW_TOKENS),
+}
+# Paper section 2.6: PersonaMem-v2 and PersonalizationV4 are evaluated with
+# their benchmark-specific fine-tunes; every other target with stage3.
+PAPER_TARGET_CHECKPOINTS = {"pmv2": "checkpoints/pmv2", "pv4": "checkpoints/pv4"}
+# evaluate.py's prompt token limit for a custom (unregistered) config.
+CUSTOM_MAX_LENGTH = 2048
+# Optional per-row columns that choice scoring reads (upstream EVAL_COLUMNS).
+CHOICES_COLUMN, HARD_COLUMN = "choices", "hard"
+CHOICE_SCORING, POLARITY_SCORING = "choice", "polarity"
+CHOICE_TABLE = "choice-embeddings"
+# Mirror of upstream ``metrics.CHAT_TOKEN_PATTERN`` for the CUDA venv (which
+# cannot import ``memorilla.metrics``); ``paper-score`` re-derives every text
+# with upstream ``clean_generation`` and fails on any lookup mismatch.
+CHAT_TOKEN_PATTERN = re.compile(r"<\|(?:im_end|im_start|endoftext|im_sep)\|>")
+BOOTSTRAP_RESAMPLES = 10_000
 QUESTION_TYPES = ("who", "which", "what", "why", "how", "where", "when", "other")
 ENCODER_SLUG = "qwen3-embedding-4b"
 STORE_INDEX = "index.safetensors"
@@ -1065,19 +1237,21 @@ def upstream_benchmarks():
 
 def paper_protocol(target: str, benchmarks=None) -> dict:
     """Memorilla and baseline prompting for one target from upstream
-    ``BENCHMARKS``. EnWiki is not a registered benchmark: it takes
-    ``evaluate.py``'s custom-config defaults (helpful prompt, no suffix,
-    generation scoring) with the paper's 512-token reconstruction budget."""
+    ``BENCHMARKS``. EnWiki and ``CUSTOM_TARGETS`` are not registered: they
+    take ``evaluate.py``'s custom-config defaults (helpful prompt, no suffix,
+    generation scoring), EnWiki with the paper's 512-token reconstruction
+    budget and the others with the custom default of 128."""
     if target not in PAPER_TARGETS:
         raise ValueError("unknown paper target: " + target)
     benchmarks = benchmarks or upstream_benchmarks()
-    if target == "enwiki":
+    if target == "enwiki" or target in CUSTOM_TARGETS:
         return {
             "target": target,
             "system": benchmarks.HELPFUL_PROMPT,
             "suffix": "",
             "max_new_tokens": PAPER_TABLE3_LIMITS[target],
             "paper_max_new_tokens": PAPER_TABLE3_LIMITS[target],
+            "max_length": CUSTOM_MAX_LENGTH,
             "scoring": benchmarks.GENERATION,
             "metrics": (benchmarks.ROUGE1, benchmarks.ROUGEL),
             "baseline": None,
@@ -1089,6 +1263,7 @@ def paper_protocol(target: str, benchmarks=None) -> dict:
         "suffix": benchmark.suffix,
         "max_new_tokens": benchmark.max_new_tokens,
         "paper_max_new_tokens": PAPER_TABLE3_LIMITS[target],
+        "max_length": benchmark.max_length,
         "scoring": benchmark.scoring,
         "metrics": tuple(benchmark.metrics),
         "baseline": {
@@ -1096,6 +1271,117 @@ def paper_protocol(target: str, benchmarks=None) -> dict:
             "suffix": benchmark.baseline.suffix,
             "max_new_tokens": benchmark.baseline.max_new_tokens,
         },
+    }
+
+
+def paper_released_checkpoint(
+    target: str, assets: Path, default: Path, override: Path | None = None
+) -> Path:
+    """Released reader for a target: ``override`` when given, else the
+    benchmark-specific fine-tune (pmv2, pv4; paper section 2.6), else
+    ``default`` (stage3, or ``--checkpoint``)."""
+    if override:
+        return Path(override)
+    relative = PAPER_TARGET_CHECKPOINTS.get(target)
+    return Path(assets) / relative if relative else Path(default)
+
+
+def file_sha256(path: Path, block: int = 1 << 24) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(block):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def truncate_prompt_right(embeds: torch.Tensor, max_length: int | None):
+    """Upstream ``MemoryCollator`` tokenizes the rendered prompt with
+    ``truncation=True, max_length=benchmark.max_length`` and the decoder
+    tokenizer's default right truncation side; the same cut on prompt
+    embeddings -> (embeds, untruncated length or None)."""
+    if not max_length or embeds.shape[0] <= int(max_length):
+        return embeds, None
+    return embeds[: int(max_length)], int(embeds.shape[0])
+
+
+def clean_generation_text(text: str) -> str:
+    """Upstream ``metrics.clean_generation`` (chat tokens removed, stripped)."""
+    return CHAT_TOKEN_PATTERN.sub("", str(text)).strip()
+
+
+def nonempty_choices(choices) -> list[str]:
+    """The choice texts upstream ``choice_accuracy`` embeds: every choice whose
+    stripped text is non-empty, unstripped, in order."""
+    return [choice for choice in choices if choice.strip()]
+
+
+def choice_embedding_texts(rows: list[dict]) -> list[str]:
+    """Distinct texts the choice scorer embeds for ``rows``: each prediction
+    (every budget key) cleaned and stripped as upstream embeds
+    ``prediction.strip()``, and every non-empty choice; first-seen order."""
+    texts = {}
+    for row in rows:
+        for prediction in row["predictions"].values():
+            texts.setdefault(clean_generation_text(prediction).strip(), None)
+        for choice in nonempty_choices(row.get(CHOICES_COLUMN) or []):
+            texts.setdefault(choice, None)
+    return list(texts)
+
+
+def text_key(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def choice_accuracy_from_correct(correct, hard=None, want_hard: bool = False) -> dict:
+    """Upstream ``choice_accuracy`` aggregation over per-row correctness:
+    ``accuracy`` and, when requested, ``accuracy_hard`` over the hard rows (0
+    when no row is hard)."""
+    correct = [bool(c) for c in correct]
+    if not correct:
+        raise ValueError("choice accuracy needs at least one row")
+    scores = {"accuracy": sum(correct) / len(correct)}
+    if want_hard:
+        flags = [bool(h) for h in (hard or [])]
+        if len(flags) != len(correct):
+            raise ValueError("hard flags must align with the rows")
+        picked = [c for c, h in zip(correct, flags, strict=True) if h]
+        scores["accuracy_hard"] = sum(picked) / len(picked) if picked else 0.0
+    return scores
+
+
+def paired_bootstrap_ci(
+    left: dict,
+    right: dict,
+    resamples: int = BOOTSTRAP_RESAMPLES,
+    seed: int = 23,
+    confidence: float = 0.95,
+) -> dict:
+    """Paired bootstrap over the common rows of two per-row score maps: the
+    mean of ``right - left`` and its percentile interval (scores x 100)."""
+    import numpy as np
+
+    if resamples < 1 or not 0 < confidence < 1:
+        raise ValueError("bootstrap needs resamples >= 1 and 0 < confidence < 1")
+    common = sorted(set(left) & set(right))
+    if not common:
+        return {"rows": 0}
+    deltas = np.array([right[n] - left[n] for n in common], dtype=np.float64)
+    rng = np.random.default_rng(int(seed))
+    means = np.empty(int(resamples), dtype=np.float64)
+    for start in range(0, int(resamples), 1000):
+        stop = min(int(resamples), start + 1000)
+        picks = rng.integers(0, len(deltas), size=(stop - start, len(deltas)))
+        means[start:stop] = deltas[picks].mean(axis=1)
+    tail = (1 - confidence) / 2
+    low, high = np.quantile(means, [tail, 1 - tail])
+    return {
+        "rows": len(common),
+        "mean_delta": round(100 * float(deltas.mean()), 2),
+        "ci_low": round(100 * float(low), 2),
+        "ci_high": round(100 * float(high), 2),
+        "confidence": confidence,
+        "resamples": int(resamples),
+        "seed": int(seed),
     }
 
 
@@ -1376,6 +1662,63 @@ def parquet_rows(files, rows, columns=("question", "documents")) -> dict[int, di
     return found
 
 
+def paper_scoring_check(target: str, dataset) -> dict:
+    """Upstream ``evaluate.load_target`` on the whole split: choice scoring
+    reports ``accuracy_hard`` exactly when the split flags hard rows, then
+    ``metrics.check_scoring_inputs`` (every reference among its row's choices;
+    the NLTK data METEOR needs). EnWiki and the custom targets are not
+    registered: no check."""
+    if target == "enwiki" or target in CUSTOM_TARGETS:
+        return {"scoring": "generation", "metrics": ["rouge1", "rougeL"]}
+    from dataclasses import replace
+
+    from memorilla import benchmarks
+    from memorilla.metrics import check_scoring_inputs
+
+    benchmark = benchmarks.BENCHMARKS[target]
+    if benchmark.scoring == benchmarks.CHOICE:
+        has_hard = HARD_COLUMN in dataset.column_names and any(dataset[HARD_COLUMN])
+        metrics = (
+            (benchmarks.ACCURACY, benchmarks.ACCURACY_HARD)
+            if has_hard
+            else (benchmarks.ACCURACY,)
+        )
+        benchmark = replace(benchmark, metrics=metrics)
+    check_scoring_inputs(benchmark, dataset)
+    return {"scoring": benchmark.scoring, "metrics": list(benchmark.metrics)}
+
+
+def case_name(target: str, split: str, row: int, collection_id) -> str:
+    """Case names of the registered split keep their original form; another
+    split names itself, so its rows never collide with the registered ones."""
+    if split == PAPER_TARGETS[target][1]:
+        return f"{target}-{row:05d}-{collection_id}"
+    return f"{target}-{split}-{row:05d}-{collection_id}"
+
+
+def cases_split(target: str, cases) -> str:
+    """The one split a cases file was drawn from (absent = registered)."""
+    splits = {c.get("split", PAPER_TARGETS[target][1]) for c in cases}
+    if len(splits) != 1:
+        raise ValueError(f"cases mix splits: {sorted(splits)}")
+    return splits.pop()
+
+
+def records_split(target: str, records) -> str:
+    """The one split paper-run records came from, read back from case_name
+    (records do not carry the split field)."""
+    registered = PAPER_TARGETS[target][1]
+    others = [s for s in ("train", "validation", "test") if s != registered]
+    splits = set()
+    for record in records:
+        name = str(record["name"])
+        found = [s for s in others if name.startswith(f"{target}-{s}-")]
+        splits.add(found[0] if found else registered)
+    if len(splits) != 1:
+        raise ValueError(f"records mix splits: {sorted(splits)}")
+    return splits.pop()
+
+
 def paper_prep(args) -> dict:
     import os
 
@@ -1383,10 +1726,19 @@ def paper_prep(args) -> dict:
     from memorilla.data import split_files
     from memorilla.embeddings import load_split_with_embeddings
 
-    config, split = PAPER_TARGETS[args.target]
+    config, registered = PAPER_TARGETS[args.target]
+    split = args.split or registered
+    # Upstream EVAL_COLUMNS; load_split skips the ones a split lacks.
     dataset, store = load_split_with_embeddings(
-        config, split, args.data_root, ["collection_id", "question", "answer"]
+        config,
+        split,
+        args.data_root,
+        ["collection_id", "question", "answer", CHOICES_COLUMN, HARD_COLUMN],
     )
+    scoring = paper_scoring_check(args.target, dataset)
+    extra_columns = [
+        c for c in (CHOICES_COLUMN, HARD_COLUMN) if c in dataset.column_names
+    ]
     mirror = StoredEmbeddings(store.directory)
     if mirror.num_questions != store.num_questions or len(mirror) != len(store):
         raise ValueError("mirror store disagrees with upstream EmbeddingStore")
@@ -1406,8 +1758,11 @@ def paper_prep(args) -> dict:
             raise ValueError(f"mirror documents differ at row {row}")
         if not torch.equal(query, mirror.question(row)):
             raise ValueError(f"mirror question differs at row {row}")
-        chunks = texts[row]["documents"] or []
-        if texts[row]["question"] != item["question"]:
+        # Pop each row's chunk texts once used: long personalization
+        # collections stay resident only until their case is written.
+        text = texts.pop(row)
+        chunks = text["documents"] or []
+        if text["question"] != item["question"]:
             raise ValueError(f"parquet question differs from the dataset at row {row}")
         if len(chunks) != documents.shape[0]:
             mismatches.append(
@@ -1419,8 +1774,9 @@ def paper_prep(args) -> dict:
         counts[kind] += 1
         cases.append(
             {
-                "name": f"{args.target}-{row:05d}-{item['collection_id']}",
+                "name": case_name(args.target, split, row, item["collection_id"]),
                 "target": args.target,
+                **({} if split == registered else {"split": split}),
                 "row": row,
                 "collection_id": int(item["collection_id"]),
                 "question": item["question"],
@@ -1433,8 +1789,10 @@ def paper_prep(args) -> dict:
                 "top_indices": indices,
                 "top_scores": scores,
                 "top_documents": [chunks[i] for i in indices],
+                **{c: item[c] for c in extra_columns},
             }
         )
+        del chunks, text
     if mismatches:
         raise ValueError(f"chunk/vector count mismatches: {mismatches[:5]}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1454,6 +1812,13 @@ def paper_prep(args) -> dict:
         "collections": len({c["collection_id"] for c in cases}),
         "top_k": args.top_k,
         "question_types": {k: counts.get(k, 0) for k in QUESTION_TYPES},
+        "scoring": scoring,
+        "case_columns": extra_columns,
+        **(
+            {"hard_rows": sum(bool(c[HARD_COLUMN]) for c in cases)}
+            if HARD_COLUMN in extra_columns
+            else {}
+        ),
         "mean_chunks_per_question": mean(c["documents"] for c in cases),
         "alignment": {
             "upstream_rows_equal_question_vectors": True,
@@ -1569,29 +1934,59 @@ class PaperRun:
         """copy17's snapped record of the top-2 chunks (cached per case and
         per input digest in ``records.jsonl``)."""
         documents = case["top_documents"][: self.args.record_top_k]
-        key = hashlib.sha256(
-            json.dumps([documents, case["question"]], ensure_ascii=False).encode()
-        ).hexdigest()
+        read_tokens = getattr(self.args, "record_read_tokens", 0)
+        window_policy = getattr(self.args, "record_window_policy", None)
+        if read_tokens:
+            # Budget study B: top-ranked chunks until the token budget.
+            from qwen_span_copy import read_budget_documents
+
+            tokenizer = self.models["enc_tok"]
+            documents = read_budget_documents(
+                lambda text: len(tokenizer(text, add_special_tokens=False)["input_ids"]),
+                case["top_documents"],
+                read_tokens,
+            )
+        extractor = getattr(self.args, "record_extractor", "candidate")
+        inputs = [documents, case["question"]]
+        if extractor != "candidate":
+            inputs += [extractor, self.args.record_stride]
+        if read_tokens or window_policy:
+            inputs += ["budget-study-b", read_tokens, window_policy]
+        key = hashlib.sha256(json.dumps(inputs, ensure_ascii=False).encode()).hexdigest()
         cached = self.records.get(case["name"])
         if cached is not None and cached.get("inputs_sha256") == key:
+            if self.gate_mode != "cosine" and not cached.get("error"):
+                cached["gate_open"] = self.gate_open(cached)
             return cached
         started = time.perf_counter()
         try:
-            _, info = record_memory(
-                self.models,
-                self.args.record_protocol,
-                {"documents": documents, "question": case["question"]},
-                suffix=self.args.encoder_suffix,
-                pad_id=self.args.record_pad_id,
-                max_length=self.args.encoder_max_length,
-            )
+            if extractor == "candidate":
+                _, info = record_memory(
+                    self.models,
+                    self.args.record_protocol,
+                    {"documents": documents, "question": case["question"]},
+                    suffix=self.args.encoder_suffix,
+                    pad_id=self.args.record_pad_id,
+                    max_length=self.args.encoder_max_length,
+                    window_policy=window_policy,
+                )
+            else:
+                from qwen_span_copy import DEFAULT_WINDOW, cheap_record_memory
+
+                _, info = cheap_record_memory(
+                    self.models,
+                    {"documents": documents, "question": case["question"]},
+                    extractor=extractor,
+                    query=self.question_vector(case),
+                    width=int(
+                        self.args.record_protocol.get("span_window_tokens", DEFAULT_WINDOW)
+                    ),
+                    stride=self.args.record_stride,
+                    pad_id=self.args.record_pad_id,
+                )
             info.pop("copy_ids", None)
             record = {"name": case["name"], "inputs_sha256": key, **info}
-            record["gate_open"] = record_gate_open(
-                [tuple(s) for s in record["spans"]],
-                record["snap_top1_cosines"],
-                self.args.record_gate_cosine,
-            )
+            record["gate_open"] = self.gate_open(record)
         except ValueError as error:
             record = {
                 "name": case["name"],
@@ -1604,11 +1999,27 @@ class PaperRun:
         append_row(self.record_path, record)
         return record
 
+    @property
+    def gate_mode(self) -> str:
+        return getattr(self.args, "record_gate_mode", "cosine")
+
+    def gate_open(self, record: dict) -> bool:
+        """The record gate of one computed record under ``--record-gate-mode``."""
+        return record_gate_decision(
+            self.gate_mode,
+            [tuple(s) for s in record["spans"]],
+            record["gate"],
+            record["snap_top1_cosines"],
+            self.args.record_gate_cosine,
+        )
+
     def prompt(self, case, spec) -> tuple[torch.Tensor, dict]:
         """Prompt embeddings [L, 4096] BF16 of one case under one arm."""
         if spec["kind"] == "text":
             documents = case["top_documents"][: spec["top_k"]]
-            if spec["top_k"] and len(documents) < min(spec["top_k"], case["documents"]):
+            # Re-chunked cases (``chunk_count``) retrieve over their own chunks.
+            available = case.get("chunk_count", case["documents"])
+            if spec["top_k"] and len(documents) < min(spec["top_k"], available):
                 raise ValueError("case carries fewer chunk texts than the arm needs")
             messages = paper_text_messages(self.protocol, documents, case["question"])
             rendered = self.dec_tok.apply_chat_template(
@@ -1662,10 +2073,14 @@ class PaperRun:
                 question=memory_user_turn(case["question"], self.protocol["suffix"]),
                 device="cuda",
             )
+        embeds, untruncated = truncate_prompt_right(
+            embeds, self.protocol.get("max_length")
+        )
         return embeds, {
             "prompt_tokens": int(embeds.shape[0]),
             "memory_rows": int(memories.shape[0]),
             "system_prompt": system,
+            **({"prompt_truncated_from": untruncated} if untruncated else {}),
             **extra,
         }
 
@@ -1695,6 +2110,7 @@ class PaperRun:
             "finish_reason": reason,
             "max_new_tokens": limit,
             "token_ids": ids,
+            **{c: case[c] for c in (CHOICES_COLUMN, HARD_COLUMN) if c in case},
             **meta,
         }
         if canonicalized:
@@ -1772,46 +2188,39 @@ class PaperRun:
         }
 
     def verify_stored_vectors(self, soft: SoftMemory, count: int) -> list[dict]:
-        """Re-embed the question and the top-1 chunk of the first ``count``
-        cases with the frozen encoder (adapters off, last-token pooling) and
-        compare to the stored vectors: confirms row alignment and pooling."""
+        """Re-embed the question and (when the case carries chunk texts) the
+        top-1 chunk of the first ``count`` cases with the frozen encoder
+        (adapters off, last-token pooling) and compare to the stored vectors:
+        confirms row alignment and pooling."""
+
+        def cosine(left, right) -> float:
+            value = torch.nn.functional.cosine_similarity(left, right, dim=0)
+            return round(float(value), 5)
+
         checks = []
         for case in self.cases[:count]:
-            stored_q = self.question_vector(case).float().cuda()
-            stored_d = self.documents(case)[case["top_indices"][0]].float().cuda()
-            ours_q = soft.pooled(case["question"].strip()).float()
-            ours_d = soft.pooled(case["top_documents"][0]).float()
-            checks.append(
-                {
-                    "name": case["name"],
-                    "question_cosine": round(
-                        float(
-                            torch.nn.functional.cosine_similarity(
-                                ours_q, stored_q, dim=0
-                            )
-                        ),
-                        5,
-                    ),
-                    "top1_chunk_cosine": round(
-                        float(
-                            torch.nn.functional.cosine_similarity(
-                                ours_d, stored_d, dim=0
-                            )
-                        ),
-                        5,
-                    ),
-                }
-            )
+            stored = self.question_vector(case).float().cuda()
+            check = {
+                "name": case["name"],
+                "question_cosine": cosine(
+                    soft.pooled(case["question"].strip()).float(), stored
+                ),
+            }
+            if case["top_indices"]:
+                stored = self.documents(case)[case["top_indices"][0]].float().cuda()
+                ours = soft.pooled(case["top_documents"][0]).float()
+                check["top1_chunk_cosine"] = cosine(ours, stored)
+            checks.append(check)
         soft.cache.clear()
         return checks
 
 
 def paper_run(args) -> dict:
-    config, split = PAPER_TARGETS[args.target]
     protocol = paper_protocol(args.target)
     cases = read_rows(args.cases)
     if not cases or any(c["target"] != args.target for c in cases):
         raise ValueError("cases file does not hold this target")
+    config, split = PAPER_TARGETS[args.target][0], cases_split(args.target, cases)
     if args.limit:
         cases = cases[: args.limit]
     cases.sort(key=lambda c: (c["collection_id"], c["row"]))
@@ -1822,12 +2231,21 @@ def paper_run(args) -> dict:
         for key, relative in DEFAULT_ASSETS.items()
     }
     candidate, record_protocol = load_candidate(args.candidate)
+    if getattr(args, "record_read_tokens", 0) < 0:
+        raise ValueError("--record-read-tokens must be >= 0")
+    if getattr(args, "record_window_policy", None) and (
+        record_protocol.get("record_kind") != "span-window"
+    ):
+        raise ValueError("--record-window-policy needs a span-window candidate")
+    checkpoint = paper_released_checkpoint(
+        args.target, args.assets, paths["checkpoint"], args.released_checkpoint
+    )
+    checkpoint_sha256 = file_sha256(checkpoint / "memory.pt")
     cotenant = wait_for_gpu(args.cotenant_limit_mib)
     loading = time.perf_counter()
     models = load_models(args.candidate, record_protocol, paths)
-    released = load_released_reader(
-        paths, models["reader_config"], args.released_checkpoint
-    )
+    attach_span_head(models, args.candidate, record_protocol)
+    released = load_released_reader(paths, models["reader_config"], checkpoint)
     load_seconds = round(time.perf_counter() - loading, 1)
     args.record_protocol = record_protocol
     args.encoder_suffix = encoder_special_suffix(models["enc_tok"])
@@ -1850,11 +2268,37 @@ def paper_run(args) -> dict:
         "cases": len(cases),
         "arms": args.arms,
         "protocol": {k: v for k, v in protocol.items()},
-        "released_checkpoint": str(args.released_checkpoint or paths["checkpoint"]),
+        "released_checkpoint": str(checkpoint),
+        "released_checkpoint_memory_sha256": checkpoint_sha256,
+        "released_checkpoint_source": (
+            "override"
+            if args.released_checkpoint
+            else "target"
+            if args.target in PAPER_TARGET_CHECKPOINTS
+            else "default"
+        ),
         "candidate": str(args.candidate.resolve()),
         "candidate_sha256": candidate.get("protocol_sha256"),
         "record_top_k": args.record_top_k,
+        **(
+            {"record_extractor": args.record_extractor, "record_stride": args.record_stride}
+            if args.record_extractor != "candidate"
+            else {}
+        ),
+        **(
+            {
+                "record_read_tokens": args.record_read_tokens,
+                "record_window_policy": args.record_window_policy,
+            }
+            if args.record_read_tokens or args.record_window_policy
+            else {}
+        ),
         "record_gate_cosine": args.record_gate_cosine,
+        **(
+            {"record_gate_mode": args.record_gate_mode}
+            if args.record_gate_mode != "cosine"
+            else {}
+        ),
         "encoder_max_length": args.encoder_max_length,
         "noise_seed": args.noise_seed,
         "batch_size": args.batch_size,
@@ -1882,6 +2326,206 @@ def paper_run(args) -> dict:
     return result
 
 
+# -------------------------------------------------------- paper-choice-embed
+#
+# Upstream scores pmv2/pv4/factkg by embedding each generation and every
+# non-empty choice with Qwen3-Embedding-4B (vLLM ``task="embed"``: BF16,
+# tokenizer special tokens on, last-token pooling, L2 normalization, FP16
+# arrays) and picking the most cosine-similar choice. ``paper-choice-embed``
+# (GPU, CUDA venv) computes the same vectors with transformers through the
+# path that reproduces the stored question vectors (``SoftMemory.pooled``)
+# and stores them per distinct text; ``paper-score`` (upstream venv) then runs
+# upstream ``choice_predictions`` / ``choice_index`` on them.
+
+
+def paper_arm_files(output: Path) -> list[str]:
+    """Arm names of a paper-run directory (every ``<arm>.jsonl`` except the
+    record cache)."""
+    return [
+        p.stem
+        for p in sorted(Path(output).glob("*.jsonl"))
+        if p.stem != "records" and not p.stem.startswith("run-")
+    ]
+
+
+def load_choice_table(output: Path):
+    """``(sha256 -> row, FP16 numpy vectors [U, D], metadata)`` of a
+    ``paper-choice-embed`` table, or ``({}, None, {})`` before the first run."""
+    from safetensors.numpy import load_file
+
+    meta_path = Path(output) / f"{CHOICE_TABLE}.json"
+    if not meta_path.exists():
+        return {}, None, {}
+    meta = json.loads(meta_path.read_text())
+    vectors = load_file(str(Path(output) / f"{CHOICE_TABLE}.safetensors"))["vectors"]
+    keys = meta["text_sha256"]
+    if len(keys) != vectors.shape[0] or len(set(keys)) != len(keys):
+        raise ValueError("choice table index and vectors disagree")
+    if meta.get("vectors_sha256") != hashlib.sha256(vectors.tobytes()).hexdigest():
+        raise ValueError("choice table vectors changed since they were written")
+    return {k: i for i, k in enumerate(keys)}, vectors, meta
+
+
+def save_choice_table(output: Path, keys: list[str], vectors, meta: dict) -> None:
+    """Write the table atomically (vectors first, index last)."""
+    import os
+
+    from safetensors.numpy import save_file
+
+    if len(keys) != vectors.shape[0]:
+        raise ValueError("choice table index and vectors disagree")
+    output = Path(output)
+    tensor_path = output / f"{CHOICE_TABLE}.safetensors"
+    save_file({"vectors": vectors}, str(tensor_path) + ".partial")
+    os.replace(str(tensor_path) + ".partial", tensor_path)
+    meta = {
+        **meta,
+        "text_sha256": list(keys),
+        "texts": len(keys),
+        "vectors_sha256": hashlib.sha256(vectors.tobytes()).hexdigest(),
+    }
+    save_json(output / f"{CHOICE_TABLE}.json.partial", meta)
+    os.replace(output / f"{CHOICE_TABLE}.json.partial", output / f"{CHOICE_TABLE}.json")
+
+
+def embed_pooled_texts(
+    encoder, tokenizer, texts, batch_size: int, max_tokens: int, device="cuda"
+):
+    """Last-token pooled, L2-normalized BF16 vectors -> FP16 CPU ``[N, D]``
+    (texts batched by length with right padding; the attention mask keeps
+    each text's last real token)."""
+    if not texts:
+        return torch.zeros((0, 0), dtype=torch.float16)
+    lengths = [len(tokenizer(t)["input_ids"]) for t in texts]
+    if max(lengths) > max_tokens:
+        raise ValueError(f"choice-scorer text of {max(lengths)} tokens > {max_tokens}")
+    order = sorted(range(len(texts)), key=lambda i: lengths[i])
+    out = [None] * len(texts)
+    for start in range(0, len(order), batch_size):
+        picks = order[start : start + batch_size]
+        tokens = tokenizer(
+            [texts[i] for i in picks], padding=True, return_tensors="pt"
+        ).to(device)
+        with torch.inference_mode():
+            hidden = encoder(**tokens, use_cache=False).last_hidden_state
+            vectors = normalize_features(hidden, tokens["attention_mask"]).half().cpu()
+        for row, index in enumerate(picks):
+            out[index] = vectors[row]
+    return torch.stack(out)
+
+
+def load_choice_encoder(path: Path):
+    from transformers import AutoModel, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    tokenizer.padding_side = "right"
+    encoder = (
+        AutoModel.from_pretrained(
+            path,
+            local_files_only=True,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        .requires_grad_(False)
+        .cuda()
+        .eval()
+    )
+    return encoder, tokenizer
+
+
+def paper_choice_embed(args) -> dict:
+    import numpy as np
+
+    protocol = paper_protocol(args.target)
+    if protocol["scoring"] != CHOICE_SCORING:
+        raise ValueError(f"{args.target} is not choice-scored")
+    arms = args.arms or paper_arm_files(args.output)
+    rows = [r for arm in arms for r in latest_rows(args.output / f"{arm}.jsonl")]
+    if not rows:
+        raise ValueError(f"no paper-run rows under {args.output}")
+    config, split = PAPER_TARGETS[args.target][0], records_split(args.target, rows)
+    texts = choice_embedding_texts(rows)
+    index, vectors, meta = load_choice_table(args.output)
+    keys = [None] * len(index)
+    for key, position in index.items():
+        keys[position] = key
+    missing = [t for t in texts if text_key(t) not in index]
+    encoder_path = Path(args.encoder or (args.assets / DEFAULT_ASSETS["encoder"]))
+    cotenant = wait_for_gpu(args.cotenant_limit_mib)
+    started = time.perf_counter()
+    encoder, tokenizer = load_choice_encoder(encoder_path)
+    # Alignment: the question texts of the first rows re-embedded through the
+    # same path must reproduce the stored (upstream vLLM) question vectors,
+    # and batching must not move a vector.
+    store = StoredEmbeddings(embedding_directory(args.data_root, config, split))
+    probes = sorted({(r["row"], str(r["question"]).strip()) for r in rows})
+    probes = probes[: args.verify_cases]
+    batched = embed_pooled_texts(
+        encoder, tokenizer, [q for _, q in probes], args.batch_size, args.max_tokens
+    )
+    verification = []
+    for (row, question), vector in zip(probes, batched, strict=True):
+        alone = embed_pooled_texts(encoder, tokenizer, [question], 1, args.max_tokens)
+        stored = store.question(row).float()
+        verification.append(
+            {
+                "row": row,
+                "stored_question_cosine": round(
+                    float(
+                        torch.nn.functional.cosine_similarity(
+                            vector.float(), stored, dim=0
+                        )
+                    ),
+                    5,
+                ),
+                "batched_vs_single_cosine": round(
+                    float(
+                        torch.nn.functional.cosine_similarity(
+                            vector.float(), alone[0].float(), dim=0
+                        )
+                    ),
+                    5,
+                ),
+            }
+        )
+    if any(v["stored_question_cosine"] < args.min_verify_cosine for v in verification):
+        raise ValueError(f"scorer does not reproduce stored vectors: {verification}")
+    new = embed_pooled_texts(
+        encoder, tokenizer, missing, args.batch_size, args.max_tokens
+    )
+    if missing:
+        added = new.numpy()
+        vectors = added if vectors is None else np.concatenate([vectors, added])
+        keys += [text_key(t) for t in missing]
+    meta = {
+        **meta,
+        "schema": "antfly.memorilla.qwen-hybrid-choice-embeddings.v1",
+        "target": args.target,
+        "encoder": str(encoder_path),
+        "pooling": "last-token, L2-normalized in BF16, FP16 storage",
+        "tokenizer_special_tokens": True,
+        "batch_size": args.batch_size,
+        "verification": verification,
+        "arms": sorted(set(meta.get("arms", [])) | set(arms)),
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "gpu_cotenant_mib_at_start": cotenant,
+    }
+    if vectors is not None:
+        save_choice_table(args.output, keys, vectors, meta)
+    result = {
+        "target": args.target,
+        "arms": arms,
+        "rows": len(rows),
+        "distinct_texts": len(texts),
+        "embedded_now": len(missing),
+        "table_texts": len(keys),
+        "verification": verification,
+        "seconds": round(time.perf_counter() - started, 1),
+    }
+    print(json.dumps(result, indent=1), flush=True)
+    return result
+
+
 # --------------------------------------------------------------- paper-score
 
 
@@ -1893,16 +2537,66 @@ def latest_rows(path: Path) -> list[dict]:
     return list(rows.values())
 
 
-def score_arm(protocol: dict, rows: list[dict], key: str, metrics_module) -> dict:
+def choice_row_correct(rows: list[dict], key: str, table, metrics_module) -> list[bool]:
+    """Upstream ``choice_accuracy`` per row from the ``paper-choice-embed``
+    vectors: each cleaned prediction (stripped) and every non-empty choice
+    looked up by text, upstream ``choice_predictions`` picks the most
+    cosine-similar choice (FP16 arrays, as upstream's ``embed_texts``
+    returns), correct when it is upstream ``choice_index`` of the reference."""
+    import numpy as np
+
+    m = metrics_module
+    index, vectors = table
+
+    def vector(text: str):
+        position = index.get(text_key(text))
+        if position is None:
+            raise ValueError(
+                f"no choice-scorer vector for {text[:60]!r}; run paper-choice-embed"
+            )
+        return vectors[position]
+
+    if not rows:
+        return []
+    predictions, candidates, choices = [], [], []
+    for row in rows:
+        if not row.get(CHOICES_COLUMN):
+            raise ValueError(f"{row['name']} carries no choices")
+        predictions.append(vector(m.clean_generation(row["predictions"][key]).strip()))
+        candidates.append(
+            np.stack([vector(c) for c in row[CHOICES_COLUMN] if c.strip()])
+        )
+        choices.append(row[CHOICES_COLUMN])
+    selected = m.choice_predictions(np.stack(predictions), candidates, choices)
+    return [
+        m.choice_index(row[CHOICES_COLUMN], str(row["answer"]).strip()) == picked
+        for row, picked in zip(rows, selected, strict=True)
+    ]
+
+
+def score_arm(
+    protocol: dict, rows: list[dict], key: str, metrics_module, choice_table=None
+) -> dict:
     """Upstream scoring of one arm at one prediction key ('full' or a prefix
-    budget) overall and, for generation targets, by question type."""
+    budget) overall and, for generation targets, by question type. Choice
+    targets need the ``paper-choice-embed`` table (``choice_table``)."""
     m = metrics_module
     usable = [r for r in rows if key in r["predictions"]]
     predictions = [m.clean_generation(r["predictions"][key]) for r in usable]
     references = [str(r["answer"]).strip() for r in usable]
-    scores = m.compute_metrics(
-        protocol["scoring"], protocol["metrics"], predictions, references
-    )
+    if protocol["scoring"] == CHOICE_SCORING:
+        if choice_table is None:
+            raise ValueError("choice scoring needs the paper-choice-embed table")
+        scores = choice_accuracy_from_correct(
+            choice_row_correct(usable, key, choice_table, m),
+            [r.get(HARD_COLUMN) for r in usable],
+            "accuracy_hard" in protocol["metrics"],
+        )
+        scores = {name: scores[name] for name in protocol["metrics"]}
+    else:
+        scores = m.compute_metrics(
+            protocol["scoring"], protocol["metrics"], predictions, references
+        )
     result = {
         "rows": len(usable),
         "metrics": {k: round(100 * v, 2) for k, v in scores.items()},
@@ -1932,19 +2626,31 @@ def score_arm(protocol: dict, rows: list[dict], key: str, metrics_module) -> dic
     return result
 
 
-def per_row_scores(protocol: dict, rows: list[dict], key: str, metrics_module) -> dict:
-    """name -> primary per-row score (EM for TriviaQA, ROUGE-L otherwise)."""
+def per_row_scores(
+    protocol: dict, rows: list[dict], key: str, metrics_module, choice_table=None
+) -> dict:
+    """name -> primary per-row score: EM (TriviaQA), choice correctness
+    (pmv2, pv4, factkg), polarity match (PubMedQA; rows whose reference has no
+    leading yes/no/maybe are skipped, as upstream ``polarity_accuracy`` does)
+    or ROUGE-L (generation targets)."""
     m = metrics_module
+    usable = [r for r in rows if key in r["predictions"]]
+    if protocol["scoring"] == CHOICE_SCORING:
+        correct = choice_row_correct(usable, key, choice_table, m)
+        return {r["name"]: float(c) for r, c in zip(usable, correct, strict=True)}
     scores = {}
-    for row in rows:
-        if key not in row["predictions"]:
-            continue
+    for row in usable:
         prediction = m.clean_generation(row["predictions"][key])
         reference = str(row["answer"]).strip()
         if protocol["scoring"] == "exact_match":
             value = float(
                 m.normalize_answer(prediction) == m.normalize_answer(reference)
             )
+        elif protocol["scoring"] == POLARITY_SCORING:
+            gold = m.first_polarity(reference)
+            if gold is None:
+                continue
+            value = float(m.first_polarity(prediction) == gold)
         else:
             value = m.rouge([prediction], [reference])["rougeL"]
         scores[row["name"]] = value
@@ -1981,10 +2687,7 @@ def paper_score(args) -> dict:
     from memorilla import metrics as upstream_metrics
 
     protocol = paper_protocol(args.target)
-    files = sorted(args.output.glob("*.jsonl"))
-    arms = args.arms or [
-        p.stem for p in files if p.stem != "records" and not p.stem.startswith("run-")
-    ]
+    arms = args.arms or paper_arm_files(args.output)
     result = {
         "schema": "antfly.memorilla.qwen-hybrid-paper-scores.v1",
         "target": args.target,
@@ -1992,6 +2695,16 @@ def paper_score(args) -> dict:
         "arms": {},
         "paired": {},
     }
+    choice_table = None
+    if protocol["scoring"] == CHOICE_SCORING:
+        index, vectors, meta = load_choice_table(args.output)
+        if vectors is None:
+            raise ValueError("choice scoring needs paper-choice-embed output")
+        choice_table = (index, vectors)
+        result["choice_scorer"] = {
+            k: meta.get(k)
+            for k in ("encoder", "pooling", "texts", "verification", "updated")
+        }
     per_row = {}
     for arm in arms:
         rows = latest_rows(args.output / f"{arm}.jsonl")
@@ -2003,8 +2716,10 @@ def paper_score(args) -> dict:
         entry = {
             "rows": len(rows),
             "by_budget": {
-                key: score_arm(protocol, rows, key, upstream_metrics) for key in keys
+                key: score_arm(protocol, rows, key, upstream_metrics, choice_table)
+                for key in keys
             },
+            "prompt_truncated": sum("prompt_truncated_from" in r for r in rows),
             "canonicalized": sum(bool(r.get("canonicalized")) for r in rows),
             "generation_seconds_per_row": round(
                 mean(r["batch_generation_seconds"] / r["batch_size"] for r in rows), 4
@@ -2029,7 +2744,7 @@ def paper_score(args) -> dict:
         primary = args.primary_budget if args.primary_budget in keys else "full"
         per_row[arm] = (
             primary,
-            per_row_scores(protocol, rows, primary, upstream_metrics),
+            per_row_scores(protocol, rows, primary, upstream_metrics, choice_table),
         )
     threshold = args.answered_threshold
     for left, right in args.pairs:
@@ -2037,8 +2752,20 @@ def paper_score(args) -> dict:
             result["paired"][f"{left}->{right}"] = {
                 "budgets": [per_row[left][0], per_row[right][0]],
                 **paired_summary(per_row[left][1], per_row[right][1], threshold),
+                "bootstrap": paired_bootstrap_ci(
+                    per_row[left][1],
+                    per_row[right][1],
+                    args.bootstrap_resamples,
+                    args.bootstrap_seed,
+                ),
             }
     save_json(args.output / "scores.json", result)
+    # Primary per-row scores of every arm, for seed aggregates
+    # (``qwen_span_copy.py seeds``).
+    save_json(
+        args.output / "per-row.json",
+        {arm: {"budget": budget, "scores": scores} for arm, (budget, scores) in per_row.items()},
+    )
     print(json.dumps(result, indent=1, ensure_ascii=False), flush=True)
     return result
 
@@ -2070,6 +2797,12 @@ def parse_paper_args(argv):
         p.add_argument("--seed", type=int, default=23)
         p.add_argument("--top-k", type=int, default=50, help="chunk texts kept")
         p.add_argument("--datasets-cache", type=Path, required=True)
+        p.add_argument(
+            "--split",
+            choices=("train", "validation", "test"),
+            default="",
+            help="default: the target's registered split (fresh-row checks use another)",
+        )
     elif command == "paper-run":
         p.add_argument("--assets", type=Path, required=True)
         for key in DEFAULT_ASSETS:
@@ -2084,11 +2817,48 @@ def parse_paper_args(argv):
         p.add_argument("--max-new-tokens", type=int, default=0, help="override")
         p.add_argument("--truncations", default="", help="extra prefix budgets")
         p.add_argument("--record-top-k", type=int, default=RECORD_TOP_K)
+        p.add_argument(
+            "--record-extractor",
+            choices=("candidate", "embed-window", "lead"),
+            default="candidate",
+            help="record from the candidate, or a cheap window (extractor ablation)",
+        )
+        p.add_argument("--record-stride", type=int, default=8, help="embed-window scan stride")
+        p.add_argument(
+            "--record-read-tokens",
+            type=int,
+            default=0,
+            help="budget study B: read top chunks until this many tokens (0: --record-top-k)",
+        )
+        p.add_argument(
+            "--record-window-policy",
+            choices=("P1", "P2", "P3"),
+            default=None,
+            help="budget study B window policy (span-window candidates; default: candidate's)",
+        )
         p.add_argument("--record-gate-cosine", type=float, default=RECORD_GATE_COSINE)
+        p.add_argument(
+            "--record-gate-mode",
+            choices=RECORD_GATE_MODES,
+            default="cosine",
+            help="snap-cosine rule or the copy head's learned gate",
+        )
         p.add_argument("--encoder-max-length", type=int, default=2048)
         p.add_argument("--noise-seed", type=int, default=23)
         p.add_argument("--verify-cases", type=int, default=3)
         p.add_argument("--limit", type=int, default=0)
+        p.add_argument("--cotenant-limit-mib", type=int, default=40960)
+    elif command == "paper-choice-embed":
+        p.add_argument(
+            "--output", type=Path, required=True, help="paper-run output dir"
+        )
+        p.add_argument("--assets", type=Path, required=True)
+        p.add_argument("--encoder", type=Path, help="default: <assets>/models/...")
+        p.add_argument("--arms", default="", help="default: every arm file")
+        p.add_argument("--batch-size", type=int, default=32)
+        p.add_argument("--max-tokens", type=int, default=8192)
+        p.add_argument("--verify-cases", type=int, default=4)
+        p.add_argument("--min-verify-cosine", type=float, default=0.999)
         p.add_argument("--cotenant-limit-mib", type=int, default=40960)
     else:
         p.add_argument(
@@ -2099,6 +2869,8 @@ def parse_paper_args(argv):
         p.add_argument("--primary-budget", default="full")
         p.add_argument("--answered-threshold", type=float, default=0.2)
         p.add_argument("--enwiki-lcs", action="store_true")
+        p.add_argument("--bootstrap-resamples", type=int, default=BOOTSTRAP_RESAMPLES)
+        p.add_argument("--bootstrap-seed", type=int, default=23)
     args = p.parse_args(rest)
     args.command = command
     if command == "paper-run":
@@ -2110,9 +2882,17 @@ def parse_paper_args(argv):
             p.error("record gate cosine must lie in [0, 1]")
         if args.batch_size < 1:
             p.error("batch size must be positive")
+        if args.record_stride < 1:
+            p.error("record stride must be positive")
     elif command == "paper-score":
         args.arms = [a.strip() for a in args.arms.split(",") if a.strip()]
         args.pairs = parse_pairs(args.pairs)
+        if args.bootstrap_resamples < 1:
+            p.error("bootstrap resamples must be positive")
+    elif command == "paper-choice-embed":
+        args.arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+        if args.batch_size < 1:
+            p.error("batch size must be positive")
     elif args.sample and args.first:
         p.error("--sample and --first are exclusive")
     return args
@@ -2124,6 +2904,8 @@ def paper_main(argv) -> dict:
         return paper_prep(args)
     if args.command == "paper-run":
         return paper_run(args)
+    if args.command == "paper-choice-embed":
+        return paper_choice_embed(args)
     return paper_score(args)
 
 

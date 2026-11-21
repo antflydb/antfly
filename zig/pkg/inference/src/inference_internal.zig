@@ -61,6 +61,7 @@ pub const pipelines = struct {
     pub const memorilla_generation = @import("pipelines/memorilla_generation.zig");
     pub const memorilla_copy = @import("pipelines/memorilla_copy.zig");
     pub const memorilla_token_features = @import("pipelines/memorilla_token_features.zig");
+    pub const memorilla_span = @import("pipelines/memorilla_span.zig");
     pub const memorilla_grounding = @import("pipelines/memorilla_grounding.zig");
     pub const image = @import("pipelines/image.zig");
     pub const media_chunking = @import("pipelines/media_chunking.zig");
@@ -205,6 +206,8 @@ test "Memorilla production encoder declarations" {
     _ = models.memorilla_runtime;
     _ = models.memorilla_research_runtime;
     _ = @import("server/memorilla_reader_cache.zig");
+    _ = @import("server/memorilla_span_head_cache.zig");
+    _ = @import("models/memorilla_span_head_runtime.zig");
     _ = pipelines.memorilla_encoder;
 }
 test "embeddinggemma2 video module declarations" {

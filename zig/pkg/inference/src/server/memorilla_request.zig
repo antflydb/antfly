@@ -19,6 +19,12 @@ const grounding = @import("../pipelines/memorilla_grounding.zig");
 
 pub const ContextMode = enum { latent, source_verified };
 pub const ReaderKind = platform.inference_settings.MemorillaProfile.ReaderKind;
+/// `read_mode` of a hybrid_research request: `auto`, `narrow` and `wide` are
+/// the span cascade's read modes (`memorilla_span.ReadMode`); `none` skips the
+/// span pass and answers from the 16 soft rows alone under the released
+/// prompt (the closed-gate path: stock Memorilla over the same pooled
+/// vectors).
+pub const ReadMode = enum { auto, narrow, wide, none };
 
 // Ordinary Zig numeric parsing permits quoted numbers. The API wire contract
 // requires actual numeric tokens, including inside each feature vector.
@@ -41,6 +47,19 @@ pub const SourceTexts = struct {
     }
 };
 
+/// An optional string enum that refuses an explicit JSON null (absent is the
+/// only way to leave it unset).
+fn StrictEnum(comptime E: type) type {
+    return struct {
+        value: ?E = null,
+
+        pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() != .string) return error.UnexpectedToken;
+            return .{ .value = try std.json.innerParse(E, a, source, options) };
+        }
+    };
+}
+
 pub const Request = struct {
     model: []const u8,
     question: []const u8,
@@ -51,6 +70,10 @@ pub const Request = struct {
     max_new_tokens: JsonNumber(i64) = .{ .value = 64 },
     context_mode: ContextMode = .latent,
     document_texts: SourceTexts = .{},
+    /// hybrid_research only; absent keeps the bundle's default read.
+    read_mode: StrictEnum(ReadMode) = .{},
+    /// hybrid_research only: add the `diagnostics` object to the response.
+    include_diagnostics: bool = false,
 
     pub const Embeddings = struct {
         value: ?[]const []const JsonNumber(f32) = null,
@@ -80,6 +103,11 @@ pub const Request = struct {
     /// accepts vectors, and its source-verified mode is not implemented. The
     /// hybrid profile takes the same texts (the server also pools them).
     pub fn validateShape(self: @This(), kind: ReaderKind) !void {
+        // The read mode and the span diagnostics exist only on the hybrid.
+        if (kind != .hybrid_research) {
+            if (self.read_mode.value != null) return error.UnsupportedMemorillaReadMode;
+            if (self.include_diagnostics) return error.UnsupportedMemorillaDiagnostics;
+        }
         switch (kind) {
             .released => {
                 if (self.embeddingRows().len == 0) return error.EmptyMemorillaCollection;
@@ -262,6 +290,94 @@ test "Memorilla request wire rejects ambiguous modes null sources and number coe
         if (std.json.parseFromSlice(Request, a, body, .{})) |parsed_value| {
             var parsed = parsed_value;
             parsed.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "Memorilla request read mode and diagnostics are hybrid-only and absent by default" {
+    const a = std.testing.allocator;
+    var plain = try std.json.parseFromSlice(Request, a,
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."]}
+    , .{});
+    defer plain.deinit();
+    try std.testing.expect(plain.value.read_mode.value == null);
+    try std.testing.expect(!plain.value.include_diagnostics);
+    try plain.value.validateShape(.hybrid_research);
+    try plain.value.validateShape(.encoder_lora_research);
+
+    const modes = [_]struct { text: []const u8, mode: ReadMode }{
+        .{ .text = "auto", .mode = .auto },
+        .{ .text = "narrow", .mode = .narrow },
+        .{ .text = "wide", .mode = .wide },
+        .{ .text = "none", .mode = .none },
+    };
+    for (modes) |case| {
+        const body = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"question\":\"q\",\"encoder_execution_identity\":\"id\",\"document_texts\":[\"A fact.\"],\"read_mode\":\"{s}\",\"include_diagnostics\":true}}", .{case.text});
+        defer a.free(body);
+        var parsed = try std.json.parseFromSlice(Request, a, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.mode, parsed.value.read_mode.value.?);
+        try std.testing.expect(parsed.value.include_diagnostics);
+        try parsed.value.validateShape(.hybrid_research);
+        try std.testing.expectError(error.UnsupportedMemorillaReadMode, parsed.value.validateShape(.encoder_lora_research));
+    }
+
+    // Other reader kinds refuse the hybrid-only fields; an explicit false is
+    // the default and harmless.
+    const others = [_]struct { body: []const u8, kind: ReaderKind, failure: ?anyerror }{
+        .{ .body =
+        \\{"model":"m","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"id","read_mode":"auto"}
+        , .kind = .released, .failure = error.UnsupportedMemorillaReadMode },
+        .{ .body =
+        \\{"model":"m","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"id","include_diagnostics":true}
+        , .kind = .released, .failure = error.UnsupportedMemorillaDiagnostics },
+        .{ .body =
+        \\{"model":"m","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"id","include_diagnostics":false}
+        , .kind = .released, .failure = null },
+        .{ .body =
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"include_diagnostics":true}
+        , .kind = .encoder_lora_research, .failure = error.UnsupportedMemorillaDiagnostics },
+        .{ .body =
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"read_mode":"none"}
+        , .kind = .encoder_lora_research, .failure = error.UnsupportedMemorillaReadMode },
+    };
+    for (others) |case| {
+        var parsed = try std.json.parseFromSlice(Request, a, case.body, .{});
+        defer parsed.deinit();
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, parsed.value.validateShape(case.kind));
+        } else {
+            try parsed.value.validateShape(case.kind);
+        }
+    }
+
+    // Wire strictness: no null, no unknown mode, no coercion, no duplicates.
+    const rejected = [_][]const u8{
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"read_mode":null}
+        ,
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"read_mode":"cascade"}
+        ,
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"read_mode":"AUTO"}
+        ,
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"read_mode":1}
+        ,
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"read_mode":"auto","read_mode":"wide"}
+        ,
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"include_diagnostics":"true"}
+        ,
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"include_diagnostics":null}
+        ,
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"include_diagnostics":1}
+        ,
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact."],"diagnostics":true}
+        ,
+    };
+    for (rejected) |body| {
+        if (std.json.parseFromSlice(Request, a, body, .{})) |parsed_value| {
+            var parsed = parsed_value;
+            parsed.deinit();
+            std.debug.print("accepted: {s}\n", .{body});
             return error.TestUnexpectedResult;
         } else |_| {}
     }

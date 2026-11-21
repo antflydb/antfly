@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memorilla Playground</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #5d6676; --faint: #8a93a3;
+  --line: #e2e5ea; --accent: #2f6fde; --accent-soft: #e6eefc;
+  --good: #1f8a4c; --good-soft: #e3f4ea; --bad: #b4372f; --bad-soft: #fbe9e7;
+  --warn: #9a6a00; --warn-soft: #fbf1d9;
+  --window: #fff2b3; --span: #ffd04d; --narrow: #7c5cd6; --narrow-soft: #eee8fb; --wide: #0f8b8d; --wide-soft: #e0f3f3;
+  --t1: #5b8def; --t2: #8e6be8; --t3: #c26ad6; --t4: #13a3a6; --t5: #48b97a; --t6: #b8b8c2; --t7: #e0a03c; --t8: #e46a5a;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1a1e26; --ink: #e6e9ef; --muted: #a3abb9; --faint: #727b8b;
+    --line: #2a303b; --accent: #7aa7ff; --accent-soft: #1f2b44;
+    --good: #5fd38f; --good-soft: #17301f; --bad: #ff8a80; --bad-soft: #3a1d1b;
+    --warn: #f0c454; --warn-soft: #3a2f12;
+    --window: #4a4220; --span: #8a6a10; --narrow: #b39bff; --narrow-soft: #2a2442; --wide: #4fd1d3; --wide-soft: #163334;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--sans); }
+header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+header .sub { color: var(--muted); font-size: 13px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; font-size: 12px; background: var(--line); color: var(--muted); white-space: nowrap; }
+.pill.good { background: var(--good-soft); color: var(--good); }
+.pill.bad { background: var(--bad-soft); color: var(--bad); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.accent { background: var(--accent-soft); color: var(--accent); }
+.pill.narrow { background: var(--narrow-soft); color: var(--narrow); }
+.pill.wide { background: var(--wide-soft); color: var(--wide); }
+.pill.ghost { background: transparent; border: 1px dashed var(--line); color: var(--faint); }
+.spacer { flex: 1; }
+main { display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: 16px; padding: 16px 20px 40px; max-width: 1600px; margin: 0 auto; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px 32px; } main > section:last-child { order: -1; } header { padding: 12px 16px; flex-wrap: wrap; } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.chunk { margin-bottom: 12px; }
+.chunk .head { display: flex; align-items: baseline; gap: 6px; font-size: 12px; color: var(--muted); margin-bottom: 4px; min-width: 0; }
+.chunk .head b { color: var(--ink); font-weight: 600; white-space: nowrap; }
+.chunk .head .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chunk .head .count { white-space: nowrap; }
+textarea, input[type=text], select, input[type=number] { width: 100%; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+textarea { min-height: 92px; resize: vertical; font-size: 12.5px; line-height: 1.4; }
+textarea:focus, input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+button { font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 7px 12px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; padding: 9px 18px; }
+button.primary:disabled { opacity: 0.6; cursor: progress; }
+button.link { border: none; background: none; color: var(--accent); padding: 0; }
+.ask { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+.ask input[type=text] { font-size: 16px; padding: 10px 12px; }
+.controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 10px; color: var(--muted); font-size: 13px; }
+.controls label { display: inline-flex; gap: 6px; align-items: center; }
+.controls select { width: auto; padding: 5px 8px; }
+.controls input[type=number] { width: 70px; padding: 5px 8px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chip { font-size: 12.5px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+.results { display: grid; gap: 14px; margin-top: 14px; }
+.answers { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.answer .label { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.answer .text { font-size: 20px; font-weight: 600; margin: 8px 0 10px; word-break: break-word; white-space: pre-wrap; }
+.answer .text.unknown { color: var(--faint); font-style: italic; }
+.answer .meta { display: flex; gap: 6px; flex-wrap: wrap; }
+.answer .raw { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.latency { margin-top: 10px; font-size: 12px; color: var(--muted); }
+.latency .big { font-size: 15px; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 6px 0 4px; background: var(--line); }
+.bar span { display: block; height: 100%; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11.5px; color: var(--muted); }
+.legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: 0; }
+.trace { display: flex; align-items: stretch; flex-wrap: wrap; gap: 6px; }
+.step { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 130px; background: var(--bg); }
+.step .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.step .v { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.step .d { font-size: 12px; color: var(--muted); }
+.step.on { border-color: var(--good); background: var(--good-soft); }
+.step.off { border-color: var(--line); opacity: 0.8; }
+.step.hot { border-color: var(--warn); background: var(--warn-soft); }
+.step.narrowc { border-left: 3px solid var(--narrow); }
+.step.widec { border-left: 3px solid var(--wide); }
+.arrow { align-self: center; color: var(--faint); font-size: 16px; }
+.evidence { font-size: 13.5px; line-height: 1.6; }
+.evidence mark, .ptext mark { background: var(--window); color: inherit; border-radius: 2px; padding: 1px 0; }
+.evidence mark strong, .ptext mark strong { background: var(--span); border-radius: 2px; padding: 1px 1px; }
+.evidence .src { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.decoder-window { margin-top: 10px; font: 12px/1.5 var(--mono); background: var(--bg); border: 1px dashed var(--line); border-radius: 6px; padding: 8px; white-space: pre-wrap; word-break: break-word; }
+.passages { display: grid; gap: 6px; }
+.prow { display: grid; grid-template-columns: 34px 70px minmax(0, 1fr); gap: 10px; padding: 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); align-items: start; }
+.prow.hit { border-color: var(--span); box-shadow: inset 3px 0 0 var(--span); }
+.prow .rank { font-weight: 700; font-variant-numeric: tabular-nums; color: var(--muted); }
+.prow .score { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); }
+.prow .sbar { height: 4px; border-radius: 2px; background: var(--accent); opacity: 0.7; margin-top: 4px; }
+.prow .who { font-size: 12px; color: var(--muted); display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 3px; }
+.prow .ptext { font-size: 13px; line-height: 1.5; }
+.prow.outside .ptext { color: var(--muted); }
+.cite { border-left: 3px solid var(--good); padding: 4px 10px; margin: 6px 0; font-size: 13px; }
+.cite .src { font-size: 12px; color: var(--muted); }
+.error { background: var(--bad-soft); color: var(--bad); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; font-size: 13px; }
+.note { font-size: 12.5px; color: var(--muted); }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; font-size: 12.5px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+details summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+pre.json { font: 11.5px/1.45 var(--mono); background: var(--bg); border-radius: 6px; padding: 10px; overflow: auto; max-height: 420px; }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--accent-soft); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -2px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.empty { color: var(--faint); text-align: center; padding: 30px 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Memorilla playground</h1>
+  <span class="sub">span hybrid on the Zig runtime</span>
+  <span class="spacer"></span>
+  <span id="status" class="pill">checking server…</span>
+</header>
+<main>
+  <section class="panel" aria-label="Chunks">
+    <h2>Chunks <span class="spacer"></span>
+      <button class="link" id="reset">reset samples</button>
+      <button class="link" id="clear">clear</button>
+    </h2>
+    <p class="note" id="chunk-note">Each chunk is split into sentence passages of at most 64 encoder tokens before ranking.</p>
+    <div id="chunks"></div>
+  </section>
+  <section>
+    <div class="panel">
+      <div class="ask">
+        <input type="text" id="question" placeholder="Ask a question about the chunks…" autocomplete="off">
+        <button class="primary" id="go">Ask</button>
+      </div>
+      <div class="controls">
+        <label>Read mode
+          <select id="mode">
+            <option value="auto" selected>auto (cascade)</option>
+            <option value="narrow">narrow (top 2)</option>
+            <option value="wide">wide (to budget)</option>
+            <option value="none">none (stock only)</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="compare" checked> compare with stock Memorilla</label>
+        <label>max tokens <input type="number" id="maxtok" min="1" max="128" value="64"></label>
+      </div>
+      <div class="chips" id="chips"></div>
+    </div>
+    <div class="results" id="results">
+      <div class="panel empty">Pick a sample question or type your own. The first request after a cold start loads the models (a few minutes).</div>
+    </div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else if (k === "style") n.style.cssText = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  return n;
+};
+const fmt = (x, d = 2) => (x == null || Number.isNaN(x) ? "–" : (x > 0 ? "+" : x < 0 ? "−" : "") + Math.abs(x).toFixed(d));
+const ms = (x) => (x == null ? "–" : x >= 1000 ? (x / 1000).toFixed(2) + " s" : Math.round(x) + " ms");
+let config = null, chunkBoxes = [], splitTimer = null;
+const STORE = "memorilla-playground-v1";
+
+function saveState() {
+  try { localStorage.setItem(STORE, JSON.stringify({ chunks: chunkBoxes.map((t) => t.value), question: $("#question").value, mode: $("#mode").value, compare: $("#compare").checked })); } catch (_) {}
+}
+function loadState() { try { return JSON.parse(localStorage.getItem(STORE) || "null"); } catch (_) { return null; } }
+
+function buildChunks(texts) {
+  const box = $("#chunks"); box.textContent = ""; chunkBoxes = [];
+  const titles = config.samples.chunks.map((c) => c.title);
+  texts.forEach((text, i) => {
+    const area = el("textarea", { "aria-label": `Chunk ${i + 1}`, spellcheck: "false", oninput: () => { saveState(); scheduleSplit(); } });
+    area.value = text;
+    chunkBoxes.push(area);
+    box.append(el("div", { class: "chunk" },
+      el("div", { class: "head" }, el("b", { text: `Chunk ${i + 1}` }), el("span", { class: "title", title: titles[i] || "", text: titles[i] ? "· " + titles[i] : "" }), el("span", { class: "count", id: `count-${i}` })),
+      area));
+  });
+  scheduleSplit(0);
+}
+function scheduleSplit(delay = 400) {
+  clearTimeout(splitTimer);
+  splitTimer = setTimeout(async () => {
+    try {
+      const r = await fetch("/api/split", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chunks: chunkBoxes.map((t) => t.value) }) });
+      const data = await r.json();
+      let total = 0;
+      data.chunks.forEach((c) => {
+        total += c.passages.length;
+        const n = $(`#count-${c.chunk}`);
+        if (n) n.textContent = c.tokens ? `${c.tokens} tokens · ${c.passages.length} passage${c.passages.length === 1 ? "" : "s"}` : "empty";
+      });
+      $("#chunk-note").textContent = `Each chunk is split into sentence passages of at most ${config.passage_tokens} encoder tokens: ${total} passages in all (the route takes 64). Ranking: ${config.ranking === "dense" ? "dense cosine, stock Qwen3-Embedding-4B" : "BM25"}.`;
+    } catch (_) {}
+  }, delay);
+}
+
+async function init() {
+  config = await (await fetch("/api/config")).json();
+  const s = $("#status");
+  s.className = "pill " + (config.zig_healthy ? "good" : "bad");
+  s.textContent = config.zig_healthy ? `Zig server up · ${config.profile}` : `Zig server down (${config.zig_url})`;
+  $("#maxtok").value = config.max_new_tokens;
+  const saved = loadState();
+  buildChunks(saved && saved.chunks && saved.chunks.length ? saved.chunks : config.samples.chunks.map((c) => c.text));
+  if (saved) { $("#question").value = saved.question || ""; $("#mode").value = saved.mode || "auto"; $("#compare").checked = saved.compare !== false; }
+  const chips = $("#chips");
+  config.samples.questions.forEach((q) => chips.append(el("button", { class: "chip", text: q, onclick: () => { $("#question").value = q; ask(); } })));
+}
+
+$("#reset").addEventListener("click", () => { buildChunks(config.samples.chunks.map((c) => c.text)); saveState(); });
+$("#clear").addEventListener("click", () => { buildChunks(config.samples.chunks.map(() => "")); saveState(); });
+$("#go").addEventListener("click", () => ask());
+$("#question").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
+["#mode", "#compare"].forEach((s) => $(s).addEventListener("change", saveState));
+
+async function ask() {
+  const question = $("#question").value.trim();
+  if (!question) { $("#question").focus(); return; }
+  saveState();
+  const go = $("#go"); go.disabled = true;
+  const results = $("#results");
+  const started = performance.now();
+  const waiting = el("div", { class: "panel" }, el("span", { class: "spinner" }), " ", el("span", { id: "elapsed", text: "asking…" }));
+  results.textContent = ""; results.append(waiting);
+  const tick = setInterval(() => { const n = $("#elapsed"); if (n) n.textContent = `asking… ${((performance.now() - started) / 1000).toFixed(1)} s`; }, 100);
+  try {
+    const r = await fetch("/api/ask", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chunks: chunkBoxes.map((t) => t.value), question, read_mode: $("#mode").value, compare: $("#compare").checked, max_new_tokens: +$("#maxtok").value }) });
+    const data = await r.json();
+    results.textContent = "";
+    if (!r.ok) { results.append(el("div", { class: "panel" }, el("div", { class: "error", text: data.error || JSON.stringify(data) }))); return; }
+    render(data, results);
+  } catch (err) {
+    results.textContent = ""; results.append(el("div", { class: "panel" }, el("div", { class: "error", text: String(err) })));
+  } finally { clearInterval(tick); go.disabled = false; }
+}
+
+const STAGES = [["pooled", "pooled vectors", "--t1"], ["span_features", "span features", "--t2"], ["span_head", "span head", "--t3"], ["wide_features", "wide features", "--t4"], ["wide_head", "wide head", "--t5"], ["window", "window", "--t6"], ["soft_rows", "soft rows", "--t7"], ["generate", "generation", "--t8"]];
+
+function timingBar(t) {
+  if (!t) return null;
+  const parts = STAGES.filter(([k]) => t[k] != null && t[k] > 0);
+  const sum = parts.reduce((a, [k]) => a + t[k], 0) || 1;
+  return [
+    el("div", { class: "bar", title: "server stages" }, parts.map(([k, name, c]) => el("span", { style: `width:${(100 * t[k]) / sum}%;background:var(${c})`, title: `${name}: ${ms(t[k])}` }))),
+    el("div", { class: "legend" }, parts.map(([k, name, c]) => el("span", {}, el("i", { style: `background:var(${c})` }), `${name} ${ms(t[k])}`))),
+  ];
+}
+
+function answerCard(run, title, sub) {
+  if (!run) return null;
+  if (run.error) {
+    return el("div", { class: "panel answer" }, el("div", { class: "label" }, el("b", { text: title }), sub),
+      el("div", { class: "error", text: `HTTP ${run.error.status}: ${typeof run.error.body === "string" ? run.error.body : JSON.stringify(run.error.body)}` }));
+  }
+  const r = run.response, d = r.diagnostics || {};
+  const unknown = r.text.trim() === "UNKNOWN";
+  const badges = [];
+  badges.push(el("span", { class: "pill " + (r.record_gate === "open" ? "good" : ""), text: r.record_gate === "open" ? `window in prompt · ${r.memory_tokens} rows` : `soft rows only · ${r.memory_tokens} rows` }));
+  if (r.canonicalized) badges.push(el("span", { class: "pill accent", text: "re-spelled from window" }));
+  if (r.answer_guard === "rejected") badges.push(el("span", { class: "pill bad", text: "guard: abstained" }));
+  if (r.finish_reason === "length") badges.push(el("span", { class: "pill warn", text: "hit max tokens" }));
+  const raw = d.raw_answer != null && d.raw_answer !== r.text ? el("div", { class: "raw" }, "decoder said: ", el("code", { text: JSON.stringify(d.raw_answer) })) : null;
+  const t = d.timings_ms || {};
+  return el("div", { class: "panel answer" },
+    el("div", { class: "label" }, el("b", { text: title }), sub),
+    el("div", { class: "text" + (unknown ? " unknown" : ""), text: r.text }),
+    el("div", { class: "meta" }, badges), raw,
+    el("div", { class: "latency" }, el("span", { class: "big", text: ms(run.wall_ms) }), " round trip · server ", ms(t.total), ` · ${r.usage.prompt_tokens} prompt + ${r.usage.completion_tokens} answer tokens`),
+    timingBar(t));
+}
+
+function traceView(data, d) {
+  if (!d) return null;
+  const steps = [];
+  const arrow = () => el("span", { class: "arrow", text: "→" });
+  if (d.read_mode === "none") return el("div", { class: "note", text: "Span pass skipped (read_mode none): the decoder reads the 16 soft rows alone." });
+  const thr = d.cascade_threshold;
+  const nRan = d.narrow_margin != null, wRan = d.wide_margin != null;
+  const plan = data.plan;
+  if (nRan) {
+    steps.push(el("div", { class: "step narrowc" + (d.read_pass === "narrow" ? " on" : "") },
+      el("div", { class: "k", text: "narrow read" }), el("div", { class: "v", text: `margin ${fmt(d.narrow_margin)}` }),
+      el("div", { class: "d", text: `top ${plan.narrow_documents} passages · 32-row window` })));
+  } else if (d.narrow_unavailable) {
+    steps.push(el("div", { class: "step off" }, el("div", { class: "k", text: "narrow read" }), el("div", { class: "v", text: "skipped" }), el("div", { class: "d", text: d.narrow_unavailable })));
+  }
+  if (d.read_mode === "auto" && nRan && thr != null) {
+    steps.push(arrow());
+    const widen = d.narrow_margin < thr;
+    steps.push(el("div", { class: "step " + (widen ? "hot" : "off") },
+      el("div", { class: "k", text: "cascade" }), el("div", { class: "v", text: widen ? `${fmt(d.narrow_margin)} < ${fmt(thr, 0)}` : `${fmt(d.narrow_margin)} ≥ ${fmt(thr, 0)}` }),
+      el("div", { class: "d", text: widen ? (wRan ? "widen" : "would widen; wide set unavailable") : "keep narrow" })));
+  }
+  if (wRan) {
+    if (steps.length) steps.push(arrow());
+    steps.push(el("div", { class: "step widec" + (d.read_pass === "wide" ? " on" : "") },
+      el("div", { class: "k", text: "wide read" }), el("div", { class: "v", text: `margin ${fmt(d.wide_margin)}` }),
+      el("div", { class: "d", text: `${d.read_documents} passages · ${d.read_budget_tokens ?? d.read_tokens} of ${plan.read_tokens} tokens · ${d.window_rows}-row window` })));
+  }
+  if (d.read_mode === "all") {
+    steps.push(el("div", { class: "step on" }, el("div", { class: "k", text: "read (no cascade)" }), el("div", { class: "v", text: `margin ${fmt(d.margin)}` }), el("div", { class: "d", text: `${d.read_documents} passages` })));
+  }
+  steps.push(arrow());
+  const gateText = d.gate_offset != null ? `${fmt(d.margin)} ${d.gate_open ? "≥" : "<"} ${fmt(d.gate_offset, 0)}` : "always open";
+  steps.push(el("div", { class: "step " + (d.gate_open ? "on" : "off") },
+    el("div", { class: "k", text: `gate (${d.gate_policy})` }), el("div", { class: "v", text: gateText }),
+    el("div", { class: "d", text: `score ${d.score?.toFixed(2)} vs no-answer ${d.null_score?.toFixed(2)}` })));
+  steps.push(arrow());
+  steps.push(el("div", { class: "step " + (d.gate_open ? "on" : "off") },
+    el("div", { class: "k", text: "evidence window" }), el("div", { class: "v", text: d.gate_open ? "in the prompt" : "left out" }),
+    el("div", { class: "d", text: d.gate_open ? `16 soft + ${d.window_rows} window rows` : "16 soft rows only" })));
+  return el("div", { class: "trace" }, steps);
+}
+
+function segView(segs) {
+  return segs.map((s) => {
+    if (s.kind === "plain") return document.createTextNode(s.text);
+    if (s.kind === "span") return el("mark", {}, el("strong", { text: s.text }));
+    return el("mark", { text: s.text });
+  });
+}
+
+function evidenceView(data, run) {
+  const r = run && run.response; if (!r) return null;
+  const d = r.diagnostics || {};
+  if (d.read_mode === "none" || !d.window) return null;
+  const parts = [];
+  (run.highlights || []).forEach((h) => {
+    const p = data.passages[h.document_index];
+    parts.push(el("div", { class: "evidence" },
+      el("div", { class: "src", text: `#${h.document_index + 1} in the ranking · chunk ${p.chunk + 1}, passage ${p.index + 1}` + (d.span && d.span.document_index === h.document_index ? ` · span “${d.span.text}”` : "") }),
+      el("div", {}, segView(h.segments))));
+  });
+  parts.push(el("div", { class: "decoder-window", title: "the window's tokens as the decoder reads them (padded to the window rows)", text: d.window.text.replace(/\s+$/, "") + (d.window.text.match(/\s+$/) ? ` ⟨${d.window.text.length - d.window.text.trimEnd().length} pad⟩` : "") }));
+  const cites = (r.citations || []).map((c) => el("div", { class: "cite" },
+    el("div", { class: "src", text: `${c.passage} · bytes ${c.start}–${c.end} · ${c.supports_answer ? "contains the answer (" + c.match + ")" : "does not contain the answer"}` }), c.text));
+  return el("div", { class: "panel" },
+    el("h2", {}, "Evidence window", el("span", { class: "pill " + (d.gate_open ? "good" : ""), text: d.gate_open ? "read by the decoder" : "not read (gate closed)" })),
+    parts,
+    el("h2", { style: "margin-top:12px" }, "Citations"),
+    cites.length ? cites : el("div", { class: "note", text: r.record_gate === "open" ? "none" : "none: citations exist only when the window is in the prompt" }));
+}
+
+function passagesView(data, run) {
+  const d = (run && run.response && run.response.diagnostics) || {};
+  const nRan = d.narrow_margin != null && d.read_mode !== "all", wRan = d.wide_margin != null;
+  const hl = new Map((run && run.highlights || []).map((h) => [h.document_index, h.segments]));
+  const max = Math.max(...data.passages.map((p) => p.score), 1e-9), min = Math.min(...data.passages.map((p) => p.score), 0);
+  const rows = data.passages.map((p, i) => {
+    const tags = [];
+    if (d.read_mode === "all" && i < d.read_documents) tags.push(el("span", { class: "pill accent", text: "read" }));
+    if (nRan && i < data.plan.narrow_documents) tags.push(el("span", { class: "pill narrow", text: "narrow" }));
+    if (wRan && i < d.read_documents) tags.push(el("span", { class: "pill wide", text: "wide" }));
+    else if (!wRan && d.read_mode === "auto" && i < data.plan.wide_documents) tags.push(el("span", { class: "pill ghost", text: "wide (not run)" }));
+    if (d.span && d.span.document_index === i) tags.push(el("span", { class: "pill warn", text: "span" }));
+    const inside = tags.length > 0;
+    return el("div", { class: "prow" + (hl.has(i) ? " hit" : "") + (inside ? "" : " outside") },
+      el("div", { class: "rank", text: `#${i + 1}` }),
+      el("div", { class: "score" }, p.score.toFixed(3), el("div", { class: "sbar", style: `width:${Math.max(4, (100 * (p.score - min)) / (max - min || 1))}%` })),
+      el("div", {}, el("div", { class: "who" }, `chunk ${p.chunk + 1} · passage ${p.index + 1} · ${p.tokens} tokens`, tags),
+        el("div", { class: "ptext" }, hl.has(i) ? segView(hl.get(i)) : p.text)));
+  });
+  return el("div", { class: "panel" },
+    el("h2", {}, `Ranked passages (${data.passages.length})`, el("span", { class: "note", style: "text-transform:none;letter-spacing:0", text: `${data.ranking.method} · ${ms(data.ranking.ms)}` })),
+    el("div", { class: "passages" }, rows));
+}
+
+function render(data, root) {
+  const hybrid = data.runs.hybrid, stock = data.runs.stock;
+  const modeLabel = data.read_mode === "none" ? "stock Memorilla (read_mode none)" : `span hybrid · read ${data.read_mode}`;
+  root.append(el("div", { class: "answers" },
+    answerCard(hybrid, data.read_mode === "none" ? "Stock Memorilla" : "Span hybrid", el("span", { class: "pill", text: modeLabel })),
+    answerCard(stock, "Stock Memorilla", el("span", { class: "pill", text: "same pooled vectors, soft rows only" }))));
+  const d = hybrid && hybrid.response && hybrid.response.diagnostics;
+  if (d && d.read_mode !== "none") {
+    root.append(el("div", { class: "panel" }, el("h2", {}, "Cascade trace"), traceView(data, d),
+      el("dl", { class: "kv", style: "margin-top:10px" },
+        el("dt", { text: "read pass used" }), el("dd", { text: `${d.read_pass ?? d.read_mode}${d.widened ? " (widened)" : ""}` }),
+        el("dt", { text: "read set" }), el("dd", { text: `${d.read_documents} passages, ${d.read_tokens} copy tokens` }),
+        el("dt", { text: "span" }), el("dd", { text: d.span ? `“${d.span.text}”` : "–" }),
+        el("dt", { text: "margins" }), el("dd", { text: `narrow ${fmt(d.narrow_margin)} · wide ${fmt(d.wide_margin)} · used ${fmt(d.margin)}` }))));
+  }
+  root.append(evidenceView(data, hybrid) || el("span"));
+  root.append(passagesView(data, hybrid));
+  root.append(el("div", { class: "panel" }, el("details", {}, el("summary", { text: "raw responses" }), el("pre", { class: "json", text: JSON.stringify(data.runs, null, 2) }))));
+}
+
+init();
+</script>
+</body>
+</html>

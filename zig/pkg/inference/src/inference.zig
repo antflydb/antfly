@@ -165,6 +165,7 @@ test {
     _ = @import("pipelines/memorilla_generation.zig");
     _ = @import("pipelines/memorilla_copy.zig");
     _ = @import("pipelines/memorilla_token_features.zig");
+    _ = @import("pipelines/memorilla_span.zig");
     _ = @import("models/memorilla.zig");
     _ = @import("server/memorilla_research_service.zig");
     _ = @import("server/memorilla_hybrid_service.zig");

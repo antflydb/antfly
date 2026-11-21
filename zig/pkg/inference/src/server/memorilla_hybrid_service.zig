@@ -52,6 +52,9 @@ const encoder = @import("../pipelines/memorilla_encoder.zig");
 const memory_pipeline = @import("../pipelines/memorilla.zig");
 const token_features = @import("../pipelines/memorilla_token_features.zig");
 const copy = @import("../pipelines/memorilla_copy.zig");
+const span_window = @import("../pipelines/memorilla_span.zig");
+const gpt = @import("../architectures/gpt.zig");
+const c_file = @import("../util/c_file.zig");
 const grounding = @import("../pipelines/memorilla_grounding.zig");
 const decode = @import("../pipelines/memorilla_generation.zig");
 const generation = @import("../pipelines/generation.zig");
@@ -130,15 +133,127 @@ pub const OwnedResult = struct {
     record_text: []u8,
     raw_text: []u8,
     min_snap_cosine: f32,
+    /// Span-window bundles: the decoded span, its evidence window and the
+    /// gate margin (null for copy17 records and for `span_soft_only`).
+    span: ?SpanDiagnostics = null,
+    /// Span-window bundles: the predicted span and the evidence window as
+    /// regions of the caller's documents (`copy.buildCitations` of each, with
+    /// no answer), whether or not the gate opened; null for copy17 records
+    /// and for `span_soft_only`. `unavailable` as for `citations`.
+    span_regions: ?copy.Citations = null,
+    window_regions: ?copy.Citations = null,
+    /// Span-window bundles: stage timings (null for copy17 records).
+    timings: ?SpanTimings = null,
+    /// `span_soft_only`: no span pass ran; the decoder read the soft rows
+    /// alone under the released prompt.
+    soft_only: bool = false,
     response_lease: memory.AdmissionLease,
 
     pub fn deinit(self: *OwnedResult) void {
         self.allocator.free(self.record_text);
         self.allocator.free(self.raw_text);
+        if (self.span) |diagnostics| {
+            if (diagnostics.gate_profile) |name| self.allocator.free(name);
+        }
+        if (self.span_regions) |*regions| regions.deinit();
+        if (self.window_regions) |*regions| regions.deinit();
         self.generation.deinit();
         self.citations.deinit();
         self.response_lease.release();
         self.* = undefined;
+    }
+};
+
+/// Span-window record diagnostics (`qwen_span_copy.span_record_memory`).
+pub const SpanDiagnostics = struct {
+    /// Inclusive span in the concatenated copy ids.
+    start: usize,
+    end: usize,
+    /// Window `[lo, hi)` in the copy ids (the record rows before padding).
+    window_lo: usize,
+    window_hi: usize,
+    score: f64,
+    null_score: f64,
+    /// `score - null_score - threshold`; the gate opens at `margin >=
+    /// gate_offset`.
+    margin: f64,
+    gate_policy: span_window.GatePolicy,
+    /// The offset the margin was compared with (-inf for `always`).
+    gate_offset: f64 = 0,
+    /// Routed or declared profile name (owned by the result), null for
+    /// `always` and `learned` without a declared profile.
+    gate_profile: ?[]u8 = null,
+    /// Cosine of the question to the routed centroid (routed only).
+    gate_similarity: f32 = 0,
+    /// The routed question fell below its profile's floor and took the
+    /// `learned` offset.
+    gate_fallback: bool = false,
+    /// Span-head load and forward time (every pass the request ran).
+    head_ms: f64,
+    /// Read mode of a cascade bundle (plan 8.32), null without a cascade.
+    read_mode: ?span_window.ReadMode = null,
+    /// The pass whose record the request used (null without a cascade).
+    read_pass: ?span_window.ReadPass = null,
+    /// The cascade's widening threshold (null without a cascade).
+    cascade_threshold: ?f64 = null,
+    /// Margins of the narrow and wide passes that ran (null: not run).
+    narrow_margin: ?f64 = null,
+    wide_margin: ?f64 = null,
+    /// Why a cascade read set was skipped (its preflight error name; the
+    /// request kept or took the other read), null when both were usable.
+    narrow_unavailable: ?[]const u8 = null,
+    wide_unavailable: ?[]const u8 = null,
+    /// Leading candidate documents read (the span pass, citations and copy
+    /// sources cover exactly these).
+    read_documents: usize = 0,
+    /// Copy ids of the read set (`read_tokens` of the evaluator's records).
+    read_tokens: usize = 0,
+    /// Encoder tokens the read budget summed (0 without a budget).
+    read_budget_tokens: usize = 0,
+    /// Evidence window rows (`span_window_tokens` or the cascade's).
+    window_rows: usize = 0,
+};
+
+/// Stage timings of a span-bundle request in milliseconds: the
+/// `memorilla_span_timing` stages (each measured from the previous mark, so
+/// a stage also carries the model-handle and verification work done since).
+/// `total_ms` covers the whole service call (`generate`), including
+/// preflight, admission and the stages not listed.
+pub const SpanTimings = struct {
+    /// Pooled (stock encoder) document and question vectors.
+    pooled_ms: f64 = 0,
+    /// The first span pass's per-token encoder features (with LoRA).
+    span_features_ms: f64 = 0,
+    /// The first pass's span head (after the decoder handle is acquired).
+    span_head_ms: f64 = 0,
+    /// The cascade's wide pass, when it ran.
+    wide_features_ms: f64 = 0,
+    wide_head_ms: f64 = 0,
+    /// Read plan, evidence window, path checks and the window's embedding rows.
+    window_ms: f64 = 0,
+    /// The released reader's 16 soft rows.
+    soft_rows_ms: f64 = 0,
+    /// Prefill and greedy decoding.
+    generate_ms: f64 = 0,
+    total_ms: f64 = 0,
+
+    fn add(self: *SpanTimings, stage: []const u8, ms: f64) void {
+        const named = .{
+            .{ "pooled", "pooled_ms" },
+            .{ "span_features", "span_features_ms" },
+            .{ "span_head", "span_head_ms" },
+            .{ "wide_features", "wide_features_ms" },
+            .{ "wide_head", "wide_head_ms" },
+            .{ "soft_rows", "soft_rows_ms" },
+            .{ "generate", "generate_ms" },
+        };
+        inline for (named) |entry| {
+            if (std.mem.eql(u8, stage, entry[0])) {
+                @field(self, entry[1]) += ms;
+                return;
+            }
+        }
+        self.window_ms += ms;
     }
 };
 
@@ -533,9 +648,11 @@ fn preflightEncoder(a: A, io: std.Io, manager: *manager_mod.ModelManager, select
 pub fn generate(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: Profile, paths: Paths, question: []const u8, documents: []const []const u8, identity: []const u8, max_new_tokens: usize, limits: memory.Limits, request_limits: platform.resource_policy.InferenceRequestLimits, control: Control, options_in: Options) !OwnedResult {
     var options = options_in;
     options.request_limits = request_limits;
+    const started = std.Io.Timestamp.now(io, .awake);
     var result = try generateImpl(a, io, manager, profile, paths, question, documents, identity, max_new_tokens, limits, control, options);
     errdefer result.deinit();
     try control.check();
+    if (result.timings) |*timings| timings.total_ms = elapsedSince(io, started);
     return result;
 }
 
@@ -552,6 +669,16 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     const decoder_control = paths.decoder.bind(control);
     const canonical = try qualified.canonicalQuestion(question);
     const released_directory = profile.released_memory_module_path orelse return error.UnsupportedMemorillaProfile;
+    // A span-window bundle (plan 8.11) replaces the copy17 record half.
+    if (try readSpanProtocol(platform.allocator.reclaimingScratch(a), profile.memory_module_path)) |span_protocol| {
+        if (options.span_soft_only)
+            return generateSoftOnlyImpl(a, io, manager, profile, paths, canonical, documents, max_new_tokens, limits, control, options, span_protocol, released_directory);
+        return generateSpanImpl(a, io, manager, profile, paths, canonical, documents, max_new_tokens, limits, control, options, span_protocol, released_directory);
+    }
+    // Read modes (and the soft-only comparison) are span-bundle features.
+    if (options.span_read_mode != null or options.span_soft_only) return error.UnsupportedMemorillaReadMode;
+    // Stored soft-half vectors are a span-bundle feature.
+    if (options.stored_documents != null or options.stored_question != null) return error.UnsupportedMemorillaProfile;
 
     var response_lease = try manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = 32 * 1024 * 1024 });
     var transfer_response = false;
@@ -870,6 +997,976 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     };
 }
 
+// --- span-window record half (plan 8.11/8.12) ------------------------------------
+
+/// Debug-level stage timing of the span path (`memorilla_span_timing`).
+const SpanTimer = struct {
+    io: std.Io,
+    last: std.Io.Timestamp,
+    /// The marks so far, by stage (`SpanTimings.add`).
+    timings: SpanTimings = .{},
+
+    fn start(io: std.Io) SpanTimer {
+        return .{ .io = io, .last = std.Io.Timestamp.now(io, .awake) };
+    }
+
+    fn mark(self: *SpanTimer, name: []const u8) void {
+        const now = std.Io.Timestamp.now(self.io, .awake);
+        const nanoseconds = self.last.durationTo(now).nanoseconds;
+        self.last = now;
+        const ms = @as(f64, @floatFromInt(@max(nanoseconds, 0))) / 1_000_000.0;
+        self.timings.add(name, ms);
+        std.log.info("memorilla_span_timing stage={s} ms={d:.1}", .{ name, ms });
+    }
+};
+
+/// `ANTFLY_MEMORILLA_SPAN_HEAD_HOST=1`: run the span head on the host (F32,
+/// `memorilla_span.forward`) instead of the device-resident head.
+pub const span_head_host_env = "ANTFLY_MEMORILLA_SPAN_HEAD_HOST";
+
+fn spanHeadOnHost() bool {
+    return platform.env.getenvBool(span_head_host_env);
+}
+
+/// The span fields of the bundle's pinned `protocol.json` (sha256 and size
+/// checked against `manifest.json`), or null for a copy17 bundle.
+pub fn readSpanProtocol(a: A, directory: []const u8) !?span_window.Protocol {
+    const manifest_path = try std.fs.path.join(a, &.{ directory, "manifest.json" });
+    defer a.free(manifest_path);
+    const manifest_bytes = try c_file.readFileMax(a, manifest_path, 1024 * 1024);
+    defer a.free(manifest_bytes);
+    var manifest = std.json.parseFromSlice(std.json.Value, a, manifest_bytes, .{}) catch return error.InvalidMemorillaManifest;
+    defer manifest.deinit();
+    const protocol_path = try std.fs.path.join(a, &.{ directory, "protocol.json" });
+    defer a.free(protocol_path);
+    const protocol_bytes = try c_file.readFileMax(a, protocol_path, 256 * 1024);
+    defer a.free(protocol_bytes);
+    try @import("../models/memorilla.zig").verifyFile(manifest.value, "protocol.json", protocol_bytes);
+    return span_window.parseProtocol(a, protocol_bytes);
+}
+
+/// The soft half's reader inputs: BF16-valued F32 rows, `qualified.width` wide.
+const SoftInputs = struct {
+    documents: []const f32,
+    document_count: usize,
+    question: []const f32,
+};
+
+/// Encoder tokens (no special tokens, `tokenizer(text,
+/// add_special_tokens=False)`) of the candidate documents, counted on first
+/// use: the read-budget rule inspects only the documents it reads plus the
+/// first one it refuses.
+const DocumentTokens = struct {
+    a: A,
+    tokenizer: tok.Tokenizer,
+    documents: []const []const u8,
+
+    fn count(self: *const DocumentTokens, index: usize) anyerror!usize {
+        if (index >= self.documents.len) return error.InvalidMemorillaDocumentCount;
+        const ids = try self.tokenizer.encode(self.a, self.documents[index]);
+        defer self.a.free(ids);
+        return ids.len;
+    }
+};
+
+/// One read set a request may take: its plan and the span rows (copy ids)
+/// its record pass selects.
+const ReadOption = struct { plan: span_window.ReadPlan, span_rows: usize };
+
+/// Preflight failures of one cascade read set that leave the request
+/// answerable from the other read (study F: a record error is margin -inf
+/// for the narrow read and "keep narrow" for the wide one).
+fn recoverableRead(err: anyerror) bool {
+    return err == error.MemorillaEncoderBoundExceeded or err == error.MemorillaQuestionPrefixMismatch;
+}
+
+const SpanPreflight = struct {
+    a: A,
+    question_tokens: usize,
+    soft_texts: [][]const u8,
+    /// The narrow read of a cascade request (without a cascade: the one read
+    /// of every document) and the wide read, when they passed preflight and
+    /// the mode can take them.
+    narrow: ?ReadOption = null,
+    wide: ?ReadOption = null,
+    /// A cascade read set skipped at preflight (`recoverableRead`).
+    narrow_error: ?anyerror = null,
+    wide_error: ?anyerror = null,
+    /// Admitted: the most span rows and the widest window of the usable reads.
+    span_rows: usize = 0,
+    window_rows: usize = 0,
+
+    fn deinit(self: *SpanPreflight) void {
+        self.a.free(self.soft_texts);
+    }
+
+    fn option(self: *const SpanPreflight, pass: span_window.ReadPass) ?ReadOption {
+        return switch (pass) {
+            .narrow => self.narrow,
+            .wide => self.wide,
+        };
+    }
+};
+
+/// The span batch of `plan`'s read set, bounded as the encoder pass bounds
+/// it: its copy-id count.
+fn prepareRead(a: A, tokenizer: tok.Tokenizer, documents: []const []const u8, canonical: []const u8, plan: span_window.ReadPlan, control: Control) !ReadOption {
+    try control.check();
+    var batch = try token_features.prepareSpanBounded(a, tokenizer, documents[0..plan.documents], canonical, token_features.hybrid_max_padded_length);
+    defer batch.deinit();
+    if (try mul(batch.batch, batch.seq_len) > max_record_positions) return error.MemorillaEncoderBoundExceeded;
+    return .{ .plan = plan, .span_rows = batch.copy_ids.len };
+}
+
+/// Encoder-side preflight of a span request. `documents` are the request's
+/// documents: the span read set itself for a bundle without a cascade
+/// (`mode` null), the ranked candidate list with one. A cascade request
+/// prepares the reads its mode can take (`narrow`: the narrow one, `wide`:
+/// the wide one, `auto`: both); a read that fails a recoverable bound is
+/// skipped while the mode's first pass stays possible, and admission covers
+/// the larger. `pool_documents`: the soft half pools `documents` (no stored
+/// chunk vectors). `reads`: false prepares no span read at all (the
+/// soft-only request), only the question and the pooled texts.
+fn preflightSpan(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, canonical: []const u8, documents: []const []const u8, protocol: *const span_window.Protocol, mode: ?span_window.ReadMode, pool_documents: bool, reads: bool, control: Control) !SpanPreflight {
+    try control.check();
+    var assets = try common.acquireGenerationAssets(a, io, manager, selected, encoder_profile, control);
+    defer assets.deinit();
+    const tokenizer = assets.tokenizer();
+    const question_tokens = blk: {
+        var tokens = try tokenizer.encodeForModel(a, canonical, qualified.max_text_tokens + 1);
+        defer tokens.deinit();
+        if (tokens.ids.len != tokens.attention_mask.len) return error.InvalidMemorillaTokens;
+        var active: usize = 0;
+        var last: i32 = -1;
+        for (tokens.ids, tokens.attention_mask) |id, used| {
+            if (used != 0 and used != 1) return error.InvalidMemorillaTokens;
+            if (used == 1) {
+                active += 1;
+                last = id;
+            }
+        }
+        if (active > qualified.max_text_tokens) return error.MemorillaTextLimitExceeded;
+        if (active == 0 or last != token_features.eos_id) return error.InvalidMemorillaTokens;
+        break :blk active;
+    };
+    var soft: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer soft.deinit(a);
+    if (pool_documents) {
+        for (documents) |document| {
+            try control.check();
+            if (try tokenCount(a, tokenizer, document) <= qualified.max_text_tokens) {
+                try soft.append(a, document);
+                continue;
+            }
+            const chunks = try chunkDocument(a, tokenizer, document, chunk_max_tokens);
+            defer a.free(chunks);
+            for (chunks) |chunk| try soft.append(a, document[chunk.start..chunk.end]);
+        }
+        if (soft.items.len == 0) return error.EmptyMemorillaCollection;
+        if (soft.items.len > qualified.max_documents) return error.MemorillaCollectionBudgetExceeded;
+    }
+    var out = SpanPreflight{ .a = a, .question_tokens = question_tokens, .soft_texts = &.{} };
+    if (!reads) {
+        if (mode != null) return error.UnsupportedMemorillaReadMode;
+    } else if (mode) |m| {
+        const cascade = protocol.read_cascade orelse return error.UnsupportedMemorillaReadMode;
+        if (m != .wide) {
+            const plan = try span_window.narrowPlan(protocol, documents.len);
+            if (prepareRead(a, tokenizer, documents, canonical, plan, control)) |option| out.narrow = option else |err| {
+                if (!recoverableRead(err)) return err;
+                out.narrow_error = err;
+            }
+        }
+        if (m != .narrow) {
+            const tokens = DocumentTokens{ .a = a, .tokenizer = tokenizer, .documents = documents };
+            const plan = try span_window.widePlan(cascade, &tokens, DocumentTokens.count, documents.len);
+            // A wide read of the narrow documents selects the same rows.
+            const same = if (out.narrow) |narrow| narrow.plan.documents == plan.documents else false;
+            if (same) {
+                out.wide = .{ .plan = plan, .span_rows = out.narrow.?.span_rows };
+            } else if (prepareRead(a, tokenizer, documents, canonical, plan, control)) |option| out.wide = option else |err| {
+                if (!recoverableRead(err)) return err;
+                out.wide_error = err;
+            }
+        }
+        if (span_window.firstPass(m, out.narrow != null, out.wide != null) == null)
+            return (if (m == .wide) out.wide_error else out.narrow_error) orelse error.MemorillaCollectionBudgetExceeded;
+    } else {
+        out.narrow = try prepareRead(a, tokenizer, documents, canonical, try span_window.wholePlan(protocol, documents.len), control);
+    }
+    for ([_]?ReadOption{ out.narrow, out.wide }) |entry| if (entry) |option| {
+        out.span_rows = @max(out.span_rows, option.span_rows);
+        out.window_rows = @max(out.window_rows, option.plan.window_tokens);
+    };
+    try selected.verify(a, io);
+    try control.check();
+    out.soft_texts = try soft.toOwnedSlice(a);
+    return out;
+}
+
+/// The pinned candidate every span pass of one request must read.
+const AdapterPins = struct { adapter: [64]u8, candidate: [64]u8 };
+
+/// The span features of one read set: the stock encoder with the bundle's
+/// encoder LoRA (verified on a miss and cached per encoder) at run time.
+fn spanPassFeatures(a: A, io: std.Io, manager: *manager_mod.ModelManager, encoder_handle: *const manager_mod.ModelHandle, profile: Profile, paths: Paths, documents: []const []const u8, canonical: []const u8, span_rows: usize, prefix: ?encoder.SpanPrefix, limits: memory.Limits, control: Control, encoder_control: Control, pins: *?AdapterPins) !encoder.SpanTokenFeatures {
+    const encoder_model = encoder_handle.get();
+    var adapter_handle = try encoder_model.memorilla_adapter_cache.acquire(encoder_model.allocator, a, io, manager, profile.memory_module_path, encoder_lora.qwen3_embedding_4b, limits, control);
+    const seen = AdapterPins{ .adapter = adapter_handle.adapter().sha256, .candidate = adapter_handle.adapter().candidate_sha256 };
+    var features = blk: {
+        defer adapter_handle.deinit();
+        break :blk try encoder.encodeSpanTokenFeatures(a, encoder_handle, documents, canonical, adapter_handle.adapter(), prefix, limits, encoder_control);
+    };
+    errdefer features.deinit();
+    try encoder.requireProducer(features.producer, paths.encoder.publication.?, encoder_profile);
+    if (!std.mem.eql(u8, &features.adapter_sha256, &seen.adapter)) return error.MemorillaCandidateMismatch;
+    if (features.rows() != span_rows) return error.MemorillaCollectionBudgetExceeded;
+    // Both passes of a cascade request read one candidate.
+    if (pins.*) |known| {
+        if (!std.meta.eql(known, seen)) return error.ModelArtifactsChanging;
+    } else pins.* = seen;
+    return features;
+}
+
+/// The span head over one pass's features: its best span. The head runs on
+/// the device (weights resident per decoder); `ANTFLY_MEMORILLA_SPAN_HEAD_HOST=1`
+/// selects the host F32 head (A/B parity runs).
+fn spanPassHead(a: A, io: std.Io, manager: *manager_mod.ModelManager, decoder_model: anytype, profile: Profile, protocol: span_window.Protocol, features: *const encoder.SpanTokenFeatures, bounds: []const span_window.Bound, limits: memory.Limits, control: Control, head_sha256: *[64]u8) !span_window.Span {
+    if (spanHeadOnHost()) {
+        var head_handle = try decoder_model.memorilla_span_head_cache.acquire(decoder_model.allocator, a, io, manager, profile.memory_module_path, protocol, limits, control);
+        defer head_handle.deinit();
+        head_sha256.* = head_handle.head().sha256;
+        var logits = try span_window.forward(a, io, head_handle.head(), features.features, features.counts);
+        defer logits.deinit();
+        return span_window.bestSpan(logits.start, logits.end, bounds, protocol.max_span_tokens);
+    }
+    var head_handle = try decoder_model.memorilla_span_head_device_cache.acquire(decoder_model.allocator, io, manager, profile.memory_module_path, limits, control);
+    defer head_handle.deinit();
+    const owner = head_handle.owner();
+    head_sha256.* = owner.sha256;
+    var logits = owner.forward(a, protocol, features.features, features.counts) catch |err| {
+        head_handle.invalidate();
+        return err;
+    };
+    defer logits.deinit();
+    return span_window.bestSpan(logits.start, logits.end, bounds, protocol.max_span_tokens);
+}
+
+/// One span pass of a request: its read plan, features, document bounds,
+/// best span and gate margin.
+const SpanRead = struct {
+    plan: span_window.ReadPlan,
+    features: encoder.SpanTokenFeatures,
+    bounds: []span_window.Bound,
+    best: span_window.Span,
+    margin: f64,
+
+    fn deinit(self: *SpanRead, a: A) void {
+        a.free(self.bounds);
+        self.features.deinit();
+    }
+};
+
+fn elapsedSince(io: std.Io, started: std.Io.Timestamp) f64 {
+    const nanoseconds = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+    return if (nanoseconds <= 0) 0 else @as(f64, @floatFromInt(nanoseconds)) / 1_000_000.0;
+}
+
+/// `ANTFLY_MEMORILLA_SPAN_CASCADE_REUSE=0`: a cascade's wide pass encodes
+/// every document it reads instead of reusing the narrow pass's rows of the
+/// leading documents (research A/B; outputs as `wide` mode, bit for bit).
+pub const span_cascade_reuse_env = "ANTFLY_MEMORILLA_SPAN_CASCADE_REUSE";
+
+fn cascadeReuse() bool {
+    return platform.env.getenvBoolDefault(span_cascade_reuse_env, true);
+}
+
+/// Runs `option`'s span features into `slot` (owned there from the moment
+/// they exist, so every later error path releases their lease).
+fn startSpanRead(a: A, io: std.Io, manager: *manager_mod.ModelManager, encoder_handle: *const manager_mod.ModelHandle, profile: Profile, paths: Paths, documents: []const []const u8, canonical: []const u8, option: ReadOption, prefix: ?encoder.SpanPrefix, limits: memory.Limits, control: Control, encoder_control: Control, pins: *?AdapterPins, slot: *?SpanRead) !void {
+    var features = try spanPassFeatures(a, io, manager, encoder_handle, profile, paths, documents[0..option.plan.documents], canonical, option.span_rows, prefix, limits, control, encoder_control, pins);
+    const bounds = span_window.docBounds(a, features.counts) catch |err| {
+        features.deinit();
+        return err;
+    };
+    slot.* = .{ .plan = option.plan, .features = features, .bounds = bounds, .best = undefined, .margin = undefined };
+}
+
+/// The span head over `read`'s features: its best span and gate margin.
+/// Returns the head's milliseconds.
+fn finishSpanRead(a: A, io: std.Io, manager: *manager_mod.ModelManager, decoder_model: anytype, profile: Profile, protocol: span_window.Protocol, limits: memory.Limits, control: Control, head_sha256: *[64]u8, read: *SpanRead) !f64 {
+    const started = std.Io.Timestamp.now(io, .awake);
+    read.best = try spanPassHead(a, io, manager, decoder_model, profile, protocol, &read.features, read.bounds, limits, control, head_sha256);
+    const ms = elapsedSince(io, started);
+    read.margin = read.best.score - read.best.null_score - protocol.gate_threshold;
+    return ms;
+}
+
+fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: Profile, paths: Paths, canonical: []const u8, documents: []const []const u8, max_new_tokens: usize, limits: memory.Limits, control: Control, options: Options, protocol: span_window.Protocol, released_directory: []const u8) !OwnedResult {
+    const encoder_control = paths.encoder.bind(control);
+    const decoder_control = paths.decoder.bind(control);
+    const policy = options.span_gate_policy orelse protocol.gate_policy;
+    const declared = options.span_gate_profile;
+    // Read policy (plan 8.32): with `span_read_cascade`, `documents` is the
+    // ranked candidate list and the read mode (default `auto`, the cascade)
+    // picks the read sets; no question is routed for its read. Without a
+    // cascade every document is read under `span_window_tokens`, as before.
+    const mode = try protocol.readMode(options.span_read_mode);
+    const cascade = mode != null;
+
+    var response_lease = try manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = 32 * 1024 * 1024 });
+    var transfer_response = false;
+    defer if (!transfer_response) response_lease.release();
+    const backing = platform.allocator.reclaimingScratch(a);
+
+    const exact_prompt = try research_service.bundleSystemPrompt(backing, profile.memory_module_path);
+    defer backing.free(exact_prompt);
+    const merged_prompt = try mergedSystemPrompt(backing, exact_prompt);
+    defer backing.free(merged_prompt);
+    // The service's prompts (merged when open, helpful when closed, the
+    // canonical question), or the benchmark's (`hybrid-bench`).
+    const open_system: []const u8 = if (options.span_bench_prompt) |bench| bench.system else merged_prompt;
+    const closed_system: []const u8 = if (options.span_bench_prompt) |bench| bench.system else helpful_prompt;
+    const bench_user: ?[]u8 = if (options.span_bench_prompt) |bench| try std.mem.concat(backing, u8, &.{ canonical, bench.user_suffix }) else null;
+    defer if (bench_user) |text| backing.free(text);
+    const user_text: []const u8 = if (bench_user) |text| pythonStrip(text) else canonical;
+
+    var preflight = try preflightSpan(backing, io, manager, paths.encoder, canonical, documents, &protocol, mode, !(cascade and options.stored_documents != null), true, encoder_control);
+    defer preflight.deinit();
+    try common.validateInputTokenLimit(options.request_limits, preflight.question_tokens);
+    // Admitted for the widest read the request can take (worst case wide);
+    // a narrower chosen window swaps in its own prompt and plan.
+    const admitted_window_rows = preflight.window_rows;
+    const admitted_open_rows = slots + admitted_window_rows;
+
+    var assets = try common.acquireGenerationAssets(backing, io, manager, paths.decoder, decoder_profile, decoder_control);
+    defer assets.deinit();
+    const config = try assets.decoderConfig(backing, paths.decoder.path);
+    var bounded = decode.Limits{ .max_new_tokens = profile.max_new_tokens };
+    bounded.max_memory_rows = @max(bounded.max_memory_rows, slots + protocol.maxWindowTokens());
+    const template = assets.chatTemplate() orelse return error.MemorillaChatTemplateRequired;
+    var open_text = try decode.prepareText(backing, assets.tokenizer(), template, config, user_text, .{ .system_prompt = open_system, .memory_rows = admitted_open_rows }, bounded, decoder_control);
+    defer open_text.deinit();
+    var closed_text = try decode.prepareText(backing, assets.tokenizer(), template, config, user_text, .{ .system_prompt = closed_system, .memory_rows = slots }, bounded, decoder_control);
+    defer closed_text.deinit();
+    try common.validateInputTokenLimit(options.request_limits, @max(open_text.input_ids.len, closed_text.input_ids.len));
+    if (options.prepared_text) |callback| try callback(options.context, &open_text);
+    const open_plan = try decode.ResourcePlan.create(config, .cuda, open_text.input_ids.len, open_text.rendered.len, admitted_open_rows, max_new_tokens, bounded);
+    const closed_plan = try decode.ResourcePlan.create(config, .cuda, closed_text.input_ids.len, closed_text.rendered.len, slots, max_new_tokens, bounded);
+
+    // Admission: either decoder plan plus the embedding-lookup transients;
+    // the released reader over the pooled rows plus the composed memory rows
+    // it uploads; the host span head (weights, features, forward scratch).
+    // The span passes of a cascade request run one after the other, so the
+    // larger read bounds the head scratch; each pass's features carry their
+    // own encoder lease.
+    const soft_request = memory.AdmissionAmounts{
+        .host_scratch_bytes = try add(16 * 1024 * 1024, try mul(admitted_open_rows, config.hidden_size * @sizeOf(f32))),
+        .backend_scratch_bytes = try add(try add(128 * 1024 * 1024, try mul(qualified.max_documents, qualified.width * 16 * @sizeOf(f32))), try mul(admitted_open_rows, config.hidden_size * @sizeOf(f32))),
+    };
+    // The head's weights are admitted by the decoder's span-head cache.
+    const span_host = try add(span_window.Head.forwardBytes(protocol, preflight.span_rows), try add(16 * 1024 * 1024, try mul(try mul(preflight.span_rows, span_window.feature_width), @sizeOf(f32))));
+    const span_request = memory.AdmissionAmounts{ .host_scratch_bytes = span_host };
+    const copy_request = memory.AdmissionAmounts{ .backend_scratch_bytes = research_service.decoder_copy_scratch_bytes };
+    const open_decoder = try (try memory.AdmissionAmounts.fromEstimate(open_plan.decoder).merge(.fromEstimate(open_plan.host))).merge(copy_request);
+    const closed_decoder = try (try memory.AdmissionAmounts.fromEstimate(closed_plan.decoder).merge(.fromEstimate(closed_plan.host))).merge(copy_request);
+    const decoder_request = maxAmounts(open_decoder, closed_decoder);
+    const request_amounts = try (try decoder_request.merge(soft_request)).merge(span_request);
+    var request_lease = try manager.acquireRunResourceAmounts(.gpu, limits, request_amounts);
+    defer request_lease.release();
+    var decoder_budget = memory.RunBudget.init(try common.requestBudgetLimits(limits, decoder_request));
+    var soft_budget = memory.RunBudget.init(try common.requestBudgetLimits(limits, soft_request));
+    var reservation = try open_plan.reserve(&decoder_budget);
+    defer reservation.deinit();
+    const copy_estimate = memory.Estimate{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = research_service.decoder_copy_scratch_bytes, .scratch_tier = .backend };
+    try decoder_budget.reserveEstimate(copy_estimate);
+    defer decoder_budget.releaseEstimate(copy_estimate);
+    const soft_backend_estimate = memory.Estimate{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = soft_request.backend_scratch_bytes, .scratch_tier = .backend };
+    try soft_budget.reserveEstimate(soft_backend_estimate);
+    defer soft_budget.releaseEstimate(soft_backend_estimate);
+    const soft_host_estimate = memory.Estimate{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = soft_request.host_scratch_bytes, .scratch_tier = .host };
+    try soft_budget.reserveEstimate(soft_host_estimate);
+    defer soft_budget.releaseEstimate(soft_host_estimate);
+    try notify(options, .prepared, manager);
+
+    var encoder_handle = try common.acquireResidentModel(manager, paths.encoder.path, encoder_control);
+    defer encoder_handle.release();
+    const encoder_model = encoder_handle.get();
+    try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
+    try notify(options, .encoder_loaded, manager);
+    var timer = SpanTimer.start(io);
+    // Soft half inputs: the collection's stored chunk vectors (and the
+    // question's stored vector) when the caller supplies them, as the native
+    // service reads them; otherwise pooled encodings of the span documents.
+    const stored_documents: ?[]f32 = if (options.stored_documents) |rows| try common.storedRows(backing, rows, qualified.max_documents) else null;
+    defer if (stored_documents) |values| backing.free(values);
+    const stored_question: ?[]f32 = if (stored_documents != null) if (options.stored_question) |vector| try common.storedRows(backing, &.{vector}, 1) else null else null;
+    defer if (stored_question) |values| backing.free(values);
+    var encoded: ?encoder.Features = if (stored_documents == null)
+        try encoder.encode(backing, &encoder_handle, preflight.soft_texts, canonical, limits, encoder_control)
+    else if (stored_question == null)
+        try encoder.encodeQuestion(backing, &encoder_handle, canonical, limits, encoder_control)
+    else
+        null;
+    defer if (encoded) |*features| features.deinit();
+    timer.mark("pooled");
+    factory.logMemorillaOpProfile(encoder_model.session, "pooled");
+    if (encoded) |*features| {
+        if (!std.mem.eql(u8, features.question_text, canonical)) return error.NonCanonicalMemorillaQuestion;
+        try encoder.requireProducer(features.producer, paths.encoder.publication.?, encoder_profile);
+        if (features.question_tokens != preflight.question_tokens) return error.InvalidMemorillaTokens;
+        if (stored_documents == null and features.document_count != preflight.soft_texts.len) return error.InvalidMemorillaTokens;
+    }
+    const pooled = SoftInputs{
+        .documents = if (stored_documents) |values| values else encoded.?.documents,
+        .document_count = if (options.stored_documents) |rows| rows.len else encoded.?.document_count,
+        .question = if (stored_question) |values| values else encoded.?.question,
+    };
+    // The gate's question vector (routed policy or a declared profile only).
+    const gate_question: []const f32 = pooled.question;
+
+    // Span passes: the first read (the narrow one, or without a cascade the
+    // whole read), then for `auto` below the threshold the wide read, whose
+    // record replaces the narrow one (study F `replace@t`).
+    const first_pass: span_window.ReadPass = if (mode) |m|
+        span_window.firstPass(m, preflight.narrow != null, preflight.wide != null) orelse return error.MemorillaCollectionBudgetExceeded
+    else
+        .narrow;
+    var reads: [2]?SpanRead = .{ null, null };
+    defer for (&reads) |*slot| if (slot.*) |*read| read.deinit(backing);
+    var pins: ?AdapterPins = null;
+    var head_sha256: [64]u8 = undefined;
+    var head_ms: f64 = 0;
+    const first_option = preflight.option(first_pass).?;
+    try startSpanRead(backing, io, manager, &encoder_handle, profile, paths, documents, canonical, first_option, null, limits, control, encoder_control, &pins, &reads[@backingInt(first_pass)]);
+    timer.mark("span_features");
+    factory.logMemorillaOpProfile(encoder_model.session, "span_features");
+    try notify(options, .question_encoded, manager);
+    try control.check();
+
+    // The decoder pin also pins its span-head cache.
+    var decoder_handle = try common.acquireResidentModel(manager, paths.decoder.path, decoder_control);
+    defer decoder_handle.release();
+    const decoder_model = decoder_handle.get();
+    try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
+    try notify(options, .decoder_loaded, manager);
+
+    head_ms += try finishSpanRead(backing, io, manager, decoder_model, profile, protocol, limits, control, &head_sha256, &reads[@backingInt(first_pass)].?);
+    timer.mark("span_head");
+    const narrow_index = @backingInt(span_window.ReadPass.narrow);
+    const wide_index = @backingInt(span_window.ReadPass.wide);
+    if (mode) |m| if (first_pass == .narrow and span_window.widens(protocol.read_cascade.?, m, reads[narrow_index].?.margin, preflight.wide != null)) {
+        // The wide read begins with the narrow read's documents: their rows
+        // are reused, and only the rest is encoded.
+        const narrow = &reads[narrow_index].?;
+        const prefix: ?encoder.SpanPrefix = if (options.span_cascade_reuse orelse cascadeReuse()) .{
+            .documents = @min(narrow.plan.documents, preflight.wide.?.plan.documents),
+            .copy_ids = narrow.features.copy_ids,
+            .features = narrow.features.features,
+        } else null;
+        try startSpanRead(backing, io, manager, &encoder_handle, profile, paths, documents, canonical, preflight.wide.?, prefix, limits, control, encoder_control, &pins, &reads[wide_index]);
+        timer.mark("wide_features");
+        factory.logMemorillaOpProfile(encoder_model.session, "wide_features");
+        head_ms += try finishSpanRead(backing, io, manager, decoder_model, profile, protocol, limits, control, &head_sha256, &reads[wide_index].?);
+        timer.mark("wide_head");
+    };
+    // The record used: the wide one whenever it ran.
+    const chosen_pass: span_window.ReadPass = if (reads[wide_index] != null) .wide else .narrow;
+    const chosen = &reads[@backingInt(chosen_pass)].?;
+    const features = &chosen.features;
+    const best = chosen.best;
+    const margin = chosen.margin;
+    const bounds = chosen.bounds;
+    const read_plan = chosen.plan;
+    const read_documents = documents[0..read_plan.documents];
+    const window_rows = read_plan.window_tokens;
+    const open_rows = slots + window_rows;
+    if (open_rows != admitted_open_rows) {
+        // The chosen read needs a narrower window than admitted: its own
+        // prompt and plan.
+        var narrowed = try decode.prepareText(backing, assets.tokenizer(), template, config, user_text, .{ .system_prompt = open_system, .memory_rows = open_rows }, bounded, decoder_control);
+        errdefer narrowed.deinit();
+        const narrowed_plan = try decode.ResourcePlan.create(config, .cuda, narrowed.input_ids.len, narrowed.rendered.len, open_rows, max_new_tokens, bounded);
+        reservation.deinit();
+        reservation = try narrowed_plan.reserve(&decoder_budget);
+        open_text.deinit();
+        open_text = narrowed;
+    }
+    timer.mark("read_plan");
+    // The gate (unchanged by the read policy): the routes table is read only
+    // when the routed policy or a declared profile needs it; the question
+    // routes on its pooled (stock encoder) vector.
+    var routes: ?span_window.Routes = if (policy == .routed or declared != null) try span_window.Routes.loadBundle(backing, profile.memory_module_path, protocol) else null;
+    defer if (routes) |*table| table.deinit();
+    // A wide record of a cascade with `wide_gate_offset` is gated at that
+    // offset; every other record exactly as before (`gateProtocol`).
+    const gate_protocol = span_window.gateProtocol(protocol, if (cascade) chosen_pass else null);
+    const decision = try span_window.decideGate(policy, gate_protocol, if (routes) |*table| table else null, gate_question, margin, declared);
+    const gate: RecordGate = if (decision.open) .open else .closed;
+    const gate_profile: ?[]u8 = if (decision.profile) |i| try a.dupe(u8, routes.?.names[i]) else null;
+    errdefer if (gate_profile) |name| a.free(name);
+    const continues = try span_window.continuationFlags(backing, assets.tokenizer(), features.copy_ids);
+    defer backing.free(continues);
+    const window = try span_window.evidenceWindow(continues, best.start, best.end, bounds, window_rows, protocol.left_fraction);
+    const pad = try assets.tokenizer().encode(backing, " ");
+    defer backing.free(pad);
+    if (pad.len != 1 or pad[0] != copy.default_pad_id) return error.InvalidMemorillaTokenizer;
+    const record_ids = try span_window.windowIds(backing, features.copy_ids, window, window_rows, pad[0]);
+    defer backing.free(record_ids);
+    const record_text = try recordText(backing, assets.tokenizer(), record_ids);
+    defer backing.free(record_text);
+    // The predicted span's text: the decoder's speculative answer draft
+    // (gate open only; verified losslessly by greedy decoding).
+    const span_draft: ?[]u8 = if (gate == .open and best.start <= best.end and best.end < features.copy_ids.len) draft: {
+        const ids = try backing.alloc(i32, best.end + 1 - best.start);
+        defer backing.free(ids);
+        for (features.copy_ids[best.start .. best.end + 1], ids) |id, *slot| slot.* = @intCast(id);
+        break :draft try recordText(backing, assets.tokenizer(), ids);
+    } else null;
+    defer if (span_draft) |text| backing.free(text);
+    if (span_draft) |text| std.log.debug("memorilla_span_draft text=\"{s}\"", .{text});
+    timer.mark("window");
+    try control.check();
+    try paths.encoder.verify(a, io);
+    try paths.decoder.verify(a, io);
+    timer.mark("verify_paths");
+
+    var native_guard = try control.enterUninterruptible(.uninterruptible);
+    defer native_guard.deinit();
+
+    // The released reader produces the soft rows and stays borrowed through
+    // generation: its backend carries the composed memory rows (the decoder
+    // compute must hold only resident weights when generation starts).
+    var soft_handle = try decoder_model.memorilla_reader_cache.acquire(decoder_model.allocator, io, manager, released_directory, limits, control);
+    defer soft_handle.deinit();
+    var soft_clean = false;
+    defer if (!soft_clean) soft_handle.invalidate();
+    const reader = soft_handle.owner();
+    try reader.bundle.config.validate(true);
+    if (!reader.bundle.release or reader.bundle.config.num_memories != slots or reader.bundle.config.output_dim != config.hidden_size) return error.UnsupportedMemorillaProfile;
+    const soft_module_sha256 = reader.bundle.weights_sha256;
+    var soft_backend = try reader.computeBackendWithBudget(&soft_budget);
+    soft_backend.execution_control = control;
+    soft_backend.execution_budget = &soft_budget;
+    var soft_scope = try execution.Scope.acquire(control, .{ .mutex = &reader.execution_mutex });
+    defer soft_scope.deinit();
+    var soft_physical: PhysicalBudgetScope = if (comptime @import("build_options").enable_cuda)
+        try reader.compute.beginMemorillaDeviceBudget(soft_request.backendTotalBytes())
+    else
+        return error.CudaNotEnabled;
+    defer soft_physical.deinit();
+    try soft_scope.bind(soft_backend);
+    const output = blk: {
+        defer {
+            reader.releaseRequestResources() catch @panic("Memorilla released reader request cleanup failed; worker restart required");
+            soft_clean = true;
+        }
+        const soft_rows = inner: {
+            const rows = pooled.document_count;
+            const mask = try backing.alloc(bool, rows);
+            defer backing.free(mask);
+            @memset(mask, false);
+            const docs = try soft_backend.fromFloat32Shape(pooled.documents, &.{ @intCast(rows), @intCast(qualified.width) });
+            defer soft_backend.free(docs);
+            const query = try soft_backend.fromFloat32Shape(pooled.question, &.{ 1, @intCast(qualified.width) });
+            defer soft_backend.free(query);
+            try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
+            try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
+            try factory.requireMemorillaCudaExecution(&soft_backend);
+            const memories = try memory_pipeline.forward(&soft_backend, backing, reader.bundle.config, .{ .documents = docs, .question = query, .padding_mask = mask, .batch = 1, .num_documents = rows, .max_document_rows = qualified.max_documents }, null);
+            defer soft_backend.free(memories);
+            try factory.requireMemorillaCudaExecution(&soft_backend);
+            break :inner try soft_backend.toFloat32(memories, backing);
+        };
+        defer backing.free(soft_rows);
+        if (soft_rows.len != slots * config.hidden_size) return error.InvalidMemorillaMemoryRows;
+        timer.mark("soft_rows");
+        try control.check();
+        var decoder_backend = try factory.getCoordinatedCudaComputeBackend(decoder_model.session, &decoder_budget, @intFromPtr(&reservation));
+        defer decoder_backend.deinit();
+        // The window's decoder input-embedding rows (gate open only).
+        const window_values: []f32 = if (gate == .closed) &.{} else rows: {
+            decoder_backend.execution_control = decoder_control;
+            decoder_backend.execution_budget = &decoder_budget;
+            var decoder_scope = try execution.Scope.acquire(control, .{ .mutex = decoder_model.nativeGenerationMutex(), .lane = &decoder_model.native_reader_execution_lane });
+            defer decoder_scope.deinit();
+            try decoder_scope.bind(decoder_backend);
+            try factory.requireMemorillaCudaExecution(&decoder_backend);
+            const wide = try backing.alloc(i64, window_rows);
+            defer backing.free(wide);
+            for (record_ids, wide) |id, *w| {
+                if (id < 0 or id >= config.vocab_size) return error.InvalidMemorillaTokens;
+                w.* = id;
+            }
+            const weight = try gpt.getEmbeddingWeight(&decoder_backend, config);
+            defer decoder_backend.free(weight);
+            const ct = try decoder_backend.embeddingLookup(weight, wide, window_rows, config.hidden_size);
+            defer decoder_backend.free(ct);
+            const values = try decoder_backend.toFloat32(ct, backing);
+            if (values.len != window_rows * config.hidden_size) {
+                backing.free(values);
+                return error.UnexpectedEmbeddingTable;
+            }
+            try factory.requireMemorillaCudaExecution(&decoder_backend);
+            break :rows values;
+        };
+        defer if (gate == .open) backing.free(window_values);
+        const memory_rows: usize = if (gate == .open) open_rows else slots;
+        const composed = try backing.alloc(f32, memory_rows * config.hidden_size);
+        defer backing.free(composed);
+        @memcpy(composed[0 .. slots * config.hidden_size], soft_rows);
+        if (gate == .open) @memcpy(composed[slots * config.hidden_size ..], window_values);
+        if (gate == .closed) {
+            reservation.deinit();
+            reservation = try closed_plan.reserve(&decoder_budget);
+        }
+        const text = if (gate == .open) &open_text else &closed_text;
+        const rows_ct = try soft_backend.fromFloat32Shape(composed, &.{ @intCast(memory_rows), @intCast(config.hidden_size) });
+        defer soft_backend.free(rows_ct);
+        timer.mark("window_rows");
+        var decoder = try decode.Decoder.fromQualifiedSession(decoder_model.session, &decoder_backend, assets.tokenizer(), decoder_model.nativeGenerationMutex());
+        decoder.execution_lane = &decoder_model.native_reader_execution_lane;
+        defer timer.mark("generate");
+        break :blk try decode.generate(a, decoder, text, .{ .backend = &soft_backend, .tensor = rows_ct }, .{ .max_new_tokens = max_new_tokens, .teacher_forced_ids = options.teacher_forced_ids, .trace = options.trace, .ignore_eos = options.ignore_eos, .draft_text = span_draft, .draft_context = if (gate == .open) record_text else null }, &reservation, bounded, decoder_control);
+    };
+    var result = output;
+    errdefer result.deinit();
+    try soft_handle.verify(control);
+    factory.logMemorillaOpProfile(decoder_model.session, "generate");
+
+    const raw_text = try a.dupe(u8, pythonStrip(result.text));
+    errdefer a.free(raw_text);
+    const published = if (gate == .open)
+        try canonicalizeAnswer(result.allocator, raw_text, record_text)
+    else
+        try result.allocator.dupe(u8, raw_text);
+    result.allocator.free(result.text);
+    result.text = published;
+    const answer_guard = guardAnswer(result.text);
+    if (answer_guard == .rejected) try research_service.abstainGeneration(&result);
+    const canonicalized = answer_guard == .accepted and !std.mem.eql(u8, result.text, raw_text);
+    var citations = if (gate == .open)
+        try copy.buildCitations(a, &.{span_window.windowSpan(window)}, features.sources, read_documents, research_service.citedAnswer(result.text, answer_guard))
+    else
+        copy.Citations.none(a, false);
+    errdefer citations.deinit();
+    // Diagnostics: the span and the window as regions of the caller's
+    // documents, whether or not the decoder read the window.
+    var span_regions = try copy.buildCitations(a, &.{spanRegion(best)}, features.sources, read_documents, null);
+    errdefer span_regions.deinit();
+    var window_regions = try copy.buildCitations(a, &.{span_window.windowSpan(window)}, features.sources, read_documents, null);
+    errdefer window_regions.deinit();
+    const owned_record_text = try a.dupe(u8, record_text);
+    errdefer a.free(owned_record_text);
+    try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
+    try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
+    try paths.encoder.verify(a, io);
+    try paths.decoder.verify(a, io);
+    try control.check();
+    try notify(options, .decoded, manager);
+    try control.check();
+    transfer_response = true;
+    return .{
+        .allocator = a,
+        .generation = result,
+        .answer_guard = answer_guard,
+        .record_gate = gate,
+        .canonicalized = canonicalized,
+        .memory_tokens = if (gate == .open) open_rows else slots,
+        .encoder_execution_identity = qualified.executionIdentity(encoder_profile),
+        .decoder_execution_identity = qualified.executionIdentity(decoder_profile),
+        .module_sha256 = head_sha256,
+        .soft_module_sha256 = soft_module_sha256,
+        .candidate_sha256 = pins.?.candidate,
+        .adapter_sha256 = pins.?.adapter,
+        .document_count = documents.len,
+        .soft_rows = pooled.document_count,
+        .question_tokens = preflight.question_tokens,
+        .citations = citations,
+        .record_text = owned_record_text,
+        .raw_text = raw_text,
+        .min_snap_cosine = 1,
+        .span = .{
+            .start = best.start,
+            .end = best.end,
+            .window_lo = window.lo,
+            .window_hi = window.hi,
+            .score = best.score,
+            .null_score = best.null_score,
+            .margin = margin,
+            .gate_policy = policy,
+            .gate_offset = decision.offset,
+            .gate_profile = gate_profile,
+            .gate_similarity = decision.similarity,
+            .gate_fallback = decision.fallback,
+            .head_ms = head_ms,
+            .read_mode = mode,
+            .read_pass = if (cascade) chosen_pass else null,
+            .cascade_threshold = if (cascade) protocol.read_cascade.?.threshold else null,
+            .narrow_margin = if (cascade) if (reads[narrow_index]) |read| read.margin else null else null,
+            .wide_margin = if (reads[wide_index]) |read| read.margin else null,
+            .narrow_unavailable = if (preflight.narrow_error) |err| @errorName(err) else null,
+            .wide_unavailable = if (preflight.wide_error) |err| @errorName(err) else null,
+            .read_documents = read_plan.documents,
+            .read_tokens = features.copy_ids.len,
+            .read_budget_tokens = read_plan.budget_tokens,
+            .window_rows = window_rows,
+        },
+        .span_regions = span_regions,
+        .window_regions = window_regions,
+        .timings = timer.timings,
+        .response_lease = response_lease,
+    };
+}
+
+/// The predicted inclusive span as one citable region (`copy.buildCitations`
+/// input), in copy-id positions like the window.
+pub fn spanRegion(best: span_window.Span) copy.CompletedSpan {
+    const last = @max(best.end + 1, best.start);
+    return .{
+        .span = .{ .begin = 0, .end = last - best.start, .start = best.start },
+        .first = best.start,
+        .last = last,
+        .slot_begin = 0,
+        .slot_end = last - best.start,
+    };
+}
+
+/// The bundle's pinned digests a soft-only request reports in place of the
+/// span pass's (`files["span-head.safetensors"]`, `source.candidate_sha256`,
+/// `files["encoder-lora.safetensors"]` of `manifest.json`); the caches verify
+/// the same pins whenever a span pass loads them.
+const BundlePins = struct { head: [64]u8, candidate: [64]u8, adapter: [64]u8 };
+
+fn bundlePins(a: A, directory: []const u8) !BundlePins {
+    const manifest_path = try std.fs.path.join(a, &.{ directory, "manifest.json" });
+    defer a.free(manifest_path);
+    const manifest_bytes = try c_file.readFileMax(a, manifest_path, 1024 * 1024);
+    defer a.free(manifest_bytes);
+    var manifest = std.json.parseFromSlice(std.json.Value, a, manifest_bytes, .{}) catch return error.InvalidMemorillaManifest;
+    defer manifest.deinit();
+    const Pin = struct {
+        fn hex(value: ?std.json.Value) ![64]u8 {
+            const text = value orelse return error.InvalidMemorillaManifest;
+            if (text != .string or text.string.len != 64) return error.InvalidMemorillaManifest;
+            for (text.string) |c| if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return error.InvalidMemorillaManifest;
+            return text.string[0..64].*;
+        }
+        fn file(root: std.json.Value, name: []const u8) ![64]u8 {
+            if (root != .object) return error.InvalidMemorillaManifest;
+            const files = root.object.get("files") orelse return error.InvalidMemorillaManifest;
+            if (files != .object) return error.InvalidMemorillaManifest;
+            const entry = files.object.get(name) orelse return error.InvalidMemorillaManifest;
+            if (entry != .object) return error.InvalidMemorillaManifest;
+            return hex(entry.object.get("sha256"));
+        }
+    };
+    const source = if (manifest.value == .object) manifest.value.object.get("source") else null;
+    const candidate = if (source) |value| (if (value == .object) value.object.get("candidate_sha256") else null) else null;
+    return .{
+        .head = try Pin.file(manifest.value, "span-head.safetensors"),
+        .candidate = try Pin.hex(candidate),
+        .adapter = try Pin.file(manifest.value, "encoder-lora.safetensors"),
+    };
+}
+
+/// `span_soft_only` (HTTP `read_mode: none`) on a span bundle: no span pass.
+/// The decoder reads the 16 soft rows alone under the released helpful
+/// prompt (or the benchmark prompt), which is `generateSpanImpl`'s
+/// closed-gate path step for step: the same preflight of the pooled texts,
+/// prompt bound, pooled vectors, released reader and greedy decoding without
+/// a draft. It is stock Memorilla over the same pooled vectors, for
+/// side-by-side comparison with the hybrid. Only the closed plan is
+/// admitted; nothing of the record half (adapters, span head) is touched.
+fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: Profile, paths: Paths, canonical: []const u8, documents: []const []const u8, max_new_tokens: usize, limits: memory.Limits, control: Control, options: Options, protocol: span_window.Protocol, released_directory: []const u8) !OwnedResult {
+    // Exclusive with a read mode; stored soft-half vectors are a cascade
+    // research input this comparison does not take.
+    if (options.span_read_mode != null or options.stored_documents != null or options.stored_question != null) return error.UnsupportedMemorillaReadMode;
+    const encoder_control = paths.encoder.bind(control);
+    const decoder_control = paths.decoder.bind(control);
+
+    var response_lease = try manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = 32 * 1024 * 1024 });
+    var transfer_response = false;
+    defer if (!transfer_response) response_lease.release();
+    const backing = platform.allocator.reclaimingScratch(a);
+    const pins = try bundlePins(backing, profile.memory_module_path);
+
+    const closed_system: []const u8 = if (options.span_bench_prompt) |bench| bench.system else helpful_prompt;
+    const bench_user: ?[]u8 = if (options.span_bench_prompt) |bench| try std.mem.concat(backing, u8, &.{ canonical, bench.user_suffix }) else null;
+    defer if (bench_user) |text| backing.free(text);
+    const user_text: []const u8 = if (bench_user) |text| pythonStrip(text) else canonical;
+
+    var preflight = try preflightSpan(backing, io, manager, paths.encoder, canonical, documents, &protocol, null, true, false, encoder_control);
+    defer preflight.deinit();
+    try common.validateInputTokenLimit(options.request_limits, preflight.question_tokens);
+
+    var assets = try common.acquireGenerationAssets(backing, io, manager, paths.decoder, decoder_profile, decoder_control);
+    defer assets.deinit();
+    const config = try assets.decoderConfig(backing, paths.decoder.path);
+    // Bounded as the span path bounds it, so the closed prompt and plan are
+    // prepared exactly as on a closed gate.
+    var bounded = decode.Limits{ .max_new_tokens = profile.max_new_tokens };
+    bounded.max_memory_rows = @max(bounded.max_memory_rows, slots + protocol.maxWindowTokens());
+    const template = assets.chatTemplate() orelse return error.MemorillaChatTemplateRequired;
+    var closed_text = try decode.prepareText(backing, assets.tokenizer(), template, config, user_text, .{ .system_prompt = closed_system, .memory_rows = slots }, bounded, decoder_control);
+    defer closed_text.deinit();
+    try common.validateInputTokenLimit(options.request_limits, closed_text.input_ids.len);
+    if (options.prepared_text) |callback| try callback(options.context, &closed_text);
+    const closed_plan = try decode.ResourcePlan.create(config, .cuda, closed_text.input_ids.len, closed_text.rendered.len, slots, max_new_tokens, bounded);
+
+    // Admission: the closed decoder plan; the released reader over the
+    // pooled rows plus the 16 memory rows it uploads.
+    const soft_request = memory.AdmissionAmounts{
+        .host_scratch_bytes = try add(16 * 1024 * 1024, try mul(slots, config.hidden_size * @sizeOf(f32))),
+        .backend_scratch_bytes = try add(try add(128 * 1024 * 1024, try mul(qualified.max_documents, qualified.width * 16 * @sizeOf(f32))), try mul(slots, config.hidden_size * @sizeOf(f32))),
+    };
+    const decoder_request = try memory.AdmissionAmounts.fromEstimate(closed_plan.decoder).merge(.fromEstimate(closed_plan.host));
+    const request_amounts = try decoder_request.merge(soft_request);
+    var request_lease = try manager.acquireRunResourceAmounts(.gpu, limits, request_amounts);
+    defer request_lease.release();
+    var decoder_budget = memory.RunBudget.init(try common.requestBudgetLimits(limits, decoder_request));
+    var soft_budget = memory.RunBudget.init(try common.requestBudgetLimits(limits, soft_request));
+    var reservation = try closed_plan.reserve(&decoder_budget);
+    defer reservation.deinit();
+    const soft_backend_estimate = memory.Estimate{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = soft_request.backend_scratch_bytes, .scratch_tier = .backend };
+    try soft_budget.reserveEstimate(soft_backend_estimate);
+    defer soft_budget.releaseEstimate(soft_backend_estimate);
+    const soft_host_estimate = memory.Estimate{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = soft_request.host_scratch_bytes, .scratch_tier = .host };
+    try soft_budget.reserveEstimate(soft_host_estimate);
+    defer soft_budget.releaseEstimate(soft_host_estimate);
+    try notify(options, .prepared, manager);
+
+    var encoder_handle = try common.acquireResidentModel(manager, paths.encoder.path, encoder_control);
+    defer encoder_handle.release();
+    const encoder_model = encoder_handle.get();
+    try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
+    try notify(options, .encoder_loaded, manager);
+    var timer = SpanTimer.start(io);
+    var pooled = try encoder.encode(backing, &encoder_handle, preflight.soft_texts, canonical, limits, encoder_control);
+    defer pooled.deinit();
+    timer.mark("pooled");
+    if (!std.mem.eql(u8, pooled.question_text, canonical)) return error.NonCanonicalMemorillaQuestion;
+    try encoder.requireProducer(pooled.producer, paths.encoder.publication.?, encoder_profile);
+    if (pooled.question_tokens != preflight.question_tokens or pooled.document_count != preflight.soft_texts.len) return error.InvalidMemorillaTokens;
+    try notify(options, .question_encoded, manager);
+    try control.check();
+
+    var decoder_handle = try common.acquireResidentModel(manager, paths.decoder.path, decoder_control);
+    defer decoder_handle.release();
+    const decoder_model = decoder_handle.get();
+    try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
+    try notify(options, .decoder_loaded, manager);
+    try paths.encoder.verify(a, io);
+    try paths.decoder.verify(a, io);
+
+    var native_guard = try control.enterUninterruptible(.uninterruptible);
+    defer native_guard.deinit();
+
+    // The released reader, borrowed through generation as on the span path.
+    var soft_handle = try decoder_model.memorilla_reader_cache.acquire(decoder_model.allocator, io, manager, released_directory, limits, control);
+    defer soft_handle.deinit();
+    var soft_clean = false;
+    defer if (!soft_clean) soft_handle.invalidate();
+    const reader = soft_handle.owner();
+    try reader.bundle.config.validate(true);
+    if (!reader.bundle.release or reader.bundle.config.num_memories != slots or reader.bundle.config.output_dim != config.hidden_size) return error.UnsupportedMemorillaProfile;
+    const soft_module_sha256 = reader.bundle.weights_sha256;
+    var soft_backend = try reader.computeBackendWithBudget(&soft_budget);
+    soft_backend.execution_control = control;
+    soft_backend.execution_budget = &soft_budget;
+    var soft_scope = try execution.Scope.acquire(control, .{ .mutex = &reader.execution_mutex });
+    defer soft_scope.deinit();
+    var soft_physical: PhysicalBudgetScope = if (comptime @import("build_options").enable_cuda)
+        try reader.compute.beginMemorillaDeviceBudget(soft_request.backendTotalBytes())
+    else
+        return error.CudaNotEnabled;
+    defer soft_physical.deinit();
+    try soft_scope.bind(soft_backend);
+    const output = blk: {
+        defer {
+            reader.releaseRequestResources() catch @panic("Memorilla released reader request cleanup failed; worker restart required");
+            soft_clean = true;
+        }
+        const soft_rows = inner: {
+            const rows = pooled.document_count;
+            const mask = try backing.alloc(bool, rows);
+            defer backing.free(mask);
+            @memset(mask, false);
+            const docs = try soft_backend.fromFloat32Shape(pooled.documents, &.{ @intCast(rows), @intCast(qualified.width) });
+            defer soft_backend.free(docs);
+            const query = try soft_backend.fromFloat32Shape(pooled.question, &.{ 1, @intCast(qualified.width) });
+            defer soft_backend.free(query);
+            try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
+            try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
+            try factory.requireMemorillaCudaExecution(&soft_backend);
+            const memories = try memory_pipeline.forward(&soft_backend, backing, reader.bundle.config, .{ .documents = docs, .question = query, .padding_mask = mask, .batch = 1, .num_documents = rows, .max_document_rows = qualified.max_documents }, null);
+            defer soft_backend.free(memories);
+            try factory.requireMemorillaCudaExecution(&soft_backend);
+            break :inner try soft_backend.toFloat32(memories, backing);
+        };
+        defer backing.free(soft_rows);
+        if (soft_rows.len != slots * config.hidden_size) return error.InvalidMemorillaMemoryRows;
+        timer.mark("soft_rows");
+        try control.check();
+        var decoder_backend = try factory.getCoordinatedCudaComputeBackend(decoder_model.session, &decoder_budget, @intFromPtr(&reservation));
+        defer decoder_backend.deinit();
+        const rows_ct = try soft_backend.fromFloat32Shape(soft_rows, &.{ @intCast(slots), @intCast(config.hidden_size) });
+        defer soft_backend.free(rows_ct);
+        var decoder = try decode.Decoder.fromQualifiedSession(decoder_model.session, &decoder_backend, assets.tokenizer(), decoder_model.nativeGenerationMutex());
+        decoder.execution_lane = &decoder_model.native_reader_execution_lane;
+        defer timer.mark("generate");
+        break :blk try decode.generate(a, decoder, &closed_text, .{ .backend = &soft_backend, .tensor = rows_ct }, .{ .max_new_tokens = max_new_tokens, .teacher_forced_ids = options.teacher_forced_ids, .trace = options.trace, .ignore_eos = options.ignore_eos }, &reservation, bounded, decoder_control);
+    };
+    var result = output;
+    errdefer result.deinit();
+    try soft_handle.verify(control);
+    factory.logMemorillaOpProfile(decoder_model.session, "generate");
+
+    // Published as a closed gate publishes: the stripped answer, no
+    // canonicalization, the frame-echo guard, no citations.
+    const raw_text = try a.dupe(u8, pythonStrip(result.text));
+    errdefer a.free(raw_text);
+    const published = try result.allocator.dupe(u8, raw_text);
+    result.allocator.free(result.text);
+    result.text = published;
+    const answer_guard = guardAnswer(result.text);
+    if (answer_guard == .rejected) try research_service.abstainGeneration(&result);
+    var citations = copy.Citations.none(a, false);
+    errdefer citations.deinit();
+    try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
+    try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
+    try paths.encoder.verify(a, io);
+    try paths.decoder.verify(a, io);
+    try control.check();
+    try notify(options, .decoded, manager);
+    try control.check();
+    transfer_response = true;
+    return .{
+        .allocator = a,
+        .generation = result,
+        .answer_guard = answer_guard,
+        .record_gate = .closed,
+        .canonicalized = false,
+        .memory_tokens = slots,
+        .encoder_execution_identity = qualified.executionIdentity(encoder_profile),
+        .decoder_execution_identity = qualified.executionIdentity(decoder_profile),
+        .module_sha256 = pins.head,
+        .soft_module_sha256 = soft_module_sha256,
+        .candidate_sha256 = pins.candidate,
+        .adapter_sha256 = pins.adapter,
+        .document_count = documents.len,
+        .soft_rows = pooled.document_count,
+        .question_tokens = preflight.question_tokens,
+        .citations = citations,
+        .record_text = &.{},
+        .raw_text = raw_text,
+        .min_snap_cosine = 1,
+        .timings = timer.timings,
+        .soft_only = true,
+        .response_lease = response_lease,
+    };
+}
+
 // --- tests ----------------------------------------------------------------------
 
 test "Memorilla hybrid canonicalization mirrors the evaluator cases" {
@@ -1026,6 +2123,141 @@ test "Memorilla hybrid validation rejects kind identity bounds and texts before 
     var missing = p;
     missing.released_memory_module_path = null;
     try std.testing.expectError(error.InvalidMemorillaConfig, validateInputs(missing, "q", &docs, &identity, 1));
+}
+
+test "Memorilla hybrid cascade skips a read only past a per-request bound" {
+    // A read set past the encoder bound (or whose question prefix changes its
+    // tail ids) leaves the other read; resource and model errors fail the
+    // request as before.
+    try std.testing.expect(recoverableRead(error.MemorillaEncoderBoundExceeded));
+    try std.testing.expect(recoverableRead(error.MemorillaQuestionPrefixMismatch));
+    for ([_]anyerror{ error.OutOfMemory, error.ResourceLimitExceeded, error.InvalidMemorillaTokens, error.MemorillaCollectionBudgetExceeded, error.Timeout }) |err|
+        try std.testing.expect(!recoverableRead(err));
+}
+
+test "Memorilla hybrid span bundles are detected from the pinned protocol" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..] });
+    defer a.free(dir);
+    const digest = @import("../models/memorilla.zig").digest;
+    const Write = struct {
+        fn bundle(allocator: A, dir_io: std.Io, d: std.Io.Dir, protocol: []const u8, pinned: []const u8) !void {
+            try d.writeFile(dir_io, .{ .sub_path = "protocol.json", .data = protocol });
+            var manifest: std.ArrayList(u8) = .empty;
+            defer manifest.deinit(allocator);
+            try manifest.print(allocator, "{{\"files\":{{\"protocol.json\":{{\"sha256\":\"{s}\",\"size_bytes\":{d}}}}}}}", .{ &digest(pinned), pinned.len });
+            try d.writeFile(dir_io, .{ .sub_path = "manifest.json", .data = manifest.items });
+        }
+    };
+    const copy17 = "{\"system_prompt\":\"x\"}";
+    try Write.bundle(a, io, temp.dir, copy17, copy17);
+    try std.testing.expect((try readSpanProtocol(a, dir)) == null);
+    const span_json =
+        \\{"record_kind":"span-window","document_question_prefix":"question-passage-v1","span_head":{"width":5120,"hidden":1024,"layers":2,"heads":8,"max_positions":2048,"max_documents":4},"span_window_tokens":32,"span_window_left_fraction":0.65,"span_max_tokens":30,"span_gate_threshold":-3.8,"span_gate_policy":"learned"}
+    ;
+    try Write.bundle(a, io, temp.dir, span_json, span_json);
+    const protocol = (try readSpanProtocol(a, dir)).?;
+    try std.testing.expectEqual(span_window.GatePolicy.learned, protocol.gate_policy);
+    try std.testing.expectEqual(@as(usize, 32), protocol.window_tokens);
+    // A protocol that is not the pinned one is refused.
+    try Write.bundle(a, io, temp.dir, span_json, copy17);
+    try std.testing.expectError(error.MemorillaArtifactMismatch, readSpanProtocol(a, dir));
+    // The read cascade (plan 8.32) is bundle data; the per-route read budget
+    // it replaced is refused.
+    const cascade_json =
+        \\{"record_kind":"span-window","document_question_prefix":"question-passage-v1","span_head":{"width":5120,"hidden":1024,"layers":2,"heads":8,"max_positions":2048,"max_documents":4},"span_window_tokens":32,"span_window_left_fraction":0.65,"span_max_tokens":30,"span_gate_threshold":-3.8,"span_gate_policy":"learned","span_read_cascade":{"threshold":-4.0,"read_tokens":512,"window_tokens":64}}
+    ;
+    try Write.bundle(a, io, temp.dir, cascade_json, cascade_json);
+    const cascade = (try readSpanProtocol(a, dir)).?;
+    try std.testing.expectEqual(span_window.ReadCascade{ .threshold = -4, .read_tokens = 512, .window_tokens = 64 }, cascade.read_cascade.?);
+    try std.testing.expectEqual(@as(?span_window.ReadMode, .auto), try cascade.readMode(null));
+    try std.testing.expectEqual(@as(?span_window.ReadMode, null), try protocol.readMode(null));
+    try std.testing.expectError(error.UnsupportedMemorillaReadMode, protocol.readMode(.wide));
+    const routed_json =
+        \\{"record_kind":"span-window","document_question_prefix":"question-passage-v1","span_head":{"width":5120,"hidden":1024,"layers":2,"heads":8,"max_positions":2048,"max_documents":4},"span_window_tokens":32,"span_window_left_fraction":0.65,"span_max_tokens":30,"span_gate_threshold":-3.8,"span_gate_routes":{"profiles":["triviaqa"]},"span_read_routes":{"triviaqa":{"read_tokens":512,"window_tokens":64}}}
+    ;
+    try Write.bundle(a, io, temp.dir, routed_json, routed_json);
+    try std.testing.expectError(error.UnsupportedMemorillaProfile, readSpanProtocol(a, dir));
+}
+
+test "Memorilla hybrid span timings group the timer stages" {
+    var timings = SpanTimings{};
+    for ([_]struct { []const u8, f64 }{
+        .{ "pooled", 30 },   .{ "span_features", 60 }, .{ "span_head", 5 },  .{ "wide_features", 100 },
+        .{ "wide_head", 6 }, .{ "read_plan", 0.5 },    .{ "window", 0.25 },  .{ "verify_paths", 0.25 },
+        .{ "soft_rows", 4 }, .{ "window_rows", 1 },    .{ "generate", 200 }, .{ "generate", 10 },
+    }) |entry| timings.add(entry[0], entry[1]);
+    try std.testing.expectEqual(@as(f64, 30), timings.pooled_ms);
+    try std.testing.expectEqual(@as(f64, 60), timings.span_features_ms);
+    try std.testing.expectEqual(@as(f64, 5), timings.span_head_ms);
+    try std.testing.expectEqual(@as(f64, 100), timings.wide_features_ms);
+    try std.testing.expectEqual(@as(f64, 6), timings.wide_head_ms);
+    // Read plan, window, path checks and the window rows.
+    try std.testing.expectEqual(@as(f64, 2), timings.window_ms);
+    try std.testing.expectEqual(@as(f64, 4), timings.soft_rows_ms);
+    try std.testing.expectEqual(@as(f64, 210), timings.generate_ms);
+    try std.testing.expectEqual(@as(f64, 0), timings.total_ms);
+}
+
+test "Memorilla hybrid span and window regions map copy positions to document bytes" {
+    const a = std.testing.allocator;
+    const documents = [_][]const u8{ "Site Alpha.", "Gate code Kq9-0012 opens the yard." };
+    // Copy positions: 0..2 cover document 0, 3..9 document 1 (one range per piece).
+    const sources = [_]copy.SourceRange{
+        .{ .document = 0, .start = 0, .end = 4 },   .{ .document = 0, .start = 4, .end = 10 },  .{ .document = 0, .start = 10, .end = 11 },
+        .{ .document = 1, .start = 0, .end = 4 },   .{ .document = 1, .start = 4, .end = 9 },   .{ .document = 1, .start = 9, .end = 14 },
+        .{ .document = 1, .start = 14, .end = 18 }, .{ .document = 1, .start = 18, .end = 24 }, .{ .document = 1, .start = 24, .end = 28 },
+        .{ .document = 1, .start = 28, .end = 34 },
+    };
+    // The inclusive span 5..6 is " Kq9-" + "0012" (bytes 9..18, trimmed to 10..18).
+    const region = spanRegion(.{ .start = 5, .end = 6, .score = 1, .null_score = 0 });
+    try std.testing.expectEqual(@as(usize, 5), region.first);
+    try std.testing.expectEqual(@as(usize, 7), region.last);
+    var span = try copy.buildCitations(a, &.{region}, &sources, &documents, null);
+    defer span.deinit();
+    try std.testing.expect(!span.unavailable);
+    try std.testing.expectEqual(@as(usize, 1), span.items.len);
+    try std.testing.expectEqual(@as(usize, 1), span.items[0].document_index);
+    try std.testing.expectEqualStrings("Kq9-0012", span.items[0].text);
+    try std.testing.expectEqual(@as(usize, 10), span.items[0].start);
+    try std.testing.expectEqual(@as(usize, 18), span.items[0].end);
+    try std.testing.expect(!span.items[0].supports_answer);
+    var window = try copy.buildCitations(a, &.{span_window.windowSpan(.{ .lo = 3, .hi = 10 })}, &sources, &documents, null);
+    defer window.deinit();
+    try std.testing.expectEqual(@as(usize, 1), window.items.len);
+    try std.testing.expectEqualStrings(documents[1], window.items[0].text);
+    // A one-token span; an unmappable source map is reported, not an error.
+    const single = spanRegion(.{ .start = 2, .end = 2, .score = 1, .null_score = 0 });
+    try std.testing.expectEqual(@as(usize, 3), single.last);
+    var missing = try copy.buildCitations(a, &.{single}, null, &documents, null);
+    defer missing.deinit();
+    try std.testing.expect(missing.unavailable);
+    try std.testing.expectEqual(@as(usize, 0), missing.items.len);
+}
+
+test "Memorilla hybrid soft-only requests report the bundle's pinned digests" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..] });
+    defer a.free(dir);
+    const head: [64]u8 = @splat('1');
+    const candidate: [64]u8 = @splat('2');
+    const adapter: [64]u8 = @splat('3');
+    const manifest = try std.fmt.allocPrint(a, "{{\"source\":{{\"candidate_sha256\":\"{s}\"}},\"files\":{{\"span-head.safetensors\":{{\"sha256\":\"{s}\",\"size_bytes\":1}},\"encoder-lora.safetensors\":{{\"sha256\":\"{s}\",\"size_bytes\":1}}}}}}", .{ &candidate, &head, &adapter });
+    defer a.free(manifest);
+    try temp.dir.writeFile(io, .{ .sub_path = "manifest.json", .data = manifest });
+    const pins = try bundlePins(a, dir);
+    try std.testing.expectEqualStrings(&head, &pins.head);
+    try std.testing.expectEqualStrings(&candidate, &pins.candidate);
+    try std.testing.expectEqualStrings(&adapter, &pins.adapter);
+    // A bundle without a span head (or a malformed digest) is refused.
+    try temp.dir.writeFile(io, .{ .sub_path = "manifest.json", .data = "{\"source\":{\"candidate_sha256\":\"xyz\"},\"files\":{}}" });
+    try std.testing.expectError(error.InvalidMemorillaManifest, bundlePins(a, dir));
 }
 
 test "Memorilla hybrid service cancellation precedes component resolution and model loading" {

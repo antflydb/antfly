@@ -131,10 +131,13 @@ pub const ThinkingState = struct {
     }
 };
 
+/// Plain-prompt token cap under the research fast-prefill mode only.
+pub const research_plain_prompt_tokens: usize = 4096;
+
 fn plainLimits(limits: Limits) Limits {
     var bounded = limits;
     bounded.max_prompt_bytes = @min(bounded.max_prompt_bytes, 128 * 1024);
-    bounded.max_prompt_tokens = @min(bounded.max_prompt_tokens, 1024);
+    bounded.max_prompt_tokens = @min(bounded.max_prompt_tokens, if (qualification.researchFastPrefill()) research_plain_prompt_tokens else 1024);
     bounded.max_new_tokens = @min(bounded.max_new_tokens, 128);
     return bounded;
 }
@@ -386,7 +389,70 @@ pub const Request = struct {
     mode: PlainMode = .plain,
     thinking_metadata: ?*ThinkingMetadata = null,
     reasoning_body_token_cap: usize = 64,
+    /// Text the answer is expected to copy (the hybrid's predicted evidence
+    /// span), then wider text it may copy from (the evidence window, or a
+    /// plain prompt's documents). In the BF16 research mode every greedy step
+    /// verifies the continuation of the answer so far drawn from them in one
+    /// multi-row step and keeps only the prefix greedy decoding itself
+    /// selects (`speculativeDraft`).
+    draft_text: ?[]const u8 = null,
+    draft_context: ?[]const u8 = null,
 };
+
+/// Longest speculative continuation verified in one step.
+pub const max_draft_tokens: usize = 16;
+
+/// Speculative span drafts run in the BF16 research mode unless
+/// `ANTFLY_MEMORILLA_SPAN_DRAFT_OFF=1`.
+pub fn speculativeDraftsEnabled() bool {
+    if (@import("builtin").is_test) return false;
+    return qualification.researchBf16Matrices() and !platform.env.getenvBool("ANTFLY_MEMORILLA_SPAN_DRAFT_OFF");
+}
+
+/// The speculative continuation of `generated` (the answer so far): the
+/// first word-boundary occurrence of its text (ASCII case-insensitive, leading
+/// spaces ignored) in `span`, else in `context`, and the tokens of the text
+/// that follows it there; span drafts end with the end-of-turn token. At most
+/// `max_tokens` ids; null when neither text continues the answer.
+pub fn speculativeDraft(a: A, tokenizer: tok.Tokenizer, eos_token_id: i64, generated: []const i32, span: ?[]const u8, context: ?[]const u8, max_tokens: usize) !?[]i32 {
+    if (max_tokens == 0 or generated.len == 0) return null;
+    const generated_text = try tokenizer.decodeText(a, generated);
+    defer a.free(generated_text);
+    const lead = std.mem.trimStart(u8, generated_text, " ");
+    if (lead.len == 0) return null;
+    const sources = [_]struct { text: ?[]const u8, end_of_turn: bool }{ .{ .text = span, .end_of_turn = true }, .{ .text = context, .end_of_turn = false } };
+    for (sources) |source| {
+        const text = source.text orelse continue;
+        if (text.len == 0 or text.len > max_draft_source_bytes) continue;
+        const at = wordOccurrence(text, lead) orelse continue;
+        const rest = std.mem.trimEnd(u8, text[at + lead.len ..], &std.ascii.whitespace);
+        const body = if (rest.len == 0) try a.alloc(i32, 0) else try tokenizer.encode(a, rest);
+        defer a.free(body);
+        const end_of_turn = source.end_of_turn and eos_token_id >= 0;
+        const wanted = body.len + @intFromBool(end_of_turn);
+        if (wanted == 0) continue;
+        const count = @min(wanted, max_tokens);
+        const draft = try a.alloc(i32, count);
+        for (draft, 0..) |*slot, i| slot.* = if (i < body.len) body[i] else @intCast(eos_token_id);
+        return draft;
+    }
+    return null;
+}
+
+/// Largest draft source searched (a RAG prompt of a few chunks fits).
+pub const max_draft_source_bytes: usize = 64 * 1024;
+
+/// First index where `needle` occurs in `text` (ASCII case-insensitive) at a
+/// word start: the text start or after a byte that is not alphanumeric.
+fn wordOccurrence(text: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > text.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= text.len) : (i += 1) {
+        if (i > 0 and std.ascii.isAlphanumeric(text[i - 1])) continue;
+        if (std.ascii.eqlIgnoreCase(text[i..][0..needle.len], needle)) return i;
+    }
+    return null;
+}
 pub const Decoder = struct {
     backend: *const CB,
     config: gpt_model.Config,
@@ -416,8 +482,14 @@ pub const Decoder = struct {
                 platform.env.getenvBool("ANTFLY_GEMMA4_MTP_UNSAFE_TARGET_REPLAY") or
                 platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") != null)
                 return error.UnqualifiedMemorillaDecoderPrecision;
-            var weights = compute.resident_weights.valueIterator();
-            while (weights.next()) |weight| if (weight.dtype != .f32 or weight.quant_type != null) return error.UnqualifiedMemorillaDecoderPrecision;
+            // Research-only BF16 layer matrices (`researchBf16Matrices`).
+            const bf16_matrices = qualification.researchBf16Matrices();
+            var weights = compute.resident_weights.iterator();
+            while (weights.next()) |entry| {
+                const weight = entry.value_ptr;
+                const research_bf16 = bf16_matrices and weight.dtype == .bf16 and qualification.isResearchBf16Matrix(entry.key_ptr.*, weight.shape.len);
+                if ((weight.dtype != .f32 and !research_bf16) or weight.quant_type != null) return error.UnqualifiedMemorillaDecoderPrecision;
+            }
         } else return error.UnsupportedMemorillaBackend;
     }
 };
@@ -645,7 +717,12 @@ fn run(a: A, decoder: Decoder, cb: *const CB, prompt: Prompt, request: Request, 
     defer {
         if (request.thinking_metadata) |out| out.* = thinking.metadata;
     }
-    for (0..request.max_new_tokens) |step| {
+    // One speculative verification of `request.draft_text` after the first
+    // token (greedy only: no trace, teacher forcing, thinking or ignore_eos).
+    const speculate = (request.draft_text != null or request.draft_context != null) and request.mode == .plain and request.teacher_forced_ids == null and
+        request.trace == null and !request.ignore_eos and speculativeDraftsEnabled();
+    while (generated.items.len < request.max_new_tokens) {
+        const step = generated.items.len;
         try control.update(.executing, step, request.max_new_tokens);
         const predicted = if (request.teacher_forced_ids) |ids| ids[step] else try argmax(logits);
         const token = if (request.mode == .bounded_thinking) try thinking.select(predicted, control) else predicted;
@@ -658,6 +735,49 @@ fn run(a: A, decoder: Decoder, cb: *const CB, prompt: Prompt, request: Request, 
             break;
         }
         if (request.teacher_forced_ids == null and step + 1 == request.max_new_tokens) break;
+        if (speculate) {
+            const remaining = request.max_new_tokens - generated.items.len;
+            const maybe_draft = try speculativeDraft(a, decoder.tokenizer, decoder.config.eos_token_id, generated.items, request.draft_text, request.draft_context, @min(remaining, max_draft_tokens));
+            if (maybe_draft == null) std.log.info("memorilla_span_draft drafted=0 accepted=0", .{});
+            if (maybe_draft) |draft| {
+                defer a.free(draft);
+                // Feed [token, draft...] in one step; row i's logits select the
+                // token after fed[i]. Keep the draft prefix greedy decoding
+                // reproduces, then truncate the KV of the rejected tail.
+                const fed_count = draft.len + 1;
+                const fed = try a.alloc(i64, fed_count);
+                defer a.free(fed);
+                fed[0] = token;
+                for (draft, fed[1..]) |id, *slot| slot.* = id;
+                try state.appendGeneratedTokens(fed_count);
+                const total = input_ids.len + step + fed_count;
+                const context = state.gptDecodeContext(total, fed_count);
+                const rows = try gpt.forward(cb, a, decoder.config, fed, 1, total, &context);
+                defer a.free(rows);
+                const vocab: usize = decoder.config.vocab_size;
+                if (rows.len != fed_count * vocab) return error.InvalidMemorillaLogits;
+                var accepted: usize = 0;
+                var stopped = false;
+                while (accepted < draft.len) {
+                    if (try argmax(rows[accepted * vocab ..][0..vocab]) != @as(i64, draft[accepted])) break;
+                    generated.appendAssumeCapacity(draft[accepted]);
+                    accepted += 1;
+                    if (decoder.config.isEosToken(@intCast(draft[accepted - 1]))) {
+                        stopped = true;
+                        break;
+                    }
+                }
+                std.log.info("memorilla_span_draft drafted={d} accepted={d}", .{ draft.len, accepted });
+                if (stopped) {
+                    reason = "stop";
+                    break;
+                }
+                try state.truncateTokens(fed_count - 1 - accepted);
+                a.free(logits);
+                logits = try a.dupe(f32, rows[accepted * vocab ..][0..vocab]);
+                continue;
+            }
+        }
         try state.appendGeneratedToken();
         const total = input_ids.len + step + 1;
         const context = state.gptDecodeContext(total, 1);
@@ -863,4 +983,86 @@ test "memorilla diagnostic thinking budget reserves longer KV without widening p
         state.observe(42, false);
     }
     try std.testing.expectEqual(@as(i64, think_close_id), try state.select(42, .{}));
+}
+
+/// Byte-level stand-in tokenizer: every byte is one token whose id is the byte.
+const ByteTokenizer = struct {
+    var sentinel: u8 = 0;
+    fn handle() tok.Tokenizer {
+        return .{ .ptr = &sentinel, .vtable = &.{ .encode = encode, .encodeInto = append, .encodeForModel = unused, .encodeGeneration = unusedGeneration, .decode = decodeIds, .specialTokens = specials, .vocabSize = size, .deinit = deinit } };
+    }
+    fn encode(_: *anyopaque, a: A, text: []const u8) anyerror![]i32 {
+        const ids = try a.alloc(i32, text.len);
+        for (text, ids) |byte, *id| id.* = byte;
+        return ids;
+    }
+    fn append(raw: *anyopaque, a: A, text: []const u8, out: *std.ArrayListUnmanaged(i32)) anyerror!void {
+        const ids = try encode(raw, a, text);
+        defer a.free(ids);
+        try out.appendSlice(a, ids);
+    }
+    fn decodeIds(_: *anyopaque, a: A, ids: []const i32) anyerror![]u8 {
+        const out = try a.alloc(u8, ids.len);
+        for (ids, out) |id, *byte| byte.* = @intCast(id);
+        return out;
+    }
+    fn unused(_: *anyopaque, _: A, _: []const u8, _: usize) anyerror!tok.EncodeResult {
+        return error.NotUsed;
+    }
+    fn unusedGeneration(_: *anyopaque, _: A, _: []const u8, _: usize, _: bool) anyerror!tok.EncodeResult {
+        return error.NotUsed;
+    }
+    fn specials(_: *anyopaque) tok.SpecialTokens {
+        return .{};
+    }
+    fn size(_: *anyopaque) usize {
+        return 256;
+    }
+    fn deinit(_: *anyopaque) void {}
+};
+
+test "Memorilla speculative drafts continue the answer from the span, then the context" {
+    const a = std.testing.allocator;
+    const tokenizer = ByteTokenizer.handle();
+    const eos: i64 = 300;
+    {
+        // The decoder capitalised the span's first letter; the span still
+        // continues it and its draft ends the turn.
+        const draft = (try speculativeDraft(a, tokenizer, eos, &.{'B'}, "  basketball \n", null, 16)).?;
+        defer a.free(draft);
+        try std.testing.expectEqual(@as(usize, "asketball".len + 1), draft.len);
+        for ("asketball", draft[0..9]) |byte, id| try std.testing.expectEqual(@as(i32, byte), id);
+        try std.testing.expectEqual(@as(i32, 300), draft[9]);
+    }
+    {
+        // Capped drafts stop before the end-of-turn token.
+        const draft = (try speculativeDraft(a, tokenizer, eos, &.{'B'}, "basketball", null, 3)).?;
+        defer a.free(draft);
+        try std.testing.expectEqualSlices(i32, &.{ 'a', 's', 'k' }, draft);
+    }
+    {
+        // Leading punctuation: the first word start that matches the whole
+        // answer so far.
+        const draft = (try speculativeDraft(a, tokenizer, eos, &.{ 'D', 'o' }, " (Donny", null, 16)).?;
+        defer a.free(draft);
+        try std.testing.expectEqualSlices(i32, &.{ 'n', 'n', 'y', 300 }, draft);
+    }
+    {
+        // Not in the span (it starts mid-word): the context continues the
+        // answer, without an end-of-turn token.
+        const draft = (try speculativeDraft(a, tokenizer, eos, &.{'I'}, "grid B", "by Ingrid B.", 16)).?;
+        defer a.free(draft);
+        try std.testing.expectEqualSlices(i32, &.{ 'n', 'g', 'r', 'i', 'd', ' ', 'B', '.' }, draft);
+    }
+    // The whole span already generated: only the end of the turn remains.
+    const done = (try speculativeDraft(a, tokenizer, eos, &.{ 'q', 'r' }, "QR", null, 16)).?;
+    defer a.free(done);
+    try std.testing.expectEqualSlices(i32, &.{300}, done);
+    // No draft when neither text continues the answer at a word start, the
+    // answer is blank, nothing remains in the context, or there is no room.
+    try std.testing.expect((try speculativeDraft(a, tokenizer, eos, &.{'x'}, "basketball", "box", 16)) == null);
+    try std.testing.expect((try speculativeDraft(a, tokenizer, eos, &.{' '}, "basketball", null, 16)) == null);
+    try std.testing.expect((try speculativeDraft(a, tokenizer, eos, &.{ 'a', 'b' }, null, "ab", 16)) == null);
+    try std.testing.expect((try speculativeDraft(a, tokenizer, eos, &.{'B'}, "basketball", null, 0)) == null);
+    try std.testing.expect((try speculativeDraft(a, tokenizer, eos, &.{}, "basketball", null, 16)) == null);
 }

@@ -3345,6 +3345,12 @@ pub const LoadedModel = struct {
     /// Research (encoder-LoRA) reader for the same decoder; the two caches
     /// are independent so a research profile never evicts the released reader.
     memorilla_research_reader_cache: @import("memorilla_reader_cache.zig").ResearchCache = .{},
+    /// Verified span head of the hybrid span-window bundle (host weights).
+    memorilla_span_head_cache: @import("memorilla_span_head_cache.zig").Cache = .{},
+    /// Device-resident span head (the hybrid service's default head path).
+    memorilla_span_head_device_cache: @import("memorilla_reader_cache.zig").SpanHeadCache = .{},
+    /// Run-time encoder LoRA of the hybrid span-window bundle (encoder models).
+    memorilla_adapter_cache: @import("memorilla_span_head_cache.zig").AdapterCache = .{},
     /// Last complete optional-session JIT snapshot. Metrics use it when a
     /// cold sidecar load owns embedding_session_lock, keeping scrapes bounded
     /// without racing publication of the optional session handles.
@@ -4225,6 +4231,9 @@ pub const LoadedModel = struct {
         }
         self.memorilla_reader_cache.deinit();
         self.memorilla_research_reader_cache.deinit();
+        self.memorilla_span_head_cache.deinit();
+        self.memorilla_span_head_device_cache.deinit();
+        self.memorilla_adapter_cache.deinit();
         self.native_generation_graph_cache.deinit();
         self.prompt_prefix_cache.deinit();
         self.session.close();

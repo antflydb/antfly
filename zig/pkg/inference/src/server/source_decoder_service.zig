@@ -44,6 +44,10 @@ pub const Options = struct {
     mode: decode.PlainMode = .plain,
     final_token_cap: usize = 48,
     reasoning_body_token_cap: usize = 64,
+    /// Text the answer may copy (for example the user turn's documents):
+    /// research-mode speculative drafts (`decode.Request.draft_context`).
+    /// Internal; not decoded from HTTP.
+    draft_context: ?[]const u8 = null,
 };
 
 /// Text is decoded from this exact raw-token suffix; IDs are never synthesized.
@@ -84,8 +88,15 @@ fn validateInputsWithMode(system: []const u8, user: []const u8, max_new_tokens: 
 }
 
 const bounded = decode.Limits{ .max_new_tokens = 128 };
+/// The research fast-prefill mode (`researchFastPrefill`) admits plain prompts
+/// up to `decode.research_plain_prompt_tokens` (RAG baselines over long chunks).
+fn plainBounded() decode.Limits {
+    var limits = bounded;
+    if (qualified.researchFastPrefill()) limits.max_prompt_tokens = decode.research_plain_prompt_tokens;
+    return limits;
+}
 fn modeLimits(mode: decode.PlainMode) decode.Limits {
-    return if (mode == .bounded_thinking) .{ .max_new_tokens = decode.thinking_max_new_tokens } else bounded;
+    return if (mode == .bounded_thinking) .{ .max_new_tokens = decode.thinking_max_new_tokens } else plainBounded();
 }
 const PreparedRequest = struct {
     config: gpt_model.Config,
@@ -106,7 +117,7 @@ fn prepareRequest(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected
     var assets = try common.acquireGenerationAssets(backing, io, manager, selected, .qwen3_decoder_f32_kv_f32_v1, bound_control);
     errdefer assets.deinit();
     const config = try assets.decoderConfig(backing, selected.path);
-    var text = try decode.preparePlainTextWithMode(backing, assets.tokenizer(), assets.chatTemplate() orelse return error.MemorillaChatTemplateRequired, config, system, user, bounded, bound_control, mode);
+    var text = try decode.preparePlainTextWithMode(backing, assets.tokenizer(), assets.chatTemplate() orelse return error.MemorillaChatTemplateRequired, config, system, user, plainBounded(), bound_control, mode);
     errdefer text.deinit();
     try common.validateInputTokenLimit(request_limits, text.input_ids.len);
     try selected.verify(a, io);
@@ -122,7 +133,7 @@ pub fn preflight(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected:
     defer lease.release();
     var prepared = try prepareRequest(a, io, manager, selected, system, user, max_new_tokens, request_limits, selected.bind(control), .plain);
     defer prepared.deinit();
-    const plan = try decode.ResourcePlan.createPlain(prepared.config, .cuda, prepared.text.input_ids.len, prepared.text.rendered.len, max_new_tokens, bounded);
+    const plan = try decode.ResourcePlan.createPlain(prepared.config, .cuda, prepared.text.input_ids.len, prepared.text.rendered.len, max_new_tokens, plainBounded());
     const amounts = try memory.AdmissionAmounts.fromEstimate(plan.decoder).merge(.fromEstimate(plan.host));
     _ = try common.requestBudgetLimits(limits, amounts);
     try control.check();
@@ -191,6 +202,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: 
         .mode = options.mode,
         .thinking_metadata = if (options.mode == .bounded_thinking) &thinking else null,
         .reasoning_body_token_cap = options.reasoning_body_token_cap,
+        .draft_context = options.draft_context,
     }, &reservation, caps, bound_control);
     errdefer result.deinit();
     try model.verifyMemorillaIdentityWithControl(bound_control);

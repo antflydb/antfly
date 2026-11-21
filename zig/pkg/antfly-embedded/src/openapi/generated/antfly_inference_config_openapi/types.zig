@@ -1409,6 +1409,274 @@ pub const MemorillaCitation = struct {
     match: []const u8,
 };
 
+/// A region of one caller document, mapped from encoder copy positions the way citations are.
+pub const MemorillaDiagnosticRegion = struct {
+    /// Index into the request's document_texts.
+    document_index: i64,
+    /// Inclusive UTF-8 byte offset into document_texts[document_index], on a character boundary.
+    start: i64,
+    /// Exclusive UTF-8 byte offset; end > start.
+    end: i64,
+    /// Exactly the bytes document_texts[document_index][start:end], surrounding whitespace trimmed.
+    text: []const u8,
+};
+
+/// Server-side stage times in milliseconds. Each stage is measured from the end of the previous one, so it also carries the model-handle and integrity checks done since. total spans the whole service call (preflight, admission and every stage); queueing before it is not included.
+pub const MemorillaDiagnosticTimings = struct {
+    /// Stock-encoder pooled vectors of the texts and the question.
+    pooled: f64,
+    /// The first span pass's per-token encoder features (encoder LoRA at run time). Absent for read_mode none.
+    span_features: ?f64 = null,
+    /// The first pass's span head, including the decoder handle acquisition before it. Absent for read_mode none.
+    span_head: ?f64 = null,
+    /// The cascade's wide pass features (reusing the narrow pass's leading rows). Present only when a wide pass ran after the first pass.
+    wide_features: ?f64 = null,
+    /// The wide pass's span head. Present only with wide_features.
+    wide_head: ?f64 = null,
+    /// Read plan, evidence window, path checks and the window's embedding rows. Absent for read_mode none.
+    window: ?f64 = null,
+    /// The released reader's 16 soft rows.
+    soft_rows: f64,
+    /// Decoder prefill and greedy decoding.
+    generate: f64,
+    total: f64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "pooled", "pooled", false },
+        .{ "span_features", "span_features", true },
+        .{ "span_head", "span_head", true },
+        .{ "wide_features", "wide_features", true },
+        .{ "wide_head", "wide_head", true },
+        .{ "window", "window", true },
+        .{ "soft_rows", "soft_rows", false },
+        .{ "generate", "generate", false },
+        .{ "total", "total", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("pooled");
+        try jw.write(self.pooled);
+        if (self.span_features) |value| {
+            try jw.objectField("span_features");
+            try jw.write(value);
+        }
+        if (self.span_head) |value| {
+            try jw.objectField("span_head");
+            try jw.write(value);
+        }
+        if (self.wide_features) |value| {
+            try jw.objectField("wide_features");
+            try jw.write(value);
+        }
+        if (self.wide_head) |value| {
+            try jw.objectField("wide_head");
+            try jw.write(value);
+        }
+        if (self.window) |value| {
+            try jw.objectField("window");
+            try jw.write(value);
+        }
+        try jw.objectField("soft_rows");
+        try jw.write(self.soft_rows);
+        try jw.objectField("generate");
+        try jw.write(self.generate);
+        try jw.objectField("total");
+        try jw.write(self.total);
+        try jw.endObject();
+    }
+};
+
+pub const MemorillaDiagnosticWindow = struct {
+    /// The evidence window as the decoder reads it when the gate opens (its tokens padded with spaces to window_rows), decoded.
+    text: []const u8,
+    /// Where the window sits in document_texts, one region per document it touches (a window never crosses documents today). Empty when citations_unavailable.
+    regions: []const MemorillaDiagnosticRegion,
+};
+
+/// hybrid_research profiles with include_diagnostics only: how the span hybrid read the request. Fields that do not apply are absent (never null). Margins are score - null_score - the bundle's span gate threshold; the cascade widens when the narrow margin is below cascade_threshold, and the gate opens when margin >= gate_offset. Research diagnostics, not a stable contract.
+pub const MemorillaDiagnostics = struct {
+    /// The read the request ran. all is a span bundle without a cascade (every text is read). Absent for a copy-head (non-span) bundle.
+    read_mode: ?[]const u8 = null,
+    /// Cascade only. The pass whose record the request used.
+    read_pass: ?[]const u8 = null,
+    /// Cascade only. True when auto used the wide pass.
+    widened: ?bool = null,
+    /// Cascade only. The narrow margin below which auto reads wide.
+    cascade_threshold: ?f64 = null,
+    /// Cascade only. Margin of the narrow pass; absent when it did not run.
+    narrow_margin: ?f64 = null,
+    /// Cascade only. Margin of the wide pass; absent when it did not run.
+    wide_margin: ?f64 = null,
+    /// Cascade only. Why the narrow read set was skipped at preflight (an error name); absent when usable.
+    narrow_unavailable: ?[]const u8 = null,
+    /// Cascade only. Why the wide read set was skipped at preflight; absent when usable.
+    wide_unavailable: ?[]const u8 = null,
+    /// Leading texts the used pass read.
+    read_documents: ?i64 = null,
+    /// Copy tokens of the used pass's read set.
+    read_tokens: ?i64 = null,
+    /// Encoder tokens the wide read budget summed; absent when no budget applied.
+    read_budget_tokens: ?i64 = null,
+    /// Evidence window rows of the used pass (32 narrow, the cascade's width wide).
+    window_rows: ?i64 = null,
+    /// Best span score (start plus end logit).
+    score: ?f64 = null,
+    /// No-answer score.
+    null_score: ?f64 = null,
+    /// Margin of the record used; the gate compares it with gate_offset.
+    margin: ?f64 = null,
+    gate_policy: ?[]const u8 = null,
+    /// The offset the margin was compared with; absent for the always policy (the gate is always open).
+    gate_offset: ?f64 = null,
+    /// Routed or declared gate profile name, when one applied.
+    gate_profile: ?[]const u8 = null,
+    /// Equals record_gate open. When true the decoder read the soft rows then the window rows.
+    gate_open: bool,
+    span: ?MemorillaDiagnosticRegion = null,
+    window: ?MemorillaDiagnosticWindow = null,
+    /// The stripped decoder answer before canonicalization and the answer guard.
+    raw_answer: []const u8,
+    timings_ms: ?MemorillaDiagnosticTimings = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "read_mode", "read_mode", true },
+        .{ "read_pass", "read_pass", true },
+        .{ "widened", "widened", true },
+        .{ "cascade_threshold", "cascade_threshold", true },
+        .{ "narrow_margin", "narrow_margin", true },
+        .{ "wide_margin", "wide_margin", true },
+        .{ "narrow_unavailable", "narrow_unavailable", true },
+        .{ "wide_unavailable", "wide_unavailable", true },
+        .{ "read_documents", "read_documents", true },
+        .{ "read_tokens", "read_tokens", true },
+        .{ "read_budget_tokens", "read_budget_tokens", true },
+        .{ "window_rows", "window_rows", true },
+        .{ "score", "score", true },
+        .{ "null_score", "null_score", true },
+        .{ "margin", "margin", true },
+        .{ "gate_policy", "gate_policy", true },
+        .{ "gate_offset", "gate_offset", true },
+        .{ "gate_profile", "gate_profile", true },
+        .{ "gate_open", "gate_open", false },
+        .{ "span", "span", true },
+        .{ "window", "window", true },
+        .{ "raw_answer", "raw_answer", false },
+        .{ "timings_ms", "timings_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.read_mode) |value| {
+            try jw.objectField("read_mode");
+            try jw.write(value);
+        }
+        if (self.read_pass) |value| {
+            try jw.objectField("read_pass");
+            try jw.write(value);
+        }
+        if (self.widened) |value| {
+            try jw.objectField("widened");
+            try jw.write(value);
+        }
+        if (self.cascade_threshold) |value| {
+            try jw.objectField("cascade_threshold");
+            try jw.write(value);
+        }
+        if (self.narrow_margin) |value| {
+            try jw.objectField("narrow_margin");
+            try jw.write(value);
+        }
+        if (self.wide_margin) |value| {
+            try jw.objectField("wide_margin");
+            try jw.write(value);
+        }
+        if (self.narrow_unavailable) |value| {
+            try jw.objectField("narrow_unavailable");
+            try jw.write(value);
+        }
+        if (self.wide_unavailable) |value| {
+            try jw.objectField("wide_unavailable");
+            try jw.write(value);
+        }
+        if (self.read_documents) |value| {
+            try jw.objectField("read_documents");
+            try jw.write(value);
+        }
+        if (self.read_tokens) |value| {
+            try jw.objectField("read_tokens");
+            try jw.write(value);
+        }
+        if (self.read_budget_tokens) |value| {
+            try jw.objectField("read_budget_tokens");
+            try jw.write(value);
+        }
+        if (self.window_rows) |value| {
+            try jw.objectField("window_rows");
+            try jw.write(value);
+        }
+        if (self.score) |value| {
+            try jw.objectField("score");
+            try jw.write(value);
+        }
+        if (self.null_score) |value| {
+            try jw.objectField("null_score");
+            try jw.write(value);
+        }
+        if (self.margin) |value| {
+            try jw.objectField("margin");
+            try jw.write(value);
+        }
+        if (self.gate_policy) |value| {
+            try jw.objectField("gate_policy");
+            try jw.write(value);
+        }
+        if (self.gate_offset) |value| {
+            try jw.objectField("gate_offset");
+            try jw.write(value);
+        }
+        if (self.gate_profile) |value| {
+            try jw.objectField("gate_profile");
+            try jw.write(value);
+        }
+        try jw.objectField("gate_open");
+        try jw.write(self.gate_open);
+        if (self.span) |value| {
+            try jw.objectField("span");
+            try jw.write(value);
+        }
+        if (self.window) |value| {
+            try jw.objectField("window");
+            try jw.write(value);
+        }
+        try jw.objectField("raw_answer");
+        try jw.write(self.raw_answer);
+        if (self.timings_ms) |value| {
+            try jw.objectField("timings_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Generate a buffered answer over caller-supplied stored document embeddings. Features must be full-width normalized outputs of the configured encoder execution profile. The server applies the pinned FP16-storage/BF16-readout conversion. The identity pins compatibility; it does not authenticate the origin, authorization, or collection coverage of caller-supplied vectors. The first release supports greedy decoding with fresh F32 KV only. context_mode=source_verified generates an independent source answer and checks its support. A memory candidate requires exact agreement with that supported answer; otherwise the source answer or abstention is returned. This explicit mode does not establish source truth, authorization, or text/vector association cryptographically. Profiles configured with reader_kind=encoder_lora_research or hybrid_research instead take document_texts in latent mode and encode them server-side (the hybrid computes the pooled document and question vectors itself as well); they reject document_embeddings and source_verified.
 pub const MemorillaGenerateRequest = struct {
     /// Name from inference.memorilla.profiles. Requests cannot override the bound model assets or memory module.
@@ -1423,8 +1691,12 @@ pub const MemorillaGenerateRequest = struct {
     max_new_tokens: ?i64 = null,
     /// Latent uses stored features alone. Source-verified mode requires document_texts and explicitly checks or replaces the memory candidate using their contents.
     context_mode: ?[]const u8 = null,
-    /// Released profiles: required only for source_verified and rejected in latent mode. One nonblank UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total. The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation. Pairing is asserted by the caller, not recomputed or authenticated. encoder_lora_research profiles: required in latent mode (1 to 64 texts, same per-text and total byte limits); the server encodes each text with the merged research encoder. hybrid_research profiles: the same rules; the server pools each text with the stock encoder (texts over its 256-token pooled limit are split into sentence-greedy chunks of at most 128 tokens, one soft-memory vector each, at most 64 vectors) and encodes the per-token record batch with the run-time encoder LoRA (padded batch rows of at most 1024 tokens).
+    /// Released profiles: required only for source_verified and rejected in latent mode. One nonblank UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total. The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation. Pairing is asserted by the caller, not recomputed or authenticated. encoder_lora_research profiles: required in latent mode (1 to 64 texts, same per-text and total byte limits); the server encodes each text with the merged research encoder. hybrid_research profiles: the same rules; the server pools each text with the stock encoder (texts over its 256-token pooled limit are split into sentence-greedy chunks of at most 128 tokens, one soft-memory vector each, at most 64 vectors) and encodes the per-token record batch with the run-time encoder LoRA (padded batch rows of at most 1024 tokens). With a span read cascade the texts are the ranked candidate list, best first: the soft half pools every text and the span reads take leading texts.
     document_texts: ?[]const []const u8 = null,
+    /// hybrid_research profiles only (400 for other kinds). Absent keeps the bundle's default read (auto on a bundle with a span read cascade; every text on a span bundle without one). auto, narrow and wide need a bundle with a span read cascade (400 otherwise): narrow reads the top two texts with a 32-token window; wide reads texts in order while their encoder tokens stay within the cascade's budget, with its wider window; auto reads narrow and reads wide when the narrow margin is below the cascade threshold, reusing the narrow pass's work. none needs a span bundle and skips the span pass: the decoder reads the 16 soft rows alone under the released helpful prompt, the closed-gate path, i.e. stock Memorilla over the same pooled vectors (record_gate closed, memory_tokens 16, no citations).
+    read_mode: ?[]const u8 = null,
+    /// hybrid_research profiles only (true is 400 for other kinds). Adds the diagnostics object to the response; the answer and every other field are unchanged.
+    include_diagnostics: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1435,6 +1707,8 @@ pub const MemorillaGenerateRequest = struct {
         .{ "max_new_tokens", "max_new_tokens", true },
         .{ "context_mode", "context_mode", true },
         .{ "document_texts", "document_texts", true },
+        .{ "read_mode", "read_mode", true },
+        .{ "include_diagnostics", "include_diagnostics", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1469,6 +1743,14 @@ pub const MemorillaGenerateRequest = struct {
             try jw.objectField("document_texts");
             try jw.write(value);
         }
+        if (self.read_mode) |value| {
+            try jw.objectField("read_mode");
+            try jw.write(value);
+        }
+        if (self.include_diagnostics) |value| {
+            try jw.objectField("include_diagnostics");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -1480,7 +1762,7 @@ pub const MemorillaGenerateResponse = struct {
     /// Abstained is a policy-produced UNKNOWN answer. In source-verified mode it has empty token_ids and zero final completion tokens, and that mode never publishes a truncated factual answer. On encoder_lora_research and hybrid_research profiles it is produced by the answer guard (see answer_guard) and token_ids keep the decoder's output.
     finish_reason: []const u8,
     input_documents: i64,
-    /// Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate. hybrid_research reports 32 when the record gate opened (16 soft rows then 16 record rows) and 16 when it closed (soft rows only).
+    /// Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate. hybrid_research reports 32 when the record gate opened (16 soft rows then 16 record rows) and 16 when it closed (soft rows only); span-window bundles report 16 plus the evidence window rows when it opened (48 for a 32-row window, 80 for the cascade's 64-row wide window) and 16 when it closed or read_mode is none.
     memory_tokens: i64,
     /// supplied_documents is reported by encoder_lora_research and hybrid_research profiles, which encoded caller-supplied texts server-side.
     context_source: []const u8,
@@ -1510,6 +1792,7 @@ pub const MemorillaGenerateResponse = struct {
     decoder_execution_identity: []const u8,
     memory_module_sha256: []const u8,
     usage: MemorillaGenerateUsage,
+    diagnostics: ?MemorillaDiagnostics = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1535,6 +1818,7 @@ pub const MemorillaGenerateResponse = struct {
         .{ "decoder_execution_identity", "decoder_execution_identity", false },
         .{ "memory_module_sha256", "memory_module_sha256", false },
         .{ "usage", "usage", false },
+        .{ "diagnostics", "diagnostics", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1613,6 +1897,10 @@ pub const MemorillaGenerateResponse = struct {
         try jw.write(self.memory_module_sha256);
         try jw.objectField("usage");
         try jw.write(self.usage);
+        if (self.diagnostics) |value| {
+            try jw.objectField("diagnostics");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

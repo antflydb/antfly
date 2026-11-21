@@ -1998,3 +1998,143 @@ answer canonicalization against the record rows; serve restatement requests
 through the stage1 reader as a separate mode rather than mixing it into the
 QA composition. The remaining surface-form perturbation is the target of the
 planned decoder-in-the-loop tune of the soft slots in the 32-slot frame.
+
+#### Paper protocol on all eight registered benchmarks
+
+`qwen_hybrid_eval.py paper-prep | paper-run | paper-choice-embed | paper-score`
+evaluates the soft and hybrid arms under the upstream evaluation protocol on
+every registered benchmark (`pmv2`, `pv4`, `factkg`, `triviaqa`, `narrativeqa`,
+`pubmedqa`, `lamp4`, `lamp7`, test splits) plus EnWiki reconstruction. System
+prompt, suffix, generation budget, prompt token limit, scoring and metrics come
+from upstream `memorilla.benchmarks.BENCHMARKS`:
+
+- `paper-prep` (upstream venv) also carries `choices` and pv4's `hard` flag into
+  each case and runs upstream `check_scoring_inputs` on the whole split (every
+  reference is one of its row's choices; METEOR's NLTK data) after the same
+  metric adjustment `evaluate.load_target` makes (`accuracy_hard` exactly when
+  the split flags hard rows).
+- `paper-run` reads pmv2 and pv4 with their benchmark-specific released
+  checkpoints (`checkpoints/pmv2`, `checkpoints/pv4`; paper section 2.6) and
+  every other target with stage3 (`--released-checkpoint` overrides); the run
+  receipt records the checkpoint, its `memory.pt` sha256 and why it was chosen.
+  Memory prompts longer than the benchmark's `max_length` are cut from the
+  right like upstream `MemoryCollator` (rows record `prompt_truncated_from`).
+- `paper-choice-embed` (CUDA venv, pmv2/pv4/factkg only) embeds every cleaned
+  generation and every non-empty choice with Qwen3-Embedding-4B (BF16,
+  tokenizer special tokens, last-token pooling, L2 normalization, FP16
+  storage: the path that reproduces the stored question vectors) into
+  `<output>/choice-embeddings.{safetensors,json}`, keyed by text sha256 and
+  extended incrementally. It first re-embeds the first `--verify-cases`
+  questions and fails unless each matches its stored (upstream vLLM) question
+  vector at cosine >= `--min-verify-cosine` (0.999).
+- `paper-score` (upstream venv) applies upstream `choice_predictions` /
+  `choice_index` to those vectors for choice targets, upstream
+  `compute_metrics` otherwise, and reports per-row primary scores (choice
+  correctness, PubMedQA polarity match, TriviaQA EM, ROUGE-L for generation)
+  with paired bootstrap 95% intervals (`--bootstrap-resamples`, default
+  10,000) for every `--pairs` delta.
+
+`.benchmark-results/memorilla/qwen-hybrid/paper/prep8.sh` wrote the case files
+(seed 23: 1,000 rows each for pmv2, pv4, factkg, lamp4, lamp7; all 100 for
+pubmedqa) and `bench8.sh` runs the six targets with arms
+`soft,hybrid,hybrid-bench`, the choice embeddings and the scores (`TARGETS` and
+`ARMS` override the defaults).
+
+#### Copy half for general QA (`qwen_copy_qa.py`, research)
+
+Continues copy17 decoder-free on question answering so the hybrid's record
+generalizes beyond depot facts: record `" answer" + exact source span` (gate 1,
+pointer onto the span) or 16 pads with gate 0 when the answer is not verbatim
+in the top-2 chunks (a learned relevance gate), plus 15% depot replay.
+
+```bash
+. .benchmark-results/memorilla/qwen-copy-qa/env.sh
+# CPU: examples from the Stage 2 QA configs and the TriviaQA/NarrativeQA
+# train splits (top-2 chunks by stored cosine, as the hybrid retrieves).
+$PY $COPYQA prep --data-root $DATA --tokenizer $A/models/qwen3-embedding-4b \
+  --output $Q/examples --samples triviaqa=45000
+# GPU: decoder readability of "<label> <span>" records (6 SQuAD cases).
+$PY $COPYQA probe --assets $A --candidate $CAND17 --data-root $DATA --output $Q/probe
+# GPU: training (qwen-copy-qa/train.sh NAME STEPS [args] sets the weights).
+# --question-prefix question-passage-v1 encodes each document after the
+# question text (protocol document_question_prefix, applied by
+# qwen_hybrid_eval.record_memory for exported candidates).
+$Q/train.sh copyqa2-qprefix-1024 1024 --accum 4 --micro-batch 16 \
+  --reader-lr 3e-5 --copy-head-lr 1e-4 --question-prefix question-passage-v1 \
+  --max-encoder-tokens 1280
+# GPU: remeasure a candidate on all eight benchmarks and the legacy sets.
+$Q/remeasure8.sh $Q/<run>/final
+```
+
+Status (2026-11-14, plan section 8.10): the gate learns but the copied span
+does not follow the question (SQuAD exact span 3-4/200 after 256 steps, with
+or without the question prefix); keep the reader learning rate at 3e-5
+(1e-4 erases depot recall within 8 steps). A span head over the
+question-conditioned encoder states is the proposed replacement.
+
+#### Span copy half (`qwen_span_copy.py`, research)
+
+The extractive replacement for the reader + copy head on general QA (plan
+section 8.11): copy17's encoder (+ frozen adapters) reads each of the top-2
+chunks after the question text (`question-passage-v1`, self-context doubled);
+a small bidirectional span head scores start, end and no-answer over the
+per-token final + layer-24 rows; the record is the exact source window around
+the best span (32 tokens, 65% of the free budget before the span,
+word-aligned), fed to the frozen decoder as its input-embedding rows. The
+exported candidate is copy17's directory plus `span-head.safetensors` and
+protocol `record_kind: span-window`; `qwen_hybrid_eval.py` dispatches its
+records (`--record-gate-mode always` keeps the window in every prompt,
+`learned` only when span minus no-answer clears the exported threshold).
+
+```bash
+. .benchmark-results/memorilla/qwen-span-copy/env.sh
+# Decoder reads gold-span windows (depot dev/fresh, no training).
+$PY $SPAN oracle --assets $A --candidate $CAND17 --depot-dev $ENC/lora-ref-dev.json \
+  --depot-fresh $ENC/lora-ref-fresh.json --output $D/oracle.json --widths 32,48
+# Encode examples once (fp16 per-token features, ~1.5 MB per example).
+$PY $SPAN cache --assets $A --candidate $CAND17 --examples $Q/examples \
+  --depot-data $DEPOT --output $D/cache-train --split train \
+  --quotas triviaqa=8000,squad_v2=6000,coqa=5000,drop=3000,narrativeqa=3000,msmarco=3000,quail=1500,pubmedqa=500,depot=5000
+# Train the head from the cache (held-out span/gate metrics each epoch) and
+# export the candidate to <output>/candidate.
+$PY $SPAN train --cache $D/cache-train --heldout-cache $D/cache-heldout \
+  --parent $CAND17 --output $D/span1-35k --epochs 3
+# Decoder-side evaluation: legacy sets and all eight benchmarks.
+$D/remeasure.sh $D/span1-35k/candidate span1
+```
+
+Serving in Zig (plan section 8.12): export the candidate as a hybrid bundle
+with the head pinned, then point a `hybrid_research` profile's
+`memory_module_path` at it; the service reads the pinned protocol and takes
+the span-window path (gate policy from `span_gate_policy`, default `always`).
+
+```bash
+$PY encoder_lora_export.py export-reader --candidate $D/span1-35k/candidate \
+  --output $D/span1-35k/hybrid-span-bundle --include-encoder-lora --include-span-head
+# Managed-path verification against the Python legacy rows (Zig verifier
+# built with `zig build build-memorilla-lora-hybrid-verify -Dcuda=true
+# -Doptimize=ReleaseFast`); writes span1-zig-verify[-learned].{jsonl,summary.json}.
+$D/run_span_verify.sh always
+$D/run_span_verify.sh learned
+```
+
+Robustness checks (plan section 8.14). `train --seed N` gives another head
+seed; `train --exclude-sources triviaqa` drops a source from both caches
+(leave-one-out: neither the head nor its exported threshold sees it).
+`paper-run --record-extractor embed-window` replaces the head with a cheap
+extractor over the same top-2 chunks and window width: the word-aligned
+32-token window (stride 8) whose pooled frozen-encoder vector is most similar
+to the stored question vector (`span_margin` holds that cosine, so the
+offline sweep can gate on it); `lead` takes the first window of the top-1
+chunk. `paper-score` also writes `per-row.json`, which `seeds` aggregates
+over head seeds (per-seed paired CIs plus the seed-mean delta).
+
+```bash
+. .benchmark-results/memorilla/qwen-span-copy/robust/env.sh
+$PY $SPAN train --cache $D/cache-train --heldout-cache $D/cache-heldout \
+  --parent $CAND17 --output $R/train/loo-triviaqa --exclude-sources triviaqa
+run embed triviaqa $H/paper/cases/triviaqa.jsonl   # paper-run, window always
+$PY $SPAN seeds --per-row $R/scored/full/narrativeqa/per-row.json \
+  --right s31-gate-3,s32-gate-3,s33-gate-3
+$R/main.sh   # the whole study: seeds, LOO, extractors, full splits
+```

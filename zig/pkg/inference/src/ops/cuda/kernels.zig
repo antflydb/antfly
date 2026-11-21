@@ -2465,6 +2465,19 @@ pub const KernelModule = struct {
     /// Model-scoped opt-in for Qwen3-VL automatic prefill routes. Explicit
     /// operator-selected profiles remain available to every architecture.
     qwen3vl_automatic_prefill: bool = false,
+    /// Research-only (`memorilla_qualification.researchFastPrefill`): the
+    /// automatic profile takes the cooperative dense F32 prefill kernel.
+    memorilla_research_fast_prefill: bool = false,
+    /// Lazily loaded research cubin (`memorilla_tiled_prefill.cu`, sm_121).
+    memorilla_tiled_prefill_module: driver_mod.CUmodule = null,
+    memorilla_tiled_prefill_f32: driver_mod.CUfunction = null,
+    /// BF16 tensor-core variant from the same cubin (null if the symbol is
+    /// missing); preferred for causal prefill unless
+    /// `ANTFLY_MEMORILLA_RESEARCH_F32_ATTENTION=1`.
+    memorilla_flash_prefill_bf16: driver_mod.CUfunction = null,
+    /// Rank-r adapter epilogue from the same cubin (null if missing).
+    memorilla_lora_up_add_f32: driver_mod.CUfunction = null,
+    memorilla_tiled_prefill_unavailable: bool = false,
     lighton_automatic_prefill: bool = false,
     gqa_splitk_online_decode_telemetry_word: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
@@ -4435,6 +4448,15 @@ pub const KernelModule = struct {
     }
 
     pub fn unload(self: *KernelModule, ctx: *context_mod.CudaContext) void {
+        if (self.memorilla_tiled_prefill_module) |module| {
+            ctx.makeCurrent() catch {};
+            _ = ctx.driver.fns.cuModuleUnload(module);
+            self.memorilla_tiled_prefill_module = null;
+            self.memorilla_tiled_prefill_f32 = null;
+            self.memorilla_flash_prefill_bf16 = null;
+            self.memorilla_lora_up_add_f32 = null;
+        }
+        self.memorilla_tiled_prefill_unavailable = false;
         self.gqa_attention_generated_workspace.free(ctx);
         self.gqa_attention_decode_splitk_online_workspace.free(ctx);
         if (self.runtime_jit_module_count > 0) ctx.makeCurrent() catch {};
@@ -4638,6 +4660,7 @@ pub const KernelModule = struct {
             self.attention_match_repeat_launches = 0;
             self.gqa_prefill_profile = .automatic;
             self.qwen3vl_automatic_prefill = false;
+            self.memorilla_research_fast_prefill = false;
             self.lighton_automatic_prefill = false;
             self.gqa_score_prework_mode = .automatic;
             self.gqa_score_prework_consumer_mode = .serial;
@@ -10892,6 +10915,144 @@ pub const KernelModule = struct {
         }
     }
 
+    /// Research-only (`memorilla_research_fast_prefill`): the tiled dense
+    /// prefill attention cubin, loaded on first use on SM 12.1 only. A load
+    /// failure is logged once and the caller keeps the bundled kernels.
+    fn memorillaTiledPrefill(self: *KernelModule, ctx: *context_mod.CudaContext) ?driver_mod.CUfunction {
+        if (self.memorilla_tiled_prefill_f32) |function| return function;
+        if (self.memorilla_tiled_prefill_unavailable) return null;
+        self.memorilla_tiled_prefill_unavailable = true;
+        if (ctx.info.compute_major != 12 or ctx.info.compute_minor != 1) return null;
+        ctx.makeCurrent() catch return null;
+        var module: driver_mod.CUmodule = null;
+        const image = @embedFile("memorilla_tiled_prefill.sm121.cubin");
+        const load_status = ctx.driver.fns.cuModuleLoadDataEx(&module, image.ptr, 0, null, null);
+        if (load_status != driver_mod.CUDA_SUCCESS or module == null) {
+            std.log.warn("memorilla_research_attention: tiled prefill cubin load failed: {s}", .{ctx.driver.errorName(load_status)});
+            return null;
+        }
+        var function: driver_mod.CUfunction = null;
+        const symbol_status = ctx.driver.fns.cuModuleGetFunction(&function, module, "memorilla_gqa_prefill_tiled_f32");
+        if (symbol_status != driver_mod.CUDA_SUCCESS or function == null) {
+            _ = ctx.driver.fns.cuModuleUnload(module);
+            std.log.warn("memorilla_research_attention: tiled prefill symbol missing", .{});
+            return null;
+        }
+        var flash: driver_mod.CUfunction = null;
+        if (ctx.driver.fns.cuModuleGetFunction(&flash, module, "memorilla_gqa_prefill_flash_bf16") != driver_mod.CUDA_SUCCESS) flash = null;
+        var lora: driver_mod.CUfunction = null;
+        if (ctx.driver.fns.cuModuleGetFunction(&lora, module, "memorilla_lora_up_add_f32") != driver_mod.CUDA_SUCCESS) lora = null;
+        self.memorilla_lora_up_add_f32 = lora;
+        self.memorilla_tiled_prefill_module = module;
+        self.memorilla_tiled_prefill_f32 = function;
+        self.memorilla_flash_prefill_bf16 = flash;
+        self.memorilla_tiled_prefill_unavailable = false;
+        std.log.info("memorilla_research_attention: tiled f32 prefill kernel loaded (bf16 flash {s})", .{if (flash != null) "available" else "missing"});
+        return function;
+    }
+
+    /// The BF16 tensor-core causal prefill kernel (research cubin), unless
+    /// `ANTFLY_MEMORILLA_RESEARCH_F32_ATTENTION=1` keeps the F32 tiled one.
+    fn memorillaFlashPrefill(self: *KernelModule, ctx: *context_mod.CudaContext) ?driver_mod.CUfunction {
+        if (self.memorillaTiledPrefill(ctx) == null) return null;
+        if (platform.env.getenvBool("ANTFLY_MEMORILLA_RESEARCH_F32_ATTENTION")) return null;
+        return self.memorilla_flash_prefill_bf16;
+    }
+
+    /// Full (non-causal) multi-head F32 self-attention for the Memorilla span
+    /// head, on the tiled prefill kernel: q/k/v/dst `[batch, seq, heads,
+    /// 128]`, scale 1/sqrt(128), no mask. The kernel is causal over absolute
+    /// positions; placing every query after the last key
+    /// (`query_position_offset = seq_len`, keys at 0) makes every key visible
+    /// to every query. SM 12.1 only (the prebuilt cubin).
+    /// Research cubin (SM 12.1): `out = base + scale * down @ up^T`, F32,
+    /// `base/out [rows, out_dim]`, `down [rows, rank]`, `up [out_dim, rank]`,
+    /// rank <= 64. False when the cubin or symbol is unavailable.
+    pub fn launchMemorillaLoraUpAddF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        out: buffer_mod.DeviceBuffer,
+        base: buffer_mod.DeviceBuffer,
+        down: buffer_mod.DeviceBuffer,
+        up: buffer_mod.DeviceBuffer,
+        scale: f32,
+        rows: usize,
+        out_dim: usize,
+        rank: usize,
+    ) driver_mod.Error!bool {
+        if (rank == 0 or rank > 64 or rows == 0 or out_dim == 0) return false;
+        _ = self.memorillaTiledPrefill(ctx) orelse return false;
+        const function = self.memorilla_lora_up_add_f32 orelse return false;
+        const count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(out, count);
+        try checkBytes(base, count);
+        try checkBytes(down, try checkedTensorElements(rows, rank));
+        try checkBytes(up, try checkedTensorElements(out_dim, rank));
+        var out_ptr = out.ptr;
+        var base_ptr = base.ptr;
+        var down_ptr = down.ptr;
+        var up_ptr = up.ptr;
+        var scale_value = scale;
+        var rows_u32 = try toU32(rows);
+        var out_u32 = try toU32(out_dim);
+        var rank_u32 = try toU32(rank);
+        var params = [_]?*anyopaque{
+            @ptrCast(&out_ptr),
+            @ptrCast(&base_ptr),
+            @ptrCast(&down_ptr),
+            @ptrCast(&up_ptr),
+            @ptrCast(&scale_value),
+            @ptrCast(&rows_u32),
+            @ptrCast(&out_u32),
+            @ptrCast(&rank_u32),
+        };
+        try launch3d(function, ctx, (rows + 7) / 8, (out_dim + 255) / 256, 1, 256, &params);
+        return true;
+    }
+
+    pub fn launchMemorillaFullAttentionF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+    ) driver_mod.Error!void {
+        const function = self.memorillaTiledPrefill(ctx) orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), try checkedTensorElements(num_heads, 128));
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        if (count == 0) return;
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_u32 = try toU32(seq_len);
+        var heads_u32 = try toU32(num_heads);
+        var query_offset_u32 = try toU32(seq_len);
+        var kv_offset_u32: u32 = 0;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_u32),
+            @ptrCast(&seq_u32),
+            @ptrCast(&heads_u32),
+            @ptrCast(&heads_u32),
+            @ptrCast(&query_offset_u32),
+            @ptrCast(&kv_offset_u32),
+        };
+        try launch3d(function, ctx, (seq_len + 31) / 32, num_heads, batch, 256, &params);
+    }
+
     pub fn launchGqaAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -10992,8 +11153,48 @@ pub const KernelModule = struct {
         // Generated decode consumes device-resident scalar parameters and is
         // intentionally reachable only from launchGqaAttentionDecodeScalarsF32.
         // This host-scalar entry point must keep its normal decode topology.
+        if (self.memorilla_research_fast_prefill and head_dim == 128 and q_seq_len > 1 and mask_len == 0 and bias_mode == 0 and
+            sliding_window == 0 and num_kv_heads != 0 and num_heads % num_kv_heads == 0)
+        {
+            if (self.memorillaFlashPrefill(ctx)) |function| {
+                var flash_params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&q_ptr),
+                    @ptrCast(&k_ptr),
+                    @ptrCast(&v_ptr),
+                    @ptrCast(&batch_u32),
+                    @ptrCast(&q_seq_len_u32),
+                    @ptrCast(&kv_seq_len_u32),
+                    @ptrCast(&num_heads_u32),
+                    @ptrCast(&num_kv_heads_u32),
+                    @ptrCast(&query_position_offset_u32),
+                    @ptrCast(&kv_position_offset_u32),
+                };
+                try launch3d(function, ctx, (q_seq_len + 63) / 64, num_heads, batch, 128, &flash_params);
+                self.noteGqaPrefillRouteActive(.prefill_tiled, batch, q_seq_len, num_heads, num_kv_heads, head_dim);
+                return .prefill_tiled;
+            }
+            if (self.memorillaTiledPrefill(ctx)) |function| {
+                var tiled_params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&q_ptr),
+                    @ptrCast(&k_ptr),
+                    @ptrCast(&v_ptr),
+                    @ptrCast(&batch_u32),
+                    @ptrCast(&q_seq_len_u32),
+                    @ptrCast(&kv_seq_len_u32),
+                    @ptrCast(&num_heads_u32),
+                    @ptrCast(&num_kv_heads_u32),
+                    @ptrCast(&query_position_offset_u32),
+                    @ptrCast(&kv_position_offset_u32),
+                };
+                try launch3d(function, ctx, (q_seq_len + 31) / 32, num_heads, batch, 256, &tiled_params);
+                self.noteGqaPrefillRouteActive(.prefill_tiled, batch, q_seq_len, num_heads, num_kv_heads, head_dim);
+                return .prefill_tiled;
+            }
+        }
         if (self.gqa_attention_prefill_fast_f32) |prefill_function| {
-            if ((self.gqa_prefill_profile != .automatic or self.qwen3vl_automatic_prefill) and
+            if ((self.gqa_prefill_profile != .automatic or self.qwen3vl_automatic_prefill or self.memorilla_research_fast_prefill) and
                 fastGqaPrefillEligible(self.gqa_prefill_profile, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
             {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;

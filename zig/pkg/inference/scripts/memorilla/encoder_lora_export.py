@@ -607,6 +607,8 @@ def export_reader(
     *,
     config: dict | None = None,
     include_encoder_lora: bool = False,
+    include_span_head: bool = False,
+    include_span_gate_routes: bool = False,
 ) -> dict:
     """``reader.safetensors`` -> non-release split-projection bundle whose
     execution contract declares per-token dual-layer encoder features and
@@ -616,9 +618,34 @@ def export_reader(
     ``include_encoder_lora`` also pins the candidate's ``encoder-lora.safetensors``
     so a server can apply the adapters at run time to the stock encoder instead
     of loading a second, merged encoder (the hybrid profile's one-encoder mode).
-    Its digest must equal ``candidate.json``'s ``encoder_lora_sha256``."""
+    Its digest must equal ``candidate.json``'s ``encoder_lora_sha256``.
+
+    ``include_span_head`` pins a span-window candidate's
+    ``span-head.safetensors`` (``qwen_span_copy.py``): the protocol must name
+    ``record_kind: span-window`` and ``candidate.json``'s
+    ``span_head_sha256`` must equal the file's digest.
+
+    ``include_span_gate_routes`` (with ``include_span_head``) also pins the
+    routed gate's ``span-gate-routes.safetensors`` (``qwen_span_copy.py
+    gate-routes``): the protocol must name ``span_gate_routes`` and
+    ``candidate.json``'s ``span_gate_routes_sha256`` must equal the file's
+    digest."""
     candidate_dir = Path(candidate_dir)
     candidate, protocol = load_candidate(candidate_dir)
+    if include_span_head:
+        if protocol.get("record_kind") != "span-window":
+            raise ValueError("span head export needs a span-window candidate")
+        if candidate.get("span_head_sha256") != digest(
+            candidate_dir / "span-head.safetensors"
+        ):
+            raise ValueError("candidate artifact changed: span-head.safetensors")
+    if include_span_gate_routes:
+        if not include_span_head or "span_gate_routes" not in protocol:
+            raise ValueError("gate routes export needs a span head and span_gate_routes")
+        if candidate.get("span_gate_routes_sha256") != digest(
+            candidate_dir / "span-gate-routes.safetensors"
+        ):
+            raise ValueError("candidate artifact changed: span-gate-routes.safetensors")
     config = dict(RELEASE_CONFIG if config is None else config)
     reader_path = candidate_dir / "reader.safetensors"
     weights = load_file(str(reader_path), device="cpu")
@@ -648,6 +675,8 @@ def export_reader(
             name: candidate_dir / name
             for name in BUNDLE_EXTRA_FILES
             + (("encoder-lora.safetensors",) if include_encoder_lora else ())
+            + (("span-head.safetensors",) if include_span_head else ())
+            + (("span-gate-routes.safetensors",) if include_span_gate_routes else ())
         },
     )
 
@@ -1187,6 +1216,16 @@ def main(argv=None):
         action="store_true",
         help="also pin encoder-lora.safetensors for run-time adapter application",
     )
+    reader.add_argument(
+        "--include-span-head",
+        action="store_true",
+        help="also pin a span-window candidate's span-head.safetensors",
+    )
+    reader.add_argument(
+        "--include-span-gate-routes",
+        action="store_true",
+        help="also pin the routed gate's span-gate-routes.safetensors (with --include-span-head)",
+    )
     dev = sub.add_parser("dev-cases")
     dev.add_argument("--data", type=Path, required=True)
     dev.add_argument("--output", type=Path, required=True)
@@ -1240,7 +1279,11 @@ def main(argv=None):
         )
     elif args.command == "export-reader":
         manifest = export_reader(
-            args.candidate, args.output, include_encoder_lora=args.include_encoder_lora
+            args.candidate,
+            args.output,
+            include_encoder_lora=args.include_encoder_lora,
+            include_span_head=args.include_span_head,
+            include_span_gate_routes=args.include_span_gate_routes,
         )
         _, _, loaded = load_bundle(args.output)
         if loaded != manifest:

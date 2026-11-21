@@ -6,6 +6,7 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 
 from ..models.inference_memorilla_generate_request_context_mode import InferenceMemorillaGenerateRequestContextMode
+from ..models.inference_memorilla_generate_request_read_mode import InferenceMemorillaGenerateRequestReadMode
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="InferenceMemorillaGenerateRequest")
@@ -63,7 +64,25 @@ class InferenceMemorillaGenerateRequest:
                 are split into sentence-greedy chunks of at most 128 tokens, one
                 soft-memory vector each, at most 64 vectors) and encodes the
                 per-token record batch with the run-time encoder LoRA (padded
-                batch rows of at most 1024 tokens).
+                batch rows of at most 1024 tokens). With a span read cascade the
+                texts are the ranked candidate list, best first: the soft half
+                pools every text and the span reads take leading texts.
+            read_mode (InferenceMemorillaGenerateRequestReadMode | Unset): hybrid_research profiles only (400 for other
+                kinds). Absent keeps
+                the bundle's default read (auto on a bundle with a span read
+                cascade; every text on a span bundle without one). auto, narrow
+                and wide need a bundle with a span read cascade (400 otherwise):
+                narrow reads the top two texts with a 32-token window; wide reads
+                texts in order while their encoder tokens stay within the
+                cascade's budget, with its wider window; auto reads narrow and
+                reads wide when the narrow margin is below the cascade threshold,
+                reusing the narrow pass's work. none needs a span bundle and skips
+                the span pass: the decoder reads the 16 soft rows alone under the
+                released helpful prompt, the closed-gate path, i.e. stock
+                Memorilla over the same pooled vectors (record_gate closed,
+                memory_tokens 16, no citations).
+            include_diagnostics (bool | Unset): hybrid_research profiles only (true is 400 for other kinds). Adds the
+                diagnostics object to the response; the answer and every other field are unchanged. Default: False.
     """
 
     model: str
@@ -75,6 +94,8 @@ class InferenceMemorillaGenerateRequest:
         InferenceMemorillaGenerateRequestContextMode.LATENT
     )
     document_texts: list[str] | Unset = UNSET
+    read_mode: InferenceMemorillaGenerateRequestReadMode | Unset = UNSET
+    include_diagnostics: bool | Unset = False
 
     def to_dict(self) -> dict[str, Any]:
         model = self.model
@@ -101,6 +122,12 @@ class InferenceMemorillaGenerateRequest:
         if not isinstance(self.document_texts, Unset):
             document_texts = self.document_texts
 
+        read_mode: str | Unset = UNSET
+        if not isinstance(self.read_mode, Unset):
+            read_mode = self.read_mode.value
+
+        include_diagnostics = self.include_diagnostics
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -118,6 +145,10 @@ class InferenceMemorillaGenerateRequest:
             field_dict["context_mode"] = context_mode
         if document_texts is not UNSET:
             field_dict["document_texts"] = document_texts
+        if read_mode is not UNSET:
+            field_dict["read_mode"] = read_mode
+        if include_diagnostics is not UNSET:
+            field_dict["include_diagnostics"] = include_diagnostics
 
         return field_dict
 
@@ -150,6 +181,15 @@ class InferenceMemorillaGenerateRequest:
 
         document_texts = cast(list[str], d.pop("document_texts", UNSET))
 
+        _read_mode = d.pop("read_mode", UNSET)
+        read_mode: InferenceMemorillaGenerateRequestReadMode | Unset
+        if isinstance(_read_mode, Unset):
+            read_mode = UNSET
+        else:
+            read_mode = InferenceMemorillaGenerateRequestReadMode(_read_mode)
+
+        include_diagnostics = d.pop("include_diagnostics", UNSET)
+
         inference_memorilla_generate_request = cls(
             model=model,
             question=question,
@@ -158,6 +198,8 @@ class InferenceMemorillaGenerateRequest:
             max_new_tokens=max_new_tokens,
             context_mode=context_mode,
             document_texts=document_texts,
+            read_mode=read_mode,
+            include_diagnostics=include_diagnostics,
         )
 
         return inference_memorilla_generate_request
