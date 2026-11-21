@@ -1854,7 +1854,7 @@ pub const DocStore = struct {
         };
     }
 
-    /// Explicitly upgrade an initialized non-Lite journal to the
+    /// Explicitly upgrade a non-Lite journal to the
     /// single-record credit encoding. Older binaries cannot write it.
     pub fn enableProtectedReplayCredit(self: *DocStore) !void {
         if (self.sharedReplayLane()) return error.Unsupported;
@@ -1862,7 +1862,20 @@ pub const DocStore = struct {
         errdefer batch.abort();
         const txn = batch.asTxn();
         switch (try replay_journal_format.state(txn)) {
-            .absent => return error.ReplayIndexUnavailable,
+            .absent => {
+                const next = encodeReplayNextSequence(1);
+                try txn.put(&internal_keys.replay_meta_init_key, "");
+                try txn.put(&internal_keys.replay_meta_next_sequence_key, &next);
+                try txn.put(&replay_journal_format.legacy_next_sequence_key, &next);
+                var heads: ReplayCreditLaneHeads = @splat(0);
+                for (0..replay_credit_lanes.len) |lane| {
+                    std.mem.writeInt(u64, replayCreditLaneFloor(&heads, lane), 1, .little);
+                }
+                try installProtectedReplayCredit(txn, &heads, .{}, 1);
+                try batch.commit();
+                self.markReplayIndexAvailable();
+                return;
+            },
             .legacy => try upgradeLegacyReplayJournal(txn, true),
             .current => if (try replay_journal_format.baseWroteSince(txn)) try upgradeLegacyReplayJournal(txn, true),
             .protected_credit => {
@@ -7998,6 +8011,22 @@ test "docstore reconciles rows a base binary retired after the upgrade" {
     var read = try store.beginReadTxn();
     defer read.abort();
     try std.testing.expect(!try replayCreditsNeedRepair(&read));
+}
+
+test "docstore enables protected credit before its first replay append" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+
+    try store.enableProtectedReplayCredit();
+    try store.appendReplayOpaque(alloc, 1, "fresh");
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(replay_journal_format.State.protected_credit, try replay_journal_format.state(&read));
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
+    try std.testing.expectError(error.NotFound, read.get(&internal_keys.journal_credit_totals_witness_key));
 }
 
 test "docstore reconciles missing, malformed, and undercounted ledgers with a matching lane witness" {
