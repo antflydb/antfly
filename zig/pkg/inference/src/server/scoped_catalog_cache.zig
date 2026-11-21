@@ -406,6 +406,7 @@ pub const Cache = struct {
             _ = try collector.add(logical);
             var mapped = try c_file.MmapRegion.init(artifacts.allocator, graph);
             defer mapped.deinit();
+            mapped.preserveFileCacheOnDeinit();
             const MemberReader = struct {
                 fn size(raw: *anyopaque, path: []const u8) !u64 {
                     const self: *MemberCollector = @ptrCast(@alignCast(raw));

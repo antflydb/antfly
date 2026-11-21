@@ -1141,13 +1141,17 @@ pub fn compatibilitySummaryForBackendWithOnnxCheck(allocator: std.mem.Allocator,
         const primary = path_index == 0;
         if (!primary and !std.mem.endsWith(u8, path, ".onnx")) continue;
         const logical_path = if (primary) man.onnx_logical_path else null;
+        const imported_onnx = backends.imported_onnx_session;
+        const import_context = imported_onnx.CompatibilityImportContext.forCatalog(path, logical_path);
         var duplicate = false;
-        for (onnx_paths[first_onnx_path..path_index]) |previous| {
-            if (previous) |existing| {
-                if (std.mem.eql(u8, existing, path)) {
-                    duplicate = true;
-                    break;
-                }
+        for (onnx_paths[first_onnx_path..path_index], first_onnx_path..) |previous, previous_index| {
+            const existing = previous orelse continue;
+            if (!std.mem.eql(u8, existing, path)) continue;
+            const previous_logical = if (previous_index == 0) man.onnx_logical_path else null;
+            const previous_context = imported_onnx.CompatibilityImportContext.forCatalog(existing, previous_logical);
+            if (import_context.eql(previous_context)) {
+                duplicate = true;
+                break;
             }
         }
         if (duplicate) continue;
@@ -1163,7 +1167,7 @@ pub fn compatibilitySummaryForBackendWithOnnxCheck(allocator: std.mem.Allocator,
 }
 
 pub fn inspectOnnxCompatibility(allocator: std.mem.Allocator, path: []const u8, logical_path: ?[]const u8, control: InferenceExecutionControl) !?CompatibilitySummary {
-    const base = if (logical_path) |logical| std.fs.path.dirname(logical) else null;
+    const base = backends.imported_onnx_session.CompatibilityImportContext.forCatalog(path, logical_path).external_base_dir;
     var artifacts = backends.imported_onnx_session.inspectArtifactSetWithControl(allocator, path, base, null, control) catch |err| {
         if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
         return .{
@@ -20442,6 +20446,55 @@ test "model selection bound GGUF sources preserve format independently of target
         defer a.free(alias);
         try exerciseBoundSourceLoaders(alias, alias, true);
     };
+}
+
+test "scoped model discovery validates a shared ONNX graph in distinct import contexts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "blobs");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const physical = try std.fs.path.join(a, &.{ root, "blobs", "model.onnx" });
+    defer a.free(physical);
+    const logical = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(logical);
+
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const input = try builder.parameter("input", shape);
+    const weight = try builder.parameter("weight", shape);
+    try graph.markOutput(try builder.add(input, weight));
+    const values = [_]f32{ 1, 2, 3, 4 };
+    var exported = try onnx_graph.exportGraphWithExternalData(a, &graph, .{
+        .parameter_initializers = &.{.{ .name = "weight", .shape = shape, .data = .{ .raw_bytes = std.mem.asBytes(&values) } }},
+    }, "weights.data");
+    defer exported.deinit(a);
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/model.onnx", .data = exported.model_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = exported.external_data.?.bytes });
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = a,
+        .model_type = .embedder,
+        .config_model_arch = try a.dupe(u8, "bert"),
+        .onnx_path = try a.dupe(u8, physical),
+        .onnx_logical_path = try a.dupe(u8, logical),
+    };
+    defer man.deinit();
+    const primary = (try compatibilitySummaryForBackend(a, root, &man, .native)).?;
+    try std.testing.expect(primary.level != .incompatible);
+
+    man.visual_model_path = try a.dupe(u8, physical);
+    const missing = (try compatibilitySummaryForBackend(a, root, &man, .native)).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, missing.level);
+    try std.testing.expectEqual(@as(@TypeOf(missing.code), .invalid_graph), missing.code);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/weights.data", .data = exported.external_data.?.bytes });
+    const complete = (try compatibilitySummaryForBackend(a, root, &man, .native)).?;
+    try std.testing.expectEqual(primary.level, complete.level);
 }
 
 test "model selection bound ONNX sources preserve external tensor context through every loader" {
