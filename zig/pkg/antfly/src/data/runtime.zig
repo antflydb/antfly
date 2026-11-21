@@ -17921,8 +17921,8 @@ pub const DataServer = struct {
             return error.TopologyChanged;
         const table = findTableById(snapshot.tables, contract.table_id) orelse return error.TopologyChanged;
         if (table.storage.engine != .local or !std.mem.eql(u8, table.name, table_name)) return error.TopologyChanged;
-        const start = transition.split_key orelse return error.TopologyChanged;
-        return owners.loadSplitDestinationDescriptor(alloc, group_id, contract, table.storage, .{ .start = start, .end = transition.source_range_end });
+        const split_key = transition.split_key orelse return error.TopologyChanged;
+        return owners.loadSplitDestinationDescriptor(alloc, group_id, contract, table.storage, .{ .start = split_key, .end = transition.source_range_end });
     }
 
     fn replicateSplitDestinationBatch(
