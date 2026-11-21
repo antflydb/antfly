@@ -309,6 +309,82 @@ absent. A page can be empty if its window contains only skipped manifests.
 When a backup's table details exceed the page size, its entry sets
 `table_details_omitted`. Use the backup ID to restore the entire backup.
 
+**Synchronize a complete standalone generation.** `antfly sync` implements
+one-way replacement by preparing a whole new file from a standalone Lite snapshot:
+
+```bash
+antfly sync --input uploaded.aflite --out next-generation.aflite \
+  --table docs --definition trusted.json
+```
+
+The caller owns `trusted.json`. For one table it contains `schema` and `indexes`
+objects. To synchronize several tables, supply a definition for each table:
+
+```json
+{"tables": {"docs": {"schema": {}, "indexes": {}}, "notes": {"schema": {}, "indexes": {}}}}
+```
+
+The empty objects above show only the structure; each schema and index definition
+must be complete. Use `--tables docs,notes` to select several tables, or omit both
+selectors to include every source table. Missing definitions, duplicate selections,
+and unsupported selected tables fail the entire operation. Up to 256 tables are
+supported, with document and expanded-byte limits shared across the selection.
+
+### Replacement and activation contract
+
+`sync` produces the **entire next data generation**, not a delta. The output
+contains exactly the selected source tables and their current documents and
+vectors. When the caller activates this whole file, documents and tables omitted
+from it disappear, and newly computed vectors are included even if document text
+is unchanged. It does not merge with other destination tables. A caller that owns
+only part of a larger instance must not replace that instance with this output.
+
+`--out` must be a new path. The input and any existing output are never
+overwritten. All selected tables must succeed before the output is published.
+The source is opened read-only through native storage readers; its server is
+never started. Use a stable `antfly lite snapshot` or an offline source, not a
+concurrent copy of a running file.
+
+The destination owner validates the prepared file, then switches its selected
+generation using its existing activation/recovery transaction. It preserves its
+instance identity, members, grants, and managed configuration outside this file.
+Failed staging leaves the active generation untouched. The caller owns activation,
+retry, rollback, and restart, including retaining the previous complete generation
+when an upload or activation fails. `sync` itself does not contact a server or
+replace an open database. This first version transfers and rebuilds a complete
+generation; incremental reconciliation can implement the same contract later.
+
+### Supported data and definitions
+
+Selected tables must be in `default.public`, and their authoritative schemas and
+indexes must match the caller's definitions. This restricted profile supports
+document records, the default full-text index, and external dense embedding
+indexes with `name`, `type`, `external: true`, `dimension`, and `distance_metric`.
+It copies existing finite vectors, including partial coverage, and rebuilds indexes
+without inference. It rejects replication sources and stored enrichment/resolver
+definitions. Other artifact kinds, relational rows, and catalog scopes are
+unsupported.
+
+Source system catalogs, credentials, jobs, identities, and authorization records
+are excluded. The output uses the selected table names and the caller's schema
+and index definitions. This is a restricted synchronization profile. Ordinary
+`restore` remains the backup-recovery operation, including definitions captured
+by the backup; restarting the same logical instance may resume its own accepted
+work. Synchronizing another instance's data does not authorize its pending jobs.
+
+Success emits a JSON report with `report_version: 1`, `operation: "sync"`,
+`mode: "replace"`, source/output SHA-256 hashes and sizes, selected table names,
+and document/vector counts. The report describes a staged generation, not an
+activation receipt. For one selected table, `output.table` is its name;
+`output.tables` always lists the complete selection.
+
+Defaults are 512 MiB of input, 1 GiB across the expanded portable streams and for
+the completed output, 250,000 documents total, and 16 MiB per document. Use
+`--max-input-bytes` and `--max-expanded-bytes` to change the byte limits. Allow
+space beside the output for portable scratch and the new database. A process
+interruption can leave temporary siblings with `.sync-` in their names; remove
+these only when no sync is using them.
+
 For an offline source inventory and compatibility report, use:
 
 ```bash

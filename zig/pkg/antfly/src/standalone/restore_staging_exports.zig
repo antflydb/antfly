@@ -79,3 +79,15 @@ pub fn inspect(context: *const bridge.InspectContext) callconv(.c) c_int {
 pub fn freeInspection(ptr: [*]u8, len: usize) callconv(.c) void {
     std.heap.c_allocator.free(ptr[0..len]);
 }
+
+pub fn syncData(context: *const bridge.DataSyncContext) callconv(.c) c_int {
+    context.result_ptr.* = null;
+    context.result_len.* = 0;
+    const json = @import("data_sync.zig").syncJsonAlloc(std.heap.c_allocator, context.input_ptr[0..context.input_len], context.output_ptr[0..context.output_len], context.table_ptr[0..context.table_len], context.definition_ptr[0..context.definition_len], .{ .max_input_bytes = context.max_input_bytes, .max_expanded_bytes = context.max_expanded_bytes }) catch |err| {
+        std.log.err("data sync failed: {s}", .{@errorName(err)});
+        return if (err == error.OutOfMemory) bridge.Status.out_of_memory else bridge.Status.failed;
+    };
+    context.result_ptr.* = json.ptr;
+    context.result_len.* = json.len;
+    return bridge.Status.ok;
+}

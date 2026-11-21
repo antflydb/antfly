@@ -274,6 +274,7 @@ fn printUsage(argv0: []const u8) void {
         \\  agents         Run AI agents (retrieval, query-builder)
         \\  backup         Back up tables; inspect local backup files
         \\  restore        Restore tables from backup, including Lite *.aflite input
+        \\  sync           Stage a complete one-way Lite replacement
         \\  storage        Manage table storage (migrate)
         \\  connections    Manage provider connections (login, list, models, logout)
         \\  auth           Manage data-plane users, roles, permissions, row filters, and API keys
