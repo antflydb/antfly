@@ -4381,7 +4381,7 @@ fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bo
             }
             if (part.sampled_video.reader) |reader| {
                 if (part.sampled_video.bytes.len != 0) return error.InvalidEmbeddingGroup;
-                _ = try @import("embedding_gemma2_video.zig").packetBytes(reader);
+                _ = try @import("embedding_gemma2_video.zig").sampledPacketBytes(reader, part.sampled_video.sampling, part.sampled_video.selection, .{});
             }
         }
         if (part == .pcm) {

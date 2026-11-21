@@ -118,6 +118,13 @@ pub const Source = struct {
         const a = RangeAllocator.forWorker(root.allocator, allocator);
         return .{ .allocator = a, .storage = self.storage, .identity = self.identity, .limits = self.limits, .control = control, .admission_pool = pool, .physical = self.physical orelse self };
     }
+    /// Check cancellation even when a consumer can serve from cached data.
+    pub fn checkControl(self: *const Source) !void {
+        const owner = self.physical orelse self;
+        const checks = ReadControl{ .source = owner.control, .worker = self.control };
+        try checks.control().check();
+    }
+
     pub fn length(self: *const Source) u64 {
         return switch (self.storage) {
             .borrowed => |b| b.len,
