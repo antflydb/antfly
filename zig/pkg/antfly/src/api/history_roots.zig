@@ -482,13 +482,14 @@ pub fn driveRoot(client: *MetadataClient, policy: anytype, a: A, state: control.
     const pending = item.pending_control.?;
     const driver_outcome = @import("../metadata/root_control_outcome.zig");
     const command = (try driver_outcome.validateRequest(a, state, namespace, pending.payload)).input.command;
+    const progress = command == .renew or command == .acknowledge;
     var result = if (pending.stage == .dispatching)
         try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request)
     else
         try enrollment.drive(client, policy, policy.source.controls, a, state.id, namespace, request);
-    if (command == .renew and pending.stage == .dispatching and result.status == .unproven)
-        result = try enrollment.resumeRenewal(client, policy, policy.source.controls, a, state.id, namespace, pending.sequence, request);
-    if ((command == .capture_bootstrap or command == .renew) and (result.status == .accepted or result.status == .superseded))
+    if (progress and pending.stage == .dispatching and result.status == .unproven)
+        result = try enrollment.resumeProgress(client, policy, policy.source.controls, a, state.id, namespace, pending.sequence, request);
+    if ((command == .capture_bootstrap or progress) and (result.status == .accepted or result.status == .superseded))
         result = try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request);
     switch (result.status) {
         .settled => {

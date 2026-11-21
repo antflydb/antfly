@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! Private bounded owner for ordered root controls. A confirmed begin CAS
-//! permits one submit. An unproven renewal can repeat its native expiration
+//! permits one submit. Unproven progress controls can repeat their native
 //! CAS. Accepted work uses its original receipt for read-only recovery.
 //! A known receipt is returned even when metadata persistence fails.
 const std = @import("std");
@@ -149,10 +149,10 @@ pub fn drive(svc: anytype, policy: anytype, port: operations.Port, a: A, id: con
         },
     }
 }
-/// Renewal is a native compare-and-set on the same grant, epoch, and
-/// previous expiration. It can be submitted again after an unproven read:
-/// racing submissions either advance to the same target or lose the CAS.
-pub fn resumeRenewal(svc: anytype, policy: anytype, port: operations.Port, a: A, id: control.Id, namespace: control.Namespace, sequence: u64, request: anytype) !Result {
+/// Acknowledgment and lease renewal are native compare-and-set operations
+/// on the same grant and epoch. Repeated submissions either advance to the
+/// same target or lose the CAS.
+pub fn resumeProgress(svc: anytype, policy: anytype, port: operations.Port, a: A, id: control.Id, namespace: control.Namespace, sequence: u64, request: anytype) !Result {
     var current = try load(svc, a, id, request);
     defer current.deinit();
     const state = current.value;
@@ -161,7 +161,10 @@ pub fn resumeRenewal(svc: anytype, policy: anytype, port: operations.Port, a: A,
     const pending = item.pending_control orelse return error.ChangefeedConflict;
     if (state.phase != .streaming or pending.sequence != sequence or pending.stage != .dispatching) return error.ChangefeedConflict;
     const validated = try outcome.validateRequest(a, state, namespace, pending.payload);
-    if (validated.input.command != .renew) return error.ChangefeedConflict;
+    switch (validated.input.command) {
+        .acknowledge, .renew => {},
+        else => return error.ChangefeedConflict,
+    }
     return perform(svc, policy, port, a, state, namespace, true, request);
 }
 

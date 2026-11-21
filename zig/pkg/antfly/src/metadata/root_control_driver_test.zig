@@ -78,11 +78,12 @@ const Root = struct {
                 .id = switch (input.command) {
                     .enroll => |enroll| enroll.consumer,
                     .renew => |renew| renew.reference.consumer,
+                    .acknowledge => |ack| ack.reference.consumer,
                     else => unreachable,
                 },
                 .epoch = 7,
                 .start = 3,
-                .acknowledged = 3,
+                .acknowledged = if (input.command == .acknowledge) input.command.acknowledge.next else 3,
                 .expires_at_seconds = if (input.command == .renew) input.command.renew.next else 1000,
                 .policy_revision = 1,
             } } },
@@ -189,10 +190,11 @@ pub fn run() !void {
         if (case == .superseded or case == .ambiguous or case == .lose_begin_ack) try std.testing.expect(state.value.roots[0].pending_control != null);
     }
 
-    try recoverRenewal(a);
+    try recoverProgress(a, .renew);
+    try recoverProgress(a, .acknowledge);
 }
 
-fn recoverRenewal(a: A) !void {
+fn recoverProgress(a: A, kind: enum { renew, acknowledge }) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root-renewal", .{tmp.sub_path});
@@ -208,22 +210,43 @@ fn recoverRenewal(a: A) !void {
     const route = prepared.value.roots[0].pending_control.?.payload.fence;
     try std.testing.expectEqual(.settled, (try driver.drive(&svc, &policy, root.port(), a, svc.id, testNamespace(), Request{})).status);
     try svc.mutate(a, .{ .seal = .{ .cut = @splat(9) } });
-    try svc.mutate(a, .{ .renew = .{ .now = 500, .expires_at = 1500 } });
+    switch (kind) {
+        .renew => try svc.mutate(a, .{ .renew = .{ .now = 500, .expires_at = 1500 } }),
+        .acknowledge => {
+            var sealed = try svc.load(a);
+            defer sealed.deinit();
+            var delivery: control.Delivery = .{
+                .sequence = 1,
+                .before = sealed.value.latest_cursor,
+                .cursor = @splat(0),
+                .authority = @splat(8),
+                .issued_at = 501,
+                .advances = &.{.{ .namespace = testNamespace(), .position = .{ .sequence = 10 } }},
+            };
+            delivery.cursor = delivery.identity(svc.id, sealed.value.epoch);
+            try svc.mutate(a, .{ .issue = delivery });
+            try svc.mutate(a, .{ .acknowledge = delivery.cursor });
+        },
+    }
     var current = try svc.load(a);
     defer current.deinit();
     const item = current.value.roots[0];
-    const input: operations.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .renew = .{
-        .reference = .{
-            .namespace = item.namespace,
-            .authority = current.value.authority,
-            .consumer = current.value.consumerId(),
-            .definition = current.value.definition.?.identity(),
-            .grant = item.grant_sequence,
-            .epoch = item.consumer_epoch,
+    const ref: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Reference = .{
+        .namespace = item.namespace,
+        .authority = current.value.authority,
+        .consumer = current.value.consumerId(),
+        .definition = current.value.definition.?.identity(),
+        .grant = item.grant_sequence,
+        .epoch = item.consumer_epoch,
+    };
+    const input: operations.wire.Request = .{
+        .version = 1,
+        .operation = .submit,
+        .command = switch (kind) {
+            .renew => .{ .renew = .{ .reference = ref, .previous = 1000, .next = 1500 } },
+            .acknowledge => .{ .acknowledge = .{ .reference = ref, .previous = 3, .next = 10 } },
         },
-        .previous = 1000,
-        .next = 1500,
-    } } };
+    };
     const bytes = try std.json.Stringify.valueAlloc(a, input, .{});
     defer a.free(bytes);
     try driver.prepare(&svc, &policy, a, svc.id, item.namespace, .{ .command = bytes, .fence = route, .table = "docs" }, Request{});
@@ -234,11 +257,14 @@ fn recoverRenewal(a: A) !void {
     var interrupted = try svc.load(a);
     defer interrupted.deinit();
     const sequence = interrupted.value.roots[0].pending_control.?.sequence;
-    const result = try driver.resumeRenewal(&svc, &policy, root.port(), a, svc.id, item.namespace, sequence, Request{});
+    const result = try driver.resumeProgress(&svc, &policy, root.port(), a, svc.id, item.namespace, sequence, Request{});
     try std.testing.expectEqual(.settled, result.status);
     try std.testing.expectEqual(@as(usize, 2), root.submits);
     var renewed = try svc.load(a);
     defer renewed.deinit();
     try std.testing.expect(!renewed.value.renewal_pending);
-    try std.testing.expectEqual(@as(u64, 1500), renewed.value.roots[0].renewed_through);
+    switch (kind) {
+        .renew => try std.testing.expectEqual(@as(u64, 1500), renewed.value.roots[0].renewed_through),
+        .acknowledge => try std.testing.expectEqual(@as(u64, 10), renewed.value.roots[0].reclaimed_through),
+    }
 }
