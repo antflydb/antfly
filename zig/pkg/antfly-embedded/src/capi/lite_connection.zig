@@ -5087,7 +5087,14 @@ pub const Connection = struct {
             if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
                 // Keep foreign unverified opens from publishing index leases
                 // between the detached proof and reacquiring the writer lease.
-                if (!try self.owner.retainMaintenanceTurnAssumeLocked()) return error.FileBusy;
+                if (!try self.owner.retainMaintenanceTurnAssumeLocked()) {
+                    // Another process holds the turn. Queue on it within the
+                    // busy budget rather than refusing at once: a peer that
+                    // renews its turn between this caller's retries would
+                    // otherwise starve the proof for the whole budget.
+                    if (!try self.waitProofMaintenanceTurn(lease, skip_lane_wait)) return error.FileBusy;
+                    root = try self.owner.refresh();
+                }
                 defer self.owner.releaseMaintenanceTurnAssumeLocked();
                 try self.owner.verifyAllocatorAssumeLocked(lease, self, skip_lane_wait);
                 if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked(skip_lane_wait);
@@ -5112,6 +5119,29 @@ pub const Connection = struct {
         self.current = root;
         self.attach(root);
         return root;
+    }
+
+    /// Retains the maintenance turn another process holds, waiting for it
+    /// until this call's busy deadline without the writer lease (the turn's
+    /// holder may need it to finish) and without the gate; reacquires both.
+    /// A lane checkout cannot wait here (see `refreshAfterMaintenanceTurn`):
+    /// it gets `error.MaintenanceTurnBusy` and retries with the turn held.
+    fn waitProofMaintenanceTurn(self: *Connection, lease: *?native.PathWriterLock, skip_lane_wait: bool) !bool {
+        if (lease.*) |*held| held.close();
+        lease.* = null;
+        if (skip_lane_wait) return error.MaintenanceTurnBusy;
+        const io = h.handleLockIo();
+        const unconditional = self.admission_deadline_ns == null and self.options.busy_timeout_ms == 0;
+        self.gate.mutex.unlock(io);
+        const retained = self.owner.waitRetainMaintenanceTurn(self.admissionDeadline(), unconditional) catch |err| {
+            self.gate.mutex.lockUncancelable(io);
+            return err;
+        };
+        self.gate.mutex.lockUncancelable(io);
+        if (!retained) return false;
+        errdefer self.owner.releaseMaintenanceTurnAssumeLocked();
+        lease.* = try self.acquirePathLeaseAssumeLocked(skip_lane_wait);
+        return true;
     }
 
     /// The replacement open needs the maintenance turn, and a maintenance

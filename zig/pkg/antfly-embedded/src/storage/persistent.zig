@@ -919,6 +919,8 @@ pub const PreparedMergeSegment = struct {
 const meta_committed_lsn = "committed_lsn";
 const meta_rebuild_cursor = "rebuild_snapshot_cursor";
 const meta_next_seg_id = "next_seg_id";
+/// Segment ids a native catalog index reserves at the tip per commit.
+const segment_id_reservation_block: u64 = 64;
 /// A rebuild's version allocator: its cut and next document number
 /// (`reserveRebuildVersions`). Cleared when the index is reset.
 const meta_rebuild_versions = "rebuild_versions";
@@ -1167,6 +1169,9 @@ pub const PersistentIndex = struct {
     /// Where each version of a loaded segment sits, for installing newly dead
     /// versions in memory (`installDeadVersions`).
     version_locations: VersionLocations = .{},
+    /// Segment ids this process reserved at the tip and has not used yet
+    /// (`reserveSegmentIdRange`); guarded by the writer mutex.
+    reserved_segment_ids: struct { next: u64 = 0, end: u64 = 0 } = .{},
 
     /// A private candidate publishes all segments produced by one source page
     /// together with its cursor. Until commit they are unreachable orphan files
@@ -4216,8 +4221,19 @@ pub const PersistentIndex = struct {
             self.writer.mu.unlock();
             return memory_next;
         }
+        // Ids already reserved at the tip by this process: no commit.
+        if (self.reserved_segment_ids.end - self.reserved_segment_ids.next >= count) {
+            const first = self.reserved_segment_ids.next;
+            self.reserved_segment_ids.next += count;
+            self.writer.mu.unlock();
+            return first;
+        }
         self.writer.mu.unlock();
-        var reservation: SegmentCounterFloor = .{ .floor = memory_next, .count = count };
+        // Reserve a block, so a process publishing many segments (merges,
+        // replay) pays one commit per block, not per segment. Unused ids
+        // are only gaps.
+        const block = @max(count, segment_id_reservation_block);
+        var reservation: SegmentCounterFloor = .{ .floor = memory_next, .count = block };
         defer reservation.deinit();
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
@@ -4227,7 +4243,8 @@ pub const PersistentIndex = struct {
         try txn.commit();
         self.writer.lockMutex();
         defer self.writer.mu.unlock();
-        self.writer.next_segment_id = @max(self.writer.next_segment_id, reservation.first + count);
+        self.writer.next_segment_id = @max(self.writer.next_segment_id, reservation.first + block);
+        self.reserved_segment_ids = .{ .next = reservation.first + count, .end = reservation.first + block };
         return reservation.first;
     }
 
@@ -4553,20 +4570,29 @@ pub const PersistentIndex = struct {
     pub const VersionLocations = struct {
         mutex: std.atomic.Mutex = .unlocked,
         map: std.AutoHashMapUnmanaged(u64, Location) = .empty,
-        indexed: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        /// Each indexed segment's versions, so a retired segment's entries
+        /// leave in time proportional to that segment.
+        indexed: std.AutoHashMapUnmanaged(u64, []u64) = .empty,
 
         const Location = struct { seg_id: u64, local_id: u32 };
 
         fn clear(self: *VersionLocations, alloc: Allocator) void {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
+            self.freeIndexed(alloc);
             self.map.clearAndFree(alloc);
             self.indexed.clearAndFree(alloc);
         }
 
         fn deinit(self: *VersionLocations, alloc: Allocator) void {
+            self.freeIndexed(alloc);
             self.map.deinit(alloc);
             self.indexed.deinit(alloc);
+        }
+
+        fn freeIndexed(self: *VersionLocations, alloc: Allocator) void {
+            var it = self.indexed.valueIterator();
+            while (it.next()) |versions| alloc.free(versions.*);
         }
     };
 
@@ -4609,35 +4635,27 @@ pub const PersistentIndex = struct {
 
     fn indexVersionLocationsLocked(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, present: *const std.AutoHashMapUnmanaged(u64, *const index_mod.SegmentEntry)) !void {
         const locations = &self.version_locations;
-        var retired = false;
+        var retired = std.ArrayListUnmanaged(u64).empty;
+        defer retired.deinit(self.alloc);
         var indexed_it = locations.indexed.keyIterator();
-        while (indexed_it.next()) |seg_id| if (!present.contains(seg_id.*)) {
-            retired = true;
-            break;
-        };
-        if (retired) {
-            var stale = std.ArrayListUnmanaged(u64).empty;
-            defer stale.deinit(self.alloc);
-            var map_it = locations.map.iterator();
-            while (map_it.next()) |entry| if (!present.contains(entry.value_ptr.seg_id)) try stale.append(self.alloc, entry.key_ptr.*);
-            for (stale.items) |version| _ = locations.map.remove(version);
-            stale.clearRetainingCapacity();
-            var seg_it = locations.indexed.keyIterator();
-            while (seg_it.next()) |seg_id| if (!present.contains(seg_id.*)) try stale.append(self.alloc, seg_id.*);
-            for (stale.items) |seg_id| _ = locations.indexed.remove(seg_id);
+        while (indexed_it.next()) |seg_id| if (!present.contains(seg_id.*)) try retired.append(self.alloc, seg_id.*);
+        for (retired.items) |seg_id| {
+            const versions = locations.indexed.fetchRemove(seg_id).?.value;
+            defer self.alloc.free(versions);
+            for (versions) |version| {
+                const location = locations.map.get(version) orelse continue;
+                if (location.seg_id == seg_id) _ = locations.map.remove(version);
+            }
         }
         for (snap.segments) |*segment| {
             if (locations.indexed.contains(segment.id)) continue;
-            const versions = (try segment.reader.docVersionsAlloc(self.alloc)) orelse {
-                try locations.indexed.put(self.alloc, segment.id, {});
-                continue;
-            };
-            defer self.alloc.free(versions);
+            const versions = (try segment.reader.docVersionsAlloc(self.alloc)) orelse try self.alloc.alloc(u64, 0);
+            errdefer self.alloc.free(versions);
             for (versions, 0..) |version, local| {
                 if (version == 0) continue;
                 try locations.map.put(self.alloc, version, .{ .seg_id = segment.id, .local_id = @intCast(local) });
             }
-            try locations.indexed.put(self.alloc, segment.id, {});
+            try locations.indexed.put(self.alloc, segment.id, versions);
         }
     }
 
@@ -6287,8 +6305,8 @@ test "persistent index doc map names each key's current version" {
 // A merge decides nothing per document: a write another process commits
 // after the merge read its inputs is kept (its old copy dead in the output,
 // through the dead set) instead of the merge being refused or resurrecting
-// the old version. Output ids are reserved above the other process's
-// counter, and the versions the merge dropped leave the dead set.
+// the old version. The other process's counter is never lowered, and the
+// versions the merge dropped leave the dead set.
 test "persistent index merge keeps another process's rewrite and prunes what it dropped" {
     const alloc = std.testing.allocator;
     var test_sink = InlinePublicationTestSink{ .allocator = alloc };
@@ -6346,10 +6364,10 @@ test "persistent index merge keeps another process's rewrite and prunes what it 
     });
     try std.testing.expect(try pi.replaceSegmentsIfActiveManyOwnedWithDeletes(ids.items, merged, null));
 
-    // The doc map is untouched; the merge's output id is above the counter.
+    // The doc map is untouched; the counter is not lowered.
     try std.testing.expectEqual(foreign, (try test_sink.docVersion("doc:a")).?);
     try std.testing.expectEqual(vb, (try test_sink.docVersion("doc:b")).?);
-    try std.testing.expect(try test_sink.segmentCounter() > 901);
+    try std.testing.expect(try test_sink.segmentCounter() >= 901);
     // doc:c's version left the dead set with the input that held it.
     try std.testing.expect(!try test_sink.isDead(vc));
     try std.testing.expect(try test_sink.isDead(va));
@@ -6358,7 +6376,8 @@ test "persistent index merge keeps another process's rewrite and prunes what it 
     const snap = pi.writer.acquireSnapshot();
     defer snap.release();
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
-    try std.testing.expect(snap.segments[0].id >= 901);
+    // A new id: from the block this process reserved at the tip, or above.
+    try std.testing.expect(std.mem.indexOfScalar(u64, ids.items, snap.segments[0].id) == null);
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
 }
 
