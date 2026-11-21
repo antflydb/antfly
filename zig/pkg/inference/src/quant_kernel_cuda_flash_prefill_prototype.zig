@@ -633,7 +633,7 @@ fn validateConfig(cfg: Config) !void {
         const q_len = cfg.q_len orelse return error.InvalidQueryLength;
         if (q_len < 2 or q_len > 8192) return error.InvalidQueryLength;
         const prefix = cfg.prefix orelse return error.AmbiguousPrefix;
-        if (prefix > 32768 - @as(u32, q_len)) return error.InvalidPrefix;
+        if (prefix > 131072 - @as(u32, q_len)) return error.InvalidPrefix;
     } else {
         if (cfg.q_len) |value| if (value != 512 and value != 3) return error.InvalidQueryLength;
         if (cfg.prefix) |value| {
@@ -1599,9 +1599,8 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx = try cuda_context.CudaContext.initDefault();
     defer ctx.deinit();
-    const sm89 = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9;
-    const gb10_e4b = ctx.info.compute_major == 12 and ctx.info.compute_minor == 1 and cfg.kv_heads == 2;
-    if (!sm89 and !gb10_e4b) return error.UnsupportedCudaArchitecture;
+    // CudaContext owns device/profile admission; module loading checks native
+    // image compatibility. Record the actual GPU rather than assuming SM89.
     var candidate_module = try Module.load(&ctx, candidate_image);
     defer candidate_module.deinit(&ctx);
     var baseline_module = try Module.load(&ctx, baseline_image);
@@ -1912,10 +1911,12 @@ test "E4B oracle addresses both KV heads and bounds query chunks" {
     large.q_len = 8192;
     large.prefix = 24576;
     try validateConfig(large);
+    large.prefix = 122880;
+    try validateConfig(large);
     large.q_len = 8193;
     try std.testing.expectError(error.InvalidQueryLength, validateConfig(large));
     var invalid = cfg;
-    invalid.prefix = 30721;
+    invalid.prefix = 129025;
     try std.testing.expectError(error.InvalidPrefix, validateConfig(invalid));
     invalid = cfg;
     invalid.baseline_route = .warp;

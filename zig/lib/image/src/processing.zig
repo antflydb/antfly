@@ -632,6 +632,38 @@ pub const BicubicAxis = struct {
     }
 };
 
+/// Retained coefficient planes and construction-only f64 storage for the
+/// shared Pillow/Torchvision coefficient builder.
+pub const PillowBicubicAxisPlan = struct {
+    source_size: usize,
+    target_size: usize,
+    taps: usize,
+    retained_bytes: usize,
+    temporary_bytes: usize,
+};
+
+/// Compatibility planning bound covering both publication precisions. Callers
+/// with a resolved precision use planPillowBicubicAxisForPrecision instead.
+pub fn planPillowBicubicAxis(source_size: usize, target_size: usize) !PillowBicubicAxisPlan {
+    return planPillowBicubicAxisForPrecision(source_size, target_size, true);
+}
+
+/// Exact cold allocation payload for the same geometry and temporary layout
+/// selected by buildPillowBicubicAxis. Pillow reuses one coefficient row;
+/// Torchvision needs the whole axis before choosing a publication precision.
+pub fn planPillowBicubicAxisForPrecision(source_size: usize, target_size: usize, torchvision: bool) !PillowBicubicAxisPlan {
+    const geometry = try PillowAxisGeometry.init(source_size, target_size, if (torchvision) .torchvision_bicubic else .pillow_bicubic);
+    const layout = try geometry.layout();
+    const indices = try std.math.add(usize, target_size, try std.math.add(usize, target_size, 1));
+    return .{
+        .source_size = source_size,
+        .target_size = target_size,
+        .taps = layout.count,
+        .retained_bytes = try std.math.add(usize, try std.math.mul(usize, indices, @sizeOf(usize)), try std.math.mul(usize, layout.count, @sizeOf(i32))),
+        .temporary_bytes = try std.math.mul(usize, if (torchvision) layout.count else layout.max_taps, @sizeOf(f64)),
+    };
+}
+
 /// Build Pillow-compatible antialiased bicubic coefficients. Downsampling
 /// widens the cubic support by the reduction factor and renormalizes the
 /// surviving in-bounds taps instead of clamping out-of-bounds samples.
@@ -1304,6 +1336,31 @@ test "Pillow horizontal unsafe coefficients retain wide scalar accumulation" {
     try pillowHorizontal(image, axis, &vector, 1, true);
     try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0 }, &scalar);
     try std.testing.expectEqualSlices(u8, &scalar, &vector);
+}
+
+test "Pillow bicubic cold geometry accounts exact retained and temporary coefficient payloads" {
+    inline for (.{ .{ 7, 13 }, .{ 100, 48 }, .{ 4096, 96 }, .{ 48, 48 } }) |shape| {
+        const conservative = try planPillowBicubicAxis(shape[0], shape[1]);
+        inline for (.{ false, true }) |torchvision| {
+            const plan = try planPillowBicubicAxisForPrecision(shape[0], shape[1], torchvision);
+            var axis = try buildPillowBicubicAxis(std.testing.allocator, shape[0], shape[1], torchvision);
+            defer axis.deinit();
+            try std.testing.expectEqual(plan.taps, axis.weights.len);
+            try std.testing.expectEqual(plan.retained_bytes, axis.starts.len * @sizeOf(usize) + axis.offsets.len * @sizeOf(usize) + axis.weights.len * @sizeOf(i32));
+            try std.testing.expectEqual(conservative.taps, plan.taps);
+            try std.testing.expect(plan.temporary_bytes <= conservative.temporary_bytes);
+            // The exact plan must fund the real builder, including alignment
+            // gaps; the builder's temporary is released before returning.
+            const storage = try std.testing.allocator.alloc(u8, plan.retained_bytes + plan.temporary_bytes + 4 * @alignOf(f64));
+            defer std.testing.allocator.free(storage);
+            var bounded = std.heap.FixedBufferAllocator.init(storage);
+            var admitted = try buildPillowBicubicAxis(bounded.allocator(), shape[0], shape[1], torchvision);
+            defer admitted.deinit();
+            try std.testing.expectEqualSlices(i32, axis.weights, admitted.weights);
+        }
+    }
+    try std.testing.expectError(error.InvalidImageDimensions, planPillowBicubicAxis(0, 1));
+    try std.testing.expectError(error.InvalidImageDimensions, planPillowBicubicAxis(1, 0));
 }
 
 test "model resampling matches pinned Pillow pixels including boundaries and reduction" {

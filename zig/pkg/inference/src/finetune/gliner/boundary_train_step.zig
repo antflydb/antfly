@@ -574,7 +574,7 @@ pub const Plan = struct {
         try active.check();
         try self.session.?.base().validateBackend(cb);
         const transfer_admission = try self.transferAdmission();
-        if (self.session.?.base().options.execution != .native and cb.vtable.glinerBoundaryDownload == null) return error.UnsupportedSeededTrainingBackend;
+        if (self.session.?.base().options.execution != .native and cb.vtable.regions.relative_boundary.download == null) return error.UnsupportedSeededTrainingBackend;
         var controlled = cb.*;
         controlled.execution_control = active;
         self.host_owner.resetFailure();

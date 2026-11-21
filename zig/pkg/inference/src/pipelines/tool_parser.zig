@@ -1550,46 +1550,12 @@ fn defaultGgufToolTokens(allocator: std.mem.Allocator, format: FunctionToolForma
 }
 
 fn findPrimaryGgufPath(allocator: std.mem.Allocator, model_dir: []const u8) ![]u8 {
-    if (std.mem.endsWith(u8, model_dir, ".gguf")) {
-        return try allocator.dupe(u8, model_dir);
-    }
-
-    if (!c_file.link_libc) {
-        var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, model_dir, .{ .iterate = true }) catch return error.MissingFunctionGemmaTokens;
-        defer dir.close(std.Options.debug_io);
-        var iter = dir.iterate();
-        while (iter.next(std.Options.debug_io) catch null) |entry| {
-            const name = entry.name;
-            if (name.len == 0 or name[0] == '.') continue;
-            if (!std.mem.endsWith(u8, name, ".gguf")) continue;
-            if (isGgufProjectorFileName(name)) continue;
-            return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, name });
-        }
-        return error.MissingFunctionGemmaTokens;
-    }
-
-    const model_dir_z = try allocator.dupeSentinel(u8, model_dir, 0);
-    defer allocator.free(model_dir_z);
-
-    const dir = c_file.c.opendir(model_dir_z.ptr);
-    if (dir == null) return error.MissingFunctionGemmaTokens;
-    defer _ = c_file.c.closedir(dir);
-
-    while (c_file.c.readdir(dir)) |entry| {
-        const name_z: [*:0]const u8 = @ptrCast(&entry.*.d_name);
-        const name = std.mem.span(name_z);
-        if (name.len == 0 or name[0] == '.') continue;
-        if (!std.mem.endsWith(u8, name, ".gguf")) continue;
-        if (isGgufProjectorFileName(name)) continue;
-        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, name });
-    }
-    return error.MissingFunctionGemmaTokens;
-}
-
-fn isGgufProjectorFileName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "mmproj.gguf") or
-        std.mem.startsWith(u8, name, "mmproj-") or
-        std.mem.startsWith(u8, name, "mmproj_");
+    if (std.mem.endsWith(u8, model_dir, ".gguf")) return allocator.dupe(u8, model_dir);
+    // Use the loader's deterministic decoder/projector selection. A separate
+    // directory scan can mistake a suffix-named projector for the decoder.
+    var manifest = try @import("../models/manifest.zig").loadListingFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    return allocator.dupe(u8, manifest.gguf_path orelse return error.MissingFunctionGemmaTokens);
 }
 
 fn findGgufMetadataEntry(parsed: *const gguf_format.File, key: []const u8) ?*const gguf_format.MetadataEntry {
@@ -1802,6 +1768,7 @@ test "loadParser detects tool token convention from GGUF tokenizer metadata" {
         .{ .string = "<|\"|>" },
     };
     const metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
         .{
             .key = "tokenizer.ggml.tokens",
             .value = .{ .array = .{
@@ -1816,6 +1783,14 @@ test "loadParser detects tool token convention from GGUF tokenizer metadata" {
     };
     var layout = try writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
+    const projector_metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+    };
+    var projector = try writer.buildLayout(allocator, &projector_metadata, &.{});
+    defer projector.deinit(allocator);
+    // Create the projector first and give it lexical precedence. Discovery
+    // must use the selected decoder, independent of filesystem iteration order.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "aaa-model-mmproj.gguf", .data = projector.header_bytes });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });

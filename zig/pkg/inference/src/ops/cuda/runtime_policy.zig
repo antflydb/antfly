@@ -17,7 +17,48 @@
 const std = @import("std");
 const env = @import("antfly_platform").env;
 
+/// Explicit physical policy for the shared dense encoder/decoder family.
+/// F32 and the original cross schedule remain the default. Reduced KV is
+/// accepted only with the complete typed split-KV consumer before publication.
+pub const Seq2seq = struct {
+    pub const Precision = enum { f32, f16 };
+    pub const CrossSchedule = enum { legacy, split_kv_128 };
+    pub const ProjectionSchedule = enum { legacy, rowpair_epilogue };
+    projection_schedule: ProjectionSchedule = .legacy,
+    residual_sum: bool = false,
+    im2col: bool = false,
+    projections: Precision = .f32,
+    cross_kv: Precision = .f32,
+    cross_schedule: CrossSchedule = .legacy,
+    encoder_attention: Precision = .f32,
+    vendor_attention: bool = true,
+
+    pub fn reduced() Seq2seq {
+        return .{ .im2col = true, .residual_sum = true, .projection_schedule = .rowpair_epilogue, .projections = .f16, .encoder_attention = .f16, .cross_kv = .f16, .cross_schedule = .split_kv_128 };
+    }
+    pub fn enabled(self: Seq2seq) bool {
+        return self.im2col or self.residual_sum or self.projections == .f16 or self.encoder_attention == .f16 or self.cross_schedule != .legacy;
+    }
+};
+
+/// Static partition of the existing split attention kernels. Both eager and
+/// assigned execution use this geometry; storage ownership stays with callers.
+pub const SplitAttention = struct {
+    chunk_size: usize,
+    chunk_count: usize,
+
+    pub fn select(capacity: usize, configured: usize, warp_f16: bool, windowed: bool) ?SplitAttention {
+        if (capacity == 0 or configured == 0) return null;
+        const minimum: usize = if (warp_f16) (if (windowed) 64 else 128) else configured;
+        const chunk_size = @max(@max(configured, minimum), std.math.divCeil(usize, capacity, 128) catch return null);
+        const chunk_count = std.math.divCeil(usize, capacity, chunk_size) catch return null;
+        if (chunk_count <= 1 or chunk_count > 128) return null;
+        return .{ .chunk_size = chunk_size, .chunk_count = chunk_count };
+    }
+};
+
 pub const Policy = struct {
+    seq2seq: Seq2seq = .{},
     temp_cache_mb: ?usize = null,
     max_temp_buffers: ?usize = null,
     stable_temp_reuse: bool = false,
@@ -30,10 +71,21 @@ pub const Policy = struct {
     split_attention_chunk: ?usize = null,
 
     pub fn resolve() Policy {
+        const seq2seq_f16 = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_F16", false);
         const workspace_mb = env.getenvUsize("ANTFLY_INFERENCE_CUDA_CUBLASLT_WORKSPACE_MB") orelse
             env.getenvUsize("ANTFLY_CUDA_CUBLASLT_WORKSPACE_MB") orelse
             env.getenvUsize("TERMITE_CUDA_CUBLASLT_WORKSPACE_MB") orelse 0;
         return .{
+            .seq2seq = .{
+                .im2col = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_IM2COL", seq2seq_f16),
+                .residual_sum = seq2seq_f16,
+                .projection_schedule = if (seq2seq_f16) .rowpair_epilogue else .legacy,
+                .projections = if (seq2seq_f16) .f16 else .f32,
+                .cross_kv = if (seq2seq_f16) .f16 else .f32,
+                .cross_schedule = if (seq2seq_f16) .split_kv_128 else .legacy,
+                .encoder_attention = if (seq2seq_f16) .f16 else .f32,
+                .vendor_attention = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_CUDNN", true),
+            },
             .temp_cache_mb = env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB"),
             .max_temp_buffers = env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MAX_BUFFERS"),
             .stable_temp_reuse = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE", false),
@@ -103,4 +155,29 @@ test "LightOnOCR3 CUDA resolved buffer policy retains zero limits overflow and t
         try std.testing.expectEqual(@as(usize, 9), bounded.bufferLimit(training));
         try std.testing.expectEqual(@as(usize, 0), (Policy{ .temp_cache_mb = std.math.maxInt(usize) }).cacheBytes(training));
     }
+}
+
+test "CUDA dense seq2seq precision is explicit and leaves unrelated runtime policy unchanged" {
+    const defaults = Policy{};
+    try std.testing.expect(!defaults.seq2seq.enabled());
+    const reduced = Seq2seq.reduced();
+    try std.testing.expect(reduced.projections == .f16 and reduced.encoder_attention == .f16);
+    try std.testing.expect(reduced.vendor_attention);
+    const independent = Seq2seq{ .encoder_attention = .f16, .vendor_attention = false };
+    try std.testing.expect(independent.projections == .f32 and independent.enabled());
+    try std.testing.expectEqual(@as(usize, 0), defaults.workspace_bytes);
+}
+
+test "split attention partition preserves short context decline and bounded long context scratch" {
+    try std.testing.expect(SplitAttention.select(128, 64, true, false) == null);
+    try std.testing.expect(SplitAttention.select(64, 64, true, true) == null);
+    try std.testing.expect(SplitAttention.select(512, 0, true, true) == null);
+    const local = SplitAttention.select(129, 64, true, true).?;
+    try std.testing.expectEqual(@as(usize, 64), local.chunk_size);
+    try std.testing.expectEqual(@as(usize, 3), local.chunk_count);
+    const global = SplitAttention.select(257, 64, true, false).?;
+    try std.testing.expectEqual(@as(usize, 128), global.chunk_size);
+    try std.testing.expectEqual(@as(usize, 3), global.chunk_count);
+    const long = SplitAttention.select(std.math.maxInt(usize), 32, false, false).?;
+    try std.testing.expectEqual(@as(usize, 128), long.chunk_count);
 }

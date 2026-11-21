@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const ops = @import("ops.zig");
-const tape = @import("metal_audio_execution.zig");
+const tape = @import("../execution/audio_schedule.zig");
 
 /// One immutable coefficient buffer plus indexed model slot identities. No
 /// request allocator, activation, lazy pin, or hash-map entry pointer survives.

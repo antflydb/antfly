@@ -210,5 +210,173 @@ class ArtifactIdentityTests(unittest.TestCase):
             self.snapshot()
 
 
+    def managed(self, *, scope="extractors", variant="safetensors@main", source_owner="org", source_name="model"):
+        scoped = self.root / "models" / scope / "org" / "physical--antfly-0123456789abcdef"
+        scoped.parent.mkdir(parents=True, exist_ok=True)
+        self.model.rename(scoped)
+        self.model = scoped
+        source = {"owner": source_owner, "name": source_name, "variant": variant,
+                  "requested_revision": "main", "resolved_revision": "d" * 40,
+                  "selected_format": "safetensors"}
+        artifacts = [{"path": path.name, "size": path.stat().st_size,
+                      "sha256": identity.sha256_file(path)["sha256"]}
+                     for path in sorted(self.model.iterdir())]
+        receipt = {"version": 2, "source": source, "artifacts": artifacts}
+        selector = identity._canonical_source(source)
+        self.inventory["data"][0]["model"] = selector
+        return receipt, selector, self.write_receipt(receipt, selector)
+
+    def write_receipt(self, receipt, selector):
+        path = self.model / identity.COMPLETE_RECEIPT
+        path.write_text(json.dumps(receipt))
+        return {selector: {"relative_path": str(self.model.relative_to(self.root / "models")),
+                           "publication_sha256": identity.sha256_file(path)["sha256"]}}
+
+    def managed_snapshot(self, mapping):
+        return identity.model_artifacts(self.config, "unused", self.root, model_roots=mapping)
+
+    def test_real_v2_source_resolves_public_selector_to_scoped_physical_root(self):
+        receipt, selector, mapping = self.managed(scope="generators", source_owner="Qwen", source_name="Qwen3-0.6B")
+        self.assertEqual(selector, "Qwen/Qwen3-0.6B:safetensors@" + "d" * 40)
+        first = self.managed_snapshot(mapping)
+        second = self.managed_snapshot(mapping)
+        identity.require_matching_artifacts({"model_artifacts": first}, {"model_artifacts": second})
+        publication = first["models"][0]["publication"]
+        self.assertEqual(publication["sha256"], mapping[selector]["publication_sha256"])
+        self.assertEqual(publication["source"], receipt["source"])
+        self.assertNotIn("physical--antfly", first["models"][0]["model"])
+        with self.assertRaises(q.EvidenceUnavailable):
+            self.snapshot()  # no public-selector-to-path guessing
+
+    def test_auto_requested_and_resolved_revision_follow_server_canonical_order(self):
+        for variant, expected in [("auto", "org/model"), ("@main", "org/model"), ("safetensors@feature/export", "org/model:safetensors"), ("gguf:Q4_K_M", "org/model:gguf:Q4_K_M")]:
+            source = {"owner": "org", "name": "model", "variant": variant, "resolved_revision": "e" * 40}
+            self.assertEqual(identity._canonical_source(source), expected + "@" + "e" * 40)
+        source["resolved_revision"] = "moving-ref"
+        self.assertEqual(identity._canonical_source(source), "org/model:gguf:Q4_K_M")
+
+    def test_legacy_unmanaged_scoped_runtime_name_and_ambiguity(self):
+        scoped = self.root / "models" / "extractors" / "org" / "model"
+        scoped.parent.mkdir(parents=True)
+        self.model.rename(scoped)
+        self.model = scoped
+        result = self.snapshot()
+        self.assertNotIn("publication", result["model_artifacts"]["models"][0])
+        duplicate = self.root / "models" / "readers" / "org" / "model"
+        duplicate.mkdir(parents=True)
+        (duplicate / "config.json").write_text("{}")
+        (duplicate / "model.safetensors").write_bytes(b"other")
+        with self.assertRaises(q.EvidenceUnavailable):
+            self.snapshot()
+
+    def test_version_one_receipt_preserves_physical_relative_runtime_identity(self):
+        artifacts = [{"path": path.name, "size": path.stat().st_size} for path in sorted(self.model.iterdir())]
+        (self.model / identity.COMPLETE_RECEIPT).write_text(json.dumps({"version": 1, "artifacts": artifacts}))
+        snapshot = self.snapshot()["model_artifacts"]
+        self.assertEqual(snapshot["models"][0]["model"], "org/model")
+        self.assertEqual(snapshot["models"][0]["publication"]["version"], 1)
+        self.assertNotIn(identity.COMPLETE_RECEIPT, {item["path"] for item in snapshot["models"][0]["files"]})
+
+    def test_mapping_cannot_override_receipt_source_generation_or_containment(self):
+        receipt, selector, mapping = self.managed()
+        for field, value in [("publication_sha256", "f" * 64), ("relative_path", "../outside")]:
+            changed = copy.deepcopy(mapping)
+            changed[selector][field] = value
+            with self.subTest(field=field), self.assertRaises(q.EvidenceUnavailable):
+                self.managed_snapshot(changed)
+        receipt["source"]["name"] = "same-shaped-foreign-model"
+        changed = self.write_receipt(receipt, selector)
+        with self.assertRaises(q.EvidenceUnavailable):
+            self.managed_snapshot(changed)
+
+    def test_incomplete_markers_unknown_versions_and_missing_source_fail_closed(self):
+        receipt, selector, mapping = self.managed()
+        for name in identity.BLOCKED_MARKERS:
+            marker = self.model / name
+            marker.write_text("{}")
+            with self.subTest(marker=name), self.assertRaises(q.EvidenceUnavailable):
+                self.managed_snapshot(mapping)
+            marker.unlink()
+        for version in (3, True):
+            receipt["version"] = version
+            with self.assertRaises(q.EvidenceUnavailable):
+                self.managed_snapshot(self.write_receipt(receipt, selector))
+        receipt["version"] = 2
+        receipt["source"] = None
+        with self.assertRaises(q.EvidenceUnavailable):
+            self.managed_snapshot(self.write_receipt(receipt, selector))
+
+    def test_receipt_paths_sizes_digests_duplicates_and_foreign_aliases_are_checked(self):
+        receipt, selector, _ = self.managed()
+        original = copy.deepcopy(receipt)
+        for field, value in [("path", "../foreign.safetensors"), ("size", 999), ("sha256", "a" * 64)]:
+            changed = copy.deepcopy(original)
+            changed["artifacts"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(q.EvidenceUnavailable):
+                self.managed_snapshot(self.write_receipt(changed, selector))
+        changed = copy.deepcopy(original)
+        changed["artifacts"].append(copy.deepcopy(changed["artifacts"][0]))
+        with self.assertRaises(q.EvidenceUnavailable):
+            self.managed_snapshot(self.write_receipt(changed, selector))
+        foreign = self.root / "foreign.safetensors"
+        foreign.write_bytes(b"external")
+        (self.model / "foreign.safetensors").symlink_to(foreign)
+        changed = copy.deepcopy(original)
+        changed["artifacts"].append({"path": "foreign.safetensors", "size": foreign.stat().st_size})
+        with self.assertRaises(q.EvidenceUnavailable):
+            self.managed_snapshot(self.write_receipt(changed, selector))
+
+    def test_same_physical_aliases_cannot_weaken_checked_digest(self):
+        receipt, selector, _ = self.managed()
+        source = self.model / "model.safetensors"
+        (self.model / "alias.safetensors").symlink_to("model.safetensors")
+        receipt["artifacts"].append({"path": "alias.safetensors", "size": source.stat().st_size})
+        self.managed_snapshot(self.write_receipt(receipt, selector))
+        receipt["artifacts"][-1]["sha256"] = "f" * 64
+        with self.assertRaises(q.EvidenceUnavailable):
+            self.managed_snapshot(self.write_receipt(receipt, selector))
+
+    def test_receipt_generation_and_marker_change_during_file_hashing_are_rejected(self):
+        receipt, selector, mapping = self.managed()
+        original_files = identity.model_files
+        def mutate(directory):
+            files = original_files(directory)
+            with (self.model / identity.COMPLETE_RECEIPT).open("a") as stream:
+                stream.write(" ")
+            return files
+        with patch.object(identity, "model_files", side_effect=mutate), self.assertRaises(q.EvidenceUnavailable):
+            self.managed_snapshot(mapping)
+        mapping = self.write_receipt(receipt, selector)
+        def mark(directory):
+            files = original_files(directory)
+            (self.model / identity.BLOCKED_MARKERS[0]).write_text("{}")
+            return files
+        with patch.object(identity, "model_files", side_effect=mark), self.assertRaises(q.EvidenceUnavailable):
+            self.managed_snapshot(mapping)
+
+    def test_identical_sibling_publication_cannot_borrow_controlled_root_identity(self):
+        receipt, selector, mapping = self.managed()
+        other = self.root / "models" / "readers" / "org" / "other-physical"
+        other.mkdir(parents=True)
+        for path in self.model.iterdir():
+            (other / path.name).write_bytes(path.read_bytes())
+        with self.assertRaises(q.EvidenceUnavailable):
+            self.managed_snapshot(mapping)
+
+    def test_direct_configured_model_root_mapping_uses_receipt_not_selector_path(self):
+        receipt, selector, mapping = self.managed()
+        config = {"inference": {"models_dir": str(self.model)}}
+        mapping[selector]["relative_path"] = "."
+        snapshot = identity.model_artifacts(config, "unused", self.root, model_roots=mapping)
+        self.assertEqual(snapshot["models"][0]["model"], selector)
+
+    def test_public_model_or_backend_change_with_same_instance_id_is_rejected(self):
+        for field, value in [("model", "foreign/model"), ("backend", "native"), ("state", "loading")]:
+            after = copy.deepcopy(self.inventory)
+            after["data"][0][field] = value
+            with self.subTest(field=field), patch.object(q, "http", side_effect=[(200, self.inventory, 0), (200, after, 0)]), self.assertRaises(q.EvidenceUnavailable):
+                self.snapshot()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,7 +27,17 @@ pub fn createCodegen(ctx: Context) CreateCodegenResult {
     const b = ctx.b;
     const quant_kernel_codegen_exe = b.addExecutable(.{
         .name = "antfly-quant-kernel-codegen",
-        .max_rss = 1024 * 1024 * 1024,
+        // Measured aarch64 compiler peaks: Linux 2,583,248,896 bytes and
+        // macOS 2,214,363,136 bytes. Reserve 10% headroom rounded up to
+        // 128 MiB. These declarations only bound compiler scheduling.
+        .max_rss = @as(usize, if (b.graph.host.result.cpu.arch == .aarch64)
+            switch (b.graph.host.result.os.tag) {
+                .linux => 2816,
+                .macos => 2432,
+                else => 2048,
+            }
+        else
+            2048) * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/quant_kernel_codegen_main.zig"),
             .target = b.graph.host,
@@ -35,6 +45,11 @@ pub fn createCodegen(ctx: Context) CreateCodegenResult {
             .link_libc = true,
         }),
     });
+    quant_kernel_codegen_exe.root_module.addImport("antfly_tile", b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/tile/src/mod.zig" })),
+        .target = b.graph.host,
+        .optimize = .safe,
+    }));
     const quant_kernel_codegen_check = ctx.addRunArtifact(quant_kernel_codegen_exe);
     quant_kernel_codegen_check.addPassthruArgs();
     const quant_kernel_codegen_test_check = ctx.addRunArtifact(quant_kernel_codegen_exe);
@@ -62,6 +77,7 @@ pub fn createMetalRuntimeTests(ctx: Context) CreateMetalRuntimeTestsResult {
         }),
         .filters = &.{"quant kernel metal runtime"},
     });
+    quant_kernel_metal_runtime_check_tests.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     const run_quant_kernel_metal_runtime_check_tests = ctx.addRunArtifact(quant_kernel_metal_runtime_check_tests);
     // The ReleaseFast source-validation test peaks at 103 MB on macOS arm64.
     run_quant_kernel_metal_runtime_check_tests.step.max_rss = 128 * 1024 * 1024;

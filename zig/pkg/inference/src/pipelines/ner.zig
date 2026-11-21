@@ -48,7 +48,7 @@ pub const NerConfig = struct {
 };
 
 pub const NerPipeline = struct {
-    batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
+    batch_dispatch: ?@import("../execution/tensor_dispatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     session: backends.Session,
     tok: Tokenizer,
@@ -169,8 +169,8 @@ pub const NerPipeline = struct {
         } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
 
         // Run inference
-        if (texts.len > 1 and !@import("../server/tensor_microbatch.zig").eligible(self.session, inputs)) return error.UnsupportedBatchShape;
-        var outputs = if (self.batch_dispatch) |dispatch| try dispatch.run(alloc, self.session, &run_permit, null, inputs, self.execution_control) else try run_permit.runWithControl(inputs, alloc, self.execution_control);
+        if (texts.len > 1 and !@import("../execution/tensor_dispatch.zig").eligible(self.session, inputs)) return error.UnsupportedBatchShape;
+        var outputs = try @import("../execution/tensor_dispatch.zig").run(alloc, self.session, &run_permit, null, inputs, self.execution_control, self.batch_dispatch);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);

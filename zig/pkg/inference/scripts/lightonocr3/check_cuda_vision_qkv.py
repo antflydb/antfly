@@ -113,7 +113,7 @@ def main():
                     # Retain scratch until the driver stream finishes before Python drops it.
                     gpu.call("cuCtxSynchronize")
                 gpu.launch(
-                    "lighton_vision_qkv_rope_bf16",
+                    "antfly_qkv_rope_two_axis_bf16",
                     ((rows * hidden // 2 + 255) // 256, 1),
                     256,
                     *map(pointer, actual),

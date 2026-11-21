@@ -190,7 +190,7 @@ test "gliner boundary socket pinned small concurrent admission rejection release
         // Loopback initialized the actual serving resource owner, without a
         // model, request lease, or fake usage. Capture it before concurrency.
         const domain = node.model_manager.resource_domain orelse return error.MissingResourceDomain;
-        const resource_admission = &domain.admission;
+        const resource_admission = domain.admission;
         try std.testing.expectEqual(memory.AdmissionAmounts{}, resource_admission.snapshot());
         try transport.start();
         const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/ai/v1/extract", .{transport.address.?.ip4.port});
