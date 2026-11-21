@@ -13702,6 +13702,27 @@ pub const NativeFile = struct {
 
     pub const IndexScopeDeletion = enum { empty, inline_delete, fold_first };
 
+    fn logicalMutationWireBytes(key_len: usize, inline_value_len: usize, external: bool) usize {
+        // Root, key length, key and flags, then either an inline length
+        // and value or a pair of u64s identifying the external value.
+        return key_len +| 4 +| (if (external) @as(usize, 16) else 4 +| inline_value_len);
+    }
+
+    pub fn indexScopeCompanionRedoBytes(self: *const NativeFile, documents: []const DocumentMutation, catalog: []const CatalogMutation) usize {
+        var bytes: usize = 0;
+        for (documents) |mutation| {
+            const external = !mutation.is_delete and
+                (mutation.external_value_root_page != 0 or !self.documentEntryFitsInline(mutation.key, mutation.value));
+            bytes +|= logicalMutationWireBytes(mutation.key.len, if (mutation.is_delete) 0 else mutation.value.len, external);
+        }
+        for (catalog) |mutation| {
+            const external = !mutation.is_delete and
+                (mutation.external_value_root_page != 0 or !self.catalogEntryFitsInline(mutation.key, mutation.value));
+            bytes +|= logicalMutationWireBytes(mutation.key.len, if (mutation.is_delete) 0 else mutation.value.len, external);
+        }
+        return bytes;
+    }
+
     /// A keys-only preflight with the same byte threshold used by private
     /// flushes. Caller holds writer admission and the store mutation mutex.
     pub fn planIndexScopeDeletion(self: *NativeFile, prefix: []const u8, other_bytes: usize) !IndexScopeDeletion {
@@ -13717,8 +13738,7 @@ pub const NativeFile = struct {
         };
         var bytes = other_bytes;
         while (true) {
-            // Logical delete framing: root, key length, flags, value length.
-            bytes +|= entry.key.len +| 8;
+            bytes +|= logicalMutationWireBytes(entry.key.len, 0, false);
             self.allocator.free(entry.key);
             if (bytes >= redo.large_txn_fallback_bytes) return .fold_first;
             entry = (try cursor.next()) orelse return .inline_delete;

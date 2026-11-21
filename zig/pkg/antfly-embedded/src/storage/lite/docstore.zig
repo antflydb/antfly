@@ -2918,6 +2918,7 @@ const MutationRequest = struct {
     artifact_lease: bool = false,
     scope_delete_prefix: ?[]const u8 = null,
     scope_delete_only: bool = false,
+    scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
     /// Never closes a group by becoming its leader, and never durable on
     /// its own: it joins whichever group a foreground (non-ride-along)
     /// member next forms, or `forceDrainDurable`'s forced group if none
@@ -5564,6 +5565,7 @@ pub const Store = struct {
         artifact_lease: bool = false,
         scope_delete_prefix: ?[]const u8 = null,
         scope_delete_only: bool = false,
+        scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
         /// Estimated size of this member's writes. Used only to bound group
         /// formation (`group_max_bytes`); never required to be exact. Also
         /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
@@ -5732,6 +5734,7 @@ pub const Store = struct {
             .artifact_lease = plan.artifact_lease,
             .scope_delete_prefix = plan.scope_delete_prefix,
             .scope_delete_only = plan.scope_delete_only,
+            .scope_delete_redo_bytes = plan.scope_delete_redo_bytes,
             .ride_along = ride_along,
             .estimated_bytes = plan.estimated_bytes,
         };
@@ -6738,7 +6741,8 @@ pub const Store = struct {
             std.debug.assert(head.next == null);
             // This is under the writer lease and store mutex, so an empty
             // scope cannot acquire postings between the probe and the delete.
-            switch (try self.file.planIndexScopeDeletion(prefix, head.estimated_bytes)) {
+            const other_bytes = if (head.scope_delete_redo_bytes) |measure| measure(head.context, &self.file) else 0;
+            switch (try self.file.planIndexScopeDeletion(prefix, other_bytes)) {
                 .empty => if (head.scope_delete_only) {
                     head.committed_sequence = self.file.committedSequence();
                     return;
@@ -7634,6 +7638,11 @@ pub const Txn = struct {
         // `Txn.putIndexCatalogBatch`.
         index_catalog_mutations: []const native.CatalogMutation = &.{},
         index_catalog_delete_prefix: ?[]const u8 = null,
+        fn scopeDeleteRedoBytes(ptr: *anyopaque, file: *const native.NativeFile) usize {
+            const context: *const @This() = @ptrCast(@alignCast(ptr));
+            return file.indexScopeCompanionRedoBytes(context.mutations, context.index_catalog_mutations);
+        }
+
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             try file.putDocumentBatch(context.mutations);
@@ -7752,6 +7761,17 @@ pub const Txn = struct {
             if (Store.test_commit_key_hook) |hook| hook(mutations[i].key, mutations[i].key.len + mutations[i].value.len);
             node = current.next();
         }
+        // Scope deletion wins over every staged mutation within the scope.
+        // Discard those edits before they can enter the private redo overlay.
+        if (self.index_catalog_delete_prefix) |prefix| {
+            var retained: usize = 0;
+            for (self.index_catalog_pending.items) |mutation| {
+                if (std.mem.startsWith(u8, mutation.key, prefix)) continue;
+                self.index_catalog_pending.items[retained] = mutation;
+                retained += 1;
+            }
+            self.index_catalog_pending.items.len = retained;
+        }
         for (self.index_catalog_pending.items) |m| {
             estimated_bytes += m.key.len + m.value.len;
             if (Store.test_commit_key_hook) |hook| hook(m.key, m.key.len + m.value.len);
@@ -7808,7 +7828,8 @@ pub const Txn = struct {
         const plan = Store.MutationPlan{
             .context = context,
             .apply = PrimaryCommitContext.apply,
-            .estimated_bytes = estimated_bytes +| if (self.index_catalog_delete_prefix != null) (mutations.len +| self.index_catalog_pending.items.len) *| 24 else 0,
+            .estimated_bytes = estimated_bytes,
+            .scope_delete_redo_bytes = if (self.index_catalog_delete_prefix != null) PrimaryCommitContext.scopeDeleteRedoBytes else null,
             .scope_delete_prefix = self.index_catalog_delete_prefix,
         };
         var ride_along_ticket: ?Store.Ticket = null;
@@ -8589,6 +8610,8 @@ pub const Txn = struct {
         }
     }
 
+    /// Removes the scope at commit, including catalog edits staged in
+    /// this transaction, regardless of their order.
     pub fn deleteIndexCatalogScope(self: *Txn, scope: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
         if (self.index_catalog_delete_prefix != null) return error.InvalidBatch;
@@ -10504,12 +10527,28 @@ test "lite native docstore deletes a small index scope without folding unrelated
         try txn.commit();
     }
     const folded = store.file.activeCheckpoint().redo_folded_through;
-    var sink: @import("native_catalog_sink.zig").Sink = .{ .store = &store, .allocator = allocator };
-    try @import("../native_catalog_backend.zig").deleteAllForScope(allocator, sink.sink(), "small");
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        const value: [32 * 1024]u8 = @splat('x');
+        try txn.put("catalog", &value);
+        try txn.putIndexCatalogBatch("small", &.{.{ .namespace = null, .key = "pending", .value = "discard" }});
+        try txn.deleteIndexCatalogScope("small");
+        try txn.putIndexCatalogBatch("neighbor", &.{.{ .namespace = null, .key = "pending", .value = "keep" }});
+        try txn.commit();
+    }
     try std.testing.expectEqual(folded, store.file.activeCheckpoint().redo_folded_through);
     const key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "small", null, "posting");
     defer allocator.free(key);
     try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(allocator, key)) == null);
+    const pending = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "small", null, "pending");
+    defer allocator.free(pending);
+    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(allocator, pending)) == null);
+    const neighbor = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "neighbor", null, "pending");
+    defer allocator.free(neighbor);
+    const kept = (try store.file.getIndexCatalogRecordAlloc(allocator, neighbor)).?;
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("keep", kept);
 }
 
 test "lite native docstore deletes a large index scope in one publication" {
