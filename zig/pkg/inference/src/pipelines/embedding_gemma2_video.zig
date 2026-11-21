@@ -76,9 +76,32 @@ fn validateInputSize(len: usize, sampling: Sampling) !void {
 pub const WebmInput = struct {
     reader: *const media.webm.Reader,
     index: *const video.webm_pictures.Index,
+    projection_binding: ?*WebmProjectionBinding = null,
     timeline: ?*const video.sampling.Timeline = null,
     continuation: ?*video.webm_pictures.Continuation = null,
     apple_continuation: ?*WebmDecoderContinuation = null,
+
+    fn boundIndex(self: WebmInput) video.webm_pictures.Index {
+        var index = self.index.*;
+        index.reader = self.reader;
+        return index;
+    }
+};
+/// One immutable reader serves every window in a chunk operation. Compute its
+/// projection identity on first cache use and keep failed attempts retryable.
+pub const WebmProjectionBinding = struct {
+    reader: *const media.webm.Reader,
+    gate: media.source.Gate = .{},
+    digest: ?[32]u8 = null,
+
+    fn get(self: *@This(), reader: *const media.webm.Reader, control: media.source.Control) ![32]u8 {
+        if (reader != self.reader) return error.InvalidVideoReaderSelection;
+        try self.gate.lock(control);
+        defer self.gate.unlock();
+        try control.check();
+        if (self.digest == null) self.digest = try readerBinding(reader, .reference, control);
+        return self.digest.?;
+    }
 };
 /// Mutable continuation identity, independent of source bytes and cache identity.
 pub fn sharesDecoder(left: ?*const ReaderSelection, left_webm: ?WebmInput, right: ?*const ReaderSelection, right_webm: ?WebmInput) bool {
@@ -133,6 +156,16 @@ pub const WebmDecoderContinuation = struct {
         };
     }
 };
+pub const ClipKey = struct {
+    address: usize,
+    len: usize,
+    gemma4_transport: bool,
+
+    pub fn init(bytes: []const u8, sampling: Sampling) ClipKey {
+        return .{ .address = @intFromPtr(bytes.ptr), .len = bytes.len, .gemma4_transport = sampling == .gemma4 and media.transport_stream.isTransportStream(bytes) };
+    }
+};
+
 pub const AdmittedVideos = struct {
     items: []const *const PixelInspection,
 
@@ -175,19 +208,34 @@ pub const InspectionScope = struct {
         try control.check();
         if (self.find(bytes, reader, configuration)) |entry| return entry.backendPlan(metal);
         if (self.count == self.entries.len) return error.ResourceLimitExceeded;
-        const entry = try Inspection.create(self.allocator, self.limit, bytes, reader, control, configuration);
+        const clip_key = encodedClipKey(bytes, reader, configuration);
+        const owner = if (clip_key) |key| blk: {
+            for (self.entries[0..self.count]) |item| {
+                const candidate = item.?;
+                if (candidate.clip_owner == null and candidate.clip_key != null and std.meta.eql(candidate.clip_key.?, key)) break :blk candidate;
+            }
+            break :blk null;
+        } else null;
+        const entry = try Inspection.createOwned(self.allocator, self.limit, bytes, reader, control, configuration, false, owner);
         self.entries[self.count] = entry;
         self.count += 1;
         return entry.backendPlan(metal);
     }
     pub fn deinit(self: *InspectionScope) void {
-        for (self.entries[0..self.count]) |entry| entry.?.deinit();
-        self.count = 0;
+        while (self.count != 0) {
+            self.count -= 1;
+            self.entries[self.count].?.deinit();
+        }
         if (self.permit) |*permit| permit.deinit();
         self.permit = null;
     }
 };
+fn encodedClipKey(bytes: []const u8, reader: ?*const media.mp4.Reader, configuration: Configuration) ?ClipKey {
+    if (reader != null or configuration.webm != null or configuration.selection != null) return null;
+    return ClipKey.init(bytes, configuration.sampling);
+}
 pub const Inspection = struct {
+    clip_key: ?ClipKey = null,
     backing: std.mem.Allocator,
     bounded: @import("../runtime/bounded_allocator.zig").BoundedAllocator,
     pool: media.admission.Pool,
@@ -251,13 +299,10 @@ pub const Inspection = struct {
         }
         return plan;
     }
-    fn create(backing: std.mem.Allocator, limit: usize, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, configuration: Configuration) !*Inspection {
-        return createOwned(backing, limit, bytes, borrowed, control, configuration, false, null);
-    }
     fn createOwned(backing: std.mem.Allocator, limit: usize, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, configuration: Configuration, retain_original: bool, clip_owner: ?*Inspection) !*Inspection {
         try control.check();
         const self = try backing.create(Inspection);
-        self.* = .{ .control = control, .backing = backing, .bounded = .{ .backing = backing, .limit = limit }, .pool = .{ .limits = .{ .host_bytes = limit } }, .bytes = bytes, .borrowed = borrowed, .configuration = .{ .sampling = configuration.sampling, .selection = configuration.selection, .webm = configuration.webm, .decoder = .{ .policy = configuration.decoder.policy } } };
+        self.* = .{ .clip_key = encodedClipKey(bytes, borrowed, configuration), .control = control, .backing = backing, .bounded = .{ .backing = backing, .limit = limit }, .pool = .{ .limits = .{ .host_bytes = limit } }, .bytes = bytes, .borrowed = borrowed, .configuration = .{ .sampling = configuration.sampling, .selection = configuration.selection, .webm = configuration.webm, .decoder = .{ .policy = configuration.decoder.policy } } };
         errdefer self.deinit();
         if (clip_owner) |owner| if (owner.bytes.ptr != bytes.ptr or owner.bytes.len != bytes.len or owner.clip_owner != null) return error.InvalidVideoIndex;
         self.clip_owner = clip_owner;
@@ -307,11 +352,11 @@ pub const Inspection = struct {
                 break :retry try parameterSession(a, &self.reader, false, null);
             };
             self.presentation = try PacketPresentation.init(a, self.reader.track, self.configurations);
-            self.selectPackets(a, configuration, retain_original) catch |err| {
+            self.selectPackets(a, configuration, self.clip_key != null) catch |err| {
                 if ((err != error.SharedAdmissionExceeded and !(err == error.OutOfMemory and self.bounded.denied)) or ts == null or ts.?.index.planningHeaders() == null) return err;
                 if (self.configurations) |registry| registry.releasePlanningHeaders();
                 ts.?.index.releaseHeaders();
-                try self.selectPackets(a, configuration, retain_original);
+                try self.selectPackets(a, configuration, self.clip_key != null);
             };
             if (ts) |transport| {
                 if (self.configurations) |registry| registry.releasePlanningHeaders();
@@ -852,8 +897,9 @@ fn projectionCache(reader: ?*const media.mp4.Reader, webm: ?WebmInput, selection
 /// Scope-local reuse is safe because reader metadata, provider configuration
 /// and backing bytes stay immutable until every worker/input drains. The next
 /// request validates again unless its provider carries a verified snapshot.
-fn clipBinding(bytes: []const u8, reader: ?*const media.mp4.Reader, webm: ?WebmInput, control: media.source.Control, pins: ?*const CachePins, scope_key: ?*[32]u8) ![32]u8 {
+fn clipBinding(bytes: []const u8, reader: ?*const media.mp4.Reader, webm: ?WebmInput, control: media.source.Control, pins: ?*CachePins, phase: enum { preflight, execution }) ![32]u8 {
     try control.check();
+    if (reader == null) if (webm) |input| if (input.projection_binding) |owner| return owner.get(input.reader, control);
     var scope = std.crypto.hash.sha2.Sha256.init(.{});
     scope.update("antfly-video-binding-scope-v1");
     if (reader) |r| {
@@ -868,10 +914,13 @@ fn clipBinding(bytes: []const u8, reader: ?*const media.mp4.Reader, webm: ?WebmI
         hashValue(&scope, bytes.len);
     }
     const key = scope.finalResult();
-    if (scope_key) |out| out.* = key;
     if (pins) |owner| if (owner.binding(key)) |binding| return binding;
-    if (reader) |r| return readerBinding(r, .reference, control);
-    if (webm) |input| return readerBinding(input.reader, .reference, control);
+    const digest = if (reader) |r| try readerBinding(r, .reference, control) else if (webm) |input| try readerBinding(input.reader, .reference, control) else try inlineBinding(bytes, control);
+    if (phase == .preflight) if (pins) |owner| owner.rememberBinding(key, digest);
+    return digest;
+}
+
+fn inlineBinding(bytes: []const u8, control: media.source.Control) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -1330,6 +1379,89 @@ test "embeddinggemma2 video sampling variants retain the clip index and match in
     }
 }
 
+test "embeddinggemma2 video direct inspections share encoded clips across sampling policies" {
+    const a = std.testing.allocator;
+    inline for (.{ "h264-paff-adaptive-packets-8-1.mp4", "vp9.webm", "codecs/av1.mp4", "closed.ts" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name);
+        var scope = InspectionScope{ .allocator = a };
+        defer scope.deinit();
+        const first = Configuration{ .sampling = .reference };
+        _ = try scope.inspect(bytes, null, .{}, first, false);
+        const owner = scope.find(bytes, null, first).?;
+        const reads = owner.source.reads;
+        for ([_]Sampling{ .{ .timestamps = .{ .max_frames = 2 } }, .gemma4 }) |sampling| {
+            const configuration = Configuration{ .inspection_scope = &scope, .sampling = sampling };
+            const actual = try selectedConfiguredPresentationUs(a, bytes, .{}, configuration);
+            defer a.free(actual);
+            const expected = try selectedPresentationUs(a, bytes, .{}, sampling, null);
+            defer a.free(expected);
+            try std.testing.expectEqualSlices(i64, expected, actual);
+            const entry = scope.find(bytes, null, configuration).?;
+            const separate_transport = sampling == .gemma4 and media.transport_stream.isTransportStream(bytes);
+            try std.testing.expectEqual(!separate_transport, owner == entry.clip());
+            try std.testing.expectEqual(reads, owner.source.reads);
+        }
+    }
+}
+
+test "embeddinggemma2 video reader timestamps and cache binding survive independent window scopes" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/vp9.webm");
+    var source = media.source.Source{ .allocator = a, .identity = "indexed", .storage = .{ .borrowed = bytes } };
+    var reader = try media.webm.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(.{}, null));
+    defer index.deinit();
+    var timeline = try index.presentationTimeline(a, .{});
+    defer timeline.deinit();
+    var binding = WebmProjectionBinding{ .reader = &reader };
+    const input = WebmInput{ .reader = &reader, .index = &index, .timeline = &timeline, .projection_binding = &binding };
+    const countChecks = struct {
+        calls: usize = 0,
+        stop: ?usize = null,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            if (self.stop == self.calls) return error.Cancelled;
+        }
+    };
+    var counter = countChecks{ .stop = 4 };
+    const control = media.source.Control{ .context = &counter, .check_fn = countChecks.check };
+    try std.testing.expectError(error.Cancelled, clipBinding(&.{}, null, input, control, null, .execution));
+    try std.testing.expect(binding.digest == null);
+    counter = .{};
+    const expected_key = try readerBinding(&reader, .reference, .{});
+    try std.testing.expectEqual(expected_key, try clipBinding(&.{}, null, input, control, null, .execution));
+    try std.testing.expect(counter.calls >= reader.packets.len);
+    counter.calls = 0;
+    var another_window = CachePins{ .cache = null };
+    defer another_window.deinit();
+    try std.testing.expectEqual(expected_key, try clipBinding(&.{}, null, input, control, &another_window, .execution));
+    try std.testing.expect(counter.calls < reader.packets.len);
+
+    for ([_]Sampling{ .reference, .gemma4, .{ .timestamps = .{ .max_frames = 2 } } }) |sampling| {
+        var scope = InspectionScope{ .allocator = a };
+        defer scope.deinit();
+        const scoped = try selectedConfiguredPresentationUs(a, &.{}, .{}, .{ .webm = input, .sampling = sampling, .inspection_scope = &scope });
+        defer a.free(scoped);
+        const direct = try selectedConfiguredPresentationUs(a, &.{}, .{}, .{ .webm = input, .sampling = sampling });
+        defer a.free(direct);
+        try std.testing.expectEqualSlices(i64, scoped, direct);
+    }
+    var pictures = [_]video.webm_pictures.Picture{
+        .{ .pts = -1_000_000, .duration = 1, .width = 16, .height = 16 },
+        .{ .pts = std.math.maxInt(i64), .duration = 1, .width = 16, .height = 16 },
+    };
+    const wide = video.webm_pictures.Index{ .allocator = a, .pictures = &pictures, .duration_seconds = 2 };
+    var wide_scope = InspectionScope{ .allocator = a };
+    defer wide_scope.deinit();
+    for ([_]?*InspectionScope{ null, &wide_scope }) |scope| {
+        const times = try selectedConfiguredPresentationUs(a, &.{}, .{}, .{ .webm = .{ .reader = &reader, .index = &wide }, .sampling = .reference, .inspection_scope = scope });
+        defer a.free(times);
+        try std.testing.expectEqualSlices(i64, &.{ 0, 9_223_372_036_855_775 }, times);
+    }
+}
+
 test "embeddinggemma2 video optional WebM projection cache leaves range budget for decoding" {
     const bytes = @embedFile("../testdata/video/vp9.webm");
     var inspected = PixelInspection{};
@@ -1382,9 +1514,7 @@ test "embeddinggemma2 video pixel admission keeps distinct AV1 clips out of each
     const original = WebmInput{ .reader = &adapted.webm_reader, .index = &adapted.webm_index.? };
     var pins = CachePins{ .cache = null };
     defer pins.deinit();
-    var key: [32]u8 = undefined;
-    const digest = try clipBinding(bytes, null, original, .{}, &pins, &key);
-    pins.rememberBinding(key, digest);
+    const digest = try clipBinding(bytes, null, original, .{}, &pins, .preflight);
     const changed = try a.dupe(u8, bytes);
     defer a.free(changed);
     changed[@intCast(adapted.webm_reader.packets[0].offset)] ^= 1;
@@ -1393,7 +1523,7 @@ test "embeddinggemma2 video pixel admission keeps distinct AV1 clips out of each
     var reader = adapted.webm_reader;
     reader.input = &source;
     const other = WebmInput{ .reader = &reader, .index = &adapted.webm_index.? };
-    try std.testing.expect(!std.mem.eql(u8, &digest, &try clipBinding(changed, null, other, .{}, &pins, null)));
+    try std.testing.expect(!std.mem.eql(u8, &digest, &try clipBinding(changed, null, other, .{}, &pins, .execution)));
 }
 
 test "embeddinggemma2 video pixel admission retains the execution packet reader" {
@@ -1642,9 +1772,7 @@ pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp
     var clip: [32]u8 = @splat(0);
     if (projected_cache and configuration.selection == null) {
         const adapter = control.imageWorkControl();
-        var scope_key: [32]u8 = undefined;
-        clip = try clipBinding(bytes, reader, configuration.webm, .{ .context = adapter.context, .check_fn = adapter.check_fn }, pins, &scope_key);
-        pins.?.rememberBinding(scope_key, clip);
+        clip = try clipBinding(bytes, reader, configuration.webm, .{ .context = adapter.context, .check_fn = adapter.check_fn }, pins, .preflight);
     }
     var selected: [32]usize = undefined;
     for (original.picture_indexes[0..original.pictures], selected[0..original.pictures]) |id, *out| out.* = @intCast(id);
@@ -1701,7 +1829,7 @@ fn validatedInputs(reader: ?*const media.mp4.Reader, configuration: Configuratio
 }
 fn inspectWebmPlan(a: std.mem.Allocator, input: WebmInput, sampling: Sampling, metal: bool, control: Control) !Plan {
     const adapter = control.imageWorkControl();
-    const selected = try selectWebm(a, input.index.*, sampling, .{ .context = adapter.context, .check_fn = adapter.check_fn }, input);
+    const selected = try selectWebm(a, input.boundIndex(), sampling, .{ .context = adapter.context, .check_fn = adapter.check_fn }, input);
     defer a.free(selected);
     return inspectSelectedWebmPlan(input.reader, input.index.*, metal, selected);
 }
@@ -1771,71 +1899,71 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
 /// Presentation time of each selected picture, in microseconds from the first
 /// picture. Slots match the slots delivered to a FrameObserver for this sampling.
 pub fn selectedConfiguredPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, configuration: Configuration) ![]i64 {
-    if (configuration.inspection_scope == null) return selectedPresentationUs(a, bytes, control, configuration.sampling, configuration.pool);
-    return inspectedPresentationUs(a, bytes, null, control, configuration);
+    if (configuration.inspection_scope != null) return inspectedPresentationUs(a, bytes, null, control, configuration);
+    try control.check();
+    const adapter = control.imageWorkControl();
+    const worker = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
+    const sampling = configuration.sampling;
+    if (configuration.webm) |input| {
+        const checks = media.source.ReadControl{ .source = input.reader.input.control, .worker = worker };
+        return selectedWebmPresentationUs(a, input.boundIndex(), sampling, checks.control(), input);
+    }
+    try validateInputSize(bytes.len, sampling);
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-timestamps", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .admission_pool = configuration.pool, .control = worker };
+    var opened = try ContainerInput.open(a, &source, bytes, sampling);
+    defer opened.deinit();
+    if (opened == .webm) {
+        var index = try video.webm_pictures.index(a, &opened.webm, webmDecodeOptions(worker, configuration.pool));
+        defer index.deinit();
+        return selectedWebmPresentationUs(a, index, sampling, worker, null);
+    }
+    const reader = &opened.packets.reader;
+    if (sampling == .gemma4 and configuration.selection == null) {
+        const plan = try video.packet_sampling.gemma4PortablePlan(a, reader, null);
+        return a.dupe(i64, plan.timestamps());
+    }
+    const selected = try selectReader(a, reader, sampling, worker, configuration.selection, null);
+    defer a.free(selected);
+    if (sampling == .gemma4) {
+        const plan = configuration.selection.?.gemma4_plan orelse return error.InvalidVideoReaderSelection;
+        return a.dupe(i64, plan.timestamps());
+    }
+    return relativePresentationUs(a, reader.packets, selected, reader.track.timescale, worker);
 }
 
 pub fn inspectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration) ![]i64 {
     const scope = configuration.inspection_scope orelse return error.InvalidVideoCacheReservation;
-    try control.check();
     _ = try scope.inspect(bytes, reader, control, configuration, false);
     const entry = scope.find(bytes, reader, configuration).?;
     if (entry.gemma4_plan) |*plan| return a.dupe(i64, plan.timestamps());
-    const selected = entry.selected.?;
-    const output = try a.alloc(i64, selected.len);
-    errdefer a.free(output);
-    var first: i64 = std.math.maxInt(i64);
-    if (entry.clip().webm) {
-        for (entry.clip().webm_index.?.pictures) |picture| {
-            try control.check();
-            first = @min(first, picture.pts);
-        }
-        for (selected, output) |id, *value| value.* = @divFloor(entry.clip().webm_index.?.pictures[id].pts - first, 1000);
-    } else {
-        for (entry.clip().reader.packets) |packet| {
-            try control.check();
-            first = @min(first, packet.pts);
-        }
-        for (selected, output) |id, *value| {
-            value.* = try video.packet_sampling.presentationUs(entry.clip().reader.packets[id].pts, first, entry.clip().reader.track.timescale);
-        }
-    }
-    return output;
+    const clip = entry.clip();
+    const adapter = control.imageWorkControl();
+    const worker = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
+    if (clip.webm_index) |index| return relativePresentationUs(a, index.pictures, entry.selected.?, std.time.ns_per_s, worker);
+    return relativePresentationUs(a, clip.reader.packets, entry.selected.?, clip.reader.track.timescale, worker);
 }
 
 pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) ![]i64 {
-    try validateInputSize(bytes.len, sampling);
-    const adapter = control.imageWorkControl();
-    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-timestamps", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
-    var opened = try ContainerInput.open(a, &source, bytes, sampling);
-    defer opened.deinit();
-    if (opened == .webm) {
-        const reader = &opened.webm;
-        var index = try video.webm_pictures.index(a, reader, webmDecodeOptions(source.control, pool));
-        defer index.deinit();
-        if (try webmGemma4Plan(index, sampling, source.control)) |plan| return a.dupe(i64, plan.timestamps());
-        const selected = try selectWebm(a, index, sampling, source.control, null);
-        defer a.free(selected);
-        var first: i64 = std.math.maxInt(i64);
-        for (index.pictures) |picture| first = @min(first, picture.pts);
-        const output = try a.alloc(i64, selected.len);
-        for (selected, output) |id, *value| value.* = @divFloor(index.pictures[id].pts - first, 1000);
-        return output;
-    }
-    const input = &opened.packets;
-    if (sampling == .gemma4) {
-        const plan = try video.packet_sampling.gemma4PortablePlan(a, &input.reader, null);
-        return a.dupe(i64, plan.timestamps());
-    }
-    const selected = try selectWithSampling(a, &input.reader, sampling);
+    return selectedConfiguredPresentationUs(a, bytes, control, .{ .sampling = sampling, .pool = pool });
+}
+
+fn selectedWebmPresentationUs(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, input: ?WebmInput) ![]i64 {
+    try control.check();
+    if (try webmGemma4Plan(index, sampling, control)) |plan| return a.dupe(i64, plan.timestamps());
+    const selected = try selectWebm(a, index, sampling, control, input);
     defer a.free(selected);
+    return relativePresentationUs(a, index.pictures, selected, std.time.ns_per_s, control);
+}
+
+fn relativePresentationUs(a: std.mem.Allocator, pictures: anytype, selected: []const usize, scale: u32, control: media.source.Control) ![]i64 {
     var first: i64 = std.math.maxInt(i64);
-    for (input.reader.packets) |packet| first = @min(first, packet.pts);
+    for (pictures, 0..) |picture, i| {
+        if (i % 256 == 0) try control.check();
+        first = @min(first, picture.pts);
+    }
     const output = try a.alloc(i64, selected.len);
     errdefer a.free(output);
-    for (selected, output) |id, *value| {
-        value.* = try video.packet_sampling.presentationUs(input.reader.packets[id].pts, first, input.reader.track.timescale);
-    }
+    for (selected, output) |id, *value| value.* = try video.packet_sampling.presentationUs(pictures[id].pts, first, scale);
     return output;
 }
 fn webmGemma4Plan(index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control) !?video.packet_sampling.Gemma4Plan {
@@ -1928,11 +2056,11 @@ pub const Prefetch = struct {
         self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .webm_input = webm_input, .control = control, .sampling = sampling, .pool = pool, .cache = cache, .cache_pins = if (cache != null) cache_pins else null, .inspection = inspection, .decoder = decoder, .coefficients = coefficients, .predecessor = predecessor };
         if (cache != null and selection == null) {
             const adapter = control.imageWorkControl();
-            self.clip_hash = try clipBinding(bytes, reader, webm_input, .{ .context = adapter.context, .check_fn = adapter.check_fn }, cache_pins, null);
+            self.clip_hash = try clipBinding(bytes, reader, webm_input, .{ .context = adapter.context, .check_fn = adapter.check_fn }, cache_pins, .execution);
         }
         var count: ?usize = if (inspection) |owner| owner.selected.?.len else if (selection) |bound| bound.selected.len else null;
         if (inspection == null) if (webm_input) |input| {
-            const selected = try selectWebm(a, input.index.*, sampling, .{ .context = self, .check_fn = check }, input);
+            const selected = try selectWebm(a, input.boundIndex(), sampling, .{ .context = self, .check_fn = check }, input);
             defer a.free(selected);
             count = selected.len;
         };
@@ -2617,7 +2745,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     };
     if (resident) |tensors| @memset(tensors, null);
     var clip_hash: [32]u8 = @splat(0);
-    if (cache != null and selection == null) clip_hash = try clipBinding(bytes, borrowed, webm_input, source.control, cache_pins, null);
+    if (cache != null and selection == null) clip_hash = try clipBinding(bytes, borrowed, webm_input, source.control, cache_pins, .execution);
     var capture = Capture{ .observer = observer, .observe_only = observe_only, .decoder = decoder, .reader_selection = selection, .cache = cache, .clip_hash = clip_hash, .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = presentation.signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
     defer capture.discardNativePending();
     var jobs: [8]ProjectionJob = undefined;
@@ -5309,15 +5437,13 @@ test "embeddinggemma2 video verified range binding avoids payload IO and unverif
     fake.changed = false;
     var pins = CachePins{ .cache = null };
     defer pins.deinit();
-    var key: [32]u8 = undefined;
-    const validated = try clipBinding(&.{}, &reader, null, .{}, &pins, &key);
-    pins.rememberBinding(key, validated);
+    const validated = try clipBinding(&.{}, &reader, null, .{}, &pins, .preflight);
     const reads = fake.reads;
-    try std.testing.expectEqual(validated, try clipBinding(&.{}, &reader, null, .{}, &pins, null));
+    try std.testing.expectEqual(validated, try clipBinding(&.{}, &reader, null, .{}, &pins, .execution));
     try std.testing.expectEqual(reads, fake.reads);
     pins.deinit();
     fake.changed = true;
-    try std.testing.expect(!std.mem.eql(u8, &validated, &try clipBinding(&.{}, &reader, null, .{}, &pins, null)));
+    try std.testing.expect(!std.mem.eql(u8, &validated, &try clipBinding(&.{}, &reader, null, .{}, &pins, .execution)));
     try std.testing.expect(fake.reads > reads);
 }
 
@@ -5456,7 +5582,7 @@ test "embeddinggemma2 video inspected cached range performs no additional packet
     try std.testing.expectEqual(@as(usize, 0), cpu.apple_surface_bytes);
     try std.testing.expectEqual(reads_after_index, fake.reads);
     try std.testing.expectEqual(@as(usize, 1), scope.count);
-    const clip = try clipBinding(&.{}, &reader, null, .{}, &pins, null);
+    const clip = try clipBinding(&.{}, &reader, null, .{}, &pins, .execution);
     const values: [512]f32 = @splat(0.25);
     for (first.picture_indexes[0..first.pictures]) |id| cache.storeCpu(.{ .clip = clip, .picture = @intCast(id) }, &values, 1);
     const reads = fake.reads;
@@ -5726,16 +5852,14 @@ test "embeddinggemma2 immutable packet binding memo is request local and revalid
     const control = media.source.Control{ .context = &count, .check_fn = Count.check };
     var pins = CachePins{ .cache = null };
     defer pins.deinit();
-    var key: [32]u8 = undefined;
-    const first = try clipBinding(&.{}, &reader, null, control, &pins, &key);
-    pins.rememberBinding(key, first);
+    const first = try clipBinding(&.{}, &reader, null, control, &pins, .preflight);
     const calls = count.calls;
-    try std.testing.expectEqual(first, try clipBinding(&.{}, &reader, null, control, &pins, null));
+    try std.testing.expectEqual(first, try clipBinding(&.{}, &reader, null, control, &pins, .execution));
     try std.testing.expectEqual(calls + 1, count.calls);
     // Mutation is permitted only after the borrowed request scope ends.
     pins.deinit();
     bytes[@intCast(reader.packets[0].offset)] ^= 1;
-    const changed = try clipBinding(&.{}, &reader, null, control, &pins, null);
+    const changed = try clipBinding(&.{}, &reader, null, control, &pins, .execution);
     try std.testing.expect(!std.mem.eql(u8, &first, &changed));
 }
 

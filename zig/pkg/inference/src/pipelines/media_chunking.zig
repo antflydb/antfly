@@ -83,8 +83,8 @@ pub const Request = struct {
     observe_only: bool = false,
     limits: Limits = .{},
     input: chunker.Input,
-    /// Borrow immutable provider context through completed execution/cancellation.
-    native_source: ?*const media.source.Source = null,
+    /// The physical source owns shared read quotas and provider synchronization through worker join.
+    native_source: ?*media.source.Source = null,
     native_transport_bytes: usize = 0,
     policy: planning.Policy = .{},
     source_id: ?[]const u8 = null,
@@ -746,13 +746,13 @@ pub const Runner = struct {
             if (self.stopped) break;
         }
     }
-    fn readSource(self: *Runner, supplied: *const media.source.Source) !void {
+    fn readSource(self: *Runner, supplied: *media.source.Source) !void {
         if (supplied.length() == 0) return error.EmptySource;
         if (supplied.limits.max_read_bytes == 0) return error.ResourceLimitExceeded;
         if (self.request.input != .binary) return error.InvalidChunkSource;
         const adapter = self.control.imageWorkControl();
         const controls = media.source.ReadControl{ .source = supplied.control, .worker = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
-        var source = media.source.Source{ .allocator = self.allocator, .storage = supplied.storage, .identity = supplied.identity, .limits = supplied.limits, .admission_pool = &self.pool, .control = controls.control() };
+        var source = supplied.view(self.allocator, &self.pool, controls.control());
         const mime = self.request.input.binary.mime_type;
         if (std.ascii.startsWithIgnoreCase(mime, "video/") and !self.request.audio_boundary) {
             source.identity = &self.summary.identity.source;
@@ -990,7 +990,8 @@ pub const Runner = struct {
         defer continuation.deinit();
         var apple_continuation = @import("embedding_gemma2_video.zig").WebmDecoderContinuation{ .allocator = self.allocator, .reader = reader };
         defer apple_continuation.deinit();
-        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, .{ .reader = reader, .index = &indexed, .timeline = &timeline, .continuation = &continuation, .apple_continuation = &apple_continuation });
+        var binding = @import("embedding_gemma2_video.zig").WebmProjectionBinding{ .reader = reader };
+        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, .{ .reader = reader, .index = &indexed, .timeline = &timeline, .projection_binding = &binding, .continuation = &continuation, .apple_continuation = &apple_continuation });
     }
     const VideoSource = struct { bytes: []const u8, reader: ?*const media.mp4.Reader, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput };
     const VideoSlot = struct {
@@ -1553,7 +1554,8 @@ test "model aware media multi-hour WAV ranges retain one window and resume witho
     const data_bytes = 2 * 60 * 60 * 48000 * 4;
     std.mem.writeInt(u32, provider.header[4..8], data_bytes + 36, .little);
     std.mem.writeInt(u32, provider.header[40..44], data_bytes, .little);
-    var source = media.source.Source{ .allocator = a, .identity = "immutable-two-hour-wav-v1", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = data_bytes + 44 } }, .limits = .{ .max_read_bytes = 64 * 1024, .max_retained_bytes = 128 * 1024, .max_total_bytes = 8 * 1024 * 1024 } };
+    const transport = media.source.Source{ .allocator = a, .identity = "immutable-two-hour-wav-v1", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = data_bytes + 44 } }, .limits = .{ .max_read_bytes = 64 * 1024, .max_retained_bytes = 128 * 1024, .max_total_bytes = 8 * 1024 * 1024 } };
+    var source = transport;
     var result = Qualification{};
     var runner = try Runner.init(a, .{ .input = .{ .binary = .{ .mime_type = "audio/wav", .data = &.{} } }, .native_source = &source, .source_version = "v1", .max_working_bytes = 8 * 1024 * 1024, .max_chunks = 1 }, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
     const first = try runner.run();
@@ -1562,6 +1564,8 @@ test "model aware media multi-hour WAV ranges retain one window and resume witho
     var cursor: [85]u8 = undefined;
     // Resume a distant acknowledged prefix without downloading its PCM again.
     const continuation = first.identity.cursor(100, &cursor);
+    // A new transport for this page has its own 8 MiB physical read budget.
+    source = transport;
     provider.bytes = 0;
     runner = try Runner.init(a, .{ .input = .{ .binary = .{ .mime_type = "audio/wav", .data = &.{} } }, .native_source = &source, .source_version = "v1", .max_working_bytes = 8 * 1024 * 1024, .max_chunks = 1, .continuation = continuation }, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
     try std.testing.expect(!(try runner.run()).complete);
@@ -2381,7 +2385,8 @@ test "model aware media pause boundary checkpoints avoid prefix reads across inf
     const data_bytes = 32 * 48000 * 4;
     std.mem.writeInt(u32, provider.header[4..8], data_bytes + 36, .little);
     std.mem.writeInt(u32, provider.header[40..44], data_bytes, .little);
-    var source = media.source.Source{ .allocator = a, .identity = "pause-checkpoint-wav", .storage = .{ .range = .{ .context = &provider, .read_at = Source.read, .length = data_bytes + 44, .immutable_binding = @splat(1) } }, .limits = .{ .max_read_bytes = 64 * 1024, .max_retained_bytes = 128 * 1024, .max_total_bytes = 8 * 1024 * 1024 } };
+    const transport = media.source.Source{ .allocator = a, .identity = "pause-checkpoint-wav", .storage = .{ .range = .{ .context = &provider, .read_at = Source.read, .length = data_bytes + 44, .immutable_binding = @splat(1) } }, .limits = .{ .max_read_bytes = 64 * 1024, .max_retained_bytes = 128 * 1024, .max_total_bytes = 8 * 1024 * 1024 } };
+    var source = transport;
     var executor = Qualification{};
     const request = Request{ .input = .{ .binary = .{ .mime_type = "audio/wav", .data = &.{} } }, .native_source = &source, .source_version = "v1", .policy = .{ .window_ns = std.time.ns_per_s, .audio_pause_ns = 50 * std.time.ns_per_ms }, .max_working_bytes = 8 * 1024 * 1024 };
     var reference = Capture{};
@@ -2416,6 +2421,8 @@ test "model aware media pause boundary checkpoints avoid prefix reads across inf
                 cache.deinit();
                 cache = .{}; // A new inference owner before every continuation.
             }
+            // Model the reopened range source on each independent request.
+            source = transport;
             runner = try Runner.init(a, resumed, executor.executor(), .{}, .{ .context = &paged, .accept = Capture.accept });
             _ = try runner.run();
         }
@@ -2940,6 +2947,34 @@ fn concurrentChunkRequests(requests: [4]Request, ordinal: u64) !void {
         try std.testing.expectEqual(@as(usize, 1), worker.output.seen);
         try std.testing.expectEqual(ordinal, worker.output.ordinals[0]);
     }
+}
+
+test "model aware media concurrent runners share the physical source and its read budget" {
+    const Provider = struct {
+        const bytes = @embedFile("../testdata/video/closed.mp4");
+        busy: std.atomic.Value(bool) = .init(false),
+        calls: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: media.source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.busy.swap(true, .acquire)) return error.ConcurrentProviderCall;
+            defer self.busy.store(false, .release);
+            self.calls += 1;
+            @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var provider = Provider{};
+    var source = media.source.Source{ .allocator = std.testing.allocator, .identity = "closed", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = Provider.bytes.len } } };
+    const request = Request{ .input = .{ .binary = .{ .mime_type = "video/mp4", .data = &.{} } }, .source_version = "v1", .native_source = &source, .max_chunks = 1 };
+    try concurrentChunkRequests(@splat(request), 0);
+    try std.testing.expect(provider.calls > 0);
+    try std.testing.expectEqual(provider.calls, source.reads);
+    try std.testing.expectEqual(0, source.retained_bytes);
+    source.limits.max_reads = source.reads;
+    var output = Qualification{};
+    var runner = try Runner.init(std.testing.allocator, request, output.executor(), .{}, .{ .context = &output, .accept = Qualification.accept });
+    try std.testing.expectError(error.ResourceLimitExceeded, runner.run());
+    try std.testing.expectEqual(provider.calls, source.reads);
 }
 
 test "model aware media concurrent inline continuations construct one admitted codec index" {

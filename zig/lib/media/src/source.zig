@@ -63,9 +63,10 @@ pub const Range = struct {
 };
 pub const Storage = union(enum) { borrowed: []const u8, range: Range };
 
-const Gate = struct {
+/// Serializes work on a shared source while allowing a waiting consumer to cancel.
+pub const Gate = struct {
     state: std.atomic.Value(u32) = .init(0),
-    fn lock(self: *Gate, control: ?Control) !void {
+    pub fn lock(self: *Gate, control: ?Control) !void {
         if (self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
         const io = std.Io.Threaded.global_single_threaded.io();
         // A canceled waiter can consume the unlock wake before it acquires
@@ -80,7 +81,7 @@ const Gate = struct {
         }
     }
 
-    fn unlock(self: *Gate) void {
+    pub fn unlock(self: *Gate) void {
         if (self.state.swap(0, .release) == 2)
             std.Io.futexWake(std.Io.Threaded.global_single_threaded.io(), u32, &self.state.raw, 1);
     }

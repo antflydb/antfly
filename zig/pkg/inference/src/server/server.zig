@@ -40453,15 +40453,7 @@ const GroupMediaInspections = struct {
             return .{ .address = @intFromPtr(bytes.ptr), .len = bytes.len, .sampling = sampling };
         }
     };
-    const ClipKey = struct {
-        address: usize,
-        len: usize,
-        gemma4_transport: bool,
-
-        fn init(bytes: []const u8, sampling: Sampling) ClipKey {
-            return .{ .address = @intFromPtr(bytes.ptr), .len = bytes.len, .gemma4_transport = sampling == .gemma4 and @import("antfly_media").transport_stream.isTransportStream(bytes) };
-        }
-    };
+    const ClipKey = @import("../pipelines/embedding_gemma2_video.zig").ClipKey;
     const SharedVideo = struct {
         clip_owner: ?*SharedVideo = null,
         references: usize = 1,
