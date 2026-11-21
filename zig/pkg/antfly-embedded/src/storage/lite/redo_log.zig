@@ -325,7 +325,7 @@ pub const Writer = struct {
             if (commit_sequence != last + 1) return error.SequenceOutOfOrder;
         }
         const record_len: u64 = header_len + payload.len;
-        if (record_len > self.remaining()) return error.LogFull;
+        if (record_len + header_len > self.remaining()) return error.LogFull;
 
         var header_buf: [header_len]u8 = undefined;
         const header = (RecordHeader{
@@ -363,15 +363,14 @@ pub const Writer = struct {
         // retryable torn-tail recovery this design promises for exactly
         // this case.
         //
-        // An all-zero header-sized end marker goes right after the record,
+        // A header-sized end trailer goes right after the record,
         // in the same write as the payload. A failed earlier append may
         // have left payload bytes past this record's end (recovery clears
         // only a torn header), and without the marker replay would read
         // them as the next header whenever this record is shorter.
         var end_marker: [header_len]u8 = undefined;
         (Trailer{ .sequence = commit_sequence, .salt = header.salt }).encode(&end_marker);
-        const marker_len: usize = if (record_len + header_len <= self.remaining()) header_len else 0;
-        try writePositionalPairAll(self.file, self.io, payload, end_marker[0..marker_len], offset + header_len);
+        try writePositionalPairAll(self.file, self.io, payload, &end_marker, offset + header_len);
         try self.file.writePositionalAll(self.io, &header_buf, offset);
 
         self.tail += record_len;
@@ -1514,7 +1513,12 @@ test "rollbackTo is a no-op when nothing was appended since the mark" {
 
 test "writer rejects a record that would overflow the region" {
     const io = testing.io;
-    const capacity: u64 = header_len + 4; // room for exactly one 4-byte payload.
+    const capacity: u64 = 2 * header_len + 4;
+    var short_region = try makeTempRegion(io, capacity - 1);
+    defer cleanupTempRegion(io, &short_region.file, short_region.path[0..short_region.path_len]);
+    var short_writer = Writer.init(short_region.file, io, 0, capacity - 1);
+    try testing.expectError(error.LogFull, short_writer.append(1, "abcd"));
+    try testing.expectEqual(@as(u64, 0), short_writer.tail);
     var region = try makeTempRegion(io, capacity);
     defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
 

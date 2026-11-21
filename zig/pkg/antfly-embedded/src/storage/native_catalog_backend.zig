@@ -107,6 +107,8 @@ pub const Sink = struct {
     /// allocated with the given allocator and freed by the caller
     /// immediately after use.
     loadAllAlloc: *const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry,
+    /// Like loadAllAlloc, with empty values allocated by the same allocator.
+    loadKeysAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
     /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
     /// fakes below): like `submit`, but for `durable = false` only, and
     /// never blocks waiting for the underlying group commit to apply --
@@ -163,7 +165,7 @@ pub const ScopeDeletes = struct {
     mutations: []Mutation,
 
     pub fn load(allocator: Allocator, sink: Sink, scope: []const u8) !ScopeDeletes {
-        const loaded = try sink.loadAllAlloc(sink.ptr, allocator, scope);
+        const loaded = try (sink.loadKeysAlloc orelse sink.loadAllAlloc)(sink.ptr, allocator, scope);
         errdefer freeLoaded(allocator, loaded);
         const mutations = try allocator.alloc(Mutation, loaded.len);
         for (loaded, 0..) |entry, i| {

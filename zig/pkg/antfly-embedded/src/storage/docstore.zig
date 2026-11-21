@@ -210,12 +210,7 @@ fn storeJournalCreditLedger(txn: anytype, ledger: internal_keys.JournalCreditLed
 /// revision's journal is charged when it is upgraded in place.
 fn scanReplayJournalLedger(txn: anytype) !internal_keys.JournalCreditLedger {
     var ledger: internal_keys.JournalCreditLedger = .{};
-    const kinds = [_]u8{internal_keys.replay_all_kind} ++ comptime blk: {
-        var ordinals: [replay_hints.len]u8 = undefined;
-        for (replay_hints, 0..) |hint, i| ordinals[i] = replayHintOrdinal(hint);
-        break :blk ordinals;
-    };
-    for (kinds) |kind| {
+    for (replay_credit_lanes) |kind| {
         var cursor = try txn.openCursor();
         defer cursor.close();
         const lower = internal_keys.replayRangeLower(kind, 0);
@@ -240,8 +235,47 @@ const replay_hint_ordinals = blk: {
     break :blk ordinals;
 };
 
+const replay_credit_lanes = [_]u8{internal_keys.replay_all_kind} ++ replay_hint_ordinals;
+// The first key in each lane is enough to detect base retirement, which
+// only removes prefixes. A base append is detected separately by its head.
+const ReplayCreditLaneHeads = [replay_credit_lanes.len * 8]u8;
+
+fn readReplayCreditLaneHeads(txn: anytype) !ReplayCreditLaneHeads {
+    var heads: ReplayCreditLaneHeads = @splat(0);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    cursor.setKeysOnly();
+    for (replay_credit_lanes, 0..) |kind, i| {
+        const lower = internal_keys.replayRangeLower(kind, 0);
+        const entry = (try cursor.seekAtOrAfter(&lower)) orelse continue;
+        const seq = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse continue;
+        std.mem.writeInt(u64, heads[i * 8 ..][0..8], seq + 1, .little);
+    }
+    return heads;
+}
+
+fn storedReplayCreditLaneHeads(txn: anytype) !?ReplayCreditLaneHeads {
+    const raw = txn.get(&internal_keys.journal_credit_lane_heads_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (raw.len != @sizeOf(ReplayCreditLaneHeads)) return error.CorruptReplayMetadata;
+    return raw[0..@sizeOf(ReplayCreditLaneHeads)].*;
+}
+
+fn replayCreditsNeedRepair(txn: anytype) !bool {
+    if (try replay_journal_format.baseWroteSince(txn)) return true;
+    const stored = try storedReplayCreditLaneHeads(txn) orelse return true;
+    const actual = try readReplayCreditLaneHeads(txn);
+    return !std.mem.eql(u8, &stored, &actual);
+}
+
 fn upgradeLegacyReplayJournal(txn: anytype, keep_base_layout: bool) !void {
     try replay_journal_format.upgrade(txn, try scanReplayJournalLedger(txn), &replay_hint_ordinals, keep_base_layout);
+    if (keep_base_layout) {
+        const heads = try readReplayCreditLaneHeads(txn);
+        try txn.put(&internal_keys.journal_credit_lane_heads_key, &heads);
+    }
 }
 
 /// Whether this store's appends keep the base revision's layout (every hint
@@ -367,6 +401,19 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
         var ledger = reserved_ledger.?;
         ledger = ledger.charged(charged_bytes, charged_records);
         try storeJournalCreditLedger(txn, ledger);
+        if (keep_base_layout) {
+            const stored = try storedReplayCreditLaneHeads(txn);
+            if (stored != null or !already_initialized) {
+                const previous_heads: ReplayCreditLaneHeads = stored orelse @splat(0);
+                var heads = previous_heads;
+                for (replay_credit_lanes, 0..) |kind, i| {
+                    if (i != 0 and (mask & (@as(u8, 1) << @intCast(kind))) == 0) continue;
+                    const slot = heads[i * 8 ..][0..8];
+                    if (std.mem.readInt(u64, slot, .little) == 0) std.mem.writeInt(u64, slot, sequence + 1, .little);
+                }
+                if (!std.mem.eql(u8, &heads, &previous_heads)) try txn.put(&internal_keys.journal_credit_lane_heads_key, &heads);
+            }
+        }
     }
 }
 // ============================================================================
@@ -1644,22 +1691,21 @@ pub const DocStore = struct {
             break :blk try replay_journal_format.state(&probe);
         };
         if (state == .absent or (state == .current and !keep_base_layout)) return;
+        if (state == .current) {
+            var read = try self.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer read.abort();
+            if (!try replayCreditsNeedRepair(&read)) return;
+        }
         var batch = self.beginWriteBatch() catch |err| switch (err) {
             error.ReadOnly => return,
             else => return err,
         };
         errdefer batch.abort();
-        // A base binary rolled back onto this store may have appended (its
-        // records are in every lane, but the ledger and index floor never
-        // saw them) or retired rows (the keys still agree, but the ledger
-        // still charges them). A scan of the lanes settles both.
-        if (state == .current and !try replay_journal_format.baseWroteSince(batch.asTxn())) {
-            const stored = try loadJournalCreditLedger(batch.asTxn());
-            const scanned = try scanReplayJournalLedger(batch.asTxn());
-            if (stored.bytes == scanned.bytes and stored.records == scanned.records) {
-                batch.abort();
-                return;
-            }
+        if (try replay_journal_format.state(batch.asTxn()) == .current and
+            (!keep_base_layout or !try replayCreditsNeedRepair(batch.asTxn())))
+        {
+            batch.abort();
+            return;
         }
         try upgradeLegacyReplayJournal(batch.asTxn(), keep_base_layout);
         batch.commit() catch |err| switch (err) {
@@ -3692,6 +3738,10 @@ pub const DocStore = struct {
         var ledger = try loadJournalCreditLedger(&batch);
         ledger = ledger.released(planned_bytes, @intCast(deletes.items.len));
         try storeJournalCreditLedger(&batch, ledger);
+        if (!self.sharedReplayLane()) {
+            const heads = try readReplayCreditLaneHeads(batch.asTxn());
+            try batch.put(&internal_keys.journal_credit_lane_heads_key, &heads);
+        }
 
         try batch.commit();
         committed = true;
@@ -6335,6 +6385,9 @@ test "WS5 DocStore journal credit ledger is charged on append and released on re
     const decoded_after_retire = internal_keys.JournalCreditLedger.decode(ledger_after_retire) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 0), decoded_after_retire.bytes);
     try std.testing.expectEqual(@as(u64, 0), decoded_after_retire.records);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
 }
 
 test "docstore relational bulk appends retain direct ingest and atomic dirty tokens" {
@@ -7651,6 +7704,9 @@ test "docstore reconciles rows a base binary retired after the upgrade" {
     const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 1), ledger.records);
     try std.testing.expectEqual(@as(u64, internal_keys.replay_key_len + "replay:1".len), ledger.bytes);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
 }
 
 // Appends keep the base layout where readers use hint lanes: every hint the

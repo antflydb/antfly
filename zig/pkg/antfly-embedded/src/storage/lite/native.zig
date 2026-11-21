@@ -3402,13 +3402,16 @@ pub const CatalogCursor = struct {
                 // phantom key, it must stay buffered rather than being
                 // freed as if the overlay had genuinely superseded it
                 // (same bug class as `MergedCursor.advance`'s own fix).
-                const entry = try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key);
+                const checkpoint = self.index.checkpoint;
+                const deleted = if (file.redo) |redo|
+                    redo.shared.resolveDeletion(file.runtimeIo(), @backingInt(self.overlay_root.?), key, file.readMark(checkpoint), checkpoint.redo_folded_through)
+                else
+                    null;
                 _ = try self.overlay.takeFront();
-                if (entry == null) {
+                if (deleted == null) {
                     self.pending_tree = candidate;
                     continue;
                 }
-                defer file.allocator.free(entry.?.value);
                 const tied = tree_key != null and std.mem.eql(u8, tree_key.?, key);
                 if (tied) {
                     var owned = candidate.?;
@@ -3416,7 +3419,7 @@ pub const CatalogCursor = struct {
                 } else {
                     self.pending_tree = candidate;
                 }
-                if (entry.?.is_delete) continue;
+                if (deleted.?) continue;
                 return .{ .key = try file.allocator.dupe(u8, key), .page_id = 0 };
             }
             const owned = candidate orelse break;
@@ -5028,14 +5031,14 @@ const RedoCommitState = struct {
 
     /// The exact byte length `appendRecord` would write right now for the
     /// currently staged `logical_pending`/`pending`, including the
-    /// redo-log's own record framing (`redo_log.header_len`) -- callers
+    /// redo-log's own header and end trailer -- callers
     /// check this against `self.writer.remaining()` *before* calling
     /// `appendRecord`, so a log that cannot fit this record is caught
     /// before anything is written, never surfacing as a failed, partial
     /// append (`error.LogFull`, which `publishCheckpoint` would otherwise
     /// report as the much less specific `error.OutcomeUnknown`).
     fn pendingRecordLen(self: *const RedoCommitState) u64 {
-        return redo_log.header_len + CompactCheckpoint.encoded_size + 4 + self.logical_pending.items.len + self.pending.items.len;
+        return 2 * redo_log.header_len + CompactCheckpoint.encoded_size + 4 + self.logical_pending.items.len + self.pending.items.len;
     }
 };
 
