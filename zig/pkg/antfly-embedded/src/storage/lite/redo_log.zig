@@ -416,6 +416,7 @@ pub const Writer = struct {
     /// Offset of the next write, relative to `base_offset`.
     tail: u64 = 0,
     last_sequence: ?u64 = null,
+    last_record_start: ?u64 = null,
     /// This run of the log's salt; learned on the first append (see
     /// `currentSalt`).
     salt: ?u64 = null,
@@ -526,6 +527,7 @@ pub const Writer = struct {
         try writePositionalPairAll(self.file, self.io, payload, &end_marker, offset + header_len);
         try self.file.writePositionalAll(self.io, &header_buf, offset);
 
+        self.last_record_start = self.tail;
         self.tail += record_len;
         self.last_sequence = commit_sequence;
     }
@@ -542,11 +544,11 @@ pub const Writer = struct {
     /// so a caller whose own durability barrier (`sync()`) fails afterward
     /// can undo them via `rollbackTo`. See that function's own doc comment
     /// for why this matters.
-    pub const Mark = struct { tail: u64, last_sequence: ?u64 };
+    pub const Mark = struct { tail: u64, last_sequence: ?u64, last_record_start: ?u64 = null };
 
     /// Captures the writer's current position.
     pub fn mark(self: *const Writer) Mark {
-        return .{ .tail = self.tail, .last_sequence = self.last_sequence };
+        return .{ .tail = self.tail, .last_sequence = self.last_sequence, .last_record_start = self.last_record_start };
     }
 
     /// Undoes every `append` made since `m` was captured: zeroes the
@@ -608,6 +610,7 @@ pub const Writer = struct {
         };
         self.tail = m.tail;
         self.last_sequence = m.last_sequence;
+        self.last_record_start = m.last_record_start;
     }
 };
 

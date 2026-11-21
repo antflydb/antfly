@@ -4707,6 +4707,7 @@ const PendingLogReset = struct { old_tail: u64, fold_sequence: u64 };
 
 const RedoCommitState = struct {
     frontier_cache: ?redo_log.FrontierSlots.Published = null,
+    sidecar_epoch: ?u64 = null,
     writer: redo_log.Writer,
     /// This transaction's accumulated logical mutations, encoded via
     /// `redo_overlay.SharedRedoOverlay.decodeLogicalMutationsPayload`'s own
@@ -8174,7 +8175,9 @@ pub const NativeFile = struct {
         const redo = &self.redo.?;
         // Lifetime writer authority excludes another process. The inode
         // publication guards against reuse after another local handle commits.
-        const cached = if (!retry and self.writer_lock_file != null) cached: {
+        const cached = if (!retry and (self.writer_lock_file != null or
+            (redo.sidecar_epoch != null and redo.sidecar_epoch.? == own_sidecar_locks.epoch.load(.acquire))))
+        cached: {
             const publication = redo.frontier_cache orelse break :cached null;
             const entry = self.inode_lock_ref.load(.acquire) orelse break :cached null;
             if (inode_lock.committedSequence(entry) > publication.frontier.sequence) break :cached null;
@@ -8977,7 +8980,8 @@ pub const NativeFile = struct {
             return err;
         };
         if (self.redo == null) return error.InvalidTransactionState;
-        // The fold erases the log up to the writer's tail: settle it first.
+        // Select a recyclable extent only after refreshing writer authority.
+        try self.refreshIfWriterBaseStale(true);
         try self.resyncRedoTailUnderAuthority();
         const redo: *RedoCommitState = &self.redo.?;
         const io = self.runtimeIo();
@@ -9489,6 +9493,7 @@ pub const NativeFile = struct {
             return;
         }
         if (self.header.segmented_redo) {
+            redo.durable_sequence = @max(redo.durable_sequence, new_checkpoint_sequence);
             const selected = self.header.redoOffset();
             const rotated = selected != previous_offset;
             const tail = if (rotated) 0 else old_tail;
@@ -10544,8 +10549,13 @@ pub const NativeFile = struct {
         // allocator-only slot can cover a sequence that consumed no WAL
         // record, so compare against the durable slot, not the fold floor.
         const selected = (try self.eligibleRedoSegmentRotation(next.commit_sequence)) orelse return;
-        const durable = loadCheckpointSlot(self.file, self.runtimeIo(), self.header.page_size, try self.file.length(self.runtimeIo()), self.header.active_checkpoint);
-        if (durable.commit_sequence != next.commit_sequence or durable.redo_rotation == null or
+        var disk = self.header;
+        const io = self.runtimeIo();
+        const size = try self.file.length(io);
+        disk.checkpoints = loadCheckpointSlots(self.file, io, disk.page_size, size);
+        const winner = try recoverActiveCheckpoint(self.file, io, disk, size, false);
+        const durable = disk.checkpoints[winner.index];
+        if (durable.commit_sequence != next.commit_sequence or
             !std.meta.eql(durable.redo_rotation, next.redo_rotation)) return;
         const previous = self.header;
         redo.checkpointing = true;
@@ -10555,7 +10565,6 @@ pub const NativeFile = struct {
         try self.resetRedoSegment(&next, previous, selected);
         try self.syncIfRequired(null);
         try self.publishCheckpoint(next, false, null);
-        const io = self.runtimeIo();
         redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), self.header.redo_log_capacity, 0, next.commit_sequence);
         redo.checkpoint_sequence = next.commit_sequence;
         redo.durable_sequence = next.commit_sequence;
@@ -10670,15 +10679,20 @@ pub const NativeFile = struct {
             var probe_header = disk_header;
             probe_header.checkpoints = slots;
             const recovered = try recoverActiveCheckpoint(self.file, io, probe_header, file_size, false);
-            if (slots[recovered.index].redo_folded_through > redo.checkpoint_sequence) {
-                try self.adoptOnDiskCheckpoint(io);
-                redo.checkpoint_sequence = self.activeCheckpoint().redo_folded_through;
+            probe_header.active_checkpoint = recovered.index;
+            const slot = slots[recovered.index];
+            if (slot.redo_folded_through > redo.checkpoint_sequence or
+                slot.commit_sequence > self.activeCheckpoint().commit_sequence or
+                probe_header.redoOffset() != self.header.redoOffset())
+            {
+                try self.adoptIndexPublicationHeader(probe_header);
+                redo.checkpoint_sequence = slot.redo_folded_through;
             }
             covered = @max(redo.checkpoint_sequence, slots[recovered.index].commit_sequence);
         }
         const probe = redo.tail_source == .published;
-        const start_offset: u64 = if (probe) redo.writer.tail else 0;
-        const floor = if (probe) (redo.writer.last_sequence orelse redo.checkpoint_sequence) else redo.checkpoint_sequence;
+        var start_offset: u64 = if (probe) redo.writer.tail else 0;
+        var floor = if (probe) (redo.writer.last_sequence orelse redo.checkpoint_sequence) else redo.checkpoint_sequence;
         if (probe) covered = @max(covered, floor);
         const capacity = self.header.redo_log_capacity;
         if (start_offset > capacity) return error.NativeRedoLogCorrupt;
@@ -10686,6 +10700,26 @@ pub const NativeFile = struct {
             (try redoFrontierSlots(self.header).readLatest(self.file, io)) orelse return error.NativeRedoLogCorrupt
         else
             null;
+
+        if (!probe and !torn) {
+            // The local registry can prove the overlay already contains
+            // this run. Recheck its final record against the durable seal
+            // to restore the cursor and checkpoint without rereading it all.
+            if (persisted) |seal| {
+                if (seal.frontier.sequence > covered and redo.shared.appliedThrough() >= seal.frontier.sequence) {
+                    if (try self.redoResumeCursor(io, entry, floor, self.header)) |cursor| {
+                        if (cursor.last_sequence == seal.frontier.sequence and cursor.tail == seal.frontier.end_offset and cursor.salt == seal.frontier.generation) {
+                            if (cursor.last_record_start) |start| {
+                                if (start < cursor.tail) {
+                                    start_offset = start;
+                                    floor = cursor.last_sequence - 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         const scan_end = if (persisted) |seal| end: {
             if (seal.frontier.sequence <= covered) break :end capacity;
@@ -10712,16 +10746,19 @@ pub const NativeFile = struct {
             /// The last recovered record's checkpoint (roots, free map,
             /// page count) the tip advanced to.
             compact: ?CompactCheckpoint = null,
+            last_record_start: ?u64 = null,
             fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
                 const Visit = struct {
                     overlay: *redo_overlay.SharedRedoOverlay,
                     have_through: u64,
                     decoded: u64 = 0,
                     compact: ?CompactCheckpoint = null,
+                    last_record_offset: ?u64 = null,
                     fn onRecord(ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
                         const visit: *@This() = @ptrCast(@alignCast(ptr.?));
                         if (record.payload.len < CompactCheckpoint.encoded_size) return error.InvalidNativeRedoRecord;
                         visit.compact = CompactCheckpoint.decode(record.payload[0..CompactCheckpoint.encoded_size]);
+                        visit.last_record_offset = record.offset;
                         if (record.commit_sequence <= visit.have_through) return;
                         try applyRedoRecordToOverlay(visit.overlay, record.commit_sequence, record.payload);
                         visit.overlay.noteDecoded(record.commit_sequence);
@@ -10733,6 +10770,7 @@ pub const NativeFile = struct {
                 ctx.outcome = try redo_log.replayBounded(file.allocator, file.file, ctx.io, file.header.redoOffset() + ctx.start_offset, ctx.end_offset - ctx.start_offset, ctx.floor, ctx.ceiling, ctx.unlogged_through, Visit.onRecord, &visit);
                 ctx.outcome.valid_bytes += ctx.start_offset;
                 ctx.compact = visit.compact;
+                if (visit.last_record_offset) |offset| ctx.last_record_start = ctx.start_offset + offset;
                 if (visit.decoded != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
             }
         };
@@ -10757,7 +10795,13 @@ pub const NativeFile = struct {
         }
 
         const found = scan.valid_count != 0 or (!probe and scan.valid_bytes != redo.writer.tail);
-        if ((found or torn) and !self.no_sync) {
+        const slot_advanced = covered > (if (published) |state| state.durable_sequence else redo.durable_sequence);
+        const already_published = if (persisted) |seal| if (published) |state|
+            state.checkpoint_sequence == redo.checkpoint_sequence and covered <= state.durable_sequence and state.durable_sequence == seal.frontier.sequence and
+                state.durable_offset == seal.frontier.end_offset and state.segment == (if (self.activeCheckpoint().redo_rotation) |rotation| rotation.active else 0)
+        else
+            false else false;
+        if ((found or torn or slot_advanced) and !self.no_sync and !already_published) {
             if (builtin.is_test) if (self.test_fail_redo_resync_sync) |err| {
                 self.test_fail_redo_resync_sync = null;
                 return err;
@@ -10780,23 +10824,32 @@ pub const NativeFile = struct {
                 try self.adoptIndexPublicationHeader(recovered_header);
             }
         };
-        const last = @max(scan.last_sequence orelse 0, floor, redo.writer.last_sequence orelse 0);
+        const last = @max(scan.last_sequence orelse 0, floor, covered, redo.writer.last_sequence orelse 0);
         redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), capacity, scan.valid_bytes, if (last == 0) null else last);
+        redo.writer.last_record_start = scan_ctx.last_record_start;
         if (scan.valid_count != 0) {
             redo.shared.noteApplied(last);
             _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
-            if (last > redo.durable_sequence) redo.durable_sequence = last;
         }
+        if (last > redo.durable_sequence) redo.durable_sequence = last;
+        if (self.writer_lock_file != null or redo.sidecar_epoch != null) redo.frontier_cache = persisted;
         // Provisional bump, as `refreshCrossProcessRedoOverlay` does: an
         // adopted on-disk checkpoint names only its fold boundary.
         if (self.header.checkpoints[self.header.active_checkpoint].commit_sequence < redo.durable_sequence) {
             self.header.checkpoints[self.header.active_checkpoint].commit_sequence = redo.durable_sequence;
         }
+        if (!probe) {
+            const segment = if (self.activeCheckpoint().redo_rotation) |rotation| rotation.active else 0;
+            redo.fold_start_offset = if (published) |state|
+                if (state.segment == segment and state.checkpoint_sequence == redo.checkpoint_sequence and state.fold_start_offset <= scan.valid_bytes) state.fold_start_offset else 0
+            else
+                0;
+        }
         redo.tail_source = .own;
         redo.tail_fold_boundary = redo.checkpoint_sequence;
         if (promised) |state| redo.log_reset_generation = @max(redo.log_reset_generation, state.reset_generation);
         redo.tail_reset_generation = redo.log_reset_generation;
-        if (found or torn) self.publishRedoLogState();
+        if ((found or torn or slot_advanced) and !already_published) self.publishRedoLogState();
     }
 
     /// The real fix for the stale-writer corruption (`UnexpectedNativePageKind`
@@ -10839,13 +10892,34 @@ pub const NativeFile = struct {
         return cursor;
     }
 
-    fn refreshIfWriterBaseStale(self: *NativeFile) !void {
+    /// A registered sidecar acquisition stays continuous across local
+    /// handoffs. An epoch change discards the cached frontier and forces
+    /// recovery before an externally leased handle can change WAL bytes.
+    fn refreshExternalRedoAuthority(self: *NativeFile, redo: *RedoCommitState) void {
+        if (!self.externally_locked or self.writer_lock_file != null or !self.header.protected_redo or self.no_sync) return;
+        const epoch = own_sidecar_locks.epoch.load(.acquire);
+        if (redo.sidecar_epoch == epoch) return;
+        redo.sidecar_epoch = null;
+        redo.frontier_cache = null;
+        redo.tail_source = .unknown;
+        const io = self.runtimeIo();
+        const path = writerLockPathAlloc(self.allocator, io, self.path) catch return;
+        defer self.allocator.free(path);
+        const lock = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return;
+        defer lock.close(io);
+        if (ownSidecarLockHeld(io, lock) and epoch == own_sidecar_locks.epoch.load(.acquire)) redo.sidecar_epoch = epoch;
+    }
+
+    fn refreshIfWriterBaseStale(self: *NativeFile, writer_authority: bool) !void {
         const entry = self.inode_lock_ref.load(.acquire) orelse return;
         // The inode registry only sees this process's commits. Another
         // process's durable redo appends are published in the shared region:
         // a writer that took the lease after one (a maintenance turn's
         // forwarded write, for one) must replay them into the shared overlay
         // and adopt their tail first, or it appends over durable records.
+        if (writer_authority) {
+            if (self.redo) |*redo| self.refreshExternalRedoAuthority(redo);
+        }
         if (self.redo) |*redo| if (self.regionForInode() catch null) |region| {
             // A torn publication hides how far the writer got; only writer
             // authority can rebuild it (`resyncRedoTailUnderAuthority`).
@@ -10853,7 +10927,14 @@ pub const NativeFile = struct {
             if (checked == null) redo.tail_source = .unknown;
             const published = if (checked) |state| state.durable_sequence else 0;
             const own = @max(redo.writer.last_sequence orelse 0, inode_lock.committedSequence(entry), entry.self_published_durable_sequence.load(.acquire));
-            if (published > own) try self.refreshCrossProcessRedoOverlay();
+            const moved = if (checked) |state| self.header.segmented_redo and
+                (state.checkpoint_sequence > redo.checkpoint_sequence or state.reset_generation > redo.log_reset_generation or
+                    state.segment != self.activeCheckpoint().redo_rotation.?.active) else false;
+            if (moved) {
+                if (!writer_authority) try self.refreshCrossProcessRedoOverlay();
+                redo.tail_source = .unknown;
+                redo.frontier_cache = null;
+            } else if (published > own and redo.tail_source != .unknown) try self.refreshCrossProcessRedoOverlay();
         };
         const latest = inode_lock.committedSequence(entry);
         // perf/lwa-grouped-stall: `base` below (the checkpoint's own
@@ -10890,6 +10971,13 @@ pub const NativeFile = struct {
         // any record content (already shared and current).
         const base = self.activeCheckpoint().commit_sequence;
         const redo_stale = if (self.redo) |*redo| latest > (redo.writer.last_sequence orelse 0) else false;
+        if (self.redo != null and self.header.protected_redo and !self.no_sync) {
+            if (base < latest or redo_stale) self.redo.?.tail_source = .unknown;
+            if (writer_authority) {
+                try self.resyncRedoTailUnderAuthority();
+                return;
+            }
+        }
         if (base >= latest and !redo_stale) return;
         const io = self.runtime();
         // perf/lwa-xproc-redocorrupt: read the real on-disk checkpoint (and
@@ -12928,7 +13016,7 @@ pub const NativeFile = struct {
         // same-inode NativeFile's (same process) more recent commits without
         // beginTransaction/vacuumWithCancel/pageAllocatorFromFreeMapWithProof
         // ever running on it to catch it up first.
-        try self.refreshIfWriterBaseStale();
+        try self.refreshIfWriterBaseStale(false);
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         return allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.header.page_size;
     }
@@ -12970,7 +13058,7 @@ pub const NativeFile = struct {
         // allocatorStats on `self.current`'s own (possibly idle, fallen-behind)
         // file, surfacing as UnexpectedNativePageKind out of a stale
         // free_map_root_page reused by a newer same-inode commit.
-        try self.refreshIfWriterBaseStale();
+        try self.refreshIfWriterBaseStale(false);
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         return .{
             .reusable_pages = state.free_pages,
@@ -13035,7 +13123,7 @@ pub const NativeFile = struct {
         // here as `UnexpectedNativePageKind`/`InvalidNativeAllocator` out of
         // `loadLedgerWithCancel` below. Catching up first closes that gap the
         // same way every sibling entry point already does.
-        try self.refreshIfWriterBaseStale();
+        try self.refreshIfWriterBaseStale(false);
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         if (state.checkpointDue() or self.budgetedCheckpointDue(state)) return true;
         // §9 (redo retirement signal): under the redo log, a superseded
@@ -14015,7 +14103,7 @@ pub const NativeFile = struct {
     /// flushes. Caller holds writer admission and the store mutation mutex.
     pub fn planIndexScopeDeletion(self: *NativeFile, prefix: []const u8, exact_key: ?[]const u8, other_bytes: usize, probe_hooks: ?SyncLockHooks) !IndexScopeDeletion {
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
-        try self.refreshIfWriterBaseStale();
+        try self.refreshIfWriterBaseStale(true);
         try self.resyncRedoTailUnderAuthority();
         const checkpoint = self.activeCheckpoint();
         const exact_exists = if (exact_key) |key|
@@ -17798,7 +17886,7 @@ pub const NativeFile = struct {
         // on the same path in an `externally_locked` setup).
         const data_lock = try self.acquireInodeLock(.exclusive, false, false, "vacuumWithCancel");
         defer data_lock.release(self.runtimeIo());
-        try self.refreshIfWriterBaseStale();
+        try self.refreshIfWriterBaseStale(true);
         // Replaces the old namespace-directory scan: a live pin in the
         // region's reader table (any reader, indexed or not -- the region
         // doesn't distinguish) refuses the vacuum rather than rewriting
@@ -21022,7 +21110,7 @@ pub const NativeFile = struct {
         // `reconcilePublicationUncertainty`. Only a disk that is still
         // failing (or an inconsistent latch) falls through to the refusal.
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
-        try self.refreshIfWriterBaseStale();
+        try self.refreshIfWriterBaseStale(true);
         try self.resyncRedoTailUnderAuthority();
         self.debugEnterCommitSpan();
         if (self.lease_managed) {
@@ -22037,6 +22125,7 @@ pub const NativeFile = struct {
                     .log_offset = redo.writer.base_offset,
                     .capacity = redo.writer.capacity,
                     .tail = redo.writer.tail,
+                    .last_record_start = redo.writer.last_record_start,
                     .last_sequence = last,
                     .salt = salt,
                 });
@@ -23393,7 +23482,9 @@ pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     const file = (try acquireWriterLock(allocator, io_impl.io(), path)).file;
     errdefer file.close(io_impl.io());
 
+    noteOwnSidecarLock(io_impl.io(), file, .add);
     return .{
+        .registered_sidecar = true,
         .io_impl = io_impl,
         .file = file,
     };
@@ -23420,7 +23511,9 @@ pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
         errdefer file.close(io);
         const owned_region = try std.heap.page_allocator.create(shared_lock_region.Region);
         owned_region.* = region;
+        noteOwnSidecarLock(io, file, .add);
         return .{
+            .registered_sidecar = true,
             .io_impl = undefined,
             .borrowed_io = io,
             .file = file,
@@ -23432,7 +23525,9 @@ pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
     }
     const file = (try acquireWriterLock(allocator, io, path)).file;
     errdefer file.close(io);
+    noteOwnSidecarLock(io, file, .add);
     return .{
+        .registered_sidecar = true,
         .io_impl = undefined,
         .borrowed_io = io,
         .file = file,
@@ -23708,7 +23803,9 @@ pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u
     errdefer file.close(io);
     const owned_region = try std.heap.page_allocator.create(shared_lock_region.Region);
     owned_region.* = region;
+    noteOwnSidecarLock(io, file, .add);
     return .{
+        .registered_sidecar = true,
         .io_impl = undefined,
         .borrowed_io = io,
         .file = file,
@@ -24033,6 +24130,7 @@ fn sidecarWriterHeld(allocator: Allocator, io: std.Io, path: []const u8) bool {
 /// Sidecar writer locks this process holds, by the lock file's inode.
 const own_sidecar_locks = struct {
     var mutex: std.Io.Mutex = .init;
+    var epoch: std.atomic.Value(u64) = .init(0);
     var held: std.AutoHashMapUnmanaged(std.Io.File.INode, u32) = .empty;
 };
 
@@ -24043,6 +24141,7 @@ fn noteOwnSidecarLock(io: std.Io, file: std.Io.File, change: enum { add, remove 
     const stat = file.stat(io) catch return;
     own_sidecar_locks.mutex.lockUncancelable(io);
     defer own_sidecar_locks.mutex.unlock(io);
+    defer _ = own_sidecar_locks.epoch.fetchAdd(1, .release);
     switch (change) {
         .add => {
             const slot = own_sidecar_locks.held.getOrPut(std.heap.page_allocator, stat.inode) catch return;
@@ -40137,6 +40236,72 @@ test "lite redo pinned snapshot excludes commits in a newer extent" {
     try expectRedoDocument(&reopened, "before", "kept");
     try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(a, "after"));
     try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(a, "new-extent"));
+}
+
+test "lite redo handoff refreshes the active extent before appending or rotating" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-handoff.aflite");
+    defer a.free(path);
+    var local = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+    defer local.close();
+    try local.beginTransaction();
+    try local.putDocument("seed", "one");
+    try local.commitTransaction();
+    const original_extent = local.header.redoOffset();
+    local.releaseWriterOwnership();
+
+    const peer = std.c.fork();
+    if (peer == 0) {
+        var writer = NativeFile.openWithIo(a, io, path, .{}) catch std.c._exit(1);
+        const region = (writer.regionForInode() catch std.c._exit(1)) orelse std.c._exit(1);
+        region.reclaimLivenessAfterFork() catch std.c._exit(1);
+        writer.checkpointRedoLog() catch std.c._exit(1);
+        writer.beginTransaction() catch std.c._exit(1);
+        writer.putDocument("peer", "two") catch std.c._exit(1);
+        writer.commitTransaction() catch std.c._exit(1);
+        writer.close();
+        std.c._exit(0);
+    }
+    try std.testing.expect(peer > 0);
+    const status = try crossProcessReapBounded(peer, cross_process_fork_reap_timeout_ms);
+    try std.testing.expectEqual(@as(c_int, 0), status);
+    {
+        var lease = try lockWriterPathWithIo(a, io, path);
+        defer lease.close();
+        try local.beginTransaction();
+        try std.testing.expect(local.header.redoOffset() != original_extent);
+        try local.putDocument("local", "three");
+        try local.commitTransaction();
+        try local.checkpointRedoLog();
+    }
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reader.close();
+    try expectRedoDocument(&reader, "seed", "one");
+    try expectRedoDocument(&reader, "peer", "two");
+    try expectRedoDocument(&reader, "local", "three");
+}
+
+test "lite redo handoff rejects a zeroed acknowledged record while rebuilding a tail" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-handoff-damaged.aflite");
+    defer a.free(path);
+    var first = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+    defer first.close();
+    var second = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true });
+    defer second.close();
+    try first.beginTransaction();
+    try first.putDocument("committed", "value");
+    try first.commitTransaction();
+    const zeros: [redo_log.header_len]u8 = @splat(0);
+    try first.file.writePositionalAll(io, &zeros, first.header.redoOffset());
+    try std.testing.expectError(error.NativeRedoLogCorrupt, second.beginTransaction());
 }
 
 test "lite redo segment rotation retries a folded extent after reader release" {
