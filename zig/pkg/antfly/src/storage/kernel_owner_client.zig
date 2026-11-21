@@ -797,6 +797,14 @@ pub const Owner = struct {
         return wire.decodeChunkReply(a, request, response.bytes());
     }
 
+    pub fn splitHistoryPolicy(self: *Owner) !?@import("antfly_local_sources").storage_committed_history.Policy {
+        var result: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_storage_owner_split_history_policy(self.handle, &result));
+        defer abi.antfly_storage_owner_buffer_destroy(&result);
+        if (result.len == 0) return null;
+        return try @import("antfly_local_sources").storage_committed_history.Policy.decode(result.slice());
+    }
+
     pub fn orderedHistoryControlJson(self: *Owner, table_name: []const u8, command_json: []const u8, raft_term: u64, raft_index: u64) !Response {
         if (raft_term == 0 or raft_index == 0 or command_json.len > 4096) return error.InvalidArgument;
         var response: Response = .{};

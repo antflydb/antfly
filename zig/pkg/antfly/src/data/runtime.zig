@@ -17544,6 +17544,10 @@ pub const DataServer = struct {
             after_key = next_after;
             if (page.exhausted) break;
         }
+        const history_policy = self.splitSourceHistoryPolicy(source_group_id, table_contract) catch |err| {
+            std.log.debug("split history policy read failed group_id={} err={s}", .{ source_group_id, @errorName(err) });
+            return err;
+        };
         try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitDestinationCheckpoint(
             destination_group_id,
@@ -17553,7 +17557,7 @@ pub const DataServer = struct {
             handoff.base_delta_sequence,
             .destination_complete,
             .cached,
-            try self.splitSourceHistoryPolicy(work_alloc, source_group_id, table_contract.table_name),
+            history_policy,
         );
         try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitSourceAcknowledgement(
@@ -17801,35 +17805,24 @@ pub const DataServer = struct {
         );
     }
 
-    fn splitSourceHistoryPolicy(self: *DataServer, a: std.mem.Allocator, group: u64, table: []const u8) !?@import("antfly_local_sources").storage_committed_history.Policy {
+    fn splitSourceHistoryPolicy(self: *DataServer, group: u64, contract: antfly.metadata.TransitionTableContract) !?@import("antfly_local_sources").storage_committed_history.Policy {
         if (comptime !linked_storage) return null;
-        const route = try antfly.public_api.table_catalog.routedGroupIdSnapshotUntil(a, self.write_source.catalog, table, group, null);
-        const fence = route.fence() orelse return error.TopologyChanged;
-        const binding = @import("../api/history_policy_provisioning.zig").authority(fence) catch |err| switch (err) {
-            error.ChangefeedCapabilityUnsupported => return null,
-            else => return err,
+        // Qualify the applied source before taking an owner lease. The
+        // ordered split job already owns the source transition lane.
+        try self.waitDataReadSafeWithCancellation(group, "split-history-policy", 5_000, .none);
+        const policy = policy: {
+            var source = try self.leaseReplicatedTransitionOwner(group, contract, .source, .exact);
+            defer source.release();
+            break :policy try source.owner.splitHistoryPolicy() orelse return null;
         };
-        const identity = fence.route.identity_namespace;
-        var namespace: [24]u8 = undefined;
-        std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
-        std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
-        std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
-        const received = self.submitHistoryControlLocal(a, fence, table, .{ .inspect_policy = .{ .namespace = namespace, .authority = binding } }) catch |err| switch (err) {
-            error.ChangefeedCapabilityUnsupported, error.UnsupportedBatchProtocolVersion => return null,
-            else => return err,
-        };
-        const outcome = received.outcome orelse return error.RaftBatchWriteOutcomeUnknown;
-        return switch (outcome) {
-            .superseded => error.RaftBatchWriteOutcomeUnknown,
-            .rejected => |rejection| if (rejection == .resynchronization) null else rejection.asError(),
-            .applied => |applied| if (applied.policy) |policy| .{
-                .namespace = namespace,
-                .authority = binding,
-                .previous_revision = 0,
-                .revision = policy.revision,
-                .limit = policy.limit,
-            } else error.HistoryCorrupt,
-        };
+        var snapshot = (try self.status_source.linearizableSnapshot(.{})) orelse return error.CatalogRoutingUnavailable;
+        defer self.status_source.freeAdminSnapshot(&snapshot);
+        const authority = try @import("../api/history_policy_provisioning.zig").authorityForCatalog(snapshot.status.metadata_group_id, snapshot.status.metadata_incarnation);
+        if (!std.mem.eql(u8, &policy.authority, &authority)) return error.HistoryResynchronizationRequired;
+        try self.requireReplicatedTransitionActionActive(group);
+        var initial_policy = policy;
+        initial_policy.previous_revision = 0;
+        return initial_policy;
     }
 
     fn replicateSplitDestinationCheckpoint(

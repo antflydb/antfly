@@ -5274,6 +5274,7 @@ test "compiled ordered history root policy captures without consumers and fences
     std.mem.writeInt(u64, namespace[16..24], 13, .big);
     var index: u64 = 0;
     const first: local.storage_committed_history.Policy = .{ .namespace = namespace, .authority = @splat(1), .previous_revision = 0, .revision = 1, .limit = 16 * 1024 * 1024 };
+    try std.testing.expect((try owner.splitHistoryPolicy()) == null);
     try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .begin = .{ .txn_id = @splat(41), .begin_timestamp = 10, .created_at_ns = 11, .topology_epoch = 1, .participants = &.{"table2:00000004:docs:7001"} } } });
     try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(41), .topology_epoch = 1 } }, .writes = &.{.{ .key = "legacy", .value = "{\"v\":1}" }} });
     try std.testing.expectEqual(.prepared_transactions, (try Fixture.command(a, &owner, &index, .{ .configure_policy = first })).rejected);
@@ -5283,6 +5284,7 @@ test "compiled ordered history root policy captures without consumers and fences
     try std.testing.expect(configured.applied.consumer == null);
     try std.testing.expectEqual(@as(u64, 1), configured.applied.policy.?.revision);
     try std.testing.expectEqual(first.limit, configured.applied.policy.?.limit);
+    try std.testing.expectEqualDeep(first, (try owner.splitHistoryPolicy()).?);
     const routed_owner: source.history_resolution_wire.completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(3), .root_generation = 0, .group_id = 7001, .topology_epoch = 1 };
     const qualified = try owner.historyAdmission(a, "docs", .{ .owner = routed_owner });
     try std.testing.expectEqual(first.limit, qualified.retention_limit_bytes);
@@ -5318,6 +5320,7 @@ test "compiled ordered history root policy captures without consumers and fences
     live = false;
     owner = try client.Owner.open(options);
     live = true;
+    try std.testing.expectEqualDeep(changed, (try owner.splitHistoryPolicy()).?);
     try std.testing.expectEqualDeep(upgraded, try owner.orderedHistoryOutcome(a, "docs", .{ .command = .{ .configure_policy = changed }, .entry = .{ .term = 1, .index = upgrade_index }, .minimum_applied_index = upgrade_index }));
     try std.testing.expectEqualDeep(upgraded, try Fixture.command(a, &owner, &index, .{ .inspect_policy = .{ .namespace = namespace, .authority = first.authority } }));
     var grant: control.Grant = .{ .namespace = namespace, .authority = first.authority, .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 17, .limit = changed.limit };

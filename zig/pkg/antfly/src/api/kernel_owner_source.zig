@@ -1192,6 +1192,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             return try apply_store.reconcileAuthoritativeOwner(alloc, self.lease.owner().handle, self.lease.entry.group_id, expected, false, 256, 2 * 1024 * 1024);
         }
 
+        pub fn splitHistoryPolicy(self: *TransitionLease) !?@import("antfly_local_sources").storage_committed_history.Policy {
+            return self.lease.owner().splitHistoryPolicy();
+        }
+
         pub fn mergeArtifactsPage(self: *TransitionLease, alloc: std.mem.Allocator, range: db_types.ByteRange, after_key: ?[]const u8) ![]db_types.BatchWrite {
             var response: abi.OwnedBytes = .{};
             try @import("kernel_error_identity").statusToError(abi.antfly_storage_owner_merge_artifacts_page(self.lease.owner().handle, &.{

@@ -5107,6 +5107,29 @@ pub fn storageOwnerArtifactPublicationHistory(
     return .ok;
 }
 
+/// Reads the retained-history policy through the caller's leased split
+/// source. This is a snapshot read, so it does not enter ordinary write
+/// admission or append a history-control operation.
+pub fn storageOwnerSplitHistoryPolicy(
+    owner: ?*anyopaque,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    const local = @import("antfly_local_sources");
+    const history = local.storage_committed_history;
+    var read = handle.db.core.store.beginReadTxn() catch |err| return storageOwnerStatusFromError(err);
+    defer read.abort();
+    const policy = (history.loadPolicy(&read) catch |err| return storageOwnerStatusFromError(err)) orelse return .ok;
+    const namespace = local.storage_db_online_source_contract.namespaceBytes(handle.db.core.identity_namespace);
+    if (!std.mem.eql(u8, &namespace, &policy.namespace)) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    _ = local.storage_source_authority.require(&read, .raft, namespace) catch |err| return storageOwnerStatusFromError(err);
+    const raw = policy.encode() catch |err| return storageOwnerStatusFromError(err);
+    const bytes = std.heap.c_allocator.dupe(u8, &raw) catch return .out_of_memory;
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
 pub fn storageOwnerSplitHistoryCut(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
