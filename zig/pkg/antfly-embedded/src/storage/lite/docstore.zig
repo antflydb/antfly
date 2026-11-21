@@ -9313,7 +9313,12 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     // that never touches external value pages -- so the ledger can equal a
     // scan of real bytes without ever materializing a large document's
     // value just to account for its deletion.
-    const charge: u64 = internal_keys.replay_key_len + payload.len;
+    // Each hint the record carries also gets an empty index entry in its
+    // lane: "a record for this hint in (a, b]" is then one seek instead of a
+    // filtered scan of the shared lane's backlog.
+    const hint_mask = change_journal_mod.encodedRecordHintMask(payload) catch 0;
+    const hint_entries: u64 = @popCount(hint_mask);
+    const charge: u64 = internal_keys.replay_key_len + payload.len + hint_entries * internal_keys.replay_key_len;
     // Loaded once here for the admission check and reused below for the
     // final charge instead of a second `txn.get` of the same key: nothing
     // in between writes `journal_credit_ledger_key` (the puts below are to
@@ -9336,22 +9341,15 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
 
     const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
     try txn.put(all_key[0..], payload);
-    // Each hint the record carries keeps its latest-sequence marker, a
-    // small overwrite, so a consumer's "nothing pending through S" check is
-    // one read instead of a filtered scan of the shared lane's backlog.
-    const hint_mask = change_journal_mod.encodedRecordHintMask(payload) catch 0;
-    if (hint_mask != 0) {
-        const latest_raw = encodeReplaySequence(sequence);
-        for (replay_hints) |hint| {
-            if ((hint_mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
-            const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
-            try txn.put(latest_key[0..], latest_raw[0..]);
-        }
-    }
+    if (hint_mask != 0) for (replay_hints) |hint| {
+        if ((hint_mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
+        const index_key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
+        try txn.put(index_key[0..], "");
+    };
 
     if (txn.store != null) {
         var ledger = reserved_ledger.?;
-        ledger = ledger.charged(charge, 1);
+        ledger = ledger.charged(charge, 1 + hint_entries);
         try storeJournalCreditLedger(txn, ledger);
     }
 }
@@ -19213,18 +19211,21 @@ test "lite native docstore upgrades a base-revision replay journal on its next a
     const version = internal_keys.decodeReplayJournalFormatVersion(try read.get(internal_keys.replay_journal_format_version_key[0..]));
     try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_current), version);
     const ledger = internal_keys.JournalCreditLedger.decode(try read.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 3), ledger.records);
-    try std.testing.expectEqual(@as(u64, 3 * internal_keys.replay_key_len + 2 * first.len + second.len), ledger.bytes);
-    // Raised to the head by the upgrade, then the new append's own.
-    const full_text_marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.full_text));
-    try std.testing.expectEqual(@as(?u64, 2), decodeTestReplaySequence(try read.get(full_text_marker[0..])));
-    const enrichment_marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.enrichment));
-    try std.testing.expectEqual(@as(?u64, 1), decodeTestReplaySequence(try read.get(enrichment_marker[0..])));
+    // The base layout's two entries, then the append's entry and its index
+    // entry.
+    try std.testing.expectEqual(@as(u64, 4), ledger.records);
+    try std.testing.expectEqual(@as(u64, 4 * internal_keys.replay_key_len + 2 * first.len + second.len), ledger.bytes);
+    // The per-hint index starts at the upgraded journal's head; the new
+    // append is in it.
+    try std.testing.expectEqual(@as(?u64, 2), decodeTestReplaySequence(try read.get(internal_keys.replay_hint_index_floor_key[0..])));
+    const index_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 2);
+    try std.testing.expectEqualStrings("", try read.get(index_key[0..]));
 }
 
-// One small marker per hint the record carries: the shared lane still holds
-// the only copy, and a hint's newest sequence is one read.
-test "lite native docstore keeps a latest-sequence marker per hint" {
+// One empty index entry per hint the record carries: the shared lane still
+// holds the only payload copy, and "a record for this hint in (a, b]" is
+// one seek.
+test "lite native docstore keeps a per-hint index" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -19241,12 +19242,22 @@ test "lite native docstore keeps a latest-sequence marker per hint" {
     }
     var read = try store.beginRead();
     defer read.abort();
-    const enrichment_marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.enrichment));
-    try std.testing.expectEqual(@as(?u64, 1), decodeTestReplaySequence(try read.get(enrichment_marker[0..])));
-    const full_text_marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.full_text));
-    try std.testing.expectEqual(@as(?u64, 3), decodeTestReplaySequence(try read.get(full_text_marker[0..])));
-    const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 3);
-    try std.testing.expectError(error.NotFound, read.get(lane_key[0..]));
+    for ([_]struct { change_journal_mod.TargetHint, u64, bool }{
+        .{ .enrichment, 1, true },
+        .{ .enrichment, 2, false },
+        .{ .full_text, 1, false },
+        .{ .full_text, 2, true },
+        .{ .full_text, 3, true },
+    }) |case| {
+        const index_key = internal_keys.replayEntryKey(replayHintOrdinal(case[0]), case[1]);
+        if (case[2]) {
+            try std.testing.expectEqualStrings("", try read.get(index_key[0..]));
+        } else {
+            try std.testing.expectError(error.NotFound, read.get(index_key[0..]));
+        }
+    }
+    const ledger = internal_keys.JournalCreditLedger.decode(try read.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 6), ledger.records);
 }
 
 fn decodeTestReplaySequence(raw: []const u8) ?u64 {

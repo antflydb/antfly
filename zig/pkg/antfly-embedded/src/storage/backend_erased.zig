@@ -814,8 +814,17 @@ pub const WriteTxn = struct {
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
         contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
+        put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    /// Stages index-catalog mutations to commit in this transaction's own
+    /// native commit, as `Batch.putIndexCatalogBatch` does. `error.Unsupported`
+    /// on every backend but Lite.
+    pub fn putIndexCatalogBatch(self: *WriteTxn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+        const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
+        try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
+    }
 
     pub fn abort(self: *WriteTxn) void {
         const gate = self.write_gate;
@@ -2132,6 +2141,10 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             errdefer cursor.close();
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
+
+        pub fn putIndexCatalogBatch(ptr: *anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void {
+            return unbox(ptr).handle.putIndexCatalogBatch(scope, mutations);
+        }
     };
 
     return .{
@@ -2148,6 +2161,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .delete = vt.delete,
             .open_cursor = vt.openCursor,
             .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
+            .put_index_catalog = if (@hasDecl(Handle, "putIndexCatalogBatch")) vt.putIndexCatalogBatch else null,
         },
     };
 }

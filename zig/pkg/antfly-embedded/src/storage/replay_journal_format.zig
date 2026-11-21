@@ -73,21 +73,18 @@ fn readSequence(txn: anytype, key: []const u8) !?u64 {
     return std.mem.readInt(u64, raw[0..8], .little);
 }
 
-/// The stored `next_sequence` bytes. A journal still in the base layout (a
-/// read-only open never upgrades it) keeps them under the legacy key; read
-/// there only while the format marker is absent, so a populated database
-/// never reports an empty journal.
-pub fn getNextSequence(txn: anytype) ![]const u8 {
-    return txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
-        error.NotFound => {
-            _ = txn.get(internal_keys.replay_journal_format_version_key[0..]) catch |marker_err| switch (marker_err) {
-                error.NotFound => return txn.get(legacy_next_sequence_key[0..]),
-                else => return marker_err,
-            };
-            return error.NotFound;
-        },
-        else => return err,
-    };
+/// The stored `next_sequence`, as its 8 bytes: the later of the current
+/// key and the base key, read in the caller's one snapshot. A journal still
+/// in the base layout (a read-only open never upgrades it) has only the base
+/// key; a base binary rolled back onto an upgraded store advances only the
+/// base key, and a read-only reopen cannot reconcile that, so both count.
+pub fn getNextSequence(txn: anytype) ![8]u8 {
+    const current = try readSequence(txn, internal_keys.replay_meta_next_sequence_key[0..]);
+    const base = try readSequence(txn, legacy_next_sequence_key[0..]);
+    const next = if (current) |c| @max(c, base orelse 0) else base orelse return error.NotFound;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, next, .little);
+    return raw;
 }
 
 /// What the credit ledger charges for one lane entry.
@@ -121,6 +118,12 @@ pub fn upgrade(txn: anytype, ledger: internal_keys.JournalCreditLedger, hint_ord
         for (hint_ordinals) |ordinal| {
             const key = internal_keys.replayLatestSequenceKey(ordinal);
             if ((try readSequence(txn, key[0..]) orelse 0) < next - 1) try txn.put(key[0..], head_raw[0..]);
+        }
+        // Records before `next` may lack hint-lane entries.
+        if ((try readSequence(txn, internal_keys.replay_hint_index_floor_key[0..]) orelse 0) < next) {
+            var floor_raw: [8]u8 = undefined;
+            std.mem.writeInt(u64, &floor_raw, next, .little);
+            try txn.put(internal_keys.replay_hint_index_floor_key[0..], floor_raw[0..]);
         }
     }
     const ledger_raw = ledger.encode();

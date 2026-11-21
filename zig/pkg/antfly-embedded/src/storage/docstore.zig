@@ -290,16 +290,17 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     // an upper bound (every lane gets the full unfiltered payload) before any
     // key is written, so a refused append leaves no partial state behind.
     //
-    // Every hint the record carries gets its latest-sequence marker, whatever
-    // consumers are active, so a marker bounds its hint's work exactly
-    // (`replay_journal_format_v3`). Hint lanes are written only where readers
-    // use them, and then for every hint, as the base revision does, so its
-    // binary still finds every hinted record; a shared-lane store filters the
-    // all-lane at read time instead.
+    // Every hint the record carries gets an entry in its lane, whatever
+    // consumers are active (`replay_journal_format_v3`): where readers use
+    // hint lanes, the filtered payload copy the base revision writes, so its
+    // binary still finds every hinted record; on a shared-lane store, which
+    // filters the all-lane at read time, an empty index entry, so "a record
+    // for this hint in (a, b]" stays one seek.
     const mask_all = change_journal_mod.encodedRecordHintMask(payload) catch 0;
     const mask = if (keep_base_layout) mask_all else 0;
     const lane_count: u64 = 1 + @popCount(mask);
-    const upper_bound_charge: u64 = lane_count * (internal_keys.replay_key_len + payload.len);
+    const index_count: u64 = if (keep_base_layout) 0 else @popCount(mask_all);
+    const upper_bound_charge: u64 = lane_count * (internal_keys.replay_key_len + payload.len) + index_count * internal_keys.replay_key_len;
     // Loaded once here for the admission check and reused below for the
     // final charge instead of a second `txn.get` of the same key: nothing
     // in between writes `journal_credit_ledger_key` (the puts above are to
@@ -322,11 +323,6 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
     if (keep_base_layout) try txn.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
     const latest_raw = encodeReplaySequence(sequence);
-    if (!keep_base_layout) for (replay_hints) |hint| {
-        if ((mask_all & change_journal_mod.singleHintMask(hint)) == 0) continue;
-        const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
-        try txn.put(latest_key[0..], latest_raw[0..]);
-    };
 
     const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
     try txn.put(all_key[0..], payload);
@@ -335,6 +331,13 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
 
     var charged_bytes: u64 = internal_keys.replay_key_len + payload.len;
     var charged_records: u64 = 1;
+    if (!keep_base_layout) for (replay_hints) |hint| {
+        if ((mask_all & change_journal_mod.singleHintMask(hint)) == 0) continue;
+        const index_key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
+        try txn.put(index_key[0..], "");
+        charged_bytes += internal_keys.replay_key_len;
+        charged_records += 1;
+    };
 
     write_hints: {
         if (mask == 0) break :write_hints;
@@ -1030,6 +1033,13 @@ pub const DocStore = struct {
             if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
         }
 
+        /// Stages index-catalog mutations into this write's own native
+        /// commit (`backend_erased.WriteTxn.putIndexCatalogBatch`).
+        pub fn putIndexCatalogBatch(self: *Txn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+            if (self.write) |*write| return write.putIndexCatalogBatch(scope, mutations);
+            return error.ReadOnly;
+        }
+
         pub fn delete(self: *Txn, key: []const u8) anyerror!void {
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
             try removeGraphRetirementReference(self, self.alloc, key, &self.graph_retirements_maybe);
@@ -1628,22 +1638,29 @@ pub const DocStore = struct {
     /// upgrade and is left as it is. An unknown format fails the open.
     fn upgradeLegacyReplayJournalAtOpen(self: *DocStore) !void {
         const keep_base_layout = !self.sharedReplayLane();
-        {
+        const state = blk: {
             var probe = try self.beginProbeTxn();
             defer probe.abort();
-            switch (try replay_journal_format.state(&probe)) {
-                .absent => return,
-                .legacy => {},
-                // A base binary appended since: its records are in every
-                // lane, but the ledger and markers never saw them.
-                .current => if (!keep_base_layout or !try replay_journal_format.baseWroteSince(&probe)) return,
-            }
-        }
+            break :blk try replay_journal_format.state(&probe);
+        };
+        if (state == .absent or (state == .current and !keep_base_layout)) return;
         var batch = self.beginWriteBatch() catch |err| switch (err) {
             error.ReadOnly => return,
             else => return err,
         };
         errdefer batch.abort();
+        // A base binary rolled back onto this store may have appended (its
+        // records are in every lane, but the ledger and index floor never
+        // saw them) or retired rows (the keys still agree, but the ledger
+        // still charges them). A scan of the lanes settles both.
+        if (state == .current and !try replay_journal_format.baseWroteSince(batch.asTxn())) {
+            const stored = try loadJournalCreditLedger(batch.asTxn());
+            const scanned = try scanReplayJournalLedger(batch.asTxn());
+            if (stored.bytes == scanned.bytes and stored.records == scanned.records) {
+                batch.abort();
+                return;
+            }
+        }
         try upgradeLegacyReplayJournal(batch.asTxn(), keep_base_layout);
         batch.commit() catch |err| switch (err) {
             error.ReadOnly => {
@@ -3131,20 +3148,35 @@ pub const DocStore = struct {
         return try self.latestReplaySequenceForOrdinal(replayHintOrdinal(hint), fallback_last);
     }
 
-    /// The newest sequence of any record carrying `hint`, exact in a
-    /// current-format journal (every append updates the markers of the hints
-    /// its record carries): 0 when none does. Null when the journal's layout
-    /// cannot say.
-    pub fn replayHintLatestSequence(self: *DocStore, hint: change_journal_mod.TargetHint) !?u64 {
-        var txn = try self.beginProbeTxn();
+    /// Whether a record carrying `hint` lies in (`from_sequence`,
+    /// `through`], from one seek of the hint's lane: a current-format journal
+    /// gives every such record an entry there from the index floor on. Null
+    /// when the lane cannot say (an older layout, or a range below the floor).
+    pub fn replayHintRecordBetween(self: *DocStore, hint: change_journal_mod.TargetHint, from_sequence: u64, through: u64) !?bool {
+        if (from_sequence >= through) return false;
+        var txn = try self.beginReadTxn();
         defer txn.abort();
         if (try replay_journal_format.state(&txn) != .current) return null;
-        const key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
-        const raw = txn.get(key[0..]) catch |err| switch (err) {
-            error.NotFound => return 0,
+        const floor_raw = txn.get(internal_keys.replay_hint_index_floor_key[0..]) catch |err| switch (err) {
+            error.NotFound => null,
             else => return err,
         };
-        return decodeReplaySequence(raw) orelse error.CorruptReplayMetadata;
+        if (floor_raw) |raw| {
+            const floor = decodeReplaySequence(raw) orelse return error.CorruptReplayMetadata;
+            if (from_sequence +| 1 < floor) return null;
+        }
+        const ordinal = replayHintOrdinal(hint);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(ordinal, from_sequence + 1);
+        const upper = internal_keys.replayRangeUpper(ordinal);
+        cursor.setUpperBound(&upper);
+        const entry = (cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        }) orelse return false;
+        if (entry.key.len != internal_keys.replay_key_len or entry.key[0] != internal_keys.replay_namespace or entry.key[1] != ordinal) return false;
+        return std.mem.readInt(u64, entry.key[2..10], .big) <= through;
     }
 
     pub fn latestReplaySequenceForOrdinal(self: *DocStore, kind_ordinal: u8, fallback_last: u64) !u64 {
@@ -7574,6 +7606,11 @@ test "docstore reconciles appends a base binary made after the upgrade" {
         const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
         try batch.put(all_key[0..], "replay:2");
         try batch.commit();
+        // Before any reconciliation (a read-only reopen never runs one), the
+        // head is read from both keys in one snapshot.
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 2), try store.lastReplaySequenceFromTxn(&txn, 0));
     }
     var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
     defer store.close();
@@ -7585,6 +7622,35 @@ test "docstore reconciles appends a base binary made after the upgrade" {
     try std.testing.expectEqual(@as(u64, 3), ledger.records);
     const marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.enrichment));
     try std.testing.expectEqual(@as(?u64, 2), decodeReplaySequence(try txn.get(marker[0..])));
+}
+
+// A base binary that only retires rows leaves both sequence keys agreeing;
+// the ledger still has to stop charging them.
+test "docstore reconciles rows a base binary retired after the upgrade" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try writeLegacyReplayJournal(&store);
+    }
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+        try batch.delete(lane_key[0..]);
+        try batch.commit();
+    }
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), ledger.records);
+    try std.testing.expectEqual(@as(u64, internal_keys.replay_key_len + "replay:1".len), ledger.bytes);
 }
 
 // Appends keep the base layout where readers use hint lanes: every hint the
@@ -7612,8 +7678,9 @@ test "docstore appends stay readable by the base layout" {
     }
     const full_text_lane = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
     try std.testing.expectError(error.NotFound, txn.get(full_text_lane[0..]));
-    try std.testing.expectEqual(@as(?u64, 1), try store.replayHintLatestSequence(.enrichment));
-    try std.testing.expectEqual(@as(?u64, 0), try store.replayHintLatestSequence(.full_text));
+    try std.testing.expectEqual(@as(?bool, true), try store.replayHintRecordBetween(.enrichment, 0, 1));
+    try std.testing.expectEqual(@as(?bool, false), try store.replayHintRecordBetween(.enrichment, 1, 5));
+    try std.testing.expectEqual(@as(?bool, false), try store.replayHintRecordBetween(.full_text, 0, 1));
 }
 
 // A read-only open never upgrades a base-revision journal; its sequence

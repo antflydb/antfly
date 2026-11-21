@@ -147,8 +147,38 @@ pub const Sink = struct {
 /// saying the index is gone while its stale scope survives underneath a
 /// later re-admission. A no-op when nothing is committed under `scope`.
 pub fn deleteAllForScope(allocator: Allocator, sink: Sink, scope: []const u8) !void {
-    const loaded = try sink.loadAllAlloc(sink.ptr, allocator, scope);
-    defer {
+    var deletes = try ScopeDeletes.load(allocator, sink, scope);
+    defer deletes.deinit();
+    if (deletes.mutations.len == 0) return;
+    try sink.submit(sink.ptr, scope, deletes.mutations, true);
+}
+
+/// A delete for every record committed under `scope`, for a caller that
+/// commits them in its own transaction (index removal, alongside the catalog
+/// mutation that makes the removal visible: neither half can land alone).
+pub const ScopeDeletes = struct {
+    allocator: Allocator,
+    scope: []const u8,
+    loaded: []Entry,
+    mutations: []Mutation,
+
+    pub fn load(allocator: Allocator, sink: Sink, scope: []const u8) !ScopeDeletes {
+        const loaded = try sink.loadAllAlloc(sink.ptr, allocator, scope);
+        errdefer freeLoaded(allocator, loaded);
+        const mutations = try allocator.alloc(Mutation, loaded.len);
+        for (loaded, 0..) |entry, i| {
+            mutations[i] = .{ .namespace = entry.namespace, .key = entry.key, .is_delete = true };
+        }
+        return .{ .allocator = allocator, .scope = scope, .loaded = loaded, .mutations = mutations };
+    }
+
+    pub fn deinit(self: *ScopeDeletes) void {
+        self.allocator.free(self.mutations);
+        freeLoaded(self.allocator, self.loaded);
+        self.* = undefined;
+    }
+
+    fn freeLoaded(allocator: Allocator, loaded: []Entry) void {
         for (loaded) |entry| {
             if (entry.namespace) |n| allocator.free(n);
             allocator.free(entry.key);
@@ -156,14 +186,7 @@ pub fn deleteAllForScope(allocator: Allocator, sink: Sink, scope: []const u8) !v
         }
         allocator.free(loaded);
     }
-    if (loaded.len == 0) return;
-    const mutations = try allocator.alloc(Mutation, loaded.len);
-    defer allocator.free(mutations);
-    for (loaded, 0..) |entry, i| {
-        mutations[i] = .{ .namespace = entry.namespace, .key = entry.key, .is_delete = true };
-    }
-    try sink.submit(sink.ptr, scope, mutations, true);
-}
+};
 
 const State = struct {
     tree: ordered.Tree = .empty,
