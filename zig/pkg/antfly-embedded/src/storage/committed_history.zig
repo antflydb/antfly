@@ -69,6 +69,8 @@ pub const SplitCut = struct {
         }
     };
 
+    pub const OrderedRead = struct { request: Request, minimum_applied_index: u64 };
+    pub const max_read_bytes = 4096;
     pub const encoded_size = 164;
     namespace: frame.Namespace,
     transition: u64,

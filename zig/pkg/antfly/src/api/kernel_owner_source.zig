@@ -2210,10 +2210,12 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     const completion_decision = @import("antfly_local_sources").storage_history_decision_wire;
     const artifact_history = @import("antfly_local_sources").storage_db_artifact_publication;
-    const HistoryReadKind = enum { page, bootstrap, outcome, grant, resolution, publication, admission, decision, artifact_history };
+    const split_cut = @import("antfly_local_sources").storage_committed_history.SplitCut;
+    const HistoryReadKind = enum { split_cut, page, bootstrap, outcome, grant, resolution, publication, admission, decision, artifact_history };
     fn HistoryReadInput(comptime kind: HistoryReadKind) type {
         return switch (kind) {
             .page => table_write_source.history_page.Request,
+            .split_cut => split_cut.Request,
             .artifact_history => artifact_history.HistoryRead,
             .bootstrap => table_write_source.history_page.BootstrapRequest,
             .outcome => table_write_source.history_ordered.Lookup,
@@ -2227,6 +2229,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     fn HistoryReadResult(comptime kind: HistoryReadKind) type {
         return switch (kind) {
             .page => table_write_source.history_page.Page,
+            .split_cut => ?split_cut,
             .artifact_history => artifact_history.HistoryObservation,
             .bootstrap => table_write_source.history_page.BootstrapPage,
             .outcome => table_write_source.history_ordered.Outcome,
@@ -2240,6 +2243,10 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     pub fn artifactPublicationHistoryRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: artifact_history.HistoryRead) !artifact_history.HistoryObservation {
         return self.historyReadRouted(alloc, fence, table_name, .artifact_history, request);
+    }
+
+    pub fn splitHistoryCutRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: split_cut.Request) !?split_cut {
+        return self.historyReadRouted(alloc, fence, table_name, .split_cut, request);
     }
 
     /// Private retained-history reads never fall back to stale consistency.
@@ -2329,7 +2336,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .page, .bootstrap => request.reference.namespace,
             .outcome => request.command.namespace(),
             .grant => request.namespace,
-            .resolution, .artifact_history => request.namespace,
+            .resolution, .artifact_history, .split_cut => request.namespace,
             .publication, .admission, .decision => request.owner.namespace,
         };
         if (comptime kind == .grant or kind == .bootstrap) try request.validate();
@@ -2365,6 +2372,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             // positive persisted marker establishes native Raft authority.
             // The quorum/owner fences establish freshness for every read.
             .page => try lease.owner().orderedHistoryPage(alloc, table_name, request, 1),
+            .split_cut => blk: {
+                if (request.root_generation != lease.entry.generation) return error.HistoryResynchronizationRequired;
+                const cut = try lease.owner().splitHistoryCut(alloc, table_name, request, 1);
+                if (cut) |value| if (value.index > proof.applied_index or value.term > proof.term) return error.StorageReadTemporarilyUnavailable;
+                break :blk cut;
+            },
             .artifact_history => blk: {
                 if (request.root_generation != lease.entry.generation) return error.HistoryResynchronizationRequired;
                 break :blk try lease.owner().artifactPublicationHistory(alloc, table_name, request, 1);

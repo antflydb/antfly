@@ -179,6 +179,21 @@ test "ordered history routed pages retain real images and discard failed final f
     ahead.authority = .native;
     ahead.minimum_applied_index = 0;
     try std.testing.expectError(error.ChangefeedCapabilityUnsupported, owners.orderedHistoryResolutionRouted(a, fence, "docs", ahead));
+    const cut_request: @import("antfly_local_sources").storage_committed_history.SplitCut.Request = .{
+        .namespace = namespace,
+        .transition = 12,
+        .attempt = 1,
+        .successor_group = 9,
+        .root_generation = descriptor.lsm_root_generation,
+        .boundary = @splat(1),
+    };
+    fixture.validations = 0;
+    try std.testing.expect((try owners.splitHistoryCutRouted(a, fence, "docs", cut_request)) == null);
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.mode = .leader_loss;
+    fixture.validations = 0;
+    try std.testing.expectError(error.NotLeader, owners.splitHistoryCutRouted(a, fence, "docs", cut_request));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
 }
 
 test "compiled ordered history control retains native outcomes without catalog reads" {

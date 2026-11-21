@@ -1965,6 +1965,9 @@ pub const AntflyApiHandler = struct {
             try server.postWithBodyLimit(table_prefix ++ routes.history_artifact_suffix, @import("artifact_history_operations.zig").max_bytes, httpx.Handler.bind(self, internalArtifactHistory));
         } else try server.post(table_prefix ++ routes.history_artifact_suffix, httpx.Handler.bind(self, internalArtifactHistory));
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_split_cut_suffix, @import("split_history_operations.zig").max_bytes, httpx.Handler.bind(self, internalSplitHistoryCut));
+        } else try server.post(table_prefix ++ routes.history_split_cut_suffix, httpx.Handler.bind(self, internalSplitHistoryCut));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
             try server.postWithBodyLimit(table_prefix ++ routes.history_publication_suffix, @import("history_publication_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryPublication));
         } else try server.post(table_prefix ++ routes.history_publication_suffix, httpx.Handler.bind(self, internalHistoryPublication));
         try self.registerInternalSqlRoutes(server);
@@ -4123,6 +4126,22 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
         if (body.len > operations.max_bytes) return textResponse(ctx, 413, "artifact history request exceeds byte limit");
         const result = operations.execute(self.api_server.cfg.native_artifact_history, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPublicationFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn internalSplitHistoryCut(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("split_history_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "split history request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_split_cut, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPublicationFailure(ctx, err);
         try ctx.setHeader("Cache-Control", "no-store");
         return ctx.json(result);
     }

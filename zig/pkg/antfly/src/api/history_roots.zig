@@ -115,6 +115,7 @@ test "history root discovery validates the complete installed route vector" {
 }
 pub const Source = struct {
     artifact_owners: ?@import("history_owner_operations.zig").Port = null,
+    split_cut: ?@import("split_history_operations.zig").Port = null,
     artifact_history: ?@import("artifact_history_operations.zig").Port = null,
     catalog: catalog_api.CatalogSource,
     controls: @import("history_control_operations.zig").Port,

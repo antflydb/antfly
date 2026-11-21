@@ -2971,6 +2971,84 @@ pub const ApiHttpClient = struct {
         try context.ensureActive();
         return decoded.value;
     }
+    pub fn fetchGroupSplitHistoryCut(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        input: @import("split_history_operations.zig").wire.Request,
+        fence: route_metadata_api.CatalogRouteFence,
+        original_context: @import("antfly_local_sources").api_operation.RequestContext,
+    ) !?@import("split_history_operations.zig").wire {
+        const contract = @import("split_history_operations.zig");
+        const history = @import("history_publication_operations.zig");
+        var scope = try history.Scope.init(fence, original_context);
+        const context = scope.context();
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        try fence.validate();
+        if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
+        try contract.validate(input, fence, table_name);
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, routes.Routes.history_split_cut_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > contract.max_bytes) return error.InvalidHistoryAdmission;
+        const encoded_fence = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        defer self.alloc.free(encoded_fence);
+        if (encoded_fence.len > 16384) return error.InvalidCatalogRouteFence;
+        const timeout = @min(try context.remainingTimeoutMs() orelse route_metadata_api.catalog_route_default_deadline_ms, 5000);
+        var buffer: [10]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&buffer, "{d}", .{timeout});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        try context.ensureActive();
+        var response = self.executeRequest(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .headers = &.{
+            .{ .name = route_metadata_api.catalog_route_fence_header, .value = encoded_fence },
+            .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = budget },
+        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = contract.max_bytes }) catch |err| return switch (err) {
+            error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => err,
+            else => error.ReadUnavailable,
+        };
+        defer response.deinit(self.alloc);
+        try context.ensureActive();
+        if (response.body.len > contract.max_bytes or response.header(internal_batch_forwarding.outcome_header) != null) return error.InvalidRemoteResponse;
+        if (response.status != 200) {
+            if (response.status == 401) return error.Unauthorized;
+            if (response.status == 403) return error.Forbidden;
+            if (response.status == 404) return error.ChangefeedCapabilityUnsupported;
+            var parsed = std.json.parseFromSlice(history.ErrorResponse, self.alloc, response.body, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch return error.InvalidRemoteResponse;
+            defer parsed.deinit();
+            if (parsed.value.version != 1 or parsed.value.status() != response.status) return error.InvalidRemoteResponse;
+            return switch (parsed.value.code) {
+                .invalid_request => error.InvalidHistoryAdmission,
+                .resynchronization_required => error.HistoryResynchronizationRequired,
+                .topology_changed => error.TopologyChanged,
+                .unsupported => error.ChangefeedCapabilityUnsupported,
+                .unavailable => error.ReadUnavailable,
+                .corrupt_publication => error.HistoryCorrupt,
+                .internal_error => error.UnexpectedHttpStatus,
+            };
+        }
+        var acknowledged = false;
+        for (response.headers) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_fence_ack_header)) continue;
+            if (acknowledged or !std.mem.eql(u8, header.value, route_metadata_api.catalog_route_fence_ack_value)) return error.InvalidRemoteResponse;
+            acknowledged = true;
+        }
+        if (!acknowledged) return error.InvalidRemoteResponse;
+        const content_type = response.header("Content-Type") orelse response.content_type orelse return error.InvalidRemoteResponse;
+        if (!std.ascii.eqlIgnoreCase(content_type, "application/json")) return error.InvalidRemoteResponse;
+        var decoded = std.json.parseFromSlice(?contract.wire, self.alloc, response.body, .{}) catch |err|
+            return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
+        defer decoded.deinit();
+        if (decoded.value) |cut| if (!input.matches(cut)) return error.InvalidRemoteResponse;
+        try context.ensureActive();
+        return decoded.value;
+    }
 
     pub fn fetchGroupHistoryResolution(
         self: *ApiHttpClient,
