@@ -7107,7 +7107,7 @@ fn encodeGraphStatus(out: *std.ArrayList(u8), alloc: std.mem.Allocator, session:
 }
 
 fn readStatusTxn(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: db_mod.types.TxnId, filter: SessionRegistry.StatusPrincipalFilter, colocated: bool) !?GraphStatusLookup {
-    var result = (try readGraphStatus(txn, alloc, key, id, filter)) orelse legacy: {
+    var result: GraphStatusLookup = (try readGraphStatus(txn, alloc, key, id, filter)) orelse legacy: {
         const raw = txn.get(key) catch |err| switch (err) {
             error.NotFound => return .absent,
             else => return err,
