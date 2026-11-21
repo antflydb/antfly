@@ -155,9 +155,11 @@ pub const WebmDecoderContinuation = struct {
             if (indexed.pictures.len == 0) return error.EmptyVideo;
             const shape = indexed.pictures[0];
             // Bind immutable index eligibility once, before reserving surfaces.
-            const owner = try video.apple_webm.Continuation.create(self.allocator, self.reader, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 } });
+            const options = video.apple_webm.Options{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .replay_budget = budget };
+            const owner = try video.apple_webm.Continuation.create(self.allocator, self.reader, options);
             errdefer owner.deinit();
             _ = try owner.validateIndex(reader, indexed);
+            _ = try video.apple_webm.planReplay(reader, indexed, selected, options, null);
             const bytes = try video.apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth);
             self.permit = try session.admitHostPreprocess(std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded);
             errdefer {
@@ -169,7 +171,7 @@ pub const WebmDecoderContinuation = struct {
             self.apple = owner;
         }
         return self.apple.?.decodeBounded(reader, indexed, selected, budget, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| {
-            self.deinit();
+            if (err != error.AppleReplayPacketLimit) self.deinit();
             return err;
         };
     }
@@ -1575,6 +1577,15 @@ test "embeddinggemma2 video reader timestamps and cache binding survive independ
                 return error.TestUnexpectedResult;
             }
         };
+        const bounded_options = video.apple_webm.Options{
+            .decode = .{ .max_decode_packets = 0 },
+            .replay_budget = planned.window.?.replay,
+        };
+        try std.testing.expectError(error.AppleReplayPacketLimit, video.apple_webm.planReplay(&reader, index, &.{0}, bounded_options, 0));
+        var incompatible_format = index;
+        incompatible_format.apple_index_eligible = false;
+        const portable_plan = try inspectSelectedWebmPlan(&reader, incompatible_format, true, &.{0});
+        try std.testing.expectEqual(@as(usize, 0), portable_plan.apple_surface_bytes);
         const reads_before_apple = source.reads;
         try std.testing.expectError(error.AppleReplayPacketLimit, video.apple_webm.decodeTo(a, &reader, index, &.{0}, .{
             .decode = .{ .max_decode_packets = 0 },
@@ -2149,6 +2160,13 @@ fn inspectWebmPlan(a: std.mem.Allocator, input: WebmInput, sampling: Sampling, m
 }
 fn inspectSelectedWebmPlan(reader: *const media.webm.Reader, index: video.webm_pictures.Index, metal: bool, selected: []const usize) !Plan {
     var plan = Plan{ .commands = preparationSlots(selected), .metal_preparation = metal, .decoder_host_bytes = 256 * 1024 * 1024 };
+    const apple_eligible = metal and @import("builtin").os.tag == .macos and blk: {
+        _ = video.apple_webm.validate(reader, index) catch |err| switch (err) {
+            error.UnsupportedVideoProfile => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
     for (selected) |id| {
         if (plan.pictures >= plan.picture_indexes.len) return error.ResourceLimitExceeded;
         plan.picture_indexes[plan.pictures] = id;
@@ -2156,7 +2174,7 @@ fn inspectSelectedWebmPlan(reader: *const media.webm.Reader, index: video.webm_p
         const picture = index.pictures[id];
         const preparation = try webmFramePolicy(reader.track, picture);
         try plan.picture(picture.width, picture.height, preparation);
-        if (metal and @import("builtin").os.tag == .macos and reader.track.codec != .vp8 and picture.chroma_format == 1 and (picture.bit_depth == 8 or picture.bit_depth == 10)) {
+        if (apple_eligible and reader.track.codec != .vp8 and picture.chroma_format == 1 and (picture.bit_depth == 8 or picture.bit_depth == 10)) {
             const estimate = try video.apple.surfaceAdmissionBytesForDepth(picture.width, picture.height, selected.len, picture.bit_depth);
             if (estimate <= 512 * 1024 * 1024) plan.apple_surface_bytes = @max(plan.apple_surface_bytes, @as(usize, @intCast(estimate)));
         }

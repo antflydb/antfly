@@ -125,7 +125,7 @@ const Capture = struct {
         };
     }
 };
-pub fn validate(reader: *media.webm.Reader, indexed: pictures.Index) !Configuration {
+pub fn validate(reader: *const media.webm.Reader, indexed: pictures.Index) !Configuration {
     if (indexed.reader != reader or indexed.operating_point != 0) return error.InvalidVideoIndex;
     if (indexed.pictures.len == 0) return error.EmptyVideo;
     if (!indexed.apple_packet_layout) return error.UnsupportedVideoProfile;
@@ -218,9 +218,16 @@ pub const Continuation = struct {
 pub fn decodeTo(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink) !Receipt {
     return decode(a, reader, indexed, selected, options, sink, null, null);
 }
-fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink, continuation: ?*Continuation, validated: ?Configuration) !Receipt {
-    if (@import("builtin").os.tag != .macos) return error.UnsupportedVideoBackend;
-    try reader.input.control.check();
+pub const ReplayPlan = struct {
+    restart: pictures.Restart,
+    end: usize,
+    reuse: bool = false,
+    preserve: bool = false,
+};
+
+/// Compute backend eligibility without changing continuation state or admitting surfaces.
+pub fn planReplay(reader: *const media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, cursor: ?usize) !ReplayPlan {
+    try reader.input.checkControl();
     if (indexed.reader != reader or indexed.operating_point != 0) return error.InvalidVideoIndex;
     if (selected.len == 0 or selected.len > options.decode.max_frames or selected.len > 64) return error.ResourceLimitExceeded;
     if (indexed.pictures.len == 0) return error.EmptyVideo;
@@ -231,29 +238,47 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
         first = @min(first, id);
         last = @max(last, id);
     }
-    const config = if (validated) |config| config else if (continuation) |owner| try owner.validateIndex(reader, indexed) else try validate(reader, indexed);
-    const shape = indexed.pictures[0];
-    var restart: pictures.Restart = .{};
-    var warm = if (continuation) |owner| owner.native != null else false;
-    const end = indexed.pictures[last].packet_index.?;
-    if (warm) {
-        const owner = continuation.?;
-        // Forward work needs no restart-index scan. Seeking must not disturb
-        // references retained for later forward work.
-        if (indexed.pictures[first].packet_index.? < owner.next_packet) return decode(a, reader, indexed, selected, options, sink, null, config);
-        restart = .{ .packet = owner.next_packet, .logical = first };
-        if (options.replay_budget) |budget| {
-            if (end - restart.packet + 1 > options.decode.max_decode_packets or !try budget.fits(indexed, reader, restart, end + 1, reader.input.control)) {
-                owner.reset();
-                warm = false;
+    const first_packet = indexed.pictures[first].packet_index orelse return error.InvalidVideoIndex;
+    const end = indexed.pictures[last].packet_index orelse return error.InvalidVideoIndex;
+    if (end < first_packet or end >= reader.packets.len) return error.InvalidVideoIndex;
+    if (cursor) |packet| {
+        const warm = pictures.Restart{ .packet = packet, .logical = first };
+        if (first_packet >= packet) {
+            if (options.replay_budget == null) {
+                try checkPacketLimit(options, packet, end);
+                return .{ .restart = warm, .end = end, .reuse = true };
             }
+            if (end - packet + 1 <= options.decode.max_decode_packets and try options.replay_budget.?.fits(indexed, reader, warm, end + 1, reader.input.control))
+                return .{ .restart = warm, .end = end, .reuse = true };
         }
     }
-    if (!warm) restart = if (options.replay_budget) |budget| try budget.coldRestart(indexed, reader, first, end + 1, reader.input.control) else indexed.restartFor(first);
-    if (restart.packet > end) return error.InvalidVideoIndex;
-    if (end - restart.packet + 1 > options.decode.max_decode_packets) {
+    const restart = if (options.replay_budget) |budget|
+        try budget.coldRestart(indexed, reader, first, end + 1, reader.input.control)
+    else
+        indexed.restartFor(first);
+    try checkPacketLimit(options, restart.packet, end);
+    return .{ .restart = restart, .end = end, .preserve = if (cursor) |packet| first_packet < packet else false };
+}
+
+fn checkPacketLimit(options: Options, first: usize, end: usize) !void {
+    if (first > end) return error.InvalidVideoIndex;
+    if (end - first + 1 > options.decode.max_decode_packets) {
         return if (options.replay_budget != null) error.AppleReplayPacketLimit else error.ResourceLimitExceeded;
     }
+}
+
+fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink, continuation: ?*Continuation, validated: ?Configuration) !Receipt {
+    if (@import("builtin").os.tag != .macos) return error.UnsupportedVideoBackend;
+    try reader.input.control.check();
+    if (indexed.reader != reader or indexed.operating_point != 0) return error.InvalidVideoIndex;
+    const config = if (validated) |value| value else if (continuation) |owner| try owner.validateIndex(reader, indexed) else try validate(reader, indexed);
+    const cursor = if (continuation) |owner| if (owner.native != null) owner.next_packet else null else null;
+    const plan = try planReplay(reader, indexed, selected, options, cursor);
+    if (plan.preserve) return decode(a, reader, indexed, selected, options, sink, null, config);
+    const restart = plan.restart;
+    const end = plan.end;
+    const warm = plan.reuse;
+    const shape = indexed.pictures[0];
     const bytes = try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, selected.len, shape.bit_depth);
     if (bytes > options.decode.max_surface_bytes) return error.ResourceLimitExceeded;
     const metadata = try std.math.mul(usize, selected.len, @sizeOf(?apple.Surface) + @sizeOf(bool));
@@ -272,6 +297,7 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     defer if (transient) |*session| session.deinit();
     errdefer if (continuation) |owner| owner.reset();
     const session = if (continuation) |owner| retained: {
+        if (!warm and owner.native != null) owner.reset();
         owner.active = &capture;
         if (owner.native == null) {
             // Budget a bounded reference working set separately from selected
