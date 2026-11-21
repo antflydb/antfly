@@ -25,7 +25,8 @@ const c_file = @import("../util/c_file.zig");
 const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 const max_cached_bytes_per_slot = 4 * 1024 * 1024;
-const max_cached_primary_bytes = 1024 * 1024;
+const max_cached_primary_bytes: usize = 1024 * 1024;
+const max_cached_adapter_bytes: usize = 64 * 1024;
 const safetensors = @import("../models/safetensors.zig");
 const revalidate_after_ns = 60 * std.time.ns_per_s;
 const dependency_retry_ns = std.time.ns_per_s;
@@ -84,8 +85,8 @@ pub const Cache = struct {
     const Inspection = struct {
         const Member = struct { path: []const u8, stamp: managed.ArtifactStamp };
         const Members = std.StringHashMapUnmanaged(managed.ArtifactStamp);
-        const Primary = enum { native, onnx };
-        const PrimaryCache = struct {
+        const Dependency = enum { native, onnx, jina_adapter };
+        const DependencyCache = struct {
             const Stamps = struct {
                 arena: std.heap.ArenaAllocator,
                 members: []const Member,
@@ -99,7 +100,7 @@ pub const Cache = struct {
             available: std.atomic.Value(?*Stamps) = .init(null),
             retry_at: ?std.Io.Timestamp = null,
 
-            fn check(self: *PrimaryCache, owner: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, primary: Primary, control: ExecutionControl) !bool {
+            fn check(self: *DependencyCache, owner: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, dependency: Dependency, control: ExecutionControl) !bool {
                 if (self.available.load(.acquire)) |cached| {
                     try validate(cached.members, artifacts, control);
                     return true;
@@ -120,17 +121,17 @@ pub const Cache = struct {
                 defer if (!retained) current.destroy(owner);
                 const a = current.arena.allocator();
                 var members: Members = .empty;
-                collectPrimaryMembers(&members, a, artifacts, manifest, primary, control) catch |err| return self.reject(artifacts.io, err);
+                collectDependencyMembers(&members, a, artifacts, manifest, dependency, control) catch |err| return self.reject(artifacts.io, err);
                 current.members = try freeze(a, &members);
                 validate(current.members, artifacts, control) catch |err| return self.reject(artifacts.io, err);
-                if (current.arena.queryCapacity() <= max_cached_primary_bytes) {
+                if (current.arena.queryCapacity() <= if (dependency == .jina_adapter) max_cached_adapter_bytes else max_cached_primary_bytes) {
                     retained = true;
                     self.available.store(current, .release);
                 }
                 return true;
             }
 
-            fn reject(self: *PrimaryCache, io: std.Io, err: anyerror) !bool {
+            fn reject(self: *DependencyCache, io: std.Io, err: anyerror) !bool {
                 switch (err) {
                     error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled, error.ModelArtifactsChanging => return err,
                     error.ChecksumMismatch, error.CatalogArtifactUnavailable => return false,
@@ -142,7 +143,7 @@ pub const Cache = struct {
         };
         arena: std.heap.ArenaAllocator,
         members: []const Member,
-        primary: [2]PrimaryCache,
+        dependencies_by_role: [std.enums.values(Dependency).len]DependencyCache,
         backend_order: []const backends.BackendType,
         execution_manifest: manifest_mod.ModelManifest,
         summary: model_manager.CompatibilitySummary,
@@ -161,7 +162,7 @@ pub const Cache = struct {
             const a = result.arena.allocator();
             const execution_manifest = try manifest_mod.loadFromPublishedArtifacts(a, path, artifacts, false);
             const checks = try collectCommon(a, artifacts, &execution_manifest, control);
-            result.primary = @splat(.{});
+            result.dependencies_by_role = @splat(.{});
             const order = try a.dupe(backends.BackendType, backend_order);
             const summary = model_manager.compatibilitySummaryForBackendsWithControl(artifacts.allocator, path, manifest, backend_order, control) catch |err| switch (err) {
                 error.OutOfMemory, error.Timeout, error.Cancelled, error.Canceled => return err,
@@ -191,7 +192,12 @@ pub const Cache = struct {
                 if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest.*, field)) == ?[]const u8 and
                     !std.mem.eql(u8, field, "onnx_path") and !std.mem.eql(u8, field, "onnx_logical_path") and
                     !std.mem.eql(u8, field, "gguf_path") and !std.mem.eql(u8, field, "safetensors_path") and
-                    !std.mem.eql(u8, field, "safetensors_index_path"))
+                    !std.mem.eql(u8, field, "safetensors_index_path") and
+                    !std.mem.eql(u8, field, "gguf_projector_path") and
+                    !std.mem.eql(u8, field, "gliner_head_gguf_path") and
+                    !std.mem.eql(u8, field, "gliner_head_safetensors_path") and
+                    !std.mem.eql(u8, field, "jina_adapter_config_path") and
+                    !std.mem.eql(u8, field, "jina_adapter_weights_path"))
                 {
                     if (@field(manifest.*, field)) |member| {
                         try control.check();
@@ -211,27 +217,34 @@ pub const Cache = struct {
             return freeze(a, &members);
         }
 
-        fn collectPrimaryMembers(members: *Members, a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, primary: Primary, control: ExecutionControl) !void {
+        fn collectDependencyMembers(members: *Members, a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, dependency: Dependency, control: ExecutionControl) !void {
             try control.check();
-            switch (primary) {
+            switch (dependency) {
                 .onnx => if (manifest.onnx_path) |graph| {
                     try collectOnnx(members, a, artifacts, graph, manifest.onnx_logical_path orelse graph, control);
                 },
-                .native => switch (manifest.nativeWeightArtifactKind() orelse return) {
-                    .gguf => try add(members, a, artifacts, manifest.gguf_path.?),
-                    .safetensors => try add(members, a, artifacts, manifest.safetensors_path.?),
-                    .sharded_safetensors => {
-                        const index = manifest.safetensors_index_path.?;
-                        try add(members, a, artifacts, index);
-                        const bytes = try artifacts.readPath(index, safetensors.max_header_size);
-                        defer artifacts.allocator.free(bytes);
-                        var shards = try safetensors.inspectIndexDependencies(artifacts.allocator, index, bytes, control);
-                        defer shards.deinit();
-                        for (shards.paths[1..]) |shard| {
-                            try control.check();
-                            try add(members, a, artifacts, shard);
-                        }
-                    },
+                .jina_adapter => if (try manifest.jinaRetrievalAdapter()) |adapter| {
+                    try add(members, a, artifacts, adapter.config);
+                    try add(members, a, artifacts, adapter.weights);
+                },
+                .native => {
+                    if (manifest.nativeCompanionPath()) |companion| try add(members, a, artifacts, companion);
+                    switch (manifest.nativeWeightArtifactKind() orelse return) {
+                        .gguf => try add(members, a, artifacts, manifest.gguf_path.?),
+                        .safetensors => try add(members, a, artifacts, manifest.safetensors_path.?),
+                        .sharded_safetensors => {
+                            const index = manifest.safetensors_index_path.?;
+                            try add(members, a, artifacts, index);
+                            const bytes = try artifacts.readPath(index, safetensors.max_header_size);
+                            defer artifacts.allocator.free(bytes);
+                            var shards = try safetensors.inspectIndexDependencies(artifacts.allocator, index, bytes, control);
+                            defer shards.deinit();
+                            for (shards.paths[1..]) |shard| {
+                                try control.check();
+                                try add(members, a, artifacts, shard);
+                            }
+                        },
+                    }
                 },
             }
         }
@@ -272,8 +285,8 @@ pub const Cache = struct {
         }
 
         fn destroy(self: *Inspection, owner: std.mem.Allocator) void {
-            for (&self.primary) |*primary| {
-                if (primary.available.load(.monotonic)) |cached| cached.destroy(owner);
+            for (&self.dependencies_by_role) |*cache| {
+                if (cache.available.load(.monotonic)) |cached| cached.destroy(owner);
             }
             self.arena.deinit();
             owner.destroy(self);
@@ -349,7 +362,7 @@ pub const Cache = struct {
             }
             const owner = snapshot.artifacts.allocator;
             const inspection = try Inspection.create(owner, artifacts, path, manifest, backend_order, control);
-            if (snapshot.inspection.load(.monotonic) == null and inspection.arena.queryCapacity() <= max_cached_bytes_per_slot - 2 * max_cached_primary_bytes) {
+            if (snapshot.inspection.load(.monotonic) == null and inspection.arena.queryCapacity() <= max_cached_bytes_per_slot - 2 * max_cached_primary_bytes - max_cached_adapter_bytes) {
                 snapshot.inspection.store(inspection, .release);
                 return inspection.summary;
             }
@@ -365,24 +378,27 @@ pub const Cache = struct {
         pub fn filterEmbeddingRevisions(self: Borrow, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, revisions: *model_manager.ModelManager.EmbeddingRevisions, control: ExecutionControl) !model_manager.ModelManager.EmbeddingRevisions {
             var rejected: model_manager.ModelManager.EmbeddingRevisions = .{};
             const inspection = self.request_inspection orelse self.snapshot.inspection.load(.acquire) orelse return rejected;
-            var verified: [2]?bool = @splat(null);
+            var verified: [std.enums.values(Inspection.Dependency).len]?bool = @splat(null);
             var kept: usize = 0;
             for (revisions.backends[0..revisions.len], revisions.revisions[0..revisions.len]) |backend, revision| {
-                const primary: Inspection.Primary = if (model_manager.embeddingBackendUsesOnnxPrimary(manifest.*, backend)) .onnx else .native;
-                const i = @backingInt(primary);
-                if (verified[i] == null) {
-                    // Inspect the selected closure lazily. A cold native-only
-                    // probe never needs to map or walk the optional ONNX graph.
-                    const cache = &inspection.primary[i];
-                    verified[i] = cache.check(self.snapshot.artifacts.allocator, artifacts, &inspection.execution_manifest, primary, control) catch |err| switch (err) {
-                        error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
-                        else => invalid: {
-                            self.invalidate();
-                            break :invalid false;
-                        },
-                    };
-                }
-                if (verified[i].?) {
+                const primary: Inspection.Dependency = if (model_manager.embeddingBackendUsesOnnxPrimary(manifest.*, backend)) .onnx else .native;
+                const required = [_]Inspection.Dependency{ primary, .jina_adapter };
+                const count: usize = if (model_manager.embeddingBackendUsesJinaAdapter(manifest.*, backend)) 2 else 1;
+                const available = for (required[0..count]) |dependency| {
+                    const i = @backingInt(dependency);
+                    if (verified[i] == null) {
+                        const cache = &inspection.dependencies_by_role[i];
+                        verified[i] = cache.check(self.snapshot.artifacts.allocator, artifacts, &inspection.execution_manifest, dependency, control) catch |err| switch (err) {
+                            error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                            else => invalid: {
+                                self.invalidate();
+                                break :invalid false;
+                            },
+                        };
+                    }
+                    if (!verified[i].?) break false;
+                } else true;
+                if (available) {
                     revisions.backends[kept] = backend;
                     revisions.revisions[kept] = revision;
                     kept += 1;

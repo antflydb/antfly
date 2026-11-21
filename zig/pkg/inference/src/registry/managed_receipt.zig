@@ -48,6 +48,7 @@ pub const DownloadReceipt = struct {
 pub const DamagedReceipt = struct {
     parsed: std.json.Parsed(DownloadReceipt),
     publication: [32]u8,
+    member: ?[]const u8,
 };
 
 pub const ValidatedArtifact = struct {
@@ -316,6 +317,21 @@ pub fn resolveContainedArtifactPath(
     return canonical_path;
 }
 
+/// Recheck the member that caused a strict inventory check to fail. Use
+/// the current contained target so repairing a missing symlink also counts.
+pub fn memberHasDeclaredSize(allocator: std.mem.Allocator, io: std.Io, canonical_root: []const u8, member: *const ValidatedArtifact) !bool {
+    const path = resolveContainedArtifactFromCanonicalRoot(allocator, io, canonical_root, member.path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.ModelArtifactOutsideRoot, error.InvalidModelArtifactPath => return false,
+        else => return err,
+    };
+    defer allocator.free(path);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    return stat.kind == .file and stat.size == member.size;
+}
+
 /// Load and validate a managed completion receipt.
 ///
 /// `null` means the directory is unmanaged. A present but invalid, incomplete,
@@ -387,11 +403,12 @@ fn loadValidatedSource(
         else => return error.InvalidManagedDownload,
     };
     var artifact_damaged = false;
+    var damaged_member: ?[]const u8 = null;
     errdefer {
         if (artifact_damaged and damaged != null) {
             var publication: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(receipt_json, &publication, .{});
-            damaged.?.* = .{ .parsed = parsed, .publication = publication };
+            damaged.?.* = .{ .parsed = parsed, .publication = publication, .member = damaged_member };
         } else parsed.deinit();
     }
     try control.check();
@@ -451,6 +468,7 @@ fn loadValidatedSource(
                 break :missing try std.fs.path.join(allocator, &.{ canonical_root, artifact.path });
             } else {
                 artifact_damaged = true;
+                damaged_member = artifact.path;
                 return error.InvalidManagedDownload;
             },
             else => return err,
@@ -460,12 +478,14 @@ fn loadValidatedSource(
             const stat = cwd.statFile(io, canonical_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
                 error.FileNotFound, error.NotDir => {
                     artifact_damaged = true;
+                    damaged_member = artifact.path;
                     return error.InvalidManagedDownload;
                 },
                 else => return err,
             };
             if (stat.kind != .file or stat.size != artifact.size) {
                 artifact_damaged = true;
+                damaged_member = artifact.path;
                 return error.InvalidManagedDownload;
             }
         }

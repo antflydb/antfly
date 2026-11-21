@@ -552,6 +552,17 @@ pub fn embeddingBackendUsesOnnxPrimary(manifest: manifest_mod.ModelManifest, bac
     return artifactCandidateForBackend(manifest, backend) == .onnx;
 }
 
+pub fn embeddingBackendUsesJinaAdapter(manifest: manifest_mod.ModelManifest, backend: backends.BackendType) bool {
+    return session_factory.usesJinaRetrievalAdapter(manifest, backend);
+}
+
+/// Gemma's execution identity and backend setup use one native SafeTensors
+/// checkpoint. An index or an alternate export cannot supply that identity.
+fn embeddingGemma2Weights(manifest: manifest_mod.ModelManifest) ![]const u8 {
+    if (manifest.nativeWeightArtifactKind() != .safetensors) return error.UnsupportedEmbeddingGemma2Weights;
+    return manifest.safetensors_path.?;
+}
+
 fn artifactCandidateForBackend(
     man: manifest_mod.ModelManifest,
     backend: backends.BackendType,
@@ -10411,7 +10422,7 @@ pub const ModelManager = struct {
 
     fn chunkPlanningGemmaIdentity(self: *ModelManager, model_dir: []const u8, man: manifest_mod.ModelManifest, io: std.Io, control: InferenceExecutionControl) ![64]u8 {
         const identity = @import("../models/embedding_gemma2_identity.zig");
-        const snapshot = try identity.snapshotCached(self.allocator, io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights, control);
+        const snapshot = try identity.snapshotCached(self.allocator, io, model_dir, try embeddingGemma2Weights(man), control);
         return identity.forBackend(snapshot.digest, embeddingPlanningBackend(self.session_manager));
     }
 
@@ -10523,6 +10534,9 @@ pub const ModelManager = struct {
         try control.check();
         if (!std.meta.eql(manifest.managed_publication, artifacts.publication)) return error.ModelArtifactsChanging;
         if (!hasCompleteChecksums(artifacts)) return result;
+        if (manifest.embedding_style == .embedding_gemma2) {
+            _ = embeddingGemma2Weights(manifest) catch return result;
+        }
         const receipt = &artifacts.receipt.?;
         const slot = &self.declared_receipt_revisions[receipt.publication_generation[0] % self.declared_receipt_revisions.len];
         const declared = try slot.get(self.allocator, artifacts.io, receipt, control);
@@ -10830,7 +10844,7 @@ pub const ModelManager = struct {
         } else try modelIdentityWithArtifacts(self.allocator, publication_io, model_dir, man, tokenizer_artifacts, control orelse .{});
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
-            try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
+            try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, try embeddingGemma2Weights(man))
         else
             null;
 

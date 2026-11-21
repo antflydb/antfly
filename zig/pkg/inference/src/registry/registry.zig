@@ -356,6 +356,7 @@ pub const ManagedSelection = struct {
     publication: ?[32]u8 = null,
     rejected: bool = false,
     damaged: bool = false,
+    damaged_member: ?[]const u8 = null,
 };
 pub fn managedModelSelectorsAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) ![]const []const u8 {
     return (try managedModelSelectionAlloc(allocator, io, model_dir)).names;
@@ -2258,6 +2259,7 @@ fn modelDirectorySelection(io: Io, path: []const u8, selection_allocator: ?std.m
             var selection = try managedModelSelectionFromDeclaration(selection_allocator.?, candidate.parsed.value, candidate.publication);
             if (selection.rejected) return null;
             selection.damaged = true;
+            selection.damaged_member = if (candidate.member) |member| try selection_allocator.?.dupe(u8, member) else null;
             return selection;
         }
         return switch (err) {

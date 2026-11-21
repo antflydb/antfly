@@ -27247,17 +27247,28 @@ pub const Node = struct {
                         return err;
                     };
                     if (scope.*) |*captured| {
-                        const manifest = manifest_mod.loadFromPublishedArtifacts(a, entry.path, &captured.artifacts, true) catch |err| {
+                        var manifest = manifest_mod.loadFromPublishedArtifacts(a, entry.path, &captured.artifacts, true) catch |err| {
                             if (replica_probe and isPinnedCatalogArtifactFailure(err)) return err;
                             if (manifest_mod.isListingCandidateRejection(err)) break :candidate .{ .rejected = err };
                             return err;
                         };
+                        errdefer manifest.deinit();
                         const verification_cache = &self.model_manager.verified_artifacts;
                         if (captured.artifacts.hasKnownChecksumRejections(verification_cache))
                             captured.artifacts.verification_cache = verification_cache;
-                        // Let execution resolve a repaired selector immediately,
-                        // even when in-place repair leaves the receipt unchanged.
-                        if (entry.installation_selection.damaged) if (borrowed) |lease| lease.invalidateIfCurrent();
+                        // An optional export can leave a healthy pinned route
+                        // in a damaged installation. Refresh strict selector
+                        // ownership only when the recorded failed member recovers.
+                        if (entry.installation_selection.damaged_member) |member| if (borrowed) |lease| {
+                            if (captured.artifacts.receipt.?.find(member)) |recorded| {
+                                const receipt = @import("../registry/managed_receipt.zig");
+                                const recovered = receipt.memberHasDeclaredSize(a, io, captured.artifacts.physical_root, recorded) catch |err| switch (err) {
+                                    error.OutOfMemory, error.Canceled => return err,
+                                    else => false,
+                                };
+                                if (recovered) lease.invalidateIfCurrent();
+                            }
+                        };
                         break :candidate .{ .manifest = manifest };
                     }
                 }
@@ -51272,14 +51283,18 @@ test "model selection reuses the verified resident installation for embedding re
 }
 
 test "scoped model discovery reuses compatibility and refuses a truncated extensionless shard" {
-    try testScopedShardedDiscovery(false);
+    try testScopedShardedDiscovery(false, false);
 }
 
 test "scoped model discovery keeps native revisions when an alternate ONNX dependency is invalid" {
-    try testScopedShardedDiscovery(true);
+    try testScopedShardedDiscovery(true, false);
 }
 
-fn testScopedShardedDiscovery(comptime with_onnx: bool) !void {
+test "scoped model discovery withholds revision pinning for sharded EmbeddingGemma 2" {
+    try testScopedShardedDiscovery(false, true);
+}
+
+fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime gemma: bool) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const managed = @import("../registry/managed_receipt.zig");
@@ -51288,7 +51303,7 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool) !void {
     const path = "embedders/acme/sharded";
     const shard_path = "parts/weight";
     const index_path = "model.safetensors.index.json";
-    const config = @embedFile("../architectures/embedding_gemma2_config.json");
+    const config = if (gemma) @embedFile("../architectures/embedding_gemma2_config.json") else "{\"model_type\":\"bert\",\"architectures\":[\"BertModel\"],\"hidden_size\":32,\"num_attention_heads\":2,\"num_hidden_layers\":2,\"intermediate_size\":64}";
     const index = "{\"weight_map\":{\"model.embed_tokens.weight\":\"" ++ shard_path ++ "\"}}";
     const weights = "scoped catalog shard fixture";
     try tmp.dir.createDirPath(io, path ++ "/parts");
@@ -51323,7 +51338,7 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool) !void {
     var request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fsharded&task=embed&model_revision_candidates=1");
     defer request.deinit();
 
-    for (0..2) |_| {
+    for (0..2) |attempt| {
         var ctx = httpx.Context.init(a, io, &request);
         defer ctx.deinit();
         const before = request_work_test_counters.compatibility_checkpoint_samples;
@@ -51333,9 +51348,11 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
         defer parsed.deinit();
         const model = parsed.value.object.get("embedders").?.object.get("acme/sharded").?;
-        try std.testing.expect(model.object.get("model_revision_pinning").?.bool);
-        try std.testing.expectEqual(before, request_work_test_counters.compatibility_checkpoint_samples);
+        try std.testing.expectEqual(!gemma, model.object.get("model_revision_pinning").?.bool);
+        if (attempt != 0) try std.testing.expectEqual(before, request_work_test_counters.compatibility_checkpoint_samples);
     }
+
+    if (gemma) return;
 
     if (with_onnx) {
         const model_dir = try std.fs.path.join(a, &.{ root, path });
@@ -51371,6 +51388,15 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool) !void {
         defer parsed.deinit();
         const model = parsed.value.object.get("embedders").?.object.get("acme/sharded").?;
         try std.testing.expect(model.object.get("model_revision_pinning").?.bool);
+        const rebuilds = node.selector_cache.?.rebuilds;
+        for (0..2) |_| {
+            var repeated_ctx = httpx.Context.init(a, io, &request);
+            defer repeated_ctx.deinit();
+            var repeated = try node.listModels(&repeated_ctx);
+            defer repeated.deinit();
+            try std.testing.expectEqual(@as(u16, 200), repeated.status.code);
+        }
+        try std.testing.expectEqual(rebuilds, node.selector_cache.?.rebuilds);
         var preparation = model_manager_mod.PreparedPinnedEmbedding{ .manager = &node.model_manager };
         defer preparation.deinit();
         var pinned = PinnedRequestSelection{ .node = &node, .proof = &preparation, .control = control };
@@ -51407,6 +51433,62 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool) !void {
     var repaired = try node.listModels(&repaired_ctx);
     defer repaired.deinit();
     try std.testing.expectEqual(@as(u16, 200), repaired.status.code);
+}
+
+test "scoped model discovery isolates a damaged Jina adapter from CPU GGUF" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const managed = @import("../registry/managed_receipt.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "adapters/retrieval");
+    const files = .{
+        .{ "config.json", "{\"model_type\":\"jina_embeddings_v5\",\"architectures\":[\"JinaEmbeddingsV5Model\"],\"hidden_size\":32}" },
+        .{ "model.gguf", "metadata-only GGUF fixture" },
+        .{ "adapters/retrieval/adapter_config.json", "{}" },
+        .{ "adapters/retrieval/adapter_model.safetensors", "adapter fixture" },
+    };
+    var artifacts: [files.len]managed.ArtifactReceipt = undefined;
+    var hashes: [files.len][64]u8 = undefined;
+    inline for (files, 0..) |file, i| {
+        try tmp.dir.writeFile(io, .{ .sub_path = file[0], .data = file[1] });
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(file[1], &digest, .{});
+        hashes[i] = std.fmt.bytesToHex(digest, .lower);
+        artifacts[i] = .{ .path = file[0], .size = file[1].len, .sha256 = &hashes[i] };
+    }
+    const receipt_bytes = try std.json.Stringify.valueAlloc(a, managed.DownloadReceipt{
+        .version = 2,
+        .source = .{ .owner = "acme", .name = "jina", .variant = "gguf", .selected_format = "gguf" },
+        .artifacts = &artifacts,
+    }, .{});
+    defer a.free(receipt_bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = receipt_bytes });
+    try tmp.dir.deleteFile(io, "adapters/retrieval/adapter_model.safetensors");
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var cache: ScopedCatalogCache = .{};
+    defer cache.deinit();
+    const control = InferenceExecutionControl{ .io = io };
+    var publication = (try ScopedCatalogPublication.open(&cache, a, a, io, root, try managed.publicationGeneration(a, io, root), control)).?;
+    defer publication.deinit();
+    var listing = try manifest_mod.loadFromPublishedArtifacts(a, root, &publication.artifacts, true);
+    defer listing.deinit();
+    _ = try publication.borrow.compatibility(&publication.artifacts, root, &listing, &.{.native}, control);
+    const manifest = publication.borrow.executionManifest().?;
+    try std.testing.expectEqualStrings("jina_embeddings_v5", manifest.config_model_arch);
+    try std.testing.expectEqual(manifest_mod.NativeWeightArtifactKind.gguf, manifest.nativeWeightArtifactKind().?);
+    try std.testing.expect(manifest.jina_adapter_weights_path != null);
+
+    var candidates: model_manager_mod.ModelManager.EmbeddingRevisions = .{};
+    candidates.backends[0..2].* = .{ .metal, .native };
+    candidates.revisions[0..2].* = .{ @splat(1), @splat(2) };
+    candidates.len = 2;
+    const rejected = try publication.borrow.filterEmbeddingRevisions(&publication.artifacts, manifest, &candidates, control);
+    try std.testing.expectEqual(@as(usize, 1), candidates.len);
+    try std.testing.expect(candidates.contains(@splat(2)));
+    try std.testing.expect(rejected.contains(@splat(1)));
 }
 
 test "scoped model discovery resolves dense geometry without loading weights" {

@@ -300,6 +300,8 @@ pub const Inventory = struct {
                 const damaged_names = try a.alloc([]const u8, entry.installation_selection.names.len);
                 for (entry.installation_selection.names, damaged_names) |name, *value| value.* = try a.dupe(u8, name);
                 out.installation_selection.names = damaged_names;
+                if (entry.installation_selection.damaged_member) |member|
+                    out.installation_selection.damaged_member = try a.dupe(u8, member);
             }
             const strings = try a.alloc([]const u8, selectors.len);
             for (selectors, strings) |name, *value| value.* = try a.dupe(u8, name);
