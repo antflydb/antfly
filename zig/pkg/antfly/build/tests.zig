@@ -1389,6 +1389,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "embedded api hosted profile drains derived indexing without native runtimes",
             "embedded api hosted profile persists text index across reopen over storage",
             "embedded api hosted profile persists text and vectors over host file storage",
+            "embedded api host file storage implements the storage file contract",
+            "embedded api host file storage lists more names than one buffer holds",
             "embedded api createLite provisions default full text index",
             "embedded api openLite round-trips batch lookup over aflite file",
             "embedded api openLite manages index and enrichment definitions over aflite file",

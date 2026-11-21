@@ -20,8 +20,9 @@ export const localSchema = Object.freeze({
   vectorIndex: (dimensions) => ({
     name: "mail_semantic",
     kind: "dense_vector",
-    // Vectors come from the browser's EmbeddingGemma2, not from Antfly.
-    config_json: JSON.stringify({ dims: dimensions, metric: "cosine", external: true }),
+    // Vectors come from the browser's EmbeddingGemma2 via _embeddings, not
+    // from Antfly; the engine still requires a field name for the index.
+    config_json: JSON.stringify({ field: "embedding", dims: dimensions, metric: "cosine", external: true }),
   }),
   vectorIndexName: "mail_semantic",
   key: (id) => "message/" + id,

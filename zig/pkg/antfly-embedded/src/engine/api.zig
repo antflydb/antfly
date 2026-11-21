@@ -807,6 +807,88 @@ test "embedded api hosted profile persists text index across reopen over storage
     }
 }
 
+test "embedded api host file storage implements the storage file contract" {
+    const host_files = support.host_file_storage;
+    const a = std.testing.allocator;
+    var host = host_files.MemoryHost.init(a);
+    defer host.deinit();
+    var backend = host_files.HostFileStorage.init(host.ops());
+    const s = backend.storage();
+
+    try std.testing.expectError(error.FileNotFound, s.fileSize("/db/missing"));
+    try s.writeFileAbsolute("/db/a/one", "hello");
+    try s.appendFileAbsolute(a, "/db/a/one", " world", true);
+    try std.testing.expectEqual(@as(u64, 11), try s.fileSize("/db/a/one"));
+    try std.testing.expect(host.syncs == 1);
+
+    const all = try s.readFileAlloc(a, "/db/a/one", 64);
+    defer a.free(all);
+    try std.testing.expectEqualStrings("hello world", all);
+    try std.testing.expectError(error.FileTooBig, s.readFileAlloc(a, "/db/a/one", 4));
+
+    const range = try s.readFileRangeAlloc(a, "/db/a/one", 6, 5);
+    defer a.free(range);
+    try std.testing.expectEqualStrings("world", range);
+    try std.testing.expectError(error.EndOfStream, s.readFileRangeAlloc(a, "/db/a/one", 7, 5));
+    try std.testing.expectError(error.EndOfStream, s.readFileRangeAlloc(a, "/db/a/one", 12, 0));
+
+    var trailer = try s.readFileTrailerAlloc(a, "/db/a/one", 5);
+    defer trailer.deinit(a);
+    try std.testing.expectEqualStrings("world", trailer.bytes);
+    try std.testing.expectEqual(@as(u64, 11), trailer.file_size);
+
+    // Rename atomically replaces an existing destination.
+    try s.writeFileAbsolute("/db/a/two", "old");
+    try s.writeFileAbsolute("/db/a/two.tmp", "new");
+    try s.renameAbsolute("/db/a/two.tmp", "/db/a/two");
+    const two = try s.readFileAlloc(a, "/db/a/two", 16);
+    defer a.free(two);
+    try std.testing.expectEqualStrings("new", two);
+    try std.testing.expectError(error.FileNotFound, s.fileSize("/db/a/two.tmp"));
+    try std.testing.expectError(error.FileNotFound, s.renameAbsolute("/db/none", "/db/x"));
+
+    try s.writeFileAbsolute("/db/b/deep/three", "3");
+    const files = try s.listFileNamesAlloc(a, "/db/a");
+    defer {
+        for (files) |name| a.free(name);
+        a.free(files);
+    }
+    try std.testing.expectEqual(@as(usize, 2), files.len);
+    const dirs = try s.listDirectoryNamesAlloc(a, "/db");
+    defer {
+        for (dirs) |name| a.free(name);
+        a.free(dirs);
+    }
+    try std.testing.expectEqual(@as(usize, 2), dirs.len);
+
+    try s.deleteFileAbsolute("/db/a/one");
+    try std.testing.expectError(error.FileNotFound, s.deleteFileAbsolute("/db/a/one"));
+    try s.deleteTree("/db/b");
+    try std.testing.expectError(error.FileNotFound, s.fileSize("/db/b/deep/three"));
+    try std.testing.expectEqual(@as(u64, 3), try s.fileSize("/db/a/two"));
+
+    host.fail_next_write = host_files.status.no_space;
+    try std.testing.expectError(error.NoSpaceLeft, s.writeFileAbsolute("/db/full", "x"));
+    try std.testing.expect(s.nowNs() < s.nowNs());
+}
+
+test "embedded api host file storage lists more names than one buffer holds" {
+    const host_files = support.host_file_storage;
+    const a = std.testing.allocator;
+    var host = host_files.MemoryHost.init(a);
+    defer host.deinit();
+    var backend = host_files.HostFileStorage.init(host.ops());
+    const s = backend.storage();
+    var name_buf: [64]u8 = undefined;
+    for (0..600) |i| try s.writeFileAbsolute(try std.fmt.bufPrint(&name_buf, "/db/segment-{d:0>8}.sst", .{i}), "x");
+    const names = try s.listFileNamesAlloc(a, "/db");
+    defer {
+        for (names) |name| a.free(name);
+        a.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 600), names.len);
+}
+
 test "embedded api hosted profile persists text and vectors over host file storage" {
     const host_files = support.host_file_storage;
     const alloc = std.testing.allocator;
@@ -824,7 +906,7 @@ test "embedded api hosted profile persists text and vectors over host file stora
         var api = try Api.openHosted(alloc, "/mail", options);
         defer api.close();
         try api.db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
-        const created = try api.addIndexJson(alloc, "{\"name\":\"mail_semantic\",\"kind\":\"dense_vector\",\"config_json\":\"{\\\"dims\\\":3,\\\"metric\\\":\\\"cosine\\\",\\\"external\\\":true}\"}");
+        const created = try api.addIndexJson(alloc, "{\"name\":\"mail_semantic\",\"kind\":\"dense_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"dims\\\":3,\\\"metric\\\":\\\"cosine\\\",\\\"external\\\":true}\"}");
         defer alloc.free(created);
         for (0..3) |round| {
             var body_buf: [512]u8 = undefined;

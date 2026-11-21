@@ -226,7 +226,7 @@ test("local documents carry display fields, one lexical field and the vector", (
   assert.match(doc.content, /plumber@example.test/);
   assert.throws(() => documentFor(message, [NaN]), /InvalidLocalVector/);
   assert.throws(() => documentFor(message, []), /InvalidLocalVector/);
-  assert.deepEqual(JSON.parse(localSchema.vectorIndex(256).config_json), { dims: 256, metric: "cosine", external: true });
+  assert.deepEqual(JSON.parse(localSchema.vectorIndex(256).config_json), { field: "embedding", dims: 256, metric: "cosine", external: true });
 
   const hybrid = searchRequest("  invoice ", [1, 0], 5);
   assert.deepEqual(hybrid.full_text_search, { match: { field: "content", text: "invoice" } });

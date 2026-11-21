@@ -241,7 +241,7 @@ const opfs = opfsDirectory();
 const pool = await openOpfsFileSystem(opfs, { initialSlots: 64, reserve: 32 });
 const fsApi = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, { fileSystem: pool });
 fsApi.openFileSystem("/mail");
-fsApi.addIndex({ name: "mail_semantic", kind: "dense_vector", config_json: JSON.stringify({ dims: 3, metric: "cosine", external: true }) });
+fsApi.addIndex({ name: "mail_semantic", kind: "dense_vector", config_json: JSON.stringify({ field: "embedding", dims: 3, metric: "cosine", external: true }) });
 for (let round = 0; round < 4; round++) {
     await pool.ensureCapacity();
     fsApi.putMany({
