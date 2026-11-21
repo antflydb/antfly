@@ -6101,6 +6101,9 @@ pub const ModelManager = struct {
                 }) orelse continue;
                 break :resolved loaded_runtime.durableEmbeddingRevisionWithCudaPolicy(manifest, artifact_revision, backend, policy);
             } else durableEmbeddingRevision(manifest, artifact_revision, backend);
+            if (expected) |pin| {
+                if (!std.mem.eql(u8, &pin, &revision)) continue;
+            }
             result.backends[result.len] = backend;
             result.revisions[result.len] = revision;
             result.len += 1;

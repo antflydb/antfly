@@ -27921,7 +27921,7 @@ pub const Node = struct {
                     break :pin requested;
                 } else null;
                 var declared = if (pin_scope) |scope|
-                    self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, &scope.artifacts, if (include_revisions) null else expected_pin) catch |err| {
+                    self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, &scope.artifacts, expected_pin) catch |err| {
                         if (isPinnedCatalogArtifactFailure(err)) {
                             // A checksum refusal can arrive after discovery
                             // captured healthy-looking size and path stamps.
