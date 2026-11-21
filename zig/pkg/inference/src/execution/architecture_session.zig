@@ -730,7 +730,7 @@ pub fn createGemma4CudaQualificationSession(allocator: std.mem.Allocator, model_
     errdefer session.close();
     if (comptime build_options.enable_cuda) {
         const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-        const compute = &self.backend_data.cuda.compute;
+        const compute = self.backend_data.cuda.compute;
         const cfg = getGptConfig(session) orelse return error.WrongArchitecture;
         if (compute.gemma4_dense_qualified and @import("../ops/cuda/ple_host.zig").eligibleConfig(cfg) and
             compute.ctx.info.compute_major == 12 and compute.ctx.info.compute_minor == 1)
