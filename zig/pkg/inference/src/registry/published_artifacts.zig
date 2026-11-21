@@ -170,6 +170,9 @@ pub const PublishedArtifacts = struct {
     receipt: ?managed.ValidatedReceipt,
     publication: ?[32]u8,
     verification_scope: ?[32]u8,
+    // A catalog snapshot may supply the digest after revalidating every
+    // filesystem alias on which checksum inheritance depends.
+    bound_declared_revision: ?[32]u8 = null,
     installation: ?managed.Installation = null,
     verified_stamps: []?managed.ArtifactStamp = &.{},
     canonical_index: std.StringHashMapUnmanaged(usize) = .empty,

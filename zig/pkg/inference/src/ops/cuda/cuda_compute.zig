@@ -2393,7 +2393,7 @@ const EmbeddingGemma2CudaProviders = struct {
 pub fn probeEmbeddingGemma2Policy(allocator: std.mem.Allocator) !@import("embedding_gemma2_policy.zig").Policy {
     var ctx = try context_mod.CudaContext.initDefault();
     defer ctx.deinit();
-    var lt = initCublasLtIfAvailable(allocator, &ctx);
+    var lt = try initCublasLtIfAvailable(allocator, &ctx);
     defer if (lt) |*value| value.deinit();
     const tuning = try CublasLtBf16TuningProfile.resolve(ctx.info.compute_major, ctx.info.compute_minor);
     if (tuning.from_env and tuning.profile != .off and lt == null) return error.InvalidCudaState;
@@ -8594,7 +8594,8 @@ pub const CudaCompute = struct {
             ctx.info.compute_minor,
         );
         const sm89_q4_0_ggml_q8_1_gate = try Sm89Q4_0GgmlQ8_1Gate.resolve();
-        var cublaslt = initCublasLtIfAvailable(allocator, &ctx);
+        var cublaslt = initCublasLtIfAvailable(allocator, &ctx) catch |err|
+            if (profile == .embedding_gemma2) return err else null;
         errdefer if (cublaslt) |*blas| blas.deinit();
         if (profile == .lightonocr3) if (cublaslt) |*blas| try blas.setPlanCacheCapacity(platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES") orelse 1024);
         if (cublaslt) |*blas| blas.florence_canonical_f16_decode = profile == .florence2 and ctx.info.compute_major == 12 and ctx.info.compute_minor == 1 and
@@ -12453,10 +12454,13 @@ fn cudaDenseHostPrefetchBudgetBytes() usize {
     return budget_mb * 1024 * 1024;
 }
 
-fn initCublasLtIfAvailable(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext) ?cublaslt_mod.CublasLt {
+fn initCublasLtIfAvailable(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext) !?cublaslt_mod.CublasLt {
     if (!cudaCublasLtEnabled()) return null;
     if (ctx.info.compute_major < 8) return null;
-    return cublaslt_mod.CublasLt.openWithAllocator(allocator, ctx) catch null;
+    return cublaslt_mod.CublasLt.openWithAllocator(allocator, ctx) catch |err| switch (err) {
+        error.CublasLtUnavailable, error.CublasLtSymbolMissing => null,
+        else => return err,
+    };
 }
 
 fn cudaCublasLtWarmupEnabled() bool {

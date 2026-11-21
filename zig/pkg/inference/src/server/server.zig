@@ -3425,6 +3425,7 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         .retryable = false,
     });
     if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
+    if (err == error.MemoryBudgetExceeded) return inferenceFailureResponse(ctx, err);
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     return switch (err) {
@@ -27929,6 +27930,8 @@ pub const Node = struct {
                 else
                     model_manager_mod.ModelManager.EmbeddingRevisions{};
                 if (declared.len == 0 and rejected.len != 0) return embeddingArtifactFailureResponse(ctx);
+                if (declared.len == 0 and declared.cuda_probe_refused)
+                    return modelResourceBusyResponse(ctx);
                 var revision: ?[32]u8 = if (cached_model) |*handle| loaded: {
                     // The held runtime supplies both geometry and revision.
                     const serving = handle.get();
@@ -27968,8 +27971,10 @@ pub const Node = struct {
                     if (required.len != 64) return embeddingRevisionFailureResponse(ctx);
                     _ = std.fmt.hexToBytes(&requested, required) catch return embeddingRevisionFailureResponse(ctx);
                     if (rejected.contains(requested) and !declared.contains(requested)) return embeddingArtifactFailureResponse(ctx);
-                    if (!std.meta.eql(durable_revision, @as(?[32]u8, requested)) and !declared.contains(requested))
+                    if (!std.meta.eql(durable_revision, @as(?[32]u8, requested)) and !declared.contains(requested)) {
+                        if (declared.cuda_probe_refused) return (try pinnedEmbeddingPreflightFailure(ctx, requested, error.PinnedEmbeddingBackendUnavailable)).?;
                         return embeddingRevisionFailureResponse(ctx);
+                    }
                     durable_revision = requested;
                     revision = requested;
                 };
@@ -27996,6 +28001,7 @@ pub const Node = struct {
                 defer parsed_limits.deinit();
                 try info.object.put(catalog_allocator, "chunking_limits", parsed_limits.value);
                 if (scoped_artifacts) |artifacts| artifacts.verifyPublication() catch |err| return modelLoadFailureResponse(ctx, err);
+                if (scoped_publication) |*scope| scope.borrow.verifyAliasBindings(ctx.allocator, ctx.io, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 catalog_publication.require(ctx.allocator, ctx.io, self.config.models_dir, catalog_generation) catch |err| return modelLoadFailureResponse(ctx, err);
                 return ctx.json(catalog.value);
             };

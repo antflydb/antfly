@@ -401,7 +401,7 @@ pub const CublasLt = struct {
     }
 
     pub fn openWithAllocator(allocator: ?std.mem.Allocator, ctx: *context_mod.CudaContext) Error!CublasLt {
-        ctx.makeCurrent() catch return error.CublasLtUnavailable;
+        ctx.makeCurrent() catch return error.CublasLtError;
         var lib = openLibrary() catch return error.CublasLtUnavailable;
         errdefer lib.close();
         const fns = Table{
@@ -421,7 +421,7 @@ pub const CublasLt = struct {
             .cublasLtMatmulAlgoCheck = lookup(&lib, @TypeOf(@as(Table, undefined).cublasLtMatmulAlgoCheck), "cublasLtMatmulAlgoCheck") catch return error.CublasLtSymbolMissing,
         };
         var handle: Handle = null;
-        if (fns.cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS) return error.CublasLtUnavailable;
+        if (fns.cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS) return error.CublasLtError;
         return .{
             .allocator = allocator,
             .lib = lib,

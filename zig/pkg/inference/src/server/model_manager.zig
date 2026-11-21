@@ -1556,26 +1556,62 @@ const CudaGemmaPolicyProbe = struct {
     lock: std.Io.Mutex = .init,
     expires: std.Io.Timestamp = .zero,
     policy: ?CudaGemmaPolicy = null,
+    refused: bool = false,
 
     fn resolve(self: *CudaGemmaPolicyProbe, a: std.mem.Allocator, io: std.Io, control: InferenceExecutionControl) !?CudaGemmaPolicy {
         if (comptime !build_options.enable_cuda) return null;
+        return self.resolveWithProbe(a, io, control, @import("../ops/cuda/cuda_compute.zig").probeEmbeddingGemma2Policy);
+    }
+
+    fn resolveWithProbe(self: *CudaGemmaPolicyProbe, a: std.mem.Allocator, io: std.Io, control: InferenceExecutionControl, comptime probe: anytype) !?CudaGemmaPolicy {
         try managed_receipt.lockVerification(control, &self.lock, io);
         defer self.lock.unlock(io);
-        if (std.Io.Timestamp.now(io, .awake).nanoseconds < self.expires.nanoseconds) return self.policy;
+        if (std.Io.Timestamp.now(io, .awake).nanoseconds < self.expires.nanoseconds) {
+            if (self.refused) return error.PinnedEmbeddingBackendUnavailable;
+            return self.policy;
+        }
         var guard = try control.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
-        const result: anyerror!CudaGemmaPolicy = @import("../ops/cuda/cuda_compute.zig").probeEmbeddingGemma2Policy(a);
+        const result: anyerror!CudaGemmaPolicy = probe(a);
+        var refused = false;
         const policy: ?CudaGemmaPolicy = result catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => null,
+            error.CudaUnavailable, error.CudaSymbolMissing, error.CudaDriverTooOld, error.CudaArtifactUnsupportedDevice, error.NoCudaDevices, error.CudaLibrariesUnavailable, error.CublasBf16Unavailable, error.CudnnUnavailable, error.InvalidCudaState => null,
+            else => unavailable: {
+                refused = true;
+                break :unavailable null;
+            },
         };
         try control.check();
         self.policy = policy;
+        self.refused = refused;
         const lifetime = std.Io.Duration.fromSeconds(if (policy == null) 1 else 60);
         self.expires = std.Io.Timestamp.now(io, .awake).addDuration(lifetime);
+        if (refused) return error.PinnedEmbeddingBackendUnavailable;
         return policy;
     }
 };
+
+test "model selection transient CUDA provider failure cannot advertise a fallback recipe" {
+    const Fake = struct {
+        var attempts: usize = 0;
+        fn probe(_: std.mem.Allocator) !CudaGemmaPolicy {
+            attempts += 1;
+            if (attempts == 1) return error.CublasLtError;
+            return .{};
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var cache: CudaGemmaPolicyProbe = .{};
+    const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+    Fake.attempts = 0;
+    try std.testing.expectError(error.PinnedEmbeddingBackendUnavailable, cache.resolveWithProbe(a, io, control, Fake.probe));
+    try std.testing.expectError(error.PinnedEmbeddingBackendUnavailable, cache.resolveWithProbe(a, io, control, Fake.probe));
+    try std.testing.expectEqual(@as(usize, 1), Fake.attempts);
+    cache.expires = .zero;
+    try std.testing.expect((try cache.resolveWithProbe(a, io, control, Fake.probe)) != null);
+}
 
 pub const ModelManager = struct {
     /// One physical ledger for an invocation's target, draft and artifact
@@ -5936,6 +5972,7 @@ pub const ModelManager = struct {
         revisions: [max_backends][32]u8 = undefined,
         backends: [max_backends]backends.BackendType = undefined,
         len: usize = 0,
+        cuda_probe_refused: bool = false,
 
         pub fn values(self: *const EmbeddingRevisions) []const [32]u8 {
             return self.revisions[0..self.len];
@@ -6004,7 +6041,7 @@ pub const ModelManager = struct {
         }
         const receipt = &artifacts.receipt.?;
         const slot = &self.declared_receipt_revisions[receipt.publication_generation[0] % self.declared_receipt_revisions.len];
-        const declared = try slot.get(self.allocator, artifacts.io, receipt, control);
+        const declared = artifacts.bound_declared_revision orelse try slot.get(self.allocator, artifacts.io, receipt, control);
         const artifact_revision = try embeddingArtifactRevision(manifest, imagePreprocessingRevision(manifest, declared), artifacts);
         const manager = &self.session_manager;
         if (manager.required_backend_invalid) return result;
@@ -6035,7 +6072,13 @@ pub const ModelManager = struct {
             const revision = if (backend == .cuda and manifest.embedding_style == .embedding_gemma2) resolved: {
                 if (try self.residentCudaEmbeddingRevision(model_dir, artifacts.installation, load_policy.cache_policy)) |resident|
                     break :resolved resident;
-                const policy = (try self.cuda_gemma_policy.resolve(self.allocator, artifacts.io, control)) orelse continue;
+                const policy = (self.cuda_gemma_policy.resolve(self.allocator, artifacts.io, control) catch |err| switch (err) {
+                    error.PinnedEmbeddingBackendUnavailable => {
+                        result.cuda_probe_refused = true;
+                        continue;
+                    },
+                    else => return err,
+                }) orelse continue;
                 break :resolved loaded_runtime.durableEmbeddingRevisionWithCudaPolicy(manifest, artifact_revision, backend, policy);
             } else durableEmbeddingRevision(manifest, artifact_revision, backend);
             result.backends[result.len] = backend;
@@ -6076,7 +6119,7 @@ pub const ModelManager = struct {
 
     fn isPinnedBackendLoadFailure(err: anyerror) bool {
         return switch (err) {
-            error.ModelBackendUnhealthy, error.CudaUnavailable, error.CudaSymbolMissing, error.CudaBackendUnavailable, error.MetalUnavailable, error.RequiredBackendUnavailable, error.NoBackendAvailable, error.NoModelFileFound => true,
+            error.ModelBackendUnhealthy, error.CudaUnavailable, error.CudaSymbolMissing, error.CudaBackendUnavailable, error.MetalUnavailable, error.RequiredBackendUnavailable, error.NoBackendAvailable, error.NoModelFileFound, error.CudaDriverError, error.CublasLtError, error.CublasError, error.CudnnFailure => true,
             else => false,
         };
     }
@@ -6142,7 +6185,7 @@ pub const ModelManager = struct {
         }
         if (count == 0) return if (refused_artifact)
             error.PinnedEmbeddingArtifactUnavailable
-        else if (known_recipe)
+        else if (known_recipe or declared.cuda_probe_refused)
             error.PinnedEmbeddingBackendUnavailable
         else
             error.InferenceCapabilitiesStale;

@@ -20,6 +20,7 @@ const managed = @import("../registry/managed_receipt.zig");
 const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
 const manifest_mod = @import("../models/manifest.zig");
 const model_manager = @import("model_manager.zig");
+const loaded_runtime = @import("../models/loaded_runtime.zig");
 const backends = @import("../backends/backends.zig");
 const dependencies = @import("../registry/artifact_dependencies.zig");
 const c_file = @import("../util/c_file.zig");
@@ -60,7 +61,7 @@ fn validateGemmaSidecarWithBudget(artifacts: *const PublishedArtifacts, check: g
     var current = gemma_inspection_bytes.load(.monotonic);
     while (true) {
         try control.check();
-        if (charge > gemma_inspection_limit - current) return error.MemoryBudgetExceeded;
+        if (charge > gemma_inspection_limit - current) return error.ResourceTemporarilyUnavailable;
         current = gemma_inspection_bytes.cmpxchgWeak(current, current + charge, .acq_rel, .monotonic) orelse break;
     }
     defer _ = gemma_inspection_bytes.fetchSub(charge, .release);
@@ -150,9 +151,17 @@ pub const Cache = struct {
             error.ModelArtifactsChanging, error.FileNotFound, error.NotDir => return null,
             else => return err,
         };
+        const borrow = Borrow{ .snapshot = current, .slot = slot };
+        current.validateAliasBindings(a, io, control) catch |err| switch (err) {
+            error.ModelArtifactsChanging, error.FileNotFound, error.NotDir, error.InvalidModelArtifactKind => {
+                borrow.invalidate();
+                return null;
+            },
+            else => return err,
+        };
         try control.check();
         retained = true;
-        return .{ .snapshot = current, .slot = slot };
+        return borrow;
     }
 
     const Inspection = struct {
@@ -281,7 +290,7 @@ pub const Cache = struct {
 
             fn reject(self: *DependencyCache, owner: std.mem.Allocator, collector: MemberCollector, err: anyerror) !bool {
                 switch (err) {
-                    error.OutOfMemory, error.MemoryBudgetExceeded, error.Timeout, error.Canceled, error.Cancelled, error.ModelArtifactsChanging => return err,
+                    error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded, error.Timeout, error.Canceled, error.Cancelled, error.ModelArtifactsChanging => return err,
                     else => {},
                 }
                 self.failure = try FailedMember.capture(&collector, owner, err);
@@ -528,6 +537,7 @@ pub const Cache = struct {
         inspection: std.atomic.Value(?*Inspection) = .init(null),
         root_stamp: managed.ArtifactStamp,
         checked_at: std.Io.Timestamp,
+        inherited_aliases: []const usize = &.{},
 
         fn release(self: *Snapshot) void {
             if (self.refs.fetchSub(1, .acq_rel) != 1) return;
@@ -536,20 +546,50 @@ pub const Cache = struct {
             if (self.inspection.load(.monotonic)) |inspection| inspection.destroy(a);
             Inspection.FailedMember.deinit(self.common_failure, a);
             self.artifacts.deinit();
+            a.free(self.inherited_aliases);
             a.free(path);
             a.destroy(self);
         }
 
-        fn cacheable(self: *const Snapshot) bool {
-            const receipt = self.artifacts.receipt orelse return false;
-            if (!receipt.all_checksums_declared) return false;
+        fn prepareForCache(self: *Snapshot, control: ExecutionControl) !bool {
+            const receipt = if (self.artifacts.receipt) |*receipt| receipt else return false;
+            if (!receipt.hasCompleteChecksums()) return false;
             // Include the parsed receipt, lookup tables, and resolved paths.
             var bytes = self.artifacts.installation.?.receipt_stamp.size *| 2;
             for (receipt.artifacts) |artifact| {
                 bytes +|= 192 + artifact.canonical_path.len;
                 if (bytes > max_cached_bytes_per_slot) return false;
             }
-            return bytes <= max_cached_bytes_per_slot;
+            if (!receipt.all_checksums_declared) {
+                const a = self.artifacts.allocator;
+                var aliases: std.ArrayList(usize) = .empty;
+                defer aliases.deinit(a);
+                const root = std.mem.trimEnd(u8, self.artifacts.physical_root, "/");
+                for (receipt.artifacts, 0..) |artifact, index| {
+                    try control.check();
+                    if (std.mem.startsWith(u8, artifact.canonical_path, root)) {
+                        const tail = artifact.canonical_path[root.len..];
+                        if (tail.len > 0 and tail[0] == '/' and std.mem.eql(u8, tail[1..], artifact.path)) continue;
+                    }
+                    try aliases.append(a, index);
+                }
+                self.inherited_aliases = try aliases.toOwnedSlice(a);
+                try self.validateAliasBindings(a, self.artifacts.io, control);
+                self.artifacts.bound_declared_revision = try loaded_runtime.receiptedModelRevision(a, self.artifacts.io, receipt, null, control, false);
+            }
+            return true;
+        }
+
+        fn validateAliasBindings(self: *const Snapshot, a: std.mem.Allocator, io: std.Io, control: ExecutionControl) !void {
+            for (self.inherited_aliases) |index| {
+                try control.check();
+                const artifact = self.artifacts.receipt.?.artifacts[index];
+                const logical = try std.fs.path.join(a, &.{ self.artifacts.physical_root, artifact.path });
+                defer a.free(logical);
+                const resolved = try std.Io.Dir.cwd().realPathFileAlloc(io, logical, a);
+                defer a.free(resolved);
+                if (!std.mem.eql(u8, resolved, artifact.canonical_path)) return error.ModelArtifactsChanging;
+            }
         }
     };
 
@@ -616,7 +656,7 @@ pub const Cache = struct {
                 if (self.checked_roles[i] == null) {
                     const cache = &inspection.dependencies_by_role[i];
                     self.checked_roles[i] = cache.check(self.snapshot.artifacts.allocator, artifacts, &inspection.execution_manifest, dependency, control) catch |err| switch (err) {
-                        error.OutOfMemory, error.MemoryBudgetExceeded, error.Timeout, error.Canceled, error.Cancelled => return err,
+                        error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded, error.Timeout, error.Canceled, error.Cancelled => return err,
                         else => invalid: {
                             self.invalidate();
                             break :invalid false;
@@ -626,7 +666,7 @@ pub const Cache = struct {
                 if (!self.checked_roles[i].?) return unavailable_dependency;
             }
             return inspection.backendSummary(artifacts, path, backend, roles[0..count], control) catch |err| switch (err) {
-                error.OutOfMemory, error.MemoryBudgetExceeded, error.Timeout, error.Canceled, error.Cancelled => return err,
+                error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded, error.Timeout, error.Canceled, error.Cancelled => return err,
                 error.ModelArtifactsChanging, error.InvalidManagedDownload, error.ChecksumMismatch, error.CatalogArtifactUnavailable => {
                     self.invalidate();
                     return unavailable_dependency;
@@ -663,6 +703,16 @@ pub const Cache = struct {
             }
             revisions.len = kept;
             return rejected;
+        }
+
+        pub fn verifyAliasBindings(self: Borrow, a: std.mem.Allocator, io: std.Io, control: ExecutionControl) !void {
+            self.snapshot.validateAliasBindings(a, io, control) catch |err| switch (err) {
+                error.ModelArtifactsChanging, error.FileNotFound, error.NotDir, error.InvalidModelArtifactKind => {
+                    self.invalidate();
+                    return error.ModelArtifactsChanging;
+                },
+                else => return err,
+            };
         }
 
         pub fn invalidate(self: Borrow) void {
@@ -706,12 +756,15 @@ pub const Cache = struct {
         if (try reuse(slot, owner, io, path, publication, canonical, stamp, control)) |borrow| return borrow;
 
         const owned_path = try owner.dupe(u8, path);
-        errdefer owner.free(owned_path);
+        var snapshot_owns_artifacts = false;
+        errdefer if (!snapshot_owns_artifacts) owner.free(owned_path);
         var artifacts = try PublishedArtifacts.initForSelectedArtifacts(owner, io, owned_path, .{ .publication = publication }, control);
-        errdefer artifacts.deinit();
+        errdefer if (!snapshot_owns_artifacts) artifacts.deinit();
         const snapshot = try owner.create(Snapshot);
         snapshot.* = .{ .artifacts = artifacts, .root_stamp = stamp, .checked_at = std.Io.Timestamp.now(io, .awake) };
-        if (snapshot.cacheable()) slot.publish(snapshot);
+        snapshot_owns_artifacts = true;
+        errdefer snapshot.release();
+        if (try snapshot.prepareForCache(control)) slot.publish(snapshot);
         return .{ .snapshot = snapshot, .slot = slot };
     }
 };
@@ -730,4 +783,40 @@ test "scoped model discovery retries a valid Gemma sidecar after scratch underes
 
     try std.testing.expectError(error.GemmaInspectionScratchExceeded, validateGemmaSidecarWithBudget(&artifacts, .processor, processor.len, .{}));
     try validateGemmaSidecarWithEstimate(&artifacts, .processor, processor.len, .{});
+}
+
+test "scoped model discovery reuses inherited checksums until the binding changes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The checked member itself is an alias. Changing it must invalidate the
+    // inherited digest even though the checksum-free member has not moved.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "first" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.safetensors", .data = "other" });
+    try tmp.dir.symLink(io, "model.safetensors", "checked.safetensors", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data =
+        \\{"version":1,"artifacts":[
+        \\{"path":"model.safetensors","size":5},
+        \\{"path":"checked.safetensors","size":5,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const publication = (try managed.publicationGeneration(a, io, root)).?;
+    var cache: Cache = .{};
+    defer cache.deinit();
+    var first = try cache.acquire(a, io, root, publication, .{});
+    defer first.release();
+    try std.testing.expect(first.view(a, io).bound_declared_revision != null);
+    var reused = try cache.acquire(a, io, root, publication, .{});
+    defer reused.release();
+    try std.testing.expect(first.snapshot == reused.snapshot);
+
+    try tmp.dir.deleteFile(io, "checked.safetensors");
+    try tmp.dir.symLink(io, "other.safetensors", "checked.safetensors", .{});
+    try std.testing.expectError(error.ModelArtifactsChanging, reused.verifyAliasBindings(a, io, .{}));
+    var changed = try cache.acquire(a, io, root, publication, .{});
+    defer changed.release();
+    try std.testing.expect(changed.snapshot != first.snapshot);
+    try std.testing.expect(!changed.view(a, io).receipt.?.hasCompleteChecksums());
 }
