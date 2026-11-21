@@ -272,7 +272,7 @@ pub const SplitJournalSeed = struct {
             .limit = inherited.limit,
             .retained_bytes = policy_key.len + Policy.encoded_size,
         };
-        try requireNamespace(txn, state, namespace);
+        _ = try authority.require(txn, .raft, namespace);
         const policy: Policy = .{
             .namespace = namespace,
             .authority = inherited.authority,

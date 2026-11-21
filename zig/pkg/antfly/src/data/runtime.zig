@@ -17490,6 +17490,7 @@ pub const DataServer = struct {
             handoff.base_delta_sequence,
             .destination_begin,
             .catalog,
+            null,
         );
 
         const max_writes_per_batch: usize = 128;
@@ -17534,6 +17535,7 @@ pub const DataServer = struct {
             handoff.base_delta_sequence,
             .destination_complete,
             .cached,
+            try self.splitSourceHistoryPolicy(work_alloc, source_group_id, table_contract.table_name),
         );
         try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitSourceAcknowledgement(
@@ -17769,6 +17771,7 @@ pub const DataServer = struct {
             source_seq,
             .destination_complete,
             destination_discovery,
+            null,
         );
         try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitSourceAcknowledgement(
@@ -17780,6 +17783,36 @@ pub const DataServer = struct {
         );
     }
 
+    fn splitSourceHistoryPolicy(self: *DataServer, a: std.mem.Allocator, group: u64, table: []const u8) !?@import("antfly_local_sources").storage_committed_history.Policy {
+        if (comptime !linked_storage) return null;
+        const route = try antfly.public_api.table_catalog.routedGroupIdSnapshotUntil(a, self.write_source.catalog, table, group, null);
+        const fence = route.fence() orelse return error.TopologyChanged;
+        const binding = @import("../api/history_policy_provisioning.zig").authority(fence) catch |err| switch (err) {
+            error.ChangefeedCapabilityUnsupported => return null,
+            else => return err,
+        };
+        const identity = fence.route.identity_namespace;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
+        const received = self.submitHistoryControlLocal(a, fence, table, .{ .inspect_policy = .{ .namespace = namespace, .authority = binding } }) catch |err| switch (err) {
+            error.ChangefeedCapabilityUnsupported, error.UnsupportedBatchProtocolVersion => return null,
+            else => return err,
+        };
+        const outcome = received.outcome orelse return error.RaftBatchWriteOutcomeUnknown;
+        return switch (outcome) {
+            .rejected => |rejection| if (rejection == .resynchronization) null else rejection.asError(),
+            .applied => |applied| if (applied.policy) |policy| .{
+                .namespace = namespace,
+                .authority = binding,
+                .previous_revision = 0,
+                .revision = policy.revision,
+                .limit = policy.limit,
+            } else error.HistoryCorrupt,
+        };
+    }
+
     fn replicateSplitDestinationCheckpoint(
         self: *DataServer,
         destination_group_id: u64,
@@ -17789,6 +17822,7 @@ pub const DataServer = struct {
         delta_sequence: u64,
         kind: antfly.db.types.SplitReplicationCheckpoint.Kind,
         discovery: DataRaftMutationDiscovery,
+        history_policy: ?@import("antfly_local_sources").storage_committed_history.Policy,
     ) !void {
         if (kind == .source_ack) return error.InvalidBatchRequest;
         var checkpoint_replication = replication;
@@ -17805,6 +17839,7 @@ pub const DataServer = struct {
                 .range_start = byte_range.start,
                 .range_end = byte_range.end,
                 .delta_sequence = delta_sequence,
+                .history_policy = history_policy,
             },
         }, discovery);
     }

@@ -162425,3 +162425,49 @@ test "db split finalization records the predecessor committed history frontier t
     try std.testing.expect((try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch + 1)) == null);
     try std.testing.expectEqual(@as(u64, 2), (try history.load(&read)).?.latest);
 }
+
+test "db ordered empty split destination seeds history before its first write" {
+    const a = std.testing.allocator;
+    const history = @import("../committed_history.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/split-child-history", .{tmp.sub_path});
+    defer a.free(path);
+    const identity: doc_identity.Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    const namespace = @import("online_source_contract.zig").namespaceBytes(identity);
+    var db = try DB.open(a, path, .{
+        .identity_namespace = identity,
+        .online_source_authority = .raft,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+    const replication: types.SplitReplicationContext = .{
+        .transition_id = 4,
+        .attempt_epoch = 1,
+        .source_group_id = 2,
+        .destination_group_id = 5,
+        .identity_namespace = identity,
+        .bootstrap_sequence = 0,
+        .operation = .checkpoint,
+    };
+    var checkpoint: types.SplitReplicationCheckpoint = .{
+        .kind = .destination_begin,
+        .transition_id = 4,
+        .attempt_epoch = 1,
+        .source_group_id = 2,
+        .destination_group_id = 5,
+        .range_start = "doc:m",
+        .delta_sequence = 0,
+    };
+    try db.applyOrderedCommittedMutation(.{ .split_replication = replication, .split_checkpoint = checkpoint }, .{ .term = 1, .index = 1 }, false);
+    checkpoint.kind = .destination_complete;
+    checkpoint.history_policy = .{ .namespace = namespace, .authority = @splat(1), .previous_revision = 0, .revision = 1, .limit = history.default_limit };
+    try db.applyOrderedCommittedMutation(.{ .split_replication = replication, .split_checkpoint = checkpoint }, .{ .term = 1, .index = 2 }, false);
+    try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:z", .value = "{\"value\":1}" }} }, .{ .term = 1, .index = 3 }, 100, false);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 1), (try history.load(&read)).?.latest);
+    try std.testing.expectEqual(@as(u64, 1), (try history.loadPolicy(&read)).?.revision);
+}
