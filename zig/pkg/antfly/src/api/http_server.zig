@@ -208,6 +208,10 @@ test "direct public transaction routes exclude connection-owned sessions" {
     attached.connection_id = @splat('a');
     try std.testing.expect(!ApiHttpServer.directTransactionRouteEligible(attached, false));
     try std.testing.expect(ApiHttpServer.directTransactionRouteEligible(attached, true));
+    var graph = empty;
+    graph.graph_receipt = true;
+    try std.testing.expect(ApiHttpServer.directTransactionRouteEligible(graph, true));
+    try std.testing.expect(!ApiHttpServer.directTransactionRouteEligible(graph, false));
 }
 
 test "global query requires a non-empty table name" {
@@ -14475,15 +14479,14 @@ pub const ApiHttpServer = struct {
         )) != .allowed) return false;
         var details = (try self.txn_sessions.getDetails(self.alloc, txn_id)) orelse return false;
         defer details.deinit(self.alloc);
-        // Direct transaction routes cannot present or verify the idle HTTP
-        // connection owner. SQL requests use the separate exact-ID adapter;
-        // principal equality alone must not bypass its active fence.
+        // Connection-owned sessions and graph receipts expose status here.
+        // Their execution and retirement stay with their originating protocol.
         if (!directTransactionRouteEligible(details, read_only)) return false;
         return try self.transactionSessionDetailsAuthorized(authenticated_identity, details);
     }
 
     fn directTransactionRouteEligible(details: transactions_api.SessionDetails, read_only: bool) bool {
-        return read_only or details.connection_id == null;
+        return read_only or (details.connection_id == null and !details.graph_receipt);
     }
 
     pub fn listAuthorizedTransactionSessions(
@@ -14547,7 +14550,7 @@ pub const ApiHttpServer = struct {
             if (resource.len == 0) return false;
             // Private integrity predicates are not user reads or mutations.
             // Explicit reads still require read access (and row filtering).
-            if (table.staged_read_count > 0 and
+            if ((table.staged_read_count > 0 or table.has_range_reads) and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .read)) return false;
             if ((table.staged_write_count > 0 or table.staged_delete_count > 0) and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;

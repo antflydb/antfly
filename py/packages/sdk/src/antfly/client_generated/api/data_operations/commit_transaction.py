@@ -85,6 +85,8 @@ def _parse_response(
         return response_409
 
     if response.status_code == 500:
+        if response.headers.get("content-type", "").partition(";")[0].strip().lower() == "text/plain":
+            return response.text
         response_500 = Error.from_dict(response.json())
 
         return response_500

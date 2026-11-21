@@ -354,6 +354,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.CatalogGenerationChanged, error.SchemaVersionChanged, error.RowPolicyCatalogChanged, error.CypherTransactionConflict, error.CypherWriteRequestAlreadyUsed => 409,
         error.StorageOwnerAdmissionPending, error.CatalogRoutingSnapshotTimeout, error.DocIdentityNamespaceMismatch, error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable, error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => 503,
         error.OutOfMemory, error.CypherResponseTooLarge, error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded, error.SqlWriteCapacityUnavailable => 429,
+        error.SessionRecordTooLarge, error.TransactionTooLarge => 413,
         error.DeadlineExceeded => 408,
         error.Canceled => 499,
         else => 400,
@@ -368,6 +369,7 @@ pub fn errorMessage(err: anyerror, outcome: WriteOutcome) []const u8 {
     if (outcome == .committed)
         return "The write committed, but its response could not be delivered completely. Check its transaction status; do not replay this statement.";
     return switch (err) {
+        error.SessionRecordTooLarge, error.TransactionTooLarge => "The graph write exceeds transaction capacity. Reduce the size of the write set.",
         error.CypherWriteRequestAlreadyUsed => "This write request ID has already been admitted. Check its transaction status instead of replaying the statement.",
         error.Forbidden, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => "The current principal cannot execute this query against the graph or its mapped tables.",
         error.CatalogNotFound => "This graph no longer exists. Refresh the graph catalog and select an available graph.",

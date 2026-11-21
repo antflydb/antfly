@@ -29,13 +29,13 @@ SCOPED_MERGE_BODY = re.compile(
 SCOPED_MERGE_HEADER = 'headers["Content-Type"] = "application/vnd.antfly.scoped-merge.v1+json"'
 NDJSON_HEADER = 'headers["Content-Type"] = "application/x-ndjson"'
 RELATIONAL_QUERY = Path("api/data_operations/query_relational_rows.py")
-WRITE_OPERATIONS = (
-    "batch_write",
-    "batch_namespace_table",
-    "multi_batch_write",
-    "commit_transaction",
-    "commit_transaction_session",
-)
+WRITE_OPERATIONS = {
+    "batch_write": (403, 500, 503),
+    "batch_namespace_table": (403, 500, 503),
+    "multi_batch_write": (403, 409, 500, 503),
+    "commit_transaction": (403, 409, 500, 503),
+    "commit_transaction_session": (403, 409, 503),
+}
 SQL_OPERATIONS = [
     Path(f"api/data_operations/{operation}.py")
     for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
@@ -178,14 +178,10 @@ def fix_generated_client(root: Path) -> None:
 
     # openapi-python-client selects only the first media type for each status.
     # These operations also serve text/plain denials and routing failures.
-    for operation in WRITE_OPERATIONS:
+    for operation, statuses in WRITE_OPERATIONS.items():
         path = root / f"api/data_operations/{operation}.py"
         source = path.read_text(encoding="utf-8")
-        for status in (
-            (403, 409, 503)
-            if operation in {"multi_batch_write", "commit_transaction", "commit_transaction_session"}
-            else (403, 503)
-        ):
+        for status in statuses:
             branch = f"    if response.status_code == {status}:"
             if source.count(branch) != 1 or "TransactionWriteError.from_dict" not in source:
                 raise RuntimeError(f"unexpected generated write response in {operation}: {status}")

@@ -38,6 +38,7 @@ def write_generated_files(root: Path, signature_count: int) -> None:
         path.write_text(
             "def parse(response) -> Error | TransactionWriteError:\n"
             "    if response.status_code == 403:\n        return TransactionWriteError.from_dict(response.json())\n"
+            "    if response.status_code == 500:\n        return Error.from_dict(response.json())\n"
             "    if response.status_code == 503:\n        return TransactionWriteError.from_dict(response.json())\n"
             + (
                 "    if response.status_code == 409:\n        return TransactionSessionCommitResponse.from_dict(response.json())\n"

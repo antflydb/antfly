@@ -2134,14 +2134,16 @@ const LocalStandaloneMetadata = struct {
         const catalog = generation.indexed.snapshot.value;
         if (request.table_batch) |batch| {
             if (request.route_check != null or batch.tables.len == 0) return error.InvalidArgument;
-            const stable = stable: {
-                for (batch.tables) |expected| {
-                    const view = generation.indexed.tableRoutingView(expected.table_name, budget) catch |err| if (err == error.TableNotFound) break :stable false else return err;
-                    if (view.table_id != expected.table_id or view.topology_epoch != expected.topology_epoch) break :stable false;
+            var result: antfly.metadata_api.DecisionAdmission = .{ .stable = true, .tables_checked = true, .catalog_revision = catalog.catalog_revision, .metadata_group_id = catalog.metadata_group_id, .metadata_incarnation = catalog.metadata_incarnation };
+            for (batch.tables) |expected| {
+                const view = generation.indexed.tableRoutingView(expected.table_name, budget) catch |err| if (err == error.TableNotFound) null else return err;
+                if (view == null or view.?.table_id != expected.table_id or view.?.topology_epoch != expected.topology_epoch) {
+                    result.stable = false;
+                    result.rejected_table_id = expected.table_id;
+                    break;
                 }
-                break :stable true;
-            };
-            return .{ .stable = stable, .tables_checked = true, .catalog_revision = catalog.catalog_revision, .metadata_group_id = catalog.metadata_group_id, .metadata_incarnation = catalog.metadata_incarnation };
+            }
+            return result;
         }
         const view = try generation.indexed.tableRoutingView(request.table_name, budget);
         var stable = view.table_id == request.table_id;
@@ -16016,6 +16018,21 @@ test "system catalog standalone routing generation retains old identity through 
     try std.testing.expectEqual(revision, old.snapshot.value.catalog_revision);
     try std.testing.expect(!old.table_indexes.contains("new"));
     try std.testing.expect(current.table_indexes.contains("new"));
+
+    const docs = try current.tableRoutingView("docs", .{});
+    const second = try current.tableRoutingView("new", .{});
+    for ([_][]const u8{ "new", "missing" }) |name| {
+        const admission = try LocalStandaloneMetadata.catalogDecisionAdmission(&metadata, .{
+            .table_id = docs.table_id,
+            .table_name = "docs",
+            .table_batch = .{ .verified_revision = revision, .tables = &.{
+                .{ .table_id = docs.table_id, .table_name = "docs", .topology_epoch = docs.topology_epoch },
+                .{ .table_id = second.table_id, .table_name = name, .topology_epoch = second.topology_epoch +% 1 },
+            } },
+        }, .{});
+        try std.testing.expect(!admission.stable and admission.tables_checked);
+        try std.testing.expectEqual(second.table_id, admission.rejected_table_id.?);
+    }
 
     // Pgwire supplies an Io awake deadline, whose epoch need not agree with
     // the platform clock used by the catalog mutex. A valid remaining budget

@@ -25,17 +25,6 @@ pub const Result = struct { status: Status, outcome: ?contract.CommitOutcome = n
 pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: local.api_operation.RequestContext, id: local.storage_db_types.TxnId, tables: []const contract.TableCommitRequest, alloc: std.mem.Allocator, retained_plan: *?sessions.ExecutionPlan) !Result {
     const owned = server.alloc;
     const registry = &server.txn_sessions;
-    const info = registry.beginForPrincipalWithSettingsAndId(owned, .{ .sync_level = .full_index }, server.localSessionNodeId(), http.transactionPrincipal(identity), &.{}, null, id) catch |err| {
-        std.log.warn("graph receipt admission failed err={s}", .{@errorName(err)});
-        return err;
-    };
-    const guard = try registry.mutation(owned, id, server.localSessionNodeId());
-    var unexecuted: ?sessions.DurableSessionStore.Version = info.version;
-    errdefer if (unexecuted) |version| {
-        _ = registry.retireBeforeExecution(owned, guard, version, false) catch false;
-    };
-    const lease = registry.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
-    defer lease.release();
     var input_arena = std.heap.ArenaAllocator.init(owned);
     defer input_arena.deinit();
     const input_alloc = input_arena.allocator();
@@ -53,25 +42,31 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         };
         try entry.predicates.appendSlice(input_alloc, table.predicates);
     }
-    var staged = (try registry.cloneOwnedCommitRequest(owned, guard, &input)) orelse return error.InvalidTransactionSessionRecord;
-    defer staged.deinit(owned);
-    unexecuted = staged.session_version;
     var prepared = server.preparePublicCommitWithIntegrity(alloc, tables, context) catch |err| {
         std.log.warn("graph receipt integrity preparation failed err={s}", .{@errorName(err)});
         return err;
     };
     defer prepared.deinit();
-    unexecuted = null;
-    retained_plan.* = (registry.sealExecutionPlan(owned, guard, prepared.tables) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
-    // The response can borrow coordinator and conflict fields from the sealed plan.
+    const writer = server.table_writes orelse return error.UnsupportedOperation;
+    const normalized = try context.platformDeadline();
+    const lease = registry.tryAcquireCommitExecution(id) orelse {
+        // An admitted ID remains a reconciliation request even while another
+        // worker holds its execution stripe. Unrelated IDs can share a stripe.
+        if (registry.hasSession(owned, id) catch return .{ .status = .unknown }) return error.CypherWriteRequestAlreadyUsed;
+        return error.SqlWriteCapacityUnavailable;
+    };
+    defer lease.release();
+    const started = registry.beginGraphExecution(owned, id, server.localSessionNodeId(), http.transactionPrincipal(identity), &input, prepared.tables) catch |err| {
+        if (err == error.GraphReceiptAdmissionUnknown) return .{ .status = .unknown };
+        return err;
+    };
+    retained_plan.* = started.plan;
     const plan = &retained_plan.*.?;
-    const writer = server.table_writes orelse return .{ .status = .unknown };
-    const normalized = context.platformDeadline() catch return .{ .status = .unknown };
-    const outcome = (writer.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, .full_index, plan.firstAttempt(), normalized.cancellation) catch |err| {
+    const outcome = (writer.commitTransactionAttempt(alloc, id, started.begin_timestamp, plan.value, .full_index, plan.firstAttempt(), normalized.cancellation) catch |err| {
         const rejection = sessions.classifyCommitRejection(plan.firstAttempt(), err);
         if (rejection == .confirmed or rejection == .fresh) {
             _ = (registry.recordAttemptAbort(owned, id, if (rejection == .fresh) plan.publication else null) catch null) orelse return .{ .status = .unknown };
-            return .{ .status = .aborted, .failure = sessions.abortCause(err) orelse err };
+            return .{ .status = .aborted, .failure = publicAbortCause(err) };
         }
         if (err == error.EnrichmentWorkerFailed) {
             _ = registry.recordTerminalCommitWithRepair(owned, id, .committed, true, null, null) catch return .{ .status = .committed_pending };
@@ -98,4 +93,15 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
             return .{ .status = if (committed.visibility_repair_required) .committed_repair_required else if (status == .committed) .committed else .committed_pending, .outcome = outcome };
         },
     }
+}
+
+fn publicAbortCause(err: anyerror) anyerror {
+    if (err == error.PreDispatchCatalogGenerationChanged) return error.CatalogGenerationChanged;
+    return sessions.abortCause(err) orelse err;
+}
+
+test "transaction graph effects report fresh pre-dispatch catalog conflicts" {
+    const cause = publicAbortCause(error.PreDispatchCatalogGenerationChanged);
+    try std.testing.expectEqual(error.CatalogGenerationChanged, cause);
+    try std.testing.expectEqual(@as(u16, 409), @import("graph_execution.zig").httpStatus(cause));
 }

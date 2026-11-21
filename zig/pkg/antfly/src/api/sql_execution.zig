@@ -78,18 +78,6 @@ fn attachedSettingOverlay(source: SettingOverlaySource, caller: []const setting_
     };
 }
 
-fn refreshAttachedSettingOverlay(
-    registry: *@import("transactions.zig").SessionRegistry,
-    alloc: std.mem.Allocator,
-    id: db_types.TxnId,
-    source: SettingOverlaySource,
-    caller: []const setting_catalog.OverlayEntry,
-    retained: *?@import("transactions.zig").SessionRegistry.SqlState,
-) ![]const setting_catalog.OverlayEntry {
-    retained.* = (try registry.getSqlState(alloc, id)) orelse return error.SqlTransactionNotActive;
-    return attachedSettingOverlay(source, caller, retained.*.?.setting_active.items);
-}
-
 test "SQL attached setting overlay keeps HTTP durable authority separate from pgwire connection state" {
     const caller = [_]setting_catalog.OverlayEntry{.{ .identity = .{ .id = 1, .generation = 1 }, .value = .{ .integer = 99 } }};
     const durable = [_]setting_catalog.OverlayEntry{.{ .identity = .{ .id = 1, .generation = 1 }, .value = .{ .integer = 5 } }};
@@ -132,9 +120,10 @@ test "SQL attached setting overlay refresh observes a setting committed after at
     }
     const lease = registry.tryAcquireCommitExecution(begun.txn_id) orelse return error.TestExpectedSessionLease;
     defer lease.release();
-    var refreshed: ?@import("transactions.zig").SessionRegistry.SqlState = null;
-    defer if (refreshed) |*state| state.deinit(alloc);
-    const overlay = try refreshAttachedSettingOverlay(&registry, alloc, begun.txn_id, .durable_session, attached.setting_active.items, &refreshed);
+    var refreshed = try registry.admitSqlStatement(alloc, alloc, guard, "alice", null);
+    defer refreshed.state.deinit(alloc);
+    defer refreshed.staged.deinit(alloc);
+    const overlay = try attachedSettingOverlay(.durable_session, attached.setting_active.items, refreshed.state.setting_active.items);
     try std.testing.expectEqual(@as(i64, 5), attached.setting_active.items[0].value.integer);
     try std.testing.expectEqual(@as(i64, 7), overlay[0].value.integer);
 }
@@ -481,30 +470,21 @@ pub const Adapter = struct {
                     break :zig017_failure error.SqlWriteCapacityUnavailable;
                 };
                 defer execution_lease.release();
-                // A concurrent HTTP SET/RESET may have committed after the
-                // initial session attachment but before this statement's
-                // execution lease. Refresh the overlay while holding the
-                // same lease that serializes session setting mutations.
-                var leased_settings: ?@import("transactions.zig").SessionRegistry.SqlState = null;
-                defer if (leased_settings) |*state| state.deinit(self.server.alloc);
-                if (self.session_id != null and compiled.uses_current_setting) {
-                    self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
-                        zig017_return_error = zig017_err;
-                        return zig017_err;
-                    });
-                }
-                _ = (session.statement(switch (compiled.statement) {
-                    .select, .explain => false,
-                    else => true,
-                }) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                });
-                var staged = (self.server.txn_sessions.cloneSqlStaged(alloc, id) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                });
+                // Re-admit after acquiring the execution lease. A concurrent SET
+                // or staged write must be observed on the same transaction cut.
+                var admitted = self.server.txn_sessions.admitSqlStatement(self.server.alloc, alloc, self.admitted_mutation.?, http_server.transactionPrincipal(self.identity.*), self.connection_id) catch |err| {
+                    zig017_return_error = err;
+                    return err;
+                };
+                defer admitted.state.deinit(self.server.alloc);
+                var staged = admitted.staged;
                 defer staged.deinit(alloc);
+                if (self.session_id != null and compiled.uses_current_setting) {
+                    self.setting_overlay = attachedSettingOverlay(self.setting_overlay_source, previous_setting_overlay, admitted.state.setting_active.items) catch |err| {
+                        zig017_return_error = err;
+                        return err;
+                    };
+                }
                 var read_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
                 defer read_guards.deinit(self.server.alloc);
                 self.range_reads = if (transaction.isolation != .read_committed) &read_guards else null;

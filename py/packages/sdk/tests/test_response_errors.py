@@ -93,3 +93,22 @@ def test_generated_commit_preparation_conflict_preserves_diagnostic(operation):
     module = import_module(f"antfly.client_generated.api.data_operations.{operation}")
     response = httpx.Response(409, text="PreparedGenerationChanged")
     assert module._parse_response(client=Client(base_url="http://test"), response=response) == response.text
+
+
+@pytest.mark.parametrize(
+    "operation", ["batch_write", "batch_namespace_table", "commit_transaction", "multi_batch_write"]
+)
+def test_generated_stateless_unknown_outcome_preserves_response(operation):
+    from importlib import import_module
+
+    from antfly.client_generated.client import Client
+    from antfly.client_generated.models import Error
+
+    module = import_module(f"antfly.client_generated.api.data_operations.{operation}")
+    client = Client(base_url="http://test")
+    message = "transaction outcome is unknown; do not retry this stateless request"
+    response = module._build_response(client=client, response=httpx.Response(500, text=message))
+    assert response.status_code == 500
+    assert response.parsed == message
+    json_error = module._build_response(client=client, response=httpx.Response(500, json={"error": "internal"}))
+    assert isinstance(json_error.parsed, Error)
