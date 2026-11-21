@@ -57,7 +57,7 @@ const PleControl = struct {
     var calls: usize = 0;
     var norm: @FieldType(ops.ComputeBackend.VTable, "rmsNorm") = undefined;
     var fused: @FieldType(ops.ComputeBackend.VTable, "rmsNormAddWeightedEmbeddingTensor") = null;
-    var prepared: @FieldType(ops.ComputeBackend.VTable, "decoderRuntimeApplyRmsNorm") = null;
+    var prepared: @FieldType(ops.ComputeBackend.DecoderRegion, "applyRmsNorm") = null;
     fn effective(size: usize, epsilon: f32) f32 {
         if (size == dim and epsilon == eps) {
             calls += 1;
@@ -88,7 +88,7 @@ const Capture = struct {
     var active: ?*Capture = null;
     var original: *const fn (*anyopaque, ops.CT, std.mem.Allocator) anyerror![]f32 = undefined;
     var linear: @FieldType(ops.ComputeBackend.VTable, "linearNoBias") = undefined;
-    var prepared: @FieldType(ops.ComputeBackend.VTable, "decoderRuntimeApplyLinear") = null;
+    var prepared: @FieldType(ops.ComputeBackend.DecoderRegion, "applyLinear") = null;
     fn input(ctx: *anyopaque, tensor: ops.CT, rows: usize, in_dim: usize, out_dim: usize) !void {
         const self = active orelse return;
         const path = self.input_path orelse return;
@@ -137,9 +137,9 @@ const Runner = struct {
             Capture.original = original_vtable.toFloat32;
             Capture.active = &capture;
             Capture.linear = original_vtable.linearNoBias;
-            Capture.prepared = original_vtable.decoderRuntimeApplyLinear;
+            Capture.prepared = original_vtable.regions.decoder.applyLinear;
             capture_vtable.linearNoBias = Capture.project;
-            if (Capture.prepared != null) capture_vtable.decoderRuntimeApplyLinear = Capture.projectPrepared;
+            if (Capture.prepared != null) capture_vtable.regions.decoder.applyLinear = Capture.projectPrepared;
             self.pipeline.cb.vtable = &capture_vtable;
         }
         defer {
@@ -217,10 +217,10 @@ pub fn main(init: std.process.Init) !void {
     PleControl.dim = cfg.ple_hidden_size;
     PleControl.norm = controlled_vtable.rmsNorm;
     PleControl.fused = controlled_vtable.rmsNormAddWeightedEmbeddingTensor;
-    PleControl.prepared = controlled_vtable.decoderRuntimeApplyRmsNorm;
+    PleControl.prepared = controlled_vtable.regions.decoder.applyRmsNorm;
     controlled_vtable.rmsNorm = PleControl.rms;
     if (PleControl.fused != null) controlled_vtable.rmsNormAddWeightedEmbeddingTensor = PleControl.combined;
-    if (PleControl.prepared != null) controlled_vtable.decoderRuntimeApplyRmsNorm = PleControl.cached;
+    if (PleControl.prepared != null) controlled_vtable.regions.decoder.applyRmsNorm = PleControl.cached;
     cb.vtable = &controlled_vtable;
     cfg.max_position_embeddings = @min(cfg.max_position_embeddings, suite.context_tokens);
     const tok_raw = try std.Io.Dir.cwd().readFileAlloc(init.io, args[2], a, .limited(64 * 1024 * 1024));
