@@ -242,7 +242,7 @@ test "gemma4 video portable fallback fits beside a run's scratch unless the oper
     const session = Session{
         .ptr = undefined,
         .vtable = undefined,
-        .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .scratch_limit_bytes = cap }, .static_workspace_bytes = 0 },
+        .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .scratch_limit_bytes = cap }, .static_workspace_bytes = 0, .check_live_memory = false },
     };
     var run = try session.admitHostPreprocess(cap);
     defer run.deinit();

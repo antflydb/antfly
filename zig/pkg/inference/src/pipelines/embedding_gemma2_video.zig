@@ -609,9 +609,10 @@ pub const ReaderSelection = struct {
         errdefer a.free(selected);
         if (selected.len == 0 or selected.len > 32) return error.InvalidVideoReaderSelection;
         for (selected) |id| if (id >= reader.packets.len) return error.InvalidVideoReaderSelection;
-        const keys = try readerProjectionKeys(a, reader, logical, selected, control, pool);
-        errdefer a.free(keys);
+        // Sampling scratch has drained. Only the selected IDs and their
+        // keys overlap the dependency sweep's packet-boundary allocation.
         try reservation.resize(.{ .host_bytes = selected.len * (@sizeOf(usize) + @sizeOf(CacheKey)) });
+        const keys = try readerProjectionKeys(a, reader, logical, selected, control, pool);
         return .{ .allocator = a, .gemma4_plan = plan, .selected = selected, .projection_keys = keys, .binding = binding, .immutable = false, .reservation = reservation };
     }
     /// The owning source/packet index must remain immutable until all windows
@@ -4332,14 +4333,15 @@ test "embeddinggemma2 Metal video source bound preparation preserves field patch
 }
 fn selectionAllocationRun(a: std.mem.Allocator) !void {
     const bytes = @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4");
-    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
-    defer std.debug.assert(pool.snapshot().host_bytes == 0);
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "selection-failure" };
     var reader = try media.mp4.Reader.init(a, &source, .{});
     defer reader.deinit();
     var logical = try video.h264_pictures.streaming(a, &reader, .{});
     defer logical.deinit();
-    var selection = try ReaderSelection.init(a, &reader, .{ .source_timestamps = .{ .end_ns = std.time.ns_per_s, .max_frames = 1 } }, &logical, &pool, .{});
+    const sampling: Sampling = .{ .source_timestamps = .{ .end_ns = std.time.ns_per_s, .max_frames = 1 } };
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = try ReaderSelection.selectionPeakBytes(logical.pictures.len, reader.track.edit, sampling) } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var selection = try ReaderSelection.init(a, &reader, sampling, &logical, &pool, .{});
     defer selection.deinit();
 }
 test "embeddinggemma2 video source bound selection releases admission on allocation failure" {

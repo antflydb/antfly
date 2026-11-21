@@ -8710,7 +8710,11 @@ test "gemma4 video portable generation projects large edited AV1 and AVC transpo
     const edit = std.mem.indexOf(u8, original, "elst").? + 4;
     std.mem.writeInt(u32, bytes[edit + 8 ..][0..4], 2000, .big);
     std.mem.writeInt(i32, bytes[edit + 12 ..][0..4], 6144, .big);
-    try std.testing.expectError(error.ResourceLimitExceeded, @import("../pipelines/embedding_gemma2_video.zig").selectedPresentationUs(a, bytes, .{}, .reference, null));
+    const video_input = @import("../pipelines/embedding_gemma2_video.zig");
+    try std.testing.expectError(error.ResourceLimitExceeded, video_input.selectedPresentationUs(a, bytes, .{}, .{ .timestamps = .{} }, null));
+    const reference = try video_input.selectedPresentationUs(a, bytes, .{}, .reference, null);
+    defer a.free(reference);
+    try std.testing.expectEqualSlices(i64, &.{ 250000, 1250000 }, reference);
     var projected = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{}, a, projector, bytes);
     defer projected.deinit();
     try std.testing.expectEqualSlices(i64, &.{ 0, 1125000 }, projected.timestamps_us);
@@ -10479,7 +10483,7 @@ fn checkAdmittedAudioPeak(cb: ComputeBackend, _: ComputeBackend) !void {
     const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.ptr));
     compute.require_f32_linears = true;
     const a = std.testing.allocator;
-    const cfg = embeddingGemma2AudioConfig();
+    const cfg = try audioConfigForBackend(&cb, embeddingGemma2AudioConfig());
     const frames = 1000;
     const batch = subsampleBatchCapacityFor(cfg, frames, 4, true, false);
     var samples: [3][]f32 = undefined;
