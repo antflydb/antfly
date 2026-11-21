@@ -974,7 +974,7 @@ pub const Runner = struct {
         const scale = indexed.timescale();
         const duration = @divFloor((timeline.last - timeline.first) * std.time.ns_per_s + scale - 1, scale);
         if (duration <= 0) return error.UnknownVideoDuration;
-        const snapshot = @import("media_index_cache.zig").Cache.WebmSnapshot{ .index = indexed, .source_bound = indexed.reader != null, .timeline = timeline, .origin = timeline.first, .duration = duration };
+        const snapshot = @import("media_index_cache.zig").Cache.WebmSnapshot{ .index = indexed, .timeline = timeline, .origin = timeline.first, .duration = duration };
         if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.rememberPlanned(std.heap.smp_allocator, key, .{ .webm = reader.* }, admission, .{ .webm = snapshot });
         if (build.*) |lease| lease.deinit();
         build.* = null;
@@ -982,16 +982,14 @@ pub const Runner = struct {
     }
     fn webmWindowsSnapshot(self: *Runner, reader: *media.webm.Reader, snapshot: *const @import("media_index_cache.zig").Cache.WebmSnapshot) !void {
         try self.control.check();
-        var indexed = snapshot.index;
-        indexed.allocator = self.allocator;
-        indexed.reader = if (snapshot.source_bound) reader else null;
-        var timeline = snapshot.timeline;
+        const indexed = snapshot.rebind(reader);
+        const timeline = &snapshot.timeline;
         var continuation = video.webm_pictures.Continuation{ .allocator = self.allocator, .reader = reader };
         defer continuation.deinit();
         var apple_continuation = @import("embedding_gemma2_video.zig").WebmDecoderContinuation{ .allocator = self.allocator, .reader = reader };
         defer apple_continuation.deinit();
         var binding = @import("embedding_gemma2_video.zig").WebmProjectionBinding{ .reader = reader };
-        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, .{ .reader = reader, .index = &indexed, .timeline = &timeline, .projection_binding = &binding, .continuation = &continuation, .apple_continuation = &apple_continuation });
+        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, .{ .reader = reader, .index = &indexed, .timeline = .{ .index = &indexed, .value = timeline }, .projection_binding = &binding, .continuation = &continuation, .apple_continuation = &apple_continuation });
     }
     const VideoSource = struct { bytes: []const u8, reader: ?*const media.mp4.Reader, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput };
     const VideoSlot = struct {

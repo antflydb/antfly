@@ -70,10 +70,18 @@ pub const Cache = struct {
     };
     pub const WebmSnapshot = struct {
         index: video.webm_pictures.Index,
-        source_bound: bool,
         timeline: video.sampling.Timeline,
         origin: i64,
         duration: i128,
+        /// The caller has already matched the immutable media cache key and
+        /// rebuilt this reader from the corresponding packet snapshot.
+        pub fn rebind(self: *const WebmSnapshot, reader: *const media.webm.Reader) video.webm_pictures.Index {
+            var index = self.index;
+            index.allocator = reader.allocator;
+            index.reader = reader;
+            return index;
+        }
+
         fn copy(a: std.mem.Allocator, value: WebmSnapshot) !WebmSnapshot {
             var result = value;
             result.index.reader = null;
