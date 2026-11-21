@@ -104,12 +104,20 @@ function text(tag, value) {
   element.textContent = value ?? "";
   return element;
 }
+const folderPaths = { inbox: "/mail/messages", outbox: "/mail/outbox", trash: "/mail/trash" };
 async function load(path = "/mail/messages") {
-  folder = path.startsWith("/mail/outbox") ? "outbox" : "inbox";
+  folder = path.startsWith("/mail/outbox") ? "outbox" : path.startsWith("/mail/trash") ? "trash" : "inbox";
   const result = await api(path);
   cursor = result.cursor;
+  $("trash-banner").hidden = folder !== "trash";
+  if (folder === "trash") {
+    $("trash-retention").textContent =
+      "Messages that have been in Trash more than " + result.retention_days + " days will be deleted automatically.";
+    $("empty-trash").hidden = !result.messages.length;
+  }
   render(result.messages);
 }
+const daysLeft = (time) => Math.max(0, Math.ceil((time - Date.now()) / 86400000));
 function render(messages) {
   $("next").hidden = !cursor;
   $("messages").replaceChildren();
@@ -125,6 +133,7 @@ function render(messages) {
           new Date(message.received_at ?? message.created_at).toLocaleString()
       )
     );
+    if (message.delete_at) button.append(text("small", "Deleted forever in " + daysLeft(message.delete_at) + " days"));
     if (message.local) {
       const badge = text("small", "Found on this device");
       badge.className = "local";
@@ -181,27 +190,71 @@ async function openMessage(id) {
   const reply = text("button", "Reply");
   reply.onclick = () => edit(message);
   article.append(document.createElement("br"), reply);
-  // Deleting needs the server; an offline copy is read-only.
-  if (!message.offline) {
+  // Changing a message needs the server; an offline copy is read-only.
+  if (message.offline) return;
+  if (message.trashed_at != null) {
+    article.prepend(
+      text("small", "This message is in Trash and will be deleted forever on " + new Date(message.delete_at).toLocaleDateString() + ".")
+    );
+    article.firstChild.className = "trash-note";
+    const restore = text("button", "Restore");
+    restore.onclick = guarded(() => restoreMessage(id));
+    const forever = text("button", "Delete forever");
+    forever.className = "danger";
+    forever.onclick = guarded(() => deleteForever(id));
+    article.append(restore, forever);
+  } else {
     const remove = text("button", "Delete");
     remove.className = "danger";
-    remove.onclick = guarded(() => deleteMessage(id));
+    remove.onclick = guarded(() => trashMessage(id));
     article.append(remove);
   }
 }
-async function deleteMessage(id) {
-  if (!confirm("Delete this message? It is removed from your mailbox, its attachments and every device's copy."))
-    return;
-  await api("/mail/messages/" + encodeURIComponent(id), null, "DELETE");
-  // The next sync also carries the deletion; drop the local copy right away.
+// The device copy holds the inbox only: drop messages leaving it right away
+// (the next sync carries the same change).
+async function dropLocal(id) {
   if (local)
     await local
       .forget([id])
       .then(() => localReady(local?.state))
       .catch(() => {});
-  $("message").replaceChildren(text("p", "Message deleted."));
-  status("Message deleted.");
-  await load();
+}
+function statusWithAction(message, label, action) {
+  status(message);
+  const button = text("button", label);
+  button.type = "button";
+  button.onclick = guarded(action);
+  $("status").append(button);
+}
+async function trashMessage(id) {
+  await api("/mail/messages/" + encodeURIComponent(id) + "/trash", {});
+  await dropLocal(id);
+  $("message").replaceChildren(text("p", "Message moved to Trash."));
+  await load(folderPaths[folder] ?? folderPaths.inbox);
+  statusWithAction("Message moved to Trash.", "Undo", () => restoreMessage(id));
+}
+async function restoreMessage(id) {
+  await api("/mail/messages/" + encodeURIComponent(id) + "/restore", {});
+  $("message").replaceChildren(text("p", "Message restored to the inbox."));
+  await load(folderPaths[folder] ?? folderPaths.inbox);
+  status("Message restored to the inbox.");
+  // The restored message is re-announced to devices; fetch and embed it now.
+  if (local) syncLocal().catch((error) => localStatus(error.message));
+}
+async function deleteForever(id) {
+  if (!confirm("Delete this message forever? You can't undo this.")) return;
+  await api("/mail/messages/" + encodeURIComponent(id), null, "DELETE");
+  await dropLocal(id);
+  $("message").replaceChildren(text("p", "Message deleted forever."));
+  status("Message deleted forever.");
+  await load(folderPaths.trash);
+}
+async function emptyTrash() {
+  if (!confirm("Delete all messages in Trash forever? You can't undo this.")) return;
+  const result = await api("/mail/trash/empty", {});
+  $("message").replaceChildren(text("p", "Select a message."));
+  status(result.done ? "Trash emptied." : "Emptying Trash… larger Trash folders finish in the background.");
+  await load(folderPaths.trash);
 }
 function edit(message) {
   replyTo = message?.id ?? null;
@@ -434,13 +487,9 @@ if ("serviceWorker" in navigator)
   });
 $("inbox").onclick = guarded(() => load());
 $("outbox").onclick = guarded(() => load("/mail/outbox"));
-$("next").onclick = guarded(() =>
-  load(
-    (folder === "outbox" ? "/mail/outbox" : "/mail/messages") +
-      "?cursor=" +
-      encodeURIComponent(cursor)
-  )
-);
+$("trash").onclick = guarded(() => load("/mail/trash"));
+$("empty-trash").onclick = guarded(emptyTrash);
+$("next").onclick = guarded(() => load((folderPaths[folder] ?? folderPaths.inbox) + "?cursor=" + encodeURIComponent(cursor)));
 $("compose").onclick = () => edit();
 $("cancel").onclick = () => {
   $("editor").hidden = true;

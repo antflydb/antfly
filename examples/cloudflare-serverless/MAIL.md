@@ -18,15 +18,18 @@ Implemented:
   `MAIL_SENDS_PER_HOUR`). Unknown submissions are never automatically resent.
 - Queue replay and restart-safe receipt/projection state, with periodic bounded
   reconciliation of pending work.
-- Message deletion: a message disappears from the inbox, search and every
-  on-device copy, and its stored MIME, attachments and search document are
-  purged.
+- Gmail-style Trash and retention. Delete moves a message to Trash, with Undo;
+  it leaves the inbox, search and on-device copies but can still be opened.
+  Trash offers Restore, Delete forever and Empty Trash now. Messages left in
+  Trash longer than `MAIL_TRASH_DAYS` (default 30) are deleted forever
+  automatically. Deleting forever purges the stored MIME, attachments and
+  search document.
 - An installable PWA with opt-in on-device semantic search (see below).
 
 This is webmail, with no IMAP/POP server or Gmail synchronization. Mailboxes are
 currently private per-user inboxes; shared mailbox memberships, folders/drafts,
-mailbox deletion/retention controls (trash, undo, automatic expiry) and
-delivery-event reconciliation are future work. Account deletion is disabled in this app until the mailbox lifecycle is
+labels, per-mailbox retention settings, legal holds and delivery-event
+reconciliation are future work. Account deletion is disabled in this app until the mailbox lifecycle is
 implemented. The generic auth adapter retains its own account-deletion support.
 
 ## On-device search (PWA)
@@ -103,8 +106,9 @@ Limits:
   takes time. It runs in the background and resumes after reloads.
 - The on-device copy can be open in one tab at a time, because OPFS access
   handles are exclusive. Other tabs fall back to server search.
-- Deletions reach a device at its next sync (immediately on the device that
-  deleted). Messages are never edited, so there is nothing else to propagate.
+- Trash, restores and deletions reach a device at its next sync (immediately
+  on the device that made the change). Devices hold the inbox, not Trash.
+  Messages are never edited, so there is nothing else to propagate.
 
 ## Local setup
 
@@ -196,7 +200,27 @@ are stored per delivery (`raw/<receipt>`, `attachments/<receipt>/<index>`) so a
 deleted message's bytes can be removed without reference counting; content
 hashes still verify every object.
 
-Deleting a message (`DELETE /mail/messages/:id`) works in two steps:
+Trash follows Gmail:
+
+| Action | Route |
+| --- | --- |
+| Move to Trash | `POST /mail/messages/:id/trash` |
+| Restore (also Undo) | `POST /mail/messages/:id/restore` |
+| List Trash | `GET /mail/trash` |
+| Empty Trash | `POST /mail/trash/empty` (continues through the queue in batches of 25) |
+| Delete forever | `DELETE /mail/messages/:id` |
+
+- **Moving to Trash** is one transaction: it moves the message from the inbox
+  order to the Trash indexes and appends a sync tombstone so devices drop
+  their copy. The search document and objects stay, so the message can still
+  be opened and restored; search and the inbox exclude it.
+- **Restoring** puts it back and appends a new sync entry; devices fetch and
+  embed it again.
+- **Retention.** Each minute's scheduled sweep finds mailboxes whose oldest
+  Trash is older than `MAIL_TRASH_DAYS` and queues `expire`, which deletes
+  forever in batches of 25 until none remain.
+
+Deleting forever works in two steps:
 
 1. **Mark.** One metadata transaction marks the receipt deleted, removes it
    from the inbox order, appends a sync tombstone and records a purge intent.

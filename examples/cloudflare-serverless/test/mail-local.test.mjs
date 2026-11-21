@@ -312,6 +312,52 @@ test("DELETE removes a message through the session's mailbox and queues its purg
   assert.deepEqual(hints, [{ mailbox: mailbox.id, kind: "purge", id: "11111111-1111-4111-8111-111111111111" }]);
 });
 
+test("Trash routes, bounded emptying and the retention sweep", async () => {
+  const mailbox = { id: crypto.randomUUID(), address: "me@example.test" },
+    calls = [],
+    hints = [];
+  let emptied = 0;
+  const e = {
+    AUTH_ORIGIN: "https://mail.example.test",
+    AUTH_SERVICE: {
+      session: async () => ({ session: { user: { id: "alice" }, mailbox }, cookies: [] }),
+      mailboxes: async () => [mailbox.id],
+    },
+    MAIL_QUEUE: { send: async (body) => hints.push(body) },
+    MAILBOXES: {
+      getByName: () => ({
+        trash: async (box, id) => (calls.push(["trash", id]), id.startsWith("0000") ? Promise.reject(Error("MessageNotReady")) : { id, trashed: true }),
+        restore: async (box, id) => (calls.push(["restore", id]), { id, restored: true }),
+        trashList: async (box, cursor) => (calls.push(["trashList", cursor]), { messages: [], cursor: null, retention_days: 30 }),
+        emptyTrash: async () => (calls.push(["empty"]), { deleted: 25, done: ++emptied > 1 }),
+        expire: async () => (calls.push(["expire"]), { deleted: 25, done: false }),
+        pending: async () => ({ inbound: [], outbound: [], purge: [], expire: true, publish: false }),
+      }),
+    },
+  };
+  const send = (path, method = "POST", origin = e.AUTH_ORIGIN) =>
+    worker.fetch(new Request(e.AUTH_ORIGIN + path, { method, headers: { Origin: origin } }), e);
+  const id = crypto.randomUUID();
+  assert.deepEqual(await (await send("/mail/messages/" + id + "/trash")).json(), { id, trashed: true });
+  assert.deepEqual(await (await send("/mail/messages/" + id + "/restore")).json(), { id, restored: true });
+  assert.equal((await send("/mail/messages/" + id + "/trash", "POST", "https://attacker.test")).status, 403);
+  assert.equal((await send("/mail/messages/00000000-0000-4000-8000-000000000000/trash")).status, 409);
+  assert.equal((await send("/mail/trash?cursor=x", "GET")).status, 200);
+  assert.deepEqual(calls.find(([op]) => op === "trashList"), ["trashList", "x"]);
+  // A large Trash is emptied in bounded steps that continue through the queue.
+  assert.deepEqual(await (await send("/mail/trash/empty")).json(), { deleted: 25, done: false });
+  assert.deepEqual(hints.at(-1), { mailbox: mailbox.id, kind: "empty" });
+  const queued = (body) => worker.queue({ messages: [{ body, ack() {}, retry() {} }] }, e);
+  hints.length = 0;
+  await queued({ mailbox: mailbox.id, kind: "empty" });
+  assert.deepEqual(hints, [], "the second step finished");
+  await queued({ mailbox: mailbox.id, kind: "expire" });
+  assert.deepEqual(hints, [{ mailbox: mailbox.id, kind: "expire" }], "unfinished expiry continues");
+  hints.length = 0;
+  await worker.scheduled({}, e);
+  assert.deepEqual(hints, [{ mailbox: mailbox.id, kind: "expire" }], "the sweep starts retention");
+});
+
 test("static assets allow WASM and workers but stay same-origin; runtimes are immutable", async () => {
   const e = env();
   const page = await get("/", e);
@@ -713,40 +759,75 @@ test("service worker never caches mail, auth or model weights", async () => {
   assert.ok(await request("/local/models/catalog.json"));
 });
 
-test("a message can be deleted from the UI after confirmation", async () => {
+test("Delete moves to Trash with Undo; Trash offers Restore, Delete forever and Empty Trash", async () => {
   const dom = new JSDOM(html, { url: "https://mail.example.test/", runScripts: "outside-only" });
   const { window } = dom;
   const id = crypto.randomUUID(),
     requests = [];
-  let present = true,
+  let trashedAt = null,
+    deleted = false,
     confirmAnswer = false;
   window.confirm = () => confirmAnswer;
-  const message = { id, subject: "Invoice", from: "a@example.net", to: "me@example.test", text: "x", received_at: 1, attachments: [] };
+  const day = 86400000;
+  const base = { id, subject: "Invoice", from: "a@example.net", to: "me@example.test", text: "x", received_at: 1, attachments: [] };
+  const current = () => (trashedAt == null ? base : { ...base, trashed_at: trashedAt, delete_at: trashedAt + 30 * day });
   window.fetch = async (url, options = {}) => {
-    requests.push([options.method ?? "GET", url]);
+    const method = options.method ?? "GET";
+    requests.push([method, url]);
     if (url === "/api/me")
       return Response.json({ user: { id: "u", email: "me@example.test" }, mailbox: { id: crypto.randomUUID(), address: "me@example.test" } });
-    if (url === "/mail/messages") return Response.json({ messages: present ? [message] : [], cursor: null });
-    if (url === "/mail/messages/" + id && options.method === "DELETE") {
-      present = false;
-      return Response.json({ id, deleted: true });
-    }
-    if (url === "/mail/messages/" + id) return Response.json(message);
-    throw Error("UnexpectedUiRequest " + url);
+    if (url === "/mail/messages") return Response.json({ messages: !deleted && trashedAt == null ? [current()] : [], cursor: null });
+    if (url === "/mail/trash") return Response.json({ messages: !deleted && trashedAt != null ? [current()] : [], cursor: null, retention_days: 30 });
+    if (url === "/mail/messages/" + id + "/trash") return (trashedAt = Date.now() - 5 * day), Response.json({ id, trashed: true });
+    if (url === "/mail/messages/" + id + "/restore") return (trashedAt = null), Response.json({ id, restored: true });
+    if (url === "/mail/messages/" + id && method === "DELETE") return (deleted = true), Response.json({ id, deleted: true });
+    if (url === "/mail/trash/empty") return (deleted = true), Response.json({ deleted: 1, done: true });
+    if (url === "/mail/messages/" + id) return Response.json(current());
+    throw Error("UnexpectedUiRequest " + method + " " + url);
   };
   try {
     await window.eval("(async()=>{" + script + "\n})()");
     const $ = (name) => window.document.getElementById(name);
+    const button = (root, label) => [...root.querySelectorAll("button")].find((b) => b.textContent === label);
     await $("messages").querySelector("button").onclick();
-    const remove = [...$("message").querySelectorAll("button")].find((b) => b.textContent === "Delete");
-    assert.ok(remove, "server-backed messages offer Delete");
-    await remove.onclick();
-    assert.ok(!requests.some(([method]) => method === "DELETE"), "nothing is deleted without confirmation");
+    // Delete moves to Trash without a prompt, with Undo.
+    await button($("message"), "Delete").onclick();
+    assert.deepEqual(requests.at(-2), ["POST", "/mail/messages/" + id + "/trash"]);
+    assert.match($("status").textContent, /moved to Trash/);
+    assert.equal($("messages").textContent, "No messages.", "gone from the inbox");
+    await button($("status"), "Undo").onclick();
+    assert.ok(requests.some(([m, u]) => m === "POST" && u === "/mail/messages/" + id + "/restore"));
+    assert.match($("status").textContent, /restored/);
+    // Trash again, then open the Trash folder.
+    await $("messages").querySelector("button").onclick();
+    await button($("message"), "Delete").onclick();
+    await $("trash").onclick();
+    assert.equal($("trash-banner").hidden, false);
+    assert.match($("trash-retention").textContent, /more than 30 days will be deleted automatically/);
+    assert.match($("messages").textContent, /Deleted forever in 25 days/);
+    await $("messages").querySelector("button").onclick();
+    assert.match($("message").textContent, /in Trash and will be deleted forever on/);
+    assert.equal(button($("message"), "Delete"), undefined, "Trash offers Delete forever instead");
+    await button($("message"), "Delete forever").onclick();
+    assert.ok(!requests.some(([m]) => m === "DELETE"), "Delete forever asks first");
     confirmAnswer = true;
-    await remove.onclick();
-    assert.deepEqual(requests.filter(([method]) => method === "DELETE"), [["DELETE", "/mail/messages/" + id]]);
-    assert.equal($("message").textContent, "Message deleted.");
-    assert.equal($("messages").textContent, "No messages.", "the list is refreshed");
+    await button($("message"), "Delete forever").onclick();
+    assert.deepEqual(requests.filter(([m]) => m === "DELETE"), [["DELETE", "/mail/messages/" + id]]);
+    assert.equal($("message").textContent, "Message deleted forever.");
+    assert.equal($("empty-trash").hidden, true, "nothing left to empty");
+    // Empty Trash.
+    deleted = false;
+    await $("trash").onclick();
+    confirmAnswer = false;
+    await $("empty-trash").onclick();
+    assert.ok(!requests.some(([, u]) => u === "/mail/trash/empty"), "Empty Trash asks first");
+    confirmAnswer = true;
+    await $("empty-trash").onclick();
+    assert.deepEqual(requests.filter(([, u]) => u === "/mail/trash/empty"), [["POST", "/mail/trash/empty"]]);
+    assert.equal($("status").textContent, "Trash emptied.");
+    assert.equal($("inbox").hidden, false);
+    await $("inbox").onclick();
+    assert.equal($("trash-banner").hidden, true, "the banner belongs to Trash");
   } finally {
     window.close();
   }

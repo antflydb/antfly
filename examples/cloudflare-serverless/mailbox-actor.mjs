@@ -20,6 +20,7 @@ import {
   MailOutbox,
   MailSyncLog,
   MailDeletion,
+  MailTrash,
   ownedObjects,
   syncMessage,
   syncLimits,
@@ -55,6 +56,9 @@ export class Mailbox extends R2CommitCoordinator {
     });
     this.syncLog = new MailSyncLog(this.serviceStore);
     this.deletion = new MailDeletion(this.serviceStore, this.syncLog);
+    this.trashBin = new MailTrash(this.serviceStore, this.syncLog, {
+      retentionDays: Number(env.MAIL_TRASH_DAYS ?? 30),
+    });
   }
   scope(id) {
     if (!uuid(id) || !this.env.MAILBOXES.idFromName(id).equals(this.ctx.id))
@@ -240,6 +244,36 @@ export class Mailbox extends R2CommitCoordinator {
     if (deletedMeanwhile) return { done: true, purge: true };
     return this.publish(mailbox);
   }
+  async trash(mailbox, id) {
+    this.scope(mailbox);
+    return { id, trashed: true, delete_at: await this.trashBin.trash(id) };
+  }
+  async restore(mailbox, id) {
+    this.scope(mailbox);
+    await this.trashBin.restore(id);
+    return { id, restored: true };
+  }
+  async trashList(mailbox, cursor = "") {
+    this.scope(mailbox);
+    const page = await this.trashBin.list(cursor);
+    const messages = [];
+    for (const id of page.ids) {
+      const message = await this.message(mailbox, id);
+      if (message) messages.push(message);
+    }
+    return { messages, cursor: page.cursor, retention_days: this.trashBin.retentionDays };
+  }
+  // Delete forever, in bounded steps: everything in Trash, or only what has
+  // outlived the retention period. `done: false` asks the caller to continue.
+  async emptyTrash(mailbox, { expiredOnly = false } = {}) {
+    this.scope(mailbox);
+    const ids = expiredOnly ? await this.trashBin.expired(25) : await this.trashBin.all(25);
+    for (const id of ids) await this.delete(mailbox, id);
+    return { deleted: ids.length, done: ids.length < 25 };
+  }
+  async expire(mailbox) {
+    return this.emptyTrash(mailbox, { expiredOnly: true });
+  }
   // Hide the message at once (one transaction), then purge it. A failed or
   // interrupted purge is retried by the queue and the scheduled sweep.
   async delete(mailbox, id) {
@@ -280,7 +314,11 @@ export class Mailbox extends R2CommitCoordinator {
     // A deleted message is hidden even before its purge removes the document.
     if (await this.deletion.isDeleted(id)) return null;
     const result = await this.run({ op: "lookup", doc_id: "message/" + id });
-    return result.body ? JSON.parse(result.body) : null;
+    if (!result.body) return null;
+    const message = JSON.parse(result.body);
+    // Trashed messages can still be opened; say when they will be deleted.
+    const trashedAt = await this.trashBin.trashedAt(id);
+    return trashedAt == null ? message : { ...message, trashed_at: trashedAt, delete_at: this.trashBin.expiresAt(trashedAt) };
   }
   async list(mailbox, cursor = "") {
     this.scope(mailbox);
@@ -309,7 +347,8 @@ export class Mailbox extends R2CommitCoordinator {
     for (const hit of found.hits ?? []) {
       if (!hit.doc_id?.startsWith("message/")) throw Error("InvalidMailSearchResult");
       const message = await this.message(mailbox, hit.doc_id.slice(8));
-      if (message) messages.push(message);
+      // Like Gmail, search covers everything except Trash.
+      if (message && message.trashed_at == null) messages.push(message);
     }
     return { messages };
   }
@@ -323,7 +362,8 @@ export class Mailbox extends R2CommitCoordinator {
     const messages = [];
     for (const id of page.ids) {
       const message = await this.message(mailbox, id);
-      if (message) messages.push(syncMessage(message));
+      // Devices hold the inbox, not Trash; a later tombstone covers trashed ones.
+      if (message && message.trashed_at == null) messages.push(syncMessage(message));
     }
     return {
       messages,
@@ -377,6 +417,7 @@ export class Mailbox extends R2CommitCoordinator {
       ]),
       outbound: await this.outbox.pending(),
       purge: await this.deletion.pending(),
+      expire: (await this.trashBin.expired(1)).length > 0,
       publish: !!(await this.transaction((tx) => tx.get("mail/v1/publish"))),
     };
   }

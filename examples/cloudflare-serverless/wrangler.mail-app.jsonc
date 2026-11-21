@@ -21,7 +21,8 @@
   "vars": {
     "AUTH_ORIGIN": "https://mail.example.com",
     "MAIL_DOMAIN": "example.com",
-    "AUTH_STORAGE_ID": "example-mail-auth-v1"
+    "AUTH_STORAGE_ID": "example-mail-auth-v1",
+    "MAIL_TRASH_DAYS": "30"
   },
   "send_email": [
     {

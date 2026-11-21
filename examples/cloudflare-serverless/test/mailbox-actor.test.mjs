@@ -20,7 +20,7 @@
 import { register } from "node:module";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MailOutbox, MailSyncLog, MailDeletion, digest, objectPrefix } from "../mail-core.mjs";
+import { MailOutbox, MailSyncLog, MailDeletion, MailTrash, DAY_MS, digest, objectPrefix } from "../mail-core.mjs";
 
 register(new URL("./support/workers-node-hooks.mjs", import.meta.url));
 const { Mailbox } = await import("../mailbox-actor.mjs");
@@ -112,7 +112,9 @@ function mailbox() {
   actor.outbox = new MailOutbox(store);
   actor.syncLog = new MailSyncLog(store);
   actor.deletion = new MailDeletion(store, actor.syncLog);
-  return { id, actor, store, objects, search, prefix: objectPrefix(id) };
+  const clock = { now: 1_700_000_000_000 };
+  actor.trashBin = new MailTrash(store, actor.syncLog, { clock: () => clock.now, retentionDays: 30 });
+  return { id, actor, store, objects, search, clock, prefix: objectPrefix(id) };
 }
 
 const raw = (subject) =>
@@ -150,7 +152,7 @@ test("delete hides a message everywhere and purges only what it owns", async () 
   assert.deepEqual(keysOf(m, doomed), [], "owned objects purged");
   assert.equal([...m.objects.objects.keys()].filter((k) => k.includes("/projections/")).length, 1);
   assert.equal(keysOf(m, keep).length, 2, "the other message is untouched");
-  assert.deepEqual(await m.actor.pending(m.id), { inbound: [], outbound: [], purge: [], publish: false }, "purged and published");
+  assert.deepEqual(await m.actor.pending(m.id), { inbound: [], outbound: [], purge: [], expire: false, publish: false }, "purged and published");
 
   const synced = await m.actor.sync(m.id, "");
   assert.deepEqual(synced.deleted, [doomed]);
@@ -205,4 +207,69 @@ test("deleting before ingest leaves nothing behind", async () => {
   assert.deepEqual(keysOf(m, doomed), [], "the raw MIME is purged");
   assert.deepEqual(await m.actor.ingest(m.id, doomed), { done: true });
   assert.equal(m.search.docs.size, 0);
+});
+
+test("Trash hides a message from the inbox, search and devices, keeps it openable, and restores it", async () => {
+  const m = mailbox();
+  const keep = await deliver(m, "Keep me");
+  const message = await deliver(m, "Trash me");
+  for (const receipt of [keep, message]) await m.actor.ingest(m.id, receipt);
+  const cursor = (await m.actor.sync(m.id, "")).cursor;
+
+  const trashed = await m.actor.trash(m.id, message);
+  assert.deepEqual(trashed, { id: message, trashed: true, delete_at: m.clock.now + 30 * DAY_MS });
+  assert.deepEqual(await m.actor.trash(m.id, message), trashed, "trashing again changes nothing");
+  assert.deepEqual((await m.actor.list(m.id)).messages.map((x) => x.id), [keep]);
+  assert.deepEqual((await m.actor.search(m.id, "needleword")).messages.map((x) => x.id), [keep], "search excludes Trash");
+  const opened = await m.actor.message(m.id, message);
+  assert.equal(opened.trashed_at, m.clock.now, "trashed messages can still be opened");
+  assert.equal(opened.delete_at, m.clock.now + 30 * DAY_MS);
+  assert.ok(await m.actor.attachment(m.id, message, 0), "and their attachments downloaded");
+  const trash = await m.actor.trashList(m.id);
+  assert.deepEqual([trash.messages.map((x) => x.id), trash.retention_days], [[message], 30]);
+  assert.equal(keysOf(m, message).length, 2, "nothing is purged while in Trash");
+  assert.deepEqual((await m.actor.sync(m.id, cursor)).deleted, [message], "devices drop it");
+
+  // Restore puts it back in the inbox and re-announces it to devices.
+  const afterTrash = (await m.actor.sync(m.id, cursor)).cursor;
+  assert.deepEqual(await m.actor.restore(m.id, message), { id: message, restored: true });
+  assert.deepEqual(new Set((await m.actor.list(m.id)).messages.map((x) => x.id)), new Set([keep, message]));
+  assert.equal((await m.actor.message(m.id, message)).trashed_at, undefined);
+  assert.deepEqual((await m.actor.trashList(m.id)).messages, []);
+  const resynced = await m.actor.sync(m.id, afterTrash);
+  assert.deepEqual(resynced.messages.map((x) => x.id), [message], "devices fetch and embed it again");
+  // A message restored then trashed again before a device syncs is not re-sent.
+  await m.actor.trash(m.id, message);
+  const replay = await m.actor.sync(m.id, afterTrash);
+  assert.deepEqual([replay.messages, replay.deleted], [[], [message]]);
+  await assert.rejects(m.actor.trash(m.id, crypto.randomUUID()), /UnknownMessage/);
+});
+
+test("retention deletes Trash older than the period forever; Empty Trash deletes it all", async () => {
+  const m = mailbox();
+  const [old, recent, inbox] = [await deliver(m, "Old"), await deliver(m, "Recent"), await deliver(m, "Inbox")];
+  for (const receipt of [old, recent, inbox]) await m.actor.ingest(m.id, receipt);
+  const pending = await deliver(m, "Still arriving");
+  await assert.rejects(m.actor.trash(m.id, pending), /MessageNotReady/);
+
+  await m.actor.trash(m.id, old);
+  m.clock.now += 20 * DAY_MS;
+  await m.actor.trash(m.id, recent);
+  assert.equal((await m.actor.pending(m.id)).expire, false, "nothing has outlived 30 days yet");
+  m.clock.now += 10 * DAY_MS + 1;
+  assert.equal((await m.actor.pending(m.id)).expire, true, "the sweep will expire Trash");
+  assert.deepEqual(await m.actor.expire(m.id), { deleted: 1, done: true });
+  assert.equal(await m.actor.message(m.id, old), null, "the expired message is deleted forever");
+  assert.deepEqual(keysOf(m, old), [], "with its objects");
+  assert.ok(await m.actor.message(m.id, recent), "younger Trash is kept");
+  assert.equal((await m.actor.pending(m.id)).expire, false);
+
+  // Delete forever straight from Trash removes its Trash entries too.
+  await m.actor.trash(m.id, inbox);
+  await m.actor.delete(m.id, inbox);
+  assert.deepEqual((await m.actor.trashList(m.id)).messages.map((x) => x.id), [recent]);
+  assert.deepEqual(await m.actor.emptyTrash(m.id), { deleted: 1, done: true });
+  assert.deepEqual((await m.actor.trashList(m.id)).messages, []);
+  assert.equal(await m.actor.message(m.id, recent), null);
+  assert.equal(m.search.docs.size, 0, "only the never-indexed delivery remains, unindexed");
 });

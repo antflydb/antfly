@@ -299,6 +299,15 @@ export class MailSyncLog {
     await tx.put(marker, sequence);
     return true;
   }
+  /** Append `id` again (e.g. restored from Trash) so replicas re-add it. */
+  async recordUpsert(tx, id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    const sequence = ((await tx.get(this.prefix + "head")) ?? 0) + 1;
+    await tx.put(this.prefix + "head", sequence);
+    await tx.put(this.entryKey(sequence), id);
+    await tx.put(this.prefix + "id/" + id, sequence);
+    return sequence;
+  }
   /** Append a deletion tombstone for `id`. Call inside the deleting transaction. */
   async recordDelete(tx, id) {
     if (!uuid(id)) throw Error("InvalidMessageIdentity");
@@ -385,6 +394,98 @@ export function ownedObjects(prefix, receipt) {
 }
 const orderKey = (receipt) =>
   "mail/v1/order/" + String(9999999999999 - receipt.received_at).padStart(13, "0") + "/" + receipt.id;
+const pad = (n) => String(n).padStart(13, "0");
+// Trash is listed newest-trashed first and expires oldest-first.
+const trashKeys = (receipt) => [
+  "mail/v1/trash/" + pad(9999999999999 - receipt.trashed_at) + "/" + receipt.id,
+  "mail/v1/trash-expiry/" + pad(receipt.trashed_at) + "/" + receipt.id,
+];
+export const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Gmail-style Trash. Moving a message to Trash hides it from the inbox, search
+// and device copies (a sync tombstone) but keeps it, with its search document
+// and objects, so it can be opened or restored. Messages left in Trash longer
+// than the retention period are deleted forever by the scheduled sweep, through
+// MailDeletion. Restoring puts the message back in the inbox and re-announces it
+// to replicas, which embed it again.
+export class MailTrash {
+  constructor(store, syncLog, { clock = Date.now, retentionDays = 30, prefix = "mail/v1/" } = {}) {
+    if (!Number.isInteger(retentionDays) || retentionDays < 1 || retentionDays > 3650)
+      throw Error("InvalidTrashRetention");
+    this.store = store;
+    this.syncLog = syncLog;
+    this.clock = clock;
+    this.retentionMs = retentionDays * DAY_MS;
+    this.retentionDays = retentionDays;
+    this.prefix = prefix;
+  }
+  receiptKey(id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    return this.prefix + "receipt/" + id;
+  }
+  /** Move an inbox message to Trash; returns its expiry time. Idempotent. */
+  async trash(id) {
+    return this.store.transaction(async (tx) => {
+      const receipt = await tx.get(this.receiptKey(id));
+      if (!receipt || receipt.state === "deleted") throw Error("UnknownMessage");
+      if (receipt.state !== "indexed") throw Error("MessageNotReady");
+      if (Number.isFinite(receipt.trashed_at)) return receipt.trashed_at + this.retentionMs;
+      const trashed = { ...receipt, trashed_at: this.clock() };
+      await tx.delete(orderKey(receipt));
+      for (const key of trashKeys(trashed)) await tx.put(key, id);
+      await tx.put(this.receiptKey(id), trashed);
+      await this.syncLog.recordDelete(tx, id);
+      return trashed.trashed_at + this.retentionMs;
+    });
+  }
+  /** Return a trashed message to the inbox. Idempotent. */
+  async restore(id) {
+    return this.store.transaction(async (tx) => {
+      const receipt = await tx.get(this.receiptKey(id));
+      if (!receipt || receipt.state === "deleted") throw Error("UnknownMessage");
+      if (!Number.isFinite(receipt.trashed_at)) return false;
+      for (const key of trashKeys(receipt)) await tx.delete(key);
+      const { trashed_at: _, ...restored } = receipt;
+      await tx.put(this.receiptKey(id), restored);
+      await tx.put(orderKey(restored), id);
+      await this.syncLog.recordUpsert(tx, id);
+      return true;
+    });
+  }
+  /** Trashed-at time, or null if the message is not in Trash. */
+  async trashedAt(id) {
+    if (!uuid(id)) return null;
+    const receipt = await this.store.transaction((tx) => tx.get(this.receiptKey(id)));
+    return receipt?.state !== "deleted" && Number.isFinite(receipt?.trashed_at) ? receipt.trashed_at : null;
+  }
+  expiresAt(trashedAt) {
+    return trashedAt + this.retentionMs;
+  }
+  /** One page of Trash, most recently trashed first. */
+  async list(cursor = "", limit = 10) {
+    if (typeof cursor !== "string" || (cursor && !/^mail\/v1\/trash\/\d{13}\/[a-f0-9-]{36}$/.test(cursor)))
+      throw Error("InvalidMailCursor");
+    return this.store.transaction(async (tx) => {
+      const page = await tx.list({ prefix: this.prefix + "trash/", startAfter: cursor, limit: limit + 1 });
+      const entries = [...page].slice(0, limit);
+      return { ids: entries.map(([, id]) => id), cursor: page.size > limit ? entries.at(-1)[0] : null };
+    });
+  }
+  /** Trashed ids whose retention has elapsed, oldest first. */
+  async expired(limit = 25, now = this.clock()) {
+    return this.store.transaction(async (tx) => {
+      const page = await tx.list({ prefix: this.prefix + "trash-expiry/", limit });
+      const cutoff = now - this.retentionMs;
+      return [...page].filter(([key]) => Number(key.split("/")[3]) <= cutoff).map(([, id]) => id);
+    });
+  }
+  /** Any trashed ids (oldest first), for emptying Trash in bounded steps. */
+  async all(limit = 25) {
+    return this.store.transaction(async (tx) => [
+      ...(await tx.list({ prefix: this.prefix + "trash-expiry/", limit })).values(),
+    ]);
+  }
+}
 
 // Deleting a message is a transactional mark followed by an idempotent purge.
 // The mark hides the message everywhere at once (list order, lookups, search
@@ -409,6 +510,7 @@ export class MailDeletion {
       if (!receipt) throw Error("UnknownMessage");
       if (receipt.state === "deleted") return null;
       if (Number.isFinite(receipt.received_at)) await tx.delete(orderKey(receipt));
+      if (Number.isFinite(receipt.trashed_at)) for (const key of trashKeys(receipt)) await tx.delete(key);
       await tx.delete(this.prefix + "pending/" + id);
       await tx.put(this.receiptKey(id), { ...receipt, state: "deleted", deleted_at: this.clock() });
       await tx.put(this.prefix + "purge/" + id, id);

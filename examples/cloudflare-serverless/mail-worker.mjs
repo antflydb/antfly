@@ -179,6 +179,17 @@ export default {
       const match = /^\/mail\/messages\/([a-f0-9-]{36})(?:\/attachments\/(\d{1,2}))?$/.exec(
         url.pathname
       );
+      if (url.pathname === "/mail/trash" && request.method === "GET")
+        return reply(publicPage(await takeRpcData(stub.trashList(mailbox.id, url.searchParams.get("cursor") ?? ""))));
+      if (url.pathname === "/mail/trash/empty" && request.method === "POST") {
+        const result = await takeRpcData(stub.emptyTrash(mailbox.id));
+        if (!result.done) await hint(env, mailbox.id, "empty");
+        return reply(result);
+      }
+      const action = /^\/mail\/messages\/([a-f0-9-]{36})\/(trash|restore)$/.exec(url.pathname);
+      if (action && request.method === "POST")
+        return reply(await takeRpcData(action[2] === "trash" ? stub.trash(mailbox.id, action[1]) : stub.restore(mailbox.id, action[1])));
+      // DELETE is "delete forever" (from Trash or directly), like Gmail's API.
       if (match && !match[2] && request.method === "DELETE") {
         const result = await takeRpcData(stub.delete(mailbox.id, match[1]));
         // The purge ran inline; a hint covers a failure part-way through it.
@@ -239,6 +250,7 @@ export default {
       return reply({ error: "NotFound" }, 404);
     } catch (error) {
       if (error?.message === "UnknownMessage") return reply({ error: "NotFound" }, 404);
+      if (error?.message === "MessageNotReady") return reply({ error: "MessageNotReady" }, 409);
       if (error?.message === "MailSendRateLimited")
         return reply({ error: "MailSendRateLimited" }, 429);
       const invalid =
@@ -281,8 +293,8 @@ export default {
       const body = message.body;
       if (
         !uuid(body?.mailbox) ||
-        !["ingest", "send", "publish", "purge"].includes(body.kind) ||
-        (body.kind !== "publish" && !uuid(body.id))
+        !["ingest", "send", "publish", "purge", "expire", "empty"].includes(body.kind) ||
+        (!["publish", "expire", "empty"].includes(body.kind) && !uuid(body.id))
       ) {
         message.ack();
         continue;
@@ -296,9 +308,15 @@ export default {
                 ? await takeRpcData(stub.dispatch(body.mailbox, body.id))
                 : body.kind === "purge"
                   ? await takeRpcData(stub.purge(body.mailbox, body.id))
-                  : await takeRpcData(stub.publish(body.mailbox));
+                  : body.kind === "expire"
+                    ? await takeRpcData(stub.expire(body.mailbox))
+                    : body.kind === "empty"
+                      ? await takeRpcData(stub.emptyTrash(body.mailbox))
+                      : await takeRpcData(stub.publish(body.mailbox));
         if (result.purge) await hint(env, body.mailbox, "purge", body.id);
-        if (result.done === false) await hint(env, body.mailbox, "publish");
+        // Bounded Trash work continues as its own kind; publishing as publish.
+        if (result.done === false)
+          await hint(env, body.mailbox, ["expire", "empty"].includes(body.kind) ? body.kind : "publish");
         message.ack();
       } catch {
         message.retry({ delaySeconds: 60 });
@@ -313,6 +331,8 @@ export default {
         for (const id of pending.inbound) await hint(env, mailbox, "ingest", id);
         for (const id of pending.outbound) await hint(env, mailbox, "send", id);
         for (const id of pending.purge ?? []) await hint(env, mailbox, "purge", id);
+        // Retention: Trash older than MAIL_TRASH_DAYS (default 30) is deleted forever.
+        if (pending.expire) await hint(env, mailbox, "expire");
         if (pending.publish) await hint(env, mailbox, "publish");
       } catch (error) {
         failures.push(error);

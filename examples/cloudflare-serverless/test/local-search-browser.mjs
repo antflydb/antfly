@@ -58,6 +58,7 @@ let syncCalls = 0;
 // The server's sync log: message upserts, then deletion tombstones appended later.
 const log = mail.map((message) => ({ message }));
 const deletedIds = new Set();
+const trashedIds = new Set();
 
 async function file(path) {
   try {
@@ -76,11 +77,24 @@ const server = createServer(async (request, response) => {
     const after = Number(url.searchParams.get("cursor") || 0);
     const entries = log.slice(after, after + 3);
     return send(200, JSON.stringify({
-      messages: entries.filter((e) => e.message && !deletedIds.has(e.message.id)).map((e) => e.message),
+      messages: entries.filter((e) => e.message && !deletedIds.has(e.message.id) && !trashedIds.has(e.message.id)).map((e) => e.message),
       deleted: entries.filter((e) => e.deleted).map((e) => e.deleted),
       cursor: String(after + entries.length),
       more: after + entries.length < log.length,
     }));
+  }
+  const trashRoute = /^\/mail\/messages\/([a-f0-9-]{36})\/(trash|restore)$/.exec(url.pathname);
+  if (trashRoute && request.method === "POST") {
+    const message = mail.find((m) => m.id === trashRoute[1] && !deletedIds.has(m.id));
+    if (!message) return send(404, JSON.stringify({ error: "NotFound" }));
+    if (trashRoute[2] === "trash") {
+      trashedIds.add(message.id);
+      log.push({ deleted: message.id }); // devices hold the inbox only
+      return send(200, JSON.stringify({ id: message.id, trashed: true }));
+    }
+    trashedIds.delete(message.id);
+    log.push({ message }); // re-announced: devices fetch and embed it again
+    return send(200, JSON.stringify({ id: message.id, restored: true }));
   }
   const messageRoute = /^\/mail\/messages\/([a-f0-9-]{36})$/.exec(url.pathname);
   if (messageRoute) {
@@ -155,25 +169,32 @@ try {
   const [first] = await deviceSearch("do I have mandatory compliance training");
   assert.equal(first, "Quarterly security training reminder");
   console.log(`[${elapsed()}] after reload, from OPFS: "do I have mandatory compliance training" -> ${first}`);
-  // Deleting in the UI removes the message from this device at once.
+  // Delete moves to Trash: the message leaves this device's copy at once.
   await deviceSearch("how much do I owe the plumber");
   await page.click("#messages .mail-row");
   await page.waitForSelector("#message button.danger");
   await page.click("#message button.danger");
-  await page.waitForFunction(() => document.getElementById("message").textContent === "Message deleted.");
+  await page.waitForFunction(() => document.getElementById("message").textContent === "Message moved to Trash.");
   let results = await deviceSearch("how much do I owe the plumber");
-  assert.ok(!results.includes("Invoice #4471 from Rapid Plumbing"), `deleted message is gone: ${results.join(" / ")}`);
+  assert.ok(!results.includes("Invoice #4471 from Rapid Plumbing"), `trashed message is gone: ${results.join(" / ")}`);
   assert.match(await page.textContent("#local-badge"), /4 messages on this device/);
-  console.log(`[${elapsed()}] deleted in the UI -> gone from on-device search (${results.length} left)`);
+  console.log(`[${elapsed()}] moved to Trash in the UI -> gone from on-device search (${results.length} left)`);
+
+  // Undo restores it; the device fetches and embeds it again.
+  await page.click("#status button"); // Undo
+  await page.waitForFunction(() => /5 messages on this device/.test(document.getElementById("local-badge").textContent), null, { timeout: 120_000 });
+  results = await deviceSearch("how much do I owe the plumber");
+  assert.equal(results[0], "Invoice #4471 from Rapid Plumbing", `restored message is back: ${results.join(" / ")}`);
+  console.log(`[${elapsed()}] restored from Trash -> re-embedded and found again`);
 
   // A deletion made elsewhere (another device) arrives as a sync tombstone.
+  await page.evaluate(() => (document.getElementById("local").open = true)); // collapsed after the reload
   const flight = mail.find((m) => m.subject.startsWith("Your flight")).id;
   deletedIds.add(flight);
   log.push({ deleted: flight });
-  await page.evaluate(() => (document.getElementById("local").open = true)); // collapsed after the reload
   await page.click("#local-sync");
   await page
-    .waitForFunction(() => /3 messages on this device/.test(document.getElementById("local-badge").textContent), null, { timeout: 120_000 })
+    .waitForFunction(() => /4 messages on this device/.test(document.getElementById("local-badge").textContent), null, { timeout: 120_000 })
     .catch(async (error) => {
       const debug = await page.evaluate(() => [document.getElementById("local-status").textContent, document.getElementById("status").textContent, document.getElementById("local-badge").textContent]);
       throw new Error(`tombstone sync did not finish: ${JSON.stringify(debug)} ${errors.join(" | ")}`, { cause: error });

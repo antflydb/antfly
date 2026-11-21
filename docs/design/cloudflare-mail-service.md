@@ -154,6 +154,40 @@ deletions and next cursor as one database batch, so it never resurrects a
 message or skips one. Messages are immutable once delivered, so there are no
 edits to propagate.
 
+### Trash and retention
+
+Like Gmail, Delete moves a message to Trash, and Trash is emptied after a
+retention period (`MAIL_TRASH_DAYS`, default 30). `MailTrash` keeps two
+transactional indexes per trashed message: newest-trashed first for listing
+(`mail/v1/trash/<inverted time>/<id>`) and oldest-trashed first for expiry
+(`mail/v1/trash-expiry/<time>/<id>`).
+
+- **Trash** (only for indexed messages; mail still being ingested returns 409)
+  removes the inbox order key, adds both Trash keys, stamps `trashed_at` and
+  appends a sync tombstone, all in one transaction. The search document and
+  R2 objects are kept, so a trashed message can be opened (with its deletion
+  date) and its attachments downloaded. Inbox listing and search exclude it,
+  as Gmail's search excludes Trash.
+- **Restore** reverses that and appends a fresh upsert to the sync log, so
+  devices fetch and embed the message again. Sync skips messages that are
+  currently trashed, so a message restored and re-trashed before a device
+  syncs is never re-sent.
+- **Delete forever**, Empty Trash and expiry all go through `MailDeletion`,
+  which also removes the Trash keys. Emptying and expiry run in batches of 25
+  and continue through `empty` / `expire` queue hints. The scheduled sweep
+  queues `expire` for each mailbox whose oldest Trash entry is past the
+  retention period.
+
+The UI follows Gmail's wording:
+
+- "Message moved to Trash" with Undo;
+- "Messages that have been in Trash more than 30 days will be deleted
+  automatically" with "Empty Trash now";
+- "Deleted forever in N days" on each Trash row;
+- Restore and Delete forever on a trashed message.
+
+Retention is per deployment, and there are no legal holds yet.
+
 ### Message deletion
 
 Raw MIME and attachments used to be content-addressed and shared by identical
@@ -281,7 +315,8 @@ only the server APIs are stubbed.
 - Device-only searches ("how much do I owe the plumber", "when does my plane
   leave", "weekend noodle plans with friends") each ranked the right message
   first, in about 3 s.
-- Deleting a message in the UI removed it from on-device search at once. A
+- Moving a message to Trash in the UI removed it from on-device search at
+  once. Undo restored it, and the device re-embedded it and found it again. A
   deletion made on another device reached this device as a sync tombstone.
 - After a reload the copy reopened from OPFS without re-indexing, and the
   next query was also correct.
@@ -306,7 +341,9 @@ Other checks:
   actor over in-memory store, R2 and engine fakes (Node module hooks stub its
   WASM imports). It covers delete and purge, a failed purge completed by
   retry, a delete racing an ingest (the late upsert is purged again under a
-  new operation id), and deletion before ingest. `test/mail-workerd.test.mjs`
+  new operation id), deletion before ingest, and the Trash lifecycle: hiding,
+  opening, restoring with re-sync, expiry at exactly the retention boundary,
+  and Empty Trash. `test/mail-workerd.test.mjs`
   adds the same checks on the native engine (cross-user and cross-site
   refusal, object cleanup, sync tombstone, restart). It needs the serverless
   WASM, whose build on `main` currently fails in the lake query code, so that
@@ -334,6 +371,7 @@ Limits and remaining work:
   message on this host, so a large mailbox's first sync takes a long time.
   It runs in the background and resumes after reloads.
 - **Build memory.** The embedded database WASM link needs about 20 GiB.
-- **Deletion is permanent.** There is no trash, undo or retention policy, and
-  objects stored before per-delivery keys are retained when their message is
-  deleted.
+- **Delete forever is permanent.** Objects stored before per-delivery keys are
+  retained when their message is deleted, because they may be shared.
+  Retention is one setting per deployment, with no per-mailbox override or
+  legal hold.
