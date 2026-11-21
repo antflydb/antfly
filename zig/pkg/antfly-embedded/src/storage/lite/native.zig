@@ -10721,6 +10721,13 @@ pub const NativeFile = struct {
             }
         }
 
+        if (builtin.is_test and !probe and start_offset == 0) {
+            if (persisted) |seal| {
+                if (seal.frontier.sequence > covered and inode_lock.committedSequence(entry) >= seal.frontier.sequence) {
+                    test_stale_writer_full_scans += 1;
+                }
+            }
+        }
         const scan_end = if (persisted) |seal| end: {
             if (seal.frontier.sequence <= covered) break :end capacity;
             if (seal.frontier.end_offset < start_offset or seal.frontier.end_offset > capacity) return error.NativeRedoLogCorrupt;
