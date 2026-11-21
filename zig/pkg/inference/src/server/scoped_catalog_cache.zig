@@ -25,6 +25,7 @@ const c_file = @import("../util/c_file.zig");
 const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 const max_cached_bytes_per_slot = 4 * 1024 * 1024;
+const max_cached_primary_bytes = 1024 * 1024;
 const safetensors = @import("../models/safetensors.zig");
 const revalidate_after_ns = 60 * std.time.ns_per_s;
 const dependency_retry_ns = std.time.ns_per_s;
@@ -47,9 +48,7 @@ pub const Cache = struct {
             defer self.mutex.unlock();
             const current = self.current orelse return null;
             const age = now.nanoseconds - current.checked_at.nanoseconds;
-            const inspection = current.inspection.load(.acquire);
             if (age >= revalidate_after_ns or
-                (if (inspection) |built| built.retry_at != null and now.nanoseconds >= built.retry_at.? else false) or
                 !std.mem.eql(u8, path, current.artifacts.root) or
                 !std.mem.eql(u8, canonical, current.artifacts.physical_root) or
                 !std.meta.eql(stamp, current.root_stamp) or
@@ -86,25 +85,66 @@ pub const Cache = struct {
         const Member = struct { path: []const u8, stamp: managed.ArtifactStamp };
         const Members = std.StringHashMapUnmanaged(managed.ArtifactStamp);
         const Primary = enum { native, onnx };
-        const PrimaryDependencies = union(enum) {
-            members: []const Member,
-            unavailable,
+        const PrimaryCache = struct {
+            const Stamps = struct {
+                arena: std.heap.ArenaAllocator,
+                members: []const Member,
 
-            fn validate(self: PrimaryDependencies, artifacts: *const PublishedArtifacts, control: ExecutionControl) !void {
-                switch (self) {
-                    .members => |members| try Inspection.validate(members, artifacts, control),
-                    .unavailable => return error.InvalidManagedDownload,
+                fn destroy(self: *Stamps, owner: std.mem.Allocator) void {
+                    self.arena.deinit();
+                    owner.destroy(self);
                 }
+            };
+            build: std.Io.Mutex = .init,
+            available: std.atomic.Value(?*Stamps) = .init(null),
+            retry_at: ?std.Io.Timestamp = null,
+
+            fn check(self: *PrimaryCache, owner: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, primary: Primary, control: ExecutionControl) !bool {
+                if (self.available.load(.acquire)) |cached| {
+                    try validate(cached.members, artifacts, control);
+                    return true;
+                }
+                try managed.lockVerification(control, &self.build, artifacts.io);
+                defer self.build.unlock(artifacts.io);
+                if (self.available.load(.acquire)) |cached| {
+                    try validate(cached.members, artifacts, control);
+                    return true;
+                }
+                if (self.retry_at) |retry| {
+                    if (std.Io.Timestamp.now(artifacts.io, .awake).nanoseconds < retry.nanoseconds) return false;
+                }
+
+                const current = try owner.create(Stamps);
+                current.arena = .init(owner);
+                var retained = false;
+                defer if (!retained) current.destroy(owner);
+                const a = current.arena.allocator();
+                var members: Members = .empty;
+                collectPrimaryMembers(&members, a, artifacts, manifest, primary, control) catch |err| return self.reject(artifacts.io, err);
+                current.members = try freeze(a, &members);
+                validate(current.members, artifacts, control) catch |err| return self.reject(artifacts.io, err);
+                if (current.arena.queryCapacity() <= max_cached_primary_bytes) {
+                    retained = true;
+                    self.available.store(current, .release);
+                }
+                return true;
+            }
+
+            fn reject(self: *PrimaryCache, io: std.Io, err: anyerror) !bool {
+                switch (err) {
+                    error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                    else => {},
+                }
+                self.retry_at = .{ .nanoseconds = std.Io.Timestamp.now(io, .awake).nanoseconds + dependency_retry_ns };
+                return false;
             }
         };
         arena: std.heap.ArenaAllocator,
         members: []const Member,
-        native: PrimaryDependencies,
-        onnx: PrimaryDependencies,
+        primary: [2]PrimaryCache,
         backend_order: []const backends.BackendType,
         execution_manifest: manifest_mod.ModelManifest,
         summary: model_manager.CompatibilitySummary,
-        retry_at: ?i96,
 
         fn add(members: *std.StringHashMapUnmanaged(managed.ArtifactStamp), a: std.mem.Allocator, artifacts: *const PublishedArtifacts, path: []const u8) !void {
             if (members.contains(path)) return;
@@ -120,8 +160,7 @@ pub const Cache = struct {
             const a = result.arena.allocator();
             const execution_manifest = try manifest_mod.loadFromPublishedArtifacts(a, path, artifacts, false);
             const checks = try collectCommon(a, artifacts, &execution_manifest, control);
-            result.native = try collectPrimary(a, artifacts, &execution_manifest, .native, control);
-            result.onnx = try collectPrimary(a, artifacts, &execution_manifest, .onnx, control);
+            result.primary = @splat(.{});
             const order = try a.dupe(backends.BackendType, backend_order);
             const summary = model_manager.compatibilitySummaryForBackendsWithControl(artifacts.allocator, path, manifest, backend_order, control) catch |err| switch (err) {
                 error.OutOfMemory, error.Timeout, error.Cancelled, error.Canceled => return err,
@@ -132,10 +171,6 @@ pub const Cache = struct {
             result.backend_order = order;
             result.execution_manifest = execution_manifest;
             result.summary = summary;
-            result.retry_at = if (result.native == .unavailable or result.onnx == .unavailable)
-                std.Io.Timestamp.now(artifacts.io, .awake).nanoseconds + dependency_retry_ns
-            else
-                null;
             return result;
         }
 
@@ -173,20 +208,6 @@ pub const Cache = struct {
                     try collectOnnx(&members, a, artifacts, graph, graph, control);
             }
             return freeze(a, &members);
-        }
-
-        fn collectPrimary(a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, primary: Primary, control: ExecutionControl) !PrimaryDependencies {
-            var members: Members = .empty;
-            collectPrimaryMembers(&members, a, artifacts, manifest, primary, control) catch |err| switch (err) {
-                error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
-                else => return .unavailable,
-            };
-            const checks = try freeze(a, &members);
-            validate(checks, artifacts, control) catch |err| switch (err) {
-                error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
-                else => return .unavailable,
-            };
-            return .{ .members = checks };
         }
 
         fn collectPrimaryMembers(members: *Members, a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, primary: Primary, control: ExecutionControl) !void {
@@ -240,6 +261,9 @@ pub const Cache = struct {
         }
 
         fn destroy(self: *Inspection, owner: std.mem.Allocator) void {
+            for (&self.primary) |*primary| {
+                if (primary.available.load(.monotonic)) |cached| cached.destroy(owner);
+            }
             self.arena.deinit();
             owner.destroy(self);
         }
@@ -314,7 +338,7 @@ pub const Cache = struct {
             }
             const owner = snapshot.artifacts.allocator;
             const inspection = try Inspection.create(owner, artifacts, path, manifest, backend_order, control);
-            if (snapshot.inspection.load(.monotonic) == null and inspection.arena.queryCapacity() <= max_cached_bytes_per_slot) {
+            if (snapshot.inspection.load(.monotonic) == null and inspection.arena.queryCapacity() <= max_cached_bytes_per_slot - 2 * max_cached_primary_bytes) {
                 snapshot.inspection.store(inspection, .release);
                 return inspection.summary;
             }
@@ -336,14 +360,13 @@ pub const Cache = struct {
                 const primary: Inspection.Primary = if (model_manager.embeddingBackendUsesOnnxPrimary(manifest.*, backend)) .onnx else .native;
                 const i = @backingInt(primary);
                 if (verified[i] == null) {
-                    const checks = switch (primary) {
-                        .native => inspection.native,
-                        .onnx => inspection.onnx,
-                    };
-                    verified[i] = if (checks.validate(artifacts, control)) |_| true else |err| switch (err) {
+                    // Inspect the selected closure lazily. A cold native-only
+                    // probe never needs to map or walk the optional ONNX graph.
+                    const cache = &inspection.primary[i];
+                    verified[i] = cache.check(self.snapshot.artifacts.allocator, artifacts, &inspection.execution_manifest, primary, control) catch |err| switch (err) {
                         error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
                         else => invalid: {
-                            if (checks == .members) self.invalidate();
+                            self.invalidate();
                             break :invalid false;
                         },
                     };
@@ -362,7 +385,7 @@ pub const Cache = struct {
             return rejected;
         }
 
-        fn invalidate(self: Borrow) void {
+        pub fn invalidate(self: Borrow) void {
             self.slot.lock();
             const removed = self.slot.current == self.snapshot;
             if (removed) self.slot.current = null;

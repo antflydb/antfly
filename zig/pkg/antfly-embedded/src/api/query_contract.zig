@@ -13447,7 +13447,7 @@ fn validateCanonicalHierarchyExecutionBudget(req: db_mod.types.SearchRequest) !v
 }
 
 fn removeInternalShardFields(object: *std.json.ObjectMap) void {
-    inline for (internal_shard_fields) |field| {
+    inline for (internal_shard_field_names) |field| {
         _ = object.orderedRemove(field);
     }
 }

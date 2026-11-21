@@ -27071,7 +27071,12 @@ pub const Node = struct {
                         self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, artifacts)
                     else
                         self.model_manager.declaredEmbeddingRevisions(path, manifest.*, control)) catch |err| {
-                        if (err == error.ChecksumMismatch or err == error.InvalidManagedDownload or err == error.ModelArtifactNotPublished) return embeddingArtifactFailureResponse(ctx);
+                        if (isPinnedCatalogArtifactFailure(err)) {
+                            // A checksum refusal can arrive after discovery
+                            // captured healthy-looking size and path stamps.
+                            if (scoped_publication) |*captured| captured.borrow.invalidate();
+                            return embeddingArtifactFailureResponse(ctx);
+                        }
                         return modelLoadFailureResponse(ctx, err);
                     }
                 else

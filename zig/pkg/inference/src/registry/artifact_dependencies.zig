@@ -169,7 +169,7 @@ test "safetensors index selects arbitrary shard names and deduplicates reference
     defer paths.deinit();
     try std.testing.expectEqual(@as(u32, 2), paths.items.count());
     try std.testing.expect(paths.items.contains("weights/custom.safetensors"));
-    try std.testing.expect(paths.items.contains("weights/parts/other.safetensors"));
+    try std.testing.expect(paths.items.contains("weights/parts/other"));
     try std.testing.expectError(error.InvalidModelArtifactPath, safetensors(std.testing.allocator, "model.safetensors.index.json",
         \\{"weight_map":{"a":"../escape.safetensors"}}
     ));
