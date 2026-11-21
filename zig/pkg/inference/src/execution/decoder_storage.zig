@@ -252,6 +252,33 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const ComputeBackend = @import("../ops/ops.zig").ComputeBackend;
 const MetadataStorage = @import("../runtime/kv/storage_runtime.zig").KvStorageRuntime;
 
+pub const PagedReplayRequest = struct {
+    exclusive: bool,
+    compiled: bool,
+    speculative: bool,
+    shared_prefix: bool,
+    checkpoint: bool,
+    exact_history: bool,
+    allow_default: bool,
+};
+
+/// Install the backend and logical-state bounds together before any KV writes.
+/// Interleaved requests and existing sequences keep their current placement.
+pub fn preparePagedReplay(backend: *const ComputeBackend, state: *DecodeState, dtype: ?pool.KvDType, request: PagedReplayRequest, prompt_rows: usize, output_rows: usize) !void {
+    if (comptime !@import("build_options").enable_cuda) return;
+    if (backend.kind() != .cuda or backend.execution_owner != 0 or
+        !request.exclusive or request.compiled or request.speculative or request.shared_prefix or request.checkpoint or
+        !request.exact_history or dtype != .f16 or !state.isPaged() or
+        state.total_tokens != 0 or state.sequence_id != null) return;
+    const fit_probe = @import("antfly_platform").env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE");
+    state.cuda_request_replay_capacity = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.configureGemma4RequestReplayCapacity(
+        backend,
+        prompt_rows,
+        output_rows,
+        request.allow_default and !fit_probe,
+    );
+}
+
 /// Borrowed only by the constructing request. Server owns the exact local
 /// metadata object, backend and state through generation and subsequent close.
 /// It is neither a model identity nor permission to substitute another storage.

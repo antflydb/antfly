@@ -40,7 +40,7 @@ pub const Span = struct {
     source: ?Source = null,
     identity: u64 = 0,
     sequence: u64 = 0,
-    last_failure: ?diagnostics.Text = null,
+    first_failure: ?diagnostics.Text = null,
     pub fn begin(source: ?Source) Span {
         const selected = source orelse return .{};
         if (!selected.publisher.isEnabled()) return .{};
@@ -65,15 +65,17 @@ pub const Span = struct {
     }
     noinline fn observed(self: *Span, source: Source, backend: *const ops.ComputeBackend, operation: diagnostics.Operation, phase: diagnostics.PendingInterval.Phase, completion: diagnostics.PendingInterval.Completion, comptime classify: anytype, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
         self.sequence +|= 1;
-        var interval = diagnostics.PendingInterval{ .identity = self.identity, .request_id = source.request_id, .sequence = self.sequence, .phase = phase, .prior_failure = self.last_failure };
+        var interval = diagnostics.PendingInterval{ .identity = self.identity, .request_id = source.request_id, .sequence = self.sequence, .phase = phase, .prior_failure = self.first_failure };
         const binding = invocation.Binding{ .diagnostics = source.publisher, .operation = operation, .capture_programs = true, .model_allocator = source.model_allocator, .stable_backend = backend.*, .context_runtime_scope = .borrowed_execution_backend_context, .pending_interval = &interval };
-        return invocation.callClassified(binding, classify, phaseCall, .{ &interval, &self.last_failure, completion, callback, args });
+        return invocation.callClassified(binding, classify, phaseCall, .{ &interval, &self.first_failure, completion, callback, args });
     }
 };
-fn phaseCall(interval: *diagnostics.PendingInterval, last_failure: *?diagnostics.Text, completion: diagnostics.PendingInterval.Completion, comptime callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
+fn phaseCall(interval: *diagnostics.PendingInterval, first_failure: *?diagnostics.Text, completion: diagnostics.PendingInterval.Completion, comptime callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
     const result = @call(.auto, callback, args) catch |err| {
-        last_failure.* = diagnostics.Text.init(@errorName(err));
-        interval.prior_failure = last_failure.*;
+        // The invocation report records this phase's error independently.
+        // Retirement must retain the initiating failure even if cleanup fails.
+        if (first_failure.* == null) first_failure.* = diagnostics.Text.init(@errorName(err));
+        interval.prior_failure = first_failure.*;
         return err;
     };
     const available = if (comptime @typeInfo(@TypeOf(result)) == .optional) result != null else if (comptime @TypeOf(result) == bool) result else true;
@@ -97,4 +99,18 @@ pub fn acquisitionFailure(source: ?Source, failure: anyerror) void {
 fn classifyPhase(value: anytype) invocation.ResultClassification {
     const available = if (comptime @typeInfo(@TypeOf(value)) == .optional) value != null else if (comptime @TypeOf(value) == bool) value else true;
     return .{ .unsupported = !available };
+}
+
+test "pending retirement preserves the initiating error when cleanup fails" {
+    const Call = struct {
+        fn fail(err: anyerror) anyerror!void {
+            return err;
+        }
+    };
+    var first_failure: ?diagnostics.Text = null;
+    var interval = diagnostics.PendingInterval{ .identity = 1, .sequence = 1, .phase = .acquire };
+    try std.testing.expectError(error.SubmissionFailure, phaseCall(&interval, &first_failure, .unavailable, Call.fail, .{error.SubmissionFailure}));
+    interval.sequence += 1;
+    try std.testing.expectError(error.CleanupFailure, phaseCall(&interval, &first_failure, .unavailable, Call.fail, .{error.CleanupFailure}));
+    try std.testing.expectEqualStrings("SubmissionFailure", interval.prior_failure.?.view());
 }

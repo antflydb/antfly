@@ -9464,7 +9464,7 @@ pub const CudaCompute = struct {
     /// The same bound is installed in NativeDecodeState before any KV write.
     /// allow_default additionally requires the caller's pure-greedy contract.
     pub fn configureGemma4RequestReplayCapacity(cb: *const ops.ComputeBackend, prompt: usize, output: usize, allow_default: bool) !?usize {
-        if (cb.kind() != .cuda or cb.execution_owner != 0) return null;
+        if (!acceptsPhysicalImplementation(cb.vtable) or cb.execution_owner != 0) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const explicit_mode = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") != null;
         // Installed artifact-qualified automatic plans and explicit experiments

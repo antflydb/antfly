@@ -2726,11 +2726,11 @@ pub const Frame = struct {
         for (self.pool.replay_outputs, outputs) |binding, *output| {
             const allocation = self.storages[binding.allocation] orelse return error.InvalidShape;
             output.* = try self.viewForShape(cb, allocation, binding.shape);
+            initialized += 1;
             if (try self.publishLiteralOutput(cb, binding.node, output.*)) |independent| {
                 cb.free(output.*);
                 output.* = independent;
             }
-            initialized += 1;
         }
         try self.replay.?.launch();
         self.stats.graph_replays += 1;

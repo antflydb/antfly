@@ -33,7 +33,6 @@ const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
-const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const tokenizer_mod = @import("inference_tokenizer");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
@@ -3678,25 +3677,15 @@ pub const NativeGenerationPipeline = struct {
         const max_tokens = requested_max_tokens;
         const spec_slack: usize = if (use_speculative and config.speculative_k > 0) 1 else 0;
         const max_seq = prompt_token_count + max_tokens + spec_slack;
-        // The server holds the model lock for this owner. Interleaved owners,
-        // compiled execution, speculation, shared prefixes and checkpoints
-        // retain their existing capacity contracts. No process env is mutated.
-        if (comptime build_options.enable_cuda) {
-            if (self.cb.kind() == .cuda and self.cb.execution_owner == 0 and self.execution_lock == null and
-                self.graph_cache == null and self.compiled_partition_backend == null and
-                self.draft_cb == null and !config.speculation_requested and self.prompt_cache == null and
-                !config.prompt_cache_enabled and !native_checkpoint and config.kv_cache_mode == .exact_hybrid and
-                decode_state.isPaged() and decode_state.total_tokens == 0 and decode_state.sequence_id == null and
-                self.kv_dtype == .f16)
-            {
-                decode_state.cuda_request_replay_capacity = try cuda_compute.CudaCompute.configureGemma4RequestReplayCapacity(
-                    &self.cb,
-                    prompt_token_count,
-                    max_tokens,
-                    gemma4DefaultReplayConfigEligible(config, platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE")),
-                );
-            }
-        }
+        try decoder_storage.preparePagedReplay(&self.cb, decode_state, self.kv_dtype, .{
+            .exclusive = self.execution_lock == null,
+            .compiled = self.graph_cache != null or self.compiled_partition_backend != null,
+            .speculative = self.draft_cb != null or config.speculation_requested,
+            .shared_prefix = self.prompt_cache != null or config.prompt_cache_enabled,
+            .checkpoint = native_checkpoint,
+            .exact_history = config.kv_cache_mode == .exact_hybrid,
+            .allow_default = gemma4DefaultReplayConfigEligible(config, false),
+        }, prompt_token_count, max_tokens);
         try decoder_storage.validateSelectedTokenBudget(config.kv_cache_mode == .select_v1, max_seq, config.kv_protected_spans);
         var token_ids = try allocator.alloc(i64, max_seq);
         defer allocator.free(token_ids);
