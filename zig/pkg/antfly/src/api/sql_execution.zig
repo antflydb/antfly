@@ -3645,6 +3645,90 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     try std.testing.expectEqual(@as(usize, 3), fake.commit_attempts);
     try std.testing.expectEqual(@as(usize, 1), fake.commits);
     fake.unknown_commit = false;
+    {
+        const Replicated = struct {
+            const Erased = @import("antfly_local_sources").storage_backend_erased;
+            const records = @import("../metadata/transaction_session_record.zig");
+            const group: u64 = 7;
+            store: *Erased.Store,
+            lose_ack_at: ?usize = null,
+            writes: usize = 0,
+            apply_lost_write: bool = false,
+
+            fn read(ptr: *anyopaque, _: std.mem.Allocator) !Erased.ReadTxn {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return self.store.beginRead();
+            }
+
+            fn term(_: *anyopaque) ?u64 {
+                return 1;
+            }
+
+            fn propose(ptr: *anyopaque, bytes: []const u8, _: u64, submitted: *bool) !bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                submitted.* = true;
+                self.writes += 1;
+                const lose_ack = self.lose_ack_at == self.writes;
+                if (lose_ack and !self.apply_lost_write) return error.TestLostAcknowledgement;
+                var write = try self.store.beginWrite();
+                errdefer write.abort();
+                const applied = try records.apply(&write, std.testing.allocator, group, bytes);
+                try write.commit();
+                if (lose_ack) return error.TestLostAcknowledgement;
+                return applied;
+            }
+        };
+        const a = std.testing.allocator;
+        var physical = try prepared_backend.runtimeStore(a, .{ .name = "merge-session-lost-ack" });
+        defer physical.deinit();
+        var host: Replicated = .{ .store = &physical };
+        var replicated: @import("../metadata/transaction_session_store.zig").Store = .{
+            .host = .{ .ptr = &host, .read = Replicated.read, .term = Replicated.term, .propose = Replicated.propose },
+            .group = Replicated.group,
+        };
+        var logical = replicated.runtime(a);
+        defer logical.deinit();
+        var durable = @import("transactions.zig").DurableSessionStore.initRuntime(a, &logical);
+        const previous_store = server.txn_sessions.durable;
+        const previous_scope = server.txn_sessions.durable_scope;
+        server.txn_sessions.durable = &durable;
+        server.txn_sessions.durable_scope = .cluster_shared;
+        defer {
+            server.txn_sessions.durable = previous_store;
+            server.txn_sessions.durable_scope = previous_scope;
+        }
+        var begin = try compiler.compile(a, "BEGIN ISOLATION LEVEL SERIALIZABLE", .{});
+        defer begin.deinit();
+        var commit = try compiler.compile(a, "COMMIT", .{});
+        defer commit.deinit();
+        const attempts = fake.commit_attempts;
+        const previous_fake = fake;
+        defer fake = previous_fake;
+        for ([_]usize{ 1, 2, 2 }, [_]bool{ true, false, true }) |write_number, apply_lost_write| {
+            var client: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+            var begun = try client.execute(a, &begin, &.{}, .{}, null);
+            defer begun.deinit();
+            const encoded_id = client.result_session_id.?;
+            const id = try @import("distributed_txn.zig").parseTxnIdHex(&encoded_id);
+            client.session_id = &encoded_id;
+            var staged = try client.execute(a, &compiled, &.{}, .{}, null);
+            defer staged.deinit();
+            host.lose_ack_at = host.writes + write_number;
+            host.apply_lost_write = apply_lost_write;
+            try std.testing.expectError(error.SqlTransactionOutcomeUnknown, client.execute(a, &commit, &.{}, .{}, null));
+            try std.testing.expectEqual(encoded_id, client.outcome_transaction_id.?);
+            try std.testing.expectEqual(attempts, fake.commit_attempts);
+            var persisted = (try durable.load(id)).?;
+            defer persisted.deinit(a);
+            try std.testing.expect(persisted.commit_body_digest != null);
+            try std.testing.expectEqual(write_number == 2 and apply_lost_write, persisted.commit_execution_started);
+            if (persisted.commit_execution_started) {
+                client.outcome_transaction_id = null;
+                try std.testing.expectError(error.SqlTransactionOutcomeUnknown, client.execute(a, &commit, &.{}, .{}, null));
+                try std.testing.expectEqual(encoded_id, client.outcome_transaction_id.?);
+            }
+        }
+    }
     fake.fail_source_proof = true;
     try std.testing.expectError(error.TestProofUnavailable, adapter.execute(std.testing.allocator, &compiled, &.{}, .{}, null));
     try std.testing.expectEqual(@as(usize, 4), fake.captures);
