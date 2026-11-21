@@ -3722,27 +3722,21 @@ pub const DocStore = struct {
     /// shared write batch, so a crash mid-turn can never durably delete an
     /// entry without releasing its credit, or the reverse. `up_to_sequence`
     /// is inclusive, matching this layer's historical `truncateReplayUpTo`.
+    const ReplayRetirementPlan = std.MultiArrayList(struct { key: [internal_keys.replay_key_len]u8, charge: usize });
+
     fn retireReplaySlice(
         self: *DocStore,
         alloc: Allocator,
         up_to_sequence: u64,
         budget: replay_chunks.RetirementBudget,
     ) !replay_chunks.RetirementStats {
-        var stats = replay_chunks.RetirementStats{ .done = true, .no_op = true };
-        if (up_to_sequence == 0) return stats;
-        if (!(try self.hasReplayEntries())) return stats;
+        if (up_to_sequence == 0 or !(try self.hasReplayEntries())) return .{};
 
-        // Only the key is buffered across the scan/delete phase boundary
-        // (matching the historical `truncateReplayEntries` footprint
-        // exactly): bytes and the retired-through sequence are running
-        // accumulators computed once, while each key is still in hand
-        // during the scan, rather than carried per-entry.
-        var deletes = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (deletes.items) |key| alloc.free(key);
-            deletes.deinit(alloc);
-        }
-        try deletes.ensureTotalCapacityPrecise(alloc, @min(budget.max_keys, replay_truncate_batch_keys));
+        // A plan owns keys and their immutable charge. Recheck presence in
+        // the deleting transaction before releasing any of that charge.
+        var deletes: ReplayRetirementPlan = .empty;
+        defer deletes.deinit(alloc);
+        try deletes.setCapacity(alloc, @min(budget.max_keys, replay_truncate_batch_keys));
 
         const track_heads = !self.sharedReplayLane();
         const initial_heads = if (track_heads) blk: {
@@ -3750,10 +3744,7 @@ pub const DocStore = struct {
             defer probe.abort();
             break :blk try storedReplayCreditLaneHeads(&probe);
         } else null;
-        var deleted_through: [replay_credit_lanes.len]u64 = @splat(0);
         var planned_bytes: u64 = 0;
-        var any_retired = false;
-        var max_retired_sequence: u64 = 0;
         var all_lanes_done = true;
         var budget_exhausted = false;
 
@@ -3782,14 +3773,10 @@ pub const DocStore = struct {
                 if (std.mem.order(u8, kv.key, &upper) != .lt) break;
                 const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
                 if (sequence > up_to_sequence) break;
-                const key = try alloc.dupe(u8, kv.key);
-                errdefer alloc.free(key);
-                try deletes.append(alloc, key);
-                planned_bytes += kv.key.len + kv.value.len;
-                deleted_through[lane] = sequence + 1;
-                if (!any_retired or sequence > max_retired_sequence) max_retired_sequence = sequence;
-                any_retired = true;
-                if (deletes.items.len >= budget.max_keys or planned_bytes >= budget.max_bytes) {
+                const charge = kv.key.len + kv.value.len;
+                try deletes.append(alloc, .{ .key = kv.key[0..internal_keys.replay_key_len].*, .charge = charge });
+                planned_bytes += charge;
+                if (deletes.len >= budget.max_keys or planned_bytes >= budget.max_bytes) {
                     budget_exhausted = true;
                     all_lanes_done = false;
                     break;
@@ -3797,25 +3784,46 @@ pub const DocStore = struct {
             }
         }
 
-        if (deletes.items.len == 0) return stats;
-        stats.no_op = false;
+        return try self.commitReplayRetirementPlan(deletes, all_lanes_done);
+    }
 
+    fn commitReplayRetirementPlan(self: *DocStore, deletes: ReplayRetirementPlan, all_lanes_done: bool) !replay_chunks.RetirementStats {
+        var stats: replay_chunks.RetirementStats = .{};
+        if (deletes.len == 0) return stats;
+        stats.done = all_lanes_done;
         var batch = try self.beginWriteBatch();
         var committed = false;
         defer if (!committed) batch.abort();
 
-        for (deletes.items) |key| {
-            batch.delete(key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
+        const txn = batch.asTxn();
+        var deleted_through: [replay_credit_lanes.len]u64 = @splat(0);
+        var keys: [128][]const u8 = undefined;
+        var present: [128]bool = undefined;
+        var offset: usize = 0;
+        while (offset < deletes.len) {
+            const count = @min(keys.len, deletes.len - offset);
+            for (deletes.items(.key)[offset..][0..count], keys[0..count]) |*key, *borrowed| borrowed.* = key;
+            try txn.runtime.?.containsManySorted(keys[0..count], present[0..count]);
+            for (keys[0..count], deletes.items(.charge)[offset..][0..count], present[0..count]) |key, charge, exists| {
+                if (!exists) continue;
+                try batch.delete(key);
+                const kind = key[1];
+                const lane = std.mem.indexOfScalar(u8, &replay_credit_lanes, kind).?;
+                const sequence = internal_keys.parseReplayEntrySequence(key, kind).?;
+                deleted_through[lane] = sequence + 1;
+                stats.retired_through = @max(stats.retired_through, sequence);
+                stats.keys_deleted += 1;
+                stats.bytes_deleted += charge;
+            }
+            offset += count;
         }
+        if (stats.keys_deleted == 0) return stats;
+        stats.no_op = false;
 
         var ledger = try loadJournalCreditLedger(&batch);
-        ledger = ledger.released(planned_bytes, @intCast(deletes.items.len));
+        ledger = ledger.released(stats.bytes_deleted, stats.keys_deleted);
         try storeJournalCreditLedger(&batch, ledger);
-        if (track_heads) {
-            const txn = batch.asTxn();
+        if (!self.sharedReplayLane()) {
             if (try storedReplayCreditLaneHeads(txn)) |old_heads| {
                 var heads = old_heads;
                 const next = try replayCreditNextSequence(txn);
@@ -3834,11 +3842,6 @@ pub const DocStore = struct {
 
         try batch.commit();
         committed = true;
-
-        stats.keys_deleted = deletes.items.len;
-        stats.bytes_deleted = @intCast(planned_bytes);
-        stats.retired_through = max_retired_sequence;
-        stats.done = all_lanes_done;
         return stats;
     }
 
@@ -6445,6 +6448,34 @@ test "WS5 DocStore serviceRetirement retires every lane in one commit and refuse
         alloc.free(full_text_after);
     }
     try std.testing.expectEqual(@as(usize, 0), full_text_after.len);
+}
+
+test "docstore releases replay credit only once for overlapping retirement plans" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.appendReplayOpaque(alloc, 1, "first");
+        try store.appendReplayOpaque(alloc, 2, "second");
+        const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+        var plan: DocStore.ReplayRetirementPlan = .empty;
+        defer plan.deinit(alloc);
+        try plan.append(alloc, .{ .key = key, .charge = key.len + "first".len });
+        const first = try store.commitReplayRetirementPlan(plan, true);
+        const overlapping = try store.commitReplayRetirementPlan(plan, true);
+        try std.testing.expectEqual(@as(usize, 1), first.keys_deleted);
+        try std.testing.expect(overlapping.no_op);
+    }
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
+    const ledger = try loadJournalCreditLedger(&read);
+    try std.testing.expectEqual(@as(u64, 1), ledger.records);
+    try std.testing.expectEqual(@as(u64, internal_keys.replay_key_len + "second".len), ledger.bytes);
 }
 
 test "WS5 DocStore journal credit ledger is charged on append and released on retirement" {

@@ -6738,15 +6738,15 @@ pub const Store = struct {
             std.debug.assert(head.next == null);
             // This is under the writer lease and store mutex, so an empty
             // scope cannot acquire postings between the probe and the delete.
-            if (!try self.file.hasIndexCatalogPrefix(prefix)) {
-                if (head.scope_delete_only) {
+            switch (try self.file.planIndexScopeDeletion(prefix, head.estimated_bytes)) {
+                .empty => if (head.scope_delete_only) {
                     head.committed_sequence = self.file.committedSequence();
                     return;
-                }
-            } else if (self.file.redo != null) {
+                },
+                .inline_delete => {},
                 // Older overlay entries could shadow physical deletes in
                 // later private batches. Settle them before the transaction.
-                try self.file.checkpointRedoLog();
+                .fold_first => try self.file.checkpointRedoLog(),
             }
         }
         if (artifact_lease_only) {
@@ -7808,7 +7808,7 @@ pub const Txn = struct {
         const plan = Store.MutationPlan{
             .context = context,
             .apply = PrimaryCommitContext.apply,
-            .estimated_bytes = estimated_bytes,
+            .estimated_bytes = estimated_bytes +| if (self.index_catalog_delete_prefix != null) (mutations.len +| self.index_catalog_pending.items.len) *| 24 else 0,
             .scope_delete_prefix = self.index_catalog_delete_prefix,
         };
         var ride_along_ticket: ?Store.Ticket = null;
@@ -10480,6 +10480,36 @@ test "lite native docstore skips redo folding for an empty index scope" {
     var sink: @import("native_catalog_sink.zig").Sink = .{ .store = &store, .allocator = allocator };
     try @import("../native_catalog_backend.zig").deleteAllForScope(allocator, sink.sink(), "unused");
     try std.testing.expectEqual(before, store.file.committedSequence());
+}
+
+test "lite native docstore deletes a small index scope without folding unrelated redo" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-small-scope.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.putIndexCatalogBatch("small", &.{.{ .namespace = null, .key = "posting", .value = "data" }});
+        try txn.commit();
+    }
+    try store.checkpointRedoLog();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put("unrelated", "unfolded");
+        try txn.commit();
+    }
+    const folded = store.file.activeCheckpoint().redo_folded_through;
+    var sink: @import("native_catalog_sink.zig").Sink = .{ .store = &store, .allocator = allocator };
+    try @import("../native_catalog_backend.zig").deleteAllForScope(allocator, sink.sink(), "small");
+    try std.testing.expectEqual(folded, store.file.activeCheckpoint().redo_folded_through);
+    const key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "small", null, "posting");
+    defer allocator.free(key);
+    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(allocator, key)) == null);
 }
 
 test "lite native docstore deletes a large index scope in one publication" {
