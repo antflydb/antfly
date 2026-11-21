@@ -3749,29 +3749,31 @@ pub const DocStore = struct {
         return try self.retireReplaySlice(alloc, replay_chunks.clampRetireTarget(requested, safe_ceiling), budget);
     }
 
-    /// Plan a bounded ordered prefix and publish its deletes, lane heads,
-    /// and credit release under the same backend writer serialization.
-    fn retireReplaySlice(
-        self: *DocStore,
+    const ReplayRetirementPlan = struct {
+        stats: replay_chunks.RetirementStats = .{},
+        deletes: std.ArrayListUnmanaged([internal_keys.replay_key_len]u8) = .empty,
+        deleted_through: [replay_credit_lanes.len]u64 = @splat(0),
+        heads: ?ReplayCreditLaneHeads = null,
+        emptied_lane: bool = false,
+
+        fn reset(plan: *ReplayRetirementPlan) void {
+            plan.stats = .{};
+            plan.deletes.clearRetainingCapacity();
+            plan.deleted_through = @splat(0);
+            plan.heads = null;
+            plan.emptied_lane = false;
+        }
+    };
+
+    fn planReplayRetirement(
+        txn: anytype,
+        plan: *ReplayRetirementPlan,
         alloc: Allocator,
         up_to_sequence: u64,
         budget: replay_chunks.RetirementBudget,
-    ) !replay_chunks.RetirementStats {
-        if (up_to_sequence == 0 or !(try self.hasReplayEntries())) return .{};
-
-        var batch = try self.beginWriteBatchWithOptions(.{ .block_cache_admission = .transient });
-        var committed = false;
-        defer if (!committed) batch.abort();
-        const txn = batch.asTxn();
-
-        var stats: replay_chunks.RetirementStats = .{};
-        var deletes: std.ArrayListUnmanaged([internal_keys.replay_key_len]u8) = .empty;
-        defer deletes.deinit(alloc);
-        try deletes.ensureTotalCapacityPrecise(alloc, @min(budget.max_keys, replay_truncate_batch_keys));
-
-        const initial_heads = if (!self.sharedReplayLane()) try storedReplayCreditLaneHeads(txn) else null;
-        var deleted_through: [replay_credit_lanes.len]u64 = @splat(0);
-
+        initial_heads: ?ReplayCreditLaneHeads,
+        next: u64,
+    ) !void {
         {
             var cursor = try txn.openPhysicalCursorAdapter();
             defer cursor.close();
@@ -3791,47 +3793,98 @@ pub const DocStore = struct {
                 while (entry) |kv| : (entry = try cursor.next()) {
                     const sequence = internal_keys.parseReplayEntrySequence(kv.key, kind) orelse break;
                     if (sequence > up_to_sequence) break;
-                    try deletes.append(alloc, kv.key[0..internal_keys.replay_key_len].*);
-                    stats.keys_deleted += 1;
-                    stats.bytes_deleted += kv.key.len + kv.value.len;
-                    stats.retired_through = @max(stats.retired_through, sequence);
-                    deleted_through[lane] = sequence + 1;
-                    if (stats.keys_deleted >= budget.max_keys or stats.bytes_deleted >= budget.max_bytes) {
-                        stats.done = false;
+                    try plan.deletes.append(alloc, kv.key[0..internal_keys.replay_key_len].*);
+                    plan.stats.keys_deleted += 1;
+                    plan.stats.bytes_deleted += kv.key.len + kv.value.len;
+                    plan.stats.retired_through = @max(plan.stats.retired_through, sequence);
+                    plan.deleted_through[lane] = sequence + 1;
+                    if (plan.stats.keys_deleted >= budget.max_keys or plan.stats.bytes_deleted >= budget.max_bytes) {
+                        plan.stats.done = false;
                         break;
                     }
                 }
-                if (!stats.done) break;
+                if (!plan.stats.done) break;
             }
         }
-
-        if (deletes.items.len == 0) return stats;
+        if (plan.deletes.items.len == 0) return;
         if (initial_heads) |old_heads| {
             var heads = old_heads;
-            const next = try replayCreditNextSequence(txn);
+
             {
                 var cursor = try txn.openPhysicalCursorAdapter();
                 defer cursor.close();
                 cursor.setKeysOnly();
-                for (replay_credit_lanes, deleted_through, 0..) |kind, from, i| {
+                for (replay_credit_lanes, plan.deleted_through, 0..) |kind, from, i| {
                     if (from == 0) continue;
                     const head = try seekReplayCreditLaneHead(&cursor, kind, from);
+                    plan.emptied_lane = plan.emptied_lane or head == 0;
                     std.mem.writeInt(u64, replayCreditLaneHead(&heads, i), head, .little);
                     std.mem.writeInt(u64, replayCreditLaneFloor(&heads, i), if (head == 0) @max(from, next) else 0, .little);
                 }
             }
-            try txn.put(&internal_keys.journal_credit_lane_heads_key, &heads);
+            plan.heads = heads;
+        }
+    }
+
+    /// Appends advance the sequence and retirement changes the first key
+    /// of each affected lane. Validate both before publishing a read plan.
+    /// If they changed, replan once under writer serialization.
+    fn retireReplaySlice(
+        self: *DocStore,
+        alloc: Allocator,
+        up_to_sequence: u64,
+        budget: replay_chunks.RetirementBudget,
+    ) !replay_chunks.RetirementStats {
+        if (up_to_sequence == 0 or !(try self.hasReplayEntries())) return .{};
+
+        var plan: ReplayRetirementPlan = .{};
+        defer plan.deletes.deinit(alloc);
+        try plan.deletes.ensureTotalCapacityPrecise(alloc, @min(budget.max_keys, replay_truncate_batch_keys));
+
+        const lanes_witnessed = !self.sharedReplayLane();
+        var observed_heads: ?ReplayCreditLaneHeads = null;
+        var observed_next: u64 = 0;
+        if (lanes_witnessed) {
+            var read = try self.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer read.abort();
+            observed_heads = try storedReplayCreditLaneHeads(&read);
+            if (observed_heads != null) {
+                observed_next = try replayCreditNextSequence(&read);
+                try planReplayRetirement(&read, &plan, alloc, up_to_sequence, budget, observed_heads, observed_next);
+                if (plan.deletes.items.len == 0) return plan.stats;
+            }
         }
 
-        for (deletes.items) |*key| try batch.delete(key);
-        stats.no_op = false;
+        var batch = try self.beginWriteBatchWithOptions(.{ .block_cache_admission = .transient });
+        var committed = false;
+        defer if (!committed) batch.abort();
+        const txn = batch.asTxn();
+        const initial_heads = if (lanes_witnessed) try storedReplayCreditLaneHeads(txn) else null;
+        const next = if (initial_heads != null) try replayCreditNextSequence(txn) else 0;
+        // An append beyond the cutoff cannot change a surviving successor.
+        // Empty lanes still need a fresh seek if the append advanced the tip.
+        const next_compatible = observed_next == next or
+            (next > observed_next and observed_next > up_to_sequence and !plan.emptied_lane);
+        const unchanged = if (observed_heads) |before|
+            if (initial_heads) |after| next_compatible and std.mem.eql(u8, &before, &after) else false
+        else
+            false;
+        if (!unchanged) {
+            plan.reset();
+            try planReplayRetirement(txn, &plan, alloc, up_to_sequence, budget, initial_heads, next);
+            if (plan.deletes.items.len == 0) return plan.stats;
+        }
+        if (plan.heads) |*heads| try txn.put(&internal_keys.journal_credit_lane_heads_key, heads);
+
+        for (plan.deletes.items) |*key| try batch.delete(key);
+        plan.stats.no_op = false;
         var ledger = try loadJournalCreditLedger(&batch);
-        ledger = ledger.released(stats.bytes_deleted, stats.keys_deleted);
+        ledger = ledger.released(plan.stats.bytes_deleted, plan.stats.keys_deleted);
         try storeJournalCreditLedger(&batch, ledger);
 
         try batch.commit();
         committed = true;
-        return stats;
+        return plan.stats;
     }
 
     const replay_truncate_batch_keys: usize = 4096;
