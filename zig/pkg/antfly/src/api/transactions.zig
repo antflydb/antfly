@@ -2160,34 +2160,57 @@ pub const DurableSessionStore = struct {
         after: ?db_mod.types.TxnId,
         scan_limit: usize,
     ) !RecoveryIdPage {
-        var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
-        errdefer ids.deinit(alloc);
-        if (scan_limit == 0) return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = null };
         const start_key = if (after) |txn_id| try makeSessionKey(alloc, txn_id) else null;
         defer if (start_key) |key| alloc.free(key);
-        const Scan = struct {
-            allocator: std.mem.Allocator,
-            scan_limit: usize,
-            scanned: usize = 0,
-            last_txn_id: ?db_mod.types.TxnId = null,
-            ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
+        switch (self.backend) {
+            .docstore => |store| {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                var cursor = try read.openPhysicalCursorAdapter();
+                defer cursor.close();
+                return scanLegacyRecoveryTxn(&read, &cursor, alloc, start_key, scan_limit);
+            },
+            .runtime => |store| {
+                var read = try store.beginRead();
+                defer read.abort();
+                var cursor = try read.openCursor();
+                defer cursor.close();
+                return scanLegacyRecoveryTxn(&read, &cursor, alloc, start_key, scan_limit);
+            },
+        }
+    }
 
-            fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
-                const scan: *@This() = @ptrCast(@alignCast(raw));
-                if (key.len <= session_prefix.len) return true;
-                const txn_id = distributed_txn.parseTxnIdHex(key[session_prefix.len..]) catch return true;
-                scan.scanned += 1;
-                scan.last_txn_id = txn_id;
-                var session = decodeSessionRecord(scan.allocator, txn_id, value) catch return scan.scanned < scan.scan_limit;
-                defer session.deinit(scan.allocator);
-                if (sessionNeedsRecovery(session)) try scan.ids.append(scan.allocator, txn_id);
-                return scan.scanned < scan.scan_limit;
-            }
-        };
-        var scan = Scan{ .allocator = alloc, .scan_limit = scan_limit, .ids = &ids };
-        try self.scanPrefixFromWithContext(session_prefix, start_key, &scan, Scan.visit);
-        const next_after = if (scan.scanned == scan_limit) scan.last_txn_id else null;
-        return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = next_after };
+    fn scanLegacyRecoveryTxn(read: anytype, cursor: *backend_erased.Cursor, alloc: std.mem.Allocator, start: ?[]const u8, limit: usize) !RecoveryIdPage {
+        var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
+        errdefer ids.deinit(alloc);
+        if (limit == 0) return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = null };
+        cursor.setKeysOnly();
+        var scanned: usize = 0;
+        var last: ?db_mod.types.TxnId = null;
+        var entry = try cursor.seekAtOrAfter(start orelse session_prefix);
+        while (entry) |row| : (entry = if (scanned < limit) try cursor.next() else null) {
+            if (!std.mem.startsWith(u8, row.key, session_prefix)) break;
+            if (start) |key| if (std.mem.eql(u8, row.key, key)) continue;
+            const id = distributed_txn.parseTxnIdHex(row.key[session_prefix.len..]) catch continue;
+            last = id;
+            scanned += 1;
+            var scope = read.openReadScope(alloc) catch |err| {
+                std.log.warn("legacy transaction recovery read scope unavailable txn_id={x} err={s}", .{ id, @errorName(err) });
+                continue;
+            };
+            defer scope.close();
+            const raw = scope.get(row.key) catch |err| {
+                std.log.warn("legacy transaction recovery row unreadable txn_id={x} err={s}", .{ id, @errorName(err) });
+                continue;
+            };
+            var session = decodeSessionRecord(alloc, id, raw) catch |err| {
+                std.log.warn("legacy transaction recovery row invalid txn_id={x} err={s}", .{ id, @errorName(err) });
+                continue;
+            };
+            defer session.deinit(alloc);
+            if (sessionNeedsRecovery(session)) try ids.append(alloc, id);
+        }
+        return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = if (scanned == limit) last else null };
     }
 
     /// Rechecks the current durable row under a write transaction before
