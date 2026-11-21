@@ -6210,7 +6210,7 @@ fn consumerTests() type {
                 defer arena.deinit();
                 var enlisted_participants: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
                 const stamp = try routeParticipants(arena.allocator(), compact_source, &.{
-                    .{ .table_name = "docs", .bound_catalog_incarnation = @splat('1'), .writes = &.{.{ .key = "a", .value = "{}" }} },
+                    .{ .table_name = "docs", .bound_catalog_incarnation = @splat(0x11), .writes = &.{.{ .key = "a", .value = "{}" }} },
                     .{ .table_name = "audit", .writes = &.{.{ .key = "b", .value = "{}" }} },
                 }, &enlisted_participants, true);
                 for (enlisted_participants.items) |participant| try std.testing.expectEqual(participant.group_id, participant.route_fence.?.route.group_id);
