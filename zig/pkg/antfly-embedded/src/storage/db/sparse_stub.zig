@@ -66,13 +66,27 @@ pub const SparseIndexOptions = struct {
     lsm_cache: ?*lsm_backend.Cache = null,
     lsm_options: lsm_backend.Options = .{ .flush_threshold = 1 },
     lsm_root_generation: u64 = 0,
+    /// Type parity with `sparse/sparse.zig`'s real `SparseIndexOptions` only
+    /// -- this platform's `open` always returns `error.UnsupportedPlatform`
+    /// regardless of backend, so `.native_catalog` is never actually
+    /// exercised here.
+    main_native_catalog_sink: ?NativeCatalogSink = null,
 };
+
+/// See `sparse/sparse.zig`'s identically-named alias.
+pub const NativeCatalogSink = @import("../native_catalog_backend.zig").Sink;
 
 pub const SparseBackend = enum {
     lmdb,
     mem,
     lsm_memory,
     lsm,
+    /// See `sparse/sparse.zig`'s identically-named variant's doc comment.
+    /// Unreachable on this stub platform (`open` always returns
+    /// `error.UnsupportedPlatform`), kept only so `config.zig`'s shared
+    /// `IndexBackendOptions.sparse_backend` field type-checks identically
+    /// across platforms.
+    native_catalog,
 };
 
 pub const BatchOptions = struct {
@@ -119,6 +133,22 @@ pub const WriteProfile = struct {
 };
 
 pub const SparseIndex = struct {
+    /// Stub builds never publish sparse writes inline.
+    pub const InlineSparsePublication = struct {
+        pub fn pendingMutations(_: *const InlineSparsePublication) []const @import("../native_catalog_backend.zig").Mutation {
+            return &.{};
+        }
+
+        pub fn abort(_: *InlineSparsePublication) void {}
+    };
+
+    pub fn installInlineSparsePublication(_: *SparseIndex, _: *InlineSparsePublication) !void {}
+
+    /// Stub builds have no native-catalog sparse index.
+    pub fn nativeCatalogScope(_: *const SparseIndex) ?[]const u8 {
+        return null;
+    }
+
     doc_count: u64 = 0,
     next_doc_num: u64 = 0,
     chunk_size: u32 = 1024,

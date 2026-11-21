@@ -43,6 +43,7 @@ pub const public_api = struct {
     pub const indexes = @import("api/indexes.zig");
 };
 pub const capi_dependencies = struct {
+    pub const storage_db_relational_integrity = @import("storage/db/relational_integrity.zig");
     pub const storage_db_relational_integrity_topology_contract = @import("storage/db/relational_integrity_topology_contract.zig");
     pub const storage_db_relational_integrity_catalog = @import("storage/db/relational_integrity_catalog.zig");
     pub const storage_db_relational_integrity_activation_contract = @import("storage/db/relational_integrity_activation_contract.zig");

@@ -268,6 +268,25 @@ pub const Session = struct {
         const metadata = adapter.localCatalog(a, requests[0].schema_version.?) catch |err| return outcomes.notApplied(err);
         var prepared = d.api_relational_integrity_commit.prepareWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests, adapter.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
         defer prepared.deinit();
+        // A multi-statement session transaction that only ever touched one
+        // table on a Lite single-file store needs no cross-database
+        // two-phase decision, exactly like `sql.zig`'s `mutate` single-
+        // table fast path (lite-single-commit-write-path.md §3.3c): every
+        // table there already shares one physical commit domain. Fused
+        // (`allow_local_decision = true`) now that `commitCoordinatedLocal`
+        // gives an ambiguous outcome a resolvable `transaction_id` too (the
+        // retired outcome-receipt writer id, not a durable intent record --
+        // see its own comment).
+        if (self.handle.owned_lite_backend != null and prepared.tables.len == 1 and std.mem.eql(u8, prepared.tables[0].table_name, adapter.table_name)) {
+            const outcome = adapter.commitCoordinated(a, prepared.tables[0], true) catch |err| {
+                out_id.* = adapter.outcome_transaction_id;
+                self.failed = true;
+                return err;
+            };
+            out_id.* = adapter.outcome_transaction_id;
+            self.reset();
+            return outcome;
+        }
         const outcome = @import("sql_commit.zig").commit(self.handle, prepared.tables, out_id) catch |err| {
             self.failed = true;
             return err;

@@ -159,6 +159,17 @@ pub const BatchOptions = struct {
     // default reusable, but let those callers avoid filling the shared block
     // cache with source blocks that already have a bounded native workspace.
     block_cache_admission: Namespace.BlockCacheAdmission = .retain,
+    /// WS7/§3.2a: `.ride_along` marks this batch as background work that
+    /// must never force its own durability barrier -- it becomes durable
+    /// only when a later durable commit's checkpoint happens to cover it
+    /// (retirement, reclamation, deferred progress/catch-up, status). Only
+    /// a caller that can prove the work is safe to lose and redo on crash
+    /// may pass this; every synchronous-ack caller must keep `.durable`, or
+    /// an acknowledged write could be lost. Distinct from
+    /// `defer_commit_flush`, which only defers an LSM memtable flush and
+    /// carries no durability meaning (see apply_state.zig's
+    /// contributeProgressDeferred for why that distinction matters).
+    durability: enum { durable, ride_along } = .durable,
 };
 
 pub const BulkIngestFinishOptions = struct {
@@ -239,6 +250,11 @@ pub const Capabilities = struct {
     write_batches: WriteBatchMode = .atomic,
     single_writer: bool = true,
     read_snapshots: ReadVisibility = .snapshot,
+    /// The replay journal keeps one shared lane: per-hint lanes and their
+    /// latest-sequence markers are filtered views of it (or, after an
+    /// upgrade, stale leftovers of an older layout), never the source of
+    /// truth. Consumers read the shared lane and the producer head.
+    shared_replay_lane: bool = false,
 };
 
 /// Transitional alias while higher-level code migrates terminology away from
@@ -268,6 +284,9 @@ pub const ReplayLaneIterationStats = struct {
     last_sequence: u64 = 0,
     scan_batches: usize = 0,
     fallback_used: bool = false,
+    /// The batch stopped at its scan budget rather than at its match limit
+    /// or the end of the lane: more entries follow `last_sequence`.
+    scan_budget_exhausted: bool = false,
 };
 
 test "default backend capabilities assume ordered single-writer snapshots" {

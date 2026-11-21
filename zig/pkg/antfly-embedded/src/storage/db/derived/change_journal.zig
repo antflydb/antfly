@@ -1133,6 +1133,49 @@ test "change journal record derives thin identities from derived batch" {
     try std.testing.expect(recordHasHint(record, .graph));
 }
 
+// Regression for the `mutation_commit.zig` journal-suppression panic
+// ("index out of bounds: index 8, len 8"): the per-document `doc.targets`
+// loop above appends one hint per matching target for EVERY document in
+// the batch, with no de-duplication against hints already recorded for an
+// earlier document in the same batch (unlike every other site in this
+// function, which goes through `appendUniqueHintAlloc`). A multi-document
+// batch where more than 8 documents each carry the same target kind -- the
+// real `test_external_dense_index_wait_finishes[full_index]` repro inserts
+// several documents per batch, each targeting two external dense-vector
+// indexes -- therefore produces a `target_hints` slice longer than
+// `TargetHint`'s 8 variants, and with duplicates. `mutation_commit.zig`'s
+// journal-suppression step must size any buffer it keeps a filtered subset
+// of this slice in from `target_hints.len` itself, never from the (decoded,
+// deduplicated) 8-variant bound. This test locks in the actual, undeduped
+// shape so a future "fix" that silently caps or assumes uniqueness here
+// doesn't reintroduce that overflow.
+test "change journal per-document target hints are not deduplicated across documents" {
+    const alloc = std.testing.allocator;
+
+    var documents: [9]derived_types.DerivedDocument = undefined;
+    for (&documents, 0..) |*doc, i| {
+        doc.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i}),
+            .targets = &.{.{ .kind = .dense_vector, .index_name = "dv_v1" }},
+        };
+    }
+    defer for (documents) |doc| alloc.free(doc.key);
+
+    var record = try recordFromDerivedBatch(alloc, .{ .documents = &documents }, 1);
+    defer deinitRecord(alloc, &record);
+
+    // One `.dense_vector` hint per document (9), on top of the
+    // per-upsert `.dense_vector`/`.sparse_vector`/`.algebraic` triple that
+    // `appendUniqueHintAlloc` already deduplicates to one each -- so more
+    // than 8 raw entries, and more than one `.dense_vector` entry.
+    try std.testing.expect(record.target_hints.len > 8);
+    var dense_vector_count: usize = 0;
+    for (record.target_hints) |hint| {
+        if (hint == .dense_vector) dense_vector_count += 1;
+    }
+    try std.testing.expect(dense_vector_count > 1);
+}
+
 test "change journal edge deletion preserves source document identity" {
     const alloc = std.testing.allocator;
 

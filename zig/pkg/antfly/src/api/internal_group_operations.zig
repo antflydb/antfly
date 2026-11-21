@@ -724,9 +724,24 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            // All four are raised before any Raft proposal for this txn: a
+            // leader/term/incarnation check (NotLeader) or a stale/unavailable
+            // local catalog snapshot (CatalogRoutingSnapshotTimeout), same as
+            // the two below. Nothing was proposed, so GroupLeaderUnavailable's
+            // "definitely not proposed, safe to retry another candidate or
+            // wait" contract holds. Omitting NotLeader/CatalogRoutingSnapshotTimeout
+            // here previously fell through to the generic `error.Internal` ->
+            // HTTP 500 below, which a client cannot safely retry (a 500 does
+            // not prove nothing was applied) -- turning an ordinary transient
+            // "not currently the leader" or "catalog view not yet caught up"
+            // condition (e.g. right after a Raft leader election following a
+            // network partition) into a permanent failure for the whole
+            // cross-group transaction.
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.MetadataSnapshotUnavailable,
+            error.NotLeader,
+            error.CatalogRoutingSnapshotTimeout,
             => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
@@ -784,9 +799,15 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            // See the matching comment in txnBegin: NotLeader and
+            // CatalogRoutingSnapshotTimeout are both raised before this
+            // prepare is proposed and belong in the same "definitely not
+            // proposed" bucket as the three below.
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.MetadataSnapshotUnavailable,
+            error.NotLeader,
+            error.CatalogRoutingSnapshotTimeout,
             => return error.GroupLeaderUnavailable,
             else => {
                 // One registry drives Raft terminal results and participant
@@ -1824,6 +1845,39 @@ fn consumerTests() type {
                 "docs",
                 .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
             ));
+
+            // NotLeader (a leader/term/incarnation check failing before any
+            // proposal) and CatalogRoutingSnapshotTimeout (a stale/unavailable
+            // local catalog snapshot, also checked before proposing) are both
+            // raised pre-decision, the same as LeaderUnavailable and
+            // MetadataSnapshotUnavailable above. A network partition that
+            // forces a Raft leader election, or otherwise disrupts catalog
+            // sync, routinely produces these on the node a client happens to
+            // have cached as "the leader." Regression for a prior gap where
+            // both fell through to the generic error.Internal (-> HTTP 500),
+            // which a client cannot safely retry against another candidate
+            // (a 500 does not prove nothing was applied) -- turning an
+            // ordinary transient condition into a permanent failure for the
+            // whole cross-group transaction instead of the "definitely not
+            // proposed, try the next candidate or wait" GroupLeaderUnavailable
+            // contract.
+            for ([_]anyerror{ error.NotLeader, error.CatalogRoutingSnapshotTimeout }) |failure| {
+                context_deadline_source.failure = failure;
+                try std.testing.expectError(error.GroupLeaderUnavailable, context_deadline_operations.txnBegin(
+                    std.testing.allocator,
+                    .{},
+                    7,
+                    "docs",
+                    .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+                ));
+                try std.testing.expectError(error.GroupLeaderUnavailable, context_deadline_operations.txnPrepare(
+                    std.testing.allocator,
+                    .{},
+                    7,
+                    "docs",
+                    .{ .txn_id = txn_id, .req = .{} },
+                ));
+            }
         }
 
         test "typed routed batch preserves forwarding cancellation and identity conflicts" {
