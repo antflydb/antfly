@@ -771,7 +771,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
 }
 
-fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, parsed: *control.Parsed, cursor: control.Digest, request: Context) !void {
+pub fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, parsed: *control.Parsed, cursor: control.Digest, request: Context) !void {
     if (routes.validateInstalledRoutes(parsed.value)) |_| return else |err| {
         if (err != error.ChangefeedResynchronizationRequired or parsed.value.phase != .streaming or source.split_cut == null)
             return err;
@@ -812,7 +812,7 @@ fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Source, r
     try routes.validateInstalledRoutes(parsed.value);
 }
 
-fn progressSplitSuccessor(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, state: control.State, cursor: control.Digest, request: Context) !void {
+pub fn progressSplitSuccessor(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, state: control.State, cursor: control.Digest, request: Context) !void {
     for (state.roots) |root| {
         const handoff = root.split_handoff orelse continue;
         if (state.phase != .streaming) continue;
@@ -824,6 +824,13 @@ fn progressSplitSuccessor(client: *config.Client, a: A, source: source_api.Sourc
         }
         if (state.cursors.len != 0 or root.pending_control != null or handoff.cut.reserved_bytes != 0 or
             root.acknowledged.order(.{ .sequence = handoff.cut.latest }) != .eq) continue;
+        if (state.slot) |slot| {
+            if (slot.entries.len != 0 or !same(slot.mapped_cursor, state.acknowledged_cursor)) continue;
+            const pending_upload = for (slot.spool.records) |record| {
+                if (record.phase == .uploading) break true;
+            } else false;
+            if (pending_upload) continue;
+        }
         return change(client, a, state, .{ .activate_split_successor = .{
             .namespace = root.namespace,
             .grant_sequence = root.split_grant_sequence.?,

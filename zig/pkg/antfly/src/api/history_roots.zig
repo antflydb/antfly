@@ -393,6 +393,10 @@ pub const Source = struct {
         const item = state.roots[read.root_index];
         if (item.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
         const root = try captured.findInstalled(item);
+        if (item.split_handoff) |handoff| {
+            if (read.position.sequence > handoff.cut.latest) return error.ChangefeedResynchronizationRequired;
+            if (read.position.sequence == handoff.cut.latest) return null;
+        }
         for (definition.tables) |table| {
             if (table.table_id != root.fence.table_id) continue;
             if (table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
@@ -401,13 +405,16 @@ pub const Source = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const scratch = arena.allocator();
-        const projection_count = if (captured.roots.len > 1) captured.roots.len else 0;
+        const shared_storage = for (state.roots) |position| {
+            if (position.storage_namespace != null) break true;
+        } else false;
+        const projection_count = if (!shared_storage and state.roots.len > 1) state.roots.len else 0;
         if (projection_count > history.pages.max_projection_roots) return error.ChangefeedCapabilityUnsupported;
         const completion_roots = try scratch.alloc(control.Namespace, projection_count);
-        for (completion_roots, captured.roots[0..projection_count]) |*namespace, selected| namespace.* = selected.namespace;
+        for (completion_roots, state.roots[0..projection_count]) |*namespace, selected| namespace.* = selected.namespace;
         var input: history.Request = .{ .version = 1, .request = .{
             .reference = .{
-                .namespace = root.namespace,
+                .namespace = item.storageNamespace(),
                 .authority = state.authority,
                 .consumer = state.consumerId(),
                 .epoch = item.consumer_epoch,
@@ -441,9 +448,16 @@ pub const Source = struct {
                 arena.deinit();
                 return null;
             };
+            if (item.split_handoff) |handoff| {
+                if (current.sequence > handoff.cut.latest) return error.ChangefeedResynchronizationRequired;
+                latest = @min(latest, handoff.cut.latest);
+            }
             switch (current.transaction_scope) {
                 .root_local => {},
-                .coordinated => if (page.completion == null) return error.ReadUnavailable,
+                .coordinated => {
+                    if (shared_storage) return error.ChangefeedCapabilityUnsupported;
+                    if (page.completion == null) return error.ReadUnavailable;
+                },
                 .unknown => return error.ChangefeedCapabilityUnsupported,
             }
             const digest = control.hash(current);

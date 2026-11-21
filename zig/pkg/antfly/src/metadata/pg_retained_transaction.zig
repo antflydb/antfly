@@ -57,6 +57,7 @@ fn commitTime(page: history.Page) !i64 {
 }
 
 pub const Frame = struct {
+    stream: ?feeds.Namespace = null,
     page: history.Page,
     relation: relation_values.HistoricalRelation,
 };
@@ -111,10 +112,12 @@ pub fn encode(a: A, state: feeds.State, frames: []const Frame, issued_at: u64, b
         const header = page.header orelse return error.InvalidPgSpool;
         if (!std.meta.eql(header.transaction_id, first_header.transaction_id) or !std.meta.eql(page.completion, first.completion) or !std.meta.eql(effects_digest, feeds.hash(page.completion_effects)) or try commitTime(page) != commit_time_ns)
             return error.HistoryCorrupt;
-        if (index != 0 and std.mem.order(u8, &advances[index - 1].namespace, &header.namespace) != .lt)
+        const stream = frame.stream orelse header.namespace;
+        if (index != 0 and std.mem.order(u8, &advances[index - 1].namespace, &stream) != .lt)
             return error.InvalidPgSpool;
         if (page.next.event != 0 or page.next.sequence != header.sequence) return error.InvalidPgSpool;
-        const root = roots[try state.rootIndex(header.namespace)];
+        const root = roots[try state.rootIndex(stream)];
+        if (!std.meta.eql(root.storageNamespace(), header.namespace)) return error.HistoryCorrupt;
         if (root.delivered.event != 0 or header.sequence != std.math.add(u64, root.delivered.sequence, 1) catch return error.InvalidPgSpool)
             return error.ChangefeedResynchronizationRequired;
         const table_id = std.mem.readInt(u64, header.namespace[0..8], .big);
@@ -123,7 +126,7 @@ pub fn encode(a: A, state: feeds.State, frames: []const Frame, issued_at: u64, b
             if (table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
             break;
         } else return error.ChangefeedResynchronizationRequired;
-        advance.* = .{ .namespace = header.namespace, .position = .{ .sequence = header.sequence } };
+        advance.* = .{ .namespace = stream, .position = .{ .sequence = header.sequence } };
 
         var scratch_arena = std.heap.ArenaAllocator.init(a);
         defer scratch_arena.deinit();
@@ -212,7 +215,7 @@ pub fn Producer(comptime Policy: type) type {
             const now = try self.nowSeconds(request);
             if (now >= state.expires_at or now < state.created_at) return error.ChangefeedResynchronizationRequired;
             const context = try self.policy.context(request);
-            var captured = try self.source.capture(a, state.definition.?, context);
+            var captured = try self.source.capturePhysical(a, state.definition.?, context);
             defer captured.deinit();
             // An issued cursor pins the first participant even when another
             // root advances between admission and spool verification.
@@ -250,7 +253,7 @@ pub fn Producer(comptime Policy: type) type {
             };
 
             if (first.completion == null or positions.len == 1) {
-                try frames.append(scratch, .{ .page = first, .relation = try self.policy.relation(scratch, state, first_header, request) });
+                try frames.append(scratch, .{ .stream = positions[seed].namespace, .page = first, .relation = try self.policy.relation(scratch, state, first_header, request) });
             } else {
                 if (first.completion_effects.len != positions.len or first.completion_effects[seed] == null)
                     return error.HistoryCorrupt;
@@ -265,7 +268,7 @@ pub fn Producer(comptime Policy: type) type {
                 for (positions, first.completion_effects, 0..) |position, effect, index| {
                     if (effect == null) continue;
                     if (index == seed) {
-                        try frames.append(scratch, .{ .page = first, .relation = try self.policy.relation(scratch, state, first_header, request) });
+                        try frames.append(scratch, .{ .stream = positions[seed].namespace, .page = first, .relation = try self.policy.relation(scratch, state, first_header, request) });
                         continue;
                     }
                     read.root_index = index;
@@ -275,7 +278,7 @@ pub fn Producer(comptime Policy: type) type {
                     errdefer page.deinit();
                     const header = page.header orelse return error.HistoryCorrupt;
                     remaining = std.math.sub(usize, remaining, try frame_codec.encodedLength(header, page.events)) catch return error.HistoryTooLarge;
-                    try frames.append(scratch, .{ .page = page, .relation = try self.policy.relation(scratch, state, header, request) });
+                    try frames.append(scratch, .{ .stream = position.namespace, .page = page, .relation = try self.policy.relation(scratch, state, header, request) });
                 }
             }
             // A replay must use commit evidence rather than the polling clock.
