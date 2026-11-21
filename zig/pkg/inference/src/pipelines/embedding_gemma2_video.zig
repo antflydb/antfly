@@ -143,6 +143,7 @@ pub const WebmDecoderContinuation = struct {
     apple: ?*video.apple_webm.Continuation = null,
     session: ?@import("../backends/session.zig").Session = null,
     permit: ?@import("../backends/session.zig").RunPermit = null,
+    reference_reservation: media.admission.Token = .{},
     /// Published only after a decoder attempt drains. Planning can run ahead.
     apple_cursor: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
 
@@ -150,7 +151,13 @@ pub const WebmDecoderContinuation = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.permit != null) return;
         const session = self.session orelse return error.VideoDecoderUnavailable;
-        self.permit = try session.admitHostPreprocess(std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded);
+        var reservation = if (self.reader.input.admission_pool) |pool|
+            pool.acquire(.{ .host_bytes = bytes }) catch return error.AppleReferenceAdmissionExceeded
+        else
+            media.admission.Token{};
+        errdefer reservation.deinit();
+        self.permit = session.admitHostPreprocess(std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded) catch return error.AppleReferenceAdmissionExceeded;
+        self.reference_reservation = reservation;
     }
 
     pub fn deinit(self: *@This()) void {
@@ -159,6 +166,7 @@ pub const WebmDecoderContinuation = struct {
         self.apple = null;
         if (self.permit) |*permit| permit.deinit();
         self.permit = null;
+        self.reference_reservation.deinit();
     }
     fn decode(self: *@This(), reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, budget: ?video.webm_pictures.ReplayBudget) !?video.apple_webm.Receipt {
         if (@import("builtin").os.tag != .macos) return null;
@@ -167,8 +175,18 @@ pub const WebmDecoderContinuation = struct {
             self.apple = try video.apple_webm.Continuation.create(self.allocator, self.reader, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 } });
         }
         const owner = self.apple.?;
-        const receipt = owner.decodeAdmitted(reader, indexed, selected, budget, .{ .context = self, .acquire = admitReferences }, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| {
-            if (err != error.AppleReplayPacketLimit) self.deinit();
+        const receipt = owner.decodeWindow(reader, indexed, selected, budget, .{ .context = self, .acquire = admitReferences }, .{
+            .allocator = capture.a,
+            .pool = capture.pool,
+            .device_surfaces = capture.metal != null,
+        }, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| {
+            if (err == error.AppleReferenceAdmissionExceeded) {
+                // Retention is optional. The window can still take the
+                // separately admitted transient Apple path.
+                self.deinit();
+                return null;
+            }
+            if (err != error.AppleReplayPacketLimit and err != error.AppleWindowAdmissionExceeded) self.deinit();
             return err;
         };
         if (owner.native != null) self.apple_cursor.store(owner.next_packet, .release);
@@ -347,7 +365,7 @@ pub const Inspection = struct {
         var plan = self.plan;
         if (!metal) {
             plan.metal_preparation = false;
-            plan.apple_surface_bytes = 0;
+            plan.setWebmAppleSurfaceBytes(if (plan.webm_apple_surface_slot != null) plan.apple_surface_bytes else 0);
             plan.source_apple_surface_bytes = 0;
             plan.apple_surfaces_fixed = false;
         }
@@ -390,7 +408,7 @@ pub const Inspection = struct {
             self.selected = if (self.gemma4_plan) |*plan| try a.dupe(usize, plan.ids()) else try selectWebm(a, self.webm_index.?, configuration.sampling, self.source.control, configuration.webm);
             self.plan = try inspectSelectedWebmPlan(&self.webm_reader, self.webm_index.?, true, self.selected.?);
             if (!webmApplePreflight(configuration.webm)) {
-                self.plan.apple_surface_bytes = 0;
+                self.plan.setWebmAppleSurfaceBytes(0);
             }
         } else {
             if (borrowed) |reader| {
@@ -1883,6 +1901,7 @@ pub const Plan = struct {
     // A WebM index has one Apple-compatible format. Keep its per-surface
     // cost even when the unfiltered selection exceeds the native limit.
     webm_apple_surface_slot: ?u64 = null,
+    webm_apple_host_bytes: usize = 0,
     // Preserve the unfiltered envelope when a precomputed plan is admitted
     // again under a different cache owner. A past hit is not a future pin.
     source_apple_surface_bytes: ?usize = null,
@@ -1891,12 +1910,22 @@ pub const Plan = struct {
     apple_surfaces_fixed: bool = false,
     patch_output_bytes: usize = 0,
     commands: u64 = 0,
-    pub fn hostBytes(self: Plan) !usize {
-        // There is one decoder/preparation producer. GPU queue entries retain
-        // device buffers; CPU entries retain final patches, not RGB scratch.
-        const active = if (self.commands == 0) 0 else try std.math.add(usize, self.preparation_bytes, if (self.needs_decoder) self.decoder_host_bytes else 0);
+    pub fn decoderHostBytes(self: Plan) usize {
+        return if (self.commands != 0 and self.needs_decoder) @max(self.decoder_host_bytes, self.webm_apple_host_bytes) else 0;
+    }
+    pub fn otherHostBytes(self: Plan) !usize {
+        const active = if (self.commands == 0) 0 else self.preparation_bytes;
         const queued = if (self.metal_preparation) self.host_patch_bytes else self.patch_output_bytes;
         return std.math.add(usize, 32 * 1024 * 1024, try std.math.add(usize, active, queued));
+    }
+    pub fn hostBytes(self: Plan) !usize {
+        return std.math.add(usize, try self.otherHostBytes(), self.decoderHostBytes());
+    }
+    fn setWebmAppleSurfaceBytes(self: *Plan, bytes: usize) void {
+        self.apple_surface_bytes = if (self.metal_preparation) bytes else 0;
+        // Leave space for packet reads, preparation and the rest of the row.
+        // Windows too large for the native pool can still use portable decode.
+        self.webm_apple_host_bytes = if (!self.metal_preparation and bytes <= 512 * 1024 * 1024 -| (self.otherHostBytes() catch std.math.maxInt(usize))) bytes else 0;
     }
     pub fn deviceBytes(self: Plan) !usize {
         if (self.commands == 0) return 0;
@@ -2123,7 +2152,7 @@ pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const med
 pub fn inspectConfiguredPlan(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration, metal: bool) !Plan {
     var plan = if (configuration.inspection_scope) |scope| try scope.inspect(bytes, reader, control, configuration, metal) else if (configuration.webm) |input| try inspectWebmPlan(a, input, configuration.sampling, metal, control) else if (reader) |r| try inspectReaderPlanWithSelection(a, r, control, configuration.sampling, configuration.pool, metal, configuration.selection) else try inspectPlan(a, bytes, control, configuration.sampling, configuration.pool, metal);
     if (configuration.decoder.policy == .portable) {
-        plan.apple_surface_bytes = 0;
+        plan.setWebmAppleSurfaceBytes(0);
         plan.source_apple_surface_bytes = 0;
     }
     return pinCachedPlan(plan, bytes, reader, control, configuration);
@@ -2184,10 +2213,10 @@ pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp
     result.source_apple_surface_bytes = original.source_apple_surface_bytes orelse original.apple_surface_bytes;
     result.apple_surface_bytes = if (decode_count == 0 or (configuration.webm != null and !projected_cache and !webmApplePreflight(configuration.webm))) 0 else if (original.apple_surfaces_fixed) result.source_apple_surface_bytes.? else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(decode_count)) + 24);
     if (original.webm_apple_surface_slot) |slot| {
-        result.apple_surface_bytes = if (original.metal_preparation and configuration.decoder.policy != .portable and (projected_cache or webmApplePreflight(configuration.webm)))
+        result.setWebmAppleSurfaceBytes(if (configuration.decoder.policy != .portable and (projected_cache or webmApplePreflight(configuration.webm)))
             try webmAppleSurfaceReservation(slot, @intCast(decode_count))
         else
-            0;
+            0);
     }
     if (projected_cache and configuration.decoder.policy != .portable) if (configuration.webm) |input| if (input.window) |window| {
         var misses: [32]usize = undefined;
@@ -2203,7 +2232,7 @@ pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp
         else
             false);
         const recorded = pins.?.rememberWebmApple(key, possible);
-        if (!(if (recorded) possible else window.apple_possible)) result.apple_surface_bytes = 0;
+        if (!(if (recorded) possible else window.apple_possible)) result.setWebmAppleSurfaceBytes(0);
     };
     return result;
 }
@@ -2221,7 +2250,7 @@ fn inspectWebmPlan(a: std.mem.Allocator, input: WebmInput, sampling: Sampling, m
     defer a.free(selected);
     var plan = try inspectSelectedWebmPlan(input.reader, input.index.*, metal, selected);
     if (!webmApplePreflight(input)) {
-        plan.apple_surface_bytes = 0;
+        plan.setWebmAppleSurfaceBytes(0);
     }
     return plan;
 }
@@ -2230,7 +2259,7 @@ fn webmApplePreflight(input: ?WebmInput) bool {
 }
 fn inspectSelectedWebmPlan(reader: *const media.webm.Reader, index: video.webm_pictures.Index, metal: bool, selected: []const usize) !Plan {
     var plan = Plan{ .commands = preparationSlots(selected), .metal_preparation = metal, .decoder_host_bytes = 256 * 1024 * 1024 };
-    const apple_eligible = metal and @import("builtin").os.tag == .macos and blk: {
+    const apple_eligible = @import("builtin").os.tag == .macos and blk: {
         _ = video.apple_webm.validate(reader, index) catch |err| switch (err) {
             error.UnsupportedVideoProfile => break :blk false,
             else => return err,
@@ -2253,7 +2282,7 @@ fn inspectSelectedWebmPlan(reader: *const media.webm.Reader, index: video.webm_p
         for (selected, 0..) |id, index_in_selection| {
             if (std.mem.indexOfScalar(usize, selected[0..index_in_selection], id) == null) unique += 1;
         }
-        plan.apple_surface_bytes = try webmAppleSurfaceReservation(slot, unique);
+        plan.setWebmAppleSurfaceBytes(try webmAppleSurfaceReservation(slot, unique));
     }
     return plan;
 }
@@ -2722,16 +2751,20 @@ pub const Prefetch = struct {
     }
 
     fn waitForDecoder(self: *Prefetch) !void {
-        const previous = self.predecessor orelse return;
-        while (true) {
-            try check(self);
-            previous.finished.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
-                error.Timeout => continue,
-                else => return err,
-            };
-            try check(self);
-            return;
+        var predecessor = self.predecessor;
+        // A cache-only predecessor can finish without entering the decoder.
+        // Its earlier dependencies still own their scratch until they finish.
+        while (predecessor) |previous| : (predecessor = previous.predecessor) {
+            while (true) {
+                try check(self);
+                previous.finished.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return err,
+                };
+                break;
+            }
         }
+        try check(self);
     }
 
     fn jobOptions(job: Job) video.preparation.Options {
@@ -3419,10 +3452,11 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
     if (capture.decoder.policy != .portable and (capture.decoder.policy == .apple or apple_possible)) {
         const bytes_before = reader.input.total_bytes;
         const receipt: ?video.apple_webm.Receipt = decodeAppleWebm(a, reader, indexed, selected, capture, input, budget) catch |err| blk: {
-            const reason = if (err == error.AppleReplayPacketLimit)
-                (if (capture.decoder.policy == .automatic) error.UnsupportedVideoProfile else error.ResourceLimitExceeded)
-            else
-                err;
+            const reason = switch (err) {
+                error.AppleReplayPacketLimit => if (capture.decoder.policy == .automatic) error.UnsupportedVideoProfile else error.ResourceLimitExceeded,
+                error.AppleWindowAdmissionExceeded => if (capture.decoder.policy == .automatic) error.VideoDecoderUnavailable else error.SharedAdmissionExceeded,
+                else => err,
+            };
             try appleUnavailable(capture, reason);
             // The worker owns this source view. Its counters include packet
             // and sequence bootstrap reads, even when Apple publishes nothing.
@@ -5856,6 +5890,16 @@ test "embeddinggemma2 video cache admission removes only pinned unique preparati
     try std.testing.expectEqual(@as(usize, 0), webm_plan.apple_surface_bytes);
     const pinned_webm = try pinCachedPlan(webm_plan, bytes, null, .{}, configuration);
     try std.testing.expectEqual(@as(usize, @intCast(slot * (original.pictures + 23))), pinned_webm.apple_surface_bytes);
+    var native_webm_plan = webm_plan;
+    native_webm_plan.metal_preparation = false;
+    const native_pinned = try pinCachedPlan(native_webm_plan, bytes, null, .{}, configuration);
+    try std.testing.expectEqual(@as(usize, 0), native_pinned.apple_surface_bytes);
+    const native_slot = try video.apple.surfacePayloadBytesForDepth(4096, 2160, 8);
+    native_webm_plan.webm_apple_surface_slot = native_slot;
+    native_webm_plan.decoder_host_bytes = 256 * 1024 * 1024;
+    native_webm_plan.setWebmAppleSurfaceBytes(try webmAppleSurfaceReservation(native_slot, 1));
+    try std.testing.expectEqual(try webmAppleSurfaceReservation(native_slot, 1), native_webm_plan.decoderHostBytes());
+    try std.testing.expectEqual((try native_webm_plan.otherHostBytes()) + native_webm_plan.decoderHostBytes(), try native_webm_plan.hostBytes());
     const portable_webm = try pinCachedPlan(webm_plan, bytes, null, .{}, .{
         .sampling = sampling,
         .cache_pins = &pins,

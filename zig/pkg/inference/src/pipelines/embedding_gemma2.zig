@@ -1247,6 +1247,10 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     // Admission/compatibility can decline before ordinary producers start.
     // A running later row must not retain the decoder lease during fallback.
     errdefer if (cohort) releaseVideoBatchPreparations(items, &.{});
+    const video_model = @import("embedding_gemma2_video.zig");
+    var predecessors: [4]?usize = @splat(null);
+    var decoder_chain: [4]usize = undefined;
+    var decoder_host_peaks: [4]usize = @splat(0);
     var parts: [4][2]Part = undefined;
     var groups: [4]Group = undefined;
     for (items, 0..) |item, index| {
@@ -1254,9 +1258,21 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         groups[index] = .{ .content = parts[index][0..if (item.caption != null) 2 else 1] };
         try validateGroupContentControlled(groups[index], options, true, control);
     }
-    for (items) |item| {
+    for (items, 0..) |item, index| {
         const movie = item.movie;
         try control.check();
+        if (cohort and item.ahead == null) {
+            var previous = index;
+            while (previous != 0) {
+                previous -= 1;
+                const candidate = items[previous].movie;
+                if (video_model.sharesDecoder(movie.selection, movie.webm, candidate.selection, candidate.webm)) {
+                    predecessors[index] = previous;
+                    break;
+                }
+            }
+        }
+        decoder_chain[index] = if (predecessors[index]) |previous| decoder_chain[previous] else index;
         if (item.ahead) |ahead| if (ahead.released or !ahead.matches(movie, options.video_decoder, session, cache)) return error.InvalidVideoReaderSelection;
         const plan = if (item.ahead) |ahead| ahead.plan else if (item.plan) |plan| try @import("embedding_gemma2_video.zig").pinCachedPlan(plan.*, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins }) else try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope }, session.backend() == .metal);
         // UTF-8 byte length bounds caption token count conservatively; exact
@@ -1269,10 +1285,17 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         if (item.ahead == null) {
             device = if (cohort) try std.math.add(usize, device, try plan.deviceBytes()) else @max(device, try plan.deviceBytes());
             commands = if (cohort) try std.math.add(u64, commands, plan.commands) else @max(commands, plan.commands);
-            host = if (cohort) try std.math.add(usize, host, try plan.hostBytes()) else @max(host, try plan.hostBytes());
+            if (cohort) {
+                // Queued work can coexist. Decoder scratch is reused only
+                // across producers ordered by the same dependency chain.
+                host = try std.math.add(usize, host, try plan.otherHostBytes());
+                const peak = &decoder_host_peaks[decoder_chain[index]];
+                peak.* = @max(peak.*, plan.decoderHostBytes());
+            } else host = @max(host, try plan.hostBytes());
         }
         vision_workspace = @max(vision_workspace, plan.vision_workspace_bytes);
     }
+    for (decoder_host_peaks) |peak| host = try std.math.add(usize, host, peak);
     // Avoid padding-heavy cohorts. The runner falls back to independent calls.
     const compact_policy = encoder.compactRowsEnabled(session.backend() == .metal);
     if (compact_policy) {
@@ -1297,7 +1320,6 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer std.debug.assert(std.meta.eql(pool.snapshot(), media_admission.Resources{}));
     var preparation_guard = if (cohort) try control.enterUninterruptible(session.interruption()) else @import("../execution_control.zig").UninterruptibleGuard{};
     defer preparation_guard.deinit();
-    const video_model = @import("embedding_gemma2_video.zig");
     var preparation_wake: std.Io.Event = .unset;
     var producers: [4]*video_model.Prefetch = undefined;
     var producer_count: usize = 0;
@@ -1316,15 +1338,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         };
         for (items, 0..) |item, index| {
             const movie = item.movie;
-            const predecessor: ?*video_model.Prefetch = dependency: {
-                var previous = index;
-                while (previous != 0) {
-                    previous -= 1;
-                    const candidate = items[previous].movie;
-                    if (video_model.sharesDecoder(movie.selection, movie.webm, candidate.selection, candidate.webm)) break :dependency producers[previous];
-                }
-                break :dependency null;
-            };
+            const predecessor = if (predecessors[index]) |previous| producers[previous] else null;
             producers[index] = if (item.ahead) |ahead| ahead.producer.? else try video_model.Prefetch.startConfigured(a, cohort_io.?, context.device, movie.bytes, movie.reader, control, .{ .predecessor = predecessor, .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins, .inspection_scope = &inspection_scope, .pool = &pool, .cache = cache, .coefficients = context.coefficients });
             producer_count += 1;
         }

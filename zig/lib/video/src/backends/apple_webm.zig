@@ -29,6 +29,13 @@ pub const Options = struct {
     replay_budget: ?pictures.ReplayBudget = null,
     reference_admission: ?ReferenceAdmission = null,
 };
+/// Allocation and surface tier for one synchronous decode window.
+pub const WindowMemory = struct {
+    allocator: std.mem.Allocator,
+    pool: ?*media.admission.Pool,
+    device_surfaces: bool,
+};
+/// An external owner funds and releases the retained native reference pool.
 pub const ReferenceAdmission = struct {
     context: *anyopaque,
     acquire: *const fn (*anyopaque, u64) anyerror!void,
@@ -215,13 +222,20 @@ pub const Continuation = struct {
         return self.decodeAdmitted(reader, indexed, selected, budget, self.options.reference_admission, sink);
     }
     pub fn decodeAdmitted(self: *@This(), reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, budget: ?pictures.ReplayBudget, admission: ?ReferenceAdmission, sink: Sink) !Receipt {
+        return self.decodeWindow(reader, indexed, selected, budget, admission, null, sink);
+    }
+    pub fn decodeWindow(self: *@This(), reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, budget: ?pictures.ReplayBudget, admission: ?ReferenceAdmission, window: ?WindowMemory, sink: Sink) !Receipt {
         if (self.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return error.InvalidDecodeOptions;
         defer self.busy.store(false, .release);
         if (reader.packets.ptr != self.reader.packets.ptr or reader.packets.len != self.reader.packets.len or !std.mem.eql(u8, reader.input.identity, self.reader.input.identity)) return error.InvalidVideoIndex;
         var options = self.options;
         options.replay_budget = budget;
         options.reference_admission = admission;
-        return decode(self.allocator, reader, indexed, selected, options, sink, self);
+        if (window) |memory| {
+            options.pool = memory.pool;
+            options.device_surfaces = memory.device_surfaces;
+        }
+        return decode(if (window) |memory| memory.allocator else self.allocator, reader, indexed, selected, options, sink, self);
     }
 };
 pub fn decodeTo(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink) !Receipt {
@@ -288,14 +302,17 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     const end = plan.end;
     const warm = plan.reuse;
     const shape = indexed.pictures[0];
-    const bytes = try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, selected.len, shape.bit_depth);
-    if (bytes > options.decode.max_surface_bytes) return error.ResourceLimitExceeded;
-    if (retained_owner != null and !warm) if (options.reference_admission) |admission| {
-        try admission.acquire(admission.context, try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth));
-    };
+    const transient_bytes = try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, selected.len, shape.bit_depth);
+    if (transient_bytes > options.decode.max_surface_bytes) return error.ResourceLimitExceeded;
+    // The retained reservation already covers the native decoder's internal
+    // surfaces. This window owns only the selected outputs in that case.
+    const bytes = if (retained_owner != null)
+        try std.math.mul(u64, try apple.surfacePayloadBytesForDepth(shape.width, shape.height, shape.bit_depth), selected.len)
+    else
+        transient_bytes;
     const metadata = try std.math.mul(usize, selected.len, @sizeOf(?apple.Surface) + @sizeOf(bool));
     const charge = if (options.device_surfaces) media.admission.Resources{ .device_bytes = bytes, .host_bytes = metadata } else media.admission.Resources{ .host_bytes = try std.math.add(u64, bytes, metadata) };
-    var reservation = if (options.pool) |pool| try pool.acquire(charge) else media.admission.Token{};
+    var reservation = if (options.pool) |pool| pool.acquire(charge) catch return error.AppleWindowAdmissionExceeded else media.admission.Token{};
     defer reservation.deinit();
     const slots = try a.alloc(?apple.Surface, selected.len);
     defer a.free(slots);
@@ -304,6 +321,9 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     const seen = try a.alloc(bool, selected.len);
     defer a.free(seen);
     @memset(seen, false);
+    if (retained_owner != null and !warm) if (options.reference_admission) |admission| {
+        try admission.acquire(admission.context, try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth));
+    };
     var capture = Capture{ .indexed = indexed, .selected = selected, .slots = slots, .seen = seen, .format = config.format, .control = reader.input.control, .limit = options.decode.max_retained_surface_bytes };
     var transient: ?apple.CodedSession = null;
     defer if (transient) |*session| session.deinit();
@@ -314,9 +334,11 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
         if (owner.native == null) {
             // Budget a bounded reference working set separately from selected
             // output surfaces. Driver-private overhead remains platform-owned.
-            const reference_bytes = try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth);
-            const resources = if (options.device_surfaces) media.admission.Resources{ .device_bytes = reference_bytes } else media.admission.Resources{ .host_bytes = reference_bytes };
-            owner.reservation = if (options.pool) |pool| try pool.acquire(resources) else .{};
+            if (options.reference_admission == null) {
+                const reference_bytes = try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth);
+                const resources = if (owner.options.device_surfaces) media.admission.Resources{ .device_bytes = reference_bytes } else media.admission.Resources{ .host_bytes = reference_bytes };
+                owner.reservation = if (owner.options.pool) |pool| try pool.acquire(resources) else .{};
+            }
             owner.native = try apple.CodedSession.init(if (reader.track.codec == .vp9) .vp9 else .av1, config.bytes[0..config.len], shape.width, shape.height, config.format, options.decode.require_hardware, Continuation.callback, owner);
         }
         break :retained owner.native.?;
