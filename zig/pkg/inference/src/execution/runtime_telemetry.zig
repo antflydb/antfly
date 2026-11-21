@@ -187,6 +187,21 @@ pub const DeviceMemory = struct {
     invocation_peak: enum { unavailable } = .unavailable,
 };
 
+pub const PeriodicWorkspace = struct {
+    scope: enum { cuda_context_pinned_allocations } = .cuda_context_pinned_allocations,
+    state: enum { fixed, idle, observing, validating, capture_ready, disabled },
+    slots: usize,
+    live_backing_bytes: usize,
+    planned_bytes: ?usize = null,
+    admission_limit_bytes: ?usize = null,
+    // Context lifetime totals. The actual bound memory above is a gauge, and
+    // neither value attributes all device allocations to the current request.
+    trace_observations: usize,
+    activations: usize,
+    invalidations: usize,
+    admission_denials: usize,
+};
+
 pub const Snapshot = struct {
     device_memory: ?DeviceMemory = null,
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
@@ -210,6 +225,7 @@ pub const Snapshot = struct {
     allocation_owners: ?@import("allocation_registry.zig").Summary = null,
     device_owners: ?@import("device_owner_registry.zig").Summary = null,
     cuda: ?Cuda = null,
+    cuda_periodic_workspace: ?PeriodicWorkspace = null,
     memory: Memory = .{},
     /// Invocation interval on its submitting thread, including CPU fallbacks.
     submission: ?@import("runtime_observation.zig").Counters = null,
@@ -235,6 +251,7 @@ pub const Snapshot = struct {
             .transfers = self.transfers,
             .counters = self.counters.since(before.counters),
             .memory = self.memory,
+            .cuda_periodic_workspace = self.cuda_periodic_workspace,
             .cuda = if (self.cuda) |after| if (before.cuda) |start| after.since(start) else after else null,
             .native_allocations = if (self.native_allocations) |after| if (before.native_allocations) |start| after.since(start) else after else null,
             .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,

@@ -48,6 +48,7 @@ pub const Report = struct {
     metal_command_waits: ?u64 = null,
     /// Actual accepted driver API/topology units, not completed device kernels.
     cuda: ?runtime.Cuda = null,
+    cuda_periodic_workspace: ?runtime.PeriodicWorkspace = null,
     resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
     terminal_native_bodies: ?@import("runtime_observation.zig").NativeBodies = null,
@@ -132,6 +133,7 @@ pub const Report = struct {
         report.stage_placement = value.stage_placement;
         report.decoder_route = value.decoder_route;
         report.device_memory = value.runtime.device_memory;
+        report.cuda_periodic_workspace = value.runtime.cuda_periodic_workspace;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {

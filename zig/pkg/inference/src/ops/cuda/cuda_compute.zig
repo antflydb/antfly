@@ -36105,6 +36105,29 @@ fn gqaPagedAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct
     return gqaDenseAttention(ctx, q_ct, k_ct, v_ct, attn_bias_ct, attention.attn_or_mask, batch, attention.query_sequence_len, attention.kv_sequence_len, num_heads, num_kv_heads, head_dim, query_position_offset, attention.kv_position_offset, attention.sliding_window, attention.total_sequence_len);
 }
 
+fn observePeriodicWorkspace(self: *CudaCompute) ?@import("../../execution/runtime_telemetry.zig").PeriodicWorkspace {
+    const config = self.temp_slot_config;
+    if ((!config.autoplan_enabled and config.configured_period == 0) or !self.temp_buffer_mutex.tryLock()) return null;
+    defer self.temp_buffer_mutex.unlock();
+    const plan = &self.temp_arena_planner;
+    var physical_bytes: usize = 0;
+    for (self.temp_pinned_slots.items) |slot| {
+        if (slot.buffer.ptr != 0) physical_bytes +|= pinnedWorkspaceBytes(slot.buffer);
+    }
+    const learned = config.configured_period == 0;
+    return .{
+        .state = if (!learned) .fixed else if (plan.disabled) .disabled else if (plan.ready_for_capture) .capture_ready else if (plan.active) .validating else if (plan.observing) .observing else .idle,
+        .slots = cudaEffectiveTempSlotPeriod(self),
+        .live_backing_bytes = physical_bytes,
+        .planned_bytes = if (learned and plan.active) plan.planned_physical_high_water_bytes else null,
+        .admission_limit_bytes = if (learned and plan.active) plan.admission_budget_bytes else null,
+        .trace_observations = plan.observations,
+        .activations = plan.activations,
+        .invalidations = plan.invalidations,
+        .admission_denials = plan.admission_denials,
+    };
+}
+
 fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     var provider = ops.NativeQuantTimingStats{};
@@ -36119,7 +36142,7 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
     }
     const memory = self.ctx.device_allocations.snapshot();
     return .{
-        .runtime = .{ .cuda = self.ctx.runtimeObservation(), .counters = .{ .kernel_dispatches = null, .graph_submissions = if (self.ctx.observation.load(.acquire)) |state| state.counterValue("known_graph_submissions") +| state.counterValue("opaque_graph_submissions") else null, .synchronizations = if (self.ctx.observation.load(.acquire)) |state| state.counterValue("host_stream_synchronizations") +| state.counterValue("host_event_synchronizations") else null, .physical_allocations = memory.allocations, .physical_frees = memory.frees }, .memory = .{ .scope = .backend_device_buffers, .excludes_detached_owners = true, .live_bytes = memory.physical_live, .lifetime_peak_bytes = memory.physical_peak } },
+        .runtime = .{ .cuda = self.ctx.runtimeObservation(), .cuda_periodic_workspace = observePeriodicWorkspace(self), .counters = .{ .kernel_dispatches = null, .graph_submissions = if (self.ctx.observation.load(.acquire)) |state| state.counterValue("known_graph_submissions") +| state.counterValue("opaque_graph_submissions") else null, .synchronizations = if (self.ctx.observation.load(.acquire)) |state| state.counterValue("host_stream_synchronizations") +| state.counterValue("host_event_synchronizations") else null, .physical_allocations = memory.allocations, .physical_frees = memory.frees }, .memory = .{ .scope = .backend_device_buffers, .excludes_detached_owners = true, .live_bytes = memory.physical_live, .lifetime_peak_bytes = memory.physical_peak } },
         .native_quant_null = false,
         .provider = provider,
         .quant = .{},
@@ -62446,6 +62469,11 @@ test "Gemma4 CUDA learned scratch backing survives requests without retaining th
     try compute.ctx.synchronize();
     const allocations = compute.stats.device_alloc_calls;
     const frees = compute.stats.device_free_calls;
+    const observed = observePeriodicWorkspace(&compute).?;
+    try std.testing.expectEqual(.fixed, observed.state);
+    try std.testing.expectEqual(@as(usize, 2), observed.slots);
+    try std.testing.expectEqual(@as(usize, 192), observed.live_backing_bytes);
+    try std.testing.expect(observed.planned_bytes == null);
     try resetTempPinnedSlotsForRequest(&compute);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
@@ -62468,6 +62496,7 @@ test "Gemma4 CUDA learned scratch backing survives requests without retaining th
     compute.runtime_policy.temp_cache_mb = 0;
     try resetTempPinnedSlotsForRequest(&compute);
     for (compute.temp_pinned_slots.items) |slot| try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), slot.buffer.ptr);
+    try std.testing.expectEqual(@as(usize, 0), observePeriodicWorkspace(&compute).?.live_backing_bytes);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
     try synchronizeAndDrainDeferredDeviceFrees(&compute);
     try std.testing.expect(compute.stats.device_free_calls >= frees + 2);
