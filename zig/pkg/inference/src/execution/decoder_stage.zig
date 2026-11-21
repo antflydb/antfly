@@ -184,7 +184,9 @@ pub const Decoder = struct {
         var row = Row{ .allocator = self.allocator, .vocab_size = self.vocab_size };
         errdefer row.deinit();
         if (self.native) |*decoder| {
-            const pending = prefix[decoder.positions()..];
+            const processed = decoder.positions();
+            if (prefix.len <= processed) return error.InvalidDecoderPosition;
+            const pending = prefix[processed..];
             if (stats_request) |request| {
                 switch (try decoder.stepWith(pending, .{ .stats = request })) {
                     .stats => |stats| row.stats = stats,
