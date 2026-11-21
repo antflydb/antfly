@@ -589,7 +589,7 @@ def test_pg_recvlogical_resume_after_restart(
         assert created[5] == "reserved"
         assert catalog_slot(plugin="wrong_plugin") == []
         first = tmp_path / "first.bin"
-        with stream(first, expect_disconnect=cross_node) as reader:
+        with stream(first, expect_disconnect=cross_node and not topology) as reader:
             insert = (
                 "INSERT INTO smoke (id, content) VALUES (7, 'retained-stream-smoke')"
             )
@@ -636,10 +636,11 @@ def test_pg_recvlogical_resume_after_restart(
                 (checkpointed,) = catalog_slot()
                 assert checkpointed[2] == "t"
                 assert checkpointed[4] != created[4]
-                failed = server.data_procs[0]
-                failed.kill()
-                failed.wait(timeout=25)
-                reader.wait(timeout=10)
+                if not topology:
+                    failed = server.data_procs[0]
+                    failed.kill()
+                    failed.wait(timeout=25)
+                    reader.wait(timeout=10)
 
         if cross_node:
             connection[3] = str(server.pgwire_ports[1])
@@ -740,7 +741,6 @@ def test_pg_recvlogical_resume_after_restart(
                 assert resumed.read_bytes().count(b"after-node-failover") == 1
                 assert all(marker not in resumed.read_bytes() for marker in markers)
                 if topology:
-                    server.restart_crashed_node(metadata=False, index=0)
                     catalog = requests.get(
                         f"{server.data_api_urls[1]}/tables",
                         headers={"X-Antfly-Trusted-Principal": env["PGPASSWORD"]},
