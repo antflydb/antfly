@@ -138,12 +138,16 @@ pub fn validateTokenizer(a: std.mem.Allocator, bytes: []const u8) !void {
     }
 }
 
-pub fn signature(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8) ![32]u8 {
+pub fn requireWeightBinding(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8) !void {
     const actual_weights = try receipt.resolveRegularFilePath(a, io, weights);
     defer a.free(actual_weights);
     const contained_weights = try receipt.resolveContainedArtifactPath(a, io, directory, std.fs.path.basename(weights));
     defer a.free(contained_weights);
     if (!std.mem.eql(u8, actual_weights, contained_weights)) return error.ModelArtifactOutsideRoot;
+}
+
+pub fn signature(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8) ![32]u8 {
+    try requireWeightBinding(a, io, directory, weights);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     for (0..sidecars.len + 1) |i| {
         const path = try receipt.resolveContainedArtifactPath(a, io, directory, if (i == sidecars.len) std.fs.path.basename(weights) else sidecars[i]);

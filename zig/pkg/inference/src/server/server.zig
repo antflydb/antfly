@@ -51283,18 +51283,23 @@ test "model selection reuses the verified resident installation for embedding re
 }
 
 test "scoped model discovery reuses compatibility and refuses a truncated extensionless shard" {
-    try testScopedShardedDiscovery(false, false);
+    try testScopedShardedDiscovery(false, .sharded);
 }
 
 test "scoped model discovery keeps native revisions when an alternate ONNX dependency is invalid" {
-    try testScopedShardedDiscovery(true, false);
+    try testScopedShardedDiscovery(true, .sharded);
 }
 
 test "scoped model discovery withholds revision pinning for sharded EmbeddingGemma 2" {
-    try testScopedShardedDiscovery(false, true);
+    try testScopedShardedDiscovery(false, .gemma_sharded);
 }
 
-fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime gemma: bool) !void {
+test "scoped model discovery refuses an EmbeddingGemma 2 pin with missing recipe sidecars" {
+    try testScopedShardedDiscovery(false, .gemma_incomplete);
+}
+
+fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime fixture: enum { sharded, gemma_sharded, gemma_incomplete }) !void {
+    const gemma = fixture != .sharded;
     const a = std.testing.allocator;
     const io = std.testing.io;
     const managed = @import("../registry/managed_receipt.zig");
@@ -51311,7 +51316,17 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime gemma: bool) !v
     defer dir.close(io);
     // The external tensor points beyond the end of a valid receipt member.
     const graph = "\x3a\x2c\x2a\x2a\x6a\x17\x0a\x08location\x12\x0btensors.bin\x6a\x0d\x0a\x06offset\x12\x03999\x70\x01";
-    const native_files = .{ .{ "config.json", config }, .{ index_path, index }, .{ shard_path, weights } };
+    const native_files = if (fixture == .gemma_incomplete)
+        .{
+            .{ "config.json", config },
+            .{ "model.safetensors", weights },
+            .{ "tokenizer.json", "{}" },
+            .{ "tokenizer_config.json", "{}" },
+            .{ "processor_config.json", "{}" },
+            .{ "config_sentence_transformers.json", "{}" },
+        }
+    else
+        .{ .{ "config.json", config }, .{ index_path, index }, .{ shard_path, weights } };
     const files = if (with_onnx) native_files ++ .{ .{ "model.onnx", graph }, .{ "tensors.bin", "tensor data" } } else native_files;
     var entries: [files.len]managed.ArtifactReceipt = undefined;
     var sums: [files.len][64]u8 = undefined;
@@ -51344,6 +51359,11 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime gemma: bool) !v
         const before = request_work_test_counters.compatibility_checkpoint_samples;
         var response = try node.listModels(&ctx);
         defer response.deinit();
+        if (fixture == .gemma_incomplete) {
+            try std.testing.expectEqual(@as(u16, 503), response.status.code);
+            try std.testing.expectEqualStrings("true", response.headers.get("X-Antfly-Embedding-Artifact-Unavailable").?);
+            continue;
+        }
         try std.testing.expectEqual(@as(u16, 200), response.status.code);
         var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
         defer parsed.deinit();
@@ -51359,7 +51379,9 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime gemma: bool) !v
         defer a.free(model_dir);
         const control = InferenceExecutionControl{ .io = io };
         const model_publication = try managed.publicationGeneration(a, io, model_dir);
-        var publication = (try ScopedCatalogPublication.open(&node.scoped_catalog_cache, a, a, io, model_dir, model_publication, control)).?;
+        var cache: ScopedCatalogCache = .{};
+        defer cache.deinit();
+        var publication = (try ScopedCatalogPublication.open(&cache, a, a, io, model_dir, model_publication, control)).?;
         defer publication.deinit();
         var listing = try manifest_mod.loadFromPublishedArtifacts(a, model_dir, &publication.artifacts, true);
         defer listing.deinit();
@@ -51368,14 +51390,38 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool, comptime gemma: bool) !v
         _ = try publication.borrow.compatibility(&publication.artifacts, model_dir, &listing, order, control);
         const manifest = publication.borrow.executionManifest().?;
         try std.testing.expect(manifest.onnx_path != null);
-        var candidates: model_manager_mod.ModelManager.EmbeddingRevisions = .{};
-        candidates.backends[0..2].* = .{ .wasm, .native };
-        candidates.revisions[0..2].* = .{ @splat(1), @splat(2) };
-        candidates.len = 2;
-        const rejected = try publication.borrow.filterEmbeddingRevisions(&publication.artifacts, manifest, &candidates, control);
-        try std.testing.expectEqual(@as(usize, 1), candidates.len);
-        try std.testing.expect(candidates.contains(@splat(2)));
-        try std.testing.expect(rejected.contains(@splat(1)));
+        const Probe = struct {
+            var graph_stats: usize = 0;
+            var original: @FieldType(std.Io.VTable, "dirStatFile") = undefined;
+
+            fn stat(raw: ?*anyopaque, directory: std.Io.Dir, name: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+                if (std.mem.endsWith(u8, name, "/model.onnx")) graph_stats += 1;
+                return original(raw, directory, name, options);
+            }
+        };
+        var table = io.vtable.*;
+        Probe.original = table.dirStatFile;
+        table.dirStatFile = Probe.stat;
+        var counted_artifacts = publication.artifacts;
+        counted_artifacts.io = .{ .userdata = io.userdata, .vtable = &table };
+        // Hold the captured publication across the removal and repair to
+        // prove the dependency check notices the repaired member itself.
+        try dir.deleteFile(io, "tensors.bin");
+        for (0..3) |attempt| {
+            if (attempt == 2) try dir.writeFile(io, .{ .sub_path = "tensors.bin", .data = "tensor data" });
+            Probe.graph_stats = 0;
+            var candidates: model_manager_mod.ModelManager.EmbeddingRevisions = .{};
+            candidates.backends[0..2].* = .{ .wasm, .native };
+            candidates.revisions[0..2].* = .{ @splat(1), @splat(2) };
+            candidates.len = 2;
+            const rejected = try publication.borrow.filterEmbeddingRevisions(&counted_artifacts, manifest, &candidates, control);
+            try std.testing.expectEqual(@as(usize, 1), candidates.len);
+            try std.testing.expect(candidates.contains(@splat(2)));
+            try std.testing.expect(rejected.contains(@splat(1)));
+            // The repair retries the walk and reveals the preexisting invalid
+            // offset. A warm miss revisits only the unavailable tensor file.
+            try std.testing.expectEqual(attempt != 1, Probe.graph_stats > 0);
+        }
         publication.borrow.invalidate();
         try dir.deleteFile(io, "model.onnx");
         node.selector_cache.?.invalidate(io);
@@ -51491,6 +51537,15 @@ test "scoped model discovery isolates a damaged Jina adapter from CPU GGUF" {
     try std.testing.expect(rejected.contains(@splat(1)));
 }
 
+fn writeScopedGemmaSidecars(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, root: []const u8, config: []const u8) !void {
+    for (@import("../models/embedding_gemma2_identity.zig").sidecars) |sidecar| {
+        const path = try std.fs.path.join(a, &.{ root, sidecar });
+        defer a.free(path);
+        try dir.createDirPath(io, std.fs.path.dirname(path).?);
+        try dir.writeFile(io, .{ .sub_path = path, .data = if (std.mem.eql(u8, sidecar, "config.json")) config else "{}" });
+    }
+}
+
 test "scoped model discovery resolves dense geometry without loading weights" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -51515,17 +51570,25 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     std.crypto.hash.sha2.Sha256.hash(weights, &weights_digest, .{});
     const config_hex = std.fmt.bytesToHex(config_digest, .lower);
     const weights_hex = std.fmt.bytesToHex(weights_digest, .lower);
+    const recipe = @import("../models/embedding_gemma2_identity.zig");
+    var sidecar_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &sidecar_digest, .{});
+    const sidecar_hex = std.fmt.bytesToHex(sidecar_digest, .lower);
+    var members: [recipe.sidecars.len + 1]managed.ArtifactReceipt = undefined;
+    members[0] = .{ .path = "model.safetensors", .size = weights.len, .sha256 = &weights_hex };
+    for (recipe.sidecars, 1..) |path, i|
+        members[i] = if (std.mem.eql(u8, path, "config.json"))
+            .{ .path = path, .size = config.len, .sha256 = &config_hex }
+        else
+            .{ .path = path, .size = 2, .sha256 = &sidecar_hex };
+    const source: managed.DownloadSource = .{ .owner = "acme", .name = "other", .variant = "safetensors", .selected_format = "safetensors" };
     const receipt = try std.json.Stringify.valueAlloc(a, managed.DownloadReceipt{
         .version = 2,
-        .source = .{ .owner = "acme", .name = "other", .variant = "safetensors", .selected_format = "safetensors" },
-        .artifacts = &.{
-            .{ .path = "config.json", .size = config.len, .sha256 = &config_hex },
-            .{ .path = "model.safetensors", .size = weights.len, .sha256 = &weights_hex },
-        },
+        .source = source,
+        .artifacts = &members,
     }, .{});
     defer a.free(receipt);
-    try tmp.dir.createDirPath(io, "embedders/acme/other");
-    try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/config.json", .data = config });
+    try writeScopedGemmaSidecars(a, io, tmp.dir, "embedders/acme/other", config);
     try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/model.safetensors", .data = weights });
     try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/" ++ managed.complete_filename, .data = receipt });
     const models_path = try tmp.dir.realPathFileAlloc(io, ".", a);
@@ -51716,17 +51779,14 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     const replacement_weights = "replacement managed weights";
     std.crypto.hash.sha2.Sha256.hash(replacement_weights, &weights_digest, .{});
     const replacement_hex = std.fmt.bytesToHex(weights_digest, .lower);
+    members[0] = .{ .path = "model.safetensors", .size = replacement_weights.len, .sha256 = &replacement_hex };
     const replacement_receipt = try std.json.Stringify.valueAlloc(a, managed.DownloadReceipt{
         .version = 2,
-        .source = .{ .owner = "acme", .name = "other", .variant = "safetensors", .selected_format = "safetensors" },
-        .artifacts = &.{
-            .{ .path = "model.safetensors", .size = replacement_weights.len, .sha256 = &replacement_hex },
-            .{ .path = "config.json", .size = config.len, .sha256 = &config_hex },
-        },
+        .source = source,
+        .artifacts = &members,
     }, .{});
     defer a.free(replacement_receipt);
-    try tmp.dir.createDirPath(io, "replacement");
-    try tmp.dir.writeFile(io, .{ .sub_path = "replacement/config.json", .data = config });
+    try writeScopedGemmaSidecars(a, io, tmp.dir, "replacement", config);
     try tmp.dir.writeFile(io, .{ .sub_path = "replacement/model.safetensors", .data = replacement_weights });
     try tmp.dir.writeFile(io, .{ .sub_path = "replacement/" ++ managed.complete_filename, .data = replacement_receipt });
     try tmp.dir.rename("embedders/acme/other", tmp.dir, ".retired", io);

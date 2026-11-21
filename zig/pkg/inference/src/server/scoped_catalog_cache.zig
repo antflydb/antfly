@@ -27,6 +27,7 @@ const ExecutionControl = @import("../execution_control.zig").InferenceExecutionC
 const max_cached_bytes_per_slot = 4 * 1024 * 1024;
 const max_cached_primary_bytes: usize = 1024 * 1024;
 const max_cached_adapter_bytes: usize = 64 * 1024;
+const gemma_identity = @import("../models/embedding_gemma2_identity.zig");
 const safetensors = @import("../models/safetensors.zig");
 const revalidate_after_ns = 60 * std.time.ns_per_s;
 const dependency_retry_ns = std.time.ns_per_s;
@@ -84,7 +85,37 @@ pub const Cache = struct {
 
     const Inspection = struct {
         const Member = struct { path: []const u8, stamp: managed.ArtifactStamp };
-        const Members = std.StringHashMapUnmanaged(managed.ArtifactStamp);
+        const MemberCollector = struct {
+            allocator: std.mem.Allocator,
+            artifacts: *const PublishedArtifacts,
+            members: std.StringHashMapUnmanaged(managed.ArtifactStamp) = .empty,
+            failed_member: ?[]const u8 = null,
+
+            fn stamp(self: *MemberCollector, path: []const u8) !managed.ArtifactStamp {
+                return self.artifacts.requireCatalogMember(path) catch |err| {
+                    if (err == error.CatalogArtifactUnavailable or err == error.ChecksumMismatch)
+                        self.failed_member = try self.allocator.dupe(u8, path);
+                    return err;
+                };
+            }
+
+            fn add(self: *MemberCollector, path: []const u8) !u64 {
+                if (self.members.get(path)) |record| return record.size;
+                const record = try self.stamp(path);
+                try self.members.put(self.allocator, try self.allocator.dupe(u8, path), record);
+                return record.size;
+            }
+
+            fn freeze(self: *const MemberCollector) ![]const Member {
+                const checks = try self.allocator.alloc(Member, self.members.count());
+                var it = self.members.iterator();
+                for (checks) |*member| {
+                    const entry = it.next().?;
+                    member.* = .{ .path = entry.key_ptr.*, .stamp = entry.value_ptr.* };
+                }
+                return checks;
+            }
+        };
         const Dependency = enum { native, onnx, jina_adapter };
         const DependencyCache = struct {
             const Stamps = struct {
@@ -98,6 +129,9 @@ pub const Cache = struct {
             };
             build: std.Io.Mutex = .init,
             available: std.atomic.Value(?*Stamps) = .init(null),
+            // Protected by build. Recheck only this member until it recovers;
+            // an ONNX graph may be large and have many healthy dependencies.
+            failed_member: ?[]const u8 = null,
             retry_at: ?std.Io.Timestamp = null,
 
             fn check(self: *DependencyCache, owner: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, dependency: Dependency, control: ExecutionControl) !bool {
@@ -111,6 +145,14 @@ pub const Cache = struct {
                     try validate(cached.members, artifacts, control);
                     return true;
                 }
+                if (self.failed_member) |path| {
+                    _ = artifacts.requireCatalogMember(path) catch |err| switch (err) {
+                        error.ChecksumMismatch, error.CatalogArtifactUnavailable => return false,
+                        else => return err,
+                    };
+                    owner.free(path);
+                    self.failed_member = null;
+                }
                 if (self.retry_at) |retry| {
                     if (std.Io.Timestamp.now(artifacts.io, .awake).nanoseconds < retry.nanoseconds) return false;
                 }
@@ -119,11 +161,14 @@ pub const Cache = struct {
                 current.arena = .init(owner);
                 var retained = false;
                 defer if (!retained) current.destroy(owner);
-                const a = current.arena.allocator();
-                var members: Members = .empty;
-                collectDependencyMembers(&members, a, artifacts, manifest, dependency, control) catch |err| return self.reject(artifacts.io, err);
-                current.members = try freeze(a, &members);
-                validate(current.members, artifacts, control) catch |err| return self.reject(artifacts.io, err);
+                var collector = MemberCollector{ .allocator = current.arena.allocator(), .artifacts = artifacts };
+                collectDependencyMembers(&collector, manifest, dependency, control) catch |err| return self.reject(owner, collector, err);
+                current.members = try collector.freeze();
+                for (current.members) |member| {
+                    try control.check();
+                    const stamp = collector.stamp(member.path) catch |err| return self.reject(owner, collector, err);
+                    if (!std.meta.eql(member.stamp, stamp)) return error.ModelArtifactsChanging;
+                }
                 if (current.arena.queryCapacity() <= if (dependency == .jina_adapter) max_cached_adapter_bytes else max_cached_primary_bytes) {
                     retained = true;
                     self.available.store(current, .release);
@@ -131,13 +176,19 @@ pub const Cache = struct {
                 return true;
             }
 
-            fn reject(self: *DependencyCache, io: std.Io, err: anyerror) !bool {
+            fn reject(self: *DependencyCache, owner: std.mem.Allocator, collector: MemberCollector, err: anyerror) !bool {
                 switch (err) {
                     error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled, error.ModelArtifactsChanging => return err,
-                    error.ChecksumMismatch, error.CatalogArtifactUnavailable => return false,
                     else => {},
                 }
-                self.retry_at = .{ .nanoseconds = std.Io.Timestamp.now(io, .awake).nanoseconds + dependency_retry_ns };
+                if (collector.failed_member) |path| {
+                    if (path.len <= 4096) {
+                        self.failed_member = try owner.dupe(u8, path);
+                        self.retry_at = null;
+                        return false;
+                    }
+                }
+                self.retry_at = .{ .nanoseconds = std.Io.Timestamp.now(collector.artifacts.io, .awake).nanoseconds + dependency_retry_ns };
                 return false;
             }
         };
@@ -147,12 +198,6 @@ pub const Cache = struct {
         backend_order: []const backends.BackendType,
         execution_manifest: manifest_mod.ModelManifest,
         summary: model_manager.CompatibilitySummary,
-
-        fn add(members: *std.StringHashMapUnmanaged(managed.ArtifactStamp), a: std.mem.Allocator, artifacts: *const PublishedArtifacts, path: []const u8) !void {
-            if (members.contains(path)) return;
-            const stamp = try artifacts.requireCatalogMember(path);
-            try members.put(a, try a.dupe(u8, path), stamp);
-        }
 
         fn create(owner: std.mem.Allocator, artifacts: *const PublishedArtifacts, path: []const u8, manifest: *const manifest_mod.ModelManifest, backend_order: []const backends.BackendType, control: ExecutionControl) !*Inspection {
             const result = try owner.create(Inspection);
@@ -176,18 +221,8 @@ pub const Cache = struct {
             return result;
         }
 
-        fn freeze(a: std.mem.Allocator, members: *const Members) ![]const Member {
-            const checks = try a.alloc(Member, members.count());
-            var it = members.iterator();
-            for (checks) |*member| {
-                const entry = it.next().?;
-                member.* = .{ .path = entry.key_ptr.*, .stamp = entry.value_ptr.* };
-            }
-            return checks;
-        }
-
         fn collectCommon(a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, control: ExecutionControl) ![]const Member {
-            var members: Members = .empty;
+            var collector = MemberCollector{ .allocator = a, .artifacts = artifacts };
             inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
                 if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest.*, field)) == ?[]const u8 and
                     !std.mem.eql(u8, field, "onnx_path") and !std.mem.eql(u8, field, "onnx_logical_path") and
@@ -201,7 +236,7 @@ pub const Cache = struct {
                 {
                     if (@field(manifest.*, field)) |member| {
                         try control.check();
-                        try add(&members, a, artifacts, member);
+                        _ = try collector.add(member);
                     }
                 }
             }
@@ -212,36 +247,50 @@ pub const Cache = struct {
             for (components) |component| {
                 const graph = component orelse continue;
                 if (std.mem.endsWith(u8, graph, ".onnx"))
-                    try collectOnnx(&members, a, artifacts, graph, graph, control);
+                    try collectOnnx(&collector, graph, graph, control);
             }
-            return freeze(a, &members);
+            return collector.freeze();
         }
 
-        fn collectDependencyMembers(members: *Members, a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, dependency: Dependency, control: ExecutionControl) !void {
+        fn collectDependencyMembers(collector: *MemberCollector, manifest: *const manifest_mod.ModelManifest, dependency: Dependency, control: ExecutionControl) !void {
+            const artifacts = collector.artifacts;
             try control.check();
             switch (dependency) {
                 .onnx => if (manifest.onnx_path) |graph| {
-                    try collectOnnx(members, a, artifacts, graph, manifest.onnx_logical_path orelse graph, control);
+                    try collectOnnx(collector, graph, manifest.onnx_logical_path orelse graph, control);
                 },
                 .jina_adapter => if (try manifest.jinaRetrievalAdapter()) |adapter| {
-                    try add(members, a, artifacts, adapter.config);
-                    try add(members, a, artifacts, adapter.weights);
+                    _ = try collector.add(adapter.config);
+                    _ = try collector.add(adapter.weights);
                 },
                 .native => {
-                    if (manifest.nativeCompanionPath()) |companion| try add(members, a, artifacts, companion);
+                    if (manifest.embedding_style == .embedding_gemma2) {
+                        const weights = manifest.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights;
+                        const weight_member = try std.fs.path.join(artifacts.allocator, &.{ artifacts.root, std.fs.path.basename(weights) });
+                        defer artifacts.allocator.free(weight_member);
+                        _ = try collector.add(weight_member);
+                        try gemma_identity.requireWeightBinding(artifacts.allocator, artifacts.io, artifacts.root, weights);
+                        for (gemma_identity.sidecars) |sidecar| {
+                            try control.check();
+                            const member = try std.fs.path.join(artifacts.allocator, &.{ artifacts.root, sidecar });
+                            defer artifacts.allocator.free(member);
+                            _ = try collector.add(member);
+                        }
+                    }
+                    if (manifest.nativeCompanionPath()) |companion| _ = try collector.add(companion);
                     switch (manifest.nativeWeightArtifactKind() orelse return) {
-                        .gguf => try add(members, a, artifacts, manifest.gguf_path.?),
-                        .safetensors => try add(members, a, artifacts, manifest.safetensors_path.?),
+                        .gguf => _ = try collector.add(manifest.gguf_path.?),
+                        .safetensors => _ = try collector.add(manifest.safetensors_path.?),
                         .sharded_safetensors => {
                             const index = manifest.safetensors_index_path.?;
-                            try add(members, a, artifacts, index);
+                            _ = try collector.add(index);
                             const bytes = try artifacts.readPath(index, safetensors.max_header_size);
                             defer artifacts.allocator.free(bytes);
                             var shards = try safetensors.inspectIndexDependencies(artifacts.allocator, index, bytes, control);
                             defer shards.deinit();
                             for (shards.paths[1..]) |shard| {
                                 try control.check();
-                                try add(members, a, artifacts, shard);
+                                _ = try collector.add(shard);
                             }
                         },
                     }
@@ -249,25 +298,20 @@ pub const Cache = struct {
             }
         }
 
-        fn collectOnnx(members: *Members, a: std.mem.Allocator, artifacts: *const PublishedArtifacts, graph: []const u8, logical: []const u8, control: ExecutionControl) !void {
+        fn collectOnnx(collector: *MemberCollector, graph: []const u8, logical: []const u8, control: ExecutionControl) !void {
+            const artifacts = collector.artifacts;
             try control.check();
-            try add(members, a, artifacts, logical);
+            _ = try collector.add(logical);
             var mapped = try c_file.MmapRegion.init(artifacts.allocator, graph);
             defer mapped.deinit();
             const MemberReader = struct {
-                members: *Members,
-                allocator: std.mem.Allocator,
-                artifacts: *const PublishedArtifacts,
-
                 fn size(raw: *anyopaque, path: []const u8) !u64 {
-                    const self: *@This() = @ptrCast(@alignCast(raw));
-                    try add(self.members, self.allocator, self.artifacts, path);
-                    return self.members.get(path).?.size;
+                    const self: *MemberCollector = @ptrCast(@alignCast(raw));
+                    return self.add(path);
                 }
             };
-            var reader: MemberReader = .{ .members = members, .allocator = a, .artifacts = artifacts };
             var tensors = dependencies.onnxWithMemberSizes(artifacts.allocator, logical, mapped.data, control, .{
-                .context = &reader,
+                .context = collector,
                 .size = MemberReader.size,
             }) catch |err| switch (err) {
                 error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled, error.ChecksumMismatch, error.ModelArtifactsChanging, error.CatalogArtifactUnavailable => return err,
@@ -287,6 +331,7 @@ pub const Cache = struct {
         fn destroy(self: *Inspection, owner: std.mem.Allocator) void {
             for (&self.dependencies_by_role) |*cache| {
                 if (cache.available.load(.monotonic)) |cached| cached.destroy(owner);
+                if (cache.failed_member) |path| owner.free(path);
             }
             self.arena.deinit();
             owner.destroy(self);
