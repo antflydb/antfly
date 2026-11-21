@@ -186,7 +186,10 @@ pub const Page = struct {
         var manager = try core.initTxnManager();
         defer manager.deinit();
         try manager.checkOrdinaryWriteConflict(&maintenance.controlKey(self.id));
-        var txn = try core.store.beginWriteTxn();
+        // §3.2a ride-along: a lost GC page just rediscovers the same
+        // already-retired entries from the durable retirement record on the
+        // next pass; never force its own fsync for an owner-only sweep.
+        var txn = try core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer txn.abort();
         if (!std.mem.eql(u8, &self.owner, &(try jobs.ownership(&txn)))) return error.PreparedGenerationChanged;
         const record_key = key(self.id);

@@ -1,0 +1,1350 @@
+{
+  "native_source_commit": "7ee2011df3",
+  "sqlite_source_id": "2025-07-30 19:33:53 4d8adfb30e03f9cf27f800a2c1ba3c48fb4ca1b08b0f5ed59a4d5ecbf45e20a3",
+  "sqlite_compile_options": [
+    "ATOMIC_INTRINSICS=1",
+    "COMPILER=clang-20.1.4",
+    "DEFAULT_AUTOVACUUM",
+    "DEFAULT_CACHE_SIZE=-2000",
+    "DEFAULT_FILE_FORMAT=4",
+    "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+    "DEFAULT_MMAP_SIZE=0",
+    "DEFAULT_PAGE_SIZE=4096",
+    "DEFAULT_PCACHE_INITSZ=20",
+    "DEFAULT_RECURSIVE_TRIGGERS",
+    "DEFAULT_SECTOR_SIZE=4096",
+    "DEFAULT_SYNCHRONOUS=2",
+    "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+    "DEFAULT_WAL_SYNCHRONOUS=2",
+    "DEFAULT_WORKER_THREADS=0",
+    "DIRECT_OVERFLOW_READ",
+    "ENABLE_DBSTAT_VTAB",
+    "ENABLE_FTS3",
+    "ENABLE_FTS3_PARENTHESIS",
+    "ENABLE_FTS3_TOKENIZER",
+    "ENABLE_FTS4",
+    "ENABLE_FTS5",
+    "ENABLE_GEOPOLY",
+    "ENABLE_MATH_FUNCTIONS",
+    "ENABLE_RTREE",
+    "MALLOC_SOFT_LIMIT=1024",
+    "MAX_ATTACHED=10",
+    "MAX_COLUMN=2000",
+    "MAX_COMPOUND_SELECT=500",
+    "MAX_DEFAULT_PAGE_SIZE=8192",
+    "MAX_EXPR_DEPTH=1000",
+    "MAX_FUNCTION_ARG=1000",
+    "MAX_LENGTH=1000000000",
+    "MAX_LIKE_PATTERN_LENGTH=50000",
+    "MAX_MMAP_SIZE=0x7fff0000",
+    "MAX_PAGE_COUNT=0xfffffffe",
+    "MAX_PAGE_SIZE=65536",
+    "MAX_SQL_LENGTH=1000000000",
+    "MAX_TRIGGER_DEPTH=1000",
+    "MAX_VARIABLE_NUMBER=32766",
+    "MAX_VDBE_OP=250000000",
+    "MAX_WORKER_THREADS=8",
+    "MUTEX_PTHREADS",
+    "SYSTEM_MALLOC",
+    "TEMP_STORE=1",
+    "THREADSAFE=1"
+  ],
+  "cpu_count": 14,
+  "status": "passed",
+  "qualified": false,
+  "purpose": "Matched primary-only and synchronous full-text-visible durable churn; not comparable to primary-acknowledged asynchronous indexing rates.",
+  "library_sha256": "3c7804ca11744b72dc60e853ca56c31b7b553491f3c6414f9730c3abc686383e",
+  "script_sha256": "a8071622f7190443e560c0ba3165bbcdc028ded78e93c3a65485333e450436fa",
+  "sqlite_version": "3.50.4",
+  "python": "3.12.11 (main, Sep  2 2025, 14:12:30) [Clang 20.1.4 ]",
+  "host": "macOS-27.0.1-arm64-arm-64bit",
+  "sqlite_settings": {
+    "journal_mode": "wal",
+    "synchronous": "FULL",
+    "fullfsync": false,
+    "checkpoint_fullfsync": false,
+    "busy_timeout_ms": 5000,
+    "wal_autocheckpoint_pages": 1000
+  },
+  "antfly_settings": {
+    "no_sync": false,
+    "busy_timeout_seconds": 5.0,
+    "primary_only_sync_level": "write",
+    "indexed_sync_level": "full_index"
+  },
+  "indexed_field": "text",
+  "tokenizer_scope": "Controlled ASCII alphanumeric corpus; no general language/tokenizer equivalence claimed",
+  "payload_bytes_text": 1024,
+  "documents_per_transaction": 1,
+  "keys_per_worker": 128,
+  "retention": "One fixed path per engine, removed after closed successful verification; receipts only.",
+  "cases": [
+    {
+      "engine": "antfly",
+      "indexed": false,
+      "workers": 1,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 19.999933999999485,
+      "successful_calls": 13562,
+      "successful_calls_per_second": 678.102237737402,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 13562,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61890.224394208,
+          "ended": 61910.224328208,
+          "close_seconds": 0.0028064590005669743
+        }
+      ],
+      "latency_p50_ns": 1187167,
+      "latency_p95_ns": 2863542,
+      "peak_file_bytes": 59232256,
+      "final_file_bytes": 59232256,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.4862529589954647
+      },
+      "load_average": [
+        14.98486328125,
+        11.681640625,
+        10.54345703125
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 140,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 59232256
+      },
+      "round": 0
+    },
+    {
+      "engine": "sqlite",
+      "indexed": false,
+      "workers": 1,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 19.999285332996806,
+      "successful_calls": 235112,
+      "successful_calls_per_second": 11756.020081982075,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 235112,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61911.286888,
+          "ended": 61931.286173333,
+          "close_seconds": 0.002772166997601744
+        }
+      ],
+      "latency_p50_ns": 38958,
+      "latency_p95_ns": 69541,
+      "peak_file_bytes": 4341216,
+      "final_file_bytes": 188416,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.0028845000051660463
+      },
+      "load_average": [
+        15.083984375,
+        11.92578125,
+        10.6572265625
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 126,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 188416
+      },
+      "round": 0
+    },
+    {
+      "engine": "sqlite",
+      "indexed": false,
+      "workers": 1,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.34173166599794,
+      "successful_calls": 201045,
+      "successful_calls_per_second": 9883.376858030979,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 201045,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61931.878638875,
+          "ended": 61952.220370541,
+          "close_seconds": 0.002464416997099761
+        }
+      ],
+      "latency_p50_ns": 35917,
+      "latency_p95_ns": 58375,
+      "peak_file_bytes": 4341216,
+      "final_file_bytes": 188416,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.0016807499996502884
+      },
+      "load_average": [
+        16.91357421875,
+        12.55810546875,
+        10.9140625
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 140,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 188416
+      },
+      "round": 1
+    },
+    {
+      "engine": "antfly",
+      "indexed": false,
+      "workers": 1,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.001098374996218,
+      "successful_calls": 14919,
+      "successful_calls_per_second": 745.9090356082918,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 14919,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61952.735758125,
+          "ended": 61972.7368565,
+          "close_seconds": 0.00294045900227502
+        }
+      ],
+      "latency_p50_ns": 1109542,
+      "latency_p95_ns": 2320125,
+      "peak_file_bytes": 65048576,
+      "final_file_bytes": 65048576,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.428642958002456
+      },
+      "load_average": [
+        16.44921875,
+        12.73193359375,
+        11.01416015625
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 155,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 65048576
+      },
+      "round": 1
+    },
+    {
+      "engine": "antfly",
+      "indexed": false,
+      "workers": 8,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.02108470800158,
+      "successful_calls": 9803,
+      "successful_calls_per_second": 489.6338107036806,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 1229,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61973.92528375,
+          "ended": 61993.936528416,
+          "close_seconds": 0.029191541994805448
+        },
+        {
+          "worker": 1,
+          "successful_calls": 1225,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61973.924147916,
+          "ended": 61993.931681,
+          "close_seconds": 0.01985037500708131
+        },
+        {
+          "worker": 2,
+          "successful_calls": 1213,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61973.92377725,
+          "ended": 61993.933761875,
+          "close_seconds": 0.023180458003480453
+        },
+        {
+          "worker": 3,
+          "successful_calls": 1229,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61973.923785583,
+          "ended": 61993.928992291,
+          "close_seconds": 0.0202572499983944
+        },
+        {
+          "worker": 4,
+          "successful_calls": 1212,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61973.92511075,
+          "ended": 61993.926830041,
+          "close_seconds": 0.020309084000473376
+        },
+        {
+          "worker": 5,
+          "successful_calls": 1233,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61973.925412625,
+          "ended": 61993.939479791,
+          "close_seconds": 0.028674625005805865
+        },
+        {
+          "worker": 6,
+          "successful_calls": 1233,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61973.925701333,
+          "ended": 61993.941924083,
+          "close_seconds": 0.028771375000360422
+        },
+        {
+          "worker": 7,
+          "successful_calls": 1229,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61973.925594708,
+          "ended": 61993.944861958,
+          "close_seconds": 0.030749124998692423
+        }
+      ],
+      "latency_p50_ns": 14103625,
+      "latency_p95_ns": 26702333,
+      "peak_file_bytes": 43851776,
+      "final_file_bytes": 43851776,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 1024,
+        "expected_rows": 1024,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 1.4318605000007665
+      },
+      "load_average": [
+        14.89599609375,
+        12.65771484375,
+        11.03515625
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 124,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 43851776
+      },
+      "round": 0
+    },
+    {
+      "engine": "sqlite",
+      "indexed": false,
+      "workers": 8,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.07370762500068,
+      "successful_calls": 197900,
+      "successful_calls_per_second": 9858.667053291472,
+      "busy_calls": 1,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 25881,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61996.39308425,
+          "ended": 62016.396319416,
+          "close_seconds": 5.295900336932391e-05
+        },
+        {
+          "worker": 1,
+          "successful_calls": 26484,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61996.390706375,
+          "ended": 62016.446903958,
+          "close_seconds": 4.754200199386105e-05
+        },
+        {
+          "worker": 2,
+          "successful_calls": 38768,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61996.403144125,
+          "ended": 62016.464414,
+          "close_seconds": 0.003610042003856506
+        },
+        {
+          "worker": 3,
+          "successful_calls": 18278,
+          "busy_calls": 1,
+          "error": null,
+          "started": 61996.399492041,
+          "ended": 62016.4175365,
+          "close_seconds": 5.524999869521707e-05
+        },
+        {
+          "worker": 4,
+          "successful_calls": 29946,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61996.39497625,
+          "ended": 62016.460900833,
+          "close_seconds": 6.245899567147717e-05
+        },
+        {
+          "worker": 5,
+          "successful_calls": 18795,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61996.403131958,
+          "ended": 62016.394189375,
+          "close_seconds": 5.229199450695887e-05
+        },
+        {
+          "worker": 6,
+          "successful_calls": 28251,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61996.399121875,
+          "ended": 62016.380241458,
+          "close_seconds": 4.641600389732048e-05
+        },
+        {
+          "worker": 7,
+          "successful_calls": 11497,
+          "busy_calls": 0,
+          "error": null,
+          "started": 61996.3914865,
+          "ended": 62016.3784395,
+          "close_seconds": 5.6750002840999514e-05
+        }
+      ],
+      "latency_p50_ns": 36583,
+      "latency_p95_ns": 66834,
+      "peak_file_bytes": 5615240,
+      "final_file_bytes": 1433600,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 1024,
+        "expected_rows": 1024,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.008847999997669831
+      },
+      "load_average": [
+        15.197265625,
+        12.92431640625,
+        11.1708984375
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 122,
+      "all_workers_progressed": true,
+      "zero_busy": false,
+      "qualification_passed": false,
+      "cleanup": {
+        "removed_bytes": 1433600
+      },
+      "round": 0
+    },
+    {
+      "engine": "sqlite",
+      "indexed": false,
+      "workers": 8,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.09840237499884,
+      "successful_calls": 196890,
+      "successful_calls_per_second": 9796.301035594694,
+      "busy_calls": 5,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 13072,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62017.131077375,
+          "ended": 62037.198409041,
+          "close_seconds": 0.00016799999866634607
+        },
+        {
+          "worker": 1,
+          "successful_calls": 17468,
+          "busy_calls": 2,
+          "error": null,
+          "started": 62017.130403541,
+          "ended": 62037.184494583,
+          "close_seconds": 0.00010395899880677462
+        },
+        {
+          "worker": 2,
+          "successful_calls": 25230,
+          "busy_calls": 1,
+          "error": null,
+          "started": 62017.130985916,
+          "ended": 62037.221664958,
+          "close_seconds": 0.00012008300109300762
+        },
+        {
+          "worker": 3,
+          "successful_calls": 52086,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62017.130291833,
+          "ended": 62037.228544083,
+          "close_seconds": 0.003836666001006961
+        },
+        {
+          "worker": 4,
+          "successful_calls": 33699,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62017.130395541,
+          "ended": 62037.219797875,
+          "close_seconds": 0.00013466700329445302
+        },
+        {
+          "worker": 5,
+          "successful_calls": 32989,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62017.130964875,
+          "ended": 62037.199071166,
+          "close_seconds": 0.0002070419941446744
+        },
+        {
+          "worker": 6,
+          "successful_calls": 10437,
+          "busy_calls": 1,
+          "error": null,
+          "started": 62017.131991666,
+          "ended": 62037.19426125,
+          "close_seconds": 0.00011624999751802534
+        },
+        {
+          "worker": 7,
+          "successful_calls": 11909,
+          "busy_calls": 1,
+          "error": null,
+          "started": 62017.130141708,
+          "ended": 62037.129998291,
+          "close_seconds": 0.0001417500025127083
+        }
+      ],
+      "latency_p50_ns": 35959,
+      "latency_p95_ns": 53708,
+      "peak_file_bytes": 5611120,
+      "final_file_bytes": 1433600,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 1024,
+        "expected_rows": 1024,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.007817083998816088
+      },
+      "load_average": [
+        12.4482421875,
+        12.44287109375,
+        11.0380859375
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 136,
+      "all_workers_progressed": true,
+      "zero_busy": false,
+      "qualification_passed": false,
+      "cleanup": {
+        "removed_bytes": 1433600
+      },
+      "round": 1
+    },
+    {
+      "engine": "antfly",
+      "indexed": false,
+      "workers": 8,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.01973616699979,
+      "successful_calls": 4716,
+      "successful_calls_per_second": 235.56753998455673,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 593,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62037.844896166,
+          "ended": 62057.852421333,
+          "close_seconds": 0.02208045800216496
+        },
+        {
+          "worker": 1,
+          "successful_calls": 589,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62037.844503416,
+          "ended": 62057.847136583,
+          "close_seconds": 0.021822374998009764
+        },
+        {
+          "worker": 2,
+          "successful_calls": 590,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62037.844672583,
+          "ended": 62057.856229666,
+          "close_seconds": 0.02476320899586426
+        },
+        {
+          "worker": 3,
+          "successful_calls": 582,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62037.844388041,
+          "ended": 62057.854407708,
+          "close_seconds": 0.023259166999196168
+        },
+        {
+          "worker": 4,
+          "successful_calls": 590,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62037.845179458,
+          "ended": 62057.864124208,
+          "close_seconds": 0.020655957996496
+        },
+        {
+          "worker": 5,
+          "successful_calls": 581,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62037.844836875,
+          "ended": 62057.850144375,
+          "close_seconds": 0.022636000001512002
+        },
+        {
+          "worker": 6,
+          "successful_calls": 590,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62037.845110666,
+          "ended": 62057.858413041,
+          "close_seconds": 0.023738042000331916
+        },
+        {
+          "worker": 7,
+          "successful_calls": 601,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62037.84537225,
+          "ended": 62057.845052875,
+          "close_seconds": 0.022322999997413717
+        }
+      ],
+      "latency_p50_ns": 15585209,
+      "latency_p95_ns": 87976542,
+      "peak_file_bytes": 21848064,
+      "final_file_bytes": 21848064,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 1024,
+        "expected_rows": 1024,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.6771805000025779
+      },
+      "load_average": [
+        14.0927734375,
+        12.85009765625,
+        11.22607421875
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 161,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 21848064
+      },
+      "round": 1
+    },
+    {
+      "engine": "antfly",
+      "indexed": true,
+      "workers": 1,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.000470457998745,
+      "successful_calls": 3019,
+      "successful_calls_per_second": 150.9464493017772,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 3019,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62059.297614625,
+          "ended": 62079.298085083,
+          "close_seconds": 0.002590999996755272
+        }
+      ],
+      "latency_p50_ns": 3135333,
+      "latency_p95_ns": 9453292,
+      "peak_file_bytes": 15519744,
+      "final_file_bytes": 15519744,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.5905178339962731
+      },
+      "load_average": [
+        14.71142578125,
+        13.03076171875,
+        11.32568359375
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 149,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 15519744
+      },
+      "round": 0
+    },
+    {
+      "engine": "sqlite",
+      "indexed": true,
+      "workers": 1,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 19.999952749996737,
+      "successful_calls": 67031,
+      "successful_calls_per_second": 3351.557918056128,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 67031,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62080.585845583,
+          "ended": 62100.585798333,
+          "close_seconds": 0.0009062919998541474
+        }
+      ],
+      "latency_p50_ns": 107375,
+      "latency_p95_ns": 285917,
+      "peak_file_bytes": 4550448,
+      "final_file_bytes": 339968,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.005113916995469481
+      },
+      "load_average": [
+        13.7548828125,
+        12.91552734375,
+        11.32373046875
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 168,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 339968
+      },
+      "round": 0
+    },
+    {
+      "engine": "sqlite",
+      "indexed": true,
+      "workers": 1,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.00580662500579,
+      "successful_calls": 47468,
+      "successful_calls_per_second": 2372.7111278116868,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 47468,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62101.209355666,
+          "ended": 62121.215162291,
+          "close_seconds": 0.03250016700621927
+        }
+      ],
+      "latency_p50_ns": 110500,
+      "latency_p95_ns": 432542,
+      "peak_file_bytes": 4550448,
+      "final_file_bytes": 339968,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.005318916999385692
+      },
+      "load_average": [
+        15.935546875,
+        13.49609375,
+        11.5703125
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 161,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 339968
+      },
+      "round": 1
+    },
+    {
+      "engine": "antfly",
+      "indexed": true,
+      "workers": 1,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 21.393637500004843,
+      "successful_calls": 3370,
+      "successful_calls_per_second": 157.5234693024614,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 3370,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62122.925459916,
+          "ended": 62144.319097416,
+          "close_seconds": 0.00900283400551416
+        }
+      ],
+      "latency_p50_ns": 3254083,
+      "latency_p95_ns": 9310666,
+      "peak_file_bytes": 16809984,
+      "final_file_bytes": 16809984,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.6877829170043697
+      },
+      "load_average": [
+        16.01904296875,
+        13.7119140625,
+        11.70361328125
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 194,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 16809984
+      },
+      "round": 1
+    },
+    {
+      "engine": "antfly",
+      "indexed": true,
+      "workers": 8,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.041804042004514,
+      "successful_calls": 1947,
+      "successful_calls_per_second": 97.14694325517752,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 257,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62145.912249875,
+          "ended": 62165.937060041,
+          "close_seconds": 0.03412287500395905
+        },
+        {
+          "worker": 1,
+          "successful_calls": 257,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62145.912916416,
+          "ended": 62165.953124958,
+          "close_seconds": 0.030697165995661635
+        },
+        {
+          "worker": 2,
+          "successful_calls": 257,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62145.91291025,
+          "ended": 62165.947310333,
+          "close_seconds": 0.0326598340034252
+        },
+        {
+          "worker": 3,
+          "successful_calls": 235,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62145.911478208,
+          "ended": 62165.926055333,
+          "close_seconds": 0.03819620799913537
+        },
+        {
+          "worker": 4,
+          "successful_calls": 224,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62145.912754458,
+          "ended": 62165.9422095,
+          "close_seconds": 0.034539790998678654
+        },
+        {
+          "worker": 5,
+          "successful_calls": 214,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62145.911641083,
+          "ended": 62165.919655375,
+          "close_seconds": 0.04157087500061607
+        },
+        {
+          "worker": 6,
+          "successful_calls": 251,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62145.912258583,
+          "ended": 62165.931696458,
+          "close_seconds": 0.0573764580040006
+        },
+        {
+          "worker": 7,
+          "successful_calls": 252,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62145.911320916,
+          "ended": 62165.912921458,
+          "close_seconds": 0.04534050000074785
+        }
+      ],
+      "latency_p50_ns": 52841084,
+      "latency_p95_ns": 262941959,
+      "peak_file_bytes": 28368896,
+      "final_file_bytes": 28368896,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 1024,
+        "expected_rows": 1024,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 1.0128635830042185
+      },
+      "load_average": [
+        15.60595703125,
+        13.74951171875,
+        11.76220703125
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 168,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 28368896
+      },
+      "round": 0
+    },
+    {
+      "engine": "sqlite",
+      "indexed": true,
+      "workers": 8,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.06090433299687,
+      "successful_calls": 72098,
+      "successful_calls_per_second": 3593.955626487422,
+      "busy_calls": 5,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 16034,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62167.541978416,
+          "ended": 62187.540041916,
+          "close_seconds": 7.075000030454248e-05
+        },
+        {
+          "worker": 1,
+          "successful_calls": 6110,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62167.541908958,
+          "ended": 62187.56168925,
+          "close_seconds": 7.408300007227808e-05
+        },
+        {
+          "worker": 2,
+          "successful_calls": 5889,
+          "busy_calls": 1,
+          "error": null,
+          "started": 62167.541626,
+          "ended": 62187.59461775,
+          "close_seconds": 7.337500574067235e-05
+        },
+        {
+          "worker": 3,
+          "successful_calls": 11915,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62167.540537666,
+          "ended": 62187.590817458,
+          "close_seconds": 7.358400034718215e-05
+        },
+        {
+          "worker": 4,
+          "successful_calls": 5414,
+          "busy_calls": 1,
+          "error": null,
+          "started": 62167.540624708,
+          "ended": 62187.601295083,
+          "close_seconds": 0.0013904999941587448
+        },
+        {
+          "worker": 5,
+          "successful_calls": 9234,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62167.54039075,
+          "ended": 62187.5428655,
+          "close_seconds": 7.374999404419214e-05
+        },
+        {
+          "worker": 6,
+          "successful_calls": 6178,
+          "busy_calls": 2,
+          "error": null,
+          "started": 62167.541767166,
+          "ended": 62187.577808708,
+          "close_seconds": 6.941599713172764e-05
+        },
+        {
+          "worker": 7,
+          "successful_calls": 11324,
+          "busy_calls": 1,
+          "error": null,
+          "started": 62167.541990333,
+          "ended": 62187.571772208,
+          "close_seconds": 6.791600026190281e-05
+        }
+      ],
+      "latency_p50_ns": 110750,
+      "latency_p95_ns": 344583,
+      "peak_file_bytes": 9538664,
+      "final_file_bytes": 2637824,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 1024,
+        "expected_rows": 1024,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.027939209001488052
+      },
+      "load_average": [
+        14.98681640625,
+        13.744140625,
+        11.80712890625
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 173,
+      "all_workers_progressed": true,
+      "zero_busy": false,
+      "qualification_passed": false,
+      "cleanup": {
+        "removed_bytes": 2637824
+      },
+      "round": 0
+    },
+    {
+      "engine": "sqlite",
+      "indexed": true,
+      "workers": 8,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.130200125000556,
+      "successful_calls": 58908,
+      "successful_calls_per_second": 2926.349446811492,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 8282,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62188.148053958,
+          "ended": 62208.163036958,
+          "close_seconds": 7.954199827509001e-05
+        },
+        {
+          "worker": 1,
+          "successful_calls": 10209,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62188.14840125,
+          "ended": 62208.2779165,
+          "close_seconds": 0.00648058299702825
+        },
+        {
+          "worker": 2,
+          "successful_calls": 6695,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62188.148056833,
+          "ended": 62208.225195291,
+          "close_seconds": 0.000646417000098154
+        },
+        {
+          "worker": 3,
+          "successful_calls": 6597,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62188.148588416,
+          "ended": 62208.268927625,
+          "close_seconds": 0.0005723750000470318
+        },
+        {
+          "worker": 4,
+          "successful_calls": 4583,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62188.147724041,
+          "ended": 62208.153408875,
+          "close_seconds": 0.00012649999553104863
+        },
+        {
+          "worker": 5,
+          "successful_calls": 6692,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62188.147716375,
+          "ended": 62208.156155708,
+          "close_seconds": 9.133300045505166e-05
+        },
+        {
+          "worker": 6,
+          "successful_calls": 3730,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62188.148388958,
+          "ended": 62208.149820833,
+          "close_seconds": 0.0004445000013220124
+        },
+        {
+          "worker": 7,
+          "successful_calls": 12120,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62188.148440583,
+          "ended": 62208.166736791,
+          "close_seconds": 4.916699981549755e-05
+        }
+      ],
+      "latency_p50_ns": 116541,
+      "latency_p95_ns": 539042,
+      "peak_file_bytes": 9814032,
+      "final_file_bytes": 2752512,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 1024,
+        "expected_rows": 1024,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.05809866700292332
+      },
+      "load_average": [
+        14.673828125,
+        13.751953125,
+        11.86474609375
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 161,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 2752512
+      },
+      "round": 1
+    },
+    {
+      "engine": "antfly",
+      "indexed": true,
+      "workers": 8,
+      "seconds_requested": 20.0,
+      "elapsed_seconds": 20.048817334005435,
+      "successful_calls": 1556,
+      "successful_calls_per_second": 77.61056296127848,
+      "busy_calls": 0,
+      "per_worker": [
+        {
+          "worker": 0,
+          "successful_calls": 185,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62209.356469916,
+          "ended": 62229.391117375,
+          "close_seconds": 0.07568304099550005
+        },
+        {
+          "worker": 1,
+          "successful_calls": 205,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62209.357076375,
+          "ended": 62229.358892333,
+          "close_seconds": 0.0504949999958626
+        },
+        {
+          "worker": 2,
+          "successful_calls": 195,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62209.357063458,
+          "ended": 62229.40528725,
+          "close_seconds": 0.042593000005581416
+        },
+        {
+          "worker": 3,
+          "successful_calls": 183,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62209.357746791,
+          "ended": 62229.366312416,
+          "close_seconds": 0.04664537499775179
+        },
+        {
+          "worker": 4,
+          "successful_calls": 206,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62209.356926666,
+          "ended": 62229.398707375,
+          "close_seconds": 0.041874958005791996
+        },
+        {
+          "worker": 5,
+          "successful_calls": 192,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62209.356571125,
+          "ended": 62229.37200275,
+          "close_seconds": 0.04743229199812049
+        },
+        {
+          "worker": 6,
+          "successful_calls": 184,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62209.356960833,
+          "ended": 62229.38436375,
+          "close_seconds": 0.050738459001877345
+        },
+        {
+          "worker": 7,
+          "successful_calls": 206,
+          "busy_calls": 0,
+          "error": null,
+          "started": 62209.3565825,
+          "ended": 62229.378362625,
+          "close_seconds": 0.05107833299553022
+        }
+      ],
+      "latency_p50_ns": 56449000,
+      "latency_p95_ns": 295959333,
+      "peak_file_bytes": 27901952,
+      "final_file_bytes": 27901952,
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 1024,
+        "expected_rows": 1024,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.9314075840011355
+      },
+      "load_average": [
+        15.6689453125,
+        14.04150390625,
+        12.01171875
+      ],
+      "smoke_only": false,
+      "compiler_contamination_samples": 186,
+      "all_workers_progressed": true,
+      "zero_busy": true,
+      "qualification_passed": true,
+      "cleanup": {
+        "removed_bytes": 27901952
+      },
+      "round": 1
+    }
+  ],
+  "documentation": [
+    "https://sqlite.org/pragma.html#pragma_synchronous",
+    "https://sqlite.org/fts5.html#external_content_tables"
+  ],
+  "current_case": {
+    "engine": "antfly",
+    "indexed": true,
+    "workers": 8,
+    "round": 1,
+    "pre_run_compiler_processes": 25
+  }
+}

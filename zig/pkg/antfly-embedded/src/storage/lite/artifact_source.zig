@@ -22,6 +22,7 @@ const native = @import("native.zig");
 const docs = @import("docstore.zig");
 const Source = @import("../../segment_source.zig").Source;
 const limits = @import("antfly_runtime_fs").threaded_io_limits;
+const wal_trace = @import("../write_amplification_trace.zig");
 const Allocator = std.mem.Allocator;
 
 const key_prefix = native.NativeFile.artifact_lease_key_prefix;
@@ -283,6 +284,16 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(runtime);
         defer self.mutex.unlock(runtime);
         const guard = self.publication_guard orelse return error.ReadOnly;
+        // §8.7 row 4 does not reach `publication_guard` either: its
+        // exclusive hold only serializes "a new artifact-lease marker
+        // becomes visible in this directory" against `MarkerSweep.run`'s
+        // own concurrent reap of crash-leftover markers (both in this
+        // same process, via `self.mutex` above, and across processes, via
+        // this kernel lock) -- a directory-visibility race between two
+        // *artifact-lease* bookkeeping operations, unrelated to Lite
+        // reader-vs-writer page consistency (which the shared lock region
+        // answers through `NativeFile.acquireReaderFence`, not this
+        // guard). Stays a kernel lock.
         try guard.lock(runtime, .exclusive);
         defer guard.unlock(runtime);
         return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
@@ -350,7 +361,11 @@ pub const Registry = struct {
         if (reader_fenced) {
             capture.checkpoint = reader.activeCheckpoint();
             capture.value = try reader.openIndexValue(a, key, capture.checkpoint);
-        } else try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
+        } else {
+            const wal_trace_scope = wal_trace.scope(.artifact_lease);
+            defer wal_trace_scope.end();
+            try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
+        }
         const captured_inode = (try reader.file.stat(reader.runtime())).inode;
         state.* = .{
             .registry = self,
@@ -655,6 +670,19 @@ pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
 pub const MarkerSweep = struct {
     iterator: ?std.Io.Dir.Iterator = null,
     publication_guard: ?std.Io.File = null,
+    /// When a fresh sweep (`iterator == null`) last ran, or `0` if it never
+    /// has. `run` is driven by `Store.maintainOnceWithCancel`'s maintenance
+    /// loop, which wakes and calls it again on essentially every write
+    /// (measured: ~4/write in the write-amplification CPU harness's
+    /// attribution test, almost entirely this lock/unlock pair) even though
+    /// nothing has changed in the directory since the last pass -- crash-
+    /// leftover markers are inherently rare, so reaping them promptly on
+    /// every single tick buys nothing a bounded delay would not also give.
+    /// `sweep_min_interval_ns` throttles *starting a new* pass; a pass
+    /// already mid-walk (`iterator != null`, more than 64 entries) is never
+    /// throttled, since abandoning that would restart the scan from the
+    /// beginning next time instead of making bounded progress through it.
+    last_run_ns: i128 = 0,
 
     fn resetIterator(self: *MarkerSweep, runtime: std.Io) void {
         if (self.iterator) |it| it.reader.dir.close(runtime);
@@ -666,13 +694,29 @@ pub const MarkerSweep = struct {
         self.publication_guard = null;
     }
 
+    /// How often a fresh sweep may start; see `last_run_ns`'s doc comment.
+    /// A second is still far more prompt than crash-leftover markers need
+    /// to be reaped (they only accumulate from a crash mid-rename, not
+    /// normal operation), while turning ~4 flock()/write from a tight
+    /// write loop's own maintenance wake-ups into effectively zero.
+    const sweep_min_interval_ns: i128 = 1 * std.time.ns_per_s;
+
     pub fn run(self: *MarkerSweep, file: *native.NativeFile) !void {
         const runtime = file.runtime();
+        if (self.iterator == null) {
+            const now = std.Io.Clock.awake.now(runtime).nanoseconds;
+            if (self.last_run_ns != 0 and now - self.last_run_ns < sweep_min_interval_ns) return;
+            self.last_run_ns = now;
+        }
         if (self.publication_guard == null) self.publication_guard = try openPublicationGuard(file.allocator, runtime, file.path);
         const guard = self.publication_guard.?;
         // A new marker is visible before createFile has acquired its lock.
         // Coordinate that window with every sweeper in the directory, even
         // when another Store or process owns the marker's artifact root.
+        // Stays a kernel lock, not a region pin -- see `createMarker`'s
+        // own comment on this same `publication_guard`: this is
+        // artifact-lease directory-visibility serialization, unrelated to
+        // §8.7's reader-vs-writer migration.
         try guard.lock(runtime, .exclusive);
         defer guard.unlock(runtime);
         if (self.iterator == null) {
@@ -705,12 +749,73 @@ pub const MarkerSweep = struct {
     }
 };
 
+const publication_guard_name = ".aflite-lease-publication.lock";
+
 // This persistent inode is deliberately outside the UUID marker namespace.
 // Never unlink it: replacing its inode could split cross-process coordination.
+//
+// Resolve `root`'s parent directory *once*, as an already-open handle, and
+// create the guard file relative to that handle -- rather than joining a
+// string (`dirname(root) orelse "."`) and asking `std.Io.Dir.cwd()` to
+// resolve it a second time. The second resolution is also against cwd, so a
+// bare, directory-component-free `root` (`dirname` returning `null`, hence
+// `"."`) depends on whichever directory happens to be the process's current
+// one at that exact call -- the same class of bug `reader_epochs.zig`'s
+// `Namespace.open` documents fixing for its own "identity" marker (observed
+// there as a bare file landing in the process's cwd instead of next to its
+// `.aflite` file). `openPublicationGuard` is called more than once over a
+// store's lifetime (`Registry.create` and `MarkerSweep.run`, potentially far
+// apart in time), so pinning this call to the parent directory's own open
+// handle removes any dependency on cwd being unchanged between those calls.
 fn openPublicationGuard(allocator: Allocator, io: std.Io, root: []const u8) !std.Io.File {
-    const path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(root) orelse ".", ".aflite-lease-publication.lock" });
-    defer allocator.free(path);
-    return std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
+    _ = allocator;
+    var parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(root) orelse ".", .{});
+    defer parent.close(io);
+    return parent.createFile(io, publication_guard_name, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
+}
+
+// Bug repro/regression: a bare, directory-component-free root (the shape
+// `std.fs.path.dirname` returns `null` for) must resolve the publication
+// guard next to the database file -- i.e. inside whatever directory is the
+// process's cwd *at open time* -- and never leave anything behind in a
+// *different* directory that later becomes cwd. Mirrors native.zig's "bug2"
+// regression for `reader_epochs.zig`'s `Namespace.open`.
+test "lite artifact lease publication guard at a relative path creates no files outside its own directory" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    const original_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(original_cwd);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_dir_len = try tmp.dir.realPath(io, &buf);
+    const tmp_dir_path = try a.dupe(u8, buf[0..tmp_dir_len]);
+    defer a.free(tmp_dir_path);
+
+    try std.process.setCurrentPath(io, tmp_dir_path);
+    var restored = false;
+    defer if (!restored) std.process.setCurrentPath(io, original_cwd) catch {};
+
+    const bare_name = "bug3-repro.aflite";
+    {
+        var file = try native.NativeFile.createWithIo(a, io, bare_name, .{ .no_sync = true, .exclusive = true });
+        defer file.close();
+        const guard = try openPublicationGuard(a, io, bare_name);
+        defer guard.close(io);
+        // Must have landed inside the temp directory (next to the bare
+        // `.aflite` file), not wherever cwd happens to be by the time some
+        // *other* call into this function runs.
+        try std.Io.Dir.cwd().access(io, publication_guard_name, .{});
+    }
+
+    try std.process.setCurrentPath(io, original_cwd);
+    restored = true;
+
+    // Nothing leaked into the original cwd: no bare guard file sitting
+    // directly in it.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, publication_guard_name, .{}));
 }
 
 test "lite persistent mapped lease publication excludes cross-root marker sweeping" {
