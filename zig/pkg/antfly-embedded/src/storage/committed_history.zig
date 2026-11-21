@@ -357,14 +357,21 @@ pub fn requireBootstrapCut(txn: anytype, namespace: frame.Namespace) !u64 {
 }
 
 pub fn admit(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, expires: u64, policy_revision: u64) !Consumer {
+    return admitAt(txn, namespace, id, limit, expires, policy_revision, null);
+}
+
+pub fn admitAt(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, expires: u64, policy_revision: u64, retained_start: ?u64) !Consumer {
     if (std.mem.allEqual(u8, &id, 0) or limit < transaction_overhead + frame.chunk_bytes) return error.InvalidHistoryAdmission;
     var state = (try load(txn)) orelse State{ .namespace = namespace, .limit = limit };
     try requireNamespace(txn, state, namespace);
     if (state.limit != limit) return error.InvalidHistoryAdmission;
     for (state.consumers) |consumer| if (consumer.epoch != 0 and std.mem.eql(u8, &consumer.id, &id)) {
-        if (consumer.expires_at_seconds != expires or consumer.policy_revision != policy_revision) return error.HistoryConsumerConflict;
+        if (consumer.expires_at_seconds != expires or consumer.policy_revision != policy_revision or (retained_start != null and retained_start.? != consumer.start)) return error.HistoryConsumerConflict;
         return consumer;
     };
+    const start = retained_start orelse state.latest;
+    if (retained_start != null and try loadPolicy(txn) == null) return error.HistoryResynchronizationRequired;
+    if (start < state.reclaimed or start > state.latest) return error.HistoryResynchronizationRequired;
     if (!state.active() and try loadPolicy(txn) == null) {
         var cursor = try txn.openCursor();
         defer cursor.close();
@@ -373,7 +380,7 @@ pub fn admit(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, e
     }
     for (&state.consumers) |*consumer| if (consumer.epoch == 0) {
         state.epoch = std.math.add(u64, state.epoch, 1) catch return error.HistoryCorrupt;
-        consumer.* = .{ .id = id, .epoch = state.epoch, .start = state.latest, .acknowledged = state.latest, .expires_at_seconds = expires, .policy_revision = policy_revision };
+        consumer.* = .{ .id = id, .epoch = state.epoch, .start = start, .acknowledged = start, .expires_at_seconds = expires, .policy_revision = policy_revision };
         try save(txn, state);
         return consumer.*;
     };

@@ -45,6 +45,7 @@ pub const Grant = struct {
     limit: u64 = history.default_limit,
     /// Establish the timestamped row-write protocol before recording the cut.
     require_commit_clock: bool = false,
+    retained_start: ?u64 = null,
 
     pub fn jsonStringify(self: Grant, jw: anytype) !void {
         try jw.beginObject();
@@ -55,6 +56,10 @@ pub const Grant = struct {
         if (self.require_commit_clock) {
             try jw.objectField("require_commit_clock");
             try jw.write(true);
+        }
+        if (self.retained_start) |start| {
+            try jw.objectField("retained_start");
+            try jw.write(start);
         }
         try jw.endObject();
     }
@@ -142,7 +147,7 @@ pub fn enroll(txn: anytype, grant: Grant) !history.Consumer {
         // Enrollment retry recovers the actual lease even if its original reply
         // was lost before a later renewal. It cannot shorten or extend expiry;
         // the metadata owner separately renews the returned epoch by CAS.
-        const consumer = try history.admit(txn, grant.namespace, grant.consumer, grant.limit, current.expires_at_seconds, grant.policy_revision);
+        const consumer = try history.admitAt(txn, grant.namespace, grant.consumer, grant.limit, current.expires_at_seconds, grant.policy_revision, grant.retained_start);
         if (consumer.epoch != lease.epoch) return error.HistoryCorrupt;
         if (grant.sequence != lease.grant) {
             lease.grant = grant.sequence;
@@ -158,7 +163,7 @@ pub fn enroll(txn: anytype, grant: Grant) !history.Consumer {
     if (try history.load(txn)) |native| for (native.consumers) |consumer| {
         if (consumer.epoch != 0 and same(consumer.id, grant.consumer)) return error.HistoryConsumerConflict;
     };
-    const consumer = try history.admit(txn, grant.namespace, grant.consumer, grant.limit, grant.expires_at_seconds, grant.policy_revision);
+    const consumer = try history.admitAt(txn, grant.namespace, grant.consumer, grant.limit, grant.expires_at_seconds, grant.policy_revision, grant.retained_start);
     slot.* = .{ .id = consumer.id, .epoch = consumer.epoch, .grant = grant.sequence, .definition = grant.definition };
     try txn.put(key, &state.encode());
     return consumer;
@@ -336,7 +341,7 @@ fn bootstrapPin(namespace: Namespace, consumer: history.Consumer, raw: []const u
 /// to decode, and never exposes auxiliary row keys.
 pub fn captureBootstrap(a: std.mem.Allocator, txn: anytype, grant: Grant, expires_at_seconds: u64) !BootstrapPin {
     try grant.validate();
-    if (expires_at_seconds == 0 or expires_at_seconds > grant.expires_at_seconds) return error.InvalidHistoryAdmission;
+    if (grant.retained_start != null or expires_at_seconds == 0 or expires_at_seconds > grant.expires_at_seconds) return error.InvalidHistoryAdmission;
     var state = try stateFor(txn, grant.namespace, grant.authority);
     if (try readBootstrapBlob(txn, grant.consumer)) |_| {
         if (state.find(grant.consumer) == null) return error.HistoryCorrupt;

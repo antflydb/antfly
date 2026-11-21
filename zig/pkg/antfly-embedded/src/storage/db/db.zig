@@ -162381,6 +162381,16 @@ test "db split finalization records the predecessor committed history frontier t
         try db.applyRangeFinalization(split, entry, null, null);
         try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:a", .value = "{\"value\":2}" }} }, later, 110, false);
         try db.applyRangeFinalization(second_split, second_entry, null, null);
+        var admission = try db.core.store.beginWriteTxn();
+        errdefer admission.abort();
+        const consumer = try history.admitAt(&admission, namespace, @splat(2), history.default_limit, 200, 1, 0);
+        try std.testing.expectEqual(@as(u64, 0), consumer.start);
+        try std.testing.expectEqual(@as(u64, 0), consumer.acknowledged);
+        const retry = try history.admitAt(&admission, namespace, @splat(2), history.default_limit, 200, 1, 0);
+        try std.testing.expectEqual(consumer.epoch, retry.epoch);
+        try std.testing.expectError(error.HistoryConsumerConflict, history.admitAt(&admission, namespace, @splat(2), history.default_limit, 200, 1, 1));
+        try std.testing.expectError(error.HistoryResynchronizationRequired, history.admitAt(&admission, namespace, @splat(3), history.default_limit, 200, 1, 3));
+        try admission.commit();
     }
     var db = try DB.open(alloc, path, options);
     defer db.close();

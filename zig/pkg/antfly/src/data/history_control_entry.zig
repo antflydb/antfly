@@ -24,7 +24,9 @@ pub fn requiredProtocol(command: control.Command) u16 {
     return switch (command) {
         .capture_bootstrap, .release_bootstrap => @import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version,
         .configure_policy, .inspect_policy => @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version,
-        .enroll => |grant| if (grant.require_commit_clock)
+        .enroll => |grant| if (grant.retained_start != null)
+            @import("../common/data_raft_protocol.zig").batch_history_retained_enrollment_protocol_version
+        else if (grant.require_commit_clock)
             @import("../common/data_raft_protocol.zig").batch_history_clock_enrollment_protocol_version
         else
             required_protocol_version,
@@ -133,6 +135,15 @@ test "history control entry binds bounded immutable owner data and requires acti
     var clocked_decoded = try decode(a, clocked_bytes);
     defer clocked_decoded.deinit();
     try std.testing.expectEqualDeep(clocked, clocked_decoded.value());
+    var retained = clocked;
+    retained.history_control.command.enroll.retained_start = 0;
+    retained.protocol = @import("../common/data_raft_protocol.zig").batch_history_retained_enrollment_protocol_version;
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, retained, retained.protocol - 1));
+    const retained_bytes = try encode(a, retained, retained.protocol);
+    defer a.free(retained_bytes);
+    var retained_decoded = try decode(a, retained_bytes);
+    defer retained_decoded.deinit();
+    try std.testing.expectEqualDeep(retained, retained_decoded.value());
     var wrong = entry;
     wrong.storage_owner.identity.range_id += 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, encode(a, wrong, required_protocol_version));
