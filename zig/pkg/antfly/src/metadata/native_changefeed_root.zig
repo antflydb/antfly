@@ -244,12 +244,12 @@ pub const Routed = struct {
         const positions = try state.rootsAt(a, cursor);
         defer a.free(positions);
         const after = positions[index].delivered;
-        if (root.split_handoff) |handoff| {
-            if (after.sequence > handoff.cut.latest or (after.sequence == handoff.cut.latest and after.event != 0)) return error.ChangefeedResynchronizationRequired;
-            if (after.sequence == handoff.cut.latest and after.event == 0) return .{
+        if (root.transitionLimit()) |limit| {
+            if (after.sequence > limit or (after.sequence == limit and after.event != 0)) return error.ChangefeedResynchronizationRequired;
+            if (after.sequence == limit and after.event == 0) return .{
                 .arena = std.heap.ArenaAllocator.init(a),
                 .next = .{ .sequence = after.sequence },
-                .observed_latest = handoff.cut.latest,
+                .observed_latest = limit,
                 .caught_up = true,
             };
         }
@@ -279,10 +279,10 @@ pub const Routed = struct {
             },
         }, request);
         errdefer page.deinit();
-        if (root.split_handoff) |handoff| {
-            if (page.next.sequence > handoff.cut.latest) return error.ChangefeedResynchronizationRequired;
-            page.observed_latest = @min(page.observed_latest, handoff.cut.latest);
-            page.caught_up = page.next.sequence == handoff.cut.latest and page.next.event == 0;
+        if (root.transitionLimit()) |limit| {
+            if (page.next.sequence > limit) return error.ChangefeedResynchronizationRequired;
+            page.observed_latest = @min(page.observed_latest, limit);
+            page.caught_up = page.next.sequence == limit and page.next.event == 0;
         }
         if (page.header) |header| {
             if (header.transaction_scope == .coordinated) {

@@ -261,6 +261,48 @@ pub const Source = struct {
         } };
     }
 
+    pub fn prepareMergeDrain(self: Source, a: A, captured: *const Captured, state: control.State, stored: control.Root, merge: @import("../metadata/transition_state.zig").MergeTransitionRecord, context: Context) !?control.Mutation {
+        const donor = try captured.findInstalled(stored);
+        const physical = stored.physical orelse return error.ChangefeedResynchronizationRequired;
+        const contract = merge.table_contract;
+        const identity = donor.fence.route.identity_namespace;
+        if ((merge.phase != .cutover_pending and merge.phase != .finalizing) or merge.transition_id == 0 or
+            merge.donor_group_id != physical.group_id or contract.table_id != identity.table_id or
+            contract.source_identity.shard_id != identity.shard_id or contract.source_identity.range_id != identity.range_id or
+            !std.mem.eql(u8, contract.table_name, donor.table_name))
+            return error.ChangefeedResynchronizationRequired;
+        const receiver = for (state.roots) |root| {
+            const route = root.physical orelse continue;
+            if (route.group_id == merge.receiver_group_id and std.mem.eql(u8, root.namespace[0..8], stored.namespace[0..8])) {
+                _ = try captured.findInstalled(root);
+                break route;
+            }
+        } else return error.ChangefeedResynchronizationRequired;
+        const port = self.merge_cut orelse return error.ChangefeedCapabilityUnsupported;
+        const owners = self.artifact_owners orelse return error.ChangefeedCapabilityUnsupported;
+        const qualified = try owners.read(a, donor.fence, donor.table_name, .{ .version = 1, .expected_table_binding = donor.table_binding }, context);
+        const cut = (try port.read(a, donor.fence, donor.table_name, .{
+            .namespace = stored.storageNamespace(),
+            .transition = merge.transition_id,
+            .receiver_group = receiver.group_id,
+            .root_generation = qualified.owner.root_generation,
+        }, context)) orelse return null;
+        if (cut.reclaimed > stored.acknowledged.sequence) return error.ChangefeedResynchronizationRequired;
+        return .{ .stage_merge_drain = .{
+            .namespace = stored.namespace,
+            .ownership_epoch = stored.ownership_epoch,
+            .drain = .{
+                .donor = physical,
+                .receiver = receiver,
+                .transition = cut.transition,
+                .term = cut.term,
+                .index = cut.index,
+                .latest = cut.latest,
+                .root_generation = cut.root_generation,
+            },
+        } };
+    }
+
     pub fn enrollSplitSuccessor(self: Source, a: A, captured: *const Captured, state: control.State, root: control.Root, context: Context) !control.Mutation {
         const handoff = root.split_handoff orelse return error.ChangefeedConflict;
         const grant_sequence = root.split_grant_sequence orelse return error.ChangefeedConflict;
@@ -394,9 +436,9 @@ pub const Source = struct {
         const item = state.roots[read.root_index];
         if (item.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
         const root = try captured.findInstalled(item);
-        if (item.split_handoff) |handoff| {
-            if (read.position.sequence > handoff.cut.latest) return error.ChangefeedResynchronizationRequired;
-            if (read.position.sequence == handoff.cut.latest) return null;
+        if (item.transitionLimit()) |limit| {
+            if (read.position.sequence > limit) return error.ChangefeedResynchronizationRequired;
+            if (read.position.sequence == limit) return null;
         }
         for (definition.tables) |table| {
             if (table.table_id != root.fence.table_id) continue;
@@ -449,9 +491,9 @@ pub const Source = struct {
                 arena.deinit();
                 return null;
             };
-            if (item.split_handoff) |handoff| {
-                if (current.sequence > handoff.cut.latest) return error.ChangefeedResynchronizationRequired;
-                latest = @min(latest, handoff.cut.latest);
+            if (item.transitionLimit()) |limit| {
+                if (current.sequence > limit) return error.ChangefeedResynchronizationRequired;
+                latest = @min(latest, limit);
             }
             switch (current.transaction_scope) {
                 .root_local => {},

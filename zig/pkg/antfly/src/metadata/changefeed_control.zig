@@ -192,6 +192,22 @@ pub const SplitHandoff = struct {
     }
 };
 
+pub const MergeDrain = struct {
+    donor: PhysicalRoot,
+    receiver: PhysicalRoot,
+    transition: u64,
+    term: u64,
+    index: u64,
+    latest: u64,
+    root_generation: u64,
+
+    fn validate(self: MergeDrain) !void {
+        if (!self.donor.valid() or !self.receiver.valid() or self.donor.group_id == self.receiver.group_id or
+            self.transition == 0 or self.term == 0 or self.index == 0)
+            return error.InvalidChangefeed;
+    }
+};
+
 fn writePhysicalRootRecord(value: anytype, writer: anytype) @TypeOf(writer.*).Error!void {
     try writer.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
@@ -200,7 +216,7 @@ fn writePhysicalRootRecord(value: anytype, writer: anytype) @TypeOf(writer.*).Er
                 try writer.objectField(name);
                 try writer.write(physical);
             }
-        } else if (comptime (std.mem.eql(u8, name, "split_handoff") or std.mem.eql(u8, name, "split_grant_sequence") or std.mem.eql(u8, name, "split_consumer_epoch") or std.mem.eql(u8, name, "storage_namespace"))) {
+        } else if (comptime (std.mem.eql(u8, name, "split_handoff") or std.mem.eql(u8, name, "split_grant_sequence") or std.mem.eql(u8, name, "split_consumer_epoch") or std.mem.eql(u8, name, "storage_namespace") or std.mem.eql(u8, name, "merge_drain"))) {
             if (@field(value, name)) |handoff| {
                 try writer.objectField(name);
                 try writer.write(handoff);
@@ -238,9 +254,16 @@ pub const Root = struct {
     split_grant_sequence: ?u64 = null,
     split_consumer_epoch: ?u64 = null,
     storage_namespace: ?Namespace = null,
+    merge_drain: ?MergeDrain = null,
 
     pub fn storageNamespace(self: Root) Namespace {
         return self.storage_namespace orelse self.namespace;
+    }
+
+    pub fn transitionLimit(self: Root) ?u64 {
+        if (self.merge_drain) |drain| return drain.latest;
+        if (self.split_handoff) |handoff| return handoff.cut.latest;
+        return null;
     }
 
     pub fn jsonStringify(self: Root, writer: anytype) @TypeOf(writer.*).Error!void {
@@ -485,6 +508,13 @@ pub const State = struct {
                     if (epoch == 0 or root.split_grant_sequence == null) return error.InvalidChangefeed;
                 }
             } else if (root.split_grant_sequence != null or root.split_consumer_epoch != null) return error.InvalidChangefeed;
+            if (root.merge_drain) |drain| {
+                try drain.validate();
+                if (root.split_handoff != null or root.consumer_epoch == 0 or
+                    !std.meta.eql(root.physical, @as(?PhysicalRoot, drain.donor)) or
+                    root.delivered.order(.{ .sequence = drain.latest }) == .gt)
+                    return error.InvalidChangefeed;
+            }
             if (root.storage_namespace) |namespace| {
                 const physical = root.physical orelse return error.InvalidChangefeed;
                 if (!nz(namespace) or !std.mem.eql(u8, namespace[0..8], root.namespace[0..8]) or
@@ -626,6 +656,7 @@ pub const Mutation = union(enum) {
     plan_roots: []const RootPlan,
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
+    stage_merge_drain: struct { namespace: Namespace, ownership_epoch: u64, drain: MergeDrain },
     stage_split_handoff: struct { namespace: Namespace, ownership_epoch: u64, handoff: SplitHandoff },
     confirm_split_successor: struct { namespace: Namespace, grant_sequence: u64, consumer_epoch: u64 },
     activate_split_successor: struct { namespace: Namespace, grant_sequence: u64 },
@@ -654,7 +685,7 @@ pub const Mutation = union(enum) {
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
             .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
-            .stage_split_handoff, .confirm_split_successor, .activate_split_successor => return physical_history_protocol_version,
+            .stage_merge_drain, .stage_split_handoff, .confirm_split_successor, .activate_split_successor => return physical_history_protocol_version,
             .plan_roots => |plans| for (plans) |plan| {
                 if (plan.physical != null) return physical_history_protocol_version;
             },
@@ -690,6 +721,10 @@ pub const Mutation = union(enum) {
             .enroll => |value| {
                 if (!nz(value.namespace) or value.ownership_epoch == 0 or value.grant_sequence == 0 or value.consumer_epoch == 0) return error.InvalidChangefeed;
                 if (value.snapshot) |pin| if (!nz(pin.id) or !nz(pin.digest) or pin.expires_at == 0) return error.InvalidChangefeed;
+            },
+            .stage_merge_drain => |value| {
+                if (!nz(value.namespace) or value.ownership_epoch == 0) return error.InvalidChangefeed;
+                try value.drain.validate();
             },
             .stage_split_handoff => |value| {
                 if (!nz(value.namespace) or value.ownership_epoch == 0) return error.InvalidChangefeed;
@@ -757,6 +792,7 @@ pub const Mutation = union(enum) {
         const changed_root: ?Namespace = switch (self) {
             .enroll => |v| v.namespace,
             .rebind => |v| v.namespace,
+            .stage_merge_drain => |v| v.namespace,
             .stage_split_handoff => |v| v.namespace,
             .activate_split_successor => |v| v.namespace,
             .refresh_grant => |v| v.namespace,
@@ -960,12 +996,33 @@ pub const Mutation = union(enum) {
                 roots[index].snapshot = enrollment.snapshot;
                 next.roots = roots;
             },
+            .stage_merge_drain => |staged| {
+                if (state.phase != .streaming) return error.ChangefeedConflict;
+                const index = try state.rootIndex(staged.namespace);
+                const donor = state.roots[index];
+                if (donor.ownership_epoch != staged.ownership_epoch or donor.consumer_epoch == 0 or donor.released or donor.split_handoff != null or
+                    !std.meta.eql(donor.physical, @as(?PhysicalRoot, staged.drain.donor)) or
+                    donor.delivered.order(.{ .sequence = staged.drain.latest }) == .gt)
+                    return error.ChangefeedConflict;
+                const has_receiver = for (state.roots) |root| {
+                    if (root.consumer_epoch != 0 and !root.released and std.meta.eql(root.physical, @as(?PhysicalRoot, staged.drain.receiver)) and
+                        std.mem.eql(u8, root.namespace[0..8], donor.namespace[0..8])) break true;
+                } else false;
+                if (!has_receiver) return error.ChangefeedResynchronizationRequired;
+                if (donor.merge_drain) |existing| {
+                    if (!std.meta.eql(existing, staged.drain)) return error.ChangefeedConflict;
+                    return state;
+                }
+                const roots = try a.dupe(Root, state.roots);
+                roots[index].merge_drain = staged.drain;
+                next.roots = roots;
+            },
             .stage_split_handoff => |staged| {
                 if (state.phase != .streaming) return error.ChangefeedConflict;
                 const index = try state.rootIndex(staged.namespace);
                 const previous = state.roots[index];
                 try staged.handoff.validate(previous.storageNamespace());
-                if (previous.ownership_epoch != staged.ownership_epoch or previous.consumer_epoch == 0 or previous.released or
+                if (previous.ownership_epoch != staged.ownership_epoch or previous.consumer_epoch == 0 or previous.released or previous.merge_drain != null or
                     !std.meta.eql(previous.physical, @as(?PhysicalRoot, staged.handoff.predecessor))) return error.ChangefeedConflict;
                 if (previous.split_handoff) |handoff| {
                     if (!std.meta.eql(handoff, staged.handoff)) return error.ChangefeedConflict;
@@ -1715,6 +1772,26 @@ test "changefeed stages a split proof without changing retained cursor positions
     try std.testing.expectEqual(namespace, child.storageNamespace());
     try std.testing.expectEqual(@as(u64, 0), child.delivered.sequence);
     try std.testing.expectEqual(@as(u64, 11), positions[try active.rootIndex(namespace)].delivered.sequence);
+    var merge: Mutation = .{ .stage_merge_drain = .{
+        .namespace = child.namespace,
+        .ownership_epoch = child.ownership_epoch,
+        .drain = .{
+            .donor = child.physical.?,
+            .receiver = .{ .group_id = 11, .range_id = 21 },
+            .transition = 50,
+            .term = 2,
+            .index = 60,
+            .latest = 3,
+            .root_generation = 4,
+        },
+    } };
+    const merging = try step(a, active, merge);
+    const donor = merging.roots[try merging.rootIndex(child.namespace)];
+    try std.testing.expectEqual(@as(?u64, 3), donor.transitionLimit());
+    try std.testing.expectEqual(active.latest_cursor, merging.latest_cursor);
+    try std.testing.expectEqual(merging.revision, (try step(a, merging, merge)).revision);
+    merge.stage_merge_drain.drain.receiver.range_id += 1;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, step(a, merging, merge));
     confirmation.confirm_split_successor.consumer_epoch += 1;
     try std.testing.expectError(error.ChangefeedConflict, step(a, ready, confirmation));
     mutation.stage_split_handoff.handoff.cut.root_generation += 1;
