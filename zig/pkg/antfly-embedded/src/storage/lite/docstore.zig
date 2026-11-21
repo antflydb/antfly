@@ -19734,3 +19734,39 @@ test "lite native docstore replay targets ignore a base-revision hint marker aft
     defer docstore.close();
     try std.testing.expectEqual(@as(u64, 2), try docstore.latestReplaySequenceForHint(.full_text, 1));
 }
+
+test "lite native docstore retires a planned replay prefix across hint lanes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-retire-prefix.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    var runtime = try store.runtimeStore(allocator);
+    defer runtime.deinit();
+    var docs = try docstore_root.DocStore.openRuntime(allocator, &runtime);
+    defer docs.close();
+
+    const first = try encodeTestReplayRecord(allocator, 1, .full_text);
+    defer allocator.free(first);
+    const second = try encodeTestReplayRecord(allocator, 2, .full_text);
+    defer allocator.free(second);
+    try docs.appendReplayOpaque(allocator, 1, first);
+    try docs.appendReplayOpaque(allocator, 2, second);
+    try docs.truncateReplayUpTo(allocator, 1);
+    try docs.truncateReplayUpTo(allocator, 1);
+
+    var read = try docs.beginReadTxn();
+    defer read.abort();
+    const all = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    const hint = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    try std.testing.expectError(error.NotFound, read.get(&all));
+    try std.testing.expectError(error.NotFound, read.get(&hint));
+    const live = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+    try std.testing.expectEqualSlices(u8, second, try read.get(&live));
+    const journal_credit = try read.get(&internal_keys.journal_credit_ledger_key);
+    const ledger = internal_keys.JournalCreditLedger.decode(journal_credit) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), ledger.records);
+    try std.testing.expectEqual(@as(u64, 2 * internal_keys.replay_key_len + second.len), ledger.bytes);
+}

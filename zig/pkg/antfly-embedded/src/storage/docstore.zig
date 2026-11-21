@@ -3854,12 +3854,14 @@ pub const DocStore = struct {
     const ReplayRetirementPlan = struct {
         stats: replay_chunks.RetirementStats = .{},
         deletes: std.ArrayListUnmanaged([internal_keys.replay_key_len]u8) = .empty,
+        first_deleted: [replay_credit_lanes.len]?u64 = @splat(null),
         deleted_through: [replay_credit_lanes.len]u64 = @splat(0),
         heads: ?ReplayCreditLaneHeads = null,
 
         fn reset(plan: *ReplayRetirementPlan) void {
             plan.stats = .{};
             plan.deletes.clearRetainingCapacity();
+            plan.first_deleted = @splat(null);
             plan.deleted_through = @splat(0);
             plan.heads = null;
         }
@@ -3897,6 +3899,7 @@ pub const DocStore = struct {
                     plan.stats.keys_deleted += 1;
                     plan.stats.bytes_deleted += kv.key.len + kv.value.len;
                     plan.stats.retired_through = @max(plan.stats.retired_through, sequence);
+                    if (plan.first_deleted[lane] == null) plan.first_deleted[lane] = sequence;
                     plan.deleted_through[lane] = sequence + 1;
                     if (plan.stats.keys_deleted >= budget.max_keys or plan.stats.bytes_deleted >= budget.max_bytes) {
                         plan.stats.done = false;
@@ -3943,15 +3946,13 @@ pub const DocStore = struct {
         const lanes_witnessed = !self.sharedReplayLane();
         var observed_heads: ?ReplayCreditLaneHeads = null;
         var observed_next: u64 = 0;
-        if (lanes_witnessed) {
+        {
             var read = try self.beginReadTxnWithBlockCacheAdmission(.transient);
             defer read.abort();
-            observed_heads = try storedReplayCreditLaneHeads(&read);
-            if (observed_heads != null) {
-                observed_next = try replayCreditNextSequence(&read);
-                try planReplayRetirement(&read, &plan, alloc, up_to_sequence, budget, observed_heads, observed_next);
-                if (plan.deletes.items.len == 0) return plan.stats;
-            }
+            if (lanes_witnessed) observed_heads = try storedReplayCreditLaneHeads(&read);
+            observed_next = try replayCreditNextSequence(&read);
+            try planReplayRetirement(&read, &plan, alloc, up_to_sequence, budget, observed_heads, observed_next);
+            if (plan.deletes.items.len == 0) return plan.stats;
         }
 
         var batch = try self.beginWriteBatchWithOptions(.{ .block_cache_admission = .transient });
@@ -3959,11 +3960,25 @@ pub const DocStore = struct {
         defer if (!committed) batch.abort();
         const txn = batch.asTxn();
         const initial_heads = if (lanes_witnessed) try storedReplayCreditLaneHeads(txn) else null;
-        const next = if (initial_heads != null) try replayCreditNextSequence(txn) else 0;
+        const next = try replayCreditNextSequence(txn);
+        const append_preserves_range = observed_next == next or (next > observed_next and observed_next > up_to_sequence);
         var reusable = false;
-        if (observed_heads != null and initial_heads != null and
-            (observed_next == next or (next > observed_next and observed_next > up_to_sequence)))
-        {
+        if (!lanes_witnessed and append_preserves_range) {
+            // Retirement only removes lane prefixes. Verify the first
+            // planned key in each affected lane without reading its payload.
+            var cursor = try txn.openPhysicalCursorAdapter();
+            defer cursor.close();
+            cursor.setKeysOnly();
+            reusable = true;
+            for (replay_credit_lanes, plan.first_deleted) |kind, first| {
+                const sequence = first orelse continue;
+                if (try seekReplayCreditLaneHead(&cursor, kind, 0) != sequence + 1) {
+                    reusable = false;
+                    break;
+                }
+            }
+        }
+        if (observed_heads != null and initial_heads != null and append_preserves_range) {
             const before = observed_heads.?;
             const current = initial_heads.?;
             reusable = true;
