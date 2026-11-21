@@ -5399,7 +5399,7 @@ pub const ProvisionedTableReadSource = struct {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.queryWithDelivery(&hosted, alloc, table_name, req, consistency, delivery);
         }
-        const timed_req = graphTimedSearchRequest(req);
+        const timed_req = graphTimedSearchRequest(req, self.io_impl);
         // Graph retries re-run the base scan and every shard fanout. Keep one
         // fresh topology retry, matching the hosted path, instead of applying
         // the generic point-read retry multiplier to expensive graph work.
@@ -5446,7 +5446,7 @@ pub const ProvisionedTableReadSource = struct {
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             if ((control_only_storage_sources or routed.local_read_source != null) and delivery == null and !queryRequiresCoordinatorFinalization(req)) {
                 const local_source = try routed.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation);
-                return local_source.queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), .stale) catch |err| switch (err) {
+                return local_source.queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name, routed.io_impl), .stale) catch |err| switch (err) {
                     error.ResidentDbRetryRequired => {
                         prepared.releaseActivity();
                         try routed.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
@@ -5463,7 +5463,7 @@ pub const ProvisionedTableReadSource = struct {
                 // results below through the same routed physical provider.
             } else {
                 const local_collection_req = aggregationOnlyCollectionRequest(req);
-                const local_search_req = graphScopedSearchRequest(decisionCollectionRequest(local_collection_req orelse req), group_ids.len, table_name);
+                const local_search_req = graphScopedSearchRequest(decisionCollectionRequest(local_collection_req orelse req), group_ids.len, table_name, routed.io_impl);
                 var execution = queryHostedLocalDetailed(routed.resident_db, routed.cache, routed.replica_root_dir, routed.catalog, routed.read_safety_barrier, alloc, group_ids[0], routed.visibleRootGeneration(group_ids[0]), routed.managedReadRuntimeConfig(), table_name, local_search_req, .stale, prepared.activity != null) catch |err| switch (err) {
                     error.ResidentDbRetryRequired => {
                         prepared.releaseActivity();
@@ -5586,7 +5586,7 @@ pub const ProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name);
+        const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name, routed.io_impl);
         var merged = queryProvisionedAcrossGroups(routed, alloc, group_ids, search_req, table_name, .stale) catch |err| switch (err) {
             error.ResidentDbRetryRequired => {
                 prepared.releaseActivity();
@@ -7532,7 +7532,20 @@ pub const HostedProvisionedTableReadSource = struct {
         return .{
             .ptr = self,
             .supports_sql_range_guards = true,
-            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
+            // Match ProvisionedTableReadSource.source()'s fallback below: a
+            // full storage configuration (not control-only) can assert
+            // read-index-strength absence once a route fence is held, same
+            // as the non-hosted sibling. Defaulting to `false` here instead
+            // of `!control_only_storage_sources` meant a remote group's own
+            // confirmed, route-fenced "not found" never got the
+            // AuthoritativeLookupMissing/read_index_absence_header treatment
+            // (internal_group_operations.zig's `reads.strict_read_index_absence`
+            // check), so a hosted lookup against a key with no route in the
+            // table could never trust *any* replica's answer as definitive
+            // under read_index -- not even the group's confirmed current
+            // leader's -- falling through lookupAcrossActivePlacements to
+            // StorageReadTemporarilyUnavailable forever.
+            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else !control_only_storage_sources,
             // Both alternatives have static lifetime. A runtime conditional
             // inside an address-of literal would leave a stack-backed vtable.
             .vtable = if (self.catalog.vtable.privacy_policy_binding != null or self.catalog.vtable.linearizable_table_routing_snapshot != null)
@@ -7662,7 +7675,7 @@ pub const HostedProvisionedTableReadSource = struct {
         // sources may downgrade NotLeader to stale; remote HTTP misses remain
         // ambiguous, so neither takes this shortcut.
         if (route == .local and consistency == .read_index and
-            (if (self.local_read_source) |local| local.strict_read_index_absence else false)) return null;
+            (if (self.local_read_source) |local| local.strict_read_index_absence else !control_only_storage_sources)) return null;
         return try lookupAcrossActivePlacements(self, alloc, group_id, table_name, key, scoped_opts, consistency, route);
     }
 
@@ -8125,7 +8138,7 @@ pub const HostedProvisionedTableReadSource = struct {
         const delivery = @import("antfly_local_sources").api_query_response.Delivery.forQuery(requested_delivery, req.native_query_cut != null, req.graph_queries.len != 0);
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try validateDecisionRequest(alloc, req, hosted.decision_registry);
-        const timed_req = graphTimedSearchRequest(req);
+        const timed_req = graphTimedSearchRequest(req, hosted.io_impl);
         // A graph retry re-runs its base scan and every shard fanout. Keep the
         // public retry budget to one fresh topology snapshot so churn cannot
         // amplify an expensive query up to the generic point-read limit.
@@ -8190,11 +8203,11 @@ pub const HostedProvisionedTableReadSource = struct {
             // the raw path below and move the single-carrier result.
             const retained_cover = req.native_query_cut != null and !req.native_query_cut.?.create;
             if (route == .local)
-                return try (try self.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation)).queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), consistency);
+                return try (try self.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation)).queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name, self.io_impl), consistency);
             // Preserve a retained cover's finalized response when the carrier
             // is remote too.
             if (retained_cover and route == .remote)
-                return try queryResponseRemote(self.internalExecutor(), alloc, route.remote.base_uri, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name));
+                return try queryResponseRemote(self.internalExecutor(), alloc, route.remote.base_uri, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name, self.io_impl));
         }
 
         if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
@@ -8249,7 +8262,7 @@ pub const HostedProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name);
+        const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name, self.io_impl);
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, search_req, table_name, consistency);
         try checkQueryDeadline(req);
         defer merged.deinit();
@@ -10442,16 +10455,30 @@ const graphHydrateRequestHasResolvedDocFilter = local_query_contract.graphHydrat
 
 const bindDocumentAuthorityToGroup = local_query_contract.bindDocumentAuthorityToGroup;
 
+/// `graph_ttl_now_ns` is a wall-clock deadline anchor stamped onto the
+/// request and shipped over the wire (see prepared_query_routing.zig's
+/// Envelope, whose `x-antfly-prepared-query-routing` header carries it to
+/// remote groups). Reading the host's real clock directly here would leak
+/// real time into replayed network payloads: VOPR's exact replay re-runs the
+/// same requests against a simulated clock, so the stamped value must come
+/// from the attached fanout `Io` (whose `.real` clock VOPR controls and
+/// replays bit-for-bit) when one is attached, and only fall back to the
+/// real clock outside a simulation. See DETERMINISM_AUDIT.md.
+fn graphDeadlineRealtimeNs(io_impl: ?FanoutIo) u64 {
+    const resolved = io_impl orelse return platform_time.realtimeNs();
+    return @intCast(std.Io.Clock.now(.real, resolved.io()).nanoseconds);
+}
+
 /// Single-group graph queries execute locally against a snapshot that holds
 /// the graph index's complete row set: mark the request so the storage graph
 /// executors may expand THROUGH cross-table tagged nodes (entity-sourced
 /// edges are document-owned rows in the same index) and canonicalize
 /// self-table target tags. Multi-group and non-graph requests pass through
 /// untouched; coordinator-routed requests never reach this helper.
-fn graphTimedSearchRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+fn graphTimedSearchRequest(req: db_mod.types.SearchRequest, io_impl: ?FanoutIo) db_mod.types.SearchRequest {
     if (req.graph_queries.len == 0 or req.graph_ttl_now_ns != 0) return req;
     var timed = req;
-    timed.graph_ttl_now_ns = platform_time.realtimeNs();
+    timed.graph_ttl_now_ns = graphDeadlineRealtimeNs(io_impl);
     return timed;
 }
 
@@ -10459,12 +10486,13 @@ fn graphScopedSearchRequest(
     req: db_mod.types.SearchRequest,
     group_count: usize,
     table_name: []const u8,
+    io_impl: ?FanoutIo,
 ) db_mod.types.SearchRequest {
     if (group_count != 1 or req.graph_queries.len == 0) return req;
     var scoped = req;
     scoped.graph_owning_table = table_name;
     scoped.graph_index_complete_snapshot = true;
-    if (scoped.graph_ttl_now_ns == 0) scoped.graph_ttl_now_ns = platform_time.realtimeNs();
+    if (scoped.graph_ttl_now_ns == 0) scoped.graph_ttl_now_ns = graphDeadlineRealtimeNs(io_impl);
     return scoped;
 }
 
@@ -19337,6 +19365,20 @@ fn consumerTests() type {
             const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.adminSnapshot, .free_admin_snapshot = Fixture.freeAdminSnapshot, .resolve_route = Fixture.resolve, .restore_scope_for_group = Fixture.restoreScope } };
             const router: table_router.HostedGroupRouter = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.localNodeId, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.nodeBaseUri } };
             var hosted = HostedProvisionedTableReadSource.init("unused", catalog, raft_mod.read_gate.alreadyReadSafeBarrier(), router, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
+            // Regression: with no local_read_source attached (the ordinary
+            // full-storage VOPR/production shape), strict_read_index_absence
+            // must match ProvisionedTableReadSource.source()'s own fallback
+            // (!control_only_storage_sources), not unconditionally false.
+            // The hosted source previously defaulted to false regardless,
+            // so internal_group_operations.zig's `reads.strict_read_index_absence`
+            // check never returned AuthoritativeLookupMissing for a group's
+            // own confirmed, route-fenced "not found" -- not even from its
+            // current leader -- so a hosted lookup for a key with no route
+            // could never trust any replica's answer as definitive under
+            // read_index, falling through lookupAcrossActivePlacements to
+            // StorageReadTemporarilyUnavailable forever (full-cluster.metadata-
+            // partition's history-completes hang).
+            if (comptime !control_only_storage_sources) try std.testing.expect(hosted.source().strict_read_index_absence);
             _ = hosted.withLocalReadSource(.{ .ptr = &fixture, .strict_read_index_absence = true, .vtable = &.{ .lookup = unsupportedPhysicalTopLevelLookup, .scan = unsupportedPhysicalTopLevelScan, .query = unsupportedPhysicalTopLevelQuery, .lookup_group_local_routed = Fixture.lookup } });
             for (0..36) |_| try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
             try std.testing.expectEqual(@as(usize, 36), fixture.reads);
@@ -28413,19 +28455,19 @@ fn consumerTests() type {
             }};
             const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
 
-            const scoped = graphScopedSearchRequest(req, 1, "docs");
+            const scoped = graphScopedSearchRequest(req, 1, "docs", null);
             try std.testing.expect(scoped.graph_index_complete_snapshot);
             try std.testing.expectEqualStrings("docs", scoped.graph_owning_table);
             try std.testing.expect(scoped.graph_ttl_now_ns != 0);
-            const pinned = graphTimedSearchRequest(req);
-            try std.testing.expectEqual(pinned.graph_ttl_now_ns, graphTimedSearchRequest(pinned).graph_ttl_now_ns);
+            const pinned = graphTimedSearchRequest(req, null);
+            try std.testing.expectEqual(pinned.graph_ttl_now_ns, graphTimedSearchRequest(pinned, null).graph_ttl_now_ns);
 
             // A multi-group table cannot claim snapshot completeness, and a
             // request without graph queries has no scope to carry.
-            const multi = graphScopedSearchRequest(req, 2, "docs");
+            const multi = graphScopedSearchRequest(req, 2, "docs", null);
             try std.testing.expect(!multi.graph_index_complete_snapshot);
             try std.testing.expectEqual(@as(usize, 0), multi.graph_owning_table.len);
-            const plain = graphScopedSearchRequest(.{}, 1, "docs");
+            const plain = graphScopedSearchRequest(.{}, 1, "docs", null);
             try std.testing.expect(!plain.graph_index_complete_snapshot);
         }
 

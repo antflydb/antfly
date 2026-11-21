@@ -308,6 +308,18 @@ pub const resolver_namespaces_version: u16 = 128;
 /// Published SQL completion ownership from main; do not renumber these floors.
 pub const index_aliases_version: u16 = 90;
 pub const index_alias_lifecycle_version: u16 = 91;
+/// Catalog apply checks the physical identity captured by pgwire Bind.
+pub const bound_ddl_version: u16 = 95;
+/// Bound catalog and policy commands carry guards verified by every applying replica.
+pub const bound_catalog_incarnation_version: u16 = 96;
+/// Version 97 versions FK witness-schema reconstruction and fences policy publication begin.
+pub const guarded_publication_version: u16 = 97;
+/// Generation plans can bind a catalog incarnation and policy creates can enforce capacity at apply.
+pub const guarded_generation_admission_version: u16 = 98;
+/// Catalog CREATE can require the destination namespace or database observed at Bind.
+pub const bound_create_parent_version: u16 = 99;
+/// Every prospective metadata session owner can recover incarnation-bound staged work.
+pub const bound_session_version: u16 = 100;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);

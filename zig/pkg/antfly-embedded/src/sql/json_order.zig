@@ -637,6 +637,95 @@ fn decimal(value: Json, buffer: []u8, budget: *Budget) !Decimal {
     };
     return Decimal.parse(text, budget);
 }
+// Range operands are JSON numbers, whose decimal exponents have no wire
+// width. Use the SQL fast path for ordinary values and preserve ordering for
+// larger exponents without allocating an arbitrary-precision integer.
+pub fn compareRangeNumbers(left: Json, right: Json, budget: *Budget) !Order {
+    return compare(left, right, budget, 0) catch |err| switch (err) {
+        error.SqlNumericOutOfRange => compareWideRangeNumbers(left, right, budget),
+        else => return err,
+    };
+}
+
+const RangeMagnitude = struct {
+    negative: bool = false,
+    digits: []const u8 = "",
+
+    fn init(raw: []const u8) !RangeMagnitude {
+        const text = if (raw.len != 0 and (raw[0] == '-' or raw[0] == '+')) raw[1..] else raw;
+        if (text.len == 0) return error.SqlTypeMismatch;
+        for (text) |digit| if (!std.ascii.isDigit(digit)) return error.SqlTypeMismatch;
+        const digits = std.mem.trimStart(u8, text, "0");
+        return .{ .negative = digits.len != 0 and raw[0] == '-', .digits = digits };
+    }
+
+    fn unsignedDistance(larger: []const u8, smaller: []const u8) i128 {
+        var borrow: i16 = 0;
+        var place: i128 = 1;
+        var distance: i128 = 0;
+        for (0..larger.len) |offset| {
+            const lhs: i16 = larger[larger.len - offset - 1] - '0';
+            const rhs: i16 = if (offset < smaller.len) smaller[smaller.len - offset - 1] - '0' else 0;
+            var digit = lhs - rhs - borrow;
+            borrow = @intFromBool(digit < 0);
+            if (borrow != 0) digit += 10;
+            distance +|= place *| @as(i128, digit);
+            place *|= 10;
+        }
+        return distance;
+    }
+
+    fn difference(a: RangeMagnitude, b: RangeMagnitude) i128 {
+        if (a.negative != b.negative) {
+            const distance = unsignedDistance(a.digits, "") +| unsignedDistance(b.digits, "");
+            return if (a.negative) -distance else distance;
+        }
+        const order = if (a.digits.len == b.digits.len) std.mem.order(u8, a.digits, b.digits) else std.math.order(a.digits.len, b.digits.len);
+        const distance = switch (order) {
+            .eq => 0,
+            .gt => unsignedDistance(a.digits, b.digits),
+            .lt => -unsignedDistance(b.digits, a.digits),
+        };
+        return if (a.negative) -distance else distance;
+    }
+};
+
+const RangeDecimal = struct {
+    significand: Decimal,
+    exponent: RangeMagnitude = .{},
+
+    fn init(value: Json, buffer: []u8, budget: *Budget) !RangeDecimal {
+        if (value == .number_string) {
+            const text = value.number_string;
+            if (std.mem.indexOfAny(u8, text, "eE")) |at| {
+                try budget.consume(text.len - at);
+                return .{
+                    .significand = try Decimal.parse(text[0..at], budget),
+                    .exponent = try RangeMagnitude.init(text[at + 1 ..]),
+                };
+            }
+        }
+        return .{ .significand = try decimal(value, buffer, budget) };
+    }
+};
+
+fn compareWideRangeNumbers(left: Json, right: Json, budget: *Budget) !Order {
+    var left_buffer: [768]u8 = undefined;
+    var right_buffer: [768]u8 = undefined;
+    var a = try RangeDecimal.init(left, &left_buffer, budget);
+    var b = try RangeDecimal.init(right, &right_buffer, budget);
+    if (a.significand.negative != b.significand.negative or a.significand.digits.len == 0 or b.significand.digits.len == 0)
+        return a.significand.compare(b.significand);
+    const delta = a.exponent.difference(b.exponent) +| (@as(i128, a.significand.magnitude) - b.significand.magnitude);
+    if (delta != 0) {
+        const order = std.math.order(delta, 0);
+        return if (a.significand.negative) order.invert() else order;
+    }
+    a.significand.magnitude = 0;
+    b.significand.magnitude = 0;
+    return a.significand.compare(b.significand);
+}
+
 fn keyOrder(a: []const u8, b: []const u8) Order {
     const lengths = std.math.order(a.len, b.len);
     return if (lengths == .eq) std.mem.order(u8, a, b) else lengths;

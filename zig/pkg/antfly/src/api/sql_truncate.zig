@@ -285,14 +285,22 @@ fn pendingReceipt(alloc: std.mem.Allocator, target: domain.Target, source_id: u6
 }
 
 pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.CatalogDdl) !catalog.DdlOutcome {
+    return executeBound(server, identity, context, database, namespace, alloc, ddl, null);
+}
+
+pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.CatalogDdl, expected: ?[]const @import("sql_ddl_binding.zig").Guard.Table) !catalog.DdlOutcome {
     var owned_identity = identity;
     var root: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &owned_identity, .context = context, .database = database, .namespace = namespace };
     defer root.releaseExecutionOwners();
     defer freeCapturedNotices(alloc, root.result_ddl_notices);
-    return executeWithAdapter(&root, alloc, ddl);
+    return executeWithAdapterBound(&root, alloc, ddl, expected);
 }
 
 pub fn executeWithAdapter(root: *@import("sql_execution.zig").Adapter, alloc: std.mem.Allocator, ddl: ast.CatalogDdl) !catalog.DdlOutcome {
+    return executeWithAdapterBound(root, alloc, ddl, null);
+}
+
+pub fn executeWithAdapterBound(root: *@import("sql_execution.zig").Adapter, alloc: std.mem.Allocator, ddl: ast.CatalogDdl, expected: ?[]const @import("sql_ddl_binding.zig").Guard.Table) !catalog.DdlOutcome {
     const server = root.server;
     const identity = root.identity.*;
     const context = root.context;
@@ -305,15 +313,20 @@ pub fn executeWithAdapter(root: *@import("sql_execution.zig").Adapter, alloc: st
     defer arena.deinit();
     const a = arena.allocator();
     const targets = try a.alloc(domain.Target, ddl.truncate_tables.len);
-    for (ddl.truncate_tables, targets) |name, *target| {
-        target.* = .{ .database = name.database orelse database, .namespace = name.namespace orelse namespace, .table = name.table };
+    if (expected) |entries| if (entries.len != targets.len) return error.CatalogGenerationChanged;
+    for (ddl.truncate_tables, targets, 0..) |name, *target, index| {
+        target.* = .{ .database = name.database orelse database, .namespace = if (expected) |entries| entries[index].namespace else name.namespace orelse namespace, .table = name.table };
         try target.validate();
         const resource = try target.resourceNameAlloc(a);
         if (!try server_mod.tablePermissionCurrentlyAllowed(identity, resource, .admin)) return error.Forbidden;
         if (try server_mod.resolveEffectiveRowFilterJson(a, identity, resource) != null) return error.Forbidden;
     }
-    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets } }), .{});
+    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets, .include_source_epoch = context.bound_catalog_incarnation != null } }), .{});
+    try context.checkCatalogIncarnation(resolved.source_epoch);
     if (resolved.tables.len != targets.len) return error.InvalidSqlBackendResponse;
+    if (expected) |guard| for (resolved.tables, 0..) |table, i| {
+        if (guard[i].id != (if (table) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
+    };
     const logical_state = try std.json.parseFromSliceLeaky(domain.State, a, try server.source.systemCatalog(a, context, .snapshot), .{});
     var logical_index = try domain.StateIndex.init(a, logical_state);
     defer logical_index.deinit(a);
@@ -328,6 +341,7 @@ pub fn executeWithAdapter(root: *@import("sql_execution.zig").Adapter, alloc: st
     for (resolved.tables, requested) |table, *name| name.* = (table orelse return error.TableNotFound).name;
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
+    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
     for (resolved.tables) |resolved_table| {
         const bound = resolved_table.?;
         for (snapshot.tables) |table| {
@@ -459,7 +473,7 @@ pub fn executeWithAdapter(root: *@import("sql_execution.zig").Adapter, alloc: st
         const notice = private_notices.get(ordinal);
         out.* = .{ .code = notice.code, .message = notice.message, .severity = notice.severity };
     }
-    const plan: stages.Plan = .{ .id = id, .cohort_digest = digest, .targets = planned, .external_fk_parents = external_parents, .truncate_preparation = if (receipts.len == 0) null else .{
+    const plan: stages.Plan = .{ .id = id, .expected_incarnation = context.expectedMetadataIncarnation(), .cohort_digest = digest, .targets = planned, .external_fk_parents = external_parents, .truncate_preparation = if (receipts.len == 0) null else .{
         .format_version = 1,
         .vm_contract_version = catalog.trigger_runtime.predecision_contract_version,
         .plan_id = id,
@@ -481,7 +495,7 @@ pub fn executeWithAdapter(root: *@import("sql_execution.zig").Adapter, alloc: st
     const location = try std.fmt.allocPrint(a, "metadata://empty-generation/{s}", .{std.fmt.bytesToHex(id, .lower)});
     const generation_plan = try std.json.Stringify.valueAlloc(a, plan, .{});
     const job_control = @import("../metadata/query_population_job.zig");
-    const start_request: jobs.StartRequest = .{ .scope = .cluster, .source_kind = .empty_generation, .routine_actor = if (try @import("sql/triggers/restore.zig").needsActorForPlan(a, plan)) try @import("sql/triggers/restore.zig").actorForAdmission(server, identity) else null, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan };
+    const start_request: jobs.StartRequest = .{ .scope = .cluster, .source_kind = .empty_generation, .expected_incarnation = context.expectedMetadataIncarnation(), .routine_actor = if (try @import("sql/triggers/restore.zig").needsActorForPlan(a, plan)) try @import("sql/triggers/restore.zig").actorForAdmission(server, identity) else null, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan };
     const reference: job_control.Reference = .{ .job_id = job_id, .namespace = idempotency_namespace, .key = &key, .fingerprint = try jobs.requestFingerprintAlloc(a, start_request), .plan_digest = try plan.digest(a) };
     const completion_owner: operation.SQLCompletionOwner = .{ .id = job_id, .schema_version = primary_schema.version, .kind = .restore };
     try @import("sql_completion.zig").prepareMetadataWithContext(context, completion_owner);

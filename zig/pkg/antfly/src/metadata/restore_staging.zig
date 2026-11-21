@@ -709,6 +709,17 @@ pub const TruncatePreparation = struct {
     }
 };
 
+/// Read the admission guard without materializing the staged owner manifests.
+pub const PlanGuard = struct {
+    expected_incarnation: ?[32]u8 = null,
+
+    pub fn read(alloc: std.mem.Allocator, bytes: []const u8) !PlanGuard {
+        var header = try std.json.parseFromSlice(PlanGuard, alloc, bytes, .{ .ignore_unknown_fields = true });
+        defer header.deinit();
+        return header.value;
+    }
+};
+
 pub const Plan = struct {
     /// The exact owner geometry already required by the publication writer.
     /// Rejoining a burned logical OID must require this same completed phase,
@@ -747,6 +758,7 @@ pub const Plan = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
         // Preserve the canonical digest of in-flight plans created before
         // external parents became an optional part of the envelope.
+        if (std.mem.eql(u8, name, "expected_incarnation")) return self.expected_incarnation == null;
         return (std.mem.eql(u8, name, "external_fk_parents") and self.external_fk_parents.len == 0) or
             (std.mem.eql(u8, name, "constraint_name_guard") and self.constraint_name_guard == null) or
             (std.mem.eql(u8, name, "type_retirement") and self.type_retirement == null) or
@@ -754,6 +766,7 @@ pub const Plan = struct {
     }
 
     id: Id,
+    expected_incarnation: ?[32]u8 = null,
     /// Authenticated server-issued aggregate manifest identity, not an
     /// independent set of user-selected table snapshot timestamps.
     cohort_digest: Digest,

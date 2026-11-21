@@ -40,6 +40,7 @@ const retained_effects = @import("retained_effects.zig");
 pub const topology_debt = @import("transaction_debt.zig");
 pub const ExternalDecisionOwner = @import("transaction_decision_owner.zig").External;
 pub const NativePhysicalPin = @import("../common/relation_persistence.zig").PhysicalPin;
+const wal_trace = @import("write_amplification_trace.zig");
 
 // ============================================================================
 // Key prefixes
@@ -735,6 +736,20 @@ pub const ResolutionOutcome = struct {
     replay_sequence: u64,
 };
 
+/// `resolveIntentsWithExtraBatchStaged`'s result: the same `ResolutionOutcome`
+/// plus the durability ticket (if any) for whatever this resolution staged.
+/// `ticket` is `null` only when resolution wrote nothing (the no-op terminal-
+/// retry branch with no completion writes/deletes). See
+/// `docs/design/lite-performance/lite-single-commit-write-path.md` §3.2:
+/// callers release locks scoped to "a transaction is open" between getting
+/// this ticket and calling `wait()` on it, so this resolution's commit can
+/// share a group-commit fsync with concurrent writers instead of blocking
+/// them behind it.
+pub const StagedResolutionOutcome = struct {
+    outcome: ResolutionOutcome,
+    ticket: ?backend_erased.Ticket = null,
+};
+
 pub const IntentSnapshotValidation = struct {
     status: TxnStatus,
     has_intents: bool,
@@ -1077,6 +1092,46 @@ pub const TxnManager = struct {
         retain_terminal: bool,
         extra_batch: MutationExtraBatch,
     ) !void {
+        // Attribution must wrap the wait too: the group-commit member this
+        // stages is only actually applied (and so only fsynced) once
+        // something drives/waits its group, inside `ticket.wait()` below,
+        // not at `commitStaged`/`enqueue` time -- pushing the tag only
+        // around the staged call would have it popped before the real I/O
+        // runs, misattributing this commit to `.other`.
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_txn_begin);
+        defer wal_trace_scope.end();
+        const ticket = try self.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatchStaged(
+            txn_id,
+            timestamp,
+            created_at,
+            participants,
+            coordinator,
+            retain_terminal,
+            extra_batch,
+        );
+        try ticket.wait();
+    }
+
+    /// Staged counterpart of `initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch`:
+    /// stages this transaction's begin record and returns a durability
+    /// ticket instead of blocking for the fsync, mirroring
+    /// `resolveIntentsWithExtraBatchStaged`'s split (lite-single-commit-
+    /// write-path.md §3.2/§3.2a). A caller that stages this across more
+    /// than one physical commit domain, or that needs to read this
+    /// transaction's record back before this ticket is durable, must not
+    /// defer `wait()`: a group-commit member is only applied -- and so only
+    /// readable -- once something drives/waits its group (see
+    /// `writeTransactionInternal`'s doc comment in `storage/db/db.zig`).
+    pub fn initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatchStaged(
+        self: *TxnManager,
+        txn_id: TxnId,
+        timestamp: u64,
+        created_at: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+        extra_batch: MutationExtraBatch,
+    ) !backend_erased.Ticket {
         try self.requireNativeMutationPin(extra_batch.native_pin);
         if (extra_batch.external_decision_owner) |owner| {
             try owner.validate();
@@ -1114,11 +1169,9 @@ pub const TxnManager = struct {
                 defer writes.deinit(self.alloc);
                 try writes.append(self.alloc, .{ .key = &key, .value = upgraded_value });
                 try writes.appendSlice(self.alloc, extra_batch.writes);
-                try self.applyBatch(writes.items, extra_batch.deletes, null);
-            } else {
-                try self.applyMutationExtraBatch(extra_batch);
+                return try self.applyBatchStaged(writes.items, extra_batch.deletes, null, null, null);
             }
-            return;
+            return try self.applyMutationExtraBatchStaged(extra_batch);
         }
         const record = TxnRecord{
             .external_decision_owner = extra_batch.external_decision_owner,
@@ -1170,7 +1223,7 @@ pub const TxnManager = struct {
             try deletes.appendSlice(self.alloc, &.{ &participant_key, &resolved_key });
         }
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
-        try self.applyBatch(writes.items, deletes.items, null);
+        const ticket = try self.applyBatchStaged(writes.items, deletes.items, null, null, null);
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
                 .name = "InitTransaction",
@@ -1179,6 +1232,7 @@ pub const TxnManager = struct {
                 .timestamp = timestamp,
             });
         }
+        return ticket;
     }
 
     /// Write intents for a transaction, checking version predicates first.
@@ -1198,6 +1252,32 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         extra_batch: MutationExtraBatch,
     ) !void {
+        // See `initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch`'s
+        // comment: the tag must wrap `wait()` too, since the actual apply/
+        // fsync happens there, not at `commitStaged`/`enqueue` time.
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_intent_write);
+        defer wal_trace_scope.end();
+        const ticket = try self.writeIntentsExtraBatchStaged(txn_id, intents, predicates, extra_batch);
+        try ticket.wait();
+    }
+
+    /// Staged counterpart of `writeIntentsExtraBatch`: stages this write's
+    /// intents (and their admission/reservation bookkeeping) and returns a
+    /// durability ticket instead of blocking for the fsync, mirroring
+    /// `resolveIntentsWithExtraBatchStaged`'s split (lite-single-commit-
+    /// write-path.md §3.2/§3.2a). This itself reads back the transaction
+    /// record an earlier `initTransaction*` call wrote, so a caller must
+    /// not defer that earlier call's `wait()` past this one: a group-commit
+    /// member is only applied -- and so only readable -- once something
+    /// drives/waits its group, not at `enqueue` time (see
+    /// `writeTransactionInternal`'s doc comment in `storage/db/db.zig`).
+    pub fn writeIntentsExtraBatchStaged(
+        self: *TxnManager,
+        txn_id: TxnId,
+        intents: []const WriteIntent,
+        predicates: []const VersionPredicate,
+        extra_batch: MutationExtraBatch,
+    ) !backend_erased.Ticket {
         try self.requireNativeMutationPin(extra_batch.native_pin);
         if (extra_batch.index_span_digests.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
         for (intents) |intent| {
@@ -1471,9 +1551,10 @@ pub const TxnManager = struct {
         }
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        try self.applyBatchWithReservation(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() });
+        const ticket = try self.applyBatchStaged(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() }, null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
+        return ticket;
     }
 
     /// Replicated phase-one visibility barrier for an externally committed
@@ -1520,12 +1601,15 @@ pub const TxnManager = struct {
         return floor;
     }
 
-    fn fenceMissingExternalAbort(self: *TxnManager, id: TxnId, timestamp: u64, extra: ResolutionExtraBatch) !ResolutionOutcome {
+    fn fenceMissingExternalAbort(self: *TxnManager, id: TxnId, timestamp: u64, extra: ResolutionExtraBatch) !StagedResolutionOutcome {
         const owner = extra.external_decision_owner.?;
         try owner.validate();
         if (try self.externalExpiryFloor() >= owner.expires_at_unix_ns) {
-            try self.applyBatch(extra.completion_writes, extra.completion_deletes, null);
-            return .{ .applied = false, .replay_sequence = 0 };
+            const ticket = if (extra.completion_writes.len != 0 or extra.completion_deletes.len != 0)
+                try self.applyBatchStaged(extra.completion_writes, extra.completion_deletes, null, null, null)
+            else
+                null;
+            return .{ .outcome = .{ .applied = false, .replay_sequence = 0 }, .ticket = ticket };
         }
         const key = makeRecordKey(id);
         const record: TxnRecord = .{ .status = .aborted, .begin_timestamp = timestamp, .commit_version = 0, .created_at = timestamp, .finalized_at = timestamp, .retain_terminal = true, .intents_resolved = true, .intents_resolved_known = true, .external_decision_owner = owner, .native_pin = extra.native_pin orelse self.native_relation_pin };
@@ -1548,8 +1632,8 @@ pub const TxnManager = struct {
                 try writes.append(self.alloc, .{ .key = &resolved_key, .value = value });
         }
         try writes.appendSlice(self.alloc, extra.completion_writes);
-        try self.applyBatch(writes.items, extra.completion_deletes, null);
-        return .{ .applied = false, .replay_sequence = 0 };
+        const ticket = try self.applyBatchStaged(writes.items, extra.completion_deletes, null, null, null);
+        return .{ .outcome = .{ .applied = false, .replay_sequence = 0 }, .ticket = ticket };
     }
 
     /// Resolve intents: commit applies them to real keys, abort deletes them.
@@ -1560,6 +1644,12 @@ pub const TxnManager = struct {
         _ = try self.resolveIntentsWithExtraBatch(txn_id, status, timestamp, .{});
     }
 
+    /// Blocking convenience wrapper over `resolveIntentsWithExtraBatchStaged`:
+    /// identical behavior to before that split existed (every caller here
+    /// still gets a fully durable outcome before this returns). Callers on
+    /// the synchronous write ack path that need to release locks between
+    /// staging and durability (lite-single-commit-write-path.md §3.2/§3.2a)
+    /// should call the staged form directly instead.
     pub fn resolveIntentsWithExtraBatch(
         self: *TxnManager,
         txn_id: TxnId,
@@ -1567,6 +1657,31 @@ pub const TxnManager = struct {
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
     ) !ResolutionOutcome {
+        // The tag must wrap `wait()` too: the actual apply/fsync happens
+        // there, not at `commitStaged`/`enqueue` time (see
+        // `initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch`'s
+        // comment above).
+        const wal_trace_scope = wal_trace.scopeDefault(.relational_intent_resolve);
+        defer wal_trace_scope.end();
+        const staged = try self.resolveIntentsWithExtraBatchStaged(txn_id, status, timestamp, extra_batch);
+        if (staged.ticket) |ticket| try ticket.wait();
+        return staged.outcome;
+    }
+
+    /// Staged counterpart: stages every durable effect of this resolution
+    /// attempt (the transaction record transition, applied intents, and any
+    /// completion writes) and returns a ticket instead of blocking for the
+    /// fsync, mirroring `docstore.zig`'s `Batch.commitStaged`/`StagedBatch`
+    /// split. `ticket` is `null` only when this call wrote nothing at all
+    /// (the no-op terminal-retry branch below with no completion writes or
+    /// deletes) -- there is then nothing to wait for.
+    pub fn resolveIntentsWithExtraBatchStaged(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+    ) !StagedResolutionOutcome {
         try self.requireNativeMutationPin(extra_batch.native_pin);
         const rec_key = makeRecordKey(txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
@@ -1646,13 +1761,14 @@ pub const TxnManager = struct {
             if (!retain_metadata_ack) if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             };
-            if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0) {
-                try self.applyBatch(completion_writes.items, extra_batch.completion_deletes, null);
-            }
-            return .{
+            const ticket: ?backend_erased.Ticket = if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0)
+                try self.applyBatchStaged(completion_writes.items, extra_batch.completion_deletes, null, null, null)
+            else
+                null;
+            return .{ .outcome = .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
-            };
+            }, .ticket = ticket };
         }
 
         // Scan all intents for this txn
@@ -1708,11 +1824,11 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &prepared_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyBatchWithReservation(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
-            return .{
+            const ticket = try self.applyBatchStaged(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null);
+            return .{ .outcome = .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
-            };
+            }, .ticket = ticket };
         }
 
         if (extra_batch.skip_all_intent_application and extra_batch.skip_intent_keys.len != 0) {
@@ -1872,7 +1988,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
+        const ticket = try self.applyBatchStaged(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -1888,10 +2004,10 @@ pub const TxnManager = struct {
                 .reason = if (status == .committed) "committed" else "aborted",
             });
         }
-        return .{
+        return .{ .outcome = .{
             .applied = true,
             .replay_sequence = record.replay_sequence,
-        };
+        }, .ticket = ticket };
     }
 
     pub fn collectIntentBatch(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !IntentBatch {
@@ -2888,6 +3004,21 @@ pub const TxnManager = struct {
     /// linearizable with concurrent intent admission.
     pub fn checkOrdinaryWriteConflicts(self: *TxnManager, user_keys: []const []const u8) !void {
         if (user_keys.len == 0) return;
+        var probe = try self.store.beginProbe();
+        defer probe.abort();
+        try self.checkOrdinaryWriteConflictsWithProbe(user_keys, &probe);
+    }
+
+    /// Same as `checkOrdinaryWriteConflicts`, reading through an already-open
+    /// probe/read transaction instead of opening (and aborting) its own.
+    /// perf/lwa-write-overhead: lets a mutation's own prep phase share one
+    /// transaction across this and its other read-only checks instead of
+    /// paying a separate overlay pin/unpin for each. `probe` need only
+    /// support `getManySorted`/`get`, matching both `backend_erased.ProbeTxn`
+    /// (this function's own default) and `docstore.DocStore.Txn` (the
+    /// concrete type the DB layer's shared prep-phase probe uses).
+    pub fn checkOrdinaryWriteConflictsWithProbe(self: *TxnManager, user_keys: []const []const u8, probe: anytype) !void {
+        if (user_keys.len == 0) return;
 
         const lock_keys = try self.alloc.alloc([]u8, user_keys.len);
         var initialized: usize = 0;
@@ -2913,8 +3044,6 @@ pub const TxnManager = struct {
         @memset(owners, null);
 
         const have_readers = blk: {
-            var probe = try self.store.beginProbe();
-            defer probe.abort();
             try probe.getManySorted(key_refs, owners);
             for (owners) |maybe_owner| {
                 const owner = maybe_owner orelse continue;
@@ -3517,6 +3646,11 @@ pub const TxnManager = struct {
         try self.applyBatch(extra_batch.writes, extra_batch.deletes, null);
     }
 
+    fn applyMutationExtraBatchStaged(self: *TxnManager, extra_batch: MutationExtraBatch) !backend_erased.Ticket {
+        if (extra_batch.writes.len == 0 and extra_batch.deletes.len == 0) return backend_erased.Ticket.alreadyDurable();
+        return try self.applyBatchStaged(extra_batch.writes, extra_batch.deletes, null, null, null);
+    }
+
     fn applyBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
         return self.applyBatchWithReservation(writes, deletes, replay, null);
     }
@@ -3527,6 +3661,17 @@ pub const TxnManager = struct {
     }
 
     fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !void {
+        var ticket = try self.applyBatchStaged(writes, deletes, replay, reservation, participant);
+        try ticket.wait();
+    }
+
+    /// Staged counterpart of `applyBatchWithParticipant`: stages the batch
+    /// and returns a durability ticket instead of blocking for the fsync.
+    /// `backend_erased.Batch.commitStaged` is already backend-agnostic (see
+    /// its own doc comment): a backend without a staged commit path, e.g.
+    /// the hosted LSM backend, returns an already-durable ticket from the
+    /// ordinary blocking commit, so this never changes behavior there.
+    fn applyBatchStaged(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !backend_erased.Ticket {
         // Transaction extras are not a directory initialization/repair API.
         for (writes) |kv| if (std.mem.startsWith(u8, kv.key, topology_debt.family_prefix)) return error.InvalidCommitMetadata;
         for (deletes) |key| if (std.mem.startsWith(u8, key, topology_debt.family_prefix)) return error.InvalidCommitMetadata;
@@ -3602,7 +3747,7 @@ pub const TxnManager = struct {
             }
         };
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
-        try batch.commit();
+        return try batch.commitStaged();
     }
 
     fn traceWriteIntentSuccess(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate) void {

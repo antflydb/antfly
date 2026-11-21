@@ -40,13 +40,14 @@ test "initial FK retirement scope is trusted deployment policy, not a client opt
     try std.testing.expectEqual(publication.InitialRetirementScope.hosted_store, retirementScopeForDeployment(.serverless));
 }
 
-fn parentsSettled(tables_snapshot: []const records.TableRecord, child_name: []const u8, derived: []const publication.DerivedTransition) !bool {
+fn parentsSettled(alloc: std.mem.Allocator, tables_snapshot: []const records.TableRecord, child_name: []const u8, derived: []const publication.DerivedTransition) !bool {
+    var parents = try existing.parentsByName(alloc, tables_snapshot, derived);
+    defer parents.deinit(alloc);
+    _ = parents.remove(child_name);
     var pending = false;
-    for (derived) |item| {
-        if (std.mem.eql(u8, item.parent_table_name, child_name)) continue;
-        const parent = for (tables_snapshot) |table| {
-            if (std.mem.eql(u8, table.name, item.parent_table_name)) break table;
-        } else return error.ForeignKeyParentTableNotFound;
+    var it = parents.valueIterator();
+    while (it.next()) |slot| {
+        const parent = slot.* orelse return error.ForeignKeyParentTableNotFound;
         if (parent.read_schema_json.len != 0) pending = true;
     }
     return !pending;
@@ -69,7 +70,7 @@ fn settledParentSnapshot(
         var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
         var release = true;
         defer if (release) server.source.freeAdminSnapshot(&snapshot);
-        if (try parentsSettled(snapshot.tables, child_name, derived)) {
+        if (try parentsSettled(server.alloc, snapshot.tables, child_name, derived)) {
             release = false;
             return snapshot;
         }
@@ -95,6 +96,25 @@ fn namespaceId(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, cont
     return error.NamespaceNotFound;
 }
 
+/// Resolve only the self edge after metadata has reserved the candidate's
+/// physical identity. External edges have already been bound at DDL ingress.
+fn bindReservedSelf(alloc: std.mem.Allocator, schema_json: []const u8, logical_name: []const u8, physical_name: []const u8) ![]const u8 {
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, schema_json, .{ .allocate = .alloc_always, .parse_numbers = false });
+    if (value != .object) return error.InvalidGenerationPublication;
+    const fks = value.object.getPtr("foreign_keys") orelse return schema_json;
+    if (fks.* != .array) return error.InvalidGenerationPublication;
+    var changed = false;
+    for (fks.array.items) |*fk| {
+        if (fk.* != .object) return error.InvalidGenerationPublication;
+        const parent = fk.object.getPtr("parent_table") orelse return error.InvalidGenerationPublication;
+        if (parent.* != .string) return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, parent.string, logical_name)) continue;
+        parent.* = .{ .string = physical_name };
+        changed = true;
+    }
+    return if (changed) try std.json.Stringify.valueAlloc(alloc, value, .{}) else schema_json;
+}
+
 pub fn build(
     server: *server_mod.ApiHttpServer,
     alloc: std.mem.Allocator,
@@ -103,7 +123,7 @@ pub fn build(
     target: domain.Target,
     request: tables.CreateTableRequest,
 ) !publication.InitialCreatePlan {
-    return buildWithScratch(server, alloc, alloc, context, identity, target, request);
+    return buildWithScratch(server, alloc, alloc, context, identity, target, request, null);
 }
 
 pub fn buildWithScratch(
@@ -114,8 +134,9 @@ pub fn buildWithScratch(
     identity: ?server_mod.AuthenticatedIdentity,
     target: domain.Target,
     request: tables.CreateTableRequest,
+    expected_namespace_id: ?u64,
 ) !publication.InitialCreatePlan {
-    return buildWithGeneratedNamesAndScratch(server, alloc, scratch, context, identity, target, request, &.{});
+    return buildWithCreationCopyAndScratch(server, alloc, scratch, context, identity, target, request, &.{}, &.{}, null, expected_namespace_id);
 }
 
 pub fn buildWithGeneratedNames(
@@ -155,7 +176,7 @@ pub fn buildWithColumnSequencesAndScratch(
     generated_constraint_names: []const []const u8,
     column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation,
 ) !publication.InitialCreatePlan {
-    return buildWithCreationCopyAndScratch(server, alloc, scratch, context, identity, target, request, generated_constraint_names, column_sequences, null);
+    return buildWithCreationCopyAndScratch(server, alloc, scratch, context, identity, target, request, generated_constraint_names, column_sequences, null, null);
 }
 
 pub fn buildWithCreationCopyAndScratch(
@@ -169,6 +190,7 @@ pub fn buildWithCreationCopyAndScratch(
     generated_constraint_names: []const []const u8,
     column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation,
     creation_copy: ?@import("../metadata/initial_creation_copy.zig").Input,
+    expected_namespace_id: ?u64,
 ) !publication.InitialCreatePlan {
     try context.ensureActive();
     const logical_child = try target.resourceNameAlloc(alloc);
@@ -182,7 +204,8 @@ pub fn buildWithCreationCopyAndScratch(
     var trusted = context;
     trusted.setting_admin = true;
     trusted.fk_generation_publication_authority = true;
-    const namespace_id = try namespaceId(server, alloc, trusted, target);
+    const namespace_id = try server.catalogNamespaceId(alloc, trusted, target);
+    if (expected_namespace_id) |expected| if (namespace_id != expected) return error.CatalogGenerationChanged;
     var candidate = tables.deriveTableRecord("", request);
     candidate.table_id = 0;
     const prepare_bytes = try server.source.systemCatalog(alloc, trusted, .{ .fk_initial_create_prepare = .{
@@ -196,12 +219,14 @@ pub fn buildWithCreationCopyAndScratch(
         .column_sequences = column_sequences,
     } });
     const prepared = try std.json.parseFromSliceLeaky(publication.InitialCreatePrepare, alloc, prepare_bytes, .{ .allocate = .alloc_always });
+    try context.checkMetadataIncarnation(prepared.metadata_incarnation);
     var child = prepared.child;
     child.schema_json = try @import("../metadata/relation_create.zig").bindReservedSelf(alloc, child.schema_json, target.table, child.name);
     const routing_derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
     if (routing_derived.len == 0) return error.InvalidGenerationPublication;
     var snapshot = try settledParentSnapshot(server, context, child.name, routing_derived);
     defer server.source.freeAdminSnapshot(&snapshot);
+    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
     // Calculate support definitions against this settled read cut, but do
     // not publish any parent here. Begin owns each exact before/after pair in
     // one metadata transaction with the hidden child/name reservation.
@@ -216,71 +241,45 @@ pub fn buildWithCreationCopyAndScratch(
         try io.randomSecure(&id);
         if (std.mem.readInt(u64, id[0..8], .little) != 0 and std.mem.readInt(u64, id[8..16], .little) != 0) break;
     }
+    var self_transitions: []const publication.Transition = &.{};
     var parents: std.ArrayList(publication.Parent) = .empty;
-    var self_transitions: std.ArrayList(publication.Transition) = .empty;
-    var self_target_checked = false;
-    for (derived) |item| {
-        if (std.mem.eql(u8, item.parent_table_name, child.name)) {
-            if (!self_target_checked) {
-                try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(scratch, child.schema_json, child.name, child.schema_json);
-                self_target_checked = true;
-            }
-            try self_transitions.append(alloc, item.transition);
+    var groups: existing.ParentGroups = .{ .entries = derived };
+    var by_name = try existing.parentsByName(scratch, snapshot.tables, derived);
+    defer by_name.deinit(scratch);
+    _ = by_name.remove(child.name);
+    var work = std.heap.ArenaAllocator.init(scratch);
+    defer work.deinit();
+    const temporary = work.allocator();
+    var index: existing.RangeIndex = .{};
+    try existing.authorizeParents(server, temporary, context, identity, &by_name, &index);
+    try index.collect(temporary, snapshot.ranges);
+    var support: std.AutoHashMapUnmanaged(u64, *const records.TableRecord) = .empty;
+    for (witness.parents) |*parent| try support.put(temporary, parent.before.table_id, &parent.after);
+    while (groups.next()) |group| {
+        const name = group[0].parent_table_name;
+        if (std.mem.eql(u8, name, child.name)) {
+            try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(scratch, child.schema_json, child.name, child.schema_json);
+            self_transitions = try existing.ParentGroups.transitions(alloc, group);
             continue;
         }
-        const parent_table: records.TableRecord = for (snapshot.tables) |table| {
-            if (std.mem.eql(u8, table.name, item.parent_table_name)) break table;
-        } else return error.ForeignKeyParentTableNotFound;
+        const parent_table = (by_name.get(name).? orelse return error.ForeignKeyParentTableNotFound).*;
         if (parent_table.table_id == prepared.child.table_id or parent_table.storage_migration != null or
             parent_table.relational_retirement_json.len != 0 or parent_table.restore_backup_id.len != 0)
             return error.TableTransitionActive;
-        var found: ?*publication.Parent = null;
-        for (parents.items) |*parent| if (parent.table.table_id == parent_table.table_id) {
-            found = parent;
-            break;
-        };
-        if (found == null) {
-            const names = try server.logicalTableNamesInArena(alloc, context, &.{parent_table.name});
-            if (names.len != 1 or !try server_mod.tablePermissionCurrentlyAllowed(identity, names[0], .admin) or
-                try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null)
-                return error.Forbidden;
-            const ranges = try existing.rangesFor(alloc, snapshot, parent_table.table_id);
-            const support_after: ?records.TableRecord = for (witness.parents) |support_parent| {
-                if (support_parent.before.table_id == parent_table.table_id) break try existing.ownedTableForPlan(alloc, support_parent.after);
-            } else null;
-            try parents.append(alloc, .{
-                .table = try existing.ownedTableForPlan(alloc, parent_table),
-                .ranges = ranges,
-                .fences = if (support_pending) &.{} else try existing.ownerFences(server, alloc, context, id, parent_table, ranges, .child_generation_parent),
-                .transitions = &.{},
-                .support_before = if (support_after != null) try existing.ownedTableForPlan(alloc, parent_table) else null,
-                .support_after = support_after,
-            });
-            found = &parents.items[parents.items.len - 1];
-        }
-        const old = found.?.transitions;
-        const next = try alloc.alloc(publication.Transition, old.len + 1);
-        @memcpy(next[0..old.len], old);
-        next[old.len] = item.transition;
-        found.?.transitions = next;
+        const ranges = try index.clone(alloc, parent_table.table_id);
+        const support_after = if (support.get(parent_table.table_id)) |after| try existing.ownedTableForPlan(alloc, after.*) else null;
+        try parents.append(alloc, .{
+            .table = try existing.ownedTableForPlan(alloc, parent_table),
+            .ranges = ranges,
+            .fences = if (support_pending) &.{} else try existing.ownerFences(server, alloc, context, id, parent_table, ranges, .child_generation_parent),
+            .transitions = try existing.ParentGroups.transitions(alloc, group),
+            .support_before = if (support_after != null) try existing.ownedTableForPlan(alloc, parent_table) else null,
+            .support_after = support_after,
+        });
     }
     std.mem.sort(publication.Parent, parents.items, {}, struct {
         fn less(_: void, lhs: publication.Parent, rhs: publication.Parent) bool {
             return lhs.table.table_id < rhs.table.table_id;
-        }
-    }.less);
-    for (parents.items) |*parent| {
-        const sorted = try alloc.dupe(publication.Transition, parent.transitions);
-        std.mem.sort(publication.Transition, sorted, {}, struct {
-            fn less(_: void, lhs: publication.Transition, rhs: publication.Transition) bool {
-                return std.mem.lessThan(u8, lhs.constraint_name, rhs.constraint_name);
-            }
-        }.less);
-        parent.transitions = sorted;
-    }
-    std.mem.sort(publication.Transition, self_transitions.items, {}, struct {
-        fn less(_: void, lhs: publication.Transition, rhs: publication.Transition) bool {
-            return std.mem.lessThan(u8, lhs.constraint_name, rhs.constraint_name);
         }
     }.less);
     const plan: publication.InitialCreatePlan = .{
@@ -288,6 +287,7 @@ pub fn buildWithCreationCopyAndScratch(
         .historical_reference_coverage = try publication.schemaHasUnvalidatedForeignKeys(alloc, child.schema_json),
         .id = id,
         .catalog_coverage = .checks_v1,
+        .expected_incarnation = context.expectedMetadataIncarnation(),
         .retirement_scope = retirementScopeForDeployment(server.cfg.deployment_mode),
         .column_sequences = column_sequences,
         .creation_copy = creation_copy,
@@ -301,7 +301,8 @@ pub fn buildWithCreationCopyAndScratch(
         .child_ranges = prepared.child_ranges,
         .parents = try parents.toOwnedSlice(alloc),
         .support_pending = support_pending,
-        .self_transitions = try self_transitions.toOwnedSlice(alloc),
+        .support_schema_format = if (support_pending) .lineage_v1 else .legacy,
+        .self_transitions = self_transitions,
         .logical_name = try alloc.dupe(u8, target.table),
         .namespace_id = namespace_id,
     };
@@ -325,18 +326,27 @@ pub fn sealSupport(
     if (status.phase != .preparing_support or !status.plan.support_pending) return error.GenerationPublicationChanged;
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
+    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
     const parents = try alloc.alloc(publication.Parent, status.plan.parents.len);
+    var work = std.heap.ArenaAllocator.init(alloc);
+    defer work.deinit();
+    const temporary = work.allocator();
+    var index: existing.RangeIndex = .{};
+    var current_by_id: std.AutoHashMapUnmanaged(u64, *const records.TableRecord) = .empty;
+    for (status.plan.parents) |pending| try index.want(temporary, pending.table.table_id);
+    for (snapshot.tables) |*table| if (index.selected.contains(table.table_id)) {
+        try current_by_id.put(temporary, table.table_id, table);
+    };
+    try index.collect(temporary, snapshot.ranges);
     for (status.plan.parents, parents) |pending, *parent| {
-        const current = for (snapshot.tables) |table| {
-            if (table.table_id == pending.table.table_id) break table;
-        } else return error.GenerationPublicationChanged;
+        const current = (current_by_id.get(pending.table.table_id) orelse return error.GenerationPublicationChanged).*;
         if (current.read_schema_json.len != 0) return error.ForeignKeyParentSchemaPending;
         if (pending.support_after) |after| {
             if (!std.mem.eql(u8, current.schema_json, after.schema_json)) return error.GenerationPublicationChanged;
         } else if (!std.mem.eql(u8, current.schema_json, pending.table.schema_json)) {
             return error.GenerationPublicationChanged;
         }
-        const ranges = try existing.rangesFor(alloc, snapshot, current.table_id);
+        const ranges = try index.clone(alloc, current.table_id);
         parent.* = .{
             .table = try existing.ownedTableForPlan(alloc, current),
             .ranges = ranges,
@@ -363,10 +373,10 @@ test "initial FK plan waits for all external parent schema migrations" {
         .{ .parent_table_name = "parent_b", .transition = undefined },
         .{ .parent_table_name = "child", .transition = undefined },
     };
-    try std.testing.expect(!try parentsSettled(&parents, "child", &derived));
+    try std.testing.expect(!try parentsSettled(std.testing.allocator, &parents, "child", &derived));
     var finalized = parents;
     finalized[0].read_schema_json = "";
-    try std.testing.expect(try parentsSettled(&finalized, "child", &derived));
+    try std.testing.expect(try parentsSettled(std.testing.allocator, &finalized, "child", &derived));
     finalized[1].name = "renamed";
-    try std.testing.expectError(error.ForeignKeyParentTableNotFound, parentsSettled(&finalized, "child", &derived));
+    try std.testing.expectError(error.ForeignKeyParentTableNotFound, parentsSettled(std.testing.allocator, &finalized, "child", &derived));
 }

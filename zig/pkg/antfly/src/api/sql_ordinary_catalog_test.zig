@@ -171,7 +171,7 @@ const Source = struct {
         var ready = false;
         for (0..200) |_| {
             coordinator.next_round_at_ns = 0;
-            _ = try coordinator.step(self.store, alloc, group, @splat('1'), 9, @import("antfly_platform").time.monotonicNs());
+            _ = try coordinator.step(self.store, alloc, group, @splat('1'), 9, @import("antfly_platform").time.monotonicNs(), .startup);
             const work = try self.store.relationReconciliationWork(group);
             if (work.current) |state| if (state.phase == .ready and state.coverage == .constraint_names and work.root != null and work.root.?.eql(local.system_catalog_relation_reconciliation.Generation.of(&state))) {
                 ready = true;

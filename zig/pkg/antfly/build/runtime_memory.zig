@@ -150,6 +150,20 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
     }
     if (unit == .api_kernel and
         std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
+        target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
+        target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
+        profile.optimize == .debug and !profile.strip and !profile.cpu_inference and !profile.sanitize_thread)
+    {
+        // Production archive ownership, PR #1734 run 44161718346 (native
+        // GNU LLVM Debug, no CPU inference): 17,568,182,272 bytes against
+        // the 12 GiB fallback. Add 10% and round to 128 MiB, as above.
+        const peak: usize = 17_568_182_272;
+        const quantum: usize = 128 * 1024 * 1024;
+        return (std.math.divCeil(usize, peak + peak / 10, quantum) catch unreachable) * quantum;
+    }
+    if (unit == .api_kernel and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
         profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and profile.host.abi == .gnu and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
         target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
@@ -641,9 +655,14 @@ test "native Linux LLVM Debug claims cover measured peaks and account for overla
     fallback = profile;
     fallback.strip = true;
     try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    // Without CPU inference this is the production-archive build, which
+    // claims its own measured peak instead of the fallback.
     fallback = profile;
     fallback.cpu_inference = false;
-    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    const archive_peak: usize = 17_568_182_272;
+    const archive = runtimeCompileMaxRss(.api_kernel, fallback);
+    try std.testing.expect(archive >= archive_peak + archive_peak / 10);
+    try std.testing.expect(archive <= archive_peak + archive_peak / 10 + 128 * 1024 * 1024);
     fallback = profile;
     fallback.sanitize_thread = true;
     try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));

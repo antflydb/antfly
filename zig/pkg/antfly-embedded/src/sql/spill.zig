@@ -28,6 +28,49 @@ const snappy = @import("../encoding/snappy.zig");
 const Quota = @import("antfly_platform").allocator.reclamation.Quota;
 const HostBudget = @import("../storage/resource_manager.zig").BudgetedAllocator;
 
+/// Search spills share aggregate reservations but own their files and
+/// cancellation context for the duration of a single request.
+var search_spill_mutex: std.atomic.Mutex = .unlocked;
+var search_spill_budget: ?Manager = null;
+
+pub fn initSearchSpill(alloc: Allocator, io: std.Io, context: *anyopaque, checkpoint: *const fn (*anyopaque) anyerror!void) Manager {
+    return .{ .alloc = alloc, .io = io, .context = context, .checkpoint = checkpoint, .admit_search_on_create = true };
+}
+
+fn reserveSearchSpill(manager: *Manager) !void {
+    if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
+    const Check = struct {
+        fn idle(_: *anyopaque) !void {}
+    };
+    try manager.check();
+    while (!search_spill_mutex.tryLock()) {
+        try manager.check();
+        std.atomic.spinLoopHint();
+    }
+    defer search_spill_mutex.unlock();
+    if (search_spill_budget == null) {
+        search_spill_budget = .{
+            .alloc = std.heap.page_allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .context = &search_spill_mutex,
+            .checkpoint = Check.idle,
+            .max_bytes = 4 * 1024 * 1024 * 1024,
+            .max_files = 256,
+        };
+    }
+    const child = search_spill_budget.?.admit(manager.alloc, manager.max_bytes) orelse return error.SqlProgramLimitExceeded;
+    manager.reservation_parent = child.reservation_parent;
+    manager.reservation_bytes = child.reservation_bytes;
+    manager.max_bytes = child.max_bytes;
+}
+
+pub fn searchSpillUnavailable(err: anyerror) bool {
+    return switch (err) {
+        error.SqlProgramLimitExceeded, error.NoSpaceLeft, error.FileTooBig, error.DiskQuota, error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem, error.FileNotFound, error.InputOutput, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => true,
+        else => false,
+    };
+}
+
 pub const Manager = struct {
     const BudgetLink = struct { manager: *Manager, allocator: Allocator, hook: @import("memory_budget.zig").Reclaimer };
     payload_budget_links: [32]BudgetLink = undefined,
@@ -40,6 +83,7 @@ pub const Manager = struct {
     /// execution lease. Its independent manager cannot compete with siblings.
     reservation_parent: ?*Manager = null,
     reservation_bytes: u64 = 0,
+    admit_search_on_create: bool = false,
     reserved_bytes: u64 = 0,
     reserved_files: usize = 0,
     max_files: usize = 64,
@@ -454,6 +498,9 @@ pub const Manager = struct {
         self.lock();
         defer self.mutex.unlock();
         if (self.max_bytes == 0) return error.SqlProgramLimitExceeded;
+        const admitting = self.admit_search_on_create and self.reservation_parent == null;
+        if (admitting) try reserveSearchSpill(self);
+        errdefer if (admitting) self.releaseAdmission();
         try self.open();
         if (self.files + self.reserved_files >= self.max_files) return error.SqlProgramLimitExceeded;
         if (self.quota_parent) |parent| try parent.reserveFile();
@@ -10584,6 +10631,27 @@ test "SQL shared spill runs retain balanced tiers independently of descriptor ca
     try std.testing.expect(sort.shared_directory.items.len > sort.run_limit);
     try std.testing.expect(manager.merged_rows < count * 16);
     try std.testing.expect(manager.peak_files <= 1);
+}
+
+test "optional numeric range search spill admission is lazy" {
+    if (comptime !native_spill_supported) return error.SkipZigTest;
+    const Check = struct {
+        fn run(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager = initSearchSpill(a, std.Io.Threaded.global_single_threaded.io(), &context, Check.run);
+    defer manager.deinit();
+    {
+        var sort = Sort.init(a, &manager, &.{.{}}, 512 * 1024);
+        defer sort.deinit();
+        try sort.add(.{ .keys = &.{Datum.fromJson(.{ .integer = 1 })}, .values = &.{}, .ordinal = 1 });
+        try sort.finish();
+        try std.testing.expect(manager.reservation_parent == null);
+    }
+    var file = try manager.create();
+    defer file.close();
+    try std.testing.expect(manager.reservation_parent != null);
 }
 
 test "SQL scoped spill owners share disk and descriptor admission and unwind" {

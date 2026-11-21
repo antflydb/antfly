@@ -575,7 +575,12 @@ fn ColumnBuilder(comptime DBType: type) type {
                 self.db.core.lockApplyShared();
                 defer self.db.core.unlockApplyShared();
                 if (self.namespace != self.db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-                var txn = try self.db.core.store.beginWriteTxn();
+                // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): this
+                // block only stages an in-progress build under building_key,
+                // not yet linked into the live manifest. A crash before
+                // publication leaves it as abandoned-builder garbage, which
+                // the next maintenance pass already knows how to reclaim.
+                var txn = try self.db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
                 var live = true;
                 defer if (live) txn.abort();
                 if (!try sameValue(&txn, manifest_key, &self.expected_manifest) or !try sameValue(&txn, building_key, &self.build_token)) return error.PreparedGenerationChanged;
@@ -906,7 +911,7 @@ fn ColumnBuilder(comptime DBType: type) type {
     };
 }
 
-fn sameValue(txn: *store_mod.DocStore.Txn, key: []const u8, expected: []const u8) !bool {
+fn sameValue(txn: anytype, key: []const u8, expected: []const u8) !bool {
     const value = txn.get(key) catch |err| switch (err) {
         error.NotFound => return false,
         else => return err,
@@ -967,7 +972,7 @@ pub fn validatePayloadOwnershipForTest(db: anytype, alloc: alloc_type) !void {
     }
 }
 
-fn deleteIfPresent(txn: *store_mod.DocStore.Txn, key: []const u8) !void {
+fn deleteIfPresent(txn: anytype, key: []const u8) !void {
     txn.delete(key) catch |err| switch (err) {
         error.NotFound => {},
         else => return err,
@@ -997,7 +1002,12 @@ pub fn rebuild(db: anytype, alloc: alloc_type, force: bool, adaptive: bool) !boo
     var initial_locked = true;
     defer if (initial_locked) db.core.unlockApplyShared();
     const namespace = db.core.schemaNamespaceGeneration();
-    var start = try db.core.store.beginWriteTxn();
+    // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): both outcomes
+    // below -- revoking an abandoned builder, or bootstrapping generation 0
+    // of the columnar index -- are redoable scheduling state for a derived
+    // secondary index. A crash just makes the next maintenance pass redo
+    // the same decision from the primary data that is already durable.
+    var start = try db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
     var start_live = true;
     defer if (start_live) start.abort();
     const current = start.get(manifest_key) catch |err| switch (err) {
@@ -1083,7 +1093,7 @@ pub fn rebuild(db: anytype, alloc: alloc_type, force: bool, adaptive: bool) !boo
     return true;
 }
 
-fn bootstrapBoundary(txn: *store_mod.DocStore.Txn, manifest: Manifest) !?[]const u8 {
+fn bootstrapBoundary(txn: anytype, manifest: Manifest) !?[]const u8 {
     const encoded = txn.get(bootstrap_key) catch |err| switch (err) {
         error.NotFound => return if (manifest.initializing) error.InvalidColumnSegment else null,
         else => return err,
@@ -1110,7 +1120,7 @@ const Cleanup = struct {
         if (self.inline_page) |page| alloc.free(page);
     }
 
-    fn publish(self: @This(), txn: *store_mod.DocStore.Txn, token: []const u8) !u64 {
+    fn publish(self: @This(), txn: anytype, token: []const u8) !u64 {
         if (self.pages != 0) try txn.put(cleanup_key, token);
         // The common one-page case compare-clears in the publication itself:
         // no journal write, extra commit, or post-publication cleanup work.
@@ -1118,7 +1128,7 @@ const Cleanup = struct {
     }
 };
 
-fn clearPage(txn: *store_mod.DocStore.Txn, page: []const u8) !u64 {
+fn clearPage(txn: anytype, page: []const u8) !u64 {
     var decoder = Decoder{ .bytes = page };
     var cleared: u64 = 0;
     while (decoder.bytes.len != 0) {
@@ -1168,7 +1178,11 @@ fn stageCleanup(db: anytype, alloc: alloc_type, read: *store_mod.DocStore.Txn, f
         db.core.lockApplyShared();
         defer db.core.unlockApplyShared();
         if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-        var txn = try db.core.store.beginWriteTxn();
+        // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): a dirty-page
+        // journal page staged under an in-progress build_token. Losing it on
+        // crash just abandons the in-progress build (reclaimed like any
+        // other abandoned builder); the source dirty markers are untouched.
+        var txn = try db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         var live = true;
         defer if (live) txn.abort();
         if (!try sameValue(&txn, manifest_key, manifest) or !try sameValue(&txn, building_key, &token)) return error.PreparedGenerationChanged;
@@ -1222,7 +1236,11 @@ fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namesp
         }
         if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
-        var txn = try db.core.store.beginWriteTxn();
+        // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): deleting a
+        // dirty-journal cleanup page IS the durable progress cursor (see the
+        // doc comment above drainCleanup). Redoing one page on crash just
+        // re-clears the same already-retired dirty markers; idempotent.
+        var txn = try db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         var live = true;
         defer if (live) txn.abort();
         if (!try sameValue(&txn, cleanup_key, token)) return error.PreparedGenerationChanged;
@@ -1282,7 +1300,7 @@ fn blockVersion(read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u6
     return std.mem.readInt(u32, meta[4..8], .little);
 }
 
-fn retireBlock(txn: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, block: u64) !void {
+fn retireBlock(txn: anytype, alloc: alloc_type, generation: u64, block: u64) !void {
     // Directory removal and this intent commit atomically. Payload ownership
     // remains intact until bounded GC deletes each column's metadata and
     // releases its references in the same transaction. Readers use MVCC.
@@ -1490,7 +1508,13 @@ fn selectReady(db: anytype, read: *store_mod.DocStore.Txn, alloc: alloc_type, ma
     _ = maintenance.scheduler_candidates.fetchAdd(examined, .monotonic);
     if (!std.mem.eql(u8, next_id, discovery_resume)) try writes.append(alloc, .{ .key = discovery_key, .value = try directoryValue(alloc, manifest.generation, next_id) });
     if (writes.items.len != 0 or deletes.items.len != 0) {
-        var txn = try db.core.store.beginWriteTxn();
+        // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): this is the
+        // columnar maintenance scheduler's own bookkeeping -- which range is
+        // deferred and until when, the discovery cursor's resume point --
+        // never the column data itself. Losing it on a crash just redoes
+        // the same scheduling decision on the next pass; never force its
+        // own fsync for an owner-only background sweep.
+        var txn = try db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         var live = true;
         defer if (live) txn.abort();
         if (!try sameValue(&txn, manifest_key, manifest_bytes)) return .{};
@@ -1687,7 +1711,7 @@ fn rangeClean(read: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range) !b
     return !try dirty.overlaps(alloc, range.start, range.end);
 }
 
-fn scheduleMaintenance(txn: *store_mod.DocStore.Txn, alloc: alloc_type, turn: u64, selected: ?[]const u8) !void {
+fn scheduleMaintenance(txn: anytype, alloc: alloc_type, turn: u64, selected: ?[]const u8) !void {
     var encoded: [8]u8 = undefined;
     std.mem.writeInt(u64, &encoded, turn +% 1, .little);
     try txn.put(maintenance_turn_key, &encoded);
@@ -1912,7 +1936,10 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     }
     if (selected_candidate) |candidate| {
         if (!std.mem.eql(u8, selected.start, dirty_id) or !try mergeCandidate(&read, scratch, manifest.generation, selected) or ranges.items.len == 1 or !try rangeClean(&read, scratch, selected)) {
-            var discard = try db.core.store.beginWriteTxn();
+            // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): discards
+            // a stale merge candidate and bumps the scheduling turn. Losing
+            // this on crash just re-evaluates the same candidate next pass.
+            var discard = try db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
             var discard_live = true;
             defer if (discard_live) discard.abort();
             try scheduleMaintenance(&discard, scratch, turn, selected_candidate);
@@ -1944,7 +1971,11 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
         dirty_bytes +|= entry.key.len + entry.value.len;
         captured = try captured_dirty.next();
     }
-    var start = try db.core.store.beginWriteTxn();
+    // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): claims a build
+    // slot (counter/building_key) for the compaction about to run. If this
+    // is lost on crash, no builder was ever claimed -- the next pass simply
+    // claims generation again from the same source data.
+    var start = try db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
     var start_live = true;
     defer if (start_live) start.abort();
     if (!try sameValue(&start, manifest_key, manifest_bytes)) return false;
@@ -2005,7 +2036,13 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     db.core.lockApplyShared();
     locked = true;
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-    var publish = try db.core.store.beginWriteTxn();
+    // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): publishes the
+    // compacted ranges into the live manifest and retires the old ones. If
+    // this never becomes durable, building_key stays set and the manifest
+    // stays on the old generation: the next pass finds an abandoned builder
+    // (the same recovery path as a canceled/interrupted compaction) and
+    // reclaims it, then redoes the compaction from the still-durable source.
+    var publish = try db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
     var live = true;
     defer if (live) publish.abort();
     if (!try sameValue(&publish, manifest_key, manifest_bytes) or !try sameValue(&publish, building_key, &token)) return false;
@@ -2113,7 +2150,10 @@ fn drainGarbage(db: anytype, alloc: alloc_type, namespace: u64) !bool {
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-    var txn = try db.core.store.beginWriteTxn();
+    // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): clears the
+    // garbage token once its prefix is fully reclaimed. Losing this on
+    // crash just re-reclaims the (now-empty) prefix once more next pass.
+    var txn = try db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
     var live = true;
     defer if (live) txn.abort();
     if (try sameValue(&txn, garbage_key, token)) try txn.delete(garbage_key);
@@ -2201,7 +2241,11 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
             self.db.core.lockApplyShared();
             defer self.db.core.unlockApplyShared();
             if (self.namespace != self.db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-            var txn = try self.db.core.store.beginWriteTxn();
+            // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): GC of
+            // already-retired columnar records. Deletion is the durable
+            // cursor (see doc comment on pruneRange); redoing a page on
+            // crash just re-deletes already-retired/absent keys, idempotent.
+            var txn = try self.db.core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
             var live = true;
             defer if (live) txn.abort();
             try prepared.apply(&txn);

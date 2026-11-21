@@ -440,6 +440,19 @@ pub const RaftApplyStore = struct {
     pub fn graphAuthority(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/server_call.zig").GraphAuthority) !@import("../system_catalog/server_call.zig").GraphAuthorityResult {
         return self.catalogProjection(@import("../system_catalog/server_call.zig").GraphAuthorityResult, alloc, group_id, .{ .catalog_graph_authority = request });
     }
+    pub fn policyCreateHasCapacity(self: *RaftApplyStore, group_id: u64) !bool {
+        return self.catalogProjection(bool, self.alloc, group_id, .policy_create_has_capacity);
+    }
+
+    pub fn requireMetadataIncarnation(self: *RaftApplyStore, group: u64, expected: ?[32]u8) !void {
+        const incarnation = expected orelse return;
+        const actual = (try self.getMetadataIncarnation(group)) orelse return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, &incarnation, &actual)) return error.CatalogGenerationChanged;
+    }
+
+    pub fn policyDefinitionRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.PolicyRead) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_policy_definition = request });
+    }
     pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_read = request });
     }

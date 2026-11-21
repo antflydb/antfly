@@ -2103,6 +2103,7 @@ pub const AuthenticatedIdentity = struct {
     /// intersect the request's admitted permission snapshot with this live
     /// policy source so revocation can take effect within a long request.
     live_user_manager: ?*usermgr.UserManager = null,
+    bound_policy_roles: ?[32]u8 = null,
     catalog_aliases: []CatalogAlias = &.{},
     /// Stable identity of the credential that authenticated this request.
     /// Multiple API keys owned by one user must not become interchangeable
@@ -2296,6 +2297,7 @@ pub const StatusSource = struct {
         if (input.isSchemaValidationCall() and !context.schema_validation_authority) return error.Forbidden;
         if (input == .mutate and input.mutate.mutation.action == .comment and !context.setting_admin) return error.Forbidden;
         switch (input) {
+            .policy_definition_read => if (!context.setting_admin) return error.Forbidden,
             .native_memory_create => |request| {
                 if (context.native_service != .memory or !context.setting_admin or request.mutation.kind != .table or request.mutation.action != .create) return error.Forbidden;
             },
@@ -6910,6 +6912,14 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn beginFkGenerationPublicationWithConstraintNameGuard(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8, guard: ?system_catalog.RelationMutationGuard) !FkGenerationBegin {
+        return self.beginGuardedFkGenerationPublication(alloc, context, identity, before, proposed_schema_json, guard, null);
+    }
+
+    pub fn beginBoundFkGenerationPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8, expected_parent: ?@import("sql_ddl_binding.zig").Guard.ForeignKeyParent) !FkGenerationBegin {
+        return self.beginGuardedFkGenerationPublication(alloc, context, identity, before, proposed_schema_json, null, expected_parent);
+    }
+
+    pub fn beginGuardedFkGenerationPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8, guard: ?system_catalog.RelationMutationGuard, expected_parent: ?@import("sql_ddl_binding.zig").Guard.ForeignKeyParent) !FkGenerationBegin {
         if (self.cfg.deployment_mode == .standalone and
             (self.hotStandbyMutationPolicy().failover_safe_mutations_only or self.cfg.fk_generation_source == null or self.cfg.fk_generation_parent == null))
             return error.UnsupportedOperation;
@@ -6917,6 +6927,15 @@ pub const ApiHttpServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const plan = try @import("fk_generation_plan_builder.zig").buildWithConstraintNameGuard(self, a, context, identity, before, proposed_schema_json, guard);
+        if (expected_parent) |expected| {
+            for (plan.parents) |parent| {
+                if (parent.table.table_id != expected.id or try tables_api.schemaVersion(parent.table.schema_json) != expected.schema_version) continue;
+                for (parent.transitions) |transition| {
+                    if (std.mem.eql(u8, transition.constraint_name, expected.constraint)) break;
+                } else continue;
+                break;
+            } else return error.CatalogGenerationChanged;
+        }
         return self.submitFkGenerationPlan(alloc, context, plan);
     }
 
@@ -6965,7 +6984,7 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const plan = try @import("fk_initial_create_plan_builder.zig").buildWithScratch(self, a, alloc, context, identity, target, request);
+        const plan = try @import("fk_initial_create_plan_builder.zig").buildWithScratch(self, a, alloc, context, identity, target, request, null);
         return self.submitFkInitialCreatePlan(alloc, context, plan);
     }
 
@@ -7069,16 +7088,18 @@ pub const ApiHttpServer = struct {
     /// SQL has already checked table-admin authorization. Metadata resolves
     /// schema and owner descriptors again under a leader read-index and
     /// rechecks them at Raft apply; this API supplies only a logical target.
-    pub fn beginRowPolicyPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, target: @import("antfly_local_sources").system_catalog_domain.Target, enable: bool) !void {
+    pub fn beginRowPolicyPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, target: @import("antfly_local_sources").system_catalog_domain.Target, enable: bool, expected_id: ?u64) !void {
         try context.ensureActive();
         try target.validate();
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const domain = @import("antfly_local_sources").system_catalog_domain;
-        const resolved_bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target} } });
+        const resolved_bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_source_epoch = context.bound_catalog_incarnation != null } });
         const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, resolved_bytes, .{ .allocate = .alloc_always });
+        try context.checkCatalogIncarnation(resolved.source_epoch);
         if (resolved.tables.len != 1) return error.InvalidSqlBackendResponse;
+        if (expected_id) |id| if (id != (if (resolved.tables[0]) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
         const physical = resolved.tables[0] orelse return error.TableNotFound;
         var internal_context = context;
         internal_context.setting_admin = true;
@@ -7087,6 +7108,7 @@ pub const ApiHttpServer = struct {
             .table_id = physical.table_id,
             .enable = enable,
             .expected_revision = resolved.revision,
+            .expected_incarnation = context.bound_catalog_incarnation,
         } });
         _ = response;
     }
@@ -9396,7 +9418,7 @@ pub const ApiHttpServer = struct {
             if (permission != .write) return error.RowPolicyAuthenticationRequired;
             bound_scope.access = .read;
         }
-        return manager.signRowPolicyRolesAuthorized(
+        return manager.signBoundRowPolicyRoles(
             self.alloc,
             identity.username,
             identity.credential_principal,
@@ -9406,6 +9428,7 @@ pub const ApiHttpServer = struct {
             issuer,
             bound_scope,
             @intCast(@divFloor(self.internalAuthRealtimeNs(), std.time.ns_per_s)),
+            identity.bound_policy_roles,
         );
     }
 
@@ -15855,6 +15878,7 @@ pub const ApiHttpServer = struct {
         const txn_writes: []const db_mod.types.TransactionWrite = @ptrCast(req.writes);
         const tables = [_]distributed_txn.TableCommitRequest{.{
             .table_name = table_name,
+            .bound_catalog_incarnation = request.bound_catalog_incarnation,
             .commit_requires = req.commit_requires,
             .writes = txn_writes,
             .deletes = req.deletes,
@@ -19388,6 +19412,16 @@ pub const ApiHttpServer = struct {
         return response_body;
     }
 
+    pub fn catalogNamespaceId(self: *ApiHttpServer, a: std.mem.Allocator, context: api_operation.RequestContext, target: system_catalog.Target) !u64 {
+        if (std.mem.eql(u8, target.database, system_catalog.default_database_name) and std.mem.eql(u8, target.namespace, system_catalog.default_namespace_name))
+            return system_catalog.default_namespace_id;
+        const bytes = try self.source.systemCatalog(a, context, .{ .read = .{ .kind = .namespace, .database = target.database, .name = target.namespace } });
+        defer a.free(bytes);
+        var state = try std.json.parseFromSlice(system_catalog.State, a, bytes, .{});
+        defer state.deinit();
+        return (try state.value.namespaceFor(target.database, target.namespace)).id;
+    }
+
     /// Resolve public, namespace-relative REFERENCES names once at DDL ingress.
     /// Stored constraints use immutable identities, so rename never retargets
     /// an FK and drop/recreate cannot silently attach it to a different table.
@@ -19444,16 +19478,16 @@ pub const ApiHttpServer = struct {
                     try inherited.put(rename.to, fk.object.get("parent_table").?.string);
             };
         }
-        var targets: std.ArrayList(system_catalog.Target) = .empty;
-        var target_slots: std.ArrayList(*std.json.Value) = .empty;
-        var retained: std.ArrayList([]const u8) = .empty;
+        var targets: std.StringArrayHashMapUnmanaged(system_catalog.Target) = .empty;
+        var target_slots: std.ArrayList(struct { slot: *std.json.Value, index: usize }) = .empty;
+        var retained: std.StringArrayHashMapUnmanaged(void) = .empty;
         for (foreign.array.items) |*fk| {
             if (fk.* != .object) return error.InvalidSchemaUpdateRequest;
             const parent = fk.object.getPtr("parent_table") orelse return error.InvalidSchemaUpdateRequest;
             const name = fk.object.get("name") orelse return error.InvalidSchemaUpdateRequest;
             if (name != .string) return error.InvalidSchemaUpdateRequest;
             if (parent.* == .string) if (inherited.get(name.string)) |bound| if (std.mem.eql(u8, bound, parent.string)) {
-                try retained.append(a, bound);
+                try retained.put(a, bound, {});
                 continue;
             };
             const target: system_catalog.Target = if (parent.* == .string)
@@ -19479,15 +19513,18 @@ pub const ApiHttpServer = struct {
                 parent.* = .{ .string = child };
                 continue;
             }
-            try targets.append(a, target);
-            try target_slots.append(a, parent);
+            const entry = try targets.getOrPut(a, logical);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = target;
+            }
+            try target_slots.append(a, .{ .slot = parent, .index = entry.index });
         }
-        if (targets.items.len != 0 or retained.items.len != 0) {
-            const bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets.items, .storage_names = retained.items } });
+        if (targets.count() != 0 or retained.count() != 0) {
+            const bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets.values(), .storage_names = retained.keys() } });
             const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
-            if (resolved.tables.len != targets.items.len or resolved.logical_names.len != retained.items.len) return error.UnsupportedOperation;
-            for (target_slots.items, resolved.tables) |slot, table| slot.* = .{ .string = (table orelse return error.ForeignKeyParentTableNotFound).name };
-            for (retained.items, resolved.logical_names) |physical, logical| {
+            if (resolved.tables.len != targets.count() or resolved.logical_names.len != retained.count()) return error.UnsupportedOperation;
+            for (target_slots.items) |target| target.slot.* = .{ .string = (resolved.tables[target.index] orelse return error.ForeignKeyParentTableNotFound).name };
+            for (retained.keys(), resolved.logical_names) |physical, logical| {
                 const parent = logical orelse if (std.mem.startsWith(u8, physical, "table:")) return error.ForeignKeyParentTableNotFound else physical;
                 if (!try tablePermissionCurrentlyAllowed(identity, parent, .admin)) return error.Forbidden;
             }
@@ -19523,8 +19560,10 @@ pub const ApiHttpServer = struct {
         var revision: ?u64 = null;
         while (offset < names.len) {
             const chunk = names[offset..@min(offset + 256, names.len)];
-            const bytes = try self.source.systemCatalog(arena, context, .{ .resolve_many = .{ .storage_names = chunk, .expected_revision = revision } });
+            const bytes = try self.source.systemCatalog(arena, context, .{ .resolve_many = .{ .storage_names = chunk, .expected_revision = revision, .include_source_epoch = context.bound_catalog_incarnation != null } });
             const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, arena, bytes, .{});
+            try context.checkCatalogIncarnation(resolved.source_epoch);
+            if (revision) |expected| if (resolved.revision != expected) return error.CatalogGenerationChanged;
             if (resolved.logical_names.len != chunk.len) return error.UnsupportedOperation;
             revision = resolved.revision;
             for (chunk, resolved.logical_names, out[offset..][0..chunk.len]) |physical, logical, *result| {
@@ -19609,6 +19648,7 @@ pub const ApiHttpServer = struct {
         if (self.cfg.auth_enabled and identity == null) return contextualJsonErrorResponse(self.alloc, 403, "schema rewrite requires table administrator authorization");
         var snapshot = (try self.source.adminSnapshot()) orelse return contextualRetryableJsonErrorResponse(self.alloc, 503, "schema rewrite metadata is unavailable");
         defer self.source.freeAdminSnapshot(&snapshot);
+        try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
         const current = tables_api.findTableByName(&snapshot, before.name) orelse return contextualJsonErrorResponse(self.alloc, 404, "not found");
         if (!metadata_table_manager.tableDefinitionsEqual(before, current.*)) return contextualJsonErrorResponse(self.alloc, 409, "schema changed; refresh before rewriting");
         @import("antfly_local_sources").sql_schema_ddl.requireTransformIndexBindings(self.alloc, before.indexes_json, policies.column_transforms) catch |err| {
@@ -19651,7 +19691,7 @@ pub const ApiHttpServer = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(encoded_request, &digest, .{});
         const backup_id = try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
-        var start: restore_jobs.StartRequest = .{ .scope = .cluster, .source_kind = .schema_rewrite, .routine_actor = if (try @import("sql/triggers/restore.zig").needsActorForTables(alloc, cohort)) try @import("sql/triggers/restore.zig").actorForAdmission(self, identity) else null, .backup_id = backup_id, .location = try std.fmt.allocPrint(alloc, "metadata://schema-rewrite/{s}", .{std.fmt.bytesToHex(plan_id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = namespace, .idempotency_key = key, .destination_authorization_principal = storedDestinationPrincipal(identity) };
+        var start: restore_jobs.StartRequest = .{ .scope = .cluster, .source_kind = .schema_rewrite, .expected_incarnation = context.expectedMetadataIncarnation(), .routine_actor = if (try @import("sql/triggers/restore.zig").needsActorForTables(alloc, cohort)) try @import("sql/triggers/restore.zig").actorForAdmission(self, identity) else null, .backup_id = backup_id, .location = try std.fmt.allocPrint(alloc, "metadata://schema-rewrite/{s}", .{std.fmt.bytesToHex(plan_id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = namespace, .idempotency_key = key, .destination_authorization_principal = storedDestinationPrincipal(identity) };
         if (try self.restore_job_store.existingRewriteAdmission(self.alloc, start)) |existing| {
             defer self.alloc.free(existing);
             if (context.sql_completion_submission) |observed| observed.* = true;
@@ -19673,11 +19713,14 @@ pub const ApiHttpServer = struct {
                 bound_policies.default_clock_micros = instant.micros;
             }
         }
-        var plan = try admission.buildWithPoliciesAndConstraintNameGuard(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, bound_policies, guard);
+        var plan = try admission.buildGuarded(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, bound_policies, context.expectedMetadataIncarnation(), guard);
         try admission.bindSequenceHandoffs(self, alloc, context, &plan);
         start.rewrite_plan_json = try std.json.Stringify.valueAlloc(alloc, plan, .{});
         try ensureTableOperationActive(context);
-        const accepted = self.restore_job_store.startRecoverableObserved(self.alloc, start, true, context.sql_completion_submission) catch |err| return restoreJobStartErrorResponse(self.alloc, err);
+        const accepted = self.restore_job_store.startRecoverableObserved(self.alloc, start, true, context.sql_completion_submission) catch |err| {
+            if (err == error.CatalogGenerationChanged) return err;
+            return restoreJobStartErrorResponse(self.alloc, err);
+        };
         const encoded = switch (accepted) {
             .accepted => |value| value,
             .unknown => |value| {
@@ -19876,6 +19919,7 @@ pub const ApiHttpServer = struct {
         const assembled_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| {
             std.log.warn("artifact enrichment validation failed stage=assemble_table table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
             switch (err) {
+                error.EnrichmentInUse => return error.Conflict,
                 error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
                 else => return error.InternalFailure,
             }
@@ -31974,6 +32018,7 @@ pub fn resourcePermissionsCurrentlyAllowed(alloc: std.mem.Allocator, authenticat
     const identity = authenticated_identity orelse return true;
     for (checks) |check| if (!permissionsAllow(identity.permissions, check.resource_type, check.resource, check.permission_type)) return false;
     const manager = identity.live_user_manager orelse return true;
+    if (identity.catalog_aliases.len == 0) return manager.permissionsCurrentlyAllowed(identity.username, identity.credential_principal, checks);
     const logical = try alloc.dupe(usermgr.UserManager.PermissionCheck, checks);
     defer alloc.free(logical);
     for (logical) |*check| if (check.resource_type == .table) {
@@ -61812,6 +61857,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     owned.mcp_creation_discovery = value.mcp_creation_discovery;
     owned.live_user_manager = value.live_user_manager;
     owned.user_instance_id = value.user_instance_id;
+    owned.bound_policy_roles = value.bound_policy_roles;
     for (value.catalog_aliases) |alias| try appendCatalogAlias(alloc, &owned, alias.logical, alias.physical);
     return owned;
 }

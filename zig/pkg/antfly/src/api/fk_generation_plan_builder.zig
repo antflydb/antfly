@@ -38,24 +38,73 @@ pub fn rangesFor(alloc: std.mem.Allocator, snapshot: @import("../metadata/api.zi
 }
 
 fn rangesForCut(alloc: std.mem.Allocator, snapshot: CatalogCut, table_id: u64) ![]records.RangeRecord {
-    var selected: std.ArrayList(records.RangeRecord) = .empty;
-    errdefer {
-        for (selected.items) |range| metadata.freeRange(alloc, range);
-        selected.deinit(alloc);
+    var index: RangeIndex = .{};
+    defer index.deinit(alloc);
+    try index.want(alloc, table_id);
+    try index.collect(alloc, snapshot.ranges);
+    return index.clone(alloc, table_id);
+}
+
+/// Borrow descriptors only while the snapshot is live. Plan records clone
+/// every owned field, including restore metadata and both range boundaries.
+pub const RangeIndex = struct {
+    selected: std.AutoHashMapUnmanaged(u64, std.ArrayList(*const records.RangeRecord)) = .empty,
+
+    pub fn deinit(self: *RangeIndex, a: std.mem.Allocator) void {
+        var lists = self.selected.valueIterator();
+        while (lists.next()) |list| list.deinit(a);
+        self.selected.deinit(a);
     }
-    // Publication plans outlive the linearizable snapshot. Preserve every
-    // range-owned field, not only the routing key used by ownerFences.
-    for (snapshot.ranges) |range| if (range.table_id == table_id) {
-        const owned = try metadata.cloneRange(alloc, range);
-        selected.append(alloc, owned) catch |err| {
-            metadata.freeRange(alloc, owned);
-            return err;
-        };
-    };
-    if (selected.items.len == 0 or selected.items.len > publication.max_owners) return error.InvalidGenerationPublication;
-    metadata.sortKeyspaceRanges(records.RangeRecord, selected.items);
-    try metadata.validateCompleteKeyspaceRanges(selected.items);
-    return selected.toOwnedSlice(alloc);
+
+    pub fn want(self: *RangeIndex, a: std.mem.Allocator, table_id: u64) !void {
+        const entry = try self.selected.getOrPut(a, table_id);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+    }
+
+    pub fn collect(self: *RangeIndex, a: std.mem.Allocator, ranges: []const records.RangeRecord) !void {
+        if (self.selected.count() == 0) return;
+        var owners: usize = 0;
+        for (ranges) |*range| {
+            const list = self.selected.getPtr(range.table_id) orelse continue;
+            if (owners == publication.max_owners) return error.InvalidGenerationPublication;
+            try list.append(a, range);
+            owners += 1;
+        }
+    }
+
+    pub fn clone(self: *const RangeIndex, a: std.mem.Allocator, table_id: u64) ![]records.RangeRecord {
+        const list = self.selected.get(table_id) orelse return error.InvalidGenerationPublication;
+        if (list.items.len == 0) return error.InvalidGenerationPublication;
+        const owned = try a.alloc(records.RangeRecord, list.items.len);
+        errdefer a.free(owned);
+        var initialized: usize = 0;
+        errdefer for (owned[0..initialized]) |range| metadata.freeRange(a, range);
+        for (list.items, owned) |range, *out| {
+            out.* = try metadata.cloneRange(a, range.*);
+            initialized += 1;
+        }
+        metadata.sortKeyspaceRanges(records.RangeRecord, owned);
+        try metadata.validateCompleteKeyspaceRanges(owned);
+        return owned;
+    }
+};
+
+const ParentMap = std.StringHashMapUnmanaged(?*const records.TableRecord);
+
+pub fn authorizeParents(server: *server_mod.ApiHttpServer, arena: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, parents: *const ParentMap, ranges: *RangeIndex) !void {
+    const physical = try arena.alloc([]const u8, parents.count());
+    var it = parents.valueIterator();
+    for (physical) |*out| {
+        const table = it.next().?.* orelse return error.ForeignKeyParentTableNotFound;
+        try ranges.want(arena, table.table_id);
+        out.* = table.name;
+    }
+    const logical = try server.logicalTableNamesInArena(arena, context, physical);
+    const checks = try arena.alloc(server_mod.GraphPermissionCheck, logical.len);
+    for (logical, checks) |name, *check| check.* = .{ .resource = name, .resource_type = .table, .permission_type = .admin };
+    if (!try server_mod.resourcePermissionsCurrentlyAllowed(arena, identity, checks)) return error.Forbidden;
+    for (logical) |name| if (try server_mod.resolveEffectiveRowFilterJson(arena, identity, name) != null) return error.Forbidden;
+    for (logical) |name| if (try server_mod.resolveEffectiveRowFilterJson(arena, identity, name) != null) return error.Forbidden;
 }
 
 pub fn ownerFences(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, id: publication.Id, table: records.TableRecord, ranges: []const records.RangeRecord, role: topology.Role) ![]topology.Fence {
@@ -114,6 +163,42 @@ fn childCatalogB64(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     return alloc.dupe(u8, observed.catalog);
 }
 
+/// Both transition derivations emit (parent name, constraint name) order.
+pub const ParentGroups = struct {
+    entries: []const publication.DerivedTransition,
+    offset: usize = 0,
+
+    pub fn next(self: *ParentGroups) ?[]const publication.DerivedTransition {
+        const start = self.offset;
+        if (start == self.entries.len) return null;
+        self.offset += 1;
+        while (self.offset < self.entries.len and std.mem.eql(u8, self.entries[start].parent_table_name, self.entries[self.offset].parent_table_name)) self.offset += 1;
+        return self.entries[start..self.offset];
+    }
+
+    pub fn transitions(alloc: std.mem.Allocator, group: []const publication.DerivedTransition) ![]publication.Transition {
+        const out = try alloc.alloc(publication.Transition, group.len);
+        for (out, group) |*dest, entry| dest.* = entry.transition;
+        return out;
+    }
+};
+
+pub fn parentsByName(alloc: std.mem.Allocator, snapshot: []const records.TableRecord, derived: []const publication.DerivedTransition) !ParentMap {
+    var names: ParentMap = .empty;
+    errdefer names.deinit(alloc);
+    for (derived) |item| try names.put(alloc, item.parent_table_name, null);
+    var remaining = names.count();
+    for (snapshot) |*table| {
+        if (remaining == 0) break;
+        const slot = names.getPtr(table.name) orelse continue;
+        if (slot.* == null) {
+            slot.* = table;
+            remaining -= 1;
+        }
+    }
+    return names;
+}
+
 pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, before: records.TableRecord, proposed_schema_json: []const u8) !publication.Plan {
     return buildWithConstraintNameGuard(server, alloc, context, identity, before, proposed_schema_json, null);
 }
@@ -136,6 +221,7 @@ fn buildControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     try context.ensureActive();
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
+    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
     return buildFromCut(server, alloc, context, identity, .{ .tables = snapshot.tables, .ranges = snapshot.ranges }, before, proposed_schema_json, guard, sql_drop, null);
 }
 
@@ -331,70 +417,56 @@ fn buildFromCut(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, con
             if (std.mem.readInt(u64, id[0..8], .little) != 0 and std.mem.readInt(u64, id[8..16], .little) != 0) break;
         }
     }
-    const child_ranges = try rangesForCut(alloc, snapshot, current.table_id);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var by_name = try parentsByName(a, snapshot.tables, derived);
+    var index: RangeIndex = .{};
+    try index.want(a, current.table_id);
+    if (sql_drop == null) {
+        try authorizeParents(server, a, context, identity, &by_name, &index);
+    } else {
+        var candidates = by_name.valueIterator();
+        while (candidates.next()) |candidate| {
+            const table = candidate.* orelse return error.ForeignKeyParentTableNotFound;
+            try index.want(a, table.table_id);
+        }
+    }
+    try index.collect(a, snapshot.ranges);
+    const child_ranges = try index.clone(alloc, current.table_id);
     const retiring_self = if (root) |accepted| accepted.parent(current.table_id) != null else false;
     const self_parent = for (derived) |item| {
         if (!retiring_self and std.mem.eql(u8, item.parent_table_name, current.name)) break true;
     } else false;
     const child_fences = try ownerFencesCaptured(server, alloc, context, id, current, child_ranges, if (self_parent) .child_generation_dual else .child_generation_source, .checks_v1, capture);
     var parents: std.ArrayList(publication.Parent) = .empty;
-    for (derived) |item| {
-        const parent_table = for (snapshot.tables) |table| {
-            if (std.mem.eql(u8, table.name, item.parent_table_name)) break table;
-        } else return error.ForeignKeyParentTableNotFound;
+    var groups: ParentGroups = .{ .entries = derived };
+    while (groups.next()) |group| {
+        const name = group[0].parent_table_name;
+        const parent_table = (by_name.get(name).? orelse return error.ForeignKeyParentTableNotFound).*;
         if (parent_table.storage_migration != null or
             parent_table.relational_retirement_json.len != 0 or parent_table.restore_backup_id.len != 0) return error.TableTransitionActive;
-        var found: ?*publication.Parent = null;
-        for (parents.items) |*parent| if (parent.table.table_id == parent_table.table_id) {
-            found = parent;
-            break;
-        };
-        if (found == null) {
-            // A child owner may retire its own outgoing references without
-            // parent administration. The DROP-only plan validates every edge
-            // against the exact child schema and permits no successor grant.
-            // All ordinary FK schema changes retain parent authorization.
-            if (sql_drop == null) {
-                const names = try server.logicalTableNamesInArena(alloc, context, &.{parent_table.name});
-                if (names.len != 1 or !try server_mod.tablePermissionCurrentlyAllowed(identity, names[0], .admin) or
-                    try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null) return error.Forbidden;
-            }
-            const dual = parent_table.table_id == current.table_id;
-            const parent_ranges = if (dual) child_ranges else try rangesForCut(alloc, snapshot, parent_table.table_id);
-            const retirement = if (root) |accepted| accepted.parent(parent_table.table_id) else null;
-            try parents.append(alloc, .{
-                .scope_retirement = retirement,
-                .table = try ownedTableForPlan(alloc, parent_table),
-                .ranges = parent_ranges,
-                .fences = if (retirement != null) &.{} else if (dual) child_fences else try ownerFencesCaptured(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent, .checks_v1, capture),
-                .transitions = &.{},
-            });
-            found = &parents.items[parents.items.len - 1];
-        }
-        const existing = found.?.transitions;
-        const next = try alloc.alloc(publication.Transition, existing.len + 1);
-        @memcpy(next[0..existing.len], existing);
-        next[existing.len] = item.transition;
-        found.?.transitions = next;
+        const dual = parent_table.table_id == current.table_id;
+        const parent_ranges = if (dual) child_ranges else try index.clone(alloc, parent_table.table_id);
+        const retirement = if (root) |accepted| accepted.parent(parent_table.table_id) else null;
+        try parents.append(alloc, .{
+            .scope_retirement = retirement,
+            .table = try ownedTableForPlan(alloc, parent_table),
+            .ranges = parent_ranges,
+            .fences = if (retirement != null) &.{} else if (dual) child_fences else try ownerFencesCaptured(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent, .checks_v1, capture),
+            .transitions = try ParentGroups.transitions(alloc, group),
+        });
     }
     std.mem.sort(publication.Parent, parents.items, {}, struct {
         fn less(_: void, lhs: publication.Parent, rhs: publication.Parent) bool {
             return lhs.table.table_id < rhs.table.table_id;
         }
     }.less);
-    for (parents.items) |*parent| {
-        const sorted = try alloc.dupe(publication.Transition, parent.transitions);
-        std.mem.sort(publication.Transition, sorted, {}, struct {
-            fn less(_: void, lhs: publication.Transition, rhs: publication.Transition) bool {
-                return std.mem.lessThan(u8, lhs.constraint_name, rhs.constraint_name);
-            }
-        }.less);
-        parent.transitions = sorted;
-    }
     const result: publication.Plan = .{
         .historical_reference_coverage = true,
         .table_retirement = if (root) |accepted| accepted.effects else null,
         .id = id,
+        .expected_incarnation = context.expectedMetadataIncarnation(),
         .child_before = try ownedTableForPlan(alloc, current),
         .child_after = after,
         .child_catalog_before_b64 = catalog_b64,
@@ -442,7 +514,11 @@ test "FK plan table and range descriptors survive snapshot release" {
         .split_transitions = &.{},
         .merge_transitions = &.{},
     };
-    const owned = try rangesFor(alloc, snapshot, 7);
+    var index: RangeIndex = .{};
+    defer index.deinit(alloc);
+    try index.want(alloc, 7);
+    try index.collect(alloc, snapshot.ranges);
+    const owned = try index.clone(alloc, 7);
     defer {
         for (owned) |range| metadata.freeRange(alloc, range);
         alloc.free(owned);
@@ -628,4 +704,37 @@ test "SQL relation lifetime retirement capture metadata cache releases many owne
     }
     _ = try captures.capture(table, root_range);
     try std.testing.expectEqual(@as(usize, 513), spy.calls);
+}
+
+test "FK plan batches distinct parent grants at one metadata cut" {
+    const Probe = struct {
+        calls: u32 = 0,
+        fn call(raw: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (input != .resolve_many) return error.UnexpectedCatalogCall;
+            self.calls += 1;
+            const names = input.resolve_many.storage_names;
+            try std.testing.expectEqual(@as(usize, 128), names.len);
+            return std.json.Stringify.valueAlloc(a, .{ .revision = 1, .tables = [_]?@import("antfly_local_sources").system_catalog_domain.ResolvedTable{}, .logical_names = names }, .{});
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parents: ParentMap = .empty;
+    const records_for_test = try a.alloc(records.TableRecord, 128);
+    for (records_for_test, 1..) |*table, id| {
+        table.* = .{ .table_id = id, .name = try std.fmt.allocPrint(a, "parent_{d}", .{id}) };
+        try parents.put(a, table.name, table);
+    }
+    var probe: Probe = .{};
+    var server = server_mod.ApiHttpServer.init(a, .{}, .{ .ptr = &probe, .vtable = &.{ .status = undefined, .system_catalog = Probe.call } }, null, null);
+    defer server.deinit();
+    var index: RangeIndex = .{};
+    try authorizeParents(&server, a, .{}, null, &parents, &index);
+    try std.testing.expectEqual(@as(u32, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 128), index.selected.count());
+    var permission = [_]@import("../usermgr/mod.zig").Permission{try .initOwned(a, .table, "parent_1", .admin)};
+    try std.testing.expectError(error.Forbidden, authorizeParents(&server, a, .{}, .{ .username = @constCast("editor"), .permissions = &permission }, &parents, &index));
+    try std.testing.expectEqual(@as(u32, 2), probe.calls);
 }

@@ -1648,15 +1648,17 @@ pub fn transactionRoutingSnapshot(
     table_name: []const u8,
 ) !?TransactionRoutingSnapshot {
     var snapshot = try catalog.adminSnapshot();
-    errdefer catalog.freeAdminSnapshot(&snapshot);
+    var transferred = false;
+    defer if (!transferred) catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
     try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
 
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
-    errdefer metadata_admin.freeRangeRefs(alloc, ranges);
+    defer if (!transferred) metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
     sortRangeRefs(ranges);
 
+    transferred = true;
     return .{
         .catalog = catalog,
         .snapshot = snapshot,

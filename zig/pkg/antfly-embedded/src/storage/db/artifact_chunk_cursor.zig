@@ -219,6 +219,24 @@ pub fn Cursor(comptime Txn: type) type {
             };
         }
 
+        pub fn nextControlled(self: *Self, control: @import("../../search/execution_control.zig").ExecutionControl) !?Entry {
+            while (true) {
+                try control.check();
+                var budget: Budget = .{ .deadline_ns = control.deadline_ns };
+                switch (try self.poll(&budget)) {
+                    .row => |row| {
+                        try control.check();
+                        return row;
+                    },
+                    .yielded => continue,
+                    .end => {
+                        try control.check();
+                        return null;
+                    },
+                }
+            }
+        }
+
         pub fn poll(self: *Self, budget: *Budget) !Step {
             self.last_from_head = null;
             while (true) {
@@ -303,4 +321,50 @@ test "ordered artifact inventory empty generation skips legacy scope with one se
     try std.testing.expect((try cursor.next()) == null);
     try std.testing.expectEqual(@as(usize, 2), txn.legacy_seeks);
     try std.testing.expectEqual(@as(usize, 1), txn.head_nexts);
+}
+
+test "optional numeric range controlled chunk cursor yields across skipped records" {
+    const alloc = std.testing.allocator;
+    const Txn = struct {
+        skipped: usize = 0,
+        checks: usize = 0,
+        prefix: []const u8,
+        const Owner = @This();
+
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *Owner = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks >= 2;
+        }
+
+        pub const CursorAdapter = struct {
+            txn: *Owner,
+            pub fn close(_: *@This()) void {}
+            pub fn next(self: *@This()) !?Entry {
+                self.txn.skipped += 1;
+                if (self.txn.skipped == 512) return null;
+                return .{ .key = self.txn.prefix, .value = "" };
+            }
+            pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
+                return null;
+            }
+        };
+        pub fn openPhysicalCursorAdapter(self: *Owner) !CursorAdapter {
+            return .{ .txn = self };
+        }
+    };
+    const prefix = try keys.artifactNamedPrefixAlloc(alloc, "doc", "chunk", "chunks");
+    var txn: Txn = .{ .prefix = prefix };
+    var cursor: Cursor(Txn) = .{
+        .alloc = alloc,
+        .txn = &txn,
+        .legacy_prefix = prefix,
+        .legacy_cursor = .{ .txn = &txn },
+        .legacy = .{ .key = prefix, .value = "" },
+    };
+    defer cursor.close();
+    try std.testing.expectError(error.Canceled, cursor.nextControlled(.{
+        .cancellation = .{ .ptr = &txn, .is_cancelled_fn = Txn.canceled },
+    }));
+    try std.testing.expect(txn.skipped > 0 and txn.skipped < 512);
 }

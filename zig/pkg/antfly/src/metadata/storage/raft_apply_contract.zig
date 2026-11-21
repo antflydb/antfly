@@ -398,6 +398,7 @@ pub const CatalogProjectionRequest = union(enum) {
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
     catalog_graph_authority: @import("../../system_catalog/server_call.zig").GraphAuthority,
     catalog_read: system_catalog.Read,
+    catalog_policy_definition: system_catalog.PolicyRead,
     catalog_export: void,
     catalog_checkpoint: []const u8,
     catalog_checkpoint_projection: @import("../../system_catalog/projection.zig").Export.NativeCheckpoint,
@@ -541,6 +542,7 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_graph_preparation_outcome: @import("../../system_catalog/graph_preparation.zig").Observation,
     sql_trigger_snapshot: @import("../../system_catalog/trigger_snapshot.zig").Request,
     has_index_alias_lifecycle_state: void,
+    policy_create_has_capacity: void,
 };
 
 test "system catalog creation sources have a distinct strict command version" {

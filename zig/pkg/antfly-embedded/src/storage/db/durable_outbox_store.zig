@@ -20,6 +20,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const docstore = @import("../docstore.zig");
 const outbox = @import("durable_outbox.zig");
+const backend_types = @import("../backend_types.zig");
 
 pub const PendingPage = struct {
     legacy_batch: ?[]u8,
@@ -60,12 +61,21 @@ pub fn readPending(alloc: Allocator, store: *docstore.DocStore) !PendingPage {
 
 /// Clear only the mutation which the replication adapter successfully
 /// published. No prefix deletion or arbitrary internal key access is exposed.
+///
+/// Background-only: every caller runs after the replication adapter has
+/// already durably published (or, on the recovery path, re-published) the
+/// corresponding outbox payload. Losing this clear in a crash is safe --
+/// the outbox row is simply read and republished again on the next open or
+/// flush, which the replication adapter must already tolerate (at-least-
+/// once delivery). So this rides along with the next foreground group's
+/// commit instead of forcing its own fsync (lite-single-commit-write-path.md
+/// §3.2a).
 pub fn clearPublished(store: *docstore.DocStore, key: []const u8) !void {
     if (!std.mem.eql(u8, key, outbox.replication_batch_outbox_key) and
         !std.mem.eql(u8, key, outbox.replication_replay_outbox_key) and
         !std.mem.eql(u8, key, outbox.replication_schema_outbox_key))
         _ = try outbox.durableReplicationOutboxKindFromKey(key);
-    try store.putBatch(&.{}, &.{key});
+    try store.putBatchWithReplayWithOptions(null, &.{}, &.{key}, null, .{ .durability = .ride_along });
 }
 
 /// Inspect obligations in the SAME snapshot as the effect being certified.

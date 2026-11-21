@@ -965,7 +965,8 @@ fn mutateOrPrepare(svc: anytype, alloc: std.mem.Allocator, context: operation.Re
     }
     const source_version: u16 = if (request.creation_object_comments.len != 0) protocol.sql_object_annotations_version else if (request.creation_sources.len != 0) protocol.sql_creation_sources_version else 0;
     const required_version = @max(source_version, @max(if (request.mutation.sql_owner != null) protocol.sql_authorization_version else @as(u16, 0), @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version))));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @max(if (scoped != null) protocol.sql_catalog_journal_version else 0, @max(if (named_type_readers != null) protocol.sql_type_version else 0, @max(required_version, if (request.column_sequences.len != 0) protocol.sql_column_sequences_version else 0))));
+    const bound_version: u16 = if (request.mutation.expected_parent_id != null) protocol.bound_create_parent_version else if (request.mutation.expected_incarnation != null) protocol.bound_catalog_incarnation_version else if (request.mutation.expected_resource_id != null or request.mutation.expected_tablespace_id != null) protocol.bound_ddl_version else 0;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @max(bound_version, @max(if (scoped != null) protocol.sql_catalog_journal_version else 0, @max(if (named_type_readers != null) protocol.sql_type_version else 0, @max(required_version, if (request.column_sequences.len != 0) protocol.sql_column_sequences_version else 0)))));
     if (scoped == null) svc.lockCatalogMutation();
     defer if (scoped == null) svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -1150,12 +1151,16 @@ pub fn beginPolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: o
 pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("antfly_local_sources").system_catalog_policies.PublicationCommand) ![]u8 {
     if (!context.setting_admin or !context.row_policy_install_authority) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_intent_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @max(protocol.sql_row_policy_intent_version, if (command.expected_incarnation != null) protocol.guarded_publication_version else 0));
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (command.expected_incarnation) |incarnation| {
+        const guard: operation.RequestContext = .{ .bound_catalog_incarnation = incarnation };
+        try guard.checkMetadataIncarnation(try store.getMetadataIncarnation(svc.metadata_group_id));
+    }
     const current = try store.systemCatalogMeta(alloc, svc.metadata_group_id);
     if (current.revision != command.expected_revision) return error.RowPolicyCatalogChanged;
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
@@ -1172,7 +1177,7 @@ pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: 
     return std.json.Stringify.valueAlloc(alloc, observed, .{});
 }
 
-fn serializePolicyDefinitionCommand(alloc: std.mem.Allocator, command: @import("antfly_local_sources").system_catalog_policies.Command) ![]u8 {
+pub fn serializePolicyDefinitionCommand(alloc: std.mem.Allocator, command: @import("antfly_local_sources").system_catalog_policies.Command) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(alloc);
     defer output.deinit();
     var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
@@ -2384,6 +2389,7 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     if (command.plan) |plan| if (plan.constraint_name_guard != null or plan.sql_drop != null)
         try store.preflightFkGenerationNameAdmission(svc.metadata_group_id, plan);
+    if (command.plan) |plan| try store.requireMetadataIncarnation(svc.metadata_group_id, plan.expected_incarnation);
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
     if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
@@ -2411,7 +2417,8 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     const naming = if (command.plan) |plan| plan.constraint_name_admission != null else false;
     const ordinary_minimum = if (command.catalog_coverage == .checks_v1) protocol.initial_fk_checks_catalog_version else if (naming) @max(protocol.fk_initial_create_version, protocol.constraint_occupancy_version) else protocol.fk_initial_create_version;
     const owner_minimum: u16 = if (command.plan) |plan| (if (plan.sql_owner != null) protocol.sql_authorization_version else 0) else 0;
-    const minimum = @max(ordinary_minimum, owner_minimum);
+    const guarded_minimum: u16 = if (command.plan) |plan| (if (plan.expected_incarnation != null) protocol.guarded_generation_admission_version else if (plan.support_schema_format != .legacy or fk_publication.hasStampedSupport(plan.parents)) protocol.guarded_publication_version else 0) else 0;
+    const minimum = @max(ordinary_minimum, owner_minimum, guarded_minimum);
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, minimum);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
@@ -2419,6 +2426,7 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     defer if (gate_held) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (command.plan) |plan| try store.requireMetadataIncarnation(svc.metadata_group_id, plan.expected_incarnation);
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
     if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
@@ -2441,6 +2449,24 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     return observed;
 }
 
+pub fn requirePolicyCapacity(store: anytype, group: u64, command: @import("antfly_local_sources").system_catalog_policies.Command) !void {
+    if (command.createsDefinition() and !try store.policyCreateHasCapacity(group))
+        return error.RowPolicyLimitExceeded;
+}
+
+pub fn validateBoundPolicy(alloc: std.mem.Allocator, store: anytype, group: u64, command: @import("antfly_local_sources").system_catalog_policies.Command) !void {
+    if (command.expected_incarnation) |incarnation| {
+        const guard: operation.RequestContext = .{ .bound_catalog_incarnation = incarnation };
+        try guard.checkMetadataIncarnation(try store.getMetadataIncarnation(group));
+    }
+    const expected = command.expected_schema_version orelse return;
+    if (command.change != .put or command.change.put.schema_version != expected) return error.CatalogGenerationChanged;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const table = (try store.getTable(arena.allocator(), group, command.change.put.table_id)) orelse return error.CatalogGenerationChanged;
+    if (try tables_api.schemaVersion(table.schema_json) != expected) return error.CatalogGenerationChanged;
+}
+
 /// Durable draft-only policy mutation. The authorization is a body-bound
 /// administrator service grant; this transition never installs an owner
 /// bundle or flips the serving publication. Ambiguous outcomes require a
@@ -2454,19 +2480,25 @@ pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: o
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    try validateBoundPolicy(alloc, store, svc.metadata_group_id, command);
     const current = try store.systemCatalogMeta(alloc, svc.metadata_group_id);
     if (current.revision != command.expected_revision) return error.RowPolicyCatalogChanged;
+    try requirePolicyCapacity(store, svc.metadata_group_id, command);
     const bytes = try store.sqlPolicyDefinitionCommandJson(alloc, svc.metadata_group_id, command);
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_sql_policies = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
-    const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
+    return policyDefinitionReceipt(alloc, store, svc.metadata_group_id, command.expected_revision, bytes);
+}
+
+pub fn policyDefinitionReceipt(alloc: std.mem.Allocator, store: anytype, group: u64, expected_revision: u64, bytes: []const u8) ![]u8 {
+    const observed = store.systemCatalogMeta(alloc, group) catch return error.MetadataMutationOutcomeUnknown;
     var expected_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
-    if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash))
+    if (observed.revision != expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash))
         return error.MetadataMutationOutcomeUnknown;
-    return std.json.Stringify.valueAlloc(alloc, observed, .{});
+    return std.json.Stringify.valueAlloc(alloc, observed, .{}) catch error.MetadataMutationOutcomeUnknown;
 }
 
 pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: settings.Request) ![]u8 {
@@ -2644,6 +2676,12 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk alloc.dupe(u8, "{}");
         },
         .setting_snapshot => |scope| settingSnapshotJson(svc, alloc, context, scope),
+        .policy_definition_read => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.policyDefinitionRead(alloc, svc.metadata_group_id, request);
+        },
         .policy_snapshot => |request| policySnapshotJson(svc, alloc, context, request),
         .policy_install_snapshot => |request| policyInstallSnapshotJson(svc, alloc, context, request),
         .policy_publication_status => |table_id| policyPublicationStatusJson(svc, alloc, context, table_id),
@@ -2922,6 +2960,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         },
         .resolve_many => |request| blk: {
             if (request.sql_principal != null and !context.setting_admin) return error.Forbidden;
+            if (request.cursor_bindings.len != 0 and !context.row_policy_install_authority) return error.Forbidden;
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             const result = try store.resolveSystemCatalogIdentitiesWithContext(alloc, svc.metadata_group_id, request, context);

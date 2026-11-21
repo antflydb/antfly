@@ -209,12 +209,36 @@ fn optional(txn: anytype, key: []const u8) !?[]const u8 {
     };
 }
 
+/// lite-single-commit-write-path.md §7.6: a hook for `requireEmpty` to tell
+/// a genuinely live Reference apart from a stale (dangling) one -- a
+/// Reference record whose child row no longer exists. The fused multi-
+/// table coordinator's own ride-along `.attach` write is not atomic with
+/// its leader's row write (it shares the leader's fsync when it wins a
+/// race against the idle-flush timer, but not always, and a crash in
+/// that window can leave the Reference durable with no corresponding
+/// child row ever created). Rather than preventing that window outright,
+/// a parent-side RESTRICT check that finds a Reference whose own child
+/// row is confirmed absent treats it as not-referenced and queues it for
+/// deletion in this same commit, so the dangling state self-heals on the
+/// very next restrict check instead of making the parent row permanently
+/// undeletable. `null` (every caller except the `.local_decision` fused
+/// path) preserves today's exact behavior: any live Reference blocks.
+pub const ChildExistenceCheck = struct {
+    ptr: *anyopaque,
+    exists: *const fn (ptr: *anyopaque, child_table: []const u8, child_key: []const u8) anyerror!bool,
+
+    fn check(self: ChildExistenceCheck, child_table: []const u8, child_key: []const u8) !bool {
+        return self.exists(self.ptr, child_table, child_key);
+    }
+};
+
 const Builder = struct {
     alloc: Allocator,
     retained_bytes: usize,
     operations: std.ArrayList(Operation) = .empty,
     positions: std.StringHashMapUnmanaged(usize) = .empty,
     reference_coverage_checked: bool = false,
+    child_exists: ?ChildExistenceCheck = null,
 
     fn requireReferenceCoverage(self: *Builder, txn: anytype) !void {
         if (self.reference_coverage_checked) return;
@@ -267,6 +291,14 @@ const Builder = struct {
             if (self.positions.get(item.key)) |position| if (self.operations.items[position].kind == .delete) continue;
             const reference = try Reference.decode(item.key, item.value);
             if (try generation_retirement.isRetired(txn, reference)) continue;
+            if (self.child_exists) |check| if (!try check.check(reference.child_table, reference.child_key)) {
+                // A dangling Reference -- its own child row no longer
+                // exists -- is not a live block. Queue it for deletion
+                // in this same commit instead of failing the parent's
+                // own change over it.
+                try self.add(txn, address, item.key, .delete, null);
+                continue;
+            };
             return error.ForeignKeyReferenced;
         }
     }
@@ -279,7 +311,11 @@ fn requireOwner(claim: Claim, table: []const u8, key: []const u8) !void {
 pub const Job = @import("relational_integrity_contract.zig").Job;
 
 pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effects {
-    return prepareBatches(alloc, txn, &.{commands});
+    return prepareWithChildCheck(alloc, txn, commands, null);
+}
+
+pub fn prepareWithChildCheck(alloc: Allocator, txn: anytype, commands: []const Command, child_exists: ?ChildExistenceCheck) !Effects {
+    return prepareBatchesWithChildCheck(alloc, txn, &.{commands}, child_exists);
 }
 
 /// Session probes fold statement deltas in their original order against one
@@ -287,6 +323,10 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
 /// while a later statement can delete an interval inserted by an earlier one.
 /// The resulting effects are observations, never a durable commit permission.
 pub fn prepareBatches(alloc: Allocator, txn: anytype, batches: []const []const Command) !Effects {
+    return prepareBatchesWithChildCheck(alloc, txn, batches, null);
+}
+
+fn prepareBatchesWithChildCheck(alloc: Allocator, txn: anytype, batches: []const []const Command, child_exists: ?ChildExistenceCheck) !Effects {
     var admission_bytes: usize = 0;
     var count: usize = 0;
     for (batches) |commands| {
@@ -299,7 +339,7 @@ pub fn prepareBatches(alloc: Allocator, txn: anytype, batches: []const []const C
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
-    var builder: Builder = .{ .alloc = owned, .retained_bytes = admission_bytes };
+    var builder: Builder = .{ .alloc = owned, .retained_bytes = admission_bytes, .child_exists = child_exists };
     for (batches) |commands| {
         // Detaches first make RESTRICT independent of caller row ordering. They
         // may not create a nonexistent parent; creation/attachment remain ordered.
@@ -834,7 +874,7 @@ test "relational integrity preparation cleans up every allocation failure and bo
             const claim: Claim = .{ .tuple = "tuple", .parent_table = "parent", .parent_key = "p", .schema_version = 1 };
             const reference: Reference = .{ .child_table = "child", .child_key = "c", .constraint_name = "fk", .constraint_generation = @splat(2) };
             var empty: Empty = .{};
-            var effects = try prepare(alloc, &empty, &.{ .{ .address = address, .operation = .{ .attach = reference } }, .{ .address = address, .operation = .{ .establish = claim } } });
+            var effects = try prepare(alloc, &empty, &.{ .{ .address = address, .operation = .{ .attach = reference } }, .{ .address = address, .operation = .{ .establish = claim } } }, null);
             defer effects.deinit();
             try validatePreparedEffects(alloc, &empty, effects.operations);
         }
@@ -899,27 +939,27 @@ test "relational index system integrity compare claim fences absence and exact o
     var insertion = try prepare(alloc, &empty, &.{
         .{ .address = address, .operation = .{ .establish = claim } },
         .{ .address = address, .operation = .{ .compare_claim = null } },
-    });
+    }, null);
     defer insertion.deinit();
     try std.testing.expectEqual(@as(usize, 1), insertion.operations.len);
     try std.testing.expect(insertion.operations[0].kind == .put);
     try std.testing.expect(insertion.operations[0].expected_value == null);
     var occupied: Fake = .{ .value = encoded };
-    try std.testing.expectError(error.PreparedReadSetChanged, prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = null } }}));
-    var guard = try prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = claim } }});
+    try std.testing.expectError(error.PreparedReadSetChanged, prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = null } }}, null));
+    var guard = try prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = claim } }}, null);
     defer guard.deinit();
     try std.testing.expectEqual(@as(usize, 1), guard.operations.len);
     try std.testing.expectEqualStrings(encoded, guard.operations[0].expected_value.?);
     var changed = claim;
     changed.schema_version += 1;
-    try std.testing.expectError(error.PreparedReadSetChanged, prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = changed } }}));
+    try std.testing.expectError(error.PreparedReadSetChanged, prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = changed } }}, null));
     try std.testing.expectError(error.VersionConflict, validatePreparedEffects(alloc, &empty, guard.operations));
 }
 
 fn testCommands(store: *@import("../docstore.zig").DocStore, manager: *transactions.TxnManager, id: transactions.TxnId, commands: []const Command, commit: bool) !void {
     var read = try CurrentView.init(store);
     defer read.deinit();
-    var effects = try prepare(std.testing.allocator, &read, commands);
+    var effects = try prepare(std.testing.allocator, &read, commands, null);
     defer effects.deinit();
     try manager.initTransaction(id, 1);
     try testPrepareEffects(store, manager, id, effects.operations);
@@ -1228,7 +1268,7 @@ test "relational integrity shared parent guards and fenced bounded action recove
         try testCommands(&store, &manager, @splat(1), &.{.{ .address = address, .operation = .{ .establish = claim } }}, true);
         var read_before = try store.beginReadTxn();
         defer read_before.abort();
-        var stale_release = try prepare(alloc, &read_before, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } }});
+        var stale_release = try prepare(alloc, &read_before, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } }}, null);
         defer stale_release.deinit();
         try testCommands(&store, &manager, @splat(2), &.{.{ .address = address, .operation = .{ .attach = first } }}, false);
         // Independent child prepares retain compatible shared claim guards.
@@ -1252,7 +1292,7 @@ test "relational integrity shared parent guards and fenced bounded action recove
         defer pending_read.abort();
         try std.testing.expectError(error.ForeignKeyReferenced, prepare(alloc, &pending_read, &.{
             .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } },
-        }));
+        }, null));
         // Claim bytes did not change. Participant prefix proof must still
         // reject the release planned before the two child references existed.
         try std.testing.expectError(error.ForeignKeyReferenced, testPrepareEffects(&store, &manager, @splat(4), stale_release.operations));
@@ -1306,7 +1346,7 @@ test "relational integrity shared parent guards and fenced bounded action recove
         var unchanged = try prepare(alloc, &unchanged_read, &.{
             .{ .address = address, .operation = .{ .attach = first } },
             .{ .address = address, .operation = .{ .establish = claim } },
-        });
+        }, null);
         defer unchanged.deinit();
         try std.testing.expectEqual(@as(usize, 2), unchanged.operations.len);
         for (unchanged.operations) |operation| try std.testing.expectEqual(.guard, operation.kind);
@@ -1356,7 +1396,7 @@ test "distributed txn deferred unique swaps fence concurrent claims and survive 
         defer read.deinit();
         try std.testing.expectEqualStrings("b", (try Claim.decode(&a.claimKey(), try read.get(&a.claimKey()))).parent_key);
         try std.testing.expectEqualStrings("a", (try Claim.decode(&b.claimKey(), try read.get(&b.claimKey()))).parent_key);
-        try std.testing.expectError(error.UniqueConstraintViolation, prepare(alloc, &read, &.{.{ .address = a, .operation = .{ .establish = first } }}));
+        try std.testing.expectError(error.UniqueConstraintViolation, prepare(alloc, &read, &.{.{ .address = a, .operation = .{ .establish = first } }}, null));
     }
 }
 
@@ -1381,15 +1421,15 @@ test "distributed txn deferred reference handoff commits atomically and rejects 
     const owner: ClaimOwner = .{ .parent_table = "p", .parent_key = "old" };
     var read = try CurrentView.init(&store);
     defer read.deinit();
-    try std.testing.expectError(error.ForeignKeyReferenced, prepare(alloc, &read, &.{ .{ .address = address, .operation = .{ .release = owner } }, .{ .address = address, .operation = .{ .establish = replacement } } }));
-    try std.testing.expectError(error.ForeignKeyParentMissing, prepare(alloc, &read, &.{ .{ .address = address, .operation = .{ .detach = child } }, .{ .address = address, .operation = .{ .release = owner } }, .{ .address = address, .operation = .{ .attach = child } } }));
+    try std.testing.expectError(error.ForeignKeyReferenced, prepare(alloc, &read, &.{ .{ .address = address, .operation = .{ .release = owner } }, .{ .address = address, .operation = .{ .establish = replacement } } }, null));
+    try std.testing.expectError(error.ForeignKeyParentMissing, prepare(alloc, &read, &.{ .{ .address = address, .operation = .{ .detach = child } }, .{ .address = address, .operation = .{ .release = owner } }, .{ .address = address, .operation = .{ .attach = child } } }, null));
     const commands = [_]Command{
         .{ .address = address, .operation = .{ .attach = child } },
         .{ .address = address, .operation = .{ .establish = replacement } },
         .{ .address = address, .operation = .{ .release = owner } },
         .{ .address = address, .operation = .{ .detach = child } },
     };
-    var effects = try prepare(alloc, &read, &commands);
+    var effects = try prepare(alloc, &read, &commands, null);
     defer effects.deinit();
     var unseen = child;
     unseen.child_key = "concurrent";
@@ -1427,7 +1467,7 @@ test "relational integrity transaction reads preserve shared guards and isolate 
         var read = try CurrentView.initForTransaction(&store, alloc, @splat(3));
         defer read.deinit();
         // Independent child readers do not serialize behind shared claim guards.
-        var effects = try prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = second } }});
+        var effects = try prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = second } }}, null);
         defer effects.deinit();
     }
     try manager.resolveIntents(@splat(2), .committed, 2);
@@ -1437,20 +1477,20 @@ test "relational integrity transaction reads preserve shared guards and isolate 
         var read = try CurrentView.initForTransaction(&store, alloc, @splat(5));
         defer read.deinit();
         // Both point and prefix reads must defer stale semantic conclusions.
-        try std.testing.expectError(error.IntentConflict, prepare(alloc, &read, &release));
-        try std.testing.expectError(error.IntentConflict, prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .detach = first } }}));
+        try std.testing.expectError(error.IntentConflict, prepare(alloc, &read, &release, null));
+        try std.testing.expectError(error.IntentConflict, prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .detach = first } }}, null));
     }
     {
         var own = try CurrentView.initForTransaction(&store, alloc, @splat(4));
         defer own.deinit();
-        var effects = try prepare(alloc, &own, &.{.{ .address = address, .operation = .{ .detach = first } }});
+        var effects = try prepare(alloc, &own, &.{.{ .address = address, .operation = .{ .detach = first } }}, null);
         defer effects.deinit();
     }
     try manager.resolveIntents(@splat(4), .aborted, 3);
     {
         var read = try CurrentView.initForTransaction(&store, alloc, @splat(5));
         defer read.deinit();
-        try std.testing.expectError(error.ForeignKeyReferenced, prepare(alloc, &read, &release));
+        try std.testing.expectError(error.ForeignKeyReferenced, prepare(alloc, &read, &release, null));
     }
     try testCommands(&store, &manager, @splat(6), &.{.{ .address = address, .operation = .{ .detach = first } }}, true);
     const prefix = address.referencePrefix();
@@ -1466,7 +1506,7 @@ test "relational integrity transaction reads preserve shared guards and isolate 
     {
         var read = try CurrentView.initForTransaction(&store, alloc, @splat(9));
         defer read.deinit();
-        var effects = try prepare(alloc, &read, &release);
+        var effects = try prepare(alloc, &read, &release, null);
         defer effects.deinit();
         try validatePreparedEffects(alloc, &read, effects.operations);
         try std.testing.expectEqual(@as(usize, 1), effects.operations.len);

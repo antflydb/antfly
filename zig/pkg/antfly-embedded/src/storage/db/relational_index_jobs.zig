@@ -174,6 +174,9 @@ fn getOptional(txn: anytype, key: []const u8) !?[]const u8 {
     };
 }
 
+/// Generic over `DocStore.Txn` and `DocStore.Batch`: `Page.commit` below
+/// calls this against a ride-along `Batch` (§3.2a), while `prepare`/`status`
+/// call it against an ordinary read `Txn`. Both expose the same `.get`.
 pub fn ownership(txn: anytype) !Digest {
     const identity = @import("doc_identity.zig");
     const namespace = (try identity.loadNamespaceTxn(txn)) orelse identity.default_namespace;
@@ -843,7 +846,9 @@ pub const Page = struct {
         if (self.private_job != null) return error.PrivateIndexOrderedApplyRequired;
         var manager = try core.initTxnManager();
         defer manager.deinit();
-        var txn = try core.store.beginWriteTxn();
+        // Ordinary progress can ride along with the next durable write.
+        // Ordered owners pass their own transaction into stage below.
+        var txn = try core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer txn.abort();
         try self.stage(core, &manager, &txn);
         try txn.commit();
@@ -851,7 +856,7 @@ pub const Page = struct {
 
     /// Caller holds apply-exclusive and stages its ordered operation receipt
     /// and outbox before committing. Abort the WHOLE transaction on any error.
-    pub fn stage(self: *Page, core: anytype, manager: *@import("../transactions.zig").TxnManager, txn: *docstore.DocStore.Txn) !void {
+    pub fn stage(self: *Page, core: anytype, manager: *@import("../transactions.zig").TxnManager, txn: anytype) !void {
         if (self.consumed) return error.RelationalIndexPageConsumed;
         self.consumed = true;
         if (core.schemaNamespaceGeneration() != self.namespace_generation) return error.PreparedGenerationChanged;

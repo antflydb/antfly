@@ -199,6 +199,17 @@ pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []co
 }
 
 pub fn buildWithPoliciesAndConstraintNameGuard(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype, policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !stages.Plan {
+    return buildGuarded(alloc, id, selected, all_ranges, table_name, proposed, observer, policies, null, guard);
+}
+
+pub fn buildBound(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype, policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies, expected_incarnation: ?[32]u8) !stages.Plan {
+    return buildGuarded(alloc, id, selected, all_ranges, table_name, proposed, observer, policies, expected_incarnation, null);
+}
+
+pub fn buildGuarded(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype, policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies, expected_incarnation: ?[32]u8, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !stages.Plan {
+    // Source ownership must stay fixed throughout the rewrite cohort. Check
+    // every member before issuing any source reads or admitting a durable job.
+    for (selected) |table| if (table.storage_migration != null) return error.TableTransitionActive;
     const current = for (selected) |table| {
         if (std.mem.eql(u8, table.name, table_name)) break table;
     } else return error.TableNotFound;
@@ -208,7 +219,7 @@ pub fn buildWithPoliciesAndConstraintNameGuard(alloc: std.mem.Allocator, id: sta
     defer alloc.free(replacements);
     replacements[0] = .{ .table_id = current.table_id, .schema_json = owned_support.schema_json, .policies = policies };
     for (owned_support.parents, replacements[1..]) |parent, *replacement| replacement.* = .{ .table_id = parent.before.table_id, .schema_json = parent.after.schema_json, .indexes_json = parent.after.indexes_json };
-    return buildReplacements(alloc, id, selected, all_ranges, replacements, observer, guard);
+    return buildReplacementsBound(alloc, id, selected, all_ranges, replacements, observer, guard, expected_incarnation);
 }
 
 /// Several schema postimages share one source cut, rewrite job and atomic
@@ -252,6 +263,10 @@ pub const Replacement = struct {
     policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies = .{},
 };
 pub fn buildReplacements(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, replacements: []const Replacement, observer: anytype, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !stages.Plan {
+    return buildReplacementsBound(alloc, id, selected, all_ranges, replacements, observer, guard, null);
+}
+
+fn buildReplacementsBound(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, replacements: []const Replacement, observer: anytype, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard, expected_incarnation: ?[32]u8) !stages.Plan {
     if (selected.len == 0 or selected.len > 128 or replacements.len == 0 or replacements.len > selected.len) return error.InvalidSchemaUpdateRequest;
     // Validate the complete replacement directory before any source read.
     var directory: std.AutoHashMapUnmanaged(u64, Replacement) = .empty;
@@ -354,7 +369,7 @@ pub fn buildReplacements(alloc: std.mem.Allocator, id: stages.Id, selected: []co
         target.* = .{ .source_table_id = before.table_id, .table = table, .ranges = ranges, .generation_handoffs = handoffs, .attribute_renames = target_policies.attribute_renames, .rewrite = .{ .version = if (target_policies.default_clock_micros != null) 4 else if (target_policies.column_transforms.len == 0) 2 else 3, .preserve_document = document, .default_columns = target_policies.default_columns, .default_clock_micros = target_policies.default_clock_micros, .allow_column_drops = !document and target_policies.dropped_columns == .allow, .expression_schema = target_policies.expression_schema, .column_transforms = target_policies.column_transforms, .source_schemas = source_schemas, .target_schema = table.schema_json, .target_read_schema = if (document) table.read_schema_json else "", .program_digest = programs.identity }, .rewrite_sources = scopes, .replace = .{ .table = try metadata.cloneTable(alloc, before), .ranges = original_ranges.items, .fences = fences } };
     }
     try stages.prepareEmptyGenerationHandoffMappingsAlloc(alloc, targets);
-    var result: stages.Plan = .{ .id = id, .cohort_digest = @splat(0), .targets = targets, .preparing_sources = true, .constraint_name_guard = if (guard) |value| try value.clone(alloc) else null };
+    var result: stages.Plan = .{ .id = id, .expected_incarnation = expected_incarnation, .cohort_digest = @splat(0), .targets = targets, .preparing_sources = true, .constraint_name_guard = if (guard) |value| try value.clone(alloc) else null };
     result.cohort_digest = try result.rewriteIntentDigest(alloc);
     try result.validate(alloc);
     return result;

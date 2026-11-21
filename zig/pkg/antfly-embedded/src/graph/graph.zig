@@ -39,12 +39,20 @@ const typed_edges = @import("typed_edges.zig");
 const maintenance = @import("maintenance.zig");
 const cancellation_mod = @import("antfly_cancellation");
 const backend_erased = @import("../storage/backend_erased.zig");
+const backend_types = @import("../storage/backend_types.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const backfill_state_mod = @import("../storage/db/backfill_state.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const native_catalog_backend = @import("../storage/native_catalog_backend.zig");
+const wal_trace = @import("../storage/write_amplification_trace.zig");
+
+/// Lite-only durable sink for `.native_catalog` forward/reverse stores. See
+/// `storage/native_catalog_backend.zig:Sink` and `persistent.zig`'s own
+/// `NativeCatalogSink` alias, which this mirrors.
+pub const NativeCatalogSink = native_catalog_backend.Sink;
 
 // ============================================================================
 // Edge types
@@ -890,6 +898,9 @@ pub const GraphIndexOptions = struct {
     no_sync: bool = false,
     no_meta_sync: bool = false,
     reverse_backend: ReverseBackend = .lsm,
+    /// Required when `reverse_backend == .native_catalog` (Lite only). See
+    /// `storage/native_catalog_backend.zig:Sink`.
+    native_catalog_sink: ?NativeCatalogSink = null,
     reverse_lsm_storage: ?lsm_backend.Storage = null,
     reverse_lsm_cache: ?*lsm_backend.Cache = null,
     reverse_lsm_options: lsm_backend.Options = .{ .flush_threshold = 1 },
@@ -1198,6 +1209,13 @@ pub const ReverseBackend = enum {
     mem,
     lsm_memory,
     lsm,
+    /// Lite only: forward and reverse adjacency, and all graph metadata
+    /// (counters, topology epochs, intents), live as native index-catalog
+    /// records through `native_catalog_sink`, one durable native commit
+    /// per store commit instead of an LSM-on-virtual-filesystem WAL/segment/
+    /// artifact-lease stack. See `storage/native_catalog_backend.zig` and
+    /// `docs/design/lite-performance/lite-single-commit-write-path.md` §3.3.
+    native_catalog,
 };
 
 pub var test_artifact_rebuild_abort_after_outgoing: std.atomic.Value(bool) = .init(false);
@@ -1257,6 +1275,7 @@ pub const GraphIndex = struct {
         none,
         mem: *mem_backend.Backend,
         lsm: lsm_backend.BackendHandle,
+        native_catalog: *native_catalog_backend.Backend,
 
         fn close(self: *ReverseStoreOwner, alloc: Allocator) void {
             switch (self.*) {
@@ -1266,6 +1285,10 @@ pub const GraphIndex = struct {
                     alloc.destroy(backend);
                 },
                 .lsm => |*handle| handle.close(),
+                .native_catalog => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
             }
             self.* = .none;
         }
@@ -1278,20 +1301,34 @@ pub const GraphIndex = struct {
                     alloc.destroy(backend);
                 },
                 .lsm => |*handle| handle.abandonAfterCrash(),
+                // Nothing to abandon: every record this owner's writes
+                // produced either reached the sink's own durable native
+                // commit (recovered on the next open) or never left this
+                // process (ride-along/in-flight, lost with the process).
+                .native_catalog => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
             }
             self.* = .none;
         }
 
         pub fn sync(self: *ReverseStoreOwner, force: bool) !void {
             switch (self.*) {
-                .none, .mem => {},
+                // A durable `NamespaceTxn.commit()` already forced a native
+                // sync through the sink; `force`'s only caller
+                // (`applyMutationPage`'s "outgoing must be durable before
+                // reverse retires its intent" ordering) needs nothing further
+                // here, since a non-ride-along outgoing commit is already
+                // durable by the time this would run.
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
 
         fn ensureDurableEmptyManifest(self: *ReverseStoreOwner) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| {
                     if (handle.backend.options.backend.read_only) return;
                     if (handle.backend.manifest_backing != null) return;
@@ -1303,7 +1340,7 @@ pub const GraphIndex = struct {
 
         fn checkpointLsmWalAfterDurableBoundary(self: *ReverseStoreOwner) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
@@ -1311,7 +1348,7 @@ pub const GraphIndex = struct {
         fn pinNativeCheckpoint(self: *ReverseStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
             return switch (self.*) {
                 .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-                .none, .mem => error.Unsupported,
+                .none, .mem, .native_catalog => error.Unsupported,
             };
         }
     };
@@ -1361,6 +1398,18 @@ pub const GraphIndex = struct {
 
     fn beginWriteOutgoingBatch(self: *GraphIndex) !backend_erased.Batch {
         return try self.outgoing_store.beginBatch();
+    }
+
+    /// WS4-for-vectors/§3.2a: lets a background-only caller (metric builds,
+    /// topology compaction, ownership transfer) mark its commit
+    /// `.durability = .ride_along` on a `.native_catalog`-backed graph
+    /// index, same as sparse's own beginBatchTxn/beginBatchWithOptions
+    /// sites. Not yet wired into any call site in this file -- see the
+    /// handback's graph-leftovers note on why that per-site audit (dozens
+    /// of production call sites across the metric-build pipeline) is left
+    /// for a follow-up with a working build to verify against.
+    fn beginWriteOutgoingBatchWithOptions(self: *GraphIndex, options: backend_types.BatchOptions) !backend_erased.Batch {
+        return try self.outgoing_store.beginBatchWithOptions(options);
     }
 
     fn beginReadOutgoingTxn(self: *GraphIndex) !backend_erased.ReadTxn {
@@ -1890,6 +1939,11 @@ pub const GraphIndex = struct {
 
     fn beginWriteReverseBatch(self: *GraphIndex) !backend_erased.Batch {
         return try self.reverse_store.beginBatch();
+    }
+
+    /// See beginWriteOutgoingBatchWithOptions's identical note.
+    fn beginWriteReverseBatchWithOptions(self: *GraphIndex, options: backend_types.BatchOptions) !backend_erased.Batch {
+        return try self.reverse_store.beginBatchWithOptions(options);
     }
 
     fn loadGraphCounters(store: *backend_erased.Store) !Stats {
@@ -3622,7 +3676,7 @@ pub const GraphIndex = struct {
         // both lease takeover and the new expiry on the time at which the
         // transaction is actually ready to commit, not the pre-scan probe.
         const lease_started_at_ms = self.clock.nowRealtimeMs();
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
 
         // The disabled marker is checked in the same transaction that creates
@@ -3793,7 +3847,7 @@ pub const GraphIndex = struct {
         }
         var partition_plan = try self.prepareGraphMetricPartitionPlan(cfg);
         defer partition_plan.deinit(self.alloc);
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         try partition_plan.validateMetricSnapshot(self, &batch, cfg, job.target_generation);
         try self.planGraphMetricBuildManifestInBatch(&batch, metric_name, cfg, job, partition_plan);
@@ -3995,7 +4049,7 @@ pub const GraphIndex = struct {
         }
         defer state.deinit(self.alloc);
         const boundary_digest = if (complete) state.boundaryDigest() else @as([32]u8, @splat(0));
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = batch.get(key) catch |err| switch (err) {
             error.NotFound => "",
@@ -4145,7 +4199,7 @@ pub const GraphIndex = struct {
         }
         defer state.deinit(self.alloc);
         const boundary_digest = if (complete) state.boundaryDigest() else @as([32]u8, @splat(0));
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = batch.get(graph_metric_partition_census_key) catch |err| switch (err) {
             error.NotFound => "",
@@ -4232,7 +4286,7 @@ pub const GraphIndex = struct {
             }
             complete = item == null;
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = batch.get(typed_edges.cursor_key) catch |err| switch (err) {
             error.NotFound => "",
@@ -5165,7 +5219,7 @@ pub const GraphIndex = struct {
     ) !?GraphMetricBuildPage {
         if (worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
         var candidate_page_id: ?u64 = null;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, 0)) |summary_page| {
             if (summary_page.range_kind == .summary and summary_page.state != .complete) {
@@ -5281,7 +5335,7 @@ pub const GraphIndex = struct {
         now_ms: u64,
     ) !?GraphMetricBuildPage {
         if (worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const claimed = try self.claimGraphMetricBuildPageInBatch(&batch, metric_name, job_id, phase, iteration, page_id, worker_id, now_ms);
         try batch.commit();
@@ -5378,7 +5432,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const page = try self.updateGraphMetricBuildPageProgressInBatch(
             &batch,
@@ -5442,7 +5496,7 @@ pub const GraphIndex = struct {
         seed_mass: f64,
     ) !GraphMetricBuildPage {
         if (!std.math.isFinite(rank_sum) or !std.math.isFinite(seed_mass) or seed_mass < 0) return error.InvalidGraphMetricScore;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.range_kind != .summary) return error.InvalidGraphMetricBuildPage;
@@ -5474,7 +5528,7 @@ pub const GraphIndex = struct {
         total_delta: f64,
         rank_sum: f64,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job_id, .check_convergence, iteration, page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state != .leased or !std.mem.eql(u8, page.worker_id, worker_id)) return error.GraphMetricBuildPageNotLeased;
@@ -5574,7 +5628,7 @@ pub const GraphIndex = struct {
         rank_sum: f64,
         converged: bool,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state == .complete) {
@@ -5638,7 +5692,7 @@ pub const GraphIndex = struct {
         expected_attempt: u64,
         last_error: []const u8,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state != .leased or !std.mem.eql(u8, page.worker_id, worker_id)) return error.GraphMetricBuildPageNotLeased;
@@ -5665,7 +5719,7 @@ pub const GraphIndex = struct {
         phase: GraphMetricBuildPhase,
         iteration: u32,
     ) !GraphMetricBuildPhaseSummary {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -5825,7 +5879,7 @@ pub const GraphIndex = struct {
     }
 
     fn advanceGraphMetricBuildPhaseWithRetirement(self: *GraphIndex, metric_name: []const u8, job_id: u64, phase: GraphMetricBuildPhase, iteration: u32, retired: ?*usize) !bool {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -6005,7 +6059,7 @@ pub const GraphIndex = struct {
         job_id: u64,
         iteration: u32,
     ) !GraphMetricBuildIterationSummary {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -6054,7 +6108,7 @@ pub const GraphIndex = struct {
         metric_name: []const u8,
         job_id: u64,
     ) !GraphMetricBuildPublishVerification {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -6142,7 +6196,7 @@ pub const GraphIndex = struct {
     }
 
     fn releaseGraphMetricBuildLease(self: *GraphIndex, metric_name: []const u8) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const key = try self.graphMetricBuildLeaseKeyAlloc(metric_name);
         defer self.alloc.free(key);
@@ -6171,7 +6225,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const key = try self.graphMetricBuildLeaseKeyAlloc(metric_name);
         defer self.alloc.free(key);
@@ -6215,7 +6269,7 @@ pub const GraphIndex = struct {
     }
 
     fn completeGraphMetricBuildJob(self: *GraphIndex, metric_name: []const u8) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse {
             try batch.commit();
@@ -6270,7 +6324,7 @@ pub const GraphIndex = struct {
         metric_name: []const u8,
         job_id: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var manifest = try self.metricBuildManifest(&batch, metric_name, job_id) orelse return error.GraphMetricBuildManifestNotFound;
         manifest.config_fingerprint +%= 1;
@@ -6713,7 +6767,7 @@ pub const GraphIndex = struct {
     fn recordGraphMetricFailureReasonAtGeneration(self: *GraphIndex, requested_name: []const u8, failure_reason: []const u8, preparation_generation: ?u64, preparation_task: ?[]const u8) !void {
         const metric_name = if (preparation_task != null) try self.graphMetricLifecycleOwnerName(requested_name) else requested_name;
         const pair_cfg = if (self.metricConfig(metric_name)) |cfg| self.pairedHitsMetricConfig(cfg) else null;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (preparation_task) |task_name| {
             const task_key = try topologyTaskKeyAlloc(self.alloc, task_name);
@@ -6886,6 +6940,16 @@ pub const GraphIndex = struct {
         // Rebuild is exclusive maintenance, not a query-time fallback. Its
         // marker remains durable until counters and the final cursor commit.
         // Opening the index resumes it before readers/workers can observe it.
+        //
+        // §3.2a audit: stays durable, not `.ride_along`, deliberately. This
+        // (and `rebuildCounterPage`'s own commit below) runs synchronously
+        // inside `openWithPrivateStores` on every reopen while
+        // `counters_pending`, before the index is otherwise live -- there is
+        // no guaranteed later foreground group within that same admission
+        // sequence to carry a ride-along member's durability. Confirmed by
+        // the crash-sweep harness: converting this site surfaced a real
+        // `InvalidNativeAllocator` failure on the ordinary (uncrashed)
+        // graph-add-index-with-metrics discovery pass.
         {
             var batch = try self.beginWriteReverseBatch();
             errdefer batch.abort();
@@ -6929,6 +6993,7 @@ pub const GraphIndex = struct {
         }
     }
 
+    // §3.2a audit: stays durable -- see `rebuildCounterMetadata`'s note above.
     fn rebuildCounterPage(self: *GraphIndex) !bool {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -7063,6 +7128,34 @@ pub const GraphIndex = struct {
                     .owner = .{ .lsm = handle },
                 };
             },
+            // WS4-equivalent for graph (design doc §3.3): forward/reverse
+            // adjacency and all graph metadata as native index-catalog
+            // records, one durable native commit per store commit instead
+            // of an LSM WAL + segment + artifact-lease stack on Lite's
+            // virtual filesystem. `path` (the caller-supplied, already
+            // forward/reverse-distinct "<index path>/forward" or
+            // "<index path>/reverse" string -- see `open`/
+            // `openWithPrivateStores`) is the sink scope, mirroring
+            // `persistent.zig`'s `index_path` scope for text's own
+            // `.native_catalog` main backend. No on-disk path is created:
+            // this never touches a filesystem.
+            .native_catalog => {
+                const sink = opts.native_catalog_sink orelse return error.MissingNativeCatalogSink;
+                const backend = try alloc.create(native_catalog_backend.Backend);
+                errdefer alloc.destroy(backend);
+                backend.* = try native_catalog_backend.Backend.init(alloc, .{
+                    .sink = sink,
+                    .scope = std.mem.span(path),
+                });
+                errdefer backend.close();
+
+                var runtime = try backend.runtimeStore(alloc, .{});
+                errdefer runtime.deinit();
+                return .{
+                    .store = runtime,
+                    .owner = .{ .native_catalog = backend },
+                };
+            },
         }
     }
 
@@ -7181,7 +7274,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn publishArtifactRebuildSequence(self: *GraphIndex, sequence: u64) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const previous = try readU64OrZero(&batch, artifact_rebuild_sequence_key);
         try putU64(&batch, artifact_rebuild_sequence_key, @max(previous, sequence));
@@ -7604,7 +7697,7 @@ pub const GraphIndex = struct {
         if (snapshots.len == 0) return;
         var read = try self.beginReadReverseTxn();
         defer read.abort();
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var seen = std.StringHashMapUnmanaged(void).empty;
         defer {
@@ -7702,7 +7795,7 @@ pub const GraphIndex = struct {
     pub fn publishContributionOrderingReady(self: *GraphIndex) !void {
         try self.sync(true);
         {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             try batch.put(contribution_ordering_ready_key, "1");
             try bumpReverseReadGeneration(&batch);
@@ -7995,7 +8088,28 @@ pub const GraphIndex = struct {
             try self.syncCommittedIntent();
         }
 
-        var main_batch = try self.beginWriteOutgoingBatch();
+        // §3.2a ride-along: under `.native_catalog`, when none of the three
+        // crash-ordering-sensitive conditions below hold, the outgoing
+        // commit need not force its own `syncData` -- the reverse commit a
+        // few lines down is the very next durable commit against this same
+        // `.aflite` file, on this same calling thread, and a durable
+        // commit's manifest covers every page written since the last
+        // durable checkpoint (design doc §3.1/§3.2a), so it durably covers
+        // the outgoing write too. That collapses the common single-edge
+        // write (no document clear, no producer clear, no completed range-
+        // prune intent) from two native syncs to one. The three excluded
+        // cases keep today's ordering exactly: a plain durable outgoing
+        // commit already guarantees "outgoing durable before reverse
+        // retires its recovery intent" without any extra sync (see
+        // `ReverseStoreOwner.sync`'s `.native_catalog` arm).
+        const outgoing_ride_along = switch (self.outgoing_owner) {
+            .native_catalog => completed_intent == null and !clears_private_state and !clears_producer,
+            else => false,
+        };
+        var main_batch = if (outgoing_ride_along)
+            try self.outgoing_store.beginBatchWithOptions(.{ .durability = .ride_along })
+        else
+            try self.beginWriteOutgoingBatch();
         var main_active = true;
         errdefer if (main_active) main_batch.abort();
 
@@ -8189,7 +8303,11 @@ pub const GraphIndex = struct {
         try putU64(&reverse_batch, graph_read_generation_key, next_read_generation);
         try bumpReverseReadGeneration(&reverse_batch);
         if (builtin.is_test) if (test_counter_publication_hook) |hook| try hook(self, counters);
-        try main_batch.commit();
+        {
+            const wal_trace_scope = wal_trace.scope(.graph_forward_commit);
+            defer wal_trace_scope.end();
+            try main_batch.commit();
+        }
         main_active = false;
         // A durable reverse-store completion must never retire its recovery
         // intent while the outgoing deletion can still be lost on power loss.
@@ -8200,8 +8318,229 @@ pub const GraphIndex = struct {
             }
         }
         if (builtin.is_test and completed_intent != null and test_abort_prune_after_forward_commit) return error.TestInjectedBackfillFailure;
-        try reverse_batch.commit();
+        {
+            const wal_trace_scope = wal_trace.scope(.graph_reverse_commit);
+            defer wal_trace_scope.end();
+            try reverse_batch.commit();
+        }
         self.publishCounters(counters);
+    }
+
+    // ------------------------------------------------------------------
+    // Inline edge publication (design doc §3.3's graph extension).
+    //
+    // Mirrors `persistent.zig`'s `prepareInlineSegmentPublication`/
+    // `installInlineSegmentPublication`: build a small, bounded mutation
+    // set OUTSIDE any durable commit, hand it to a caller that folds it
+    // into an externally-owned native transaction (one `commit_participant.
+    // View.putIndexCatalog` call per store scope -- see
+    // `native_catalog_backend.zig`'s `Backend.boundWrite`/
+    // `BoundTxn.pendingMutations`), then publish this index's own
+    // in-memory state (counters, read generation) only once that external
+    // commit has returned successfully.
+    //
+    // Scope is deliberately narrow -- exactly the common case the WS0
+    // harness measures (`write_amplification_bench_test.zig`'s graph
+    // modes): one `BatchWrite`, no deletes, no owner-membership tracking,
+    // no TTL contribution, no metrics (so no topology/typed-edge
+    // bookkeeping -- `applyMutationPage` itself only writes that
+    // durably when a `.types`-filtered metric is configured; see
+    // `typed_demand`/`typed_state.active` there), and both stores already
+    // on `.native_catalog`. Everything else keeps going through
+    // `applyMutationPage`'s own two commits.
+    //
+    // NOT wired into the production ack path yet (`mutation_materialization
+    // .zig`'s graph write handling still calls `applyMutationPage`
+    // unconditionally): doing that safely needs the same commit-plan
+    // integration `InlineTextPublication` (mutation_materialization.zig)
+    // required for text, which touches the primary-commit assembly this
+    // task's instructions scope to a different agent's area. This is the
+    // API + tests half of that follow-up, intentionally stopped short of
+    // the wiring -- see docs/design/lite-performance/
+    // lite-single-commit-write-path.md §3.3 and this file's write-
+    // amplification ceiling test comment for the gap this closes.
+    pub const InlineEdgePublicationError = error{InlineEdgePublicationUnsupported};
+
+    /// A single edge write's forward/reverse mutations, staged but not yet
+    /// durable. Exactly one of `install` (the mutations are now durable in
+    /// an externally-owned commit) or `abort` (they are not) must run
+    /// exactly once for every value this returns.
+    pub const InlineEdgePublication = struct {
+        alloc: Allocator,
+        forward_mutations: []native_catalog_backend.Mutation,
+        reverse_mutations: []native_catalog_backend.Mutation,
+        counters: Stats,
+
+        /// This publication's forward-store (outgoing adjacency) mutations,
+        /// to fold into an externally-owned native transaction via
+        /// `commit_participant.View.putIndexCatalog(forward_scope, ...)`.
+        /// `forward_scope` is this index's own outgoing-store path (the
+        /// same string `openEdgeStore` used as the `.native_catalog`
+        /// `Backend`'s scope); the caller already knows it from opening
+        /// this index and is not re-derived here.
+        pub fn forwardMutations(self: *const InlineEdgePublication) []const native_catalog_backend.Mutation {
+            return self.forward_mutations;
+        }
+
+        /// This publication's reverse-store (incoming adjacency) mutations;
+        /// see `forwardMutations`.
+        pub fn reverseMutations(self: *const InlineEdgePublication) []const native_catalog_backend.Mutation {
+            return self.reverse_mutations;
+        }
+
+        /// Discards a publication whose mutations were never committed
+        /// durably (or whose commit failed): nothing becomes visible to
+        /// either store's readers or this index's in-memory counters.
+        pub fn abort(self: *InlineEdgePublication) void {
+            freeOwnedMutations(self.alloc, self.forward_mutations);
+            freeOwnedMutations(self.alloc, self.reverse_mutations);
+            self.* = undefined;
+        }
+    };
+
+    fn dupeOwnedMutationsAlloc(alloc: Allocator, items: []const native_catalog_backend.Mutation) ![]native_catalog_backend.Mutation {
+        // Deep copy: `items` is normally a `BoundTxn.pendingMutations()`
+        // slice whose key/value/namespace bytes live in that transaction's
+        // own arena, freed the moment the caller aborts it.
+        const out = try alloc.alloc(native_catalog_backend.Mutation, items.len);
+        var filled: usize = 0;
+        errdefer freeOwnedMutations(alloc, out[0..filled]);
+        for (items, 0..) |m, i| {
+            out[i] = .{
+                .namespace = if (m.namespace) |n| try alloc.dupe(u8, n) else null,
+                .key = try alloc.dupe(u8, m.key),
+                .value = if (m.is_delete) "" else try alloc.dupe(u8, m.value),
+                .is_delete = m.is_delete,
+            };
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    fn freeOwnedMutations(alloc: Allocator, items: []const native_catalog_backend.Mutation) void {
+        for (items) |m| {
+            if (m.namespace) |n| alloc.free(n);
+            alloc.free(m.key);
+            if (!m.is_delete) alloc.free(m.value);
+        }
+        alloc.free(items);
+    }
+
+    /// Builds one edge write's `InlineEdgePublication`, without touching
+    /// either store's durable sink (see `native_catalog_backend.Backend.
+    /// boundWrite`'s "never talks to sink" note). Returns
+    /// `error.InlineEdgePublicationUnsupported` for everything outside
+    /// this API's narrow scope (see the section doc comment above); the
+    /// caller falls back to `applyMutationPage` (via `addEdge`/the public
+    /// batch-apply entry points) in that case.
+    pub fn prepareInlineEdgePublication(self: *GraphIndex, write: BatchWrite) !InlineEdgePublication {
+        if (std.meta.activeTag(self.outgoing_owner) != .native_catalog or std.meta.activeTag(self.reverse_owner) != .native_catalog) {
+            wal_trace.recordOp(.graph_inline_prepare_backend_mismatch);
+            return error.InlineEdgePublicationUnsupported;
+        }
+        if (write.owner.len != 0 or write.owner_document.len != 0) {
+            wal_trace.recordOp(.graph_inline_prepare_owner);
+            return error.InlineEdgePublicationUnsupported;
+        }
+        if (self.ttl_duration_ns != 0) {
+            wal_trace.recordOp(.graph_inline_prepare_ttl);
+            return error.InlineEdgePublicationUnsupported;
+        }
+        if (self.metric_configs.len != 0) {
+            wal_trace.recordOp(.graph_inline_prepare_metrics);
+            return error.InlineEdgePublicationUnsupported;
+        }
+
+        try @import("mutation_identity.zig").validate(write.edge_id, write.owner_document, write.owner);
+        try edge_type_mod.validateStored(write.edge_type);
+        try edge_weight.validateStored(write.weight);
+
+        const forward_backend = self.outgoing_owner.native_catalog;
+        const reverse_backend = self.reverse_owner.native_catalog;
+
+        var forward_txn = try forward_backend.boundWrite(.{});
+        defer forward_txn.abort();
+        var reverse_txn = try reverse_backend.boundWrite(.{});
+        defer reverse_txn.abort();
+
+        const edge_val = try encodeEdgeValueWithTtlAlloc(
+            self.alloc,
+            write.weight,
+            write.created_at,
+            write.updated_at,
+            write.ttl_created_ns,
+            write.metadata_json,
+        );
+        defer self.alloc.free(edge_val);
+
+        const out_key = try relationshipKeyAlloc(self.alloc, write.source, self.index_name, write.edge_type, write.target, write.edge_id, write.owner_document);
+        defer self.alloc.free(out_key);
+        try forward_txn.put(out_key, edge_val);
+
+        const rev_key = try relationshipKeyAlloc(self.alloc, write.target, self.index_name, write.edge_type, write.source, write.edge_id, write.owner_document);
+        defer self.alloc.free(rev_key);
+        var counters = try graphCountersInTxn(&reverse_txn);
+        try self.accountReverseInsert(&reverse_txn, &counters, write.source, write.target, rev_key);
+        try reverse_txn.put(rev_key, edge_val);
+        try persistCounters(&reverse_txn, counters);
+
+        const read_generation_key = try outgoingReadGenerationKeyAlloc(self.alloc, self.index_name);
+        defer self.alloc.free(read_generation_key);
+        const next_read_generation = std.math.add(u64, try readU64OrZero(&reverse_txn, graph_read_generation_key), 1) catch return error.InlineEdgePublicationUnsupported;
+        try putU64(&forward_txn, read_generation_key, next_read_generation);
+        try putU64(&reverse_txn, graph_read_generation_key, next_read_generation);
+        try bumpReverseReadGeneration(&reverse_txn);
+
+        const forward_mutations = try dupeOwnedMutationsAlloc(self.alloc, forward_txn.pendingMutations());
+        errdefer freeOwnedMutations(self.alloc, forward_mutations);
+        const reverse_mutations = try dupeOwnedMutationsAlloc(self.alloc, reverse_txn.pendingMutations());
+        errdefer freeOwnedMutations(self.alloc, reverse_mutations);
+
+        return .{
+            .alloc = self.alloc,
+            .forward_mutations = forward_mutations,
+            .reverse_mutations = reverse_mutations,
+            .counters = counters,
+        };
+    }
+
+    /// Runs only after `publication`'s mutations (`forwardMutations()`/
+    /// `reverseMutations()`) are already durable in an externally-owned
+    /// native transaction's commit. Syncs both stores' in-memory read
+    /// mirrors (so this index's own subsequent reads see the edge) and
+    /// publishes the in-memory counters -- the step after which a
+    /// synchronous graph-visible write's ack may return.
+    pub fn installInlineEdgePublication(self: *GraphIndex, publication: *InlineEdgePublication) !void {
+        try self.outgoing_owner.native_catalog.applyExternallyCommittedMutations(publication.forward_mutations);
+        try self.reverse_owner.native_catalog.applyExternallyCommittedMutations(publication.reverse_mutations);
+        self.publishCounters(publication.counters);
+        freeOwnedMutations(self.alloc, publication.forward_mutations);
+        freeOwnedMutations(self.alloc, publication.reverse_mutations);
+        publication.* = undefined;
+    }
+
+    /// The forward (outgoing-adjacency) store's `.native_catalog` scope --
+    /// the same string an inline caller must pass as `scope` to
+    /// `commit_participant.View.putIndexCatalog` when folding
+    /// `InlineEdgePublication.forwardMutations()` into an externally-owned
+    /// native transaction. `null` when this store is not `.native_catalog`
+    /// (in which case `prepareInlineEdgePublication` itself already fails
+    /// with `error.InlineEdgePublicationUnsupported`, so a caller that
+    /// checks this first never needs to attempt `prepare` at all).
+    pub fn forwardCatalogScope(self: *const GraphIndex) ?[]const u8 {
+        return switch (self.outgoing_owner) {
+            .native_catalog => |backend| backend.scope,
+            else => null,
+        };
+    }
+
+    /// The reverse (incoming-adjacency) store's `.native_catalog` scope;
+    /// see `forwardCatalogScope`.
+    pub fn reverseCatalogScope(self: *const GraphIndex) ?[]const u8 {
+        return switch (self.reverse_owner) {
+            .native_catalog => |backend| backend.scope,
+            else => null,
+        };
     }
 
     const TopologyMutation = struct { before: bool, after: bool, kind: []const u8, source: []const u8, target: []const u8 };
@@ -8346,7 +8685,7 @@ pub const GraphIndex = struct {
     /// Reference oracle for endpoint-maintenance cost. Abort leaves the same
     /// durable fixture available to every sample; WAL/commit are not measured.
     pub fn benchmarkTypedMembershipUpdates(self: *GraphIndex, alloc: Allocator, writes: []const BatchWrite, reference: bool) !usize {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         defer batch.abort();
         var updates = typed_edges.Updates.init(alloc);
         defer updates.deinit();
@@ -8364,7 +8703,7 @@ pub const GraphIndex = struct {
         const key = try self.graphMetricPartitionPlanKeyAlloc(filter);
         defer self.alloc.free(key);
         {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             batch.delete(key) catch |err| if (err != error.NotFound) return err;
             if (filter.mode == .all) batch.delete(graph_metric_partition_census_key) catch |err| if (err != error.NotFound) return err;
@@ -10071,6 +10410,13 @@ pub const GraphIndex = struct {
     /// Upgrade old edge-ordered membership once, in bounded durable pages.
     /// The metadata directory also holds recovery identities across store commits.
     /// Normal producer cleanup then seeks only that producer's key range.
+    ///
+    /// §3.2a audit: `ensureLegacyOwnerDirectoryPage`'s commit stays durable,
+    /// not `.ride_along` -- same reason as `rebuildCounterMetadata`/
+    /// `rebuildCounterPage` above: `openWithPrivateStores` calls this
+    /// unconditionally on every writable open/reopen, before the index is
+    /// otherwise live, with no guaranteed later foreground group in that
+    /// same admission sequence to carry a ride-along member's durability.
     fn ensureLegacyOwnerDirectory(self: *GraphIndex) !void {
         while (!try self.ensureLegacyOwnerDirectoryPage()) {}
     }
@@ -10167,7 +10513,7 @@ pub const GraphIndex = struct {
             complete = if (row) |entry| !std.mem.startsWith(u8, entry.key, prefix) else true;
         }
         if (keys.items.len == 0) return true;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         for (keys.items) |key| try batch.delete(key);
         for (due.items) |key| try batch.delete(key);
@@ -10216,7 +10562,7 @@ pub const GraphIndex = struct {
             complete = if (row) |entry| !std.mem.startsWith(u8, entry.key, prefix) else true;
         }
         if (keys.items.len == 0) return true;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         for (keys.items) |key| try batch.delete(key);
         for (due.items) |key| try batch.delete(key);
@@ -10450,7 +10796,7 @@ pub const GraphIndex = struct {
         var cursor = try source.openCursor();
         defer cursor.close();
         cursor.setUpperBound(if (range_upper.len > 0) range_upper else null);
-        var batch = try dest.beginWriteOutgoingBatch();
+        var batch = try dest.beginWriteOutgoingBatchWithOptions(.{ .durability = .ride_along });
         var active = true;
         errdefer if (active) batch.abort();
         var copied: usize = 0;
@@ -10481,7 +10827,7 @@ pub const GraphIndex = struct {
             if (bytes >= 4 * 1024 * 1024 or copied % reverse_rebuild_batch_size == 0) {
                 try batch.commit();
                 active = false;
-                batch = try dest.beginWriteOutgoingBatch();
+                batch = try dest.beginWriteOutgoingBatchWithOptions(.{ .durability = .ride_along });
                 active = true;
                 bytes = 0;
             }
@@ -13098,7 +13444,7 @@ pub const GraphIndex = struct {
     /// Benchmark fixture only: one canonical leaf with maximum producer fan-in.
     pub fn benchmarkMembershipFixture(self: *GraphIndex, nodes: []const []const u8) !void {
         if (nodes.len > graph_metric_build_target_reduce_page_units) return error.InvalidBenchmarkResult;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         try self.putGraphMetricBuildManifestInBatch(&batch, "bench-membership", .{ .job_id = 1, .node_count = nodes.len });
         try self.putGraphMetricBuildPageInBatch(&batch, "bench-membership", .{ .job_id = 1, .phase = .initialize_ranks, .page_id = graph_metric_build_summary_leaf_base, .range_kind = .summary, .state = .complete, .completed_units = nodes.len, .total_units = nodes.len });
@@ -13477,7 +13823,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn prepareSealedVectorBenchmark(self: *GraphIndex) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var chunk: vector_chunk.Chunk = @splat(0);
         for (0..vector_chunk.entries) |slot| try vector_chunk.put(&chunk, slot, 0.5);
@@ -13606,7 +13952,7 @@ pub const GraphIndex = struct {
             }
         }.lessThan);
         const completed = std.math.add(u64, prior, topology.scanned) catch return error.InvalidGraphMetricBuildProgress;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = try self.metricBuildPage(&batch, metric_name, job.job_id, page.phase, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(page, current);
@@ -13752,7 +14098,7 @@ pub const GraphIndex = struct {
                 if (state.count != 0) try outputs.append(temp, try ordinal_blocks.encodeTopology(temp, .{ .edges = state.pending[0..state.count], .cursor = @constCast(""), .scanned = state.count, .complete = true }));
             }
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = try self.metricBuildPage(&batch, metric_name, job.job_id, claimed.phase, claimed.iteration, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
@@ -14216,7 +14562,7 @@ pub const GraphIndex = struct {
             const packed_records = try self.compactOrdinalAdjacencyChunk(metric_name, job, claimed, producer_phase, chunk, @min(max_records, graph_metric_build_adoption_page_units));
             return packed_records + try self.executeOrdinalReduceSummaryCheckpoint(metric_name, cfg, job, claimed, max_nodes, max_records, false);
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var current = try self.metricBuildPage(&batch, metric_name, job.job_id, claimed.phase, claimed.iteration, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
@@ -14292,7 +14638,7 @@ pub const GraphIndex = struct {
             break :read end;
         };
         if (pack) |chunk| return self.compactOrdinalAdjacencyChunk(metric, job, claimed, producer, chunk, @min(max_records, graph_metric_build_adoption_page_units));
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var current = try self.metricBuildPage(&batch, metric, job.job_id, claimed.phase, 0, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
@@ -14436,7 +14782,7 @@ pub const GraphIndex = struct {
         };
 
         if (!adopted_topology and page.phase == .initialize_ranks and page.page_id >= graph_metric_build_summary_leaf_base) {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             const current = try self.metricBuildPage(&batch, metric_name, job.job_id, page.phase, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
             try self.validateGraphMetricBuildPageExecutionLease(page, current);
@@ -14594,7 +14940,7 @@ pub const GraphIndex = struct {
                 else => return err,
             }
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = try self.metricBuildPage(&batch, metric_name, job.job_id, claimed.phase, claimed.iteration, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
@@ -14830,7 +15176,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .scan_edges_and_out_degree, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -14986,7 +15332,7 @@ pub const GraphIndex = struct {
         initialized: []const PageRankInitializeNode,
         initial_rank: f64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .initialize_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -15038,7 +15384,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .iterate_contributions, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -15178,7 +15524,7 @@ pub const GraphIndex = struct {
         output_fingerprint: u64,
         complete_page: bool,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, .reduce_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state == .complete) {
@@ -15331,7 +15677,7 @@ pub const GraphIndex = struct {
         initialized_nodes: []const PageRankInitializeNode,
         initial_rank: f64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .initialize_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -15545,7 +15891,7 @@ pub const GraphIndex = struct {
         initialized_nodes: []const PageRankInitializeNode,
         initial_rank: f64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .initialize_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -15790,7 +16136,7 @@ pub const GraphIndex = struct {
         output_fingerprint: u64,
         complete_page: bool,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, phase, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state == .complete) {
@@ -15858,7 +16204,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .hits_hub_contributions, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -15936,7 +16282,7 @@ pub const GraphIndex = struct {
         claimed_page: GraphMetricBuildPage,
         worker_id: []const u8,
     ) !HitsHubRawSummary {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var expected_page = claimed_page;
         expected_page.worker_id = worker_id;
@@ -16342,7 +16688,7 @@ pub const GraphIndex = struct {
         const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key.items;
         const progress_units = if (reached_page_end and page.total_units != 0) page.total_units else completed_units;
         {
-            var score_batch = try self.beginWriteReverseBatch();
+            var score_batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer score_batch.abort();
             const current_page = try self.metricBuildPage(&score_batch, metric_name, job.job_id, .scan_edges_and_out_degree, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
             var expected_page = page;
@@ -16524,7 +16870,7 @@ pub const GraphIndex = struct {
         output_fingerprint: u64,
         complete_page: bool,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, .reduce_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state == .complete) {
@@ -16647,7 +16993,7 @@ pub const GraphIndex = struct {
         graphMetricConfigFingerprintHashU64(&hasher, graphMetricScoresFingerprint(pair_scores.items));
         const output_fingerprint = hasher.final();
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, .publish_generation, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, page);
@@ -16721,7 +17067,7 @@ pub const GraphIndex = struct {
         const cleanup_prefix = try self.graphMetricBuildCleanupPagePrefixAlloc(metric_name, kind, job.job_id, cleanup_page);
         defer self.alloc.free(cleanup_prefix);
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var delete_page = try self.deleteKeysWithPrefixPageInBatch(&batch, cleanup_prefix, cleanup_page.cursor, graph_metric_build_cleanup_delete_page_units);
         defer delete_page.deinit(self.alloc);
@@ -17329,7 +17675,7 @@ pub const GraphIndex = struct {
     /// pointer swaps. The two-slot queue absorbs a publish followed by an
     /// operator action while cleanup catches up, then applies backpressure.
     pub fn cleanupRetiredGraphMetricScoreGenerationPage(self: *GraphIndex, metric_name: []const u8) !bool {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const generation_key = try self.graphMetricRetiredScoreGenerationKeyAlloc(metric_name);
         defer self.alloc.free(generation_key);
@@ -17494,7 +17840,7 @@ pub const GraphIndex = struct {
 
     pub fn queueGraphMetricBuild(self: *GraphIndex, metric: []const u8, generation: u64) !GraphMetricStatus {
         const name = try self.graphMetricLifecycleOwnerName(metric);
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const key = try self.graphMetricControlKeyAlloc(&.{ name, "requested" });
         defer self.alloc.free(key);
@@ -17596,7 +17942,7 @@ pub const GraphIndex = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const temp = arena.allocator();
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (generation != try self.graphMetricFilterGeneration(&batch, cfg.edge_filter)) return error.GraphMetricBuildSnapshotChanged;
         const filter = try topology_owner.filterDigest(temp, cfg.edge_filter);
@@ -17779,7 +18125,7 @@ pub const GraphIndex = struct {
     }
 
     fn retireTopologyTaskPage(self: *GraphIndex, key: []const u8, name: []const u8, raw: []u8) !bool {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = batch.get(key) catch |err| switch (err) {
             error.NotFound => {
@@ -18023,7 +18369,7 @@ pub const GraphIndex = struct {
             if (item == null or !std.mem.startsWith(u8, item.?.key, prefix)) next_cursor = null;
         }
         if (obsolete.items.len > 0) {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             for (obsolete.items) |key| batch.delete(key) catch |err| if (err != error.NotFound) return err;
             try batch.commit();
@@ -18072,7 +18418,7 @@ pub const GraphIndex = struct {
         };
         // Revalidate all liveness under the writer transaction. A job may pin
         // this owner between the read-only census and acquisition of the lock.
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const id: topology_owner.Id = key[topology_owner.catalog_prefix.len..][0..64].*;
         const owner_raw = batch.get(key) catch |err| switch (err) {
@@ -18235,7 +18581,7 @@ pub const GraphIndex = struct {
     }
 
     fn cleanupGraphMetricBuildJobKeys(self: *GraphIndex, metric_name: []const u8, job_id: u64) !usize {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const removed = try self.cleanupGraphMetricBuildJobKeysInBatch(&batch, metric_name, job_id);
         try batch.commit();
@@ -18269,7 +18615,7 @@ pub const GraphIndex = struct {
         const job_id = std.fmt.parseInt(u64, job_id_text, 10) catch return error.InvalidGraphMetricBuildManifest;
         const job_prefix = try self.graphMetricBuildJobNamespacePrefixAlloc(metric_name, job_id);
         defer self.alloc.free(job_prefix);
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var deleted = try self.deleteKeysWithPrefixPageInBatch(&batch, job_prefix, resume_cursor, graph_metric_build_cleanup_delete_page_units);
         defer deleted.deinit(self.alloc);
@@ -18305,7 +18651,7 @@ pub const GraphIndex = struct {
         job_id: u64,
         page: GraphMetricBuildPage,
     ) !GraphMetricAttemptAdoptionResult {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const result = switch (page.phase) {
             .scan_edges_and_out_degree => if (kind == .degree)
@@ -18601,7 +18947,7 @@ pub const GraphIndex = struct {
 
     pub fn deleteGraphMetricMaterialization(self: *GraphIndex, metric_name: []const u8) !void {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const now_ms = self.clock.nowRealtimeMs();
         try self.deleteGraphMetricMaterializationInBatch(&batch, cfg.name, now_ms);
@@ -18679,7 +19025,7 @@ pub const GraphIndex = struct {
         const job_id_key = try self.graphMetricDeleteCleanupJobIdKeyAlloc(metric_name);
         defer self.alloc.free(job_id_key);
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (!try self.metricDisabled(&batch, metric_name)) {
             try batch.commit();
@@ -18730,7 +19076,7 @@ pub const GraphIndex = struct {
 
     pub fn pauseGraphMetricMaintenance(self: *GraphIndex, metric_name: []const u8) !GraphMetricStatus {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const now_ms = self.clock.nowRealtimeMs();
         try self.pauseGraphMetricMaintenanceInBatch(&batch, cfg.name, now_ms);
@@ -18756,7 +19102,7 @@ pub const GraphIndex = struct {
 
     pub fn resumeGraphMetricMaintenance(self: *GraphIndex, metric_name: []const u8) !GraphMetricStatus {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const now_ms = self.clock.nowRealtimeMs();
         try self.resumeGraphMetricMaintenanceInBatch(&batch, cfg.name, now_ms);
@@ -18813,7 +19159,7 @@ pub const GraphIndex = struct {
             const pair_disabled = if (pair_cfg) |pair| try self.metricDisabled(&txn, pair.name) else false;
             if (!requested_disabled and !pair_disabled) return;
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         try self.enableGraphMetricInBatch(&batch, cfg.name);
         if (pair_cfg) |pair| {
@@ -18850,7 +19196,7 @@ pub const GraphIndex = struct {
         meta: GraphMetricMeta,
     ) !GraphMetricStatus {
         if (self.ownershipTransitionPending()) return error.MetricNotReady;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (batch.get(maintenance.ownership_key)) |_| return error.MetricNotReady else |err| if (err != error.NotFound) return err;
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
@@ -18889,7 +19235,7 @@ pub const GraphIndex = struct {
         const verification = try self.verifyGraphMetricBuildPublishReady(metric_name, job_id);
         if (verification.config_fingerprint != meta.config_fingerprint) return error.InvalidGraphMetricBuildManifest;
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -18953,7 +19299,7 @@ pub const GraphIndex = struct {
         first_meta: GraphMetricMeta,
         second_meta: GraphMetricMeta,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const cfg = self.metricConfig(first_metric_name) orelse return error.MetricNotReady;
         const score_generation = if (try self.metricBuildJob(&batch, first_metric_name)) |job| blk: {
@@ -19111,7 +19457,7 @@ pub const GraphIndex = struct {
         var commits: usize = 0;
         while (offset < scores.len) {
             const end = @min(scores.len, offset + limit);
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             try self.putPlannedGraphMetricScorePageInBatch(&batch, "bench", job, "bench", scores[offset..end]);
             try putU64(&batch, cursor, end);
@@ -19148,7 +19494,7 @@ pub const GraphIndex = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const temp = arena.allocator();
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const persisted = try self.metricBuildJob(&batch, owner) orelse return error.GraphMetricBuildJobNotFound;
         if (persisted.job_id != job.job_id or persisted.phase != .publish_generation or persisted.iteration != job.iteration) return error.GraphMetricBuildJobMismatch;
@@ -19735,7 +20081,7 @@ pub const GraphIndex = struct {
     pub fn benchmarkTopologyBuild(self: *GraphIndex, metric: []const u8, reuse: bool) !TopologyBuildBenchmark {
         const cfg = self.metricConfig(metric) orelse return error.InvalidBenchmarkResult;
         if (!reuse) {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             const filter = try topology_owner.filterDigest(self.alloc, cfg.edge_filter);
             const digest = topology_owner.identity(filter, try self.graphMetricPartitionPlanRaw(&batch, cfg));
@@ -20191,7 +20537,7 @@ pub const GraphIndex = struct {
         var pair_meta = meta;
         pair_meta.config_fingerprint = graphMetricConfigFingerprint(pair);
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const persisted_job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (persisted_job.job_id != job.job_id) return error.GraphMetricBuildJobMismatch;
@@ -20876,7 +21222,7 @@ pub const GraphIndex = struct {
         for (names) |name| {
             var offset: usize = 0;
             while (offset < nodes.len) {
-                var batch = try self.beginWriteReverseBatch();
+                var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
                 errdefer batch.abort();
                 const end = @min(nodes.len, offset + 4096);
                 for (nodes[offset..end], offset..) |node, i| {
@@ -20887,7 +21233,7 @@ pub const GraphIndex = struct {
                 try batch.commit();
                 offset = end;
             }
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             const key = try self.graphMetricPublishedGenerationKeyAlloc(name);
             defer self.alloc.free(key);
@@ -21585,6 +21931,349 @@ test "graph addEdge and getEdges out" {
     try std.testing.expectEqual(@as(usize, 2), edges.len);
     try std.testing.expectEqualStrings("doc1", edges[0].source);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9), edges[0].weight, 0.001);
+}
+
+// ---------------------------------------------------------------------------
+// `.native_catalog` reverse backend: forward/reverse adjacency as native
+// index-catalog records (design doc §3.3's graph extension). `NativeCatalogTestSink`
+// is a minimal, allocator-backed `native_catalog_backend.Sink`, standing in
+// for Lite's real `lite/native_catalog_sink.zig` the same way the hosted
+// backend's own tests substitute `mem_backend`/`lsm_backend` for a real
+// `.aflite` file -- the `Sink` contract (one `submit` per commit, `scope`
+// disambiguates callers sharing one durable root) is exactly what a real
+// Lite DB's `Store` provides, so the full write/reopen path below (`addEdge`
+// -> `batchApplyWithAccounting` -> `applyMutationPage` -> ride-along forward
+// commit + durable reverse commit) runs unmodified against this fixture.
+// ---------------------------------------------------------------------------
+
+const NativeCatalogTestSink = struct {
+    allocator: Allocator,
+    entries: std.StringHashMapUnmanaged([]u8) = .empty,
+    submit_calls: usize = 0,
+    durable_submit_calls: usize = 0,
+
+    fn compositeKeyAlloc(alloc: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) ![]u8 {
+        return try std.mem.concat(alloc, u8, &.{ scope, "\x00", namespace orelse "", "\x00", key });
+    }
+
+    fn deinit(self: *@This()) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.submit_calls += 1;
+        if (durable) self.durable_submit_calls += 1;
+        for (mutations) |m| {
+            const composite = try compositeKeyAlloc(self.allocator, scope, m.namespace, m.key);
+            if (m.is_delete) {
+                if (self.entries.fetchRemove(composite)) |removed| {
+                    self.allocator.free(removed.key);
+                    self.allocator.free(removed.value);
+                }
+                self.allocator.free(composite);
+                continue;
+            }
+            if (self.entries.getEntry(composite)) |existing| {
+                self.allocator.free(existing.value_ptr.*);
+                existing.value_ptr.* = try self.allocator.dupe(u8, m.value);
+                self.allocator.free(composite);
+                continue;
+            }
+            try self.entries.put(self.allocator, composite, try self.allocator.dupe(u8, m.value));
+        }
+    }
+
+    fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var result = std.ArrayListUnmanaged(native_catalog_backend.Entry).empty;
+        errdefer {
+            for (result.items) |e| {
+                if (e.namespace) |n| allocator.free(n);
+                allocator.free(e.key);
+                allocator.free(e.value);
+            }
+            result.deinit(allocator);
+        }
+        const prefix = try std.mem.concat(allocator, u8, &.{ scope, "\x00" });
+        defer allocator.free(prefix);
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            const remainder = entry.key_ptr.*[prefix.len..];
+            const sep = std.mem.indexOfScalar(u8, remainder, 0) orelse return error.InvalidTestKey;
+            const ns = remainder[0..sep];
+            const key = remainder[sep + 1 ..];
+            try result.append(allocator, .{
+                .namespace = if (ns.len == 0) null else try allocator.dupe(u8, ns),
+                .key = try allocator.dupe(u8, key),
+                .value = try allocator.dupe(u8, entry.value_ptr.*),
+            });
+        }
+        return try result.toOwnedSlice(allocator);
+    }
+
+    fn sink(self: *@This()) native_catalog_backend.Sink {
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
+    }
+};
+
+test "graph native_catalog backend: edges survive reopen, change and delete" {
+    const alloc = std.testing.allocator;
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "native-catalog-reopen");
+    defer cleanupTmp(rev_path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    {
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+        });
+        defer graph.close();
+        try graph.addEdge("a", "b", "cites", 1.0, 10, 10, "");
+    }
+    // At least the ride-along forward commit (no own sync) plus the durable
+    // reverse commit must have gone through the sink; see `applyMutationPage`'s
+    // `outgoing_ride_along`.
+    try std.testing.expect(test_sink.submit_calls >= 1);
+
+    // Reopen: a fresh GraphIndex sharing only the sink (the "disk"), proving
+    // the edge's durability does not depend on the first instance's
+    // in-memory state.
+    {
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+        });
+        defer graph.close();
+
+        const edges = try graph.getEdges(alloc, "a", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("b", edges[0].target);
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), edges[0].weight, 0.001);
+
+        // Change: re-adding the same (source, target, edge_type) updates the
+        // weight in place rather than duplicating the edge.
+        try graph.addEdge("a", "b", "cites", 2.5, 20, 20, "");
+        const changed = try graph.getEdges(alloc, "a", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, changed);
+        try std.testing.expectEqual(@as(usize, 1), changed.len);
+        try std.testing.expectApproxEqAbs(@as(f64, 2.5), changed[0].weight, 0.001);
+
+        // Delete.
+        try graph.batchApply(&.{}, &.{.{ .source = "a", .target = "b", .edge_type = "cites" }});
+        const deleted = try graph.getEdges(alloc, "a", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, deleted);
+        try std.testing.expectEqual(@as(usize, 0), deleted.len);
+    }
+
+    // The delete's durability (not just this process' in-memory view) is
+    // what a crash sweep actually needs: reopen once more and confirm the
+    // edge stays gone.
+    {
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+        });
+        defer graph.close();
+        const edges = try graph.getEdges(alloc, "a", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+}
+
+test "graph native_catalog backend: reverse index stays consistent with forward after many writes" {
+    const alloc = std.testing.allocator;
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "native-catalog-consistency");
+    defer cleanupTmp(rev_path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = test_sink.sink(),
+    });
+    defer graph.close();
+
+    for (0..16) |i| {
+        var source_buf: [16]u8 = undefined;
+        var target_buf: [16]u8 = undefined;
+        const source = try std.fmt.bufPrint(&source_buf, "n{d}", .{i % 4});
+        const target = try std.fmt.bufPrint(&target_buf, "n{d}", .{(i + 1) % 4});
+        try graph.addEdge(source, target, "rel", @floatFromInt(i + 1), 0, 0, "");
+    }
+
+    for (0..4) |i| {
+        var node_buf: [16]u8 = undefined;
+        const node = try std.fmt.bufPrint(&node_buf, "n{d}", .{i});
+        const out = try graph.getEdges(alloc, node, "rel", .out);
+        defer GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+
+        var expected_source_buf: [16]u8 = undefined;
+        const expected_target = try std.fmt.bufPrint(&expected_source_buf, "n{d}", .{(i + 1) % 4});
+        const in_edges = try graph.getEdges(alloc, expected_target, "rel", .in);
+        defer GraphIndex.freeEdges(alloc, in_edges);
+        try std.testing.expectEqual(@as(usize, 1), in_edges.len);
+        try std.testing.expectEqualStrings(node, in_edges[0].source);
+    }
+}
+
+test "graph inline edge publication stages mutations without touching the sink, then installs durably via an external fold-in" {
+    const alloc = std.testing.allocator;
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "inline-edge-publication");
+    defer cleanupTmp(rev_path);
+    const root = std.mem.span(rev_path);
+    const forward_scope = try std.fmt.allocPrint(alloc, "{s}/forward", .{root});
+    defer alloc.free(forward_scope);
+    const reverse_scope = try std.fmt.allocPrint(alloc, "{s}/reverse", .{root});
+    defer alloc.free(reverse_scope);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = test_sink.sink(),
+    });
+    defer graph.close();
+    // `open`'s own one-time prune/legacy-owner-directory setup already
+    // submits through the sink for a fresh index; this test only cares that
+    // `prepareInlineEdgePublication` adds none of its own on top of that.
+    const submit_calls_after_open = test_sink.submit_calls;
+
+    var publication = try graph.prepareInlineEdgePublication(.{ .source = "x", .target = "y", .edge_type = "rel", .weight = 3.0 });
+    // Nothing durable yet, and no reader of this index sees the edge.
+    try std.testing.expectEqual(submit_calls_after_open, test_sink.submit_calls);
+    {
+        const edges = try graph.getEdges(alloc, "x", "rel", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+    try std.testing.expect(publication.forwardMutations().len > 0);
+    try std.testing.expect(publication.reverseMutations().len > 0);
+
+    // Simulate an externally-owned combined commit folding both stores'
+    // mutations into one native transaction (one `commit_participant.View.
+    // putIndexCatalog` call per scope, per the section doc comment): this
+    // harness calls the sink directly in scope order, same as
+    // `lite/native_catalog_sink.zig`'s `Sink.submit` would for each
+    // `putIndexCatalog` call inside one caller-held native transaction.
+    try NativeCatalogTestSink.submit(&test_sink, forward_scope, publication.forwardMutations(), true);
+    try NativeCatalogTestSink.submit(&test_sink, reverse_scope, publication.reverseMutations(), true);
+
+    try graph.installInlineEdgePublication(&publication);
+
+    const edges = try graph.getEdges(alloc, "x", "rel", .out);
+    defer GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("y", edges[0].target);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), edges[0].weight, 0.001);
+
+    // Reopen: the externally-committed mutations are genuinely durable in
+    // the sink, not merely visible through this process' in-memory mirror.
+    var reopened = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = test_sink.sink(),
+    });
+    defer reopened.close();
+    const reopened_edges = try reopened.getEdges(alloc, "x", "rel", .out);
+    defer GraphIndex.freeEdges(alloc, reopened_edges);
+    try std.testing.expectEqual(@as(usize, 1), reopened_edges.len);
+}
+
+test "graph inline edge publication abort discards staged mutations" {
+    const alloc = std.testing.allocator;
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "inline-edge-publication-abort");
+    defer cleanupTmp(rev_path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = test_sink.sink(),
+    });
+    defer graph.close();
+    const submit_calls_after_open = test_sink.submit_calls;
+
+    var publication = try graph.prepareInlineEdgePublication(.{ .source = "p", .target = "q", .edge_type = "rel" });
+    publication.abort();
+    try std.testing.expectEqual(submit_calls_after_open, test_sink.submit_calls);
+
+    const edges = try graph.getEdges(alloc, "p", "rel", .out);
+    defer GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "graph inline edge publication rejects owner, TTL and metric-configured indexes" {
+    const alloc = std.testing.allocator;
+
+    {
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "inline-edge-unsupported-owner");
+        defer cleanupTmp(rev_path);
+        var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+        defer test_sink.deinit();
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+        });
+        defer graph.close();
+        try std.testing.expectError(error.InlineEdgePublicationUnsupported, graph.prepareInlineEdgePublication(.{ .source = "a", .target = "b", .edge_type = "rel", .owner = "doc:1" }));
+    }
+    {
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "inline-edge-unsupported-ttl");
+        defer cleanupTmp(rev_path);
+        var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+        defer test_sink.deinit();
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+            .ttl_duration_ns = 1,
+        });
+        defer graph.close();
+        try std.testing.expectError(error.InlineEdgePublicationUnsupported, graph.prepareInlineEdgePublication(.{ .source = "a", .target = "b", .edge_type = "rel" }));
+    }
+    {
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "inline-edge-unsupported-metric");
+        defer cleanupTmp(rev_path);
+        var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+        defer test_sink.deinit();
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+            .metric_configs = &.{.{ .name = "degree", .kind = .degree }},
+        });
+        defer graph.close();
+        try std.testing.expectError(error.InlineEdgePublicationUnsupported, graph.prepareInlineEdgePublication(.{ .source = "a", .target = "b", .edge_type = "rel" }));
+    }
+    {
+        // The LSM backend never supports the inline fast path: text's own
+        // `InlineTextPublication` makes the same `main_backend ==
+        // .native_catalog` check (mutation_materialization.zig).
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "inline-edge-unsupported-lsm");
+        defer cleanupTmp(rev_path);
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{ .reverse_backend = .mem });
+        defer graph.close();
+        try std.testing.expectError(error.InlineEdgePublicationUnsupported, graph.prepareInlineEdgePublication(.{ .source = "a", .target = "b", .edge_type = "rel" }));
+    }
 }
 
 test "graph pagerank metric publishes top-k scores and status" {

@@ -85,6 +85,7 @@ pub const TableCommitRequest = struct {
     /// replacement native generation by supplying a table name alone.
     relation_owner_minter: ?@import("../common/relation_owner_authority.zig").Minter = null,
     sql_persistence: ?@import("../common/relation_persistence.zig").Descriptor = null,
+    bound_catalog_incarnation: ?[16]u8 = null,
     commit_requires: ?db_types.CommitRequires = null,
     /// Coordinator planning context, retained until cascade expansion finishes.
     /// A participant's explicit prerequisite always overrides this default.
@@ -127,7 +128,7 @@ pub const TableCommitRequest = struct {
         return std.mem.eql(u8, field, "relation_owner_minter") or std.mem.eql(u8, field, "trigger_minter");
     }
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return ((comptime std.mem.eql(u8, field, "graph_preparation")) and self.graph_preparation == null) or (comptime nativeJsonSkipFieldComptime(field)) or ((comptime std.mem.eql(u8, field, "sql_persistence")) and self.sql_persistence == null) or ((comptime std.mem.eql(u8, field, "graph_writes")) and self.graph_writes.len == 0) or ((comptime std.mem.eql(u8, field, "graph_deletes")) and self.graph_deletes.len == 0);
+        return (std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null) or ((comptime std.mem.eql(u8, field, "graph_preparation")) and self.graph_preparation == null) or (comptime nativeJsonSkipFieldComptime(field)) or ((comptime std.mem.eql(u8, field, "sql_persistence")) and self.sql_persistence == null) or ((comptime std.mem.eql(u8, field, "graph_writes")) and self.graph_writes.len == 0) or ((comptime std.mem.eql(u8, field, "graph_deletes")) and self.graph_deletes.len == 0);
     }
 };
 

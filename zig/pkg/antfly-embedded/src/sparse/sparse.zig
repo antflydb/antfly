@@ -49,6 +49,7 @@ const resource_manager_mod = @import("../storage/resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
 const mem_backend = @import("../storage/mem_backend.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const native_catalog_backend = @import("../storage/native_catalog_backend.zig");
 
 // ============================================================================
 // Types
@@ -803,17 +804,47 @@ fn forEachFwdTermId(data: []const u8, comptime Context: type, context: *Context,
 // Term metadata encoding
 // ============================================================================
 
-fn encodeTermMeta(max_weight: f32, chunk_count: u32) [8]u8 {
-    var buf: [8]u8 = undefined;
+// v2 (perf/lwa-commit-eff2): a term's meta (max_weight, chunk_count) and
+// its doc-id range (min/max across all chunks) used to live in two
+// separate records (this one, and termRangeKey's own, encoded via
+// encodeChunkRangeMeta) even though every call site in this file reads
+// or writes them as a pair -- bulk append, incremental insert/delete,
+// segment handoff/prune/split-planning, and the deferred term-range
+// recompute all touch both together. Merging them into one record under
+// the SAME key (invMetaKey; termRangeKey is retired) halves the put
+// count for every one of those call sites. A term with chunk_count == 0
+// is never actually stored (the whole record is deleted once the last
+// chunk goes), so min/max are always present when this decodes
+// successfully.
+fn encodeTermMeta(alloc: Allocator, max_weight: f32, chunk_count: u32, min_doc_id: []const u8, max_doc_id: []const u8) ![]u8 {
+    const buf = try alloc.alloc(u8, 16 + min_doc_id.len + max_doc_id.len);
     std.mem.writeInt(u32, buf[0..4], @bitCast(max_weight), .little);
     std.mem.writeInt(u32, buf[4..8], chunk_count, .little);
+    std.mem.writeInt(u32, buf[8..12], @intCast(min_doc_id.len), .little);
+    std.mem.writeInt(u32, buf[12..16], @intCast(max_doc_id.len), .little);
+    @memcpy(buf[16..][0..min_doc_id.len], min_doc_id);
+    @memcpy(buf[16 + min_doc_id.len ..][0..max_doc_id.len], max_doc_id);
     return buf;
 }
 
-fn decodeTermMeta(data: []const u8) struct { max_weight: f32, chunk_count: u32 } {
+const TermMeta = struct { max_weight: f32, chunk_count: u32, min_doc_id: []const u8, max_doc_id: []const u8 };
+
+fn decodeTermMeta(data: []const u8) !TermMeta {
+    if (data.len < 16) return error.InvalidChunk;
     const mw_bits = std.mem.readInt(u32, data[0..4], .little);
     const cc = std.mem.readInt(u32, data[4..8], .little);
-    return .{ .max_weight = @bitCast(mw_bits), .chunk_count = cc };
+    const min_len = std.mem.readInt(u32, data[8..12], .little);
+    const max_len = std.mem.readInt(u32, data[12..16], .little);
+    const min_start: usize = 16;
+    const min_end = min_start + min_len;
+    const max_end = min_end + max_len;
+    if (max_end > data.len) return error.InvalidChunk;
+    return .{
+        .max_weight = @bitCast(mw_bits),
+        .chunk_count = cc,
+        .min_doc_id = data[min_start..min_end],
+        .max_doc_id = data[min_end..max_end],
+    };
 }
 
 const ChunkRangeMeta = struct {
@@ -1936,7 +1967,7 @@ fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector,
             error.NotFound => continue,
             else => return err,
         };
-        const metadata = decodeTermMeta(bytes);
+        const metadata = try decodeTermMeta(bytes);
         for (0..metadata.chunk_count) |i| {
             try checkSearchCancellation(cancellation);
             if (streams.items.len == max_streams) return null;
@@ -2394,8 +2425,14 @@ fn termCatalogKey(buf: []u8, term_id: u32) []const u8 {
     return buf[0..5];
 }
 
-fn parseTermRangeKey(key: []const u8) ?u32 {
-    if (key.len != 6 or key[0] != key_inv or key[5] != inv_kind_term_range) return null;
+// inv_kind_term_range itself is retired (v2, perf/lwa-commit-eff2): a
+// term's range now lives in its combined invMetaKey record (inv_kind_meta)
+// instead of its own key. parseInvMetaKey replaces parseTermRangeKey's
+// own use (a cursor scan singling out the one `key_inv`-prefixed entry per
+// term cheap enough to check a range against before paying for a full
+// accumulateSplitPlanningStats call).
+fn parseInvMetaKey(key: []const u8) ?u32 {
+    if (key.len != 6 or key[0] != key_inv or key[5] != inv_kind_meta) return null;
     return std.mem.readInt(u32, key[1..][0..4], .big);
 }
 
@@ -2413,12 +2450,25 @@ pub const SparseIndexOptions = struct {
     lsm_cache: ?*lsm_backend.Cache = null,
     lsm_options: lsm_backend.Options = .{ .flush_threshold = 1 },
     lsm_root_generation: u64 = 0,
+    /// Required when `backend == .native_catalog` (Lite only). See
+    /// `storage/native_catalog_backend.zig:Sink`.
+    main_native_catalog_sink: ?NativeCatalogSink = null,
 };
+
+/// See `persistent.zig`'s identically-named alias: both point at the same
+/// backend-agnostic `native_catalog_backend.Sink`.
+pub const NativeCatalogSink = native_catalog_backend.Sink;
 
 pub const SparseBackend = enum {
     mem,
     lsm_memory,
     lsm,
+    /// WS4-for-vectors: one native commit per `beginBatchWithOptions`-sized
+    /// publication, via `storage/native_catalog_backend.zig`, instead of an
+    /// LSM instance (its own WAL) on Lite's virtual filesystem. See
+    /// `docs/design/lite-performance/lite-single-commit-write-path.md`.
+    /// Lite-only: the hosted server never selects this.
+    native_catalog,
 };
 
 pub const SparseIndex = struct {
@@ -2440,6 +2490,7 @@ pub const SparseIndex = struct {
         none,
         mem: *mem_backend.Backend,
         lsm: lsm_backend.BackendHandle,
+        native_catalog: *native_catalog_backend.Backend,
 
         fn close(self: *StoreOwner, alloc: Allocator) void {
             switch (self.*) {
@@ -2449,6 +2500,10 @@ pub const SparseIndex = struct {
                     alloc.destroy(backend);
                 },
                 .lsm => |*handle| handle.close(),
+                .native_catalog => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
             }
             self.* = .none;
         }
@@ -2461,20 +2516,28 @@ pub const SparseIndex = struct {
                     alloc.destroy(backend);
                 },
                 .lsm => |*handle| handle.abandonAfterCrash(),
+                // Every `.native_catalog` commit is already durable before
+                // this backend's in-memory mirror is published (see
+                // `native_catalog_backend.zig`'s `NamespaceTxn.commit`), so
+                // there is nothing to roll back here beyond an ordinary close.
+                .native_catalog => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
             }
             self.* = .none;
         }
 
         pub fn sync(self: *StoreOwner, force: bool) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
 
         fn checkpointLsmWalAfterDurableBoundary(self: *StoreOwner) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
@@ -2482,7 +2545,18 @@ pub const SparseIndex = struct {
         fn pinNativeCheckpoint(self: *StoreOwner) !lsm_backend.Backend.NativeCheckpoint {
             return switch (self.*) {
                 .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-                .none, .mem => error.Unsupported,
+                .none, .mem, .native_catalog => error.Unsupported,
+            };
+        }
+
+        /// WS4-for-vectors: this backend's own catalog scope string (the
+        /// same value `openStore` passed as `native_catalog_backend.Options.
+        /// scope`) when `== .native_catalog`, else `null`. See
+        /// `persistent.zig`'s identically-named method on `PersistentIndex`.
+        pub fn nativeCatalogScope(self: *const StoreOwner) ?[]const u8 {
+            return switch (self.*) {
+                .native_catalog => |backend| backend.scope,
+                .none, .mem, .lsm => null,
             };
         }
     };
@@ -2531,7 +2605,31 @@ pub const SparseIndex = struct {
                 errdefer runtime.deinit();
                 return .{ .store = runtime, .owner = .{ .lsm = handle } };
             },
+            .native_catalog => {
+                const sink = opts.main_native_catalog_sink orelse return error.MissingNativeCatalogSink;
+                const backend = try alloc.create(native_catalog_backend.Backend);
+                errdefer alloc.destroy(backend);
+                backend.* = try native_catalog_backend.Backend.init(alloc, .{
+                    .sink = sink,
+                    .scope = std.mem.span(path),
+                    .backend = .{ .read_only = opts.lsm_options.backend.read_only },
+                });
+                errdefer backend.close();
+
+                var runtime = try backend.runtimeStore(alloc, .{});
+                errdefer runtime.deinit();
+                return .{ .store = runtime, .owner = .{ .native_catalog = backend } };
+            },
         }
+    }
+
+    /// WS4-for-vectors: this index's own catalog scope string when its
+    /// backend is `.native_catalog`, else `null`. A caller building
+    /// `commit_participant.IndexCatalogMutation`s for this index must scope
+    /// them exactly the same way, or they will not be found by this index's
+    /// own reads. See `persistent.zig`'s `PersistentIndex.nativeCatalogScope`.
+    pub fn nativeCatalogScope(self: *const SparseIndex) ?[]const u8 {
+        return self.owner.nativeCatalogScope();
     }
 
     pub fn beginReadTxn(self: *SparseIndex) !backend_erased.ReadTxn {
@@ -2798,22 +2896,29 @@ pub const SparseIndex = struct {
         try self.batchIncrementalTxn(&txn, writes, deletes, options);
     }
 
-    fn batchIncrementalTxn(self: *SparseIndex, txn: anytype, writes: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
-        errdefer txn.abort();
-        const prev_next_doc_num = self.next_doc_num;
-        const prev_next_segment_id = self.next_segment_id;
-        const prev_doc_count = self.doc_count;
-        const prev_term_count = self.term_count;
-        errdefer {
-            self.next_doc_num = prev_next_doc_num;
-            self.next_segment_id = prev_next_segment_id;
-            self.doc_count = prev_doc_count;
-            self.term_count = prev_term_count;
-        }
+    /// The staged half of `batchIncrementalTxn`: every delete/insert/term-
+    /// range-refresh mutation plus the counter meta records, against
+    /// whatever `txn` already is -- a plain owned write transaction (the
+    /// ordinary `batch()`/`batchWithOptions()` path below, which commits
+    /// it itself right after) or a `native_catalog_backend.Backend.
+    /// boundWrite` handle the caller will harvest via `pendingMutations()`
+    /// and `abort()` instead of committing (`prepareInlineSparsePublication`
+    /// below). Mutates `self.next_doc_num`/`next_segment_id`/`doc_count`/
+    /// `term_count` directly, exactly like the rest of this file; callers
+    /// that must not leave those applied until some later durability point
+    /// (the inline path) save and restore them around this call themselves.
+    fn stageIncrementalMutations(self: *SparseIndex, txn: anytype, writes: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
         var scratch_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch_arena.deinit();
         const scratch = scratch_arena.allocator();
-        var touched_terms = std.AutoHashMapUnmanaged(u32, void).empty;
+        // Value is `true` when a delete touched this term (needs the
+        // expensive recompute-from-chunks pass below) or `false` for an
+        // insert-only touch (already fully, correctly updated in place by
+        // addToPostings itself -- see its own doc comment). The set is
+        // still populated for every touch either way, insert or delete,
+        // so `stats.touched_terms = term_ids.len`-style batch-level
+        // bookkeeping is unaffected.
+        var touched_terms = std.AutoHashMapUnmanaged(u32, bool).empty;
         defer touched_terms.deinit(self.alloc);
         const touched_terms_ptr = if (options.defer_term_range_updates) &touched_terms else null;
         var physical_maps: PhysicalMaps = .{ .a = self.alloc };
@@ -2844,6 +2949,7 @@ pub const SparseIndex = struct {
         if (touched_terms_ptr) |map| {
             var it = map.iterator();
             while (it.next()) |entry| {
+                if (!entry.value_ptr.*) continue; // insert-only: already correct.
                 try self.refreshTermRangeMeta(scratch, txn, entry.key_ptr.*);
                 _ = scratch_arena.reset(.retain_capacity);
             }
@@ -2852,9 +2958,203 @@ pub const SparseIndex = struct {
 
         phase_start_ns = nowNs();
         try persistSparseCounters(self, txn);
-
-        try txn.commit();
         self.write_profile.incremental_commit_ns += elapsedSince(phase_start_ns);
+    }
+
+    fn batchIncrementalTxn(self: *SparseIndex, txn: anytype, writes: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
+        errdefer txn.abort();
+        const prev_next_doc_num = self.next_doc_num;
+        const prev_next_segment_id = self.next_segment_id;
+        const prev_doc_count = self.doc_count;
+        const prev_term_count = self.term_count;
+        errdefer {
+            self.next_doc_num = prev_next_doc_num;
+            self.next_segment_id = prev_next_segment_id;
+            self.doc_count = prev_doc_count;
+            self.term_count = prev_term_count;
+        }
+        try self.stageIncrementalMutations(txn, writes, deletes, options);
+        const commit_start_ns = nowNs();
+        try txn.commit();
+        self.write_profile.incremental_commit_ns += elapsedSince(commit_start_ns);
+    }
+
+    // ------------------------------------------------------------------
+    // Inline sparse publication (design doc §3.3a's sparse extension).
+    //
+    // Mirrors `graph/graph.zig`'s `InlineEdgePublication`/
+    // `prepareInlineEdgePublication`: run the same staged mutation-
+    // building `stageIncrementalMutations` above already does for the
+    // ordinary `batchIncrementalTxn` path, but against a `native_catalog_
+    // backend.Backend.boundWrite` handle instead of this index's own
+    // owned write transaction, harvest its `pendingMutations()` (deep
+    // copied -- `boundWrite`'s own arena is freed the moment `abort()`
+    // runs below), and hand them to a caller that folds them into an
+    // externally-owned native transaction via one `commit_participant.
+    // View.putIndexCatalog` call, instead of this index opening and
+    // committing its own.
+    //
+    // Counter deferral: `stageIncrementalMutations` mutates `self.
+    // next_doc_num`/`next_segment_id`/`doc_count`/`term_count` directly
+    // (same as every other caller in this file), which is only safe here
+    // because `prepareInlineSparsePublication` immediately restores them
+    // to their pre-call values before returning -- so a reader observing
+    // `self.*` between `prepare` and `install`/`abort` never sees a
+    // counter value with no durability behind it yet, matching
+    // `native_catalog_backend.Backend.applyExternallyCommittedMutations`'s
+    // own "never call earlier" invariant for this backend's read mirror.
+    // `installInlineSparsePublication` re-applies the saved "new" values
+    // only once the caller's external commit has actually returned
+    // successfully; `abort` leaves them alone (already restored).
+    pub const InlineSparsePublicationError = error{InlineSparsePublicationUnsupported};
+
+    /// A staged sparse batch's mutations, not yet durable. Exactly one of
+    /// `install` (the mutations are now durable in an externally-owned
+    /// commit) or `abort` (they are not) must run exactly once for every
+    /// value this returns.
+    pub const InlineSparsePublication = struct {
+        alloc: Allocator,
+        mutations: []native_catalog_backend.Mutation,
+        next_doc_num: u64,
+        next_segment_id: u64,
+        doc_count: u64,
+        term_count: u64,
+
+        /// This publication's mutations, to fold into an externally-owned
+        /// native transaction via `commit_participant.View.
+        /// putIndexCatalog(scope, ...)`, where `scope` is this index's own
+        /// `nativeCatalogScope()`.
+        pub fn pendingMutations(self: *const InlineSparsePublication) []const native_catalog_backend.Mutation {
+            return self.mutations;
+        }
+
+        /// Discards a publication whose mutations were never committed
+        /// durably (or whose commit failed): nothing becomes visible to
+        /// this index's readers. `self.next_doc_num`/etc were already
+        /// restored to their pre-`prepare` values by `prepareInlineSparse
+        /// Publication` itself, so there is nothing left to roll back here.
+        pub fn abort(self: *InlineSparsePublication) void {
+            freeOwnedSparseMutations(self.alloc, self.mutations);
+            self.* = undefined;
+        }
+    };
+
+    fn dupeOwnedSparseMutationsAlloc(alloc: Allocator, items: []const native_catalog_backend.Mutation) ![]native_catalog_backend.Mutation {
+        // Deep copy: `items` is normally a `BoundTxn.pendingMutations()`
+        // slice whose key/value/namespace bytes live in that transaction's
+        // own arena, freed the moment the caller aborts it.
+        const out = try alloc.alloc(native_catalog_backend.Mutation, items.len);
+        var filled: usize = 0;
+        errdefer freeOwnedSparseMutations(alloc, out[0..filled]);
+        for (items, 0..) |m, i| {
+            out[i] = .{
+                .namespace = if (m.namespace) |n| try alloc.dupe(u8, n) else null,
+                .key = try alloc.dupe(u8, m.key),
+                .value = if (m.is_delete) "" else try alloc.dupe(u8, m.value),
+                .is_delete = m.is_delete,
+            };
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    fn freeOwnedSparseMutations(alloc: Allocator, items: []const native_catalog_backend.Mutation) void {
+        for (items) |m| {
+            if (m.namespace) |n| alloc.free(n);
+            alloc.free(m.key);
+            if (!m.is_delete) alloc.free(m.value);
+        }
+        alloc.free(items);
+    }
+
+    /// Builds one small sparse batch's `InlineSparsePublication`, without
+    /// touching this index's durable sink (see `native_catalog_backend.
+    /// Backend.boundWrite`'s "never talks to sink" note). Returns
+    /// `error.InlineSparsePublicationUnsupported` for every backend but
+    /// `.native_catalog`; the caller falls back to `batchWithOptions` (via
+    /// `IndexManager.applySparseEmbeddingWritesByNameWithOptions`'s own
+    /// commit) in that case. Takes `writes`/`deletes` exactly like
+    /// `batch`/`batchWithOptions`, but deliberately does not accept
+    /// `BatchOptions`: this fast path always runs with `defer_term_range_
+    /// updates = true` (matching the production caller) and is never
+    /// reached for bulk ingest (`IndexManager`-layer eligibility excludes
+    /// that mode before this is called).
+    pub fn prepareInlineSparsePublication(self: *SparseIndex, writes: []const SparseWrite, deletes: []const []const u8) !InlineSparsePublication {
+        const backend = switch (self.owner) {
+            .native_catalog => |b| b,
+            else => return error.InlineSparsePublicationUnsupported,
+        };
+
+        const prev_next_doc_num = self.next_doc_num;
+        const prev_next_segment_id = self.next_segment_id;
+        const prev_doc_count = self.doc_count;
+        const prev_term_count = self.term_count;
+
+        // Same defensive canonicalization `batchWithOptions` applies to
+        // every caller (allocation-free when `writes` is already sorted,
+        // per-dimension-unique, as every production caller's writes are).
+        var canonical_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer canonical_arena.deinit();
+        const canonical_writes = try canonicalWrites(canonical_arena.allocator(), self.alloc, writes);
+
+        var txn = try backend.boundWrite(.{});
+        defer txn.abort();
+
+        self.stageIncrementalMutations(&txn, canonical_writes, deletes, .{ .defer_term_range_updates = true }) catch |err| {
+            self.next_doc_num = prev_next_doc_num;
+            self.next_segment_id = prev_next_segment_id;
+            self.doc_count = prev_doc_count;
+            self.term_count = prev_term_count;
+            return err;
+        };
+
+        const mutations = dupeOwnedSparseMutationsAlloc(self.alloc, txn.pendingMutations()) catch |err| {
+            self.next_doc_num = prev_next_doc_num;
+            self.next_segment_id = prev_next_segment_id;
+            self.doc_count = prev_doc_count;
+            self.term_count = prev_term_count;
+            return err;
+        };
+
+        const result: InlineSparsePublication = .{
+            .alloc = self.alloc,
+            .mutations = mutations,
+            .next_doc_num = self.next_doc_num,
+            .next_segment_id = self.next_segment_id,
+            .doc_count = self.doc_count,
+            .term_count = self.term_count,
+        };
+
+        // Undo the optimistic in-memory mutation `stageIncrementalMutations`
+        // just made: self.* must stay at the pre-write values until
+        // `installInlineSparsePublication` runs, after the caller's
+        // external commit is durable -- see this section's doc comment.
+        self.next_doc_num = prev_next_doc_num;
+        self.next_segment_id = prev_next_segment_id;
+        self.doc_count = prev_doc_count;
+        self.term_count = prev_term_count;
+
+        return result;
+    }
+
+    /// Runs only after `publication`'s mutations (`pendingMutations()`)
+    /// are already durable in an externally-owned native transaction's
+    /// commit. Syncs this backend's in-memory read mirror (so this
+    /// index's own subsequent reads see the write) and applies the saved
+    /// counter values -- the step after which a synchronous sparse-visible
+    /// write's ack may return.
+    pub fn installInlineSparsePublication(self: *SparseIndex, publication: *InlineSparsePublication) !void {
+        const backend = switch (self.owner) {
+            .native_catalog => |b| b,
+            else => return error.InlineSparsePublicationUnsupported,
+        };
+        try backend.applyExternallyCommittedMutations(publication.mutations);
+        self.next_doc_num = publication.next_doc_num;
+        self.next_segment_id = publication.next_segment_id;
+        self.doc_count = publication.doc_count;
+        self.term_count = publication.term_count;
+        freeOwnedSparseMutations(self.alloc, publication.mutations);
+        publication.* = undefined;
     }
 
     fn estimateSparseBulkWorkingBytes(writes: []const SparseWrite) u64 {
@@ -3499,7 +3799,11 @@ pub const SparseIndex = struct {
         return key;
     }
     fn reserveCompactionId(self: *SparseIndex) !u64 {
-        var txn = try self.beginBatchTxn(.{});
+        // WS4-for-vectors/§3.2a: background compaction bookkeeping, redone
+        // from `recoverCompactionIntents`'s own durable-intent scan on a
+        // crash -- see `publishSegmentCompactionTask`'s identical note on
+        // its own final publish commit.
+        var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
         errdefer txn.abort();
         const id = self.next_segment_id;
         self.next_segment_id = try std.math.add(u64, id, 1);
@@ -3529,7 +3833,10 @@ pub const SparseIndex = struct {
         read.abort();
         if (!posting_live) {
             while (true) {
-                var txn = try self.beginBatchTxn(.{});
+                // WS4-for-vectors/§3.2a: reclamation -- a freed page is only
+                // reusable at the durable epoch, so this never needs its own
+                // sync (see the design doc's ride-along table).
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 const more = try posting_pages.reclaimDirectoryPage(&txn, id);
                 try txn.commit();
@@ -3539,7 +3846,8 @@ pub const SparseIndex = struct {
         for ([_]u8{ 0x0d, 0x11, key_segment_incarnation, key_docmap_incarnation, 0x13 }) |tag| {
             if (if (tag == key_docmap_incarnation or tag == 0x13) map_live else posting_live) continue;
             while (true) {
-                var txn = try self.beginBatchTxn(.{});
+                // Same reclamation reasoning as above.
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 var batch_open = true;
                 defer if (batch_open) txn.abort();
                 var keys: [128][17]u8 = undefined;
@@ -3574,7 +3882,9 @@ pub const SparseIndex = struct {
         if (!map_live) try clearCompactionIntent(self, id);
     }
     fn clearCompactionIntent(self: anytype, id: u64) !void {
-        var txn = try self.beginBatchTxn(.{});
+        // WS4-for-vectors/§3.2a: background intent cleanup, same reasoning
+        // as `reserveCompactionId`'s own intent write.
+        var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
         errdefer txn.abort();
         txn.delete(&pendingKey(id)) catch |err| switch (err) {
             error.NotFound => {},
@@ -3600,7 +3910,11 @@ pub const SparseIndex = struct {
         while (next != null) {
             if (gate) |g| try g.enter(g.ptr);
             defer if (gate) |g| g.leave(g.ptr);
-            var updates = try self.beginBatchTxn(.{});
+            // WS4-for-vectors/§3.2a: catch-up progress for a legacy locator
+            // page -- idempotent and redone from the still-live doc-map
+            // segment on a crash (the `active`/`root` check above returns
+            // early otherwise), so this never needs its own sync.
+            var updates = try self.beginBatchTxn(.{ .durability = .ride_along });
             var updates_open = true;
             defer if (updates_open) updates.abort();
             const active = updates.get(docMapSegmentKey(&root_key, id)) catch |err| switch (err) {
@@ -3672,12 +3986,17 @@ pub const SparseIndex = struct {
             try clearCompactionIntent(self, id);
         }
     }
+    // WS4-for-vectors/§3.2a: every staged write in this function is
+    // background compaction output that is not referenced by anything until
+    // `publishSegmentCompactionTask`'s own ride-along active-set commit
+    // below makes it live, so none of these intermediate commits needs its
+    // own sync either.
     fn stageCompaction(self: anytype, id: u64, result: *SegmentCompactionResult) !void {
         if (result.pages) |run| {
             const view = try run.sealedView();
             var offset: u64 = 0;
             while (offset < view.length) {
-                var txn = try self.beginBatchTxn(.{});
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 var batch_bytes: usize = 0;
                 while (offset < view.length and batch_bytes < 4 * 1024 * 1024) {
@@ -3713,7 +4032,7 @@ pub const SparseIndex = struct {
                     const relative = std.mem.readInt(u64, entries[at + 8 ..][0..8], .little);
                     std.mem.writeInt(u64, entries[at + 8 ..][0..8], try std.math.add(u64, header_len, relative), .little);
                 }
-                var txn = try self.beginBatchTxn(.{});
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 try posting_pages.putDirectoryPage(&txn, id, root, entries[0..len]);
                 try txn.commit();
@@ -3726,7 +4045,7 @@ pub const SparseIndex = struct {
             var previous: ?u64 = null;
             var done = false;
             while (!done) {
-                var txn = try self.beginBatchTxn(.{});
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 var bytes: usize = 0;
                 while (bytes < 4 * 1024 * 1024) {
@@ -3748,7 +4067,7 @@ pub const SparseIndex = struct {
         if (result.proofs) |proofs| {
             var offset: usize = 0;
             while (offset < proofs.count()) {
-                var txn = try self.beginBatchTxn(.{});
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 const end = @min(offset + 1024, proofs.count());
                 for (offset..end) |i| {
@@ -3771,7 +4090,16 @@ pub const SparseIndex = struct {
         var published = false;
         defer if (!published and task.generation == null) self.reclaimCompactionId(segment_id) catch {};
         if (!result.staged) try self.stageCompaction(segment_id, result);
-        var txn = try self.beginBatchTxn(.{});
+        // WS4-for-vectors/§3.2a: compaction publication is background
+        // maintenance -- redone from the still-live sources on a crash (the
+        // source-match check just above returns `false`, a cheap no-op,
+        // rather than publishing stale output), so it never needs to force
+        // its own durable sync. On `.native_catalog` this rides along on the
+        // next foreground group's commit; on every other backend
+        // `BatchOptions.durability` is a no-op (see `lsm_backend.zig`'s and
+        // `mem_backend.zig`'s own `beginBatchWithOptions`), so this is safe
+        // unconditionally.
+        var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
         var txn_open = true;
         defer if (txn_open) txn.abort();
 
@@ -3932,7 +4260,11 @@ pub const SparseIndex = struct {
                 // long-key copy before allocation. No corpus-sized reservation.
                 if (self_.index.resource_manager) |manager|
                     try manager.adjustUsage(.sparse_apply_working_set, &self_.admitted, try std.math.add(u64, self_.admitted, try std.math.add(u64, try std.math.mul(u64, bytes, 2), 128)));
-                if (self_.txn == null) self_.txn = try self_.index.beginBatchTxn(.{});
+                // WS4-for-vectors/§3.2a: lazy legacy-locator backfill -- the
+                // function doc above already establishes this is safe to
+                // lose and redo (the completion proof is written only once
+                // every page backfilled, below).
+                if (self_.txn == null) self_.txn = try self_.index.beginBatchTxn(.{ .durability = .ride_along });
                 _ = try publishDocMapLocator(self_.index.alloc, &self_.txn.?, self_.segment, self_.root, entry);
                 self_.count += 1;
                 self_.bytes += bytes;
@@ -3958,7 +4290,10 @@ pub const SparseIndex = struct {
             next = try cursor.next();
         }
         try backfill.flush();
-        var proof = try self.beginBatchTxn(.{});
+        // Losing this proof on a crash just means the (idempotent) backfill
+        // scan above runs again next time; see the function doc's "partial
+        // metadata is never trusted" note.
+        var proof = try self.beginBatchTxn(.{ .durability = .ride_along });
         errdefer proof.abort();
         try proof.put(metaKey(meta_complete_locators), &.{2});
         try proof.commit();
@@ -4204,22 +4539,14 @@ pub const SparseIndex = struct {
             else => return err,
         };
         if (meta_data) |data| {
-            const tm = decodeTermMeta(data);
+            const tm = try decodeTermMeta(data);
             chunk_count = tm.chunk_count;
             max_weight = tm.max_weight;
+            updateBorrowedRangeBounds(&term_min_doc_id, &term_max_doc_id, tm.min_doc_id, tm.max_doc_id);
         } else {
             created_term = true;
         }
         for (postings) |posting| max_weight = @max(max_weight, posting.weight);
-        var range_key_buf: [256]u8 = undefined;
-        const existing_range_data = txnGet(txn, self.dbi, termRangeKey(&range_key_buf, term_id)) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        if (existing_range_data) |data| {
-            const range = try decodeChunkRangeMeta(data);
-            updateBorrowedRangeBounds(&term_min_doc_id, &term_max_doc_id, range.min_doc_id, range.max_doc_id);
-        }
         self.write_profile.term_meta_ns += elapsedSince(phase_start_ns);
 
         var cursor: usize = 0;
@@ -4293,11 +4620,11 @@ pub const SparseIndex = struct {
         }
 
         phase_start_ns = nowNs();
-        const meta = encodeTermMeta(max_weight, chunk_count);
-        try txnAppendPut(txn, self.dbi, mk, &meta);
-        if (term_min_doc_id != null and term_max_doc_id != null) {
-            try self.writeTermRangeMeta(alloc, txn, term_id, term_min_doc_id.?, term_max_doc_id.?);
-        }
+        // postings.len > 0 (checked at entry) guarantees at least one chunk
+        // write happened above, so both bounds are always set here.
+        const meta = try encodeTermMeta(alloc, max_weight, chunk_count, term_min_doc_id.?, term_max_doc_id.?);
+        defer alloc.free(meta);
+        try txnAppendPut(txn, self.dbi, mk, meta);
         self.write_profile.term_meta_ns += elapsedSince(phase_start_ns);
         return created_term;
     }
@@ -4317,7 +4644,7 @@ pub const SparseIndex = struct {
         alloc: Allocator,
         txn: anytype,
         doc_id: []const u8,
-        touched_terms: ?*std.AutoHashMapUnmanaged(u32, void),
+        touched_terms: ?*std.AutoHashMapUnmanaged(u32, bool),
     ) !DeleteEffect {
         // Read forward entry
         var key_buf: [256]u8 = undefined;
@@ -4355,7 +4682,7 @@ pub const SparseIndex = struct {
         doc_id: []const u8,
         vec: SparseVector,
         preferred_doc_num: ?u32,
-        touched_terms: ?*std.AutoHashMapUnmanaged(u32, void),
+        touched_terms: ?*std.AutoHashMapUnmanaged(u32, bool),
     ) !void {
         // If doc_id already exists, delete the old mapping first to avoid orphaning
         self.applyDeleteEffect(try self.processDelete(alloc, txn, doc_id, touched_terms));
@@ -4416,7 +4743,7 @@ pub const SparseIndex = struct {
         doc_id: []const u8,
         doc_num: u32,
         weight: f32,
-        touched_terms: ?*std.AutoHashMapUnmanaged(u32, void),
+        touched_terms: ?*std.AutoHashMapUnmanaged(u32, bool),
     ) !bool {
         // Read term metadata
         var meta_key_buf: [256]u8 = undefined;
@@ -4425,14 +4752,26 @@ pub const SparseIndex = struct {
         var max_weight: f32 = weight;
         var created_term = false;
 
+        // Owned (not borrowed): a `txn.put` below (the chunk writes) can
+        // free the node backing `meta_data` on a persistent-tree backend
+        // (.native_catalog) -- see `writeChunkWithRangeMetaProfiled`'s own
+        // doc comment on this exact hazard, previously a real segfault
+        // under concurrent load. Freed explicitly after the final combined
+        // write below, which is the last use.
+        var old_min_doc_id: ?[]u8 = null;
+        defer if (old_min_doc_id) |m| alloc.free(m);
+        var old_max_doc_id: ?[]u8 = null;
+        defer if (old_max_doc_id) |m| alloc.free(m);
         const meta_data = txnGet(txn, self.dbi, mk) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
         if (meta_data) |d| {
-            const tm = decodeTermMeta(d);
+            const tm = try decodeTermMeta(d);
             chunk_count = tm.chunk_count;
             max_weight = @max(tm.max_weight, weight);
+            old_min_doc_id = try alloc.dupe(u8, tm.min_doc_id);
+            old_max_doc_id = try alloc.dupe(u8, tm.max_doc_id);
         } else {
             created_term = true;
         }
@@ -4484,14 +4823,32 @@ pub const SparseIndex = struct {
             }
         }
 
-        // Update term metadata
-        const meta = encodeTermMeta(max_weight, chunk_count);
-        try txnPut(txn, self.dbi, mk, &meta);
+        // Update term metadata (meta + range combined, see encodeTermMeta's
+        // doc comment). An insert only ever extends the range, which is
+        // always correct to apply immediately -- unlike a delete, which can
+        // only shrink it and needs every remaining chunk's own range
+        // rescanned to do that correctly (see removeFromPostings/
+        // refreshTermRangeMeta/recomputeTermRangeMeta below). So this
+        // writes the combined record right here, every time, regardless of
+        // `touched_terms`: deferring it (as removeFromPostings still does)
+        // would buy nothing for an insert (there is no "later, cheaper"
+        // way to compute the same extend-only update) while costing an
+        // extra put. `touched_terms`, when given, still gets this term
+        // added -- purely for the batch-level touched-term-count bookkeeping
+        // callers rely on -- but is never consulted here to decide whether
+        // to write.
+        const min_doc_id = if (old_min_doc_id) |m| (if (std.mem.order(u8, doc_id, m) == .lt) doc_id else m) else doc_id;
+        const max_doc_id = if (old_max_doc_id) |m| (if (std.mem.order(u8, doc_id, m) == .gt) doc_id else m) else doc_id;
+        const meta = try encodeTermMeta(alloc, max_weight, chunk_count, min_doc_id, max_doc_id);
+        defer alloc.free(meta);
+        try txnPut(txn, self.dbi, mk, meta);
         if (created_term) _ = try self.ensureTermCatalogEntry(txn, term_id);
         if (touched_terms) |map| {
-            try map.put(self.alloc, term_id, {});
-        } else {
-            try self.updateTermRangeMetaOnInsert(alloc, txn, term_id, doc_id);
+            // Never overwrite an existing `true` (a delete already touched
+            // this term in this same batch and still needs its own full
+            // recompute at the end): `getOrPutValue` only inserts `false`
+            // when the key is absent.
+            _ = try map.getOrPutValue(self.alloc, term_id, false);
         }
         return created_term;
     }
@@ -4502,7 +4859,7 @@ pub const SparseIndex = struct {
         txn: anytype,
         term_id: u32,
         doc_num: u32,
-        touched_terms: ?*std.AutoHashMapUnmanaged(u32, void),
+        touched_terms: ?*std.AutoHashMapUnmanaged(u32, bool),
     ) !bool {
         var meta_key_buf: [256]u8 = undefined;
         const mk = invMetaKey(&meta_key_buf, term_id);
@@ -4511,7 +4868,16 @@ pub const SparseIndex = struct {
             error.NotFound => return false,
             else => return err,
         };
-        const tm = decodeTermMeta(meta_data);
+        const decoded_tm = try decodeTermMeta(meta_data);
+        // Owned: the txnDelete/txnPut calls below can free the node backing
+        // `meta_data` on a persistent-tree backend; see addToPostings's
+        // identical note. `tm.max_weight`/`tm.chunk_count` are plain values
+        // (copied, not borrowed) so only the doc-id slices need this.
+        const old_min_doc_id = try alloc.dupe(u8, decoded_tm.min_doc_id);
+        defer alloc.free(old_min_doc_id);
+        const old_max_doc_id = try alloc.dupe(u8, decoded_tm.max_doc_id);
+        defer alloc.free(old_max_doc_id);
+        const tm = .{ .max_weight = decoded_tm.max_weight, .chunk_count = decoded_tm.chunk_count };
 
         for (0..tm.chunk_count) |ci| {
             var ck_buf: [256]u8 = undefined;
@@ -4536,19 +4902,23 @@ pub const SparseIndex = struct {
                     txnDelete(txn, self.dbi, ck) catch {};
                     var meta_ck_buf: [256]u8 = undefined;
                     txnDelete(txn, self.dbi, invChunkMetaKey(&meta_ck_buf, term_id, @intCast(ci))) catch {};
-                    // Update metadata chunk_count
-                    const new_meta = encodeTermMeta(tm.max_weight, tm.chunk_count - 1);
-                    var term_range_buf: [256]u8 = undefined;
                     if (tm.chunk_count - 1 == 0) {
                         txnDelete(txn, self.dbi, mk) catch {};
-                        txnDelete(txn, self.dbi, termRangeKey(&term_range_buf, term_id)) catch {};
                         var catalog_buf: [16]u8 = undefined;
                         txnDelete(txn, self.dbi, termCatalogKey(&catalog_buf, term_id)) catch {};
                         return true;
                     } else {
-                        try txnPut(txn, self.dbi, mk, &new_meta);
+                        // Provisional: chunk_count/max_weight updated, range
+                        // still the old (possibly now-stale-wide) one until
+                        // the recompute below -- immediate or deferred --
+                        // corrects it. Still a safe intermediate state: a
+                        // too-wide range never excludes a live posting, see
+                        // recomputeTermRangeMeta's own doc comment.
+                        const provisional = try encodeTermMeta(alloc, tm.max_weight, tm.chunk_count - 1, old_min_doc_id, old_max_doc_id);
+                        defer alloc.free(provisional);
+                        try txnPut(txn, self.dbi, mk, provisional);
                         if (touched_terms) |map| {
-                            try map.put(self.alloc, term_id, {});
+                            try map.put(self.alloc, term_id, true);
                         } else {
                             try self.recomputeTermRangeMeta(alloc, txn, term_id, tm.chunk_count - 1);
                         }
@@ -4577,7 +4947,7 @@ pub const SparseIndex = struct {
                     }
                     try self.writeChunkWithRangeMeta(alloc, txn, term_id, @intCast(ci), new_dns, new_ws, range.min_doc_id, range.max_doc_id);
                     if (touched_terms) |map| {
-                        try map.put(self.alloc, term_id, {});
+                        try map.put(self.alloc, term_id, true);
                     } else {
                         try self.recomputeTermRangeMeta(alloc, txn, term_id, tm.chunk_count);
                     }
@@ -4614,46 +4984,55 @@ pub const SparseIndex = struct {
         max_doc_id: []const u8,
         profile: ?*WriteProfile,
     ) !void {
+        // `min_doc_id`/`max_doc_id` are frequently borrowed straight out of
+        // this same `txn`'s own backing store rather than caller-owned
+        // copies -- see `addToPostings`'s "append to existing chunk" branch,
+        // which forwards `readChunkRangeMeta`'s return value (a slice into
+        // the previous chunk-meta record) without copying it. On
+        // `.native_catalog` (`storage/native_catalog_backend.zig`'s
+        // persistent-tree `State`), every `txn.put` is an immediate
+        // copy-on-write replace that releases the superseded tree nodes --
+        // including the one backing that borrowed slice, if the put's
+        // insertion path rebuilds it. Encoding (and therefore copying) both
+        // payloads before issuing *either* write means nothing below ever
+        // reads through a pointer this same call may have just invalidated.
+        // Previously the chunk-key put ran first, so a `min_doc_id`/
+        // `max_doc_id` aliasing that key's own prior chunk-meta node could
+        // be freed out from under `encodeChunkOrdinalRange`'s memcpy --
+        // reproduced as a segfault in `addToPostings` under concurrent
+        // `sparse_vector_8_writers` load (see
+        // `write_amplification_bench_test.zig`).
         var phase_start_ns = nowNs();
         const encoded = try encodeChunk(alloc, doc_nums, weights);
         if (profile) |active_profile| active_profile.chunk_encode_ns += elapsedSince(phase_start_ns);
         defer alloc.free(encoded);
-        var ck_buf: [256]u8 = undefined;
-        phase_start_ns = nowNs();
-        try txnAppendPut(txn, self.dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
-        if (profile) |active_profile| active_profile.chunk_put_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
         const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums, false);
         if (profile) |active_profile| active_profile.range_meta_encode_ns += elapsedSince(phase_start_ns);
         defer alloc.free(meta);
+
+        var ck_buf: [256]u8 = undefined;
+        phase_start_ns = nowNs();
+        try txnAppendPut(txn, self.dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
+        if (profile) |active_profile| active_profile.chunk_put_ns += elapsedSince(phase_start_ns);
+
         var meta_ck_buf: [256]u8 = undefined;
         phase_start_ns = nowNs();
         try txnAppendPut(txn, self.dbi, invChunkMetaKey(&meta_ck_buf, term_id, chunk_idx), meta);
         if (profile) |active_profile| active_profile.range_meta_put_ns += elapsedSince(phase_start_ns);
     }
 
-    fn writeTermRangeMeta(self: *SparseIndex, alloc: Allocator, txn: anytype, term_id: u32, min_doc_id: []const u8, max_doc_id: []const u8) !void {
-        const meta = try encodeChunkRangeMeta(alloc, min_doc_id, max_doc_id);
-        defer alloc.free(meta);
-        var key_buf: [256]u8 = undefined;
-        try txnAppendPut(txn, self.dbi, termRangeKey(&key_buf, term_id), meta);
-    }
-
-    fn updateTermRangeMetaOnInsert(self: *SparseIndex, alloc: Allocator, txn: anytype, term_id: u32, doc_id: []const u8) !void {
-        var key_buf: [256]u8 = undefined;
-        const existing = txnGet(txn, self.dbi, termRangeKey(&key_buf, term_id)) catch null;
-        if (existing) |raw_meta| {
-            const range = try decodeChunkRangeMeta(raw_meta);
-            const min_doc_id = if (std.mem.order(u8, doc_id, range.min_doc_id) == .lt) doc_id else range.min_doc_id;
-            const max_doc_id = if (std.mem.order(u8, doc_id, range.max_doc_id) == .gt) doc_id else range.max_doc_id;
-            try self.writeTermRangeMeta(alloc, txn, term_id, min_doc_id, max_doc_id);
-            return;
-        }
-
-        try self.writeTermRangeMeta(alloc, txn, term_id, doc_id, doc_id);
-    }
-
+    /// Rescans every chunk's own range (never the term's own prior range,
+    /// which is what a delete needs: it can only shrink the true range,
+    /// and the only way to shrink it correctly is to recompute from what
+    /// remains) and writes the combined term record with that fresh range
+    /// plus the chunk_count/max_weight already in `mk` (both already
+    /// correct -- the caller wrote them, provisionally for max_weight,
+    /// before calling this; see removeFromPostings and
+    /// stageIncrementalMutations' deferred pass). `chunk_count` is the
+    /// caller's own already-updated count, not re-derived from `mk`, so
+    /// this works whether or not `mk` has been written yet this call.
     fn recomputeTermRangeMeta(self: *SparseIndex, alloc: Allocator, txn: anytype, term_id: u32, chunk_count: u32) !void {
         var min_doc_id: ?[]const u8 = null;
         var max_doc_id: ?[]const u8 = null;
@@ -4668,30 +5047,46 @@ pub const SparseIndex = struct {
             }
         }
 
-        var key_buf: [256]u8 = undefined;
+        var meta_key_buf: [256]u8 = undefined;
+        const mk = invMetaKey(&meta_key_buf, term_id);
         if (min_doc_id == null or max_doc_id == null) {
-            txnDelete(txn, self.dbi, termRangeKey(&key_buf, term_id)) catch {};
+            txnDelete(txn, self.dbi, mk) catch {};
             return;
         }
 
-        try self.writeTermRangeMeta(alloc, txn, term_id, min_doc_id.?, max_doc_id.?);
+        const existing = txnGet(txn, self.dbi, mk) catch |err| switch (err) {
+            // No record yet (chunk_count>0 but mk was never written) should
+            // not happen -- every caller writes mk before or passes a
+            // chunk_count consistent with an existing record -- but fall
+            // back to max_weight 0 rather than erroring, since a wrong
+            // (too-low) max_weight is a ranking quality issue, not a
+            // correctness one, and this path recomputing a range at all
+            // means the term is known to still have live postings.
+            error.NotFound => null,
+            else => return err,
+        };
+        const max_weight = if (existing) |data| (try decodeTermMeta(data)).max_weight else 0;
+        const combined = try encodeTermMeta(alloc, max_weight, chunk_count, min_doc_id.?, max_doc_id.?);
+        defer alloc.free(combined);
+        try txnAppendPut(txn, self.dbi, mk, combined);
     }
 
+    /// The deferred pass's entry point (design: `stageIncrementalMutations`
+    /// calls this once per term a delete marked dirty in `touched_terms`,
+    /// after every insert/delete in the batch has run). An insert-only
+    /// touch never reaches here: `addToPostings` already wrote the
+    /// correct combined record itself, immediately -- see its own doc
+    /// comment for why deferring that would buy nothing.
     fn refreshTermRangeMeta(self: *SparseIndex, alloc: Allocator, txn: anytype, term_id: u32) !void {
         var meta_key_buf: [256]u8 = undefined;
         const mk = invMetaKey(&meta_key_buf, term_id);
         const meta_data = txnGet(txn, self.dbi, mk) catch |err| switch (err) {
-            error.NotFound => {
-                var key_buf: [256]u8 = undefined;
-                txnDelete(txn, self.dbi, termRangeKey(&key_buf, term_id)) catch {};
-                return;
-            },
+            error.NotFound => return,
             else => return err,
         };
-        const tm = decodeTermMeta(meta_data);
+        const tm = try decodeTermMeta(meta_data);
         if (tm.chunk_count == 0) {
-            var key_buf: [256]u8 = undefined;
-            txnDelete(txn, self.dbi, termRangeKey(&key_buf, term_id)) catch {};
+            txnDelete(txn, self.dbi, mk) catch {};
             return;
         }
         try self.recomputeTermRangeMeta(alloc, txn, term_id, tm.chunk_count);
@@ -5596,7 +5991,7 @@ pub const SparseIndex = struct {
                 var meta_key_buf: [256]u8 = undefined;
                 const mk = invMetaKey(&meta_key_buf, term_id);
                 const meta_data = txn.get(mk) catch continue;
-                const tm = decodeTermMeta(meta_data);
+                const tm = try decodeTermMeta(meta_data);
 
                 // Scan all chunks for this term
                 for (0..tm.chunk_count) |ci| {
@@ -5789,7 +6184,96 @@ pub const SparseIndex = struct {
         return @intCast(doc_num);
     }
 
+    /// Confirm live physical ordinals against authoritative primary keys in a
+    /// sorted page. A collision or missing reverse record needs key lookup.
+    pub fn tryProveProjectionDocNums(
+        alloc: Allocator,
+        txn: *backend_erased.ReadTxn,
+        ordinals: []const u32,
+        primary_keys: []const ?[]const u8,
+        proven: []bool,
+        control: @import("../search/query.zig").ExecutionControl,
+    ) !bool {
+        // Release proof scratch before the caller starts key-based lookup.
+        var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer scratch.deinit();
+        proveProjectionDocNums(scratch.allocator(), txn, ordinals, primary_keys, proven, control) catch |err| switch (err) {
+            error.OutOfMemory,
+            error.StorageReadTemporarilyUnavailable,
+            error.InvalidData,
+            error.InvalidSegment,
+            error.InvalidTableFile,
+            error.CorruptInput,
+            error.CrcMismatch,
+            error.TableBlockChecksumMismatch,
+            error.InputOutput,
+            error.FileNotFound,
+            error.WouldBlock,
+            error.EndOfStream,
+            error.Unsupported,
+            => {
+                @memset(proven, false);
+                return false;
+            },
+            else => return err,
+        };
+        return true;
+    }
+
+    fn proveProjectionDocNums(
+        alloc: Allocator,
+        txn: *backend_erased.ReadTxn,
+        ordinals: []const u32,
+        primary_keys: []const ?[]const u8,
+        proven: []bool,
+        control: @import("../search/query.zig").ExecutionControl,
+    ) !void {
+        var storage: [256][9]u8 = undefined;
+        var keys: [256][]const u8 = undefined;
+        var values: [256]?[]const u8 = undefined;
+        std.debug.assert(ordinals.len <= storage.len and ordinals.len == primary_keys.len and proven.len == ordinals.len);
+        @memset(proven, false);
+        var positions: [256]usize = undefined;
+        var present: usize = 0;
+        for (ordinals, primary_keys, 0..) |ordinal, key, i| {
+            if (key == null) continue;
+            positions[present] = i;
+            keys[present] = revKey(&storage[present], ordinal);
+            present += 1;
+        }
+        if (present == 0) return;
+        try control.check();
+        var reads = try txn.openReadScope(alloc);
+        defer reads.close();
+        try reads.getManySorted(keys[0..present], values[0..present]);
+        var count: usize = 0;
+        for (positions[0..present], values[0..present]) |position, physical| {
+            if (physical) |key| {
+                if (!std.mem.eql(u8, primary_keys[position].?, key)) continue;
+                positions[count] = position;
+                count += 1;
+            }
+        }
+        if (count == 0) return;
+        try control.check();
+        try reads.reset();
+        for (positions[0..count], 0..) |position, i| keys[i] = docTombstoneKey(&storage[i], ordinals[position]);
+        try reads.getManySorted(keys[0..count], values[0..count]);
+        for (positions[0..count], values[0..count]) |position, tombstone| proven[position] = tombstone == null;
+    }
+
     pub fn docNumsForDocIdsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_ids: []const []const u8) ![]const u32 {
+        return try self.docNumsForDocIdsDeferredAlloc(alloc, txn, doc_ids, null, .{});
+    }
+
+    pub fn docNumsForDocIdsDeferredAlloc(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        doc_ids: []const []const u8,
+        deferred_keys: ?struct { keys: *std.StringHashMapUnmanaged(void), allocator: Allocator },
+        control: @import("../search/query.zig").ExecutionControl,
+    ) ![]const u32 {
         if (doc_ids.len == 0) return &.{};
         const complete = try completeLocatorMap(txn);
         var wanted = std.StringHashMapUnmanaged(void).empty;
@@ -5800,49 +6284,95 @@ pub const SparseIndex = struct {
         defer seen.deinit(alloc);
 
         for (doc_ids) |doc_id| {
+            try control.check();
             const gop = try wanted.getOrPut(alloc, doc_id);
             if (gop.found_existing) continue;
-            var key_buf: [256]u8 = undefined;
-            const forward_key = try fwdKeyWithScratch(alloc, &key_buf, doc_id);
-            defer if (forward_key.ptr != &key_buf) alloc.free(forward_key);
-            if (txnGet(txn, self.dbi, forward_key)) |fwd_data| {
-                const doc_num_u64 = try decodeFwdDocNum(fwd_data);
-                if (doc_num_u64 <= std.math.maxInt(u32) and !try self.docNumDeletedChecked(txn, doc_num_u64)) {
-                    const doc_num: u32 = @intCast(doc_num_u64);
-                    const seen_gop = try seen.getOrPut(alloc, doc_num);
-                    if (!seen_gop.found_existing) try out.append(alloc, doc_num);
-                }
-                _ = wanted.remove(doc_id);
-            } else |err| {
-                if (err != error.NotFound) return err;
-                if (try readLocator(alloc, txn, doc_id)) |locator| {
-                    if (!try self.docNumDeletedChecked(txn, locator.num)) {
-                        const num = std.math.cast(u32, locator.num) orelse return error.DocNumOverflow;
-                        const found = try seen.getOrPut(alloc, num);
-                        if (!found.found_existing) try out.append(alloc, num);
-                    }
+            switch (try self.lookupProjectionDocNum(alloc, txn, doc_id, complete)) {
+                .needs_scan => {},
+                .absent => _ = wanted.remove(doc_id),
+                .found => |doc_num| {
+                    const slot = try seen.getOrPut(alloc, doc_num);
+                    if (!slot.found_existing) try out.append(alloc, doc_num);
                     _ = wanted.remove(doc_id);
-                } else if (complete) _ = wanted.remove(doc_id);
+                },
             }
         }
         if (wanted.count() == 0) return try out.toOwnedSlice(alloc);
 
+        if (deferred_keys) |deferred| {
+            var missing = wanted.keyIterator();
+            while (missing.next()) |key| {
+                try control.check();
+                try deferProjectionKey(deferred.allocator, deferred.keys, key.*);
+            }
+        } else {
+            try self.appendUnmappedDocNums(alloc, txn, &wanted, null, &seen, &out, control);
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn deferProjectionKey(alloc: Allocator, deferred: *std.StringHashMapUnmanaged(void), key: []const u8) !void {
+        if (deferred.contains(key)) return;
+        const copy = try alloc.dupe(u8, key);
+        errdefer alloc.free(copy);
+        try deferred.put(alloc, copy, {});
+    }
+
+    pub fn projectionHasCompleteLocatorMap(txn: anytype) !bool {
+        return completeLocatorMap(txn);
+    }
+
+    pub fn lookupProjectionDocNum(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_id: []const u8, complete: bool) !union(enum) {
+        found: u32,
+        absent,
+        needs_scan,
+    } {
+        var key_buf: [256]u8 = undefined;
+        const key = try fwdKeyWithScratch(alloc, &key_buf, doc_id);
+        defer if (key.ptr != &key_buf) alloc.free(key);
+        if (txnGet(txn, self.dbi, key)) |raw| {
+            const number = try decodeFwdDocNum(raw);
+            if (number > std.math.maxInt(u32) or try self.docNumDeletedChecked(txn, number)) return .absent;
+            return .{ .found = @intCast(number) };
+        } else |err| if (err != error.NotFound) return err;
+        if (try readLocator(alloc, txn, doc_id)) |locator| {
+            if (try self.docNumDeletedChecked(txn, locator.num)) return .absent;
+            return .{ .found = std.math.cast(u32, locator.num) orelse return error.DocNumOverflow };
+        }
+        return if (complete) .absent else .needs_scan;
+    }
+
+    pub fn appendUnmappedDocNums(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        wanted: *std.StringHashMapUnmanaged(void),
+        owned_key_allocator: ?Allocator,
+        seen: *std.AutoHashMapUnmanaged(u32, void),
+        out: *std.ArrayListUnmanaged(u32),
+        control: @import("../search/query.zig").ExecutionControl,
+    ) !void {
+        if (wanted.count() == 0) return;
         const LookupContext = struct {
             alloc: Allocator,
             index: *SparseIndex,
             txn: @TypeOf(txn),
             wanted: *std.StringHashMapUnmanaged(void),
+            owned_key_allocator: ?Allocator,
             seen: *std.AutoHashMapUnmanaged(u32, void),
             out: *std.ArrayListUnmanaged(u32),
+            control: @import("../search/query.zig").ExecutionControl,
 
             fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                try ctx.control.check();
                 if (!ctx.wanted.contains(entry.doc_id) or try ctx.index.docNumDeletedChecked(ctx.txn, entry.doc_num)) return false;
                 if (entry.doc_num <= std.math.maxInt(u32)) {
                     const doc_num: u32 = @intCast(entry.doc_num);
                     const seen_gop = try ctx.seen.getOrPut(ctx.alloc, doc_num);
                     if (!seen_gop.found_existing) try ctx.out.append(ctx.alloc, doc_num);
                 }
-                _ = ctx.wanted.remove(entry.doc_id);
+                const removed = ctx.wanted.fetchRemove(entry.doc_id).?;
+                if (ctx.owned_key_allocator) |key_alloc| key_alloc.free(removed.key);
                 return ctx.wanted.count() == 0;
             }
         };
@@ -5851,20 +6381,21 @@ pub const SparseIndex = struct {
         defer cur.close();
         var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
         while (maybe_entry) |entry| {
+            try control.check();
             if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
             var ctx = LookupContext{
                 .alloc = alloc,
                 .index = self,
                 .txn = txn,
-                .wanted = &wanted,
-                .seen = &seen,
-                .out = &out,
+                .wanted = wanted,
+                .owned_key_allocator = owned_key_allocator,
+                .seen = seen,
+                .out = out,
+                .control = control,
             };
             if (try forEachCurrentDocMapEntry(txn, entry.key, entry.value, &ctx, LookupContext.visit)) break;
             maybe_entry = try cur.next();
         }
-
-        return try out.toOwnedSlice(alloc);
     }
 
     pub fn docNumsForOrdinalDocNumsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, ordinals: []const u32) !OrdinalDocNumLookup {
@@ -5990,7 +6521,7 @@ pub const SparseIndex = struct {
             var entry = first_term;
             while (true) {
                 if (entry.key.len == 0 or entry.key[0] != key_inv) break;
-                const term_id = parseTermRangeKey(entry.key) orelse {
+                const term_id = parseInvMetaKey(entry.key) orelse {
                     entry = (try src_cur.next()) orelse break;
                     continue;
                 };
@@ -5998,8 +6529,8 @@ pub const SparseIndex = struct {
                     entry = (try src_cur.next()) orelse break;
                     continue;
                 }
-                const range = try decodeChunkRangeMeta(entry.value);
-                switch (classifyChunkRange(range, lower, upper)) {
+                const range = try decodeTermMeta(entry.value);
+                switch (classifyChunkRange(.{ .min_doc_id = range.min_doc_id, .max_doc_id = range.max_doc_id }, lower, upper)) {
                     .outside => {},
                     .right_only, .mixed => {
                         try accumulateSplitPlanningStats(alloc, &src_txn, self.dbi, term_id, lower, upper, &collected.selected_doc_nums, &out);
@@ -6151,12 +6682,12 @@ pub const SparseIndex = struct {
             var entry = first;
             while (true) {
                 if (entry.key.len == 0 or entry.key[0] != key_inv) break;
-                const term_id = parseTermRangeKey(entry.key) orelse {
+                const term_id = parseInvMetaKey(entry.key) orelse {
                     entry = (try cur.next()) orelse break;
                     continue;
                 };
-                const range = try decodeChunkRangeMeta(entry.value);
-                switch (classifyChunkRange(range, lower, upper)) {
+                const range = try decodeTermMeta(entry.value);
+                switch (classifyChunkRange(.{ .min_doc_id = range.min_doc_id, .max_doc_id = range.max_doc_id }, lower, upper)) {
                     .outside => {},
                     .right_only, .mixed => try term_ids.append(alloc, term_id),
                 }
@@ -6304,7 +6835,7 @@ fn handoffTermPostings(
         error.NotFound => return,
         else => return err,
     };
-    const tm = decodeTermMeta(meta_data);
+    const tm = try decodeTermMeta(meta_data);
 
     var out_chunk_count: u32 = 0;
     var out_max_weight: f32 = 0;
@@ -6374,15 +6905,19 @@ fn handoffTermPostings(
     }
 
     if (out_chunk_count == 0) return;
-    const out_meta = encodeTermMeta(out_max_weight, out_chunk_count);
-    try txnPut(dest_txn, dest_dbi, mk, &out_meta);
-    const out_range_meta = try encodeChunkRangeMeta(alloc, out_min_doc_id.?, out_max_doc_id.?);
-    defer alloc.free(out_range_meta);
-    var range_key_buf: [256]u8 = undefined;
-    try txnPut(dest_txn, dest_dbi, termRangeKey(&range_key_buf, term_id), out_range_meta);
+    const out_meta = try encodeTermMeta(alloc, out_max_weight, out_chunk_count, out_min_doc_id.?, out_max_doc_id.?);
+    defer alloc.free(out_meta);
+    try txnPut(dest_txn, dest_dbi, mk, out_meta);
 }
 
+// No current caller (kept compiling through the v2 term-record merge
+// below rather than removed, since it is not this change's call to
+// delete unrelated dead code). `term_range_meta` is the old, standalone
+// encodeChunkRangeMeta-format payload a caller would have sourced
+// separately; decoded here and folded into the combined record this
+// index now stores under `mk` instead of writing it to its own key.
 fn handoffWholeTermPostings(
+    alloc: Allocator,
     src_txn: anytype,
     src_dbi: anytype,
     dest_txn: anytype,
@@ -6396,11 +6931,11 @@ fn handoffWholeTermPostings(
         error.NotFound => return,
         else => return err,
     };
-    const tm = decodeTermMeta(meta_data);
-
-    try txnPut(dest_txn, dest_dbi, mk, meta_data);
-    var range_key_buf: [256]u8 = undefined;
-    try txnPut(dest_txn, dest_dbi, termRangeKey(&range_key_buf, term_id), term_range_meta);
+    const tm = try decodeTermMeta(meta_data);
+    const range = try decodeChunkRangeMeta(term_range_meta);
+    const combined = try encodeTermMeta(alloc, tm.max_weight, tm.chunk_count, range.min_doc_id, range.max_doc_id);
+    defer alloc.free(combined);
+    try txnPut(dest_txn, dest_dbi, mk, combined);
 
     for (0..tm.chunk_count) |ci| {
         var ck_buf: [256]u8 = undefined;
@@ -6429,7 +6964,7 @@ fn pruneTermPostings(
         error.NotFound => return,
         else => return err,
     };
-    const tm = decodeTermMeta(meta_data);
+    const tm = try decodeTermMeta(meta_data);
 
     var kept = std.ArrayListUnmanaged(RetainedChunk).empty;
     defer {
@@ -6521,10 +7056,8 @@ fn pruneTermPostings(
         txnDelete(txn, dbi, invChunkMetaKey(&meta_ck_buf, term_id, @intCast(ci))) catch {};
     }
 
-    var range_key_buf: [256]u8 = undefined;
     if (kept.items.len == 0) {
         txnDelete(txn, dbi, mk) catch {};
-        txnDelete(txn, dbi, termRangeKey(&range_key_buf, term_id)) catch {};
         return;
     }
 
@@ -6535,11 +7068,9 @@ fn pruneTermPostings(
         try txnPut(txn, dbi, invChunkMetaKey(&meta_ck_buf, term_id, @intCast(out_idx)), chunk.meta_bytes);
     }
 
-    const out_meta = encodeTermMeta(out_max_weight, @intCast(kept.items.len));
-    try txnPut(txn, dbi, mk, &out_meta);
-    const out_range_meta = try encodeChunkRangeMeta(alloc, out_min_doc_id.?, out_max_doc_id.?);
-    defer alloc.free(out_range_meta);
-    try txnPut(txn, dbi, termRangeKey(&range_key_buf, term_id), out_range_meta);
+    const out_meta = try encodeTermMeta(alloc, out_max_weight, @intCast(kept.items.len), out_min_doc_id.?, out_max_doc_id.?);
+    defer alloc.free(out_meta);
+    try txnPut(txn, dbi, mk, out_meta);
 }
 
 fn shouldKeepDocNumOutsideRange(
@@ -6579,7 +7110,7 @@ fn accumulateSplitPlanningStats(
         error.NotFound => return,
         else => return err,
     };
-    const tm = decodeTermMeta(meta_data);
+    const tm = try decodeTermMeta(meta_data);
 
     for (0..tm.chunk_count) |ci| {
         var ck_buf: [256]u8 = undefined;
@@ -6691,13 +7222,17 @@ fn writeChunkWithRangeMetaToTxn(
 ) !void {
     _ = src_txn;
     _ = src_dbi;
+    // Same ordering hazard as `writeChunkWithRangeMetaProfiled`: encode (and
+    // thereby copy) both payloads before issuing either `dest_txn` write, in
+    // case `min_doc_id`/`max_doc_id` borrow memory that a `dest_txn` put can
+    // invalidate.
     const encoded = try encodeChunk(alloc, doc_nums, weights);
     defer alloc.free(encoded);
-    var ck_buf: [256]u8 = undefined;
-    try txnPut(dest_txn, dest_dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
-
     const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums, false);
     defer alloc.free(meta);
+
+    var ck_buf: [256]u8 = undefined;
+    try txnPut(dest_txn, dest_dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
     var meta_ck_buf: [256]u8 = undefined;
     try txnPut(dest_txn, dest_dbi, invChunkMetaKey(&meta_ck_buf, term_id, chunk_idx), meta);
 }
@@ -6719,6 +7254,353 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+// ---------------------------------------------------------------------------
+// `.native_catalog` backend: a minimal, allocator-backed
+// `native_catalog_backend.Sink` standing in for Lite's real
+// `lite/native_catalog_sink.zig`, mirroring `graph/graph.zig`'s identically-
+// shaped `NativeCatalogTestSink` (see that file's own doc comment). Used
+// below to exercise `prepareInlineSparsePublication`/
+// `installInlineSparsePublication` end to end, including across a reopen.
+// ---------------------------------------------------------------------------
+
+const NativeCatalogTestSink = struct {
+    allocator: Allocator,
+    entries: std.StringHashMapUnmanaged([]u8) = .empty,
+    submit_calls: usize = 0,
+    durable_submit_calls: usize = 0,
+
+    fn compositeKeyAlloc(alloc: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) ![]u8 {
+        return try std.mem.concat(alloc, u8, &.{ scope, "\x00", namespace orelse "", "\x00", key });
+    }
+
+    fn deinit(self: *@This()) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.submit_calls += 1;
+        if (durable) self.durable_submit_calls += 1;
+        for (mutations) |m| {
+            const composite = try compositeKeyAlloc(self.allocator, scope, m.namespace, m.key);
+            if (m.is_delete) {
+                if (self.entries.fetchRemove(composite)) |removed| {
+                    self.allocator.free(removed.key);
+                    self.allocator.free(removed.value);
+                }
+                self.allocator.free(composite);
+                continue;
+            }
+            if (self.entries.getEntry(composite)) |existing| {
+                self.allocator.free(existing.value_ptr.*);
+                existing.value_ptr.* = try self.allocator.dupe(u8, m.value);
+                self.allocator.free(composite);
+                continue;
+            }
+            try self.entries.put(self.allocator, composite, try self.allocator.dupe(u8, m.value));
+        }
+    }
+
+    fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var result = std.ArrayListUnmanaged(native_catalog_backend.Entry).empty;
+        errdefer {
+            for (result.items) |e| {
+                if (e.namespace) |n| allocator.free(n);
+                allocator.free(e.key);
+                allocator.free(e.value);
+            }
+            result.deinit(allocator);
+        }
+        const prefix = try std.mem.concat(allocator, u8, &.{ scope, "\x00" });
+        defer allocator.free(prefix);
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            const remainder = entry.key_ptr.*[prefix.len..];
+            const sep = std.mem.indexOfScalar(u8, remainder, 0) orelse return error.InvalidTestKey;
+            const ns = remainder[0..sep];
+            const key = remainder[sep + 1 ..];
+            try result.append(allocator, .{
+                .namespace = if (ns.len == 0) null else try allocator.dupe(u8, ns),
+                .key = try allocator.dupe(u8, key),
+                .value = try allocator.dupe(u8, entry.value_ptr.*),
+            });
+        }
+        return try result.toOwnedSlice(allocator);
+    }
+
+    fn sink(self: *@This()) native_catalog_backend.Sink {
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
+    }
+};
+
+test "sparse inline publication folds one batch into an externally-owned commit and is durable after reopen" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "inline-publication");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var index = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer index.close();
+    // `open`'s own meta read/commit for a fresh index already submits
+    // through the sink; this test only cares that `prepareInlineSparse
+    // Publication` adds none of its own on top of that.
+    const submit_calls_after_open = test_sink.submit_calls;
+
+    const write: SparseWrite = .{ .doc_id = "doc-1", .vec = .{ .indices = &.{ 3, 7 }, .values = &.{ 1.5, 2.5 } } };
+    var publication = try index.prepareInlineSparsePublication(&.{write}, &.{});
+    // Nothing durable yet, and no reader of this index sees the doc.
+    try std.testing.expectEqual(submit_calls_after_open, test_sink.submit_calls);
+    try std.testing.expectEqual(@as(u64, 0), index.doc_count);
+    {
+        const hits = try index.search(alloc, &.{ .indices = &.{3}, .values = &.{1} }, 10);
+        defer SparseIndex.freeResults(alloc, hits);
+        try std.testing.expectEqual(@as(usize, 0), hits.len);
+    }
+    try std.testing.expect(publication.pendingMutations().len > 0);
+
+    // Simulate an externally-owned combined commit folding this index's
+    // mutations into one native transaction (one `commit_participant.
+    // View.putIndexCatalog` call, per the section doc comment): this
+    // harness calls the sink directly, same as
+    // `lite/native_catalog_sink.zig`'s `Sink.submit` would for a
+    // `putIndexCatalog` call inside one caller-held native transaction.
+    const scope = index.nativeCatalogScope().?;
+    try NativeCatalogTestSink.submit(&test_sink, scope, publication.pendingMutations(), true);
+
+    try index.installInlineSparsePublication(&publication);
+    try std.testing.expectEqual(@as(u64, 1), index.doc_count);
+
+    const hits = try index.search(alloc, &.{ .indices = &.{3}, .values = &.{1} }, 10);
+    defer SparseIndex.freeResults(alloc, hits);
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    try std.testing.expectEqualStrings("doc-1", hits[0].doc_id);
+
+    // Reopen: the externally-committed mutations are genuinely durable in
+    // the sink, not merely visible through this process' in-memory mirror.
+    var reopened = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer reopened.close();
+    const reopened_hits = try reopened.search(alloc, &.{ .indices = &.{3}, .values = &.{1} }, 10);
+    defer SparseIndex.freeResults(alloc, reopened_hits);
+    try std.testing.expectEqual(@as(usize, 1), reopened_hits.len);
+    try std.testing.expectEqual(@as(u64, 1), reopened.doc_count);
+}
+
+test "sparse inline publication abort discards staged mutations and counters" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "inline-publication-abort");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var index = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer index.close();
+    const submit_calls_after_open = test_sink.submit_calls;
+    const prev_next_doc_num = index.next_doc_num;
+    const prev_doc_count = index.doc_count;
+
+    const write: SparseWrite = .{ .doc_id = "doc-2", .vec = .{ .indices = &.{1}, .values = &.{1.0} } };
+    var publication = try index.prepareInlineSparsePublication(&.{write}, &.{});
+    publication.abort();
+    try std.testing.expectEqual(submit_calls_after_open, test_sink.submit_calls);
+    try std.testing.expectEqual(prev_next_doc_num, index.next_doc_num);
+    try std.testing.expectEqual(prev_doc_count, index.doc_count);
+
+    const hits = try index.search(alloc, &.{ .indices = &.{1}, .values = &.{1} }, 10);
+    defer SparseIndex.freeResults(alloc, hits);
+    try std.testing.expectEqual(@as(usize, 0), hits.len);
+}
+
+test "sparse inline publication rejects every backend but native_catalog" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "inline-publication-unsupported");
+    defer cleanupTmp(path);
+
+    var index = try SparseIndex.open(alloc, path, .{ .backend = .lsm_memory });
+    defer index.close();
+    const write: SparseWrite = .{ .doc_id = "doc-3", .vec = .{ .indices = &.{1}, .values = &.{1.0} } };
+    try std.testing.expectError(error.InlineSparsePublicationUnsupported, index.prepareInlineSparsePublication(&.{write}, &.{}));
+}
+
+// Regression for a use-after-free in `writeChunkWithRangeMetaProfiled`: the
+// chunk-key `txnAppendPut` used to run *before* `encodeChunkOrdinalRange`
+// read `min_doc_id`/`max_doc_id` -- which `addToPostings`'s "append to
+// existing chunk" branch borrows straight out of this same `.native_catalog`
+// transaction's previous chunk-meta record (`readChunkRangeMeta`), never
+// copied. On `.native_catalog` (`storage/native_catalog_backend.zig`'s
+// persistent-tree `State`), every `txn.put` is an immediate copy-on-write
+// replace that releases the superseded tree node once nothing else
+// references it -- including, when that node's key happened to sit on the
+// chunk key's insertion path, the exact node backing the borrowed slice.
+// `encodeChunkOrdinalRange`'s later memcpy then read freed memory.
+// Reproduced as a segfault in `addToPostings`, reached from real concurrent
+// writers in `storage/lite/write_amplification_bench_test.zig`'s
+// `sparse_vector_8_writers` mode (inline publication and the worker
+// catch-up path both funnel through the same `stageIncrementalMutations` ->
+// `processInsert` -> `addToPostings` -> `writeChunkWithRangeMeta` call
+// chain). This test drives both of those call paths --
+// `prepareInlineSparsePublication`/`installInlineSparsePublication` for
+// "foreground inline" workers and plain `batch()` for "catch-up-style"
+// workers -- from real OS threads serialized by an explicit mutex standing
+// in for production's per-index `IndexManager.lockManagedIndexApply` guard
+// (this index's own contract: every writer serializes through one such
+// lock), with a small `chunk_size` and a narrow term universe to force many
+// existing-chunk appends. Bounded by a wall-clock deadline so a real
+// regression here fails fast instead of hanging.
+test "concurrent sparse writers across inline publication and direct batch paths do not corrupt postings" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "concurrent-inline-stress");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var index = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+        .chunk_size = 3,
+    });
+    defer index.close();
+
+    const writer_count = 8;
+    const writes_per_writer = 40;
+    const term_universe = 6;
+    // Generous on purpose: this guards against a genuine hang (e.g. a
+    // reintroduced crash taking a worker thread down mid-write), not
+    // against ordinary scheduling noise. 320 total serialized writes
+    // normally finish in well under a second; a loaded machine running
+    // other work concurrently (shared CI runners, other builds) can still
+    // take meaningfully longer without anything being wrong.
+    const deadline_ns = nowNs() + 10 * 60 * std.time.ns_per_s;
+
+    const Worker = struct {
+        index: *SparseIndex,
+        sink: *NativeCatalogTestSink,
+        guard: *std.atomic.Mutex,
+        worker_id: usize,
+        count: usize,
+        deadline_ns: u64,
+        use_inline_publication: bool,
+        err: ?anyerror = null,
+        completed: usize = 0,
+
+        fn lockGuard(guard: *std.atomic.Mutex) void {
+            while (!guard.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        fn run(self: *@This()) void {
+            var id_buf: [32]u8 = undefined;
+            var i: usize = 0;
+            while (i < self.count) : (i += 1) {
+                // Bounded rather than infinite: a real regression crashes or
+                // hangs long before this fires, so the test fails fast
+                // instead of hanging the suite.
+                if (nowNs() >= self.deadline_ns) return;
+                const doc_id = std.fmt.bufPrint(&id_buf, "w{d}-doc-{d}", .{ self.worker_id, i }) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                // Two overlapping terms per doc out of a small shared
+                // universe: every term quickly accumulates postings from
+                // many different workers and repeatedly crosses the
+                // "append to existing chunk" branch that borrows range
+                // metadata out of the transaction being written to.
+                const t0: u32 = @intCast((self.worker_id + i) % term_universe);
+                const t1: u32 = @intCast((self.worker_id + i + 1) % term_universe);
+                const write: SparseWrite = .{
+                    .doc_id = doc_id,
+                    .vec = .{
+                        .indices = &.{ t0, t1 },
+                        .values = &.{ 1.0 + @as(f32, @floatFromInt(i % 5)), 2.0 },
+                    },
+                };
+
+                lockGuard(self.guard);
+                defer self.guard.unlock();
+
+                if (self.use_inline_publication) {
+                    var publication = self.index.prepareInlineSparsePublication(&.{write}, &.{}) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    const scope = self.index.nativeCatalogScope().?;
+                    NativeCatalogTestSink.submit(self.sink, scope, publication.pendingMutations(), true) catch |err| {
+                        publication.abort();
+                        self.err = err;
+                        return;
+                    };
+                    self.index.installInlineSparsePublication(&publication) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                } else {
+                    self.index.batch(&.{write}, &.{}) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                }
+                self.completed += 1;
+            }
+        }
+    };
+
+    var apply_guard: std.atomic.Mutex = .unlocked;
+    var workers: [writer_count]Worker = undefined;
+    for (0..writer_count) |w| workers[w] = .{
+        .index = &index,
+        .sink = &test_sink,
+        .guard = &apply_guard,
+        .worker_id = w,
+        .count = writes_per_writer,
+        .deadline_ns = deadline_ns,
+        .use_inline_publication = w % 2 == 0,
+    };
+
+    var threads: [writer_count]std.Thread = undefined;
+    for (0..writer_count) |w| threads[w] = try std.Thread.spawn(.{}, Worker.run, .{&workers[w]});
+    for (threads) |thread| thread.join();
+
+    var total_completed: usize = 0;
+    for (workers) |worker| {
+        if (worker.err) |err| return err;
+        total_completed += worker.completed;
+    }
+    try std.testing.expectEqual(writer_count * writes_per_writer, total_completed);
+    try std.testing.expectEqual(@as(u64, writer_count * writes_per_writer), index.doc_count);
+
+    // Every term in the shared universe now has postings from many workers
+    // across many chunks; a corrupted chunk/range record would show up here
+    // as a wrong hit count (before this fix, we would not even get this far
+    // without crashing).
+    for (0..term_universe) |t| {
+        const hits = try index.search(alloc, &.{ .indices = &.{@as(u32, @intCast(t))}, .values = &.{1} }, writer_count * writes_per_writer);
+        defer SparseIndex.freeResults(alloc, hits);
+        try std.testing.expect(hits.len > 0);
+    }
 }
 
 fn expectIncarnationSearch(index: *SparseIndex, term: u32, expected: []const struct { id: []const u8, score: f32 }, filtered: bool) !void {
@@ -7216,6 +8098,97 @@ test "sparse batch delete removes from posting lists" {
     try std.testing.expectEqual(@as(usize, 0), results.len);
 }
 
+// Regression coverage for the v2 term-record merge (perf/lwa-commit-eff2):
+// a term's combined (meta, range) record must still track the TRUE range
+// after a delete shrinks it -- an insert can only extend the range in
+// place (always correct immediately), but a delete can only shrink it,
+// and correctly shrinking requires the full chunk rescan this still
+// triggers (recomputeTermRangeMeta/refreshTermRangeMeta), not the
+// immediate-write path insert-only touches now take.
+test "sparse term range shrinks correctly after deleting the boundary document" {
+    const alloc = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "term-range-shrink");
+    defer cleanupTmp(path);
+
+    var idx = try SparseIndex.open(alloc, path, .{});
+    defer idx.close();
+
+    // Three docs sharing term 7, doc_id-ordered doc-a < doc-b < doc-c.
+    const writes = [_]SparseWrite{
+        .{ .doc_id = "doc-a", .vec = .{ .indices = &.{7}, .values = &.{1.0} } },
+        .{ .doc_id = "doc-b", .vec = .{ .indices = &.{7}, .values = &.{1.0} } },
+        .{ .doc_id = "doc-c", .vec = .{ .indices = &.{7}, .values = &.{1.0} } },
+    };
+    try idx.batch(&writes, &.{});
+
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const tm = try decodeTermMeta(try txn.get(invMetaKey(&key_buf, 7)));
+        try std.testing.expectEqualStrings("doc-a", tm.min_doc_id);
+        try std.testing.expectEqualStrings("doc-c", tm.max_doc_id);
+    }
+
+    // Delete the MIN boundary doc (default options: non-deferred delete
+    // path, recomputeTermRangeMeta runs immediately). The term still has
+    // doc-b/doc-c, so the range must shrink to [doc-b, doc-c] -- not stay
+    // stale at [doc-a, doc-c].
+    try idx.batch(&.{}, &.{"doc-a"});
+
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const tm = try decodeTermMeta(try txn.get(invMetaKey(&key_buf, 7)));
+        try std.testing.expectEqualStrings("doc-b", tm.min_doc_id);
+        try std.testing.expectEqualStrings("doc-c", tm.max_doc_id);
+    }
+
+    // Crash/restart proxy: the shrunk combined record (and the chunk it
+    // shares a write with) must have been durably committed, not just
+    // visible in this process's own open handle -- close and reopen
+    // before continuing.
+    idx.close();
+    idx = try SparseIndex.open(alloc, path, .{});
+
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const tm = try decodeTermMeta(try txn.get(invMetaKey(&key_buf, 7)));
+        try std.testing.expectEqualStrings("doc-b", tm.min_doc_id);
+        try std.testing.expectEqualStrings("doc-c", tm.max_doc_id);
+    }
+
+    // A fresh insert into the SAME term and a delete of a DIFFERENT doc in
+    // the SAME deferred batch: the insert's immediate combined write and
+    // the delete's deferred dirty-flag recompute must not clobber each
+    // other -- the final state must reflect both.
+    const more_writes = [_]SparseWrite{
+        .{ .doc_id = "doc-z", .vec = .{ .indices = &.{7}, .values = &.{1.0} } },
+    };
+    try idx.batchWithOptions(&more_writes, &.{"doc-b"}, .{ .defer_term_range_updates = true });
+
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const tm = try decodeTermMeta(try txn.get(invMetaKey(&key_buf, 7)));
+        try std.testing.expectEqualStrings("doc-c", tm.min_doc_id);
+        try std.testing.expectEqualStrings("doc-z", tm.max_doc_id);
+    }
+
+    // Functional (recall) check end to end: only doc-c and doc-z remain.
+    const q_i7 = [_]u32{7};
+    const q_v7 = [_]f32{1.0};
+    const query7 = SparseVector{ .indices = &q_i7, .values = &q_v7 };
+    const results7 = try idx.search(alloc, &query7, 10);
+    defer SparseIndex.freeResults(alloc, results7);
+    try std.testing.expectEqual(@as(usize, 2), results7.len);
+}
+
 test "sparse constrained search filters before top-k ranking" {
     const alloc = std.testing.allocator;
     var pb: [256]u8 = undefined;
@@ -7465,6 +8438,83 @@ const NoDocMapRead = struct {
         return error.UnexpectedDocMapScan;
     }
 };
+
+test "optional numeric range sparse projection proves only aligned live physical ordinals" {
+    const alloc = std.testing.allocator;
+    var index = try SparseIndex.open(alloc, "unused", .{ .backend = .mem });
+    defer index.close();
+    try index.batchWithOptions(&.{
+        .{ .doc_id = "aligned", .doc_num = 1, .vec = .{ .indices = &.{1}, .values = &.{2} } },
+        .{ .doc_id = "other", .doc_num = 2, .vec = .{ .indices = &.{1}, .values = &.{2} } },
+        .{ .doc_id = "removed", .doc_num = 3, .vec = .{ .indices = &.{1}, .values = &.{2} } },
+    }, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try index.batchWithOptions(&.{}, &.{"removed"}, .{});
+    var txn = try index.beginReadTxn();
+    defer txn.abort();
+    var aligned: [5]bool = undefined;
+    try std.testing.expect(try SparseIndex.tryProveProjectionDocNums(alloc, &txn, &.{ 0, 1, 2, 3, 4 }, &.{ null, "aligned", "collision", "removed", "missing" }, &aligned, .{}));
+    try std.testing.expectEqual([5]bool{ false, true, false, false, false }, aligned);
+}
+
+test "optional numeric range sparse proof falls back on transient reads and propagates cancellation" {
+    const Failure = struct {
+        err: anyerror = error.StorageReadTemporarilyUnavailable,
+        multiple_blocks: bool = false,
+
+        fn openScope(alloc: Allocator, ptr: *anyopaque) anyerror!backend_erased.ReadScope {
+            const failure: *@This() = @ptrCast(@alignCast(ptr));
+            _ = try alloc.alloc(u8, 64);
+            if (failure.multiple_blocks) {
+                _ = try alloc.alloc(u8, 2048);
+                _ = try alloc.alloc(u8, 8192);
+            }
+            return .{ .allocator = alloc, .ptr = ptr, .vtable = &.{ .close = abort, .get = read } };
+        }
+        fn read(ptr: *anyopaque, _: []const u8) anyerror![]const u8 {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).err;
+        }
+        fn abort(_: Allocator, _: *anyopaque) void {}
+        fn get(_: *anyopaque, _: []const u8) anyerror![]const u8 {
+            unreachable;
+        }
+        fn cursor(_: Allocator, _: *anyopaque) anyerror!backend_erased.Cursor {
+            unreachable;
+        }
+    };
+    var buffer: [1024]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var memory = std.heap.FixedBufferAllocator.init(&buffer);
+    const alloc = memory.allocator();
+    var failure: Failure = .{};
+    var txn: backend_erased.ReadTxn = .{
+        .allocator = alloc,
+        .ptr = &failure,
+        .vtable = &.{ .abort = Failure.abort, .get = Failure.get, .open_cursor = Failure.cursor, .open_read_scope = Failure.openScope },
+    };
+    defer txn.abort();
+    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.InvalidTableFile, error.CorruptInput, error.TableBlockChecksumMismatch, error.EndOfStream, error.InputOutput, error.FileNotFound, error.WouldBlock, error.OutOfMemory }) |err| {
+        failure.err = err;
+        var proven = [_]bool{true};
+        try std.testing.expect(!try SparseIndex.tryProveProjectionDocNums(alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
+        try std.testing.expectEqual([1]bool{false}, proven);
+        try std.testing.expectEqual(@as(usize, 0), memory.end_index);
+    }
+    var proven = [_]bool{true};
+    failure.err = error.Canceled;
+    try std.testing.expectError(error.Canceled, SparseIndex.tryProveProjectionDocNums(alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
+    try std.testing.expectEqual(@as(usize, 0), memory.end_index);
+
+    var tracking: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    var query_arena = std.heap.ArenaAllocator.init(tracking.allocator());
+    defer query_arena.deinit();
+    const query_alloc = query_arena.allocator();
+    const retained = try query_alloc.alloc(u8, 32);
+    @memset(retained, 42);
+    const live = tracking.allocated_bytes - tracking.freed_bytes;
+    failure = .{ .err = error.OutOfMemory, .multiple_blocks = true };
+    try std.testing.expect(!try SparseIndex.tryProveProjectionDocNums(query_alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
+    try std.testing.expectEqual(live, tracking.allocated_bytes - tracking.freed_bytes);
+    try std.testing.expectEqual(@as(u8, 42), retained[0]);
+}
 
 test "sparse locator backfill refuses corrupt roots and future incarnations" {
     const a = std.testing.allocator;

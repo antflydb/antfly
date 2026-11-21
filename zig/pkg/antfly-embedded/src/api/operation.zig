@@ -138,9 +138,26 @@ pub const SQLCompletionOwner = struct {
 };
 
 pub const RequestContext = struct {
+    pub fn checkCatalogIncarnation(self: RequestContext, epoch: ?@import("../system_catalog/relation_reconciliation.zig").Epoch) !void {
+        const expected = self.bound_catalog_incarnation orelse return;
+        if (epoch == null or !std.mem.eql(u8, &expected, &epoch.?.incarnation)) return error.CatalogGenerationChanged;
+    }
+
+    pub fn expectedMetadataIncarnation(self: RequestContext) ?[32]u8 {
+        return std.fmt.bytesToHex(self.bound_catalog_incarnation orelse return null, .lower);
+    }
+
+    pub fn checkMetadataIncarnation(self: RequestContext, actual: ?[32]u8) !void {
+        const expected = self.expectedMetadataIncarnation() orelse return;
+        if (actual == null or !std.mem.eql(u8, &expected, &actual.?)) return error.CatalogGenerationChanged;
+    }
+
     pub fn markSQLSubmission(self: RequestContext) void {
         if (self.sql_completion_submission) |observed| observed.* = true;
     }
+    /// Incarnation attested when a pgwire portal bound its physical targets.
+    bound_catalog_incarnation: ?[16]u8 = null,
+
     /// Borrowed native admission observer; never decoded from request JSON.
     /// Set only at the first possible durable submission (or existing job).
     sql_completion_submission: ?*bool = null,

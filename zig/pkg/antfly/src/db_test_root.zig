@@ -34,6 +34,7 @@ test {
     _ = @import("antfly_local_sources").storage_db_resolution_runtime;
     _ = @import("antfly_local_sources").storage_db_relational_index_catalog;
     _ = @import("antfly_local_sources").storage_db_relational_index_gc;
+    _ = @import("antfly_local_sources").storage_db_cleanup_job_owner;
 }
 
 pub const antfly_sources = struct {

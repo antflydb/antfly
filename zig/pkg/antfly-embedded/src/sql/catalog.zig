@@ -553,6 +553,7 @@ pub const Table = struct {
     id: u64,
     physical_name: []const u8,
     schema_version: u32,
+    column_lineage: ?u32 = null,
     storage_mode: enum { relational, document } = .relational,
     /// Relational legacy TTL/version source only. Document revisions are
     /// allocated under the durable apply fence independently of TTL and HLC.

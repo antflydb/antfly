@@ -222,6 +222,7 @@ pub const StartRequest = struct {
     /// duplicated into the compact public job record.
     rewrite_plan_json: ?[]const u8 = null,
     generation_plan_json: ?[]const u8 = null,
+    expected_incarnation: ?[32]u8 = null,
 };
 
 pub const ListBatch = struct {
@@ -1395,6 +1396,7 @@ pub const Store = struct {
                     replicated.createWithStaging(alloc, key, proposal, plan, self.replicated_leadership_term)
                 else
                     replicated.create(alloc, key, proposal, self.replicated_leadership_term)) catch |err| switch (err) {
+                    error.CatalogGenerationChanged,
                     error.TableTopologyProtocolUpgradeRequired,
                     error.MetadataTopologyCommandTooLarge,
                     error.RestoreJobRecordTooLarge,
@@ -3548,6 +3550,7 @@ pub fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u
     if (req.source_kind == .schema_rewrite) hash.update("antfly:restore:schema-rewrite:v1\x00");
     if (req.source_kind == .empty_generation) hash.update("antfly:restore:empty-generation:v1\x00");
     if (req.source_kind == .query_population) hash.update("antfly:restore:query-population:v1\x00");
+    if (req.expected_incarnation) |expected| hash.update(&expected);
     hash.update(canonical);
     if (req.routine_mappings) |mappings| if (mappings.len != 0) {
         const encoded = try routine_mapping.canonicalAlloc(alloc, mappings);

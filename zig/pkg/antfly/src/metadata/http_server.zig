@@ -2320,7 +2320,8 @@ pub const MetadataHttpServer = struct {
         // tokenless legacy internal calls; this operation must not use that
         // exception. A supplied token is verified by the host middleware even
         // during migration.
-        if (input == .policy_publication_status and
+        const cursor_read = input == .resolve_many and input.resolve_many.cursor_bindings.len != 0;
+        if ((input == .policy_publication_status or cursor_read) and
             ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
             return ctx.status(403).text("policy publication status requires an authenticated service");
         if (admin_grant or input.requiresSettingAuthorityReadGrant()) {
@@ -2342,7 +2343,7 @@ pub const MetadataHttpServer = struct {
         ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
         var context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
         context.setting_admin = admin_grant;
-        context.row_policy_install_authority = input == .policy_install_snapshot or input == .policy_publication_status or input == .policy_publication_work or input == .policy_publication_mutate or input == .policy_publication_begin;
+        context.row_policy_install_authority = cursor_read or input == .policy_install_snapshot or input == .policy_publication_status or input == .policy_publication_work or input == .policy_publication_mutate or input == .policy_publication_begin;
         context.fk_generation_publication_authority = fk_publication_read or input == .sql_completion_reference_mutate or input == .fk_generation_publication_begin or input == .fk_generation_publication_mutate or input == .fk_initial_create_begin or input == .fk_initial_create_mutate;
         context.index_publication_authority = input.isRelationalIndexOwnerCall();
         context.schema_validation_authority = input.isSchemaValidationCall();
@@ -4143,6 +4144,7 @@ pub const MetadataHttpServer = struct {
             error.TableTransitionActive => ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => ctx.status(405).text("method not allowed"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+            error.EnrichmentInUse => ctx.status(409).text("remove dependent dense indexes before changing embedding cardinality"),
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => ctx.status(400).text("unsupported artifact enrichment configuration"),
             else => metadataReadError(ctx, err),
         };

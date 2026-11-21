@@ -214,7 +214,10 @@ pub fn PublicationProofPool(comptime Scan: type, comptime Proof: type, comptime 
                 slot.preparation.cancel();
             };
             slot.used_at_ns = now_ns;
-            if (slot.preparation.scan == null and slot.preparation.proof == null and !slot.preparation.stopped and now_ns >= slot.preparation.retry_after_ns) {
+            // Pending pages can advance immediately. A prior resource failure
+            // explicitly asks the caller to back off until the retry window.
+            if (!slot.preparation.stopped and now_ns < slot.preparation.retry_after_ns) return error.ResourceTemporarilyUnavailable;
+            if (slot.preparation.scan == null and slot.preparation.proof == null and !slot.preparation.stopped) {
                 var active: usize = 0;
                 for (self.slots) |other| if (other) |value| {
                     if (value.preparation.scan != null) active += 1;
@@ -678,7 +681,7 @@ test "relation reconciliation worker publication pool expires idle snapshots ren
     try std.testing.expectError(error.OutOfMemory, pool.step(io, &host, work, 7, now));
     const begins = host.begins;
     host.begin_error = null;
-    try std.testing.expect((try pool.step(io, &host, work, 7, now + 1)) == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pool.step(io, &host, work, 7, now + 1));
     try std.testing.expectEqual(begins, host.begins);
     host.step_error = error.InvalidCatalogRecord;
     try std.testing.expectError(error.InvalidCatalogRecord, pool.step(io, &host, work, 7, now + std.time.ns_per_s));
