@@ -8546,7 +8546,8 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
             try std.testing.expectEqualStrings("Bearer reader-bearer", request.header("Authorization") orelse return error.MissingHeader);
             if (request.method == .GET) {
                 if (request.header(remote_capabilities.discovery_shape_header)) |shape|
-                    try std.testing.expectEqualStrings("2:2:2:-", shape);
+                    // Planning may probe one item before binding the full batch.
+                    try std.testing.expect(std.mem.eql(u8, shape, "2:1:2:-") or std.mem.eql(u8, shape, "2:2:2:-"));
             }
             if (framed and request.method == .POST) {
                 try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, request.header("Content-Type") orelse return error.MissingHeader);
@@ -8607,6 +8608,7 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
     var result: ?asset_producer.ProducedBatch = null;
     var run_err: ?anyerror = null;
     var group = std.Io.Group.init;
+    defer group.cancel(io);
     const Fiber = struct {
         fn run(
             a: Allocator,
@@ -8626,10 +8628,25 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
         }
     };
     try group.concurrent(io, Fiber.run, .{ alloc, producer, &requests, &result, &run_err });
-    try server.handleOne(); // planning
-    try server.handleOne(); // invocation
-    try server.handleOne(); // execution
+    var serving = std.Io.Group.init;
+    defer serving.cancel(io);
+    var server_err: ?anyerror = null;
+    const Serve = struct {
+        fn run(s: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            for (0..3) |_| s.handleOne() catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    try serving.concurrent(io, Serve.run, .{ &server, &server_err });
     try group.await(io);
+    // Capability leases can reuse discovery, so the fixture must not wait for
+    // a fixed request count after the producer has completed successfully.
+    serving.cancel(io);
+    if (server_err) |err| {
+        if (err != error.Canceled) return err;
+    }
     if (run_err) |err| return err;
     var batch = result.?;
     defer batch.deinit(alloc);
