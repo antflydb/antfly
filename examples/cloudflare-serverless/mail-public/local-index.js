@@ -202,7 +202,13 @@ export class LocalMailIndex {
             signal?.throwIfAborted();
             const batch = page.messages.slice(at, at + EMBED_BATCH);
             vectors.push(
-              ...(await this.serial(() => this.embed(batch.map(embeddingText), "RETRIEVAL_DOCUMENT")))
+              ...(await this.serial(() =>
+                // The encoder reads at most max_tokens; ~16 chars/token is a safe upper bound.
+                this.embed(
+                  batch.map((m) => embeddingText(m).slice(0, this.config.embedding.max_tokens * 16)),
+                  "RETRIEVAL_DOCUMENT"
+                )
+              ))
             );
             onStatus({ stage: "embedding", loaded: (this.state.messages ?? 0) + vectors.length });
           }
