@@ -725,17 +725,19 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         const native_definition = try nativeDefinition(scratch, definition);
         var catalog_routes = try source.capturePhysical(a, native_definition, internal);
         defer catalog_routes.deinit();
-        try catalog_routes.validateInstalledRoutes(state.value);
         const access = try authorizedIcebergTables(api, scratch, identity, definition, internal);
         var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
+        try policy.authorize(state.value, internal);
+        try stageVisibleSplits(&client, a, source, &catalog_routes, &state, selection.after, internal);
         return executeIceberg(&client, a, selection, limits, &policy, .{ .source = source, .captured = &catalog_routes }, internal);
     }
     var captured = try source.capturePhysical(a, definition, internal);
     defer captured.deinit();
-    try captured.validateInstalledRoutes(state.value);
     if (captured.roots.len == 0) return error.ChangefeedResynchronizationRequired;
     const access = try authorizedTableAccess(api, scratch, identity, definition, &captured, internal);
     var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
+    try policy.authorize(state.value, internal);
+    try stageVisibleSplits(&client, a, source, &captured, &state, selection.after, internal);
     var provider: native.ScheduledProvider(roots.Routed, RoutedFactory, Policy) = .{ .factory = .{ .source = source, .captured = &captured }, .policy = &policy };
     if (limits) |bounds|
         return .{ .page = try delivery.pull(&client, &provider, a, selection.id, selection.after, bounds, internal) };
@@ -765,6 +767,47 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         _ = try source_api.flushAcknowledged(&client, &driver_policy, a, active, root, internal);
     }
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
+}
+
+fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, parsed: *control.Parsed, cursor: control.Digest, request: Context) !void {
+    if (routes.validateInstalledRoutes(parsed.value)) |_| return else |err| {
+        if (err != error.ChangefeedResynchronizationRequired or parsed.value.phase != .streaming or source.split_cut == null)
+            return err;
+    }
+    _ = try parsed.value.contextAt(cursor);
+    const now = clock.realtimeNs() / std.time.ns_per_s;
+    if (parsed.value.expiryDue(now)) return error.ChangefeedLeaseExpired;
+    try request.ensureActive();
+    var snapshot = try source.catalog.adminSnapshot();
+    defer source.catalog.freeAdminSnapshot(&snapshot);
+    for (0..control.max_roots) |_| {
+        const state = parsed.value;
+        if (routes.validateInstalledRoutes(state)) |_| return else |_| {}
+        const mutation = candidate: {
+            for (state.roots) |root| {
+                const physical = root.physical orelse continue;
+                if (root.split_handoff != null) continue;
+                const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
+                for (snapshot.split_transitions) |split| {
+                    if (split.phase != .finalized or split.source_group_id != physical.group_id or split.table_contract.table_id != table_id) continue;
+                    _ = routes.findPhysical(table_id, split.destination_group_id, split.destination_group_id) catch continue;
+                    break :candidate try source.prepareSplitHandoff(a, routes, root, split, request);
+                }
+            }
+            return error.ChangefeedResynchronizationRequired;
+        };
+        try change(client, a, state, mutation, request);
+        var observed = try load(client, a, state.id, request);
+        errdefer observed.deinit();
+        const expected = mutation.stage_split_handoff;
+        const index = try observed.value.rootIndex(expected.namespace);
+        if (observed.value.epoch != state.epoch or observed.value.revision <= state.revision or
+            !std.meta.eql(observed.value.roots[index].split_handoff, @as(?control.SplitHandoff, expected.handoff)))
+            return error.MetadataMutationOutcomeUnknown;
+        parsed.deinit();
+        parsed.* = observed;
+    }
+    try routes.validateInstalledRoutes(parsed.value);
 }
 
 const RoutedFactory = struct {
