@@ -7289,7 +7289,7 @@ test "distributed txn renewed same owner rejects stale seals and retirement" {
     const original = try registry.leaseTenure(a, info.txn_id, 9);
     const guard = try registry.mutation(a, info.txn_id, 9);
     try std.testing.expect(original != null and original == guard.tenure);
-    var request = try parseCommitRequest(a, "{\"tables\":{\"docs\":{\"inserts\":{\"a\":{}}}}}");
+    var request = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{}}}}}");
     defer request.deinit(a);
     var staged = (try registry.cloneOwnedCommitRequest(a, guard, &request)).?;
     defer staged.deinit(a);
