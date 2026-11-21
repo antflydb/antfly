@@ -2043,19 +2043,27 @@ pub const TxnManager = struct {
         var read = try self.store.beginRead();
         defer read.abort();
 
-        if (try @import("source_plan_storage.zig").hasRetainedArtifacts(&read)) return true;
+        if (try @import("source_plan_storage.zig").hasRetainedArtifacts(&read)) {
+            std.log.debug("topology blocked by an active source recovery plan", .{});
+            return true;
+        }
 
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
         // than opening an intent cursor for every retained terminal record.
-        if (try readHasPrefix(&read, intents_prefix) or
-            try readHasPrefix(&read, intent_locks_prefix) or
-            try readHasPrefix(&read, read_guards_prefix) or
-            try readHasPrefix(&read, read_members_prefix) or
-            try readHasPrefix(&read, hot_standby_batch_outbox_prefix) or
-            try readHasPrefix(&read, hot_standby_replay_outbox_prefix))
-        {
-            return true;
+        const queues = [_]struct { prefix: []const u8, name: []const u8 }{
+            .{ .prefix = intents_prefix, .name = "write intents" },
+            .{ .prefix = intent_locks_prefix, .name = "intent locks" },
+            .{ .prefix = read_guards_prefix, .name = "read guards" },
+            .{ .prefix = read_members_prefix, .name = "read members" },
+            .{ .prefix = hot_standby_batch_outbox_prefix, .name = "standby batch outbox" },
+            .{ .prefix = hot_standby_replay_outbox_prefix, .name = "standby replay outbox" },
+        };
+        for (queues) |queue| {
+            if (try readHasPrefix(&read, queue.prefix)) {
+                std.log.debug("topology blocked by transaction {s}", .{queue.name});
+                return true;
+            }
         }
 
         var cursor = try read.openCursor();
@@ -2065,7 +2073,10 @@ pub const TxnManager = struct {
             if (!std.mem.startsWith(u8, record_entry.key, records_prefix)) break;
             if (record_entry.key.len == records_prefix.len + 16) {
                 const record = try decodeRecord(record_entry.value);
-                if (record.status == .pending) return true;
+                if (record.status == .pending) {
+                    std.log.debug("topology blocked by a pending transaction decision", .{});
+                    return true;
+                }
 
                 const txn_id = record_entry.key[records_prefix.len..][0..16].*;
                 const participant_key = makeSidecarKey(participants_prefix, txn_id);
@@ -2081,8 +2092,14 @@ pub const TxnManager = struct {
                         const members = try resolvedParticipantsInRead(self.alloc, &read, txn_id);
                         defer freeParticipantList(self.alloc, members);
                         if (members.len > indexed.enlisted) return error.InvalidTxnRecord;
-                        if (members.len != indexed.enlisted) return true;
-                    } else if (indexed.resolved != indexed.enlisted) return true;
+                        if (members.len != indexed.enlisted) {
+                            std.log.debug("topology blocked by unresolved transaction participants", .{});
+                            return true;
+                        }
+                    } else if (indexed.resolved != indexed.enlisted) {
+                        std.log.debug("topology blocked by unresolved transaction participants", .{});
+                        return true;
+                    }
                     entry = try cursor.next();
                     continue;
                 } else |err| if (err != error.NotFound) return err;
@@ -2092,7 +2109,10 @@ pub const TxnManager = struct {
                 // markParticipantResolved only appends unique, enlisted members,
                 // so equal validated counts prove that the participant set is
                 // fully acknowledged without allocating or comparing strings.
-                if (resolved_count != participant_count) return true;
+                if (resolved_count != participant_count) {
+                    std.log.debug("topology blocked by unresolved transaction participants", .{});
+                    return true;
+                }
             }
             entry = try cursor.next();
         }

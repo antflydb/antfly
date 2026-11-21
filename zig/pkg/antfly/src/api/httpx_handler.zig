@@ -3928,6 +3928,7 @@ pub const AntflyApiHandler = struct {
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
             error.TransitionOperationBusy,
+            error.TransactionTopologyBusy,
             error.SplitSourceProjectionNotReady,
             error.SplitSourceProjectionAdvanced,
             error.DurableRootIncarnationUnavailable,

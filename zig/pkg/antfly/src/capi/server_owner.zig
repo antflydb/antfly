@@ -3246,7 +3246,7 @@ pub fn dataApplyStoreReconcileOwner(
     const expected = dataApplyExpectedBatch(request.expected) catch return .invalid_argument;
     if (capture_handoff and expected == null) return .invalid_argument;
     if (owner.db.hasTopologySensitiveTransactions() catch |err| return storageOwnerStatusFromError(err))
-        return .busy;
+        return .transaction_topology_busy;
     const root_incarnation = owner.db.durableRootIncarnation() catch |err|
         return storageOwnerStatusFromError(err);
     const alloc = apply_handle.alloc;
@@ -3565,7 +3565,7 @@ pub fn storageOwnerLocalTransition(
         (secondary.db.hasTopologySensitiveTransactions() catch |err|
             return storageOwnerStatusFromError(err)))
     {
-        return .busy;
+        return .transaction_topology_busy;
     }
     const primary_path = primary.storage_owner_path.?;
     const secondary_path = secondary.storage_owner_path.?;

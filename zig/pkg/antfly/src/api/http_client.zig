@@ -4765,7 +4765,7 @@ pub const ApiHttpClient = struct {
             408, 504 => return error.TimedOut,
             409 => return remoteGroupConflictError(resp.body),
             503 => {
-                inline for (.{ error.TransitionOperationBusy, error.SplitSourceProjectionNotReady, error.SplitSourceProjectionAdvanced, error.DurableRootIncarnationUnavailable }) |retry| {
+                inline for (.{ error.TransitionOperationBusy, error.TransactionTopologyBusy, error.SplitSourceProjectionNotReady, error.SplitSourceProjectionAdvanced, error.DurableRootIncarnationUnavailable }) |retry| {
                     if (std.mem.eql(u8, resp.body, @errorName(retry))) return retry;
                 }
                 return error.GroupLeaderUnavailable;
