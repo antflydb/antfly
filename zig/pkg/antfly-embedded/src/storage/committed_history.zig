@@ -53,6 +53,22 @@ pub const SplitCut = struct {
         return cut;
     }
 
+    pub const Request = struct {
+        namespace: frame.Namespace,
+        transition: u64,
+        attempt: u64,
+        successor_group: u64,
+        root_generation: u64,
+        boundary: [32]u8,
+
+        pub fn matches(self: Request, cut: SplitCut) bool {
+            return std.mem.eql(u8, &self.namespace, &cut.namespace) and
+                self.transition == cut.transition and self.attempt == cut.attempt and
+                self.successor_group == cut.successor_group and self.root_generation == cut.root_generation and
+                std.mem.eql(u8, &self.boundary, &cut.boundary);
+        }
+    };
+
     pub const encoded_size = 164;
     namespace: frame.Namespace,
     transition: u64,

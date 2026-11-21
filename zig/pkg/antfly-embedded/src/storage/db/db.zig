@@ -27344,6 +27344,29 @@ pub const DB = struct {
         return self.historyPageForAuthority(allocator, request, .raft, minimum_applied_index);
     }
 
+    const SplitHistoryCut = @import("../committed_history.zig").SplitCut;
+
+    /// Observe the split cut using the predecessor's frozen Raft ReadIndex.
+    /// A missing cut at that barrier is distinct from an invalid proof.
+    pub fn orderedSplitHistoryCut(self: *DB, request: SplitHistoryCut.Request, minimum_applied_index: u64) !?SplitHistoryCut {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedSplitHistoryCut", .{ self, request, minimum_applied_index });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (minimum_applied_index == 0 or request.transition == 0 or request.attempt == 0 or request.successor_group == 0)
+            return error.InvalidHistoryAdmission;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.namespace) or request.root_generation != self.core.root_generation)
+            return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        const applied = try orderedHistoryReadCut(&txn, minimum_applied_index);
+        const cut = (try SplitHistoryCut.load(&txn, request.transition, request.attempt)) orelse return null;
+        if (!request.matches(cut)) return error.HistoryResynchronizationRequired;
+        if (cut.index > applied.index or cut.term > applied.term) return error.HistoryCorrupt;
+        return cut;
+    }
+
     /// The Raft owner supplies a frozen ReadIndex. Standalone readers use the
     /// same namespace and physical generation checks without a Raft barrier.
     pub fn artifactPublicationHistory(self: *DB, allocator: Allocator, request: @import("artifact_publication.zig").HistoryRead, minimum_applied_index: ?u64) !@import("artifact_publication.zig").HistoryObservation {
@@ -162364,6 +162387,19 @@ test "db split finalization records the predecessor committed history frontier t
     try db.applyRangeFinalization(split, entry, null, null);
     try std.testing.expectEqualStrings("doc:g", db.getRange().end);
     try std.testing.expectEqual(second_entry, (try db.orderedApplyReceipt()).?);
+    var request: history.SplitCut.Request = .{
+        .namespace = namespace,
+        .transition = split.transition_id,
+        .attempt = split.attempt_epoch,
+        .successor_group = split.destination_group_id,
+        .root_generation = db.core.root_generation,
+        .boundary = history.frame.digest(split.split_key),
+    };
+    const routed = (try db.orderedSplitHistoryCut(request, second_entry.index)).?;
+    try std.testing.expectEqual(entry.index, routed.index);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedSplitHistoryCut(request, second_entry.index + 1));
+    request.successor_group += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedSplitHistoryCut(request, second_entry.index));
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     const cut = (try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch)).?;

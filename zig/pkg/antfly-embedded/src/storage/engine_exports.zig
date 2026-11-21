@@ -1271,6 +1271,12 @@ fn orderedHistoryOutcome(self: *DB, allocator: std.mem.Allocator, recovery: @imp
 fn historyBootstrapPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").BootstrapRequest, minimum_applied_index: ?u64) engine.Outcome(@import("history_page.zig").BootstrapPage) {
     return .{ .value = self.historyBootstrapPage(allocator, request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+const SplitHistoryCut = @import("committed_history.zig").SplitCut;
+
+fn orderedSplitHistoryCut(self: *DB, request: SplitHistoryCut.Request, minimum_applied_index: u64) engine.Outcome(?SplitHistoryCut) {
+    return .{ .value = self.orderedSplitHistoryCut(request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn orderedHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request, minimum_applied_index: u64) engine.Outcome(@import("history_page.zig").Page) {
     return .{ .value = self.orderedHistoryPage(allocator, request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

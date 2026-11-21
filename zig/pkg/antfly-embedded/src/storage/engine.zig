@@ -581,6 +581,7 @@ pub const VTable = struct {
     provisionNativeHistoryAuthority: *const fn (self: *DB, expected_namespace: [24]u8) Outcome(void),
     applyOrderedHistoryConsumerControl: *const fn (*DB, @import("history_consumer.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("history_ordered.zig").Outcome),
     historyBootstrapPage: *const fn (*DB, std.mem.Allocator, @import("history_page.zig").BootstrapRequest, ?u64) Outcome(@import("history_page.zig").BootstrapPage),
+    orderedSplitHistoryCut: *const fn (*DB, @import("committed_history.zig").SplitCut.Request, u64) Outcome(?@import("committed_history.zig").SplitCut),
     orderedHistoryPage: *const fn (*DB, std.mem.Allocator, @import("history_page.zig").Request, u64) Outcome(@import("history_page.zig").Page),
     orderedHistoryOutcome: *const fn (*DB, std.mem.Allocator, @import("history_ordered.zig").Lookup) Outcome(@import("history_ordered.zig").Outcome),
     nativeHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity) Outcome(@import("history_consumer.zig").GrantObservation),
