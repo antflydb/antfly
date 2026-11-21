@@ -617,9 +617,9 @@ test "CUDA encoder graph refresh preserves physical banks across logical source 
                 },
                 .capture => {
                     try @This().capture(context, m, arena, program);
-                    try context.launchGraph(arena.graph);
+                    try arena.launch(context);
                 },
-                .replay => try context.launchGraph(arena.graph),
+                .replay => try arena.launch(context),
             }
             noteAttentionSource(arena, source, config, .{}, .{});
             arena.noteUse(context);
@@ -701,6 +701,24 @@ test "CUDA encoder graph refresh preserves physical banks across logical source 
     // Actual original mask policy changes invalidate topology before dispatch.
     try prepareAttentionSource(entry, &ctx, .{ .sequence = 178, .all_valid = false, .mask_kind = 1 }, config, .{}, .{});
     try std.testing.expect(entry.graph == null and !entry.warm);
+
+    const Failure = struct {
+        fn launch(_: driver.CUgraphExec, _: driver.CUstream) callconv(.c) driver.CUresult {
+            return 1;
+        }
+    };
+    try Fixture.capture(&ctx, &module, entry, next);
+    {
+        const launch = ctx.driver.fns.cuGraphLaunch;
+        ctx.driver.fns.cuGraphLaunch = Failure.launch;
+        defer ctx.driver.fns.cuGraphLaunch = launch;
+        @import("../test_error_logs.zig").expectErrorLogs(1);
+        try std.testing.expectError(error.CudaDriverError, entry.launch(&ctx));
+    }
+    try std.testing.expect(entry.graph == null and !entry.warm and entry.disabled);
+    for (entry.buffers, pointers) |bank, pointer| try std.testing.expectEqual(pointer, bank.ptr);
+    try std.testing.expectEqual(before.allocations, ctx.device_allocations.snapshot().allocations);
+    try std.testing.expectEqual(before.frees, ctx.device_allocations.snapshot().frees);
 }
 
 test "encoder retained logical metadata rejects topology changes without borrowing configuration" {

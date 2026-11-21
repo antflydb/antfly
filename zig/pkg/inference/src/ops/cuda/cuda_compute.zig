@@ -8352,7 +8352,7 @@ pub const CudaCompute = struct {
             if (entry.graph != null) {
                 const replay = graph_action == .replay;
                 if (replay) {
-                    try self.ctx.launchGraph(entry.graph);
+                    try entry.launch(&self.ctx);
                     self.stats.cuda_graph_capture_replays += 1;
                 } else try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
                 replay_sample = replay;
@@ -8378,7 +8378,7 @@ pub const CudaCompute = struct {
                     break :capture;
                 };
                 self.stats.cuda_graph_capture_instantiates += 1;
-                try self.ctx.launchGraph(entry.graph);
+                try entry.launch(&self.ctx);
             } else {
                 try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
                 entry.warm = true;
@@ -20036,7 +20036,10 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
 
     var profile_scope = beginDecodeProfile(self, .graph_replay, 1);
     defer if (profile_scope) |*scope| scope.end();
-    try self.ctx.launchGraph(exec);
+    self.ctx.launchGraph(exec) catch |err| {
+        resetCudaGraphReplaySlotMetadata(self, slot);
+        return err;
+    };
     self.debug_cuda_graph_prepared_output_kind = .tensor;
     try noteCapturedTempAllocationsReplayed(self, slot.captured_temp_allocation_count);
     if (slot.decode_scalars_auto_advance) markDecodeScalarsDeviceMatchesHost(self);
@@ -20137,7 +20140,10 @@ fn debugCudaGraphReplayFinalHiddenDiscard(ctx: *anyopaque, input: CT) !bool {
 
     var profile_scope = beginDecodeProfile(self, .graph_replay, 1);
     defer if (profile_scope) |*scope| scope.end();
-    try self.ctx.launchGraph(exec);
+    self.ctx.launchGraph(exec) catch |err| {
+        resetCudaGraphReplaySlotMetadata(self, slot);
+        return err;
+    };
     self.debug_cuda_graph_prepared_output_kind = .tensor;
     try noteCapturedTempAllocationsReplayed(self, slot.captured_temp_allocation_count);
     if (slot.decode_scalars_auto_advance) markDecodeScalarsDeviceMatchesHost(self);
@@ -20159,7 +20165,10 @@ fn replayCapturedDebugGraphOneShot(self: *CudaCompute, graph: driver_mod.CUgraph
     var exec = try self.ctx.instantiateGraph(graph);
     defer self.ctx.destroyGraphExecChecked(&exec) catch platform.inference_process_supervisor.restartWorker();
     self.stats.cuda_graph_capture_instantiates += 1;
-    try self.ctx.launchGraph(exec);
+    self.ctx.launchGraph(exec) catch |err| {
+        self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+        return err;
+    };
     self.stats.cuda_graph_capture_replays += 1;
     if (cudaDebugGraphCaptureProbeTraceEnabled()) {
         std.log.info("cuda_graph_capture_probe: replayed", .{});
@@ -20600,7 +20609,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const capture_sample = arena.graph == null;
     const replay = arena.graph != null and arena.preferReplay();
     if (replay) {
-        try self.ctx.launchGraph(arena.graph);
+        try arena.launch(&self.ctx);
         self.audio_graph_replays += 1;
     } else {
         // Subsampling has recreated the ordinary source-linear bank in this
@@ -20644,7 +20653,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
                 entry.disabled = true;
                 return null;
             };
-            try self.ctx.launchGraph(arena.graph);
+            try arena.launch(&self.ctx);
         }
     }
     self.audio_arena_executes += 1;
@@ -30093,7 +30102,7 @@ fn runEmbeddingGemma2VisionTowerImpl(ctx: *anyopaque, input_ct: CT, logical_sequ
             entry.warm = false;
         }
         if (entry.graph != null) {
-            try self.ctx.launchGraph(entry.graph);
+            try entry.launch(&self.ctx);
             self.embedding_gemma2_vision_graph_replays += 1;
         } else if (entry.warm and !entry.disabled and (try run.captureReady())) capture: {
             self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED) catch {
@@ -30113,7 +30122,7 @@ fn runEmbeddingGemma2VisionTowerImpl(ctx: *anyopaque, input_ct: CT, logical_sequ
                 try run.execute();
                 break :capture;
             };
-            try self.ctx.launchGraph(entry.graph);
+            try entry.launch(&self.ctx);
             self.embedding_gemma2_vision_graph_replays += 1;
         } else {
             try run.execute();
