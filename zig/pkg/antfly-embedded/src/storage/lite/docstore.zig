@@ -3185,6 +3185,8 @@ pub const Store = struct {
     /// publish a checkpoint on `file` while any commit is suspended there
     /// -- see `lockStoreExclusive`.
     commit_in_sync: usize = 0,
+    exclusive_wait_epoch: std.atomic.Value(u32) = .init(0),
+    exclusive_parked: u32 = 0,
     /// Count of callers currently blocked in `lockStoreExclusive`'s wait
     /// loop. `releaseStoreMutexForSync` checks this before releasing: once
     /// non-zero, a new group's own sync no longer overlaps another's --
@@ -6917,6 +6919,10 @@ pub const Store = struct {
         self.mutex.lock();
         std.debug.assert(self.commit_in_sync > 0);
         self.commit_in_sync -= 1;
+        if (self.commit_in_sync == 0 and self.exclusive_parked != 0) {
+            _ = self.exclusive_wait_epoch.fetchAdd(1, .release);
+            self.file.runtime().futexWake(u32, &self.exclusive_wait_epoch.raw, self.exclusive_parked);
+        }
     }
 
     fn writerSlotAvailable(self: *Store) bool {
@@ -9793,9 +9799,13 @@ fn lockStoreExclusive(store: *Store) void {
     defer _ = store.exclusive_waiting.fetchSub(1, .monotonic);
     store.mutex.lock();
     while (store.commit_in_sync != 0) {
+        const observed_epoch = store.exclusive_wait_epoch.load(.acquire);
+        const io = store.file.runtime();
+        store.exclusive_parked += 1;
         store.mutex.unlock();
-        antfly_platform.time.yieldNow();
+        io.futexWaitUncancelable(u32, &store.exclusive_wait_epoch.raw, observed_epoch);
         store.mutex.lock();
+        store.exclusive_parked -= 1;
     }
 }
 
@@ -10550,6 +10560,7 @@ test "lite overlay probe lends the Store mutex even with an exclusive waiter" {
     var store: Store = undefined;
     store.mutex = .{};
     store.commit_in_sync = 0;
+    store.exclusive_parked = 0;
     store.exclusive_waiting = .init(1);
     var gate: Store.SyncExclusiveGate = .{ .store = &store };
     store.mutex.lock();
@@ -10563,6 +10574,51 @@ test "lite overlay probe lends the Store mutex even with an exclusive waiter" {
     Store.reacquireStoreMutexAfterSync(&gate);
     try std.testing.expectEqual(@as(usize, 0), store.commit_in_sync);
     store.mutex.unlock();
+}
+
+test "lite exclusive waiter parks until the released overlay probe finishes" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "native-docstore-probe-wait.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .no_sync = true });
+    defer store.close();
+
+    const Exclusive = struct {
+        fn run(owner: *Store, completed: *std.atomic.Value(bool)) void {
+            lockStoreExclusive(owner);
+            defer owner.mutex.unlock();
+            completed.store(true, .release);
+        }
+    };
+    var completed: std.atomic.Value(bool) = .init(false);
+    var gate: Store.SyncExclusiveGate = .{ .store = &store };
+    store.mutex.lock();
+    Store.releaseStoreMutexForOverlayProbe(&gate);
+    const thread = std.Thread.spawn(.{}, Exclusive.run, .{ &store, &completed }) catch |err| {
+        Store.reacquireStoreMutexAfterSync(&gate);
+        store.mutex.unlock();
+        return err;
+    };
+
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s;
+    var parked = false;
+    while (std.Io.Clock.awake.now(io).nanoseconds < deadline) {
+        store.mutex.lock();
+        parked = store.exclusive_parked != 0;
+        store.mutex.unlock();
+        if (parked) break;
+        antfly_platform.time.yieldNow();
+    }
+    const completed_early = completed.load(.acquire);
+    Store.reacquireStoreMutexAfterSync(&gate);
+    store.mutex.unlock();
+    thread.join();
+    try std.testing.expect(parked);
+    try std.testing.expect(!completed_early);
+    try std.testing.expect(completed.load(.acquire));
 }
 
 test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
