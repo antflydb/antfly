@@ -5180,6 +5180,31 @@ pub const IndexWriter = struct {
         return try delete_infos.toOwnedSlice(alloc);
     }
 
+    /// Sets committed tombstones on this writer's copy of `seg_id`, if it is
+    /// loaded. Used once a write's deletes are durable: queries never see a
+    /// delete before it is.
+    pub fn applyCommittedDeletes(self: *IndexWriter, seg_id: u64, local_ids: []const u32) !void {
+        self.lockMutex();
+        defer self.mu.unlock();
+        const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        for (snap.segments) |*seg| {
+            if (seg.id != seg_id) continue;
+            seg.shared.lockDeletionExclusive();
+            defer seg.shared.unlockDeletionExclusive();
+            if (seg.shared.deleted == null) seg.shared.deleted = roaring.RoaringBitmap.init(self.alloc);
+            var added: u32 = 0;
+            for (local_ids) |local_id| {
+                if (local_id >= seg.reader.doc_count) continue;
+                if (seg.shared.deleted.?.contains(local_id)) continue;
+                try seg.shared.deleted.?.add(local_id);
+                updateMissingLiveCountsForDeletedDocs(seg.shared, &.{local_id}, true);
+                added += 1;
+            }
+            _ = seg.shared.deleted_count.fetchAdd(added, .acq_rel);
+            return;
+        }
+    }
+
     /// Update a document by its external ID: deletes the old version and indexes the new one.
     pub fn updateById(self: *IndexWriter, doc_id: []const u8, segment_bytes: []const u8) !void {
         _ = try self.deleteById(doc_id);

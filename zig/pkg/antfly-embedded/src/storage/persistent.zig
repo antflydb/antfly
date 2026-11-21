@@ -919,6 +919,10 @@ pub const PreparedMergeSegment = struct {
 const meta_committed_lsn = "committed_lsn";
 const meta_rebuild_cursor = "rebuild_snapshot_cursor";
 const meta_next_seg_id = "next_seg_id";
+/// Present (value `text_storage_format_doc_map`) once the doc map names every
+/// live document; see `upgradeDocMapLocked`.
+const meta_text_storage_format = "text_storage_format";
+const text_storage_format_doc_map: u32 = 1;
 const meta_active_segments = "active_segments";
 const meta_active_segment_prefix = "active_segment:";
 const meta_retired_segment_prefix = "retired_segment:";
@@ -1141,6 +1145,10 @@ pub const PersistentIndex = struct {
     main_map_size: usize,
     wal_map_size: usize,
     read_only: bool = false,
+    /// The doc map names every live document (the index was upgraded or
+    /// created with it), so a write may find old versions there instead of
+    /// scanning. See docs/design/lite-performance/lite-full-text-storage.md.
+    doc_map_complete: bool = false,
 
     /// A private candidate publishes all segments produced by one source page
     /// together with its cursor. Until commit they are unreachable orphan files
@@ -1841,6 +1849,7 @@ pub const PersistentIndex = struct {
         if (!opts.read_only) {
             try pi.pruneActiveSegmentsMissingRangesOrDataLocked(path_span);
         }
+        if (pi.keepsDocMap()) try pi.upgradeDocMapLocked();
 
         if (pi.segment_files) |*store| {
             pi.retired_segment_file_deleter = try RetiredSegmentFileDeleter.init(alloc, store);
@@ -2425,6 +2434,49 @@ pub const PersistentIndex = struct {
             .writer_publication = writer_publication,
             .doc_map_arena = doc_map_arena,
             .doc_map_puts = doc_map_puts.items,
+        };
+    }
+
+    /// Moves an unpublished inline segment to `seg_id` (another writer took
+    /// the id it was prepared with): re-prepares its writer publication and
+    /// rewrites its keys and doc map values.
+    pub fn rebaseInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication, seg_id: u64) !void {
+        if (publication.seg_id == seg_id) return;
+        publication.writer_publication.abort();
+        self.writer.lockMutex();
+        if (self.writer.next_segment_id <= seg_id) self.writer.next_segment_id = seg_id + 1;
+        self.writer.mu.unlock();
+        const segment_data = index_mod.SegmentData.fromOwnedHeap(publication.segment_bytes);
+        var replacement = [_]index_mod.ReplacementSegmentData{.{ .id = seg_id, .data = segment_data }};
+        publication.writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
+        publication.seg_id = seg_id;
+        publication.seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
+        publication.range_key = segmentRangeMetaKey(seg_id);
+        publication.active_key = activeSegmentMetaKey(seg_id);
+        for (publication.doc_map_puts) |put| {
+            const value: []u8 = @constCast(put.value);
+            std.mem.writeInt(u64, value[0..8], seg_id, .big);
+        }
+    }
+
+    /// The committed counter value for a publication of `count` segments
+    /// starting at `first`.
+    pub fn nextSegmentIdValue(first: u64, count: u64) [8]u8 {
+        return std.mem.toBytes(std.mem.nativeToLittle(u64, first + count));
+    }
+
+    pub fn decodeNextSegmentId(bytes: []const u8) !u64 {
+        if (bytes.len != 8) return error.InvalidSegmentCounter;
+        return std.mem.littleToNative(u64, std.mem.bytesToValue(u64, bytes[0..8]));
+    }
+
+    pub const next_segment_id_key = meta_next_seg_id;
+
+    /// Applies committed tombstones to this process's loaded copy of
+    /// `seg_id` (a segment it has not loaded is refreshed from the file).
+    pub fn applyCommittedDeletes(self: *PersistentIndex, seg_id: u64, local_ids: []const u32) void {
+        self.writer.applyCommittedDeletes(seg_id, local_ids) catch |err| {
+            std.log.err("full-text committed deletes could not be applied in memory seg={d} err={s}", .{ seg_id, @errorName(err) });
         };
     }
 
@@ -4138,6 +4190,107 @@ pub const PersistentIndex = struct {
         };
     }
 
+    /// Builds the doc map of an index written before it existed, in one
+    /// commit: every live document of the active segments, the newest copy
+    /// winning a key stored in several (older live copies are tombstoned, as
+    /// a delete of that key would have), the segment counter, and the format
+    /// marker. A read-only open only learns whether the marker is there.
+    fn upgradeDocMapLocked(self: *PersistentIndex) !void {
+        {
+            var probe = try self.beginReadMainTxn();
+            defer probe.abort();
+            const raw = probe.get(.meta, meta_text_storage_format) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (raw) |bytes| if (bytes.len == 4 and std.mem.readInt(u32, bytes[0..4], .little) == text_storage_format_doc_map) {
+                self.doc_map_complete = true;
+                return;
+            };
+        }
+        if (self.read_only) return;
+
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const snap = self.writer.acquireSnapshot();
+        defer snap.release();
+
+        const order = try a.alloc(usize, snap.segments.len);
+        for (order, 0..) |*slot, i| slot.* = i;
+        const ById = struct {
+            fn less(segments: []const index_mod.SegmentEntry, lhs: usize, rhs: usize) bool {
+                return segments[lhs].id < segments[rhs].id;
+            }
+        };
+        std.mem.sort(usize, order, snap.segments, ById.less);
+
+        var locations = std.StringHashMapUnmanaged(DocLocation).empty;
+        var superseded = std.AutoArrayHashMapUnmanaged(u64, std.ArrayListUnmanaged(u32)).empty;
+        for (order) |i| {
+            const seg = &snap.segments[i];
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            var local: u32 = 0;
+            while (local < seg.reader.doc_count) : (local += 1) {
+                if (seg.shared.deleted) |deleted| if (deleted.contains(local)) continue;
+                const key = (try seg.reader.storedIdAlloc(a, local)) orelse continue;
+                const here: DocLocation = .{ .seg_id = seg.id, .local_id = local };
+                if (try locations.fetchPut(a, key, here)) |earlier| {
+                    const list = try superseded.getOrPut(a, earlier.value.seg_id);
+                    if (!list.found_existing) list.value_ptr.* = .empty;
+                    try list.value_ptr.append(a, earlier.value.local_id);
+                }
+            }
+        }
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        var it = locations.iterator();
+        // Only missing entries: one already there was written by a writer
+        // that keeps the doc map, at or after this snapshot.
+        while (it.next()) |entry| {
+            _ = txn.get(.docmap, entry.key_ptr.*) catch |err| switch (err) {
+                error.NotFound => {
+                    try txn.put(.docmap, entry.key_ptr.*, &entry.value_ptr.encode());
+                    continue;
+                },
+                else => return err,
+            };
+        }
+        var installs = std.ArrayListUnmanaged(struct { u64, roaring.RoaringBitmap }).empty;
+        defer for (installs.items) |*install| install[1].deinit();
+        var superseded_it = superseded.iterator();
+        while (superseded_it.next()) |entry| {
+            const seg_id = entry.key_ptr.*;
+            var bitmap = roaring.RoaringBitmap.init(self.alloc);
+            errdefer bitmap.deinit();
+            for (snap.segments) |*seg| if (seg.id == seg_id) {
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                if (seg.shared.deleted) |deleted| {
+                    var bits = deleted.iterator();
+                    while (bits.next()) |bit| try bitmap.add(bit);
+                }
+            };
+            for (entry.value_ptr.items) |local| try bitmap.add(local);
+            const bytes = try bitmap.toBytes(a);
+            const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
+            try txn.put(.deletions, &seg_key, bytes);
+            try installs.append(a, .{ seg_id, bitmap });
+        }
+        try saveNextSegmentId(&txn, self.writer.next_segment_id);
+        var format: [4]u8 = undefined;
+        std.mem.writeInt(u32, &format, text_storage_format_doc_map, .little);
+        try txn.put(.meta, meta_text_storage_format, &format);
+        try txn.commit();
+        for (installs.items) |*install| {
+            self.writer.setDeletionBitmap(install[0], install[1]);
+            install[1] = roaring.RoaringBitmap.init(self.alloc);
+        }
+        self.doc_map_complete = true;
+    }
+
     fn saveNextSegmentId(txn: *MainTxn, next_segment_id: u64) !void {
         const next_segment_id_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, next_segment_id));
         try txn.put(.meta, meta_next_seg_id, &next_segment_id_bytes);
@@ -4394,7 +4547,7 @@ fn segmentRangeMetaKey(seg_id: u64) [meta_segment_range_prefix.len + 8]u8 {
     return key;
 }
 
-fn activeSegmentMetaKey(seg_id: u64) [meta_active_segment_prefix.len + 8]u8 {
+pub fn activeSegmentMetaKey(seg_id: u64) [meta_active_segment_prefix.len + 8]u8 {
     var key: [meta_active_segment_prefix.len + 8]u8 = undefined;
     @memcpy(key[0..meta_active_segment_prefix.len], meta_active_segment_prefix);
     key[meta_active_segment_prefix.len..][0..8].* = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
