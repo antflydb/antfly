@@ -236,7 +236,7 @@ pub const StreamOwner = struct {
                 .changes = &.{},
             });
             const bootstrap = try bootstrapIdentity(a, source, epoch, request.checkpoint, identity.key_columns);
-            retireBootstrapStage(a, bound.binding, options, context, bootstrap);
+            try removeBootstrapStage(a, bound.binding, options, context, bootstrap);
             try context.ensureActive();
             return .committed;
         }
@@ -305,23 +305,37 @@ fn removeBootstrapStage(a: A, binding: Binding, options: Options, context: Conte
     const base = try prefix(a, opened.prefix, binding, options);
     const stage = try bootstrapStageKey(a, base, batch);
     const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
-    var client = opened.client;
+    const pages_prefix = try std.fmt.allocPrint(a, "{s}.pages/", .{stage});
     const cancellation = catalog.types.contextCancellation(&context);
-    var root = client.getObject(opened.bucket, manifest, .{ .max_response_bytes = max_bootstrap_manifest_bytes, .cancellation = cancellation }) catch |err| switch (err) {
-        error.NotFound, error.ObjectNotFound, error.FileNotFound => {
+    var client = opened.client;
+    // Catalog commitment retires the entire exact cut. Pages omitted from
+    // the sealed manifest can still exist after an interrupted capture.
+    // Re-list the front of the prefix after deletion so retries need no
+    // continuation token for an inventory that is being mutated.
+    for (0..16) |_| {
+        try context.ensureActive();
+        var page = try client.listObjects(opened.bucket, .{
+            .prefix = pages_prefix,
+            .recursive = true,
+            .max_keys = 128,
+            .cancellation = cancellation,
+        });
+        defer page.deinit(client.allocator);
+        for (page.entries) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, pages_prefix)) return error.InvalidReplicationCheckpoint;
+            const suffix = entry.key[pages_prefix.len..];
+            var digest: [32]u8 = undefined;
+            if (suffix.len != digest.len * 2) return error.InvalidReplicationCheckpoint;
+            _ = std.fmt.hexToBytes(&digest, suffix) catch return error.InvalidReplicationCheckpoint;
+            try removeBootstrapObject(&opened, context, entry.key);
+        }
+        if (page.next_continuation_token == null) {
             try removeBootstrapObject(&opened, context, stage);
+            try removeBootstrapObject(&opened, context, manifest);
             return;
-        },
-        else => return err,
-    };
-    defer root.deinit(client.allocator);
-    const pages = try std.json.parseFromSliceLeaky([]const [32]u8, a, root.body, .{});
-    if (pages.len > max_bootstrap_pages) return error.LakeWriteTooLarge;
-    for (pages) |digest| {
-        const page = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
-        try removeBootstrapObject(&opened, context, page);
+        }
     }
-    try removeBootstrapObject(&opened, context, manifest);
+    return error.LakeWriteTooLarge;
 }
 
 fn removeBootstrapObject(opened: *local.serverless_object_store_support.OpenedObjectStore, context: Context, key: []const u8) !void {
@@ -497,7 +511,7 @@ fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context:
     }
     const outcome = try applyBatch(a, binding, options, context, batch);
     if (record) |accepted| if (outcome.accepted_sequence != accepted.lsn) return error.LakeWalCoverageGap;
-    if (outcome.committed) retireBootstrapStage(a, binding, options, context, batch);
+    if (outcome.committed) try removeBootstrapStage(a, binding, options, context, batch);
     return outcome.committed;
 }
 
@@ -1386,6 +1400,10 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     const digest = try port.stage_snapshot_page.?(port.ptr, alloc, snapshot);
     try std.testing.expectEqual(digest, try port.stage_snapshot_page.?(port.ptr, alloc, snapshot));
+    var interrupted = snapshot;
+    interrupted.snapshot_rows = &.{row};
+    const unsealed_digest = try port.stage_snapshot_page.?(port.ptr, alloc, interrupted);
+    try std.testing.expect(!std.mem.eql(u8, &digest, &unsealed_digest));
     try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     var seal = snapshot;
     seal.snapshot_rows = null;
@@ -1413,9 +1431,19 @@ test "external lake filesystem WAL applies the managed PostgreSQL stream owner p
     try std.testing.expectEqual(@as(u64, 0), try coverage(a, try managed.load(a)));
     staged_object = try queue.client.statObject(queue.bucket, staged_key);
     staged_object.deinit(queue.client.allocator);
+    // Inject a listing entry that the exact-cut collector cannot own.
+    const invalid_page = try std.fmt.allocPrint(a, "{s}.pages/invalid", .{stage});
+    var invalid = try queue.client.putObject(queue.bucket, invalid_page, "unowned", .{});
+    invalid.deinit(queue.client.allocator);
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    try std.testing.expectEqual(@as(u64, 1), try coverage(a, try managed.load(a)));
+    try removeBootstrapObject(&queue, .{}, invalid_page);
     try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    try std.testing.expectEqual(@as(u64, 1), try coverage(a, try managed.load(a)));
     try std.testing.expectError(error.FileNotFound, queue.client.statObject(queue.bucket, staged_key));
     try std.testing.expectError(error.FileNotFound, queue.client.statObject(queue.bucket, page_key));
+    const unsealed_page_key = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(unsealed_digest, .lower) });
+    try std.testing.expectError(error.FileNotFound, queue.client.statObject(queue.bucket, unsealed_page_key));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, snapshot));
     try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
     try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
