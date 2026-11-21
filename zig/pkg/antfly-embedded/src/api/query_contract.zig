@@ -1924,10 +1924,10 @@ fn parseAlgebraicVectorWorkerQueryAlloc(
     const k = try parseOptionalU32Json(value.object.get("k"), 10);
     if (std.mem.eql(u8, kind_value.string, "dense")) {
         if (layout != .dense_vector) return error.InvalidQueryRequest;
-        const revision = value.object.get("_model_revision");
+        const revision = if (value.object.get("_model_revision")) |raw| try parseEmbeddingRevisionFence(raw) else null;
         return .{ .dense = .{
             .vector = try parseF32JsonArrayAlloc(alloc, value.object.get("vector") orelse return error.InvalidQueryRequest),
-            .model_revision_fence = if (revision) |raw| try parseEmbeddingRevisionFence(raw) else null,
+            .model_revision_fence = revision,
             .k = k,
         } };
     }
@@ -2019,6 +2019,15 @@ fn parseF32JsonArrayAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]co
         if (!std.math.isFinite(out[i])) return error.InvalidQueryRequest;
     }
     return out;
+}
+
+test "api query contract algebraic vector worker rejects an invalid model revision without leaking its vector" {
+    const alloc = std.testing.allocator;
+    var input = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"kind":"dense","vector":[1,2,3],"_model_revision":"invalid"}
+    , .{});
+    defer input.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicVectorWorkerQueryAlloc(alloc, .dense_vector, input.value));
 }
 
 fn parseU32JsonArrayAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]const u32 {

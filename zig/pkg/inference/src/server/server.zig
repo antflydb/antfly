@@ -3607,12 +3607,15 @@ const ModelSelectionOptions = struct {
     reuse_resident: bool = false,
 };
 
+const ScopedCatalogCache = @import("scoped_catalog_cache.zig").Cache;
+
 const ScopedCatalogPublication = struct {
     path: []const u8,
     lease: PublicationLease,
     artifacts: PublishedArtifacts,
+    borrow: ScopedCatalogCache.Borrow,
 
-    fn open(a: std.mem.Allocator, io: std.Io, path: []const u8, publication: ?[32]u8, control: InferenceExecutionControl) !?ScopedCatalogPublication {
+    fn open(cache: *ScopedCatalogCache, owner: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, path: []const u8, publication: ?[32]u8, control: InferenceExecutionControl) !?ScopedCatalogPublication {
         try control.check();
         // Direct ONNX paths are not parsed by the directory/GGUF listing path.
         if (std.mem.endsWith(u8, path, ".onnx")) return null;
@@ -3621,8 +3624,8 @@ const ScopedCatalogPublication = struct {
         errdefer a.free(owned_path);
         var lease = try PublicationLease.shared(a, io, owned_path);
         errdefer lease.deinit(io);
-        const artifacts = try PublishedArtifacts.initWithControl(a, io, owned_path, .{ .publication = publication }, control);
-        return .{ .path = owned_path, .lease = lease, .artifacts = artifacts };
+        const borrow = try cache.acquire(owner, io, owned_path, publication.?, control);
+        return .{ .path = owned_path, .lease = lease, .borrow = borrow, .artifacts = borrow.view(a, io) };
     }
 
     fn resolveSelector(self: *const ScopedCatalogPublication, a: std.mem.Allocator, selector: []const u8) !?ResolvedModel {
@@ -3641,7 +3644,7 @@ const ScopedCatalogPublication = struct {
     fn deinit(self: *ScopedCatalogPublication) void {
         const a = self.artifacts.allocator;
         const io = self.artifacts.io;
-        self.artifacts.deinit();
+        self.borrow.release();
         self.lease.deinit(io);
         a.free(self.path);
     }
@@ -4637,6 +4640,7 @@ pub const Node = struct {
     model_manager: model_manager_mod.ModelManager,
     registry: registry_mod.ModelRegistry,
     selector_cache: ?*selection_mod.Cache = null,
+    scoped_catalog_cache: ScopedCatalogCache = .{},
     extraction_reader_resolver: extractors_mod.ReaderResolver,
     tabular_registry: tabular_mod.registry.Registry,
     embed_cache: cache_mod.ResultCache([]const f32),
@@ -4972,6 +4976,7 @@ pub const Node = struct {
             watchdog.destroy();
             self.hard_cancellation_watchdog = null;
         }
+        self.scoped_catalog_cache.deinit();
         if (self.selector_cache) |cache| {
             cache.deinit();
             self.allocator.destroy(cache);
@@ -27211,7 +27216,7 @@ pub const Node = struct {
             const candidate_result: manifest_mod.ListingCandidate = candidate: {
                 if (scoped_publication != null and listing_scope != null and std.mem.eql(u8, listing_scope.?.category, "embedders")) {
                     const scope = scoped_publication.?;
-                    scope.* = ScopedCatalogPublication.open(a, io, entry.path, inventory.publications[entry_index], control) catch |err| {
+                    scope.* = ScopedCatalogPublication.open(&self.scoped_catalog_cache, self.allocator, a, io, entry.path, inventory.publications[entry_index], control) catch |err| {
                         if (replica_probe) {
                             if (isPinnedCatalogArtifactFailure(err)) return err;
                             if (inventory.publications[entry_index] != null and (err == error.FileNotFound or err == error.NotDir))
@@ -51395,11 +51400,15 @@ test "scoped model discovery resolves dense geometry without loading weights" {
         const previous_loads = request_work_test_counters.scoped_execution_manifest_loads;
         var resident_request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fother&task=embed&model_revision_candidates=1");
         defer resident_request.deinit();
-        var resident_ctx = httpx.Context.init(a, io, &resident_request);
-        defer resident_ctx.deinit();
-        var resident_response = try node.listModels(&resident_ctx);
-        defer resident_response.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resident_response.status.code);
+        for (0..2) |attempt| {
+            ReceiptReads.count = 0;
+            var resident_ctx = httpx.Context.init(a, counted_io, &resident_request);
+            defer resident_ctx.deinit();
+            var resident_response = try node.listModels(&resident_ctx);
+            defer resident_response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), resident_response.status.code);
+            if (attempt != 0) try std.testing.expectEqual(@as(usize, 0), ReceiptReads.count);
+        }
         try std.testing.expectEqual(previous_loads, request_work_test_counters.scoped_execution_manifest_loads);
         try std.testing.expectEqual(@as(usize, 0), resident.active_handles);
         try std.testing.expectEqual(@as(u64, 17), resident.last_used_ns);
