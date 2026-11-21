@@ -3938,6 +3938,19 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     defer retained.abort();
     try std.testing.expectEqualStrings("\xff\x00", try retained.get(key));
     try std.testing.expectError(error.InvalidArgument, retained.get("outside-session-namespace"));
+    {
+        var raw_read: ?*anyopaque = null;
+        try std.testing.expectEqual(abi.Status.ok, abi.antfly_metadata_session_read_open(store.handle, &.{ .group_id = group }, &raw_read));
+        var raw_cursor: ?*anyopaque = null;
+        const opened = abi.antfly_metadata_session_cursor_open(raw_read, &raw_cursor);
+        abi.antfly_metadata_session_read_close(raw_read);
+        try std.testing.expectEqual(abi.Status.ok, opened);
+        defer abi.antfly_metadata_session_cursor_close(raw_cursor);
+        var output: abi.OwnedBytes = .{};
+        defer abi.antfly_storage_owner_buffer_destroy(&output);
+        try std.testing.expectEqual(abi.Status.ok, abi.antfly_metadata_session_cursor_invoke(raw_cursor, &.{ .operation = .seek_at_or_after, .key = .fromSlice(key), .length = 1 }, &output));
+        try std.testing.expectEqualStrings(key, output.slice()[4..]);
+    }
     const next = try records.encode(a, .{ .changes = &.{.{ .key = "receipt", .expected = "\xff\x00", .value = "\x80committed" }} });
     defer a.free(next);
     try store.applyStandaloneCommand(group, .{ .apply_transaction_sessions = next });

@@ -2154,51 +2154,63 @@ pub const DurableSessionStore = struct {
 
     /// Bounded compatibility audit for sessions written before the recovery
     /// index existed. Only `scan_limit` full records are decoded per call.
-    pub fn scanLegacyRecoveryIds(
+    const LegacyRecoveryPage = struct { ids: []db_mod.types.TxnId, next_after: ?[]u8 };
+
+    fn scanLegacyRecoveryIds(
         self: *DurableSessionStore,
         alloc: std.mem.Allocator,
-        after: ?db_mod.types.TxnId,
+        after: ?[]const u8,
         scan_limit: usize,
-    ) !RecoveryIdPage {
-        const start_key = if (after) |txn_id| try makeSessionKey(alloc, txn_id) else null;
-        defer if (start_key) |key| alloc.free(key);
+    ) !LegacyRecoveryPage {
         switch (self.backend) {
             .docstore => |store| {
                 var read = try store.beginReadTxn();
                 defer read.abort();
                 var cursor = try read.openPhysicalCursorAdapter();
                 defer cursor.close();
-                return scanLegacyRecoveryTxn(&read, &cursor, alloc, start_key, scan_limit);
+                return scanLegacyRecoveryTxn(&read, &cursor, alloc, after, scan_limit);
             },
             .runtime => |store| {
                 var read = try store.beginRead();
                 defer read.abort();
                 var cursor = try read.openCursor();
                 defer cursor.close();
-                return scanLegacyRecoveryTxn(&read, &cursor, alloc, start_key, scan_limit);
+                return scanLegacyRecoveryTxn(&read, &cursor, alloc, after, scan_limit);
             },
         }
     }
 
-    fn scanLegacyRecoveryTxn(read: anytype, cursor: *backend_erased.Cursor, alloc: std.mem.Allocator, start: ?[]const u8, limit: usize) !RecoveryIdPage {
+    fn scanLegacyRecoveryTxn(read: anytype, cursor: *backend_erased.Cursor, alloc: std.mem.Allocator, start: ?[]const u8, limit: usize) !LegacyRecoveryPage {
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         errdefer ids.deinit(alloc);
         if (limit == 0) return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = null };
         cursor.setKeysOnly();
         var scanned: usize = 0;
-        var last: ?db_mod.types.TxnId = null;
+        var last: ?[]u8 = null;
+        errdefer if (last) |key| alloc.free(key);
         var entry = try cursor.seekAtOrAfter(start orelse session_prefix);
         while (entry) |row| : (entry = if (scanned < limit) try cursor.next() else null) {
             if (!std.mem.startsWith(u8, row.key, session_prefix)) break;
             if (start) |key| if (std.mem.eql(u8, row.key, key)) continue;
-            const id = distributed_txn.parseTxnIdHex(row.key[session_prefix.len..]) catch continue;
-            last = id;
             scanned += 1;
+            if (scanned == limit) last = try alloc.dupe(u8, row.key);
+            const id = distributed_txn.parseTxnIdHex(row.key[session_prefix.len..]) catch continue;
             var scope = read.openReadScope(alloc) catch |err| {
                 std.log.warn("legacy transaction recovery read scope unavailable txn_id={x} err={s}", .{ id, @errorName(err) });
                 continue;
             };
             defer scope.close();
+            const recovery_key = try makeSessionRecoveryKey(alloc, id);
+            defer alloc.free(recovery_key);
+            if (scope.get(recovery_key)) |_| {
+                continue;
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => {
+                    std.log.warn("legacy transaction recovery index unreadable txn_id={x} err={s}", .{ id, @errorName(err) });
+                    continue;
+                },
+            }
             const raw = scope.get(row.key) catch |err| {
                 std.log.warn("legacy transaction recovery row unreadable txn_id={x} err={s}", .{ id, @errorName(err) });
                 continue;
@@ -2210,7 +2222,7 @@ pub const DurableSessionStore = struct {
             defer session.deinit(alloc);
             if (sessionNeedsRecovery(session)) try ids.append(alloc, id);
         }
-        return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = if (scanned == limit) last else null };
+        return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = last };
     }
 
     /// Rechecks the current durable row under a write transaction before
@@ -2227,40 +2239,36 @@ pub const DurableSessionStore = struct {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                if (txn.get(session_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                }) |raw| {
-                    var session = try decodeSessionRecord(self.alloc, txn_id, raw);
-                    defer session.deinit(self.alloc);
-                    try self.setSessionRecoveryIndexTxn(&txn, session);
-                } else {
-                    txn.delete(recovery_key) catch |err| switch (err) {
-                        error.NotFound => {},
-                        else => return err,
-                    };
-                }
-                try txn.commit();
+                if (try self.refreshRecoveryIndexTxn(&txn, txn_id, session_key, recovery_key)) try txn.commit() else txn.abort();
             },
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                if (txn.get(session_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                }) |raw| {
-                    var session = try decodeSessionRecord(self.alloc, txn_id, raw);
-                    defer session.deinit(self.alloc);
-                    try self.setSessionRecoveryIndexTxn(&txn, session);
-                } else {
-                    txn.delete(recovery_key) catch |err| switch (err) {
-                        error.NotFound => {},
-                        else => return err,
-                    };
-                }
-                try txn.commit();
+                if (try self.refreshRecoveryIndexTxn(&txn, txn_id, session_key, recovery_key)) try txn.commit() else txn.abort();
             },
         }
+    }
+
+    fn refreshRecoveryIndexTxn(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId, session_key: []const u8, recovery_key: []const u8) !bool {
+        const indexed = if (txn.get(recovery_key)) |_| true else |err| switch (err) {
+            error.NotFound => false,
+            else => return err,
+        };
+        const raw = txn.get(session_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const pending = if (raw) |value| pending: {
+            var session = try decodeSessionRecord(self.alloc, id, value);
+            defer session.deinit(self.alloc);
+            break :pending sessionNeedsRecovery(session);
+        } else false;
+        if (indexed == pending) return false;
+        // A replicated prefix read fences the observed receipt by the
+        // namespace epoch, so backfill can submit only the marker change.
+        _ = try txn.countPrefix(recovery_key);
+        if (pending) try txn.put(recovery_key, &.{}) else try txn.delete(recovery_key);
+        return true;
     }
 
     fn scanExpiredIds(self: *DurableSessionStore, alloc: std.mem.Allocator, after: ?ParsedSessionExpiryKey, cutoff_ns: u64, limit: usize) !struct { ids: []db_mod.types.TxnId, next_after: ?ParsedSessionExpiryKey } {
@@ -2288,22 +2296,41 @@ pub const DurableSessionStore = struct {
         return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = scan.next_after };
     }
 
-    fn listSessionIds(self: *DurableSessionStore, alloc: std.mem.Allocator) ![]db_mod.types.TxnId {
-        const Scan = struct {
-            alloc: std.mem.Allocator,
-            ids: std.ArrayList(db_mod.types.TxnId) = .empty,
+    fn listSessionIds(self: *DurableSessionStore, alloc: std.mem.Allocator, principal: ?[]const u8) ![]db_mod.types.TxnId {
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                var cursor = try txn.openPhysicalKeyCursorAdapter();
+                defer cursor.close();
+                return listPrincipalSessionIds(&txn, &cursor, alloc, principal);
+            },
+            .runtime => |store| {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                cursor.setKeysOnly();
+                return listPrincipalSessionIds(&txn, &cursor, alloc, principal);
+            },
+        }
+    }
 
-            fn visit(raw: *anyopaque, key: []const u8, _: []const u8) !bool {
-                const scan: *@This() = @ptrCast(@alignCast(raw));
-                const id = distributed_txn.parseTxnIdHex(key[session_prefix.len..]) catch return true;
-                try scan.ids.append(scan.alloc, id);
-                return true;
-            }
-        };
-        var scan: Scan = .{ .alloc = alloc };
-        errdefer scan.ids.deinit(alloc);
-        try self.scanPrefixFromWithContextMode(session_prefix, null, &scan, Scan.visit, true);
-        return scan.ids.toOwnedSlice(alloc);
+    fn listPrincipalSessionIds(txn: anytype, cursor: *backend_erased.Cursor, alloc: std.mem.Allocator, principal: ?[]const u8) ![]db_mod.types.TxnId {
+        var ids: std.ArrayList(db_mod.types.TxnId) = .empty;
+        errdefer ids.deinit(alloc);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(principal orelse "", &digest, .{});
+        var entry = try cursor.seekAtOrAfter(session_prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, session_prefix)) break;
+            const id = distributed_txn.parseTxnIdHex(row.key[session_prefix.len..]) catch continue;
+            var scope = try txn.openReadScope(alloc);
+            defer scope.close();
+            if (try sessionPrincipalCandidate(&scope, alloc, row.key, principal, &digest))
+                try ids.append(alloc, id);
+        }
+        return ids.toOwnedSlice(alloc);
     }
 
     pub fn scanPrefixWithContext(
@@ -2628,7 +2655,7 @@ pub const SessionRegistry = struct {
     reserved_session_count: usize = 0,
     expiry_cursor: ?ParsedSessionExpiryKey = null,
     recovery_index_cursor: ?db_mod.types.TxnId = null,
-    recovery_audit_cursor: ?db_mod.types.TxnId = null,
+    recovery_audit_cursor: ?[]u8 = null,
     memory_recovery_scan_offset: usize = 0,
 
     pub const CommitExecution = struct {
@@ -2690,6 +2717,7 @@ pub const SessionRegistry = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.sessions.deinit(alloc);
+        if (self.recovery_audit_cursor) |key| self.durable.?.alloc.free(key);
         self.* = .{};
     }
 
@@ -3882,8 +3910,13 @@ pub const SessionRegistry = struct {
         if (self.durable) |durable| {
             self.mutex.lock();
             const index_after = self.recovery_index_cursor;
-            const audit_after = self.recovery_audit_cursor;
+            const audit_after = if (self.recovery_audit_cursor) |key| alloc.dupe(u8, key) else null;
             self.mutex.unlock();
+            const audit_start = if (audit_after) |copy| copy catch |err| {
+                std.log.warn("legacy recovery continuation unavailable err={s}", .{@errorName(err)});
+                return self.indexedRecoveryOnly(alloc, index_after, limit);
+            } else null;
+            defer if (audit_start) |key| alloc.free(key);
 
             const indexed = try durable.scanRecoveryIds(alloc, index_after, limit);
             defer alloc.free(indexed.ids);
@@ -3897,11 +3930,15 @@ pub const SessionRegistry = struct {
             self.recovery_index_cursor = indexed.next_after;
             self.mutex.unlock();
 
-            const audited = durable.scanLegacyRecoveryIds(alloc, audit_after, audit_budget) catch |err| {
+            const audited = durable.scanLegacyRecoveryIds(durable.alloc, audit_start, audit_budget) catch |err| {
                 std.log.warn("legacy transaction recovery audit deferred err={s}", .{@errorName(err)});
                 return pending.toOwnedSlice(alloc);
             };
-            defer alloc.free(audited.ids);
+            defer durable.alloc.free(audited.ids);
+            var cursor_transferred = false;
+            defer if (!cursor_transferred) {
+                if (audited.next_after) |key| durable.alloc.free(key);
+            };
             for (audited.ids) |txn_id| {
                 durable.refreshRecoveryIndex(txn_id) catch |err| {
                     std.log.warn("legacy transaction recovery index backfill deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
@@ -3918,7 +3955,9 @@ pub const SessionRegistry = struct {
             }
 
             self.mutex.lock();
+            if (self.recovery_audit_cursor) |key| durable.alloc.free(key);
             self.recovery_audit_cursor = audited.next_after;
+            cursor_transferred = true;
             self.mutex.unlock();
         } else {
             self.mutex.lock();
@@ -3948,6 +3987,14 @@ pub const SessionRegistry = struct {
             self.memory_recovery_scan_offset = if (exhausted) 0 else scan_offset +| scanned;
         }
         return try pending.toOwnedSlice(alloc);
+    }
+
+    fn indexedRecoveryOnly(self: *SessionRegistry, alloc: std.mem.Allocator, after: ?db_mod.types.TxnId, limit: usize) ![]db_mod.types.TxnId {
+        const indexed = try self.durable.?.scanRecoveryIds(alloc, after, limit);
+        self.mutex.lock();
+        self.recovery_index_cursor = indexed.next_after;
+        self.mutex.unlock();
+        return indexed.ids;
     }
 
     /// Claims indexed work under the session lease and returns a stable clone
@@ -4276,14 +4323,17 @@ pub const SessionRegistry = struct {
         return details;
     }
 
-    pub fn listSessionIds(self: *SessionRegistry, alloc: std.mem.Allocator) ![]db_mod.types.TxnId {
-        if (self.durable) |durable| return durable.listSessionIds(alloc);
+    pub fn listSessionIds(self: *SessionRegistry, alloc: std.mem.Allocator, principal: ?[]const u8) ![]db_mod.types.TxnId {
+        if (self.durable) |durable| return durable.listSessionIds(alloc, principal);
         self.mutex.lock();
         defer self.mutex.unlock();
-        const ids = try alloc.alloc(db_mod.types.TxnId, self.sessions.count());
-        var keys = self.sessions.keyIterator();
-        for (ids) |*id| id.* = keys.next().?.*;
-        return ids;
+        var ids: std.ArrayList(db_mod.types.TxnId) = .empty;
+        errdefer ids.deinit(alloc);
+        var entries = self.sessions.iterator();
+        while (entries.next()) |entry| {
+            if (principalsEqual(entry.value_ptr.principal, principal)) try ids.append(alloc, entry.key_ptr.*);
+        }
+        return ids.toOwnedSlice(alloc);
     }
 
     pub fn listStatuses(self: *SessionRegistry, alloc: std.mem.Allocator) ![]SessionStatus {
@@ -6872,6 +6922,41 @@ comptime {
 }
 const GraphStatusLookup = union(enum) { absent, found: SessionStatus };
 
+fn sessionPrincipalCandidate(scope: *backend_erased.ReadScope, alloc: std.mem.Allocator, key: []const u8, principal: ?[]const u8, digest: *const [32]u8) !bool {
+    const narrow = scope.getRange(key, 0, graph_status_read_len) catch |err| switch (err) {
+        error.NotFound => return false,
+        error.Unsupported, error.EndOfStream => null,
+        else => return err,
+    };
+    if (narrow) |raw| {
+        const header: []const u8 = if (std.mem.startsWith(u8, raw, session_record.bound_session_header)) session_record.bound_session_header else "{";
+        const fields = raw[header.len..];
+        if (std.mem.startsWith(u8, fields, graph_status_field)) {
+            var bits: [graph_status_bytes]u8 = undefined;
+            std.base64.standard.Decoder.decode(&bits, fields[graph_status_field.len..][0..graph_status_encoded_len]) catch return error.InvalidTransactionSessionRecord;
+            return (principal != null) == (bits[32] != 0) and std.mem.eql(u8, digest, bits[0..32]);
+        }
+        for ([_][]const u8{ connection_field, sql_field }) |field| {
+            if (try parseSqlPrefix(raw, field)) |bytes| return std.mem.eql(u8, digest, bytes[9..41]);
+        }
+        if (std.mem.startsWith(u8, fields, reader_field)) {
+            var bytes: [reader_payload_len]u8 = undefined;
+            _ = std.fmt.hexToBytes(&bytes, fields[reader_field.len..][0 .. 2 * reader_payload_len]) catch return error.InvalidTransactionSessionRecord;
+            return std.mem.eql(u8, digest, bytes[9..41]);
+        }
+    }
+    const raw = scope.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    const parsed = std.json.parseFromSlice(struct { principal: ?[]const u8 = null }, alloc, raw, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer parsed.deinit();
+    return principalsEqual(parsed.value.principal, principal);
+}
+
 fn encodeGraphStatus(out: *std.ArrayList(u8), alloc: std.mem.Allocator, session: *const Session) !void {
     var bits: [graph_status_bytes]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(session.principal orelse "", bits[0..32], .{});
@@ -7137,6 +7222,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
 /// owner. Adoption and legacy replay still load the complete durable record.
 fn decodeOwnedSealedRecovery(alloc: std.mem.Allocator, id: db_mod.types.TxnId, body: []const u8, owner: u64) !?Session {
     const Header = struct {
+        session_format: ?u16 = null,
         owner_node_id: ?u64 = null,
         begin_timestamp: u64,
         sync_level: []const u8,
@@ -7158,6 +7244,7 @@ fn decodeOwnedSealedRecovery(alloc: std.mem.Allocator, id: db_mod.types.TxnId, b
     };
     defer decoded.deinit();
     const header = decoded.value;
+    if (header.session_format) |version| if (version != 2) return error.InvalidTransactionSessionRecord;
     if ((header.owner_node_id orelse sessionOwnerNodeId(id)) != owner) return null;
     const plan = header.execution_plan orelse return null;
     if (!header.commit_execution_started) return error.InvalidTransactionSessionRecord;
@@ -7978,6 +8065,39 @@ test "distributed txn graph admission and recovered abort retain a compact princ
     try std.testing.expectError(error.CypherWriteRequestAlreadyUsed, reader.beginGraphExecution(a, id, 2, "bob", &request, &tables));
     try std.testing.expectEqual(@as(usize, 1), try reader.cleanupExpired(a, std.math.maxInt(u64)));
     try std.testing.expect((try durable.load(id)) == null);
+}
+
+test "distributed txn legacy recovery counts malformed cursor rows" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "system/api-transaction-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(a, &store);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(session_prefix ++ "!", "{}");
+        try write.put(session_prefix ++ "!!", "{}");
+        try write.commit();
+    }
+    const first = try durable.scanLegacyRecoveryIds(a, null, 1);
+    defer a.free(first.ids);
+    defer a.free(first.next_after.?);
+    try std.testing.expectEqualStrings(session_prefix ++ "!", first.next_after.?);
+    const second = try durable.scanLegacyRecoveryIds(a, first.next_after, 1);
+    defer a.free(second.ids);
+    defer a.free(second.next_after.?);
+    try std.testing.expectEqualStrings(session_prefix ++ "!!", second.next_after.?);
+}
+
+test "distributed txn sealed recovery rejects unsupported durable formats" {
+    const a = std.testing.allocator;
+    const id: db_mod.types.TxnId = @splat(0);
+    const body =
+        \\{"session_format":999,"owner_node_id":1,"begin_timestamp":1,"sync_level":"write","commit_execution_started":true,"commit_body_digest":"0000000000000000000000000000000000000000000000000000000000000000","execution_plan":"[]"}
+    ;
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, decodeOwnedSealedRecovery(a, id, body, 1));
 }
 
 test "distributed txn graph admission reserves terminal and acknowledgement capacity" {

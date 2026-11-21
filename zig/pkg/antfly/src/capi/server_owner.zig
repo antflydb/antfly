@@ -2751,6 +2751,7 @@ const MetadataSessionRead = struct {
     txn: antfly.capi_dependencies.storage_docstore.DocStore.Txn,
     prefix: []u8,
     group: u64,
+    refs: std.atomic.Value(usize) = .init(1),
 };
 pub fn metadataSessionReadOpen(store_ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataApplyGroupRequest, out_read: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     out_read.* = null;
@@ -2777,6 +2778,7 @@ pub fn metadataSessionReadOpen(store_ptr: ?*anyopaque, request: *const kernel_ow
 }
 pub fn metadataSessionReadClose(read_ptr: ?*anyopaque) callconv(.c) void {
     const read: *MetadataSessionRead = @ptrCast(@alignCast(read_ptr orelse return));
+    if (read.refs.fetchSub(1, .acq_rel) != 1) return;
     const alloc = read.alloc;
     read.txn.abort();
     alloc.free(read.prefix);
@@ -2854,6 +2856,7 @@ pub fn metadataSessionCursorOpen(read_ptr: ?*anyopaque, out_cursor: *?*anyopaque
         read.alloc.destroy(state);
         return storageOwnerStatusFromError(err);
     };
+    _ = read.refs.fetchAdd(1, .monotonic);
     state.* = .{ .read = read, .cursor = cursor };
     out_cursor.* = state;
     return .ok;
@@ -2861,8 +2864,10 @@ pub fn metadataSessionCursorOpen(read_ptr: ?*anyopaque, out_cursor: *?*anyopaque
 
 pub fn metadataSessionCursorClose(ptr: ?*anyopaque) callconv(.c) void {
     const state: *MetadataSessionCursor = @ptrCast(@alignCast(ptr orelse return));
+    const read = state.read;
     state.cursor.close();
-    state.read.alloc.destroy(state);
+    read.alloc.destroy(state);
+    metadataSessionReadClose(read);
 }
 
 pub fn metadataSessionCursorInvoke(ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataSessionReadRequest, out_value: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {

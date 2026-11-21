@@ -209,7 +209,7 @@ const Write = struct {
             self.scanned = true;
             if (expected != null and !try record.countIsCurrent(&self.read.physical, a, self.read.store.group, self.epoch)) value = null;
         }
-        try self.changes.append(a, .{ .key = try self.own(key), .expected = expected, .value = value });
+        try self.changes.append(a, .{ .key = try self.own(key), .expected = expected, .value = value, .observation_only = true });
         return &self.changes.items[self.changes.items.len - 1];
     }
     fn own(self: *Write, bytes: []const u8) ![]const u8 {
@@ -231,9 +231,12 @@ const Write = struct {
             self.owned_limit = record.max_bytes + record.max_receipt_growth;
         }
         change.value = try self.own(value);
+        change.observation_only = false;
     }
     fn delete(ptr: *anyopaque, key: []const u8) !void {
-        (try cast(ptr).observe(key)).value = null;
+        const change = try cast(ptr).observe(key);
+        change.value = null;
+        change.observation_only = false;
     }
     fn countPrefix(ptr: *anyopaque, prefix: []const u8) !u64 {
         const self = cast(ptr);
@@ -260,9 +263,16 @@ const Write = struct {
     fn encodeChanges(self: *Write) ![]const u8 {
         const a = self.read.arena.allocator();
         const epoch = if (self.scanned) self.epoch else null;
-        return record.encode(a, .{ .changes = self.changes.items, .scan_epoch = epoch }) catch |err| {
+        const changes = if (self.scanned) filtered: {
+            var writes: std.ArrayList(record.Change) = .empty;
+            for (self.changes.items) |change| {
+                if (!change.observation_only) try writes.append(a, change);
+            }
+            break :filtered writes.items;
+        } else self.changes.items;
+        return record.encode(a, .{ .changes = changes, .scan_epoch = epoch }) catch |err| {
             if (err != error.TransactionTooLarge) return err;
-            const compact = try a.dupe(record.Change, self.changes.items);
+            const compact = try a.dupe(record.Change, changes);
             const Digest = std.crypto.hash.Blake3;
             for (compact) |*change| {
                 const previous = change.expected orelse continue;
@@ -274,7 +284,7 @@ const Write = struct {
             }
             return record.encode(a, .{ .changes = compact, .scan_epoch = epoch }) catch |compact_err| {
                 if (compact_err != error.TransactionTooLarge) return compact_err;
-                for (compact, self.changes.items) |*change, original| {
+                for (compact, changes) |*change, original| {
                     if (!change.expected_is_digest) continue;
                     const replacement = original.value orelse continue;
                     if (try record.receiptSplice(a, original.expected.?, replacement)) |patch| {
@@ -304,6 +314,7 @@ const Write = struct {
             const current = try Read.create(a, store);
             defer current.destroy(a);
             for (self.changes.items) |change| {
+                if (self.scanned and change.observation_only) continue;
                 const actual = Read.get(current, change.key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
@@ -595,6 +606,16 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
             defer probe.abort();
             try std.testing.expect(try probe.contains(key));
             try std.testing.expect(!try probe.contains(key ++ "-absent"));
+        }
+        {
+            var txn = try logical.beginWrite();
+            errdefer txn.abort();
+            try std.testing.expectEqual(payload.len, (try txn.get(key)).len);
+            _ = try txn.countPrefix("recovery-marker");
+            try txn.put("recovery-marker", &.{});
+            try txn.commit();
+            // Epoch-fenced reads do not carry receipt bytes in the frame.
+            try std.testing.expectEqual(@as(u8, 1), fixture.last_frame);
         }
         {
             var txn = try logical.beginWrite();

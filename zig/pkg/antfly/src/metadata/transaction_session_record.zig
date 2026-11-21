@@ -38,6 +38,7 @@ pub const Change = struct {
     value: ?[]const u8,
     expected_is_digest: bool = false,
     value_is_splice: bool = false,
+    observation_only: bool = false, // Local writer state, never serialized.
 };
 pub const Record = struct { changes: []const Change, scan_epoch: ?u64 = null };
 pub fn prefixForGroup(buf: []u8, group: u64) ![]const u8 {

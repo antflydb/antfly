@@ -14494,7 +14494,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]transactions_api.SessionStatus {
-        const candidates = try self.txn_sessions.listSessionIds(self.alloc);
+        const candidates = try self.txn_sessions.listSessionIds(self.alloc, transactionPrincipal(authenticated_identity));
         defer self.alloc.free(candidates);
         var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
         errdefer authorized.deinit(self.alloc);
