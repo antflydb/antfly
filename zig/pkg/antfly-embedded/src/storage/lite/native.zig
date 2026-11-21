@@ -13700,6 +13700,18 @@ pub const NativeFile = struct {
         return try self.putCatalogBatchForRoot(.index, mutations, .{});
     }
 
+    /// Caller holds writer admission and the store mutation mutex.
+    pub fn hasIndexCatalogPrefix(self: *NativeFile, prefix: []const u8) !bool {
+        if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
+        try self.refreshIfWriterBaseStale();
+        try self.resyncRedoTailUnderAuthority();
+        var cursor = try self.indexCatalogCursor(self.activeCheckpoint(), prefix);
+        defer cursor.deinit();
+        const record = (try cursor.next()) orelse return false;
+        self.allocator.free(record.key);
+        return true;
+    }
+
     /// Apply a prefix delete in bounded private batches. The caller's
     /// transaction publishes the scope removal together with its other writes.
     pub fn deleteIndexCatalogPrefix(self: *NativeFile, prefix: []const u8, exact_key: ?[]const u8) !void {

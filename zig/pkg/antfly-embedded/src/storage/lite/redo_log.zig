@@ -670,10 +670,27 @@ pub fn replayBounded(
         const header, const record_header_len = switch (try readHeaderAt(file, io, base_offset + pos, remaining)) {
             // Too little room left for any header: the region's end.
             .short => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (remaining < legacy_header_len) .end_of_region else .torn_tail },
-            // Untouched, preallocated space or an end marker: a clean end,
-            // never a torn write (a real torn write leaves whatever bytes
-            // landed, not all-zero bytes).
-            .zero => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region },
+            .zero => {
+                // A writer may leave an empty extent or a reset's retired
+                // bytes here. A surviving frame above the checkpoint/run
+                // boundary is evidence that this zero may be an erased
+                // header. Without a published bound, fail closed.
+                const after = @max(last_sequence orelse 0, unlogged_through orelse 0);
+                const at_ceiling = if (max_sequence) |ceiling| ceiling <= after else false;
+                const corrupt = !at_ceiling and try hasFrameAfterErasedHeader(
+                    allocator,
+                    file,
+                    io,
+                    base_offset,
+                    capacity,
+                    pos + header_len,
+                    run_salt,
+                    after,
+                    max_sequence,
+                    &payload_buf,
+                );
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (corrupt) .corrupt_record else .end_of_region };
+            },
             // This run's end. A retired run's trailer (another salt) past a
             // lost one is the end too, after a restart.
             .trailer => |trailer| return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = stop: {
@@ -886,6 +903,49 @@ fn laterRunHeader(file: File, io: Io, base_offset: u64, capacity: u64, from: u64
         }
         if (got < want) return false;
         // Overlap so a header straddling the chunk boundary is seen.
+        start += got - (header_len - 1);
+    }
+    return false;
+}
+
+/// Search only the zero-header path. End trailers make ordinary nonempty
+/// replay stop before this path, and the sequence floor excludes folded runs.
+fn hasFrameAfterErasedHeader(
+    allocator: Allocator,
+    file: File,
+    io: Io,
+    base_offset: u64,
+    capacity: u64,
+    from: u64,
+    salt: ?u64,
+    after: u64,
+    ceiling: ?u64,
+    payload: *std.ArrayList(u8),
+) !bool {
+    const record_prefix = "ARDO";
+    const trailer_prefix = "ARDE";
+    var chunk: [64 * 1024]u8 = undefined;
+    var start = from;
+    while (start + header_len <= capacity) {
+        const want: usize = @intCast(@min(chunk.len, capacity - start));
+        const got = try file.readPositionalAll(io, chunk[0..want], base_offset + start);
+        if (got < header_len) return false;
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, chunk[0..got], at, trailer_prefix)) |found| : (at = found + 1) {
+            if (found + header_len > got) break;
+            const trailer = Trailer.decode(chunk[found..][0..header_len]) orelse continue;
+            if ((salt == null or trailer.salt == salt.?) and trailer.sequence > after and trailer.sequence <= (ceiling orelse std.math.maxInt(u64))) return true;
+        }
+        at = 0;
+        while (std.mem.indexOfPos(u8, chunk[0..got], at, record_prefix)) |found| : (at = found + 1) {
+            if (found + header_len > got) break;
+            const header = RecordHeader.decode(chunk[found..][0..header_len]);
+            if (header.knownLength() != header_len or (salt != null and header.salt != salt.?) or
+                header.commit_sequence <= after or header.commit_sequence > (ceiling orelse std.math.maxInt(u64))) continue;
+            const offset = start + found;
+            if (try recordIntact(allocator, file, io, base_offset + offset, capacity - offset, header, header_len, payload)) return true;
+        }
+        if (got < want) return false;
         start += got - (header_len - 1);
     }
     return false;
@@ -1278,6 +1338,34 @@ test "replay rejects a damaged salt inside a run, not a short log" {
     const ended = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
     try testing.expectEqual(StopReason.end_of_region, ended.stop_reason);
     try testing.expectEqual(clean.tail, ended.valid_bytes);
+}
+
+test "replay rejects erased headers with surviving redo evidence" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(11, "first");
+    const last = writer.tail;
+    try writer.append(12, "second");
+    try writer.sync();
+    const zeros: [header_len]u8 = @splat(0);
+
+    try region.file.writePositionalAll(io, &zeros, last);
+    const erased_tail = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, erased_tail.stop_reason);
+    try testing.expectEqual(last, erased_tail.valid_bytes);
+
+    try region.file.writePositionalAll(io, &zeros, 0);
+    const erased_first = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, erased_first.stop_reason);
+    try testing.expectEqual(@as(u64, 0), erased_first.valid_bytes);
+
+    // Old bytes can survive a completed reset. A fold already covers
+    // all sequences up to the checkpoint and makes their suffix harmless.
+    const folded = try replayBounded(testing.allocator, region.file, io, 0, capacity, 12, null, null, null, null);
+    try testing.expectEqual(StopReason.end_of_region, folded.stop_reason);
 }
 
 test "replay rejects a corrupted length even without a final trailer" {

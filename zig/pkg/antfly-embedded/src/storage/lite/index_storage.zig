@@ -1220,36 +1220,17 @@ test "lite native index storage recovers previous checkpoint after interrupted u
         const storage = index_store.storage();
 
         try storage.writeFileAbsolute("/indexes/ft/stable.tbl", "stable");
-        // The redo log (the default, `opts.use_redo_log orelse true`) is this
-        // file's only durability record for an ordinary commit -- the
-        // on-disk checkpoint slot stays untouched until a real
-        // `checkpointRedoLog` fold ever advances it (`publishCheckpoint`'s
-        // own doc comment: "build step (d) is the only thing that ever
-        // advances it for a redo-log file"), so the legacy dual-slot
-        // ping-pong this test used to truncate against no longer holds a
-        // second, independently-recoverable generation. Simulate the crash
-        // against the log's own tail instead, the same technique "lite redo
-        // log ride-along commit is lost on a crash before its sync; the
-        // durable commit survives" (native.zig) already establishes.
-        const tail_after_stable = docs.file.redo.?.writer.tail;
+        const stable_sequence = docs.file.durableSequence();
+        const stable_tail = docs.file.redo.?.writer.tail;
 
         var writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/stable.tbl");
         try writer.appendSlice("replacement");
-        try writer.finish();
-        try std.testing.expect(docs.file.redo.?.writer.tail > tail_after_stable);
-
-        // Simulate a crash that landed every byte through "stable"'s own
-        // sync and nothing past it -- what an injected power loss right
-        // after that `writer.sync()` call and before "replacement"'s own
-        // append reached a durable barrier would leave. The file's total
-        // size must stay exactly what it was (a fixed, preallocated redo
-        // region, §9.1); zero the tail in place rather than truncating it.
-        const io = docs.file.runtime();
-        const capacity = docs.file.header.redo_log_capacity;
-        const zeroed = try allocator.alloc(u8, @intCast(capacity - tail_after_stable));
-        defer allocator.free(zeroed);
-        @memset(zeroed, 0);
-        try docs.file.file.writePositionalAll(io, zeroed, docs.file.header.redo_log_offset + tail_after_stable);
+        // Interrupt the replacement before its durability barrier can publish.
+        docs.file.test_fail_redo_sync = error.TestInjectedFailure;
+        try std.testing.expectError(error.OutcomeUnknown, writer.finish());
+        try std.testing.expectEqual(@as(?anyerror, null), docs.file.test_fail_redo_sync);
+        try std.testing.expectEqual(stable_sequence, docs.file.durableSequence());
+        try std.testing.expectEqual(stable_tail, docs.file.redo.?.writer.tail);
     }
 
     {

@@ -2916,7 +2916,8 @@ const MutationRequest = struct {
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
-    fold_before_apply: bool = false,
+    scope_delete_prefix: ?[]const u8 = null,
+    scope_delete_only: bool = false,
     /// Never closes a group by becoming its leader, and never durable on
     /// its own: it joins whichever group a foreground (non-ride-along)
     /// member next forms, or `forceDrainDurable`'s forced group if none
@@ -5561,7 +5562,8 @@ pub const Store = struct {
         durable: bool = true,
         index_only: bool = false,
         artifact_lease: bool = false,
-        fold_before_apply: bool = false,
+        scope_delete_prefix: ?[]const u8 = null,
+        scope_delete_only: bool = false,
         /// Estimated size of this member's writes. Used only to bound group
         /// formation (`group_max_bytes`); never required to be exact. Also
         /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
@@ -5728,7 +5730,8 @@ pub const Store = struct {
             .durable = !ride_along and plan.durable,
             .index_only = plan.index_only,
             .artifact_lease = plan.artifact_lease,
-            .fold_before_apply = plan.fold_before_apply,
+            .scope_delete_prefix = plan.scope_delete_prefix,
+            .scope_delete_only = plan.scope_delete_only,
             .ride_along = ride_along,
             .estimated_bytes = plan.estimated_bytes,
         };
@@ -6306,7 +6309,8 @@ pub const Store = struct {
         var tail: ?*MutationRequest = null;
         var bytes: usize = 0;
         while (self.commit_head) |request| {
-            if (batch.head != null and (batch.size >= self.group_max_requests or bytes +| request.estimated_bytes > self.group_max_bytes)) break;
+            if (batch.head != null and (request.scope_delete_prefix != null or
+                batch.size >= self.group_max_requests or bytes +| request.estimated_bytes > self.group_max_bytes)) break;
             self.commit_head = request.next;
             if (self.commit_head == null) self.commit_tail = null;
             request.next = null;
@@ -6320,6 +6324,7 @@ pub const Store = struct {
             } else {
                 self.non_ride_along_pending_count -|= 1;
             }
+            if (request.scope_delete_prefix != null) break;
         }
         return batch;
     }
@@ -6460,15 +6465,19 @@ pub const Store = struct {
     }
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false, false);
+        return self.submitScopedMutation(context, apply, durable, true, false);
+    }
+
+    pub fn submitIndexScopeDeletion(self: *Store, prefix: []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        const admission = if (self.write_target != null) self.writer_admission else null;
+        if (admission) |lease| try lease.enter(lease.ptr, .index);
+        defer if (admission) |lease| lease.leave(lease.ptr);
+        const ticket = try self.stage(.{ .context = context, .apply = apply, .index_only = true, .scope_delete_prefix = prefix, .scope_delete_only = true });
+        try ticket.wait();
     }
 
     /// A durability barrier allocates no pages and requires no allocator
     /// admission, retirement service, or synthetic mutation transaction.
-    pub fn submitIndexScopeDeletion(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, true, false, true);
-    }
-
     pub fn syncIndexContents(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .index);
@@ -6485,7 +6494,7 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false, false, false);
+        return self.submitScopedMutation(context, apply, durable, false, false);
     }
 
     /// WS7/WS5 interim ride-along commit, one named helper so every caller
@@ -6505,7 +6514,7 @@ pub const Store = struct {
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, false, true, false);
+        return self.submitScopedMutation(context, apply, true, false, true);
     }
 
     /// `submitIndexMutation` for one native-catalog index scope. Through a
@@ -6624,7 +6633,7 @@ pub const Store = struct {
         value.* = @max(value.*, sequence);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool, fold_before_apply: bool) !void {
+    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
         // A forwarded request commits in the writer store's group, which
         // enters that store's admission, not this one's. The detached work
         // that built it must still hold the writer lease and pass this
@@ -6637,7 +6646,7 @@ pub const Store = struct {
         const forwarded_admission = if (self.write_target != null) self.writer_admission else null;
         if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease) .artifact_lease else if (index_only) .index else .primary);
         defer if (forwarded_admission) |admission| admission.leave(admission.ptr);
-        const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease, .fold_before_apply = fold_before_apply });
+        const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
         ticket.wait() catch |err| {
             // §9.7f: a redo-log file's own fixed log-capacity reservation
             // can go stale -- frozen at whatever it was sized to when
@@ -6665,7 +6674,7 @@ pub const Store = struct {
                 // request), and retry only if the reservation shrank.
                 const shrank = (if (forwarded_admission != null) self.reclaimOversizedRedoReservationAdmitted() else self.reclaimOversizedRedoReservation()) catch false;
                 if (shrank) {
-                    const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease, .fold_before_apply = fold_before_apply });
+                    const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
                     return retry_ticket.wait();
                 }
             }
@@ -6706,12 +6715,10 @@ pub const Store = struct {
         if (!self.ride_along_flush_started.load(.acquire) and self.file.redo != null) self.ensureRideAlongFlushStarted();
         var index_only = true;
         var artifact_lease_only = true;
-        var fold_before_apply = false;
         var member: ?*MutationRequest = head;
         while (member) |item| : (member = item.next) {
             index_only = index_only and item.index_only;
             artifact_lease_only = artifact_lease_only and item.artifact_lease;
-            fold_before_apply = fold_before_apply or item.fold_before_apply;
         }
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease_only) .artifact_lease else if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
@@ -6721,13 +6728,24 @@ pub const Store = struct {
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
         errdefer self.publishReadCheckpointAssumeLocked();
+        if (head.scope_delete_prefix) |prefix| {
+            std.debug.assert(head.next == null);
+            // This is under the writer lease and store mutex, so an empty
+            // scope cannot acquire postings between the probe and the delete.
+            if (!try self.file.hasIndexCatalogPrefix(prefix)) {
+                if (head.scope_delete_only) {
+                    head.committed_sequence = self.file.committedSequence();
+                    return;
+                }
+            } else if (self.file.redo != null) {
+                // Older overlay entries could shadow physical deletes in
+                // later private batches. Settle them before the transaction.
+                try self.file.checkpointRedoLog();
+            }
+        }
         if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
-            // Large scope deletes switch from logical redo to physical
-            // updates mid-transaction. Fold older overlay entries first so
-            // physical deletes cannot be shadowed by those older versions.
-            if (fold_before_apply and self.file.redo != null) try self.file.checkpointRedoLog();
             try self.file.reclaimRetirementPressure();
             try self.file.beginTransaction();
         }
@@ -7785,7 +7803,7 @@ pub const Txn = struct {
             .context = context,
             .apply = PrimaryCommitContext.apply,
             .estimated_bytes = estimated_bytes,
-            .fold_before_apply = self.index_catalog_delete_prefix != null,
+            .scope_delete_prefix = self.index_catalog_delete_prefix,
         };
         var ride_along_ticket: ?Store.Ticket = null;
         const staged: ?Store.Staged = if (self.ride_along) staged: {
@@ -10436,6 +10454,26 @@ test "lite native docstore putIndexCatalogBatch publishes primary and index-cata
     const active_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_active_key)).?;
     defer allocator.free(active_value);
     try std.testing.expectEqualStrings("1", active_value);
+}
+
+test "lite native docstore skips redo folding for an empty index scope" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-empty-scope.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put("unrelated", "pending fold");
+        try txn.commit();
+    }
+    const before = store.file.committedSequence();
+    var sink: @import("native_catalog_sink.zig").Sink = .{ .store = &store, .allocator = allocator };
+    try @import("../native_catalog_backend.zig").deleteAllForScope(allocator, sink.sink(), "unused");
+    try std.testing.expectEqual(before, store.file.committedSequence());
 }
 
 test "lite native docstore deletes a large index scope in one publication" {
