@@ -602,6 +602,7 @@ fn hashValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
             std.mem.writeInt(u64, &bytes, word, .little);
             hash.update(&bytes);
         },
+        .float => hashValue(hash, @as(u64, @bitCast(@as(f64, value)))),
         .bool => hashValue(hash, @as(u8, @intFromBool(value))),
         .@"enum" => hashValue(hash, @as(u64, @backingInt(value))),
         .@"struct" => inline for (@typeInfo(T).@"struct".field_names) |name| hashValue(hash, @field(value, name)),
@@ -618,7 +619,7 @@ fn hashValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
         else => @compileError("unsupported reader binding metadata"),
     }
 }
-fn bindingPacket(input: *media.source.Source, packet: media.mp4.Packet) !media.source.Lease {
+fn bindingPacket(input: *media.source.Source, packet: anytype) !media.source.Lease {
     try input.control.check();
     return switch (input.storage) {
         .borrowed => |bytes| blk: {
@@ -646,6 +647,25 @@ fn readerMetadataBinding(reader: *const media.mp4.Reader, sampling: Sampling, co
     }
     return hash.finalResult();
 }
+fn hashReaderScope(scope: *std.crypto.hash.sha2.Sha256, r: anytype) void {
+    hashValue(scope, r.track);
+    // The Pins scope requires immutable packet metadata through worker join.
+    // Content validation below still runs once for every new scope.
+    hashValue(scope, @intFromPtr(r.packets.ptr));
+    hashValue(scope, r.packets.len);
+    switch (r.input.storage) {
+        .borrowed => |data| {
+            hashValue(scope, @intFromPtr(data.ptr));
+            hashValue(scope, data.len);
+        },
+        .range => |provider| {
+            hashValue(scope, @intFromPtr(provider.context));
+            hashValue(scope, @intFromPtr(provider.read_at));
+            hashValue(scope, provider.length);
+            if (provider.immutable_binding) |binding| scope.update(&binding);
+        },
+    }
+}
 /// Scope-local reuse is safe because reader metadata, provider configuration
 /// and backing bytes stay immutable until every worker/input drains. The next
 /// request validates again unless its provider carries a verified snapshot.
@@ -655,26 +675,10 @@ fn clipBinding(bytes: []const u8, reader: ?*const media.mp4.Reader, webm: ?WebmI
     scope.update("antfly-video-binding-scope-v1");
     if (reader) |r| {
         scope.update("reader");
-        hashValue(&scope, r.track);
-        // The Pins scope requires immutable packet metadata through worker join.
-        // Content validation below still runs once for every new scope.
-        hashValue(&scope, @intFromPtr(r.packets.ptr));
-        hashValue(&scope, r.packets.len);
-        switch (r.input.storage) {
-            .borrowed => |data| {
-                hashValue(&scope, @intFromPtr(data.ptr));
-                hashValue(&scope, data.len);
-            },
-            .range => |provider| {
-                hashValue(&scope, @intFromPtr(provider.context));
-                hashValue(&scope, @intFromPtr(provider.read_at));
-                hashValue(&scope, provider.length);
-                if (provider.immutable_binding) |binding| scope.update(&binding);
-            },
-        }
+        hashReaderScope(&scope, r);
     } else if (webm) |input| {
         scope.update("webm");
-        scope.update(input.reader.input.identity);
+        hashReaderScope(&scope, input.reader);
     } else {
         scope.update("inline");
         hashValue(&scope, @intFromPtr(bytes.ptr));
@@ -684,17 +688,17 @@ fn clipBinding(bytes: []const u8, reader: ?*const media.mp4.Reader, webm: ?WebmI
     if (scope_key) |out| out.* = key;
     if (pins) |owner| if (owner.binding(key)) |binding| return binding;
     var binding: [32]u8 = undefined;
-    if (reader) |r| binding = try readerBinding(r, .reference, control) else if (webm) |input| std.crypto.hash.sha2.Sha256.hash(input.reader.input.identity, &binding, .{}) else std.crypto.hash.sha2.Sha256.hash(bytes, &binding, .{});
+    if (reader) |r| return readerBinding(r, .reference, control);
+    if (webm) |input| return readerBinding(input.reader, .reference, control);
+    std.crypto.hash.sha2.Sha256.hash(bytes, &binding, .{});
     return binding;
 }
-fn readerBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control) ![32]u8 {
+fn readerBinding(reader: anytype, sampling: Sampling, control: media.source.Control) ![32]u8 {
     try control.check();
     const controls = media.source.ReadControl{ .source = reader.input.control, .worker = control };
     var input = reader.input.view(reader.input.allocator, reader.input.admission_pool, controls.control());
-    var copy = reader.*;
-    copy.input = &input;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly-reader-selection-v1");
+    hash.update(if (@TypeOf(reader.track) == media.webm.Track) "antfly-webm-reader-selection-v1" else "antfly-reader-selection-v1");
     hashValue(&hash, reader.track);
     hashValue(&hash, @as(u8, @backingInt(std.meta.activeTag(sampling))));
     switch (sampling) {
@@ -714,7 +718,7 @@ fn readerBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: m
         try control.check();
         hashValue(&hash, packet);
         if (snapshot != null) continue;
-        var lease = try bindingPacket(copy.input, packet);
+        var lease = try bindingPacket(&input, packet);
         defer lease.deinit();
         hash.update(lease.bytes);
     }
@@ -1070,6 +1074,30 @@ pub const PixelInspection = struct {
         return self.bytes.ptr == bytes.ptr and self.bytes.len == bytes.len;
     }
 };
+
+test "embeddinggemma2 video pixel admission keeps distinct AV1 clips out of each other's projection cache" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/codecs/av1.mp4");
+    var inspection = PixelInspection{};
+    defer inspection.deinit();
+    _ = try inspection.inspect(bytes, .{}, .reference);
+    const adapted = &inspection.adapted.?;
+    const original = WebmInput{ .reader = &adapted.reader, .index = &adapted.index };
+    var pins = CachePins{ .cache = null };
+    defer pins.deinit();
+    var key: [32]u8 = undefined;
+    const digest = try clipBinding(bytes, null, original, .{}, &pins, &key);
+    pins.rememberBinding(key, digest);
+    const changed = try a.dupe(u8, bytes);
+    defer a.free(changed);
+    changed[@intCast(adapted.reader.packets[0].offset)] ^= 1;
+    var source = inspection.portable_source;
+    source.storage = .{ .borrowed = changed };
+    var reader = adapted.reader;
+    reader.input = &source;
+    const other = WebmInput{ .reader = &reader, .index = &adapted.index };
+    try std.testing.expect(!std.mem.eql(u8, &digest, &try clipBinding(changed, null, other, .{}, &pins, null)));
+}
 
 test "embeddinggemma2 video pixel admission retains the execution packet reader" {
     const bytes = @embedFile("../testdata/video/codecs/av1.mp4");
