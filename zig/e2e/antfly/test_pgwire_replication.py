@@ -818,7 +818,7 @@ def test_pg_recvlogical_resume_after_restart(
                         lambda: len(topology_snapshot()[2]) == 2,
                         timeout_s=180,
                         interval_s=0.5,
-                    )
+                    ), server.debug_logs()
                     sql(
                         "INSERT INTO smoke (_id, id, content) VALUES ('a-left', 102, 'after-split-left')"
                     )
@@ -840,7 +840,7 @@ def test_pg_recvlogical_resume_after_restart(
                         lambda: len(topology_snapshot()[2]) == 1,
                         timeout_s=180,
                         interval_s=0.5,
-                    )
+                    ), server.debug_logs()
                     sql(
                         "INSERT INTO smoke (_id, id, content) VALUES ('z-merged', 104, 'after-merge')"
                     )
