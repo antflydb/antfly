@@ -27,6 +27,7 @@ const Options = struct {
     extraction_request: ?[]const u8 = null,
     generate_text: ?[]const u8 = null,
     generate_text_file: ?[]const u8 = null,
+    generate_raw_prompt: bool = false,
     generate_image: ?[]const u8 = null,
     generate_audio: ?[]const u8 = null,
     generate_video: ?[]const u8 = null,
@@ -100,6 +101,10 @@ pub fn main(init: std.process.Init) !void {
             options.extraction_request = value;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--generate-raw-prompt")) {
+            options.generate_raw_prompt = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--generate-text-file")) {
             options.generate_text_file = value;
             continue;
@@ -142,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
         if (options.generate_text != null) return error.ConflictingGenerationText;
         options.generate_text = "";
     }
+    if (options.generate_raw_prompt and (options.generate_text == null or options.generate_image != null or options.generate_audio != null or options.generate_video != null)) return error.InvalidGenerationGeometry;
     if (options.generate_control_stdin and (options.generate_text == null or options.generate_cache_comparison or options.iterations == 0)) return error.InvalidMeasurementControl;
     if (options.generate_text != null and (options.generate_tokens == 0 or options.generate_tokens > 256 or options.batch != 1 or options.embedding_pool != null or options.primitive != null or options.resident or options.incremental_source or options.transcribe_audio.len != 0 or options.decoder_steps != 0 or options.soak_seconds != 0)) return error.InvalidGenerationGeometry;
     if (options.embedding_text != null and options.embedding_pool == null) return error.EmbeddingTextRequiresEmbeddingPool;

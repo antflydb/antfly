@@ -66,7 +66,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .tokenizer = model.getTokenizer(),
         .add_bos_token = model.manifest.add_bos_token,
         .bos_token = model.manifest.bos_token,
-        .chat_template = model.chat_tmpl,
+        .chat_template = if (options.generate_raw_prompt) null else model.chat_tmpl,
         .return_raw_token_ids = true,
         .model_dir = options.model_dir,
         .gguf_projector_path = model.manifest.gguf_projector_path,
@@ -81,6 +81,14 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     defer pipeline.deinit();
     const text_bytes = if (options.generate_text_file) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(16 * 1024 * 1024)) else null;
     defer if (text_bytes) |bytes| a.free(bytes);
+    // A frozen, already rendered prompt isolates numerical execution when a
+    // baseline cannot parse a newer canonical chat template. The caller must
+    // separately qualify ordinary model rendering; this grants no task credit.
+    const input_text = text_bytes orelse options.generate_text.?;
+    pipeline.prompt_override = if (options.generate_raw_prompt) input_text else null;
+    var input_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(input_text, &input_hash, .{});
+    const input_hex = std.fmt.bytesToHex(input_hash, .lower);
     const image_bytes = if (options.generate_image) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 * 1024 * 1024)) else null;
     defer if (image_bytes) |bytes| a.free(bytes);
     const audio_bytes = if (options.generate_audio) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 * 1024 * 1024)) else null;
@@ -89,7 +97,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     defer if (video_bytes) |bytes| a.free(bytes);
     const image_inputs = [_][]const u8{image_bytes orelse &.{}};
     const audio_inputs = [_][]const u8{audio_bytes orelse &.{}};
-    const messages = [_]generation.Message{.{ .role = "user", .content = text_bytes orelse options.generate_text.?, .image_bytes = if (image_bytes != null) &image_inputs else null, .audio_bytes = if (audio_bytes != null) &audio_inputs else null, .video_bytes = video_bytes }};
+    const messages = [_]generation.Message{.{ .role = "user", .content = input_text, .image_bytes = if (image_bytes != null) &image_inputs else null, .audio_bytes = if (audio_bytes != null) &audio_inputs else null, .video_bytes = video_bytes }};
     const samples = try a.alloc(u64, options.iterations);
     defer a.free(samples);
     const stage_samples = try a.alloc(?generation.GenerationTimingMs, options.iterations);
@@ -206,6 +214,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .requested_prefill_chunk_rows = options.generate_prefill_chunk_rows,
         .measurement_control = if (options.generate_control_stdin) "stdin_after_warmup" else "uncontrolled",
         .model_chat_template = model.chat_tmpl != null,
+        .raw_prompt = options.generate_raw_prompt,
+        .input_text_sha256 = input_hex[0..],
         .runtime_capabilities = if (cache.compiled_model_runtime) |*runtime| runtime.capabilities() else null,
         .compiled_stage_shapes = factory.getPjrtSpecializationCount(model.session),
         .resident_prefill_steps = pipeline.resident_prefill_steps,
