@@ -41119,11 +41119,12 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
             .code = "INPUT_TOO_LONG",
             .message = "expanded embedding input exceeds the model context limit",
         },
-        error.InvalidVideoInput => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported or corrupt video; expected progressive SDR H.264 MP4" },
+        error.InvalidVideoInput => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported or corrupt video input" },
         error.HevcDecoderUnavailable => .{ .status = 400, .code = "VIDEO_CODEC_UNAVAILABLE", .message = "this host cannot decode this HEVC video; transcode it to H.264 or AV1, or use a host with hardware HEVC decoding, such as a Mac or an NVIDIA GPU" },
+        error.DecoderEnvelopeExceeded => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds the decoder picture or geometry limit" },
         error.VideoDurationExceeded => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds the decoder duration limit" },
         error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds the 256-MiB input limit" },
-        error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video embeddings require the Linux CUDA backend with NVDEC" },
+        error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "the selected backend does not support this video input" },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server" },
         error.InvalidAudioSamples => .{ .status = 400, .code = "INVALID_AUDIO", .message = "audio samples must be finite" },
         error.UnsupportedAudioFormat, error.EmptyAudioInput, error.InvalidAudioInput => .{ .status = 400, .code = "INVALID_AUDIO", .message = "unsupported, empty, or corrupt audio input" },
@@ -41516,11 +41517,22 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
     };
 }
 
+test "embedding decoder envelope reports a nonretryable video limit in both error modes" {
+    const failure = embedDenseInputFailure(error.DecoderEnvelopeExceeded);
+    const item = embedItemFailure(2, error.DecoderEnvelopeExceeded, "embedding");
+    try std.testing.expectEqual(400, failure.status);
+    try std.testing.expectEqualStrings("VIDEO_TOO_LARGE", failure.code);
+    try std.testing.expectEqual(failure.status, item.status);
+    try std.testing.expectEqualStrings(failure.code, item.code);
+    try std.testing.expect(!item.retryable);
+}
+
 fn isEmbeddingInputContractError(err: anyerror) bool {
     return switch (err) {
         error.EmbeddingSequenceTooLong,
         error.InvalidVideoInput,
         error.VideoDurationExceeded,
+        error.DecoderEnvelopeExceeded,
         error.VideoInputTooLarge,
         error.UnsupportedVideoBackend,
         error.InvalidAudioSamples,
@@ -44086,7 +44098,7 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         error.MissingVideoParameterSet,
         => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported, empty, or corrupt video", .retryable = false },
         error.HevcDecoderUnavailable => .{ .status = 400, .code = "VIDEO_CODEC_UNAVAILABLE", .message = "this host cannot decode this HEVC video; transcode it to H.264 or AV1, or use a host with hardware HEVC decoding, such as a Mac or an NVIDIA GPU", .retryable = false },
-        error.VideoDurationExceeded, error.VideoInputTooLarge, error.SharedAdmissionExceeded => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
+        error.DecoderEnvelopeExceeded, error.VideoDurationExceeded, error.VideoInputTooLarge, error.SharedAdmissionExceeded => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server", .retryable = true },
         error.Timeout => .{
             .status = 504,

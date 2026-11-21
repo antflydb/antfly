@@ -38,7 +38,13 @@ to select bilinear video resizing on both routes. The image resize setting
 applies to still images. The CUDA resize writes one matrix row per patch,
 with channel-major pixels for the GGUF projector.
 
-In residual precision mode, the projector retains native BF16 weights. A
+The L4 serving profile uses the original nearest-even activation rounding.
+Losslessly converted BF16 weights take one F16 product, native F16 weights
+take two products, and remaining BF16 weights use the configured term count.
+The final addition uses F32. A nonfinite result is recomputed directly from
+the original F32 activations and the stored weights.
+
+The offline GB10 residual candidate retains native BF16 weights. A
 single CUDA kernel splits each F32 activation into two or three BF16 terms
 toward zero, preserving a finite leading term through the maximum F32 value.
 cuBLASLt multiplies each term and accumulates the products in F32. If the

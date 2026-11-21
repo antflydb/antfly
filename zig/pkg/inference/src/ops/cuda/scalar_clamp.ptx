@@ -126,3 +126,131 @@ done:
 done:
     ret;
 }
+
+// SM89 qualification uses nearest-even rounding at each subtraction. Stage
+// every activation plane in one pass without materializing F32 residuals.
+.visible .entry split_rounded_terms(.param .u64 input, .param .u64 high,
+    .param .u64 low, .param .u64 tail, .param .u32 count, .param .u32 bf16) {
+    .reg .pred p, is_bf;
+    .reg .b32 i, block, size, tid, n, bits, lsb, fmt;
+    .reg .b64 src, dst, next, last, offset;
+    .reg .b16 part;
+    .reg .f32 value, rounded;
+    ld.param.u32 n, [count];
+    mov.u32 block, %ctaid.x;
+    mov.u32 size, %ntid.x;
+    mov.u32 tid, %tid.x;
+    mad.lo.u32 i, block, size, tid;
+    setp.ge.u32 p, i, n;
+    @p bra done;
+    ld.param.u64 src, [input];
+    ld.param.u64 dst, [high];
+    ld.param.u64 next, [low];
+    ld.param.u64 last, [tail];
+    ld.param.u32 fmt, [bf16];
+    setp.ne.u32 is_bf, fmt, 0;
+    mul.wide.u32 offset, i, 4;
+    add.u64 src, src, offset;
+    ld.global.f32 value, [src];
+    mul.wide.u32 offset, i, 2;
+plane:
+    @is_bf bra convert_bf;
+    cvt.rn.f16.f32 part, value;
+    cvt.f32.f16 rounded, part;
+    bra emit;
+convert_bf:
+    mov.b32 bits, value;
+    bfe.u32 lsb, bits, 16, 1;
+    add.u32 bits, bits, 0x7fff;
+    add.u32 bits, bits, lsb;
+    shr.u32 bits, bits, 16;
+    setp.nan.f32 p, value, value;
+    @p mov.u32 bits, 0x7fc0;
+    cvt.u16.u32 part, bits;
+    shl.b32 bits, bits, 16;
+    mov.b32 rounded, bits;
+emit:
+    add.u64 dst, dst, offset;
+    st.global.b16 [dst], part;
+    setp.eq.u64 p, next, 0;
+    @p bra done;
+    sub.rn.f32 value, value, rounded;
+    mov.u64 dst, next;
+    mov.u64 next, last;
+    mov.u64 last, 0;
+    bra plane;
+done:
+    ret;
+}
+
+// Complete the qualified projector's F32 addition. A nonfinite result can
+// originate in a narrowed activation even when its F32 dot product is finite.
+// Only those output lanes reread the original inputs and compact weights.
+.visible .entry finish_projection(
+    .param .u64 output, .param .u64 correction, .param .u64 input,
+    .param .u64 weights, .param .u32 count, .param .u32 inputs,
+    .param .u32 outputs, .param .u32 bf16
+) {
+    .reg .pred p, is_bf;
+    .reg .b32 i, block, tid, size, n, cols, inner, fmt, row, col, k, bits;
+    .reg .b64 dst, src, w, addend, offset, start;
+    .reg .b16 half;
+    .reg .f32 sum, other, x, y;
+    ld.param.u32 n, [count];
+    mov.u32 block, %ctaid.x;
+    mov.u32 tid, %tid.x;
+    mov.u32 size, %ntid.x;
+    mad.lo.u32 i, block, size, tid;
+    setp.ge.u32 p, i, n;
+    @p bra done;
+    ld.param.u64 dst, [output];
+    ld.param.u64 addend, [correction];
+    mul.wide.u32 offset, i, 4;
+    add.u64 dst, dst, offset;
+    ld.global.f32 sum, [dst];
+    setp.eq.u64 p, addend, 0;
+    @!p bra add_correction;
+    testp.finite.f32 p, sum;
+    @p bra done;
+    bra recompute;
+add_correction:
+    add.u64 addend, addend, offset;
+    ld.global.f32 other, [addend];
+    add.rn.f32 sum, sum, other;
+    testp.finite.f32 p, sum;
+    @p bra store;
+recompute:
+    ld.param.u32 cols, [outputs];
+    ld.param.u32 inner, [inputs];
+    ld.param.u32 fmt, [bf16];
+    ld.param.u64 src, [input];
+    ld.param.u64 w, [weights];
+    div.u32 row, i, cols;
+    rem.u32 col, i, cols;
+    mul.wide.u32 start, row, inner;
+    shl.b64 start, start, 2;
+    add.u64 src, src, start;
+    mul.wide.u32 start, col, inner;
+    shl.b64 start, start, 1;
+    add.u64 w, w, start;
+    setp.ne.u32 is_bf, fmt, 0;
+    mov.u32 k, 0;
+    mov.f32 sum, 0f00000000;
+accumulate:
+    ld.global.f32 x, [src];
+    ld.global.b16 half, [w];
+    @!is_bf cvt.f32.f16 y, half;
+    @is_bf cvt.u32.u16 bits, half;
+    @is_bf shl.b32 bits, bits, 16;
+    @is_bf mov.b32 y, bits;
+    fma.rn.f32 sum, x, y, sum;
+    add.u64 src, src, 4;
+    add.u64 w, w, 2;
+    add.u32 k, k, 1;
+    setp.lt.u32 p, k, inner;
+    @p bra accumulate;
+store:
+    st.global.f32 [dst], sum;
+done:
+    ret;
+}

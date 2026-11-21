@@ -74,8 +74,16 @@ pub const WebmInput = struct {
     reader: *const media.webm.Reader,
     index: *const video.webm_pictures.Index,
     timeline: ?*const video.sampling.Timeline = null,
+    reference_owner: ?*const PixelInspection = null,
     continuation: ?*video.webm_pictures.Continuation = null,
     apple_continuation: ?*WebmDecoderContinuation = null,
+
+    pub fn referenceOrdinals(self: WebmInput) !?[]const usize {
+        const owner = self.reference_owner orelse return null;
+        const cached = if (owner.webm) |*webm| webm else return error.InvalidVideoReaderSelection;
+        if (self.index != &cached.index or self.reader != &cached.reader) return error.InvalidVideoReaderSelection;
+        return cached.reference_ordinals;
+    }
 };
 /// Mutable continuation identity, independent of source bytes and cache identity.
 pub fn sharesDecoder(left: ?*const ReaderSelection, left_webm: ?WebmInput, right: ?*const ReaderSelection, right_webm: ?WebmInput) bool {
@@ -231,7 +239,7 @@ pub const Inspection = struct {
             self.owns_webm_index = configuration.webm == null;
             self.webm_index.?.reader = &self.webm_reader;
             self.gemma4_plan = try webmGemma4Plan(self.webm_index.?, configuration.sampling, self.source.control);
-            self.selected = if (self.gemma4_plan) |*plan| try a.dupe(usize, plan.ids()) else try selectWebm(a, self.webm_index.?, configuration.sampling, self.source.control, if (configuration.webm) |input| input.timeline else null);
+            self.selected = if (self.gemma4_plan) |*plan| try a.dupe(usize, plan.ids()) else try selectWebm(a, self.webm_index.?, configuration.sampling, self.source.control, configuration.webm);
             self.plan = try inspectSelectedWebmPlan(&self.webm_reader, self.webm_index.?, true, self.selected.?);
         } else {
             if (borrowed) |reader| {
@@ -1016,17 +1024,19 @@ pub const PixelInspection = struct {
     original_av1: ?media.mp4.Reader = null,
     portable_source: media.source.Source = undefined,
     portable_pool: media.admission.Pool = .{ .limits = .{ .host_bytes = limit } },
-    adapted: ?struct {
+    webm: ?struct {
         reader: media.webm.Reader,
         index: video.webm_pictures.Index,
-        selection: @import("../ops/cuda/video.zig").Av1ReferencePlan,
+        reference_ordinals: []usize,
+        cuda_selection: ?@import("../ops/cuda/video.zig").Av1ReferencePlan,
     } = null,
     cuda_error: ?anyerror = null,
     bytes: []const u8 = &.{},
     pixels: u64 = 0,
 
     pub fn deinit(self: *PixelInspection) void {
-        if (self.adapted) |*owner| {
+        if (self.webm) |*owner| {
+            self.memory.allocator().free(owner.reference_ordinals);
             owner.index.deinit();
             owner.reader.deinit();
         }
@@ -1051,9 +1061,13 @@ pub const PixelInspection = struct {
         };
         self.pixels = pixels;
         if (sampling != .reference) return pixels;
+        if (self.webm != null and self.original_av1 == null) {
+            self.cuda_error = error.UnsupportedVideoFormat;
+            return pixels;
+        }
+        const shared = if (self.webm) |*webm| if (webm.cuda_selection) |*plan| plan else null else null;
         const adapter = control.imageWorkControl();
         self.prepared = @as(@import("../ops/cuda/video.zig").PreparedEmbedding, undefined);
-        const shared = if (self.adapted) |*av1| &av1.selection else null;
         self.prepared.?.initWithSharedPlan(self.memory.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn }, shared) catch |err| {
             self.prepared = null;
             self.cuda_error = err;
@@ -1081,7 +1095,7 @@ test "embeddinggemma2 video pixel admission keeps distinct AV1 clips out of each
     var inspection = PixelInspection{};
     defer inspection.deinit();
     _ = try inspection.inspect(bytes, .{}, .reference);
-    const adapted = &inspection.adapted.?;
+    const adapted = &inspection.webm.?;
     const original = WebmInput{ .reader = &adapted.reader, .index = &adapted.index };
     var pins = CachePins{ .cache = null };
     defer pins.deinit();
@@ -1110,7 +1124,7 @@ test "embeddinggemma2 video pixel admission retains the execution packet reader"
     try std.testing.expect(prepared.reader.input == &prepared.source);
     try std.testing.expect(!prepared.owns_reader);
     try std.testing.expect(prepared.reader.packets.ptr == inspection.original_av1.?.packets.ptr);
-    try std.testing.expect(inspection.adapted.?.index.reader == &inspection.adapted.?.reader);
+    try std.testing.expect(inspection.webm.?.index.reader == &inspection.webm.?.reader);
     try std.testing.expectEqual(@as(usize, 0), prepared.source.reads);
     try std.testing.expect(inspection.memory.live >= std.mem.sliceAsBytes(prepared.reader.packets).len);
     try std.testing.expectEqual(@as(u64, prepared.inspection.frames) * prepared.inspection.width * prepared.inspection.height, pixels);
@@ -1327,7 +1341,7 @@ pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const med
     return inspectPacketPlan(a, &reader, control, sampling, metal, selection);
 }
 pub fn inspectConfiguredPlan(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration, metal: bool) !Plan {
-    var plan = if (configuration.inspection_scope) |scope| try scope.inspect(bytes, reader, control, configuration, metal) else if (configuration.webm) |input| try inspectWebmPlan(a, input.reader, input.index.*, configuration.sampling, metal, input.timeline) else if (reader) |r| try inspectReaderPlanWithSelection(a, r, control, configuration.sampling, configuration.pool, metal, configuration.selection) else try inspectPlan(a, bytes, control, configuration.sampling, configuration.pool, metal);
+    var plan = if (configuration.inspection_scope) |scope| try scope.inspect(bytes, reader, control, configuration, metal) else if (configuration.webm) |input| try inspectWebmPlan(a, input, configuration.sampling, metal, control) else if (reader) |r| try inspectReaderPlanWithSelection(a, r, control, configuration.sampling, configuration.pool, metal, configuration.selection) else try inspectPlan(a, bytes, control, configuration.sampling, configuration.pool, metal);
     if (configuration.decoder.policy == .portable) plan.apple_surface_bytes = 0;
     return pinCachedPlan(plan, bytes, reader, control, configuration);
 }
@@ -1398,10 +1412,11 @@ fn validatedInputs(reader: ?*const media.mp4.Reader, configuration: Configuratio
     if (source.track.codec != .avc) return null;
     return if (configuration.selection) |selection| selection.validated else null;
 }
-fn inspectWebmPlan(a: std.mem.Allocator, reader: *const media.webm.Reader, index: video.webm_pictures.Index, sampling: Sampling, metal: bool, timeline: ?*const video.sampling.Timeline) !Plan {
-    const selected = try selectWebm(a, index, sampling, reader.input.control, timeline);
+fn inspectWebmPlan(a: std.mem.Allocator, input: WebmInput, sampling: Sampling, metal: bool, control: Control) !Plan {
+    const adapter = control.imageWorkControl();
+    const selected = try selectWebm(a, input.index.*, sampling, .{ .context = adapter.context, .check_fn = adapter.check_fn }, input);
     defer a.free(selected);
-    return inspectSelectedWebmPlan(reader, index, metal, selected);
+    return inspectSelectedWebmPlan(input.reader, input.index.*, metal, selected);
 }
 fn inspectSelectedWebmPlan(reader: *const media.webm.Reader, index: video.webm_pictures.Index, metal: bool, selected: []const usize) !Plan {
     var plan = Plan{ .commands = preparationSlots(selected), .metal_preparation = metal, .decoder_host_bytes = 256 * 1024 * 1024 };
@@ -1437,21 +1452,20 @@ fn inspectPlanShared(a: std.mem.Allocator, bytes: []const u8, control: Control, 
         var index = try video.webm_pictures.index(a, reader, webmDecodeOptions(source.control, pool));
         defer if (!adopted) index.deinit();
         const selected = try selectWebm(a, index, sampling, source.control, null);
-        defer a.free(selected);
+        defer if (!adopted) a.free(selected);
         const plan = try inspectSelectedWebmPlan(reader, index, metal, selected);
-        if (owner) |cached| if (cached.original_av1 != null) {
-            var display = @import("../ops/cuda/video.zig").DisplayPlan{ .visible_count = index.pictures.len };
-            display.pictures.len = selected.len;
-            for (selected, 0..) |ordinal, i| {
-                display.visible_ordinals[i] = ordinal;
-                display.pictures.packet_ids[i] = index.pictures[ordinal].packet_index orelse return error.InvalidVideoIndex;
-            }
-            cached.adapted = .{
-                .reader = reader.*,
-                .index = index,
-                .selection = .{ .original = &cached.original_av1.?, .frame_units = index.frame_units, .largest_picture = index.largest_picture, .plan = display },
-            };
-            cached.adapted.?.index.reader = &cached.adapted.?.reader;
+        if (owner) |cached| if (sampling == .reference) {
+            const cuda_selection: ?@import("../ops/cuda/video.zig").Av1ReferencePlan = if (cached.original_av1) |*original_reader| blk: {
+                var display = @import("../ops/cuda/video.zig").DisplayPlan{ .visible_count = index.pictures.len };
+                display.pictures.len = selected.len;
+                for (selected, 0..) |ordinal, i| {
+                    display.visible_ordinals[i] = ordinal;
+                    display.pictures.packet_ids[i] = index.pictures[ordinal].packet_index orelse return error.InvalidVideoIndex;
+                }
+                break :blk .{ .original = original_reader, .frame_units = index.frame_units, .largest_picture = index.largest_picture, .plan = display };
+            } else null;
+            cached.webm = .{ .reader = reader.*, .index = index, .reference_ordinals = selected, .cuda_selection = cuda_selection };
+            cached.webm.?.index.reader = &cached.webm.?.reader;
             adopted = true;
         };
         return plan;
@@ -1572,7 +1586,15 @@ fn webmGemma4Plan(index: video.webm_pictures.Index, sampling: Sampling, control:
     if (sampling == .gemma4) return try video.packet_sampling.gemma4WebmPictures(index, control);
     return null;
 }
-fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, timeline: ?*const video.sampling.Timeline) ![]usize {
+fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, input: ?WebmInput) ![]usize {
+    try control.check();
+    if (input) |bound| if (sampling == .reference) {
+        if (try bound.referenceOrdinals()) |selected| {
+            if (bound.index.pictures.ptr != index.pictures.ptr or bound.index.pictures.len != index.pictures.len) return error.InvalidVideoReaderSelection;
+            return a.dupe(usize, selected);
+        }
+    };
+    const timeline = if (input) |bound| bound.timeline else null;
     if (try webmGemma4Plan(index, sampling, control)) |plan| return a.dupe(usize, plan.ids());
     if (sampling == .reference) return index.selectWithAllocator(a, control);
     var owned: ?video.sampling.Timeline = if (timeline == null and index.sourceTimeline() != null) try index.presentationTimeline(a, control) else null;
@@ -1659,7 +1681,7 @@ pub const Prefetch = struct {
         }
         var count: ?usize = if (inspection) |owner| owner.selected.?.len else if (selection) |bound| bound.selected.len else null;
         if (inspection == null) if (webm_input) |input| {
-            const selected = try selectWebm(a, input.index.*, sampling, input.reader.input.control, input.timeline);
+            const selected = try selectWebm(a, input.index.*, sampling, .{ .context = self, .check_fn = check }, input);
             defer a.free(selected);
             count = selected.len;
         };
@@ -1799,7 +1821,7 @@ pub const Prefetch = struct {
         defer if (inspection == null) {
             if (configurations) |session| session.deinit();
         };
-        const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, if (self.webm_input) |input| input.timeline else null) else try selectReader(a, &reader, sampling, source.control, self.reader_selection, configurations);
+        const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, self.webm_input) else try selectReader(a, &reader, sampling, source.control, self.reader_selection, configurations);
         self.selected = selected;
         const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
         var signal = if (inspection) |owner| owner.signal else video.h264.Color{};
@@ -2300,7 +2322,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     defer if (inspection == null) {
         if (configurations) |session| session.deinit();
     };
-    const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, if (webm_input) |input| input.timeline else null) else try selectReader(a, &reader, sampling, source.control, selection, configurations);
+    const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, webm_input) else try selectReader(a, &reader, sampling, source.control, selection, configurations);
     defer a.free(selected);
     const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
     var signal = if (inspection) |owner| owner.signal else video.h264.Color{};

@@ -6598,7 +6598,7 @@ pub fn loadLinearWeightCt(
                 const rows = loaded.tensor.shape[0];
                 const cols = loaded.tensor.shape[1];
                 if (rows == out_dim and cols == in_dim) {
-                    const compact = compute.gemma4_e4b_sm89_qualified or compute.gemma4_projector_residual or compute.gemma4_projector_lossless_f16;
+                    const compact = compute.gemma4_e4b_sm89_qualified or compute.gemma4_projector_precision != .standard or compute.gemma4_projector_lossless_f16;
                     if (compact and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_COMPACT", true))
                         return compute.uploadProjectorWeight(&loaded.tensor);
                     return compute.upload16BitAsF32(&loaded.tensor);

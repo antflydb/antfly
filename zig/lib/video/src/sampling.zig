@@ -61,35 +61,37 @@ pub fn hidden(pic: anytype) bool {
     return @hasField(@TypeOf(pic), "hidden") and pic.hidden;
 }
 
-// An undated presentation ends at the next distinct visible PTS. All outputs
-// tied at the preceding PTS share that interval, including across an edit.
-fn precedingHold(pictures: anytype, edit: media.timeline.Edit, control: media.source.Control) !?i64 {
-    if (edit.source_duration == null) return null;
-    var latest_undated: ?i64 = null;
-    var preceding: ?i64 = null;
-    var active: ?i64 = null;
-    for (pictures, 0..) |pic, i| {
-        if (i % 256 == 0) try control.check();
-        if (hidden(pic)) continue;
-        if (pic.pts == edit.source_start) return null;
-        if (pic.pts < edit.source_start) {
-            preceding = @max(preceding orelse pic.pts, pic.pts);
-            if (@as(?u64, pic.duration)) |d| {
-                if (@as(i128, pic.pts) + d > edit.source_start) active = @max(active orelse pic.pts, pic.pts);
-            } else latest_undated = @max(latest_undated orelse pic.pts, pic.pts);
-        }
-    }
-    // An undated hold ends at the next distinct picture, even if it expired.
-    if (latest_undated != null and latest_undated == preceding) return preceding;
-    return active;
-}
+const EditOpening = struct {
+    undated: ?i64 = null,
+    reference: ?i64 = null,
 
-fn visibleInEdit(pts: i64, duration: ?u64, edit: media.timeline.Edit, preceding: ?i64) bool {
-    const length = edit.source_duration orelse return true;
-    if (pts >= @as(i128, edit.source_start) + length) return false;
-    if (pts >= edit.source_start) return true;
-    return pts == preceding and (duration == null or @as(i128, pts) + duration.? > edit.source_start);
-}
+    fn inspect(pictures: anytype, edit: media.timeline.Edit, control: media.source.Control) !EditOpening {
+        if (edit.source_duration == null) return .{};
+        var latest: ?i64 = null;
+        var result = EditOpening{};
+        for (pictures, 0..) |pic, i| {
+            if (i % 256 == 0) try control.check();
+            if (hidden(pic) or pic.pts > edit.source_start) continue;
+            if (pic.pts == edit.source_start) return .{ .reference = pic.pts };
+            latest = @max(latest orelse pic.pts, pic.pts);
+            if (@as(?u64, pic.duration)) |d| {
+                if (@as(i128, pic.pts) + d > edit.source_start)
+                    result.reference = @max(result.reference orelse pic.pts, pic.pts);
+            } else result.undated = @max(result.undated orelse pic.pts, pic.pts);
+        }
+        // An implicit duration ends at the next distinct visible source PTS.
+        if (result.undated != latest) result.undated = null;
+        if (result.undated) |pts| result.reference = pts;
+        return result;
+    }
+
+    fn intersects(self: EditOpening, pts: i64, duration: ?u64, edit: media.timeline.Edit) bool {
+        const length = edit.source_duration orelse return true;
+        if (pts >= @as(i128, edit.source_start) + length) return false;
+        if (pts >= edit.source_start) return true;
+        return if (duration) |d| @as(i128, pts) + d > edit.source_start else pts == self.undated;
+    }
+};
 
 /// Return original picture ordinals in the reference processor's presentation
 /// order. Keep decode preroll in the reader but omit it from an explicit edit.
@@ -99,10 +101,13 @@ pub fn referencePictures(a: std.mem.Allocator, pictures: anytype, scale: u32, ed
     defer a.free(order);
     var count: usize = 0;
     var bounds = Bounds{};
-    const preceding = try precedingHold(pictures, edit, control);
+    const opening = try EditOpening.inspect(pictures, edit, control);
     for (pictures, 0..) |picture, id| {
         if (id % 256 == 0) try control.check();
-        if (hidden(picture) or !visibleInEdit(picture.pts, picture.duration, edit, preceding)) continue;
+        if (hidden(picture) or !opening.intersects(picture.pts, picture.duration, edit)) continue;
+        // Reference FPS sampling counts a single opening presentation group.
+        // Timestamp sampling indexes every intersecting interval for later holds.
+        if (edit.source_duration != null and picture.pts < edit.source_start and picture.pts != opening.reference) continue;
         bounds.include(picture.pts, picture.duration);
         order[count] = id;
         count += 1;
@@ -222,12 +227,12 @@ pub const Timeline = struct {
     /// pictures that start inside the edit or remain displayed across its start.
     pub fn initEdited(a: std.mem.Allocator, pictures: []const TimedPicture, control: media.source.Control, edit: media.timeline.Edit) !Timeline {
         const stop: ?i128 = if (edit.source_duration) |d| @as(i128, edit.source_start) + d else null;
-        const preceding = try precedingHold(pictures, edit, control);
+        const opening = try EditOpening.inspect(pictures, edit, control);
         const count = blk: {
             var n: usize = 0;
             for (pictures, 0..) |pic, i| {
                 if (i % 256 == 0) try control.check();
-                if (!hidden(pic) and visibleInEdit(pic.pts, pic.duration, edit, preceding)) n += 1;
+                if (!hidden(pic) and opening.intersects(pic.pts, pic.duration, edit)) n += 1;
             }
             break :blk n;
         };
@@ -238,7 +243,7 @@ pub const Timeline = struct {
         var i: usize = 0;
         for (pictures, 0..) |picture, id| {
             if (id % 256 == 0) try control.check();
-            if (hidden(picture) or !visibleInEdit(picture.pts, picture.duration, edit, preceding)) continue;
+            if (hidden(picture) or !opening.intersects(picture.pts, picture.duration, edit)) continue;
             bounds.include(picture.pts, picture.duration);
             entries[i] = .{ .id = id, .pts = picture.pts, .stop = @min(stop orelse std.math.maxInt(i128), if (picture.duration) |d| @as(i128, picture.pts) + d else std.math.maxInt(i128)) };
             i += 1;
@@ -644,5 +649,21 @@ test "reference and indexed edit sampling retain tied undated outputs until the 
             try std.testing.expectEqualSlices(usize, &.{ 2, 2 }, selected);
             try std.testing.expectEqual(1, timeline.entries.len);
         }
+    }
+}
+
+test "edited timestamp selection preserves overlapping holds after the opening picture expires" {
+    const a = std.testing.allocator;
+    const pictures = [_]TimedPicture{
+        .{ .pts = 0, .duration = null },
+        .{ .pts = 0, .duration = 10 },
+        .{ .pts = 4, .duration = 2 },
+    };
+    for ([_]i64{ 4, 5 }) |start| {
+        var timeline = try Timeline.initEdited(a, &pictures, .{}, .{ .source_start = start, .source_duration = 10 - start });
+        defer timeline.deinit();
+        const ids = try timeline.select(a, 1, .{ .start_ns = 5 * std.time.ns_per_s, .end_ns = 7 * std.time.ns_per_s, .hold = true }, .{}, false);
+        defer a.free(ids);
+        try std.testing.expectEqualSlices(usize, &.{ 2, 1 }, ids);
     }
 }

@@ -353,7 +353,7 @@ pub const Group = struct {
         if (@TypeOf(payload) == SampledVideo) return payload.webm;
         const inspected = self.video_inspection orelse return null;
         if (!inspected.matches(payload)) return error.InvalidVideoReaderSelection;
-        if (inspected.adapted) |*adapted| return .{ .reader = &adapted.reader, .index = &adapted.index };
+        if (inspected.webm) |*webm| return .{ .reader = &webm.reader, .index = &webm.index, .reference_owner = inspected };
         return null;
     }
 };
@@ -767,23 +767,33 @@ pub fn embedCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
 /// Indexed readers need packet/picture metadata and one bounded probe payload.
 /// Unknown container inputs retain the full conservative parsing ceiling.
 fn preflightHostBytes(group: Group) !usize {
-    var count: usize = 0;
+    const ceiling = 512 * 1024 * 1024;
+    var indexed_pictures: ?usize = null;
+    var bound_bytes: usize = 0;
     for (group.content) |part| switch (part) {
         .video => |bytes| {
-            const input = try group.webmInput(bytes) orelse return 512 * 1024 * 1024;
-            count = try std.math.add(usize, count, input.index.pictures.len);
+            const input = try group.webmInput(bytes) orelse return ceiling;
+            if (try input.referenceOrdinals()) |ids| {
+                // The source owns the index and selection. Preflight only
+                // retains its inspection wrapper and a bounded copy of IDs.
+                bound_bytes = try std.math.add(usize, bound_bytes, @sizeOf(@import("embedding_gemma2_video.zig").Inspection) + std.mem.sliceAsBytes(ids).len);
+            } else indexed_pictures = try std.math.add(usize, indexed_pictures orelse 0, input.index.pictures.len);
         },
         .sampled_video => |movie| {
             // An unbound AVC reader may reconstruct pictures to establish its
             // logical index (fields/partitions). Only a bound selection proves
             // that inspection needs metadata rather than decoder references.
-            if (movie.reader != null and movie.selection == null) return 512 * 1024 * 1024;
-            const n = if (movie.reader) |reader| reader.packets.len else if (movie.webm) |webm| if (webm.timeline != null and movie.sampling != .reference) @as(usize, 32) else webm.index.pictures.len else return 512 * 1024 * 1024;
-            count = try std.math.add(usize, count, n);
+            if (movie.reader != null and movie.selection == null) return ceiling;
+            const n = if (movie.reader) |reader| reader.packets.len else if (movie.webm) |webm| if (webm.timeline != null and movie.sampling != .reference) @as(usize, 32) else webm.index.pictures.len else return ceiling;
+            indexed_pictures = try std.math.add(usize, indexed_pictures orelse 0, n);
         },
         else => {},
     };
-    return @min(@as(usize, 512 * 1024 * 1024), try std.math.add(usize, 64 * 1024 * 1024, try std.math.mul(usize, count, 512)));
+    if (indexed_pictures) |count| {
+        const metadata = try std.math.add(usize, 64 * 1024 * 1024, try std.math.mul(usize, count, 512));
+        bound_bytes = try std.math.add(usize, bound_bytes, metadata);
+    }
+    return @min(ceiling, bound_bytes);
 }
 
 fn nativeTextGroup(session: Session, group: Group, options: Options) bool {
@@ -4834,6 +4844,34 @@ test "embeddinggemma2 video lookahead cancellation precedes model admission and 
     var pool = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
     try std.testing.expectError(error.Timeout, VideoAhead.start(undefined, .{ .sampling = .reference }, .{ .deadline_ns = 0 }, null, &pool, .{}));
     try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+}
+
+test "embeddinggemma2 native WebM reuses the admitted index and reference ordinals" {
+    const pipeline = @import("embedding_gemma2_video.zig");
+    const a = std.testing.allocator;
+    inline for (.{ "vp8.webm", "vp9.webm", "av1.webm" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name);
+        var inspection = pipeline.PixelInspection{};
+        defer inspection.deinit();
+        const pixels = try inspection.inspect(bytes, .{}, .reference);
+        try std.testing.expect(inspection.prepared == null);
+        try std.testing.expectEqual(error.UnsupportedVideoFormat, inspection.cuda_error.?);
+        const group = Group{ .content = &.{.{ .video = bytes }}, .video_inspection = &inspection };
+        const input = (try group.webmInput(bytes[0..bytes.len])).?;
+        const selected = (try input.referenceOrdinals()).?;
+        try std.testing.expect(input.index.reader == input.reader);
+        try std.testing.expectEqual(@sizeOf(pipeline.Inspection) + std.mem.sliceAsBytes(selected).len, try preflightHostBytes(group));
+        const mixed = Group{ .content = &.{ .{ .text = "caption" }, .{ .video = bytes } }, .video_inspection = &inspection };
+        try std.testing.expectEqual(try preflightHostBytes(group), try preflightHostBytes(mixed));
+        inspection.portable_source.limits.max_reads = inspection.portable_source.reads;
+        var scope = pipeline.InspectionScope{ .allocator = a };
+        defer scope.deinit();
+        const plan = try pipeline.inspectConfiguredPlan(a, bytes, null, .{}, .{ .webm = input, .inspection_scope = &scope }, false);
+        try std.testing.expectEqual(try preflightHostBytes(group), scope.retainedBytes());
+        try std.testing.expectEqual(pixels, plan.pixels);
+        try std.testing.expectEqual(selected.len, plan.pictures);
+        for (selected, plan.picture_indexes[0..plan.pictures]) |expected, actual| try std.testing.expectEqual(expected, actual);
+    }
 }
 
 test "embeddinggemma2 video execution bounds scale with inspected shape and retain unknown media ceiling" {

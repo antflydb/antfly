@@ -1851,7 +1851,7 @@ pub fn createGemma4CudaQualificationSession(allocator: std.mem.Allocator, model_
         const cfg = getGptConfig(session) orelse return error.WrongArchitecture;
         if (compute.gemma4_dense_qualified and @import("../ops/cuda/ple_host.zig").eligibleConfig(cfg) and
             compute.ctx.info.compute_major == 12 and compute.ctx.info.compute_minor == 1)
-            try compute.configureGemma4Projector(true);
+            try compute.configureGemma4Projector(.qualification);
     }
     return session;
 }

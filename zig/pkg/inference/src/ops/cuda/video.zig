@@ -126,7 +126,7 @@ fn mp4Limits(extended: bool) media.mp4.Limits {
 
 fn decodeLimits(sampling: Sampling) media.mp4.Limits {
     var limits = mp4Limits(true);
-    if (sampling == .gemma4) {
+    if (sampling != .presentation_seconds) {
         // Track choice belongs to the model. NVDEC capability is checked on
         // that track, so a fallback cannot change the content of the prompt.
         limits.codecs = @import("antfly_video").mp4_coded.limits.codecs;
@@ -135,7 +135,7 @@ fn decodeLimits(sampling: Sampling) media.mp4.Limits {
     return limits;
 }
 
-test "gemma4 video NVDEC selects the admission track before checking codec support" {
+test "model video NVDEC selects the admission track before checking codec support" {
     const a = std.testing.allocator;
     const bytes = try a.dupe(u8, @embedFile("../../testdata/video/codecs/hevc-avc-tracks.mp4"));
     defer a.free(bytes);
@@ -146,10 +146,13 @@ test "gemma4 video NVDEC selects the admission track before checking codec suppo
     @memcpy(bytes[entry..][0..4], "jpeg");
     @memcpy(bytes[config..][0..4], "free");
     const expected = try media.mp4.probeTrack(bytes, @import("antfly_video").mp4_coded.limits, .{});
-    const chosen = try media.mp4.probeTrack(bytes, decodeLimits(.gemma4), .{});
     try std.testing.expectEqual(media.mp4.Codec.mjpeg, expected.codec);
-    try std.testing.expectEqual(expected.id, chosen.id);
-    try std.testing.expectError(error.UnsupportedVideoFormat, validateTrack(chosen));
+    try std.testing.expectError(error.UnsupportedVideoFormat, inspectEmbedding(a, bytes, .{}));
+    for ([_]Sampling{ .gemma4, .embedding_gemma2 }) |model| {
+        const chosen = try media.mp4.probeTrack(bytes, decodeLimits(model), .{});
+        try std.testing.expectEqual(expected.id, chosen.id);
+        try std.testing.expectError(error.UnsupportedVideoFormat, validateTrack(chosen));
+    }
 }
 
 test "embeddinggemma2 video HEVC AV1 and AVC NVDEC pixels match independent FFmpeg samples across codec changes" {
@@ -464,7 +467,7 @@ fn embeddingSelection(a: std.mem.Allocator, reader: *media.mp4.Reader) !DisplayP
     defer a.free(counts);
     var total: usize = 0;
     for (counts) |count| {
-        if (count > nvdec_max_samples - total) return error.ResourceLimitExceeded;
+        if (count > nvdec_max_samples - total) return error.DecoderEnvelopeExceeded;
         total += count;
     }
     const Picture = struct { pts: i64, duration: u32, first_packet: usize };
@@ -516,13 +519,13 @@ pub const Av1ReferencePlan = struct {
     largest_picture: u64,
     plan: DisplayPlan,
 
-    fn readerFor(self: *const Av1ReferencePlan, bytes: []const u8, limits: media.mp4.Limits, control: media.source.Control) !?*const media.mp4.Reader {
+    fn readerFor(self: *const Av1ReferencePlan, bytes: []const u8, limits: media.mp4.Limits, control: media.source.Control) !*const media.mp4.Reader {
         const source = self.original.input.storage;
         if (source != .borrowed or source.borrowed.ptr != bytes.ptr or source.borrowed.len != bytes.len) return error.InvalidVideoReaderSelection;
-        // The route may select another track or reject dimensions in another
-        // sample description. Check the CUDA policy without expanding tables.
+        // Enforce CUDA geometry limits and the bound track identity without
+        // expanding sample tables or selecting a different track.
         const track = try media.mp4.probeTrack(bytes, limits, control);
-        if (track.codec != .av1 or track.id != self.original.track.id) return null;
+        if (track.codec != .av1 or track.id != self.original.track.id) return error.InvalidVideoReaderSelection;
         if (self.original.packets.len > limits.max_samples) return limits.track_limit_error;
         return self.original;
     }

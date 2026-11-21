@@ -22,6 +22,8 @@ pub const Kernel = struct {
     function: driver.CUfunction = null,
     widen: driver.CUfunction = null,
     split: driver.CUfunction = null,
+    split_rounded: driver.CUfunction = null,
+    finish_projection: driver.CUfunction = null,
 
     pub fn deinit(self: *Kernel, ctx: *context.CudaContext) void {
         if (self.module != null) {
@@ -43,19 +45,42 @@ pub const Kernel = struct {
             try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&widen, module, "widen_16bit"));
             var split: driver.CUfunction = null;
             try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&split, module, "split_bf16_terms"));
-            self.* = .{ .module = module, .function = function, .widen = widen, .split = split };
+            var rounded: driver.CUfunction = null;
+            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rounded, module, "split_rounded_terms"));
+            var finish: driver.CUfunction = null;
+            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&finish, module, "finish_projection"));
+            self.* = .{ .module = module, .function = function, .widen = widen, .split = split, .split_rounded = rounded, .finish_projection = finish };
         }
     }
 
-    pub fn splitBf16(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, outputs: [3]driver.CUdeviceptr, count: usize) !void {
+    pub fn finishProjection(self: *Kernel, ctx: *context.CudaContext, output: driver.CUdeviceptr, correction: driver.CUdeviceptr, input: driver.CUdeviceptr, weights: driver.CUdeviceptr, rows: usize, in_dim: usize, out_dim: usize, bf16: bool) !void {
+        const count = try std.math.mul(usize, rows, out_dim);
+        if (in_dim == 0 or in_dim > std.math.maxInt(u32) or count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        if (count == 0) return;
+        try self.init(ctx);
+        var dst = output;
+        var addend = correction;
+        var src = input;
+        var w = weights;
+        var n: u32 = @intCast(count);
+        var inner: u32 = @intCast(in_dim);
+        var cols: u32 = @intCast(out_dim);
+        var format: u32 = @intFromBool(bf16);
+        var args = [_]?*anyopaque{ &dst, &addend, &src, &w, &n, &inner, &cols, &format };
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.finish_projection, @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        ctx.noteKernelLaunch();
+    }
+
+    pub fn splitProjector(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, outputs: [3]driver.CUdeviceptr, count: usize, bf16: bool, nearest_even: bool) !void {
         if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
         if (count == 0) return;
         try self.init(ctx);
         var src = input;
         var planes = outputs;
         var n: u32 = @intCast(count);
-        var args = [_]?*anyopaque{ &src, &planes[0], &planes[1], &planes[2], &n };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.split, @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        var format: u32 = @intFromBool(bf16);
+        var args = [_]?*anyopaque{ &src, &planes[0], &planes[1], &planes[2], &n, &format };
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(if (nearest_even) self.split_rounded else self.split, @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
     }
 
