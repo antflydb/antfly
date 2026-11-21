@@ -145,6 +145,7 @@ pub fn prepareWithOptions(allocator: std.mem.Allocator, program: *const ModelPro
             if (binding.kind == .state_input or binding.kind == .state_output) {
                 pool.cuda_frame_dispatch = false;
                 pool.metal_frame_dispatch = false;
+                pool.metal_row_region_candidate = false;
             }
         };
     }
@@ -2689,6 +2690,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
     pool.native_frame_dispatch = false;
     pool.cuda_frame_dispatch = false;
     pool.metal_frame_dispatch = false;
+    pool.metal_row_region_candidate = false;
     pool.coverage_backend = .{ .ptr = executable.runtime.default_backend.ptr, .vtable = executable.runtime.default_backend.vtable };
     if (comptime @import("build_options").enable_metal) {
         if (executable.runtime.default_backend.kind() == .metal and @import("device_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
@@ -2715,22 +2717,35 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
             };
             defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             if (metadata.token() == null) return;
+            const Executor = @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor;
+            const row_head = if (ops.kernel_descriptor.projectionHead(graph)) |head|
+                head.form == .independent and head.linears[0].operation.linear.rows == 1
+            else
+                false;
+            var active_partitions: usize = 0;
             for (plan.base.partitions, 0..) |part, index| {
                 var active = false;
+                var active_compute = false;
                 for (part.node_ids) |id| {
                     if (id >= analysis.reachable.len) return;
                     if (!analysis.reachable[id]) continue;
                     if (plan.base.node_assignment[id] != index or graph.node(id).op == .fused_from_float32) return;
                     active = true;
+                    active_compute = active_compute or graph.node(id).op != .parameter;
                 }
                 if (!active) continue;
                 if (part.backend != .metal or plan.device_assignment[index] != 0) return;
+                if (row_head and !active_compute) continue;
+                active_partitions += 1;
                 const actual = part.executor orelse return;
                 var owned = false;
                 for (compiled) |cached| if (cached.partition_idx == index and actual.ptr == cached.executor.ptr and actual.vtable == cached.executor.vtable) {
                     owned = true;
                 };
-                if (!owned or !try @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
+                if (!owned) return;
+                if (row_head) {
+                    if (active_partitions != 1 or !Executor.ownsPartition(actual, graph, executable.runtime.default_backend)) return;
+                } else if (!try Executor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
             }
             for (analysis.reachable, 0..) |active, id| {
                 if (!active) continue;
@@ -2742,7 +2757,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 };
                 if (count != 1) return;
             }
-            pool.metal_frame_dispatch = true;
+            pool.metal_row_region_candidate = row_head and active_partitions == 1;
+            pool.metal_frame_dispatch = !row_head;
             return;
         }
     }

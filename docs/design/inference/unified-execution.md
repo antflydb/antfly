@@ -671,7 +671,10 @@ preparation API do not by themselves complete these remaining requirements:
   refunds. Models sharing a backend and admission Domain share the same cache
   binding, counted once by held-model conservation snapshots. Mixed graphs,
   MPS/MPP selectors, raw receivers and direct decoder APIs retain compatibility
-  ownership. These regions receive no complete-payload quota credit.
+  ownership. Canonical single-partition row-one pair and QKV heads can use
+  complete payload accounting when the prepared synchronous region owns every
+  output and validates the exact resident activation at execution. Packed
+  multirow and mixed scopes keep their conservative admission.
 - CUDA prepared projections describe eligible BF16-rounded output separately
   from F32 publication, activation conversion and vendor workspace. Cold
   preparation loads the original widening program; dispatch retains the

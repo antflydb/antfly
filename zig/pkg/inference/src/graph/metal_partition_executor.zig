@@ -1587,13 +1587,18 @@ pub const MetalPartitionExecutor = struct {
         return &self.pe;
     }
 
+    pub fn ownsPartition(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend) bool {
+        if (actual.vtable != &vtable or backend.kind() != .metal or !ownedFramePolicyAvailable()) return false;
+        const self: *const MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
+        return self.owned and self.graph == graph and self.backend.ptr == backend.ptr and self.backend.vtable == backend.vtable;
+    }
+
     /// Cold canonical-executor proof. The caller owns the actual provider's
     /// metadata operation before touching the cached region plan. This reuses
     /// the plan and reachability authority already used by real execution.
     pub fn attestOwnedFrameDispatch(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32) !bool {
-        if (actual.vtable != &vtable or backend.kind() != .metal or !ownedFramePolicyAvailable()) return false;
+        if (!ownsPartition(actual, graph, backend) or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return false;
         const self: *MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
-        if (!self.owned or self.graph != graph or self.backend.ptr != backend.ptr or self.backend.vtable != backend.vtable or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return false;
         for (nodes) |id| {
             if (id >= reachable.len) return false;
             if (!reachable[id]) continue;

@@ -229,6 +229,7 @@ pub const PreparedRoutes = struct {
     /// An exact physical variant may only reuse their original bound handles;
     /// overriding model/literal nodes requires a fresh semantic preparation.
     pub fn validateRuntimeInputs(self: *const PreparedRoutes, inputs: []const @import("../graph/interpreter.zig").RuntimeInput, default_backend: *const ops.ComputeBackend) !void {
+        const verify_row_input = self.pool.metal_row_region_candidate and self.pool.completeOwnedPayload() != null;
         for (inputs) |input| {
             const slot = self.pool.plan.slotForNode(input.node_id) orelse return error.InvalidRuntimeInputNode;
             // Weight initializers can also be parameter-shaped graph nodes.
@@ -236,9 +237,36 @@ pub const PreparedRoutes = struct {
             if (self.immutable.originalTensor(input.node_id)) |original| {
                 const backend = input.source_backend orelse default_backend;
                 if (input.value != original.value or backend.ptr != original.implementation.context or @as(*const anyopaque, backend.vtable) != original.implementation.table) return error.PreparedImmutableBindingChanged;
-            } else if (self.immutable.find(input.node_id) != null or (!slot.roles.runtime_input and slot.kind != .runtime_input)) return error.PreparedImmutableBindingChanged;
+            } else {
+                if (self.immutable.find(input.node_id) != null or (!slot.roles.runtime_input and slot.kind != .runtime_input)) return error.PreparedImmutableBindingChanged;
+                if (verify_row_input) {
+                    const selected = self.pool.selection.?.inputs.find(input.node_id) orelse return error.PreparedRegionBindingChanged;
+                    if (selected != .resident or !try matchesResidentPlane(input.source_backend orelse default_backend, input.value, selected.resident)) return error.PreparedRegionBindingChanged;
+                }
+            }
         }
     }
+
+    fn matchesResidentPlane(backend: *const ops.ComputeBackend, input: ops.CT, fact: @FieldType(route.Binding, "resident")) !bool {
+        if (backend.ptr != fact.implementation.context or @as(*const anyopaque, backend.vtable) != fact.implementation.table or fact.planes.len != 1) return false;
+        const functions = backend.vtable.kernels orelse return false;
+        if (!functions.accepts(backend.vtable)) return false;
+        const query = functions.storageOwnership orelse return false;
+        const Witness = struct {
+            expected: *const @import("storage_ownership.zig").Plane,
+            count: usize = 0,
+            matches: bool = false,
+            fn visit(raw: *anyopaque, report: @import("storage_ownership.zig").Report) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (report != .plane) return;
+                self.count += 1;
+                self.matches = self.count == 1 and std.meta.eql(self.expected.*, report.plane);
+            }
+        };
+        var witness = Witness{ .expected = &fact.planes[0] };
+        return (try query(backend.ptr, input, .{ .context = &witness, .visit = Witness.visit })) == .complete and witness.matches;
+    }
+
     pub fn requiresCleanupContext(self: *PreparedRoutes) bool {
         return self.pool.requiresCleanupContext();
     }

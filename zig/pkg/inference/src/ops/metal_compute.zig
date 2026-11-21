@@ -11444,7 +11444,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
-    const physical_storage_policy: ops.physical_storage.Policy = .{ .allocate = allocatePhysicalRequest, .reservation_bytes = physicalReservationRequest, .mark_admitted = markPhysicalStorageAdmittedOp };
+    const physical_storage_policy: ops.physical_storage.Policy = .{ .minimum_alignment = @alignOf(f32), .allocate = allocatePhysicalRequest, .reservation_bytes = physicalReservationRequest, .mark_admitted = markPhysicalStorageAdmittedOp };
     fn physicalReservationRequest(ctx: *anyopaque, request: ops.physical_storage.Request) anyerror!usize {
         if (request.usage == .ordinary) return physicalStorageReservationBytesOp(ctx, request.byte_size);
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -11697,7 +11697,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .context = ctx, .implementation = request.implementation, .requirements = request.requirements, .slot = request.slot, .index_bounds = request.index_bounds, .vtable = &host_input_table };
     }
 
-    const owned_payload_services: @import("kernel_backend.zig").OwnedPayloadServices = .{ .accepts = acceptsPhysicalImplementation, .available = ownedPayloadAvailable, .input = ownedPayloadInput, .route = ownedPayloadRoute };
+    const owned_payload_services: @import("kernel_backend.zig").OwnedPayloadServices = .{ .accepts = acceptsPhysicalImplementation, .available = ownedPayloadAvailable, .input = ownedPayloadInput, .route = ownedPayloadRoute, .region = ownedPayloadRegion };
+    fn ownedPayloadRegion(ctx: *anyopaque, owned: *const @import("../execution/region_route.zig").Owned) bool {
+        if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table) or
+            owned.vtable != &DenseProjectionRegion.table or owned.policy_key != 1) return false;
+        const self: *const DenseProjectionRegion = @ptrCast(@alignCast(owned.context));
+        if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or self.count < 2 or self.count > 3 or
+            self.packed_request != null or self.scratch_bytes != 0 or owned.entry_node != self.nodes[0]) return false;
+        const need = owned.requirements;
+        if (need.dispatch_workspace.byte_size != 0 or need.dispatch_workspace.host_byte_size != 0 or
+            need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0) return false;
+        return owned.covered_nodes.ptr == &self.nodes and owned.covered_nodes.len == self.count and
+            owned.input_nodes.ptr == &self.inputs and owned.input_nodes.len == self.count + 1 and
+            need.outputs.ptr == &self.outputs and need.outputs.len == self.count;
+    }
     fn ownedPayloadAvailable(ctx: *anyopaque) bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         // The provider/runtime link is initialization-owned, never a read of
@@ -11706,6 +11719,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
     fn ownedPayloadInput(ctx: *anyopaque, binding: @import("../execution/kernel_route.zig").Binding, logical: @import("ml").graph.Shape) !bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (binding == .resident) {
+            const resident = binding.resident;
+            if (resident.implementation.context != ctx or !acceptsPhysicalImplementation(resident.implementation.table) or
+                !resident.logical.eq(logical) or logical.dtype != .f32 or resident.planes.len != 1) return false;
+            const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+            const primary = resident.planes[0];
+            const backing = primary.backing orelse return false;
+            const count = logical.numElements() orelse return false;
+            if (count <= 0) return false;
+            const bytes = std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch return false;
+            const desc = primary.descriptor;
+            return primary.role == .primary and desc.shape.eq(logical) and desc.storage == .metal_buffer and
+                desc.current_backend == .metal and desc.resident_backend == .metal and desc.device_id == 0 and
+                desc.quant_format == null and desc.view_source == null and primary.byte_offset == 0 and
+                primary.logical_bytes == bytes and primary.readable_bytes == bytes and
+                backing.kind == .metal and backing.context == @as(*anyopaque, @ptrCast(runtime)) and backing.base != 0;
+        }
         const known = switch (binding) {
             .tensor => |value| value,
             else => return false,
@@ -11918,14 +11948,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (!committed) direct.deinit();
             const owner = try request.allocator.create(PreparedDenseLinear);
             defer if (!committed) request.allocator.destroy(owner);
-            const payload = compute.provider_impl.pinLinearSlotForPersistentUse(slot) catch |err| switch (err) {
+            const index_held = compute.ownsMetadataIndex();
+            const payload = (if (index_held)
+                compute.provider_impl.pinLinearSlotForPersistentUseWithIndexHeld(slot)
+            else
+                compute.provider_impl.pinLinearSlotForPersistentUse(slot)) catch |err| switch (err) {
                 error.QueueFull, error.PreparedSlotUnavailable => return null,
                 else => return err,
             };
             defer if (!committed) if (payload) |pin| pin.release();
             const epoch = compute.provider_impl.privateSlotDeclaration(.linear, slot);
             const declaration = (if (payload) |pin|
-                compute.provider_impl.pinCachedLinearDeclaration(slot, epoch, pin)
+                (if (index_held)
+                    compute.provider_impl.pinCachedLinearDeclarationWithIndexHeld(slot, epoch, pin)
+                else
+                    compute.provider_impl.pinCachedLinearDeclaration(slot, epoch, pin))
             else
                 compute.provider_impl.pinPrivateLinearDeclaration(slot, epoch)) catch |err| switch (err) {
                 error.QueueFull, error.PreparedSlotUnavailable, error.ForeignPreparedSlotOwner => return null,
@@ -55036,6 +55073,16 @@ const PreparedDenseRegionFixture = struct {
         const selected = (try pool.prepareRoutesWithProfile(&.{activation}, .select_regions, profile.profile)) orelse return error.MissingPreparedRoutes;
         defer selected.release();
         try std.testing.expectEqual(@as(usize, 1), selected.pool.regions.len);
+        try std.testing.expect(pool.metal_row_region_candidate);
+        const coverage = selected.pool.completeOwnedPayload() orelse {
+            std.debug.print("Metal assigned row coverage: {any}\n", .{selected.pool.payload_coverage});
+            return error.MissingOwnedPayloadWitness;
+        };
+        try std.testing.expectEqual(.device, coverage.accounting_class);
+        try std.testing.expectEqual(expected.len, coverage.operations);
+        try selected.validateRuntimeInputs(inputs[0..parameter_count], &cb);
+        const wrong = [_]interpreter.RuntimeInput{.{ .node_id = nodes[0], .value = values[1], .source_backend = &cb }};
+        try std.testing.expectError(error.PreparedRegionBindingChanged, selected.validateRuntimeInputs(&wrong, &cb));
         // Raw execution cannot invent payload ownership after admission. Model
         // preparation obtains these claims before its quota handoff as well.
         try std.testing.expectError(error.PreparedRegionClaimRequired, executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_execution_profile = &profile, .output_placement = .producer, .activation_readbacks = .forbidden }));

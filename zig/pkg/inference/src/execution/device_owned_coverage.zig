@@ -147,8 +147,11 @@ fn completeRegion(pool: *const physical.Pool, installed: *const @import("region_
     const owner = installed.owner;
     const need = owner.requirements;
     if (installed.epoch != epoch or installed.key != owner.key or installed.backend_index >= pool.backends.len or
-        !need.replacementEligible() or need.requires_execution_profile or need.payload_claim_required or need.literals.len != 0 or
+        !need.replacementEligible() or need.payload_claim_required or need.literals.len != 0 or
         owner.covered_nodes.len == 0 or installed.outputs.len != need.outputs.len) return false;
+    const synchronous_row_region = backend.kind() == .metal and pool.metal_row_region_candidate and
+        pool.region_execution_profile == .synchronous;
+    if (need.requires_execution_profile != synchronous_row_region) return false;
     const target = pool.backends[installed.backend_index];
     if (target.ptr != backend.ptr or target.vtable != backend.vtable or owner.implementation.context != backend.ptr or owner.implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable))) return false;
     if (pool.regionForNode(owner.entry_node) != installed) return false;
@@ -219,7 +222,9 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
             .runtime_input => {
                 if (node.op != .parameter or slot.roles.graph_output) return .{ .compatibility = .input_representation };
                 if (selected.inputs.find(@intCast(id))) |binding| {
-                    if ((binding != .imported_host and binding != .imported_device) or !ingress(pool, @intCast(id), slot.desc.shape, target)) return .{ .compatibility = .input_representation };
+                    if (binding == .resident and target.kind() == .metal and pool.metal_row_region_candidate and pool.region_execution_profile == .synchronous) {
+                        if (!(service.input(target.ptr, binding, slot.desc.shape) catch false)) return .{ .compatibility = .input_representation };
+                    } else if ((binding != .imported_host and binding != .imported_device) or !ingress(pool, @intCast(id), slot.desc.shape, target)) return .{ .compatibility = .input_representation };
                 } else {
                     const immutable = pool.immutable_bindings orelse return .{ .compatibility = .input_representation };
                     const binding = immutable.find(@intCast(id)) orelse return .{ .compatibility = .input_representation };
