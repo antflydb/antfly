@@ -28,9 +28,14 @@ const A = std.mem.Allocator;
 pub const Root = struct {
     namespace: control.Namespace,
     physical_range_id: u64 = 0,
+    storage_namespace: ?control.Namespace = null,
     table_name: []const u8,
     table_binding: control.Digest,
     fence: metadata.CatalogRouteFence,
+
+    pub fn storageNamespace(self: Root) control.Namespace {
+        return self.storage_namespace orelse self.namespace;
+    }
 
     fn physicalIdentity(self: Root) ?control.PhysicalRoot {
         if (self.physical_range_id == 0) return null;
@@ -105,8 +110,9 @@ pub const Captured = struct {
         const physical = root.physical orelse return self.find(root.namespace);
         const table = std.mem.readInt(u64, root.namespace[0..8], .big);
         var route = try self.findPhysical(table, physical.group_id, physical.range_id);
-        if (!std.mem.eql(u8, &route.namespace, &root.storageNamespace())) return error.ChangefeedResynchronizationRequired;
+        if (!std.mem.eql(u8, &route.storageNamespace(), &root.storageNamespace())) return error.ChangefeedResynchronizationRequired;
         route.namespace = root.namespace;
+        route.storage_namespace = root.storage_namespace;
         return route;
     }
 
@@ -117,7 +123,7 @@ pub const Captured = struct {
         errdefer a.free(plans);
         for (self.roots, plans, 0..) |root, *plan, index| {
             if (index != 0 and std.mem.eql(u8, &self.roots[index - 1].namespace, &root.namespace)) return error.TopologyChanged;
-            plan.* = .{ .namespace = root.namespace, .ownership_epoch = 1, .physical = root.physicalIdentity() };
+            plan.* = .{ .namespace = root.namespace, .ownership_epoch = 1, .physical = root.physicalIdentity(), .storage_namespace = root.storage_namespace };
         }
         return plans;
     }
@@ -161,7 +167,7 @@ pub const Captured = struct {
     pub fn validateInitialRoutes(self: *const Captured, planned: []const control.Root) !void {
         if (planned.len != self.roots.len) return error.ChangefeedResynchronizationRequired;
         for (planned, self.roots) |root, route| {
-            if (!std.mem.eql(u8, &root.namespace, &route.namespace) or root.ownership_epoch != 1 or root.released or !route.matchesPhysical(root))
+            if (!std.mem.eql(u8, &root.namespace, &route.namespace) or !std.mem.eql(u8, &root.storageNamespace(), &route.storageNamespace()) or root.ownership_epoch != 1 or root.released or !route.matchesPhysical(root))
                 return error.ChangefeedResynchronizationRequired;
         }
     }
@@ -363,15 +369,20 @@ pub const Source = struct {
     /// Authorization must precede capture. Returned locators borrow the owned
     /// generation, so they remain valid even after the publisher retires it.
     pub fn capture(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
-        return self.captureRoutes(a, definition, context, false);
+        return self.captureRoutes(a, definition, context, .unique);
     }
 
     /// Physical topology discovery also includes ranges sharing a document namespace.
     pub fn capturePhysical(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
-        return self.captureRoutes(a, definition, context, true);
+        return self.captureRoutes(a, definition, context, .physical);
     }
 
-    fn captureRoutes(self: Source, a: A, definition: control.Definition, context: Context, allow_shared_namespace: bool) !Captured {
+    /// Give a fresh feed one durable logical cursor per physical range.
+    pub fn captureAdmission(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
+        return self.captureRoutes(a, definition, context, .admission);
+    }
+
+    fn captureRoutes(self: Source, a: A, definition: control.Definition, context: Context, mode: enum { unique, physical, admission }) !Captured {
         try context.ensureActive();
         try definition.validate();
         var budget = self.catalog.budget(null);
@@ -407,7 +418,7 @@ pub const Source = struct {
                 try roots.append(a, .{ .namespace = namespace, .physical_range_id = range.range_id, .table_name = table.name, .table_binding = expected.binding, .fence = fence });
             }
         }
-        std.mem.sort(Root, roots.items, {}, struct {
+        const order = struct {
             fn less(_: void, left: Root, right: Root) bool {
                 return switch (std.mem.order(u8, &left.namespace, &right.namespace)) {
                     .lt => true,
@@ -415,9 +426,20 @@ pub const Source = struct {
                     .eq => left.fence.route.group_id < right.fence.route.group_id,
                 };
             }
-        }.less);
-        if (!allow_shared_namespace) {
-            for (roots.items, 0..) |root, index| if (index != 0 and std.mem.eql(u8, &roots.items[index - 1].namespace, &root.namespace)) return error.TopologyChanged;
+        }.less;
+        std.mem.sort(Root, roots.items, {}, order);
+        if (mode != .physical) {
+            var previous: ?control.Namespace = null;
+            for (roots.items) |*root| {
+                const namespace = root.namespace;
+                if (previous != null and std.mem.eql(u8, &previous.?, &namespace)) {
+                    if (mode == .unique) return error.TopologyChanged;
+                    root.storage_namespace = namespace;
+                    root.namespace = control.splitStreamNamespace(namespace, root.physicalIdentity().?);
+                }
+                previous = namespace;
+            }
+            if (mode == .admission) std.mem.sort(Root, roots.items, {}, order);
         }
         try budget.checkpoint();
         try context.ensureActive();
@@ -593,7 +615,7 @@ pub fn qualifyEnrollmentCut(a: A, source: Source, policy: anytype, captured: *co
             const observation = try source.grants.read(a, route.fence, route.table_name, .{
                 .version = 1,
                 .identity = .{
-                    .namespace = root.namespace,
+                    .namespace = root.storageNamespace(),
                     .authority = state.authority,
                     .consumer = state.consumerId(),
                     .definition = identity,
@@ -750,7 +772,7 @@ pub fn enrollRoot(client: *MetadataClient, policy: anytype, a: A, state: control
     if (table.policy_revision != policy_revision) return error.ChangefeedResynchronizationRequired;
     const native = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
     const grant: native.Grant = .{
-        .namespace = root.namespace,
+        .namespace = item.storageNamespace(),
         .authority = state.authority,
         .consumer = state.consumerId(),
         .definition = definition.identity(),
@@ -883,6 +905,24 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectError(error.ChangefeedResynchronizationRequired, physical.find(parent.namespace));
         try std.testing.expectError(error.TopologyChanged, physical.initialPlans(a));
         try std.testing.expectError(error.TopologyChanged, split_fixture.source().capture(a, definition, .{}));
+        var admission = try split_fixture.source().captureAdmission(a, definition, .{});
+        defer admission.deinit();
+        const split_plans = try admission.initialPlans(a);
+        defer a.free(split_plans);
+        const plan_mutation: control.Mutation = .{ .plan_roots = split_plans };
+        try std.testing.expectEqual(control.shared_namespace_plan_protocol_version, plan_mutation.requiredProtocol());
+        var plan_arena = std.heap.ArenaAllocator.init(a);
+        defer plan_arena.deinit();
+        const plan_allocator = plan_arena.allocator();
+        const stamp: control.Stamp = .{ .incarnation = @splat(9), .sequence = 1 };
+        const enrolling = try (control.Mutation{ .create = .{ .id = @splat(3), .definition = definition, .now = 1, .expires_at = 60 } }).apply(plan_allocator, .{}, stamp);
+        const planned = try plan_mutation.apply(plan_allocator, enrolling, .{ .incarnation = stamp.incarnation, .sequence = 2 });
+        try admission.validateInitialRoutes(planned.roots);
+        try physical.validateInstalledRoutes(planned);
+        const child_cursor = control.splitStreamNamespace(child.namespace, child.physicalIdentity().?);
+        const planned_child = planned.roots[try planned.rootIndex(child_cursor)];
+        try std.testing.expectEqual(child.namespace, planned_child.storageNamespace());
+        try std.testing.expectEqual(child_cursor, (try physical.findInstalled(planned_child)).namespace);
         const stored: control.Root = .{ .namespace = parent.namespace, .ownership_epoch = 1, .grant_sequence = 2, .physical = parent.physicalIdentity() };
         var transition: SplitTransition = .{
             .transition_id = 19,

@@ -473,6 +473,13 @@ pub const Result = union(enum) {
     }
 };
 
+fn isIcebergRoot(definition: control.Definition, namespace: control.Namespace) bool {
+    for (definition.tables) |table| {
+        if (table.contract == .writable_iceberg_rows and std.meta.eql(namespace, control.catalogRootNamespace(table))) return true;
+    }
+    return false;
+}
+
 fn hasIceberg(definition: control.Definition) bool {
     for (definition.tables) |table| if (table.contract == .writable_iceberg_rows) return true;
     return false;
@@ -578,9 +585,9 @@ pub fn inspect(api: *http.ApiHttpServer, backing: A, credential: http.Authentica
         try policy.authorize(state, internal);
     } else {
         const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
-        var captured = try source.capture(a, definition, internal);
+        var captured = try source.capturePhysical(a, definition, internal);
         defer captured.deinit();
-        try captured.validateInitialRoutes(state.roots);
+        try captured.validateInstalledRoutes(state);
         const access = try authorizedTableAccess(api, a, identity, definition, &captured, internal);
         var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
         try policy.authorize(state, internal);
@@ -642,17 +649,20 @@ pub fn renew(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
         const live = latest.value;
         if (live.epoch != parsed.value.epoch or !same(live.authority, parsed.value.authority)) return error.ChangefeedResynchronizationRequired;
         const native_source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
-        var routes = try native_source.capture(scratch, live.definition orelse return error.ChangefeedConflict, internal);
+        var routes = try native_source.capturePhysical(scratch, live.definition orelse return error.ChangefeedConflict, internal);
         defer routes.deinit();
         try routes.validateInstalledRoutes(live);
         var driver: RootPolicy(Policy) = .{ .access = policy, .io = api.inferenceIo(), .source = native_source, .allocator = scratch };
-        for (routes.roots) |route| try source_api.renewRoot(&client, &driver, scratch, live, route, internal);
+        for (live.roots) |root| {
+            if (root.released or isIcebergRoot(definition, root.namespace)) continue;
+            try source_api.renewRoot(&client, &driver, scratch, live, try routes.findInstalled(root), internal);
+        }
         return live.expires_at;
     }
     const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
-    var captured = try source.capture(a, definition, internal);
+    var captured = try source.capturePhysical(a, definition, internal);
     defer captured.deinit();
-    try captured.validateInitialRoutes(parsed.value.roots);
+    try captured.validateInstalledRoutes(parsed.value);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const access = try authorizedTableAccess(api, arena.allocator(), identity, definition, &captured, internal);
@@ -668,7 +678,10 @@ pub fn renew(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
         if (parsed.value.epoch != epoch or !same(parsed.value.authority, authority) or parsed.value.expires_at < expires_at)
             return error.ChangefeedResynchronizationRequired;
     }
-    for (captured.roots) |route| try source_api.renewRoot(&client, &policy, a, parsed.value, route, internal);
+    for (parsed.value.roots) |root| {
+        if (root.released) continue;
+        try source_api.renewRoot(&client, &policy, a, parsed.value, try captured.findInstalled(root), internal);
+    }
     return parsed.value.expires_at;
 }
 
@@ -1503,12 +1516,12 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
     if (input.start == .snapshot_then_changes and source.bootstrap_pages == null) return error.ChangefeedCapabilityUnsupported;
     if (hasIceberg(definition)) {
-        var native_routes = try source.capture(a, try nativeDefinition(scratch, definition), internal);
+        var native_routes = try source.captureAdmission(a, try nativeDefinition(scratch, definition), internal);
         defer native_routes.deinit();
         var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
         return createIceberg(a, &policy, meta, key, definition, input.lease_seconds, .{ .source = source, .captured = &native_routes }, internal);
     }
-    var captured = try source.capture(a, definition, internal);
+    var captured = try source.captureAdmission(a, definition, internal);
     defer captured.deinit();
     if (captured.roots.len == 0) return error.ChangefeedResynchronizationRequired;
     const root = captured.roots[0];
@@ -1757,10 +1770,7 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
             var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .renewing = true };
             for (state.roots) |item| {
                 if (item.released) continue;
-                const catalog_root = for (state.definition.?.tables) |table| {
-                    if (table.contract == .writable_iceberg_rows and std.meta.eql(item.namespace, control.catalogRootNamespace(table))) break true;
-                } else false;
-                if (catalog_root) continue;
+                if (isIcebergRoot(state.definition.?, item.namespace)) continue;
                 const route = try captured.findInstalled(item);
                 if (item.renewed_through < state.expires_at) try source_api.renewRoot(&client, &policy, a, state, route, request);
             }

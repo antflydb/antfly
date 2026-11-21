@@ -181,7 +181,8 @@ pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
 /// Version 124 moves a qualified exported PostgreSQL slot to streaming.
 /// Version 125 coordinates catalog history and publication feeds.
 /// Version 126 persists physical owners in retained history plans.
-pub const current_version: u16 = 126;
+/// Version 127 plans distinct feed roots for ranges sharing a storage namespace.
+pub const current_version: u16 = 127;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

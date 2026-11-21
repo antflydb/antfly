@@ -475,16 +475,14 @@ pub const CatalogReplicationSlots = struct {
         const root = state.roots[try state.rootIndex(namespace)];
         const pin = root.snapshot.?;
         const maintenance = maintenanceContext(context);
-        var captured = try source.capture(a, state.definition.?, maintenance);
+        var captured = try source.captureAdmission(a, state.definition.?, maintenance);
         defer captured.deinit();
-        if (captured.roots.len != state.roots.len) return error.ChangefeedResynchronizationRequired;
-        for (state.roots, captured.roots) |expected, current|
-            if (!std.meta.eql(expected.namespace, current.namespace)) return error.ChangefeedResynchronizationRequired;
+        try captured.validateInitialRoutes(state.roots);
         const selected = try captured.find(namespace);
         var page = try port.read(a, selected.fence, selected.table_name, .{
             .version = 1,
             .request = .{
-                .reference = .{ .namespace = namespace, .authority = state.authority, .consumer = state.consumerId(), .epoch = root.consumer_epoch, .grant = root.grant_sequence, .definition = state.definition.?.identity() },
+                .reference = .{ .namespace = root.storageNamespace(), .authority = state.authority, .consumer = state.consumerId(), .epoch = root.consumer_epoch, .grant = root.grant_sequence, .definition = state.definition.?.identity() },
                 .digest = pin.digest,
                 .after_rows = after,
                 .max_rows = rows,
@@ -1251,7 +1249,7 @@ pub const CatalogSlotEnrollment = struct {
             .projection = .rows,
             .start = if (export_snapshot) .snapshot_then_changes else .now,
         };
-        var captured = try source.capture(scratch, definition, maintenance);
+        var captured = try source.captureAdmission(scratch, definition, maintenance);
         defer captured.deinit();
         if (captured.roots.len == 0 or captured.roots.len > control.max_advances)
             return error.ChangefeedCapabilityUnsupported;

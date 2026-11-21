@@ -144,9 +144,9 @@ def test_pg_recvlogical_resume_after_restart(
                 continue
             raise AssertionError(result.stdout + result.stderr)
 
-    def slot(*action):
+    def slot(*action, name="smoke_slot"):
         subprocess.run(
-            [client, *connection, "--slot=smoke_slot", *action],
+            [client, *connection, f"--slot={name}", *action],
             env=env,
             check=True,
             timeout=40,
@@ -828,6 +828,8 @@ def test_pg_recvlogical_resume_after_restart(
                     floor = expect_markers(
                         [b"after-split-left", b"after-split-right"], floor
                     )
+                    slot("--create-slot", "--plugin=pgoutput", name="post_split")
+                    slot("--drop-slot", name="post_split")
                     _, _, (left, right) = topology_snapshot()
                     request_topology(
                         "merge",

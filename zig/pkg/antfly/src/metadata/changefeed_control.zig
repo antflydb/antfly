@@ -27,6 +27,7 @@ pub const qualified_bootstrap_protocol_version: u16 = 123;
 pub const slot_snapshot_start_protocol_version: u16 = 124;
 pub const provider_history_protocol_version: u16 = 125;
 pub const physical_history_protocol_version: u16 = 126;
+pub const shared_namespace_plan_protocol_version: u16 = 127;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -277,7 +278,7 @@ pub const Root = struct {
         return writePhysicalRootRecord(self, writer);
     }
 };
-fn splitStreamNamespace(namespace: Namespace, physical: PhysicalRoot) Namespace {
+pub fn splitStreamNamespace(namespace: Namespace, physical: PhysicalRoot) Namespace {
     var result = namespace;
     result[8..24].* = hash(.{ .domain = "antfly:changefeed-split-stream:v1", .namespace = namespace, .physical = physical })[0..16].*;
     return result;
@@ -287,6 +288,7 @@ pub const RootPlan = struct {
     namespace: Namespace,
     ownership_epoch: u64,
     physical: ?PhysicalRoot = null,
+    storage_namespace: ?Namespace = null,
 
     pub fn jsonStringify(self: RootPlan, writer: anytype) @TypeOf(writer.*).Error!void {
         return writePhysicalRootRecord(self, writer);
@@ -706,8 +708,13 @@ pub const Mutation = union(enum) {
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
             .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
             .prune_merge_donor, .release_merge_donor, .stage_merge_drain, .stage_split_handoff, .release_split_successor, .confirm_split_successor, .activate_split_successor => return physical_history_protocol_version,
-            .plan_roots => |plans| for (plans) |plan| {
-                if (plan.physical != null) return physical_history_protocol_version;
+            .plan_roots => |plans| {
+                var needs_physical = false;
+                for (plans) |plan| {
+                    if (plan.storage_namespace != null) return shared_namespace_plan_protocol_version;
+                    needs_physical = needs_physical or plan.physical != null;
+                }
+                if (needs_physical) return physical_history_protocol_version;
             },
             .seal => |sealed| if (sealed.catalog_starts.len != 0) return provider_history_protocol_version,
             else => {},
@@ -736,7 +743,13 @@ pub const Mutation = union(enum) {
             },
             .plan_roots => |plans| {
                 if (plans.len == 0 or plans.len > max_roots) return error.InvalidChangefeed;
-                for (plans, 0..) |plan, index| if (!nz(plan.namespace) or plan.ownership_epoch == 0 or (plan.physical != null and !plan.physical.?.valid()) or (index != 0 and std.mem.order(u8, &plans[index - 1].namespace, &plan.namespace) != .lt)) return error.InvalidChangefeed;
+                for (plans, 0..) |plan, index| {
+                    if (!nz(plan.namespace) or plan.ownership_epoch == 0 or (plan.physical != null and !plan.physical.?.valid()) or (index != 0 and std.mem.order(u8, &plans[index - 1].namespace, &plan.namespace) != .lt)) return error.InvalidChangefeed;
+                    if (plan.storage_namespace) |namespace| {
+                        const physical = plan.physical orelse return error.InvalidChangefeed;
+                        if (!nz(namespace) or !equal(plan.namespace, splitStreamNamespace(namespace, physical))) return error.InvalidChangefeed;
+                    }
+                }
             },
             .enroll => |value| {
                 if (!nz(value.namespace) or value.ownership_epoch == 0 or value.grant_sequence == 0 or value.consumer_epoch == 0) return error.InvalidChangefeed;
@@ -998,7 +1011,7 @@ pub const Mutation = union(enum) {
             .plan_roots => |plans| {
                 if (state.phase != .enrolling or state.roots.len != 0 or plans.len == 0 or plans.len > max_roots) return error.ChangefeedConflict;
                 const roots = try a.alloc(Root, plans.len);
-                for (plans, roots) |plan, *root| root.* = .{ .namespace = plan.namespace, .ownership_epoch = plan.ownership_epoch, .grant_sequence = stamp.sequence, .physical = plan.physical };
+                for (plans, roots) |plan, *root| root.* = .{ .namespace = plan.namespace, .ownership_epoch = plan.ownership_epoch, .grant_sequence = stamp.sequence, .physical = plan.physical, .storage_namespace = plan.storage_namespace };
                 next.roots = roots;
             },
             .enroll => |enrollment| {
@@ -2777,4 +2790,46 @@ test "changefeed control binds artifact offsets to the enrolled physical root ge
     try std.testing.expectEqual(@as(u64, 10), state.roots[1].acknowledged.sequence);
     state = try step(a, state, .{ .renew_catalog = .{ .now = 200, .expires_at = 2000 } });
     try std.testing.expect(!state.renewal_pending);
+}
+
+test "an enrollment plan preserves distinct cursors for a shared storage namespace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parent = testNamespace(7);
+    const physical: PhysicalRoot = .{ .group_id = 22, .range_id = 22 };
+    const child = splitStreamNamespace(parent, physical);
+    const table: Table = .{ .table_id = 7, .binding = @splat(3), .policy_revision = 1, .contract = .native_document };
+    const definition: Definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{table} };
+    const id: Id = @splat(4);
+    const incarnation: Digest = @splat(5);
+    const state = try (Mutation{ .create = .{ .id = id, .definition = definition, .now = 1, .expires_at = 60 } }).apply(a, .{}, .{ .incarnation = incarnation, .sequence = 1 });
+    var plans = [_]RootPlan{
+        .{ .namespace = parent, .physical = .{ .group_id = 11, .range_id = 11 }, .ownership_epoch = 1 },
+        .{ .namespace = child, .physical = physical, .ownership_epoch = 1, .storage_namespace = parent },
+    };
+    std.mem.sort(RootPlan, &plans, {}, struct {
+        fn less(_: void, left: RootPlan, right: RootPlan) bool {
+            return std.mem.order(u8, &left.namespace, &right.namespace) == .lt;
+        }
+    }.less);
+    const bytes = try encodeWrite(a, .{
+        .id = id,
+        .authority = incarnation,
+        .owner = definition.owner,
+        .authorization = definition.authorization,
+        .expected_revision = state.revision,
+        .expected_epoch = state.epoch,
+        .mutation = .{ .plan_roots = &plans },
+    });
+    try std.testing.expectEqual(shared_namespace_plan_protocol_version, requiredProtocolEncoded(bytes));
+    var write = try parseWrite(a, bytes);
+    defer write.deinit();
+    const planned = try write.value.apply(a, state, 2);
+    var recovered = try parse(a, try encode(a, planned));
+    defer recovered.deinit();
+    try std.testing.expectEqual(parent, recovered.value.roots[try recovered.value.rootIndex(parent)].storageNamespace());
+    const successor = recovered.value.roots[try recovered.value.rootIndex(child)];
+    try std.testing.expectEqual(parent, successor.storageNamespace());
+    try std.testing.expectEqual(physical, successor.physical.?);
 }
