@@ -3559,7 +3559,9 @@ pub const Store = struct {
         // -- rather than the flat default; an unbounded (`0`) budget, the
         // common/production case, keeps the full default untouched.
         const redo_log_capacity_bytes = native.NativeFile.redoLogCapacityForBudget(opts.reclamation.max_storage_bytes);
-        const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse) +| (if (use_redo_log) redo_log_capacity_bytes else 0);
+        const frontier_bytes = if (opts.no_sync) 0 else native.NativeFile.default_redo_frontier_reservation_bytes;
+        const redo_reservation = if (use_redo_log) redo_log_capacity_bytes +| frontier_bytes else 0;
+        const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse) +| redo_reservation;
         if (opts.reclamation.max_storage_bytes != 0 and minimum > opts.reclamation.max_storage_bytes) return error.LiteStorageBudgetExceeded;
         const available = if (opts.reclamation.capacity_probe) |probe|
             try probe.available(probe.context, path)

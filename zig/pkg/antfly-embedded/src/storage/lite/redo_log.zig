@@ -89,6 +89,110 @@ pub const header_len: usize = 32;
 pub const legacy_format_version: u16 = 1;
 pub const legacy_header_len: usize = 24;
 
+/// A durable group frontier, stored separately from the records it covers.
+pub const Frontier = struct {
+    generation: u64,
+    sequence: u64,
+    end_offset: u64,
+
+    pub const encoded_len = 40;
+    const signature = "AFRF\x01\x00\x00\x00";
+
+    pub fn encode(self: Frontier) [encoded_len]u8 {
+        var raw: [encoded_len]u8 = @splat(0);
+        raw[0..8].* = signature.*;
+        std.mem.writeInt(u64, raw[8..16], self.generation, .little);
+        std.mem.writeInt(u64, raw[16..24], self.sequence, .little);
+        std.mem.writeInt(u64, raw[24..32], self.end_offset, .little);
+        std.mem.writeInt(u32, raw[36..40], Crc32.hash(raw[0..36]), .little);
+        return raw;
+    }
+
+    pub fn decode(raw: *const [encoded_len]u8) ?Frontier {
+        if (!std.mem.eql(u8, raw[0..8], signature)) return null;
+        if (std.mem.readInt(u32, raw[36..40], .little) != Crc32.hash(raw[0..36])) return null;
+        return .{
+            .generation = std.mem.readInt(u64, raw[8..16], .little),
+            .sequence = std.mem.readInt(u64, raw[16..24], .little),
+            .end_offset = std.mem.readInt(u64, raw[24..32], .little),
+        };
+    }
+};
+
+/// The two offsets must lie in separate failure units outside the log.
+pub const FrontierSlots = struct {
+    offsets: [2]u64,
+
+    pub const Published = struct {
+        slot: u1,
+        frontier: Frontier,
+    };
+
+    pub fn readLatest(self: FrontierSlots, file: File, io: Io) !?Published {
+        var latest: ?Published = null;
+        for (self.offsets, 0..) |offset, i| {
+            var raw: [Frontier.encoded_len]u8 = undefined;
+            if (try file.readPositionalAll(io, &raw, offset) != raw.len) continue;
+            const frontier = Frontier.decode(&raw) orelse continue;
+            if (latest) |prior| {
+                if (frontier.sequence < prior.frontier.sequence) continue;
+                if (frontier.sequence == prior.frontier.sequence) {
+                    if (!std.meta.eql(frontier, prior.frontier)) return error.ConflictingRedoFrontiers;
+                    continue;
+                }
+            }
+            latest = .{ .slot = @intCast(i), .frontier = frontier };
+        }
+        return latest;
+    }
+
+    /// The caller must sync the redo bytes before calling this under writer
+    /// authority and sync again after writing the slot. After an I/O error
+    /// the covered redo bytes must be retained until reconciliation.
+    pub fn writeNext(self: FrontierSlots, file: File, io: Io, previous: ?Published, frontier: Frontier) !Published {
+        const slot: u1 = if (previous) |prior| next: {
+            if (frontier.sequence <= prior.frontier.sequence) return error.RedoFrontierOutOfOrder;
+            break :next prior.slot ^ 1;
+        } else 0;
+        const raw = frontier.encode();
+        try file.writePositionalAll(io, &raw, self.offsets[slot]);
+        return .{ .slot = slot, .frontier = frontier };
+    }
+};
+
+test "redo frontier slots retain the preceding publication after a torn slot write" {
+    const io = std.testing.io;
+    var region = try makeTempRegion(io, 8192);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+    const slots: FrontierSlots = .{ .offsets = .{ 0, 4096 } };
+    try std.testing.expect(try slots.readLatest(region.file, io) == null);
+    const first = try slots.writeNext(region.file, io, null, .{ .generation = 12, .sequence = 97, .end_offset = 60 });
+    try region.file.sync(io);
+    const second = try slots.writeNext(region.file, io, first, .{ .generation = 12, .sequence = 101, .end_offset = 92 });
+    try region.file.sync(io);
+    try std.testing.expect(first.slot != second.slot);
+    try std.testing.expectEqual(second, (try slots.readLatest(region.file, io)).?);
+
+    try region.file.writePositionalAll(io, &[_]u8{0}, slots.offsets[second.slot]);
+    try std.testing.expectEqual(first, (try slots.readLatest(region.file, io)).?);
+}
+
+test "redo frontier rejects a torn publication" {
+    const durable: Frontier = .{ .generation = 12, .sequence = 97, .end_offset = 4096 };
+    const next: Frontier = .{ .generation = 12, .sequence = 98, .end_offset = 4198 };
+    const raw = durable.encode();
+    try std.testing.expectEqual(durable, Frontier.decode(&raw).?);
+    for (raw, 0..) |_, i| {
+        var damaged = raw;
+        damaged[i] ^= 1;
+        try std.testing.expect(Frontier.decode(&damaged) == null);
+    }
+    var torn = raw;
+    const next_raw = next.encode();
+    torn[0..32].* = next_raw[0..32].*;
+    try std.testing.expect(Frontier.decode(&torn) == null);
+}
+
 pub const RecordHeader = struct {
     magic: u32 = magic,
     format_version: u16 = format_version,
@@ -559,6 +663,7 @@ pub const ReplayOutcome = struct {
     /// baseline passed in if no record was replayed.
     last_sequence: ?u64,
     stop_reason: StopReason,
+    generation: ?u64 = null,
 };
 
 /// `replay`'s own I/O and allocation failures. Its actual return type is
@@ -671,15 +776,15 @@ pub fn replayBounded(
         const remaining = capacity - pos;
         const header, const record_header_len = switch (try readHeaderAt(file, io, base_offset + pos, remaining)) {
             // Too little room left for any header: the region's end.
-            .short => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (remaining < legacy_header_len) .end_of_region else .torn_tail },
+            .short => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = if (remaining < legacy_header_len) .end_of_region else .torn_tail },
             // The append writes the payload and trailer before its
             // header. At a zero header those bytes cannot distinguish an
             // interrupted append from an erased record. The durable
             // sequence promised by the caller is checked at recovery.
-            .zero => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region },
+            .zero => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .end_of_region },
             // This run's end. A retired run's trailer (another salt) past a
             // lost one is the end too, after a restart.
-            .trailer => |trailer| return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = stop: {
+            .trailer => |trailer| return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = stop: {
                 const salt = run_salt orelse break :stop .end_of_region;
                 if (trailer.salt == salt) break :stop if (trailer.sequence == (last_sequence orelse 0)) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence);
                 break :stop if (restartable) .end_of_region else .corrupt_record;
@@ -690,7 +795,7 @@ pub fn replayBounded(
             // Unparseable bytes after the first record of a log that has
             // been folded (the only kind ever restarted) may be the middle
             // of a retired record: the end, as in point-in-time recovery.
-            .garbage => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) },
+            .garbage => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) },
             .record => |record| .{ record.header, record.len },
         };
         // A retired record, or retired payload bytes that happen to read as
@@ -716,16 +821,16 @@ pub fn replayBounded(
                 var corrected = header;
                 corrected.salt = salt;
                 if (corrected.checksum(payload_buf.items) == header.crc32) {
-                    return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+                    return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .corrupt_record };
                 }
             }
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (retired and restartable) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) };
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = if (retired and restartable) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) };
         };
 
         if (max_sequence) |ceiling| {
             const new_record = start_after_sequence == null or header.commit_sequence > start_after_sequence.?;
             if (new_record and header.commit_sequence > ceiling) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .durable_ceiling };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .durable_ceiling };
             }
         }
 
@@ -734,7 +839,7 @@ pub fn replayBounded(
             // A decoded header from this run cannot claim bytes past
             // the extent. Fail closed even for old records that were
             // allowed to fill the extent without an end trailer.
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .corrupt_record };
         }
 
         payload_buf.clearRetainingCapacity();
@@ -742,12 +847,12 @@ pub fn replayBounded(
         if (payload_len != 0) {
             const payload_got = try file.readPositionalAll(io, payload_buf.items, base_offset + pos + record_header_len);
             if (payload_got < payload_len) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .torn_tail };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .torn_tail };
             }
         }
 
         if (header.checksum(payload_buf.items) != header.crc32) {
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .corrupt_record };
         }
 
         // Superseded, not corrupt: a structurally valid, correctly
@@ -799,13 +904,13 @@ pub fn replayBounded(
             const baseline = start_after_sequence.?;
             const covered_jump = header.commit_sequence > baseline + 1 and unlogged_through != null and header.commit_sequence - 1 <= unlogged_through.?;
             if (header.commit_sequence != baseline + 1 and !covered_jump) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .corrupt_record };
             }
             in_superseded_run = false;
         } else if (last_sequence) |last| {
             const covered_jump = header.commit_sequence > last + 1 and unlogged_through != null and header.commit_sequence - 1 <= unlogged_through.?;
             if (header.commit_sequence != last + 1 and !covered_jump) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .corrupt_record };
             }
         }
 

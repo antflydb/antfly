@@ -1835,6 +1835,30 @@ checkpoint regardless, so this loses nothing a workload would need.
 
 ### 9.5 Recovery: last durable checkpoint plus a validated log prefix
 
+#### Protected redo files (native format v12)
+
+Durable redo commits use two ordered barriers per group. The writer
+appends the existing compact redo records, flushes them, writes a
+checksummed frontier to the alternate slot, and flushes again before
+acknowledging the group. The two slots reserve independent pages
+immediately before the redo extent. Each frontier records the run salt,
+last covered sequence, and end offset. The shared lock region continues
+to supply the fast path for concurrent readers.
+
+On cold recovery the frontier bounds replay. Unless the disk checkpoint
+has already folded the promised sequence, recovery must reach the
+frontier's sequence, ending offset, and run salt. Later bytes can be
+replaced by the next append. A failed frontier write or flush leaves the
+group outcome unknown. The writer retains the redo bytes and any
+referenced pages and requires reopening before another write.
+
+The idle checkpointer publishes the folded checkpoint before recycling
+the redo extent, and reader pins can defer that recycle. Each restart
+assigns a new salt. Vacuum creates a fresh protected extent and an empty
+frontier covered by its checkpoint. Existing v11 redo files keep their
+legacy format until vacuum replaces them. New durable redo files use
+v12 at creation. A v11-only binary refuses to open a v12 file.
+
 Recovery becomes: open the on-disk checkpoint (still the v8/v9 slot
 mechanism's job -- `recoverActiveCheckpoint`, native.zig:15357-15420,
 unchanged in its own slot/manifest validation), then replay the log
