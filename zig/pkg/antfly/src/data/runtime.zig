@@ -7334,6 +7334,7 @@ pub const DataServer = struct {
         api_server_cfg.native_history_bootstrap_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyBootstrapPageOperation } else null;
         api_server_cfg.native_artifact_history = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = artifactHistoryLocalOperation } else null;
         api_server_cfg.native_split_cut = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = splitHistoryCutLocalOperation } else null;
+        api_server_cfg.native_merge_cut = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = mergeHistoryCutLocalOperation } else null;
         api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
         api_server_cfg.native_history_grant = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyGrantOperation } else null;
         api_server_cfg.native_history_resolution = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyResolutionOperation } else null;
@@ -13741,7 +13742,7 @@ pub const DataServer = struct {
     /// Request-scoped feed-root transport. HTTP ingress continues to use the
     /// local-only callback so a forwarded request cannot bounce between peers.
     pub fn historyRootsSource(self: *DataServer) @import("../api/history_roots.zig").Source {
-        return .{ .catalog = self.write_source.catalog, .controls = self.historyControlPort(), .pages = self.historyPagePort(), .bootstrap_pages = self.historyBootstrapPagePort(), .grants = self.historyGrantPort(), .artifact_owners = self.historyOwnerPort(), .artifact_history = .{ .ptr = self, .read_fn = artifactHistoryRoutedOperation }, .split_cut = .{ .ptr = self, .read_fn = splitHistoryCutRoutedOperation } };
+        return .{ .catalog = self.write_source.catalog, .controls = self.historyControlPort(), .pages = self.historyPagePort(), .bootstrap_pages = self.historyBootstrapPagePort(), .grants = self.historyGrantPort(), .artifact_owners = self.historyOwnerPort(), .artifact_history = .{ .ptr = self, .read_fn = artifactHistoryRoutedOperation }, .split_cut = .{ .ptr = self, .read_fn = splitHistoryCutRoutedOperation }, .merge_cut = .{ .ptr = self, .read_fn = mergeHistoryCutRoutedOperation } };
     }
 
     pub fn historyControlPort(self: *DataServer) @import("../api/history_control_operations.zig").Port {
@@ -13768,13 +13769,14 @@ pub const DataServer = struct {
         return .{ .ptr = self, .read_fn = historyPublicationRoutedOperation };
     }
 
-    const HistoryOperation = enum { control, page, artifact_history, split_cut, bootstrap_page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk, source_checkpoint_observe, source_scope_observe, source_producer_closure_observe, source_producer_control, legacy_terminal_control, legacy_inventory_observe, source_scope_control, source_retirement_control };
+    const HistoryOperation = enum { control, page, artifact_history, split_cut, merge_cut, bootstrap_page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk, source_checkpoint_observe, source_scope_observe, source_producer_closure_observe, source_producer_control, legacy_terminal_control, legacy_inventory_observe, source_scope_control, source_retirement_control };
     fn historyRequestType(comptime kind: HistoryOperation) type {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Request,
             .page => @import("../api/history_page_operations.zig").Request,
             .artifact_history => @import("../api/artifact_history_operations.zig").wire.HistoryRead,
-            .split_cut => @import("../api/split_history_operations.zig").wire.Request,
+            .split_cut => @import("../api/topology_history_operations.zig").Split.wire.Request,
+            .merge_cut => @import("../api/topology_history_operations.zig").Merge.wire.Request,
             .bootstrap_page => @import("../api/history_page_operations.zig").Bootstrap.Request,
             .grant => @import("../api/history_grant_operations.zig").Request,
             .resolution => @import("../api/history_resolution_operations.zig").Request,
@@ -13799,7 +13801,8 @@ pub const DataServer = struct {
             .control => @import("../api/history_control_operations.zig").wire.Response,
             .page => @import("../api/history_page_operations.zig").pages.Page,
             .artifact_history => @import("../api/artifact_history_operations.zig").wire.HistoryObservation,
-            .split_cut => ?@import("../api/split_history_operations.zig").wire,
+            .split_cut => ?@import("../api/topology_history_operations.zig").Split.wire,
+            .merge_cut => ?@import("../api/topology_history_operations.zig").Merge.wire,
             .bootstrap_page => @import("../api/history_page_operations.zig").pages.BootstrapPage,
             .grant => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation,
             .resolution => @import("../api/history_resolution_operations.zig").wire.Reply,
@@ -13861,7 +13864,9 @@ pub const DataServer = struct {
         } else if (comptime kind == .artifact_history) {
             try @import("../api/artifact_history_operations.zig").validate(input, original_fence, table);
         } else if (comptime kind == .split_cut) {
-            try @import("../api/split_history_operations.zig").validate(input, original_fence, table);
+            try @import("../api/topology_history_operations.zig").Split.validate(input, original_fence, table);
+        } else if (comptime kind == .merge_cut) {
+            try @import("../api/topology_history_operations.zig").Merge.validate(input, original_fence, table);
         } else try input.validate(namespace);
         if (comptime kind == .source_plan_control or kind == .source_plan_observe or kind == .source_plan_chunk or kind == .source_checkpoint_observe or (kind == .source_scope_observe or kind == .source_producer_closure_observe or kind == .source_producer_control or kind == .legacy_terminal_control or kind == .legacy_inventory_observe) or kind == .source_scope_control or kind == .source_retirement_control) {
             const incarnation = original_fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
@@ -13897,6 +13902,7 @@ pub const DataServer = struct {
             .page => historyPageOperation(self, alloc, fence, table, input, context),
             .artifact_history => self.historyLocalRead(alloc, fence, table, .artifact_history, input, context),
             .split_cut => self.historyLocalRead(alloc, fence, table, .split_cut, input, context),
+            .merge_cut => self.historyLocalRead(alloc, fence, table, .merge_cut, input, context),
             .bootstrap_page => historyBootstrapPageOperation(self, alloc, fence, table, input, context),
             .grant => historyGrantOperation(self, alloc, fence, table, input, context),
             .resolution => historyResolutionOperation(self, alloc, fence, table, input, context),
@@ -13937,6 +13943,7 @@ pub const DataServer = struct {
             .page => client.fetchGroupHistoryPage(uri, group, table, input, fence, context),
             .artifact_history => client.fetchGroupArtifactHistory(uri, group, table, input, fence, context),
             .split_cut => client.fetchGroupSplitHistoryCut(uri, group, table, input, fence, context),
+            .merge_cut => client.fetchGroupMergeHistoryCut(uri, group, table, input, fence, context),
             .bootstrap_page => client.fetchGroupHistoryBootstrapPage(uri, group, table, input, fence, context),
             .grant => client.fetchGroupHistoryGrant(uri, group, table, input, fence, context),
             .resolution => client.fetchGroupHistoryResolution(uri, group, table, input, fence, context),
@@ -14022,6 +14029,16 @@ pub const DataServer = struct {
         return self.historyRoutedOperation(alloc, fence, table, .split_cut, input, context);
     }
 
+    fn mergeHistoryCutLocalOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.merge_cut), context: antfly.public_api.operation.RequestContext) !historyResultType(.merge_cut) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .merge_cut, input, context);
+    }
+
+    fn mergeHistoryCutRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.merge_cut), context: antfly.public_api.operation.RequestContext) !historyResultType(.merge_cut) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .merge_cut, input, context);
+    }
+
     fn historyPageOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.page), context: antfly.public_api.operation.RequestContext) !historyResultType(.page) {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return self.historyLocalRead(alloc, fence, table, .page, input, context);
@@ -14056,6 +14073,7 @@ pub const DataServer = struct {
                 .page => owner.orderedHistoryPageRouted(alloc, fence, table, input.request),
                 .artifact_history => owner.artifactPublicationHistoryRouted(alloc, fence, table, input),
                 .split_cut => owner.splitHistoryCutRouted(alloc, fence, table, input),
+                .merge_cut => owner.mergeHistoryCutRouted(alloc, fence, table, input),
                 .bootstrap_page => owner.orderedHistoryBootstrapPageRouted(alloc, fence, table, input.request),
                 .grant => owner.orderedHistoryGrantRouted(alloc, fence, table, input.identity),
                 .resolution => owner.orderedHistoryResolutionRouted(alloc, fence, table, input.binding()),
@@ -45381,7 +45399,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_scope_control = .{ .ptr = server, .execute_fn = DataServer.sourceScopeControlOperation }, .native_source_retirement_control = .{ .ptr = server, .execute_fn = DataServer.sourceRetirementControlOperation }, .native_source_scope_observe = .{ .ptr = server, .read_fn = DataServer.sourceScopeObserveOperation }, .native_source_producer_closure_observe = .{ .ptr = server, .read_fn = DataServer.sourceProducerClosureObserveOperation }, .native_source_producer_control = .{ .ptr = server, .execute_fn = DataServer.sourceProducerControlOperation }, .native_legacy_terminal = .{ .ptr = server, .execute_fn = DataServer.legacyTerminalOperation }, .native_legacy_inventory = .{ .ptr = server, .read_fn = DataServer.legacyInventoryOperation }, .native_source_checkpoint_observe = .{ .ptr = server, .read_fn = DataServer.sourceCheckpointObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_bootstrap_page = .{ .ptr = server, .read_fn = DataServer.historyBootstrapPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_artifact_history = .{ .ptr = server, .read_fn = DataServer.artifactHistoryLocalOperation }, .native_split_cut = .{ .ptr = server, .read_fn = DataServer.splitHistoryCutLocalOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_scope_control = .{ .ptr = server, .execute_fn = DataServer.sourceScopeControlOperation }, .native_source_retirement_control = .{ .ptr = server, .execute_fn = DataServer.sourceRetirementControlOperation }, .native_source_scope_observe = .{ .ptr = server, .read_fn = DataServer.sourceScopeObserveOperation }, .native_source_producer_closure_observe = .{ .ptr = server, .read_fn = DataServer.sourceProducerClosureObserveOperation }, .native_source_producer_control = .{ .ptr = server, .execute_fn = DataServer.sourceProducerControlOperation }, .native_legacy_terminal = .{ .ptr = server, .execute_fn = DataServer.legacyTerminalOperation }, .native_legacy_inventory = .{ .ptr = server, .read_fn = DataServer.legacyInventoryOperation }, .native_source_checkpoint_observe = .{ .ptr = server, .read_fn = DataServer.sourceCheckpointObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_bootstrap_page = .{ .ptr = server, .read_fn = DataServer.historyBootstrapPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_artifact_history = .{ .ptr = server, .read_fn = DataServer.artifactHistoryLocalOperation }, .native_split_cut = .{ .ptr = server, .read_fn = DataServer.splitHistoryCutLocalOperation }, .native_merge_cut = .{ .ptr = server, .read_fn = DataServer.mergeHistoryCutLocalOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -46295,6 +46313,16 @@ fn consumerTests() type {
                 try std.testing.expect((try split_port.read(a, route.fence().?, "docs", split_request, .{})) == null);
                 split_request.root_generation +%= 1;
                 try std.testing.expectError(error.HistoryResynchronizationRequired, split_port.read(a, route.fence().?, "docs", split_request, .{}));
+                const merge_port = origin.historyRootsSource().merge_cut.?;
+                var merge_request: retained_history.MergeCut.Request = .{
+                    .namespace = current_owner.namespace,
+                    .root_generation = current_owner.root_generation,
+                    .transition = 1,
+                    .receiver_group = 602,
+                };
+                try std.testing.expect((try merge_port.read(a, route.fence().?, "docs", merge_request, .{})) == null);
+                merge_request.root_generation +%= 1;
+                try std.testing.expectError(error.HistoryResynchronizationRequired, merge_port.read(a, route.fence().?, "docs", merge_request, .{}));
                 const publication_input: @import("../api/history_publication_operations.zig").Request = .{ .version = 1, .owner = current_owner, .transaction_id = txn_id, .manifest_digest = publication_query.manifest_digest, .commit_version = 1001, .minimum_applied_index = 1 };
                 const observed_publication = try server.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
                 try observed_publication.validate(publication_query);

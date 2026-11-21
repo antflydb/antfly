@@ -270,6 +270,7 @@ pub const Routes = struct {
     pub const history_owner_suffix = "/history/owner-v1";
     pub const history_publication_suffix = "/history/publication-v1";
     pub const history_split_cut_suffix = "/history/split-cut-v1";
+    pub const history_merge_cut_suffix = "/history/merge-cut-v1";
     pub const history_artifact_suffix = "/history/artifact-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";

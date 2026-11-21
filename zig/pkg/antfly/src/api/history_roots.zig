@@ -41,7 +41,7 @@ pub const Root = struct {
         return stored.physical == null or std.meta.eql(stored.physical, self.physicalIdentity());
     }
 };
-const SplitCut = @import("split_history_operations.zig").wire;
+const SplitCut = @import("topology_history_operations.zig").Split.wire;
 const SplitTransition = @import("../metadata/transition_state.zig").SplitTransitionRecord;
 
 /// Bind a finalized catalog transition to the physical predecessor route.
@@ -203,7 +203,8 @@ test "history root discovery qualifies the exact finalized split predecessor" {
 
 pub const Source = struct {
     artifact_owners: ?@import("history_owner_operations.zig").Port = null,
-    split_cut: ?@import("split_history_operations.zig").Port = null,
+    split_cut: ?@import("topology_history_operations.zig").Split.Port = null,
+    merge_cut: ?@import("topology_history_operations.zig").Merge.Port = null,
     artifact_history: ?@import("artifact_history_operations.zig").Port = null,
     catalog: catalog_api.CatalogSource,
     controls: @import("history_control_operations.zig").Port,

@@ -2911,12 +2911,25 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         group_id: u64,
         table_name: []const u8,
-        input: @import("split_history_operations.zig").wire.Request,
+        input: @import("topology_history_operations.zig").Split.wire.Request,
         fence: route_metadata_api.CatalogRouteFence,
         original_context: @import("antfly_local_sources").api_operation.RequestContext,
-    ) !?@import("split_history_operations.zig").wire {
-        const contract = @import("split_history_operations.zig");
+    ) !?@import("topology_history_operations.zig").Split.wire {
+        const contract = @import("topology_history_operations.zig").Split;
         return self.fetchFencedHistoryJson(contract, ?contract.wire, routes.Routes.history_split_cut_suffix, base_uri, group_id, table_name, input, fence, original_context);
+    }
+
+    pub fn fetchGroupMergeHistoryCut(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        input: @import("topology_history_operations.zig").Merge.wire.Request,
+        fence: route_metadata_api.CatalogRouteFence,
+        original_context: @import("antfly_local_sources").api_operation.RequestContext,
+    ) !?@import("topology_history_operations.zig").Merge.wire {
+        const contract = @import("topology_history_operations.zig").Merge;
+        return self.fetchFencedHistoryJson(contract, ?contract.wire, routes.Routes.history_merge_cut_suffix, base_uri, group_id, table_name, input, fence, original_context);
     }
 
     fn fetchFencedHistoryJson(
