@@ -72,7 +72,7 @@ fn validCacheSuffix(suffix: []const u8) bool {
     return false;
 }
 
-pub fn cacheBound(session: backends.Session, batch: usize, tokens: usize, context: usize) !usize {
+fn cacheBound(session: backends.Session, batch: usize, tokens: usize, context: usize) !usize {
     var total: usize = 0;
     for (session.inputInfo()) |info| {
         const suffix = kv.pastInputSuffix(info.name) orelse continue;
@@ -83,6 +83,24 @@ pub fn cacheBound(session: backends.Session, batch: usize, tokens: usize, contex
         total = try std.math.add(usize, total, try std.math.add(usize, bytes, 4 * @sizeOf(i64)));
     }
     return total;
+}
+
+/// Request admission accounts for both previous and replacement K/V. Move
+/// the retained inputs to the KV category without charging the same host
+/// payload again as temporary ingestion storage.
+pub fn estimateAdmission(session: backends.Session, admission: @import("../backends/session.zig").RunAdmission, base: @import("../backends/session.zig").RunRequest, batch: usize, tokens: usize, context: usize, vocabulary: usize) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
+    if (!qualified(session)) return admission.estimateRequest(base, session.outputInfo());
+    const cache_bytes = try cacheBound(session, batch, tokens, context);
+    const logit_bytes = try std.math.mul(usize, vocabulary, @sizeOf(f32));
+    const per_item = try std.math.add(usize, logit_bytes, 3 * @sizeOf(i64));
+    var request = base;
+    request.input_bytes = try std.math.add(usize, request.input_bytes, cache_bytes);
+    request.output_kv_bytes = cache_bytes;
+    request.output_bytes = try std.math.add(usize, cache_bytes, try std.math.mul(usize, batch, per_item));
+    var peak = try admission.estimateRequest(request, session.outputInfo());
+    peak.host_scratch_bytes = std.math.sub(usize, peak.host_scratch_bytes, cache_bytes) catch return error.InvalidSeq2SeqAdmission;
+    peak.host_kv_bytes = try std.math.add(usize, peak.host_kv_bytes, cache_bytes);
+    return peak;
 }
 
 const InputRole = union(enum) {
@@ -452,6 +470,17 @@ test "incremental seq2seq requires explicit merged ABI" {
     };
     vtable.inputInfo = MissingBranch.info;
     try std.testing.expect(!qualified(.{ .ptr = &fake, .vtable = &vtable }));
+}
+
+test "incremental seq2seq request admission charges retained and replacement caches separately from host IO" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    var fake = TestDecoder{};
+    var session = fake.session();
+    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const amount = try estimateAdmission(session, session.run_admission.?, .{ .batch = 2, .sequence = 3, .input_bytes = 20 }, 2, 3, 5, 4);
+    try std.testing.expectEqual(@as(usize, 1152), amount.host_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 180), amount.host_scratch_bytes);
 }
 
 test "incremental seq2seq admits cache bytes before the backend call" {

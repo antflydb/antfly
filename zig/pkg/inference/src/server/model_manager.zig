@@ -13443,7 +13443,7 @@ test "model selection composite ignores unlisted merged decoders and preserves l
     var signature_arena = std.heap.ArenaAllocator.init(a);
     defer signature_arena.deinit();
     const signature = try backends.imported_onnx_session.inspectSignature(signature_arena.allocator(), raw);
-    try std.testing.expect(@import("../pipelines/seq2seq_decode.zig").qualifiedSignature(signature.inputs, signature.outputs));
+    try std.testing.expect(@import("../execution/seq2seq_runtime.zig").qualifiedSignature(signature.inputs, signature.outputs));
     const paths = try encoder_decoder.findEncoderDecoderPaths(a, root);
     defer a.free(paths.encoder);
     defer a.free(paths.decoder);
