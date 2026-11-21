@@ -463,6 +463,15 @@ pub const State = struct {
         };
         return roots;
     }
+    pub fn atDeliveryBoundary(self: State) bool {
+        if (self.cursors.len != 0) return false;
+        if (self.slot) |slot| {
+            if (slot.entries.len != 0 or !equal(slot.mapped_cursor, self.acknowledged_cursor)) return false;
+            for (slot.spool.records) |record| if (record.phase == .uploading) return false;
+        }
+        return true;
+    }
+
     pub fn contextAt(self: State, cursor: Digest) ![]const u8 {
         if (self.phase != .streaming and self.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
         if (equal(cursor, self.acknowledged_cursor)) return self.acknowledged_provider_context;
@@ -663,6 +672,7 @@ pub const Mutation = union(enum) {
     plan_roots: []const RootPlan,
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
+    prune_merge_donor: struct { namespace: Namespace, transition: u64 },
     release_merge_donor: struct { namespace: Namespace, transition: u64, receipt_term: u64, receipt_index: u64 },
     stage_merge_drain: struct { namespace: Namespace, ownership_epoch: u64, drain: MergeDrain },
     stage_split_handoff: struct { namespace: Namespace, ownership_epoch: u64, handoff: SplitHandoff },
@@ -693,7 +703,7 @@ pub const Mutation = union(enum) {
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
             .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
-            .release_merge_donor, .stage_merge_drain, .stage_split_handoff, .confirm_split_successor, .activate_split_successor => return physical_history_protocol_version,
+            .prune_merge_donor, .release_merge_donor, .stage_merge_drain, .stage_split_handoff, .confirm_split_successor, .activate_split_successor => return physical_history_protocol_version,
             .plan_roots => |plans| for (plans) |plan| {
                 if (plan.physical != null) return physical_history_protocol_version;
             },
@@ -730,6 +740,7 @@ pub const Mutation = union(enum) {
                 if (!nz(value.namespace) or value.ownership_epoch == 0 or value.grant_sequence == 0 or value.consumer_epoch == 0) return error.InvalidChangefeed;
                 if (value.snapshot) |pin| if (!nz(pin.id) or !nz(pin.digest) or pin.expires_at == 0) return error.InvalidChangefeed;
             },
+            .prune_merge_donor => |value| if (!nz(value.namespace) or value.transition == 0) return error.InvalidChangefeed,
             .release_merge_donor => |value| if (!nz(value.namespace) or value.transition == 0 or value.receipt_term == 0 or value.receipt_index == 0) return error.InvalidChangefeed,
             .stage_merge_drain => |value| {
                 if (!nz(value.namespace) or value.ownership_epoch == 0) return error.InvalidChangefeed;
@@ -1006,13 +1017,21 @@ pub const Mutation = union(enum) {
                 roots[index].snapshot = enrollment.snapshot;
                 next.roots = roots;
             },
+            .prune_merge_donor => |pruned| {
+                if (state.phase != .streaming or !state.atDeliveryBoundary() or state.roots.len < 2)
+                    return error.ChangefeedConflict;
+                const index = try state.rootIndex(pruned.namespace);
+                const donor = state.roots[index];
+                const drain = donor.merge_drain orelse return error.ChangefeedConflict;
+                if (!donor.released or !donor.mergeDrained() or drain.transition != pruned.transition)
+                    return error.ChangefeedConflict;
+                const roots = try a.alloc(Root, state.roots.len - 1);
+                @memcpy(roots[0..index], state.roots[0..index]);
+                @memcpy(roots[index..], state.roots[index + 1 ..]);
+                next.roots = roots;
+            },
             .release_merge_donor => |released| {
-                if (state.phase != .streaming or state.cursors.len != 0) return error.ChangefeedConflict;
-                if (state.slot) |slot| {
-                    if (slot.entries.len != 0 or !equal(slot.mapped_cursor, state.acknowledged_cursor))
-                        return error.ChangefeedConflict;
-                    for (slot.spool.records) |record| if (record.phase == .uploading) return error.ChangefeedConflict;
-                }
+                if (state.phase != .streaming or !state.atDeliveryBoundary()) return error.ChangefeedConflict;
                 const index = try state.rootIndex(released.namespace);
                 const donor = state.roots[index];
                 const drain = donor.merge_drain orelse return error.ChangefeedConflict;
@@ -1078,13 +1097,8 @@ pub const Mutation = union(enum) {
                 next.roots = roots;
             },
             .activate_split_successor => |activation| {
-                if (state.phase != .streaming or state.cursors.len != 0 or state.roots.len == max_roots)
+                if (state.phase != .streaming or !state.atDeliveryBoundary() or state.roots.len == max_roots)
                     return error.ChangefeedConflict;
-                if (state.slot) |slot| {
-                    if (slot.entries.len != 0 or !equal(slot.mapped_cursor, state.acknowledged_cursor))
-                        return error.ChangefeedConflict;
-                    for (slot.spool.records) |record| if (record.phase == .uploading) return error.ChangefeedConflict;
-                }
                 const index = try state.rootIndex(activation.namespace);
                 const predecessor = state.roots[index];
                 const handoff = predecessor.split_handoff orelse return error.ChangefeedConflict;
@@ -1836,6 +1850,13 @@ test "changefeed stages a split proof without changing retained cursor positions
     const released = try step(a, draining, release);
     try std.testing.expect(released.roots[try released.rootIndex(child.namespace)].released);
     try std.testing.expectEqual(draining.latest_cursor, released.latest_cursor);
+    const prune: Mutation = .{ .prune_merge_donor = .{ .namespace = child.namespace, .transition = 50 } };
+    try std.testing.expectError(error.ChangefeedConflict, step(a, draining, prune));
+    const pruned = try step(a, released, prune);
+    try std.testing.expectEqual(released.latest_cursor, pruned.latest_cursor);
+    const retained = try pruned.rootsAt(a, pruned.latest_cursor);
+    try std.testing.expectEqual(@as(usize, 1), retained.len);
+    try std.testing.expectEqual(namespace, retained[0].namespace);
     confirmation.confirm_split_successor.consumer_epoch += 1;
     try std.testing.expectError(error.ChangefeedConflict, step(a, ready, confirmation));
     mutation.stage_split_handoff.handoff.cut.root_generation += 1;

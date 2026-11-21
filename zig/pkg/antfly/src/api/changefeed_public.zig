@@ -849,16 +849,18 @@ pub fn stageVisibleMerges(client: *config.Client, a: A, source: source_api.Sourc
 }
 
 pub fn progressMergeDrain(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, state: control.State, cursor: control.Digest, request: Context) !void {
-    if (state.phase != .streaming or state.cursors.len != 0) return;
-    if (state.slot) |slot| {
-        if (slot.entries.len != 0 or !same(slot.mapped_cursor, state.acknowledged_cursor)) return;
-        for (slot.spool.records) |record| if (record.phase == .uploading) return;
-    }
+    if (state.phase != .streaming or !state.atDeliveryBoundary()) return;
     for (state.roots) |root| {
-        if (root.released or !root.mergeDrained()) continue;
+        const drain = root.merge_drain orelse continue;
+        if (root.released) {
+            if (routes.session.group_indexes.contains(drain.donor.group_id)) continue;
+            _ = try routes.findPhysical(std.mem.readInt(u64, root.namespace[0..8], .big), drain.receiver.group_id, drain.receiver.range_id);
+            _ = try state.contextAt(cursor);
+            return change(client, a, state, .{ .prune_merge_donor = .{ .namespace = root.namespace, .transition = drain.transition } }, request);
+        }
+        if (!root.mergeDrained()) continue;
         _ = try state.contextAt(cursor);
         if (state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return error.ChangefeedLeaseExpired;
-        const drain = root.merge_drain.?;
         const donor = try routes.findInstalled(root);
         const command: @import("history_control_operations.zig").wire.Request = .{
             .version = 1,
@@ -895,15 +897,8 @@ pub fn progressSplitSuccessor(client: *config.Client, a: A, source: source_api.S
             const mutation = try source.enrollSplitSuccessor(a, routes, state, root, request);
             return change(client, a, state, mutation, request);
         }
-        if (state.cursors.len != 0 or root.pending_control != null or handoff.cut.reserved_bytes != 0 or
+        if (!state.atDeliveryBoundary() or root.pending_control != null or handoff.cut.reserved_bytes != 0 or
             root.acknowledged.order(.{ .sequence = handoff.cut.latest }) != .eq) continue;
-        if (state.slot) |slot| {
-            if (slot.entries.len != 0 or !same(slot.mapped_cursor, state.acknowledged_cursor)) continue;
-            const pending_upload = for (slot.spool.records) |record| {
-                if (record.phase == .uploading) break true;
-            } else false;
-            if (pending_upload) continue;
-        }
         return change(client, a, state, .{ .activate_split_successor = .{
             .namespace = root.namespace,
             .grant_sequence = root.split_grant_sequence.?,
