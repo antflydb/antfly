@@ -8158,6 +8158,7 @@ pub const NativeFile = struct {
             try antfly_platform.filesystem.syncData(self.file.handle, policy)
         else
             try self.file.sync(self.runtimeIo());
+        if (builtin.is_test) _ = self.test_sync_calls.fetchAdd(1, .monotonic);
     }
 
     fn recoverRedoLog(self: *NativeFile, allocator: Allocator, io: std.Io, test_hook: if (builtin.is_test) ?*const fn (?*anyopaque) void else void, test_ctx: if (builtin.is_test) ?*anyopaque else void) !void {
@@ -22246,19 +22247,6 @@ pub const NativeFile = struct {
                     redo.pending.clearRetainingCapacity();
                     return error.OutcomeUnknown;
                 };
-                // §9.7c (ReadView): `redo.writer.sync()` above is this
-                // commit's own durability barrier, exactly like
-                // `syncIfRequired`'s call below is for a non-redo file --
-                // but it calls through `redo_log.Writer.sync` directly,
-                // never through `syncIfRequired` itself, so it never used
-                // to bump this counter. Several tests across both redo
-                // and legacy modes assert an exact `test_sync_calls`
-                // delta per durable commit; without this, a redo-log
-                // file's own foreground writes always read back as zero
-                // syncs, with no way to distinguish "no sync happened"
-                // from "a sync happened, through a path this counter
-                // doesn't know about."
-                if (builtin.is_test) _ = self.test_sync_calls.fetchAdd(1, .monotonic);
                 // Monotonic, not a bare assignment: the store mutex was
                 // released for the `sync()` call just above, so -- in
                 // principle, if some future caller is ever added that can
@@ -22293,7 +22281,7 @@ pub const NativeFile = struct {
                 self.publishCommittedSequenceToInode();
                 // perf/lwa-reclaim-reconcile: this is the ordinary (by far
                 // most common) successful redo-log append -- durability
-                // comes from `redo.writer.sync()` a few lines above, so
+                // comes from the redo barriers above, so
                 // this commit's own logical mutations are exactly as
                 // published as the fold/page-shaped branches' own calls to
                 // `dropOverlayUndo` already treat theirs. Missing here,
@@ -22319,7 +22307,7 @@ pub const NativeFile = struct {
                 //
                 // perf/lwa-maint-serialize: `appendRecord` above no longer
                 // clears `logical_pending`/`pending` itself (see its own
-                // doc comment) -- now that `redo.writer.sync()` has
+                // doc comment) -- now that redo publication has
                 // actually succeeded, this commit is genuinely durable, so
                 // clear both here, alongside the existing `dropOverlayUndo`
                 // call.
