@@ -62,7 +62,8 @@ pub const SplitCut = struct {
         boundary: [32]u8,
 
         pub fn matches(self: Request, cut: SplitCut) bool {
-            return std.mem.eql(u8, &self.namespace, &cut.namespace) and
+            return cut.term != 0 and cut.index != 0 and cut.reclaimed <= cut.latest and
+                std.mem.eql(u8, &self.namespace, &cut.namespace) and
                 self.transition == cut.transition and self.attempt == cut.attempt and
                 self.successor_group == cut.successor_group and self.root_generation == cut.root_generation and
                 std.mem.eql(u8, &self.boundary, &cut.boundary);
