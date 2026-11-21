@@ -3933,6 +3933,31 @@ pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_w
     return result;
 }
 
+/// Check the immutable membership count and acknowledged members in the
+/// same snapshot as the coordinator decision. Legacy lists can safely take
+/// the idempotent acknowledgment path, which upgrades them to the index.
+pub fn completionAcknowledgmentsPending(read: anytype, admission: completion.Admission, retain_terminal: bool) !bool {
+    const txn_id = admission.transaction_id;
+    const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+    const raw_index = read.get(&index_key) catch |err| switch (err) {
+        error.NotFound => return true,
+        else => return err,
+    };
+    const index = try ParticipantIndex.decode(raw_index);
+    if (index.enlisted != admission.participants.len) return error.InvalidTxnRecord;
+    if (index.resolved == index.enlisted) return false;
+    if (!retain_terminal or index.enlisted - index.resolved != 1) return true;
+
+    const coordinator = try admission.member(admission.coordinator_namespace);
+    const ack_key = makeParticipantIndexKey(resolved_index_prefix, txn_id, coordinator.locator);
+    const ack = read.get(&ack_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, ack, coordinator.locator)) return error.InvalidTxnRecord;
+    return true;
+}
+
 fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return error.InvalidTxnRecord;
     if (raw.len == txn_record_v10_size) {

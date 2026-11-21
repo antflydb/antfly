@@ -249,6 +249,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         publication_digest: [32]u8 = @splat(0),
         resolves: usize = 0,
         publishes: usize = 0,
+        acknowledgments: usize = 0,
         lose_publication: bool = false,
         suppress_resolution: bool = false,
         state: decision_ops.wire.Record = .{ .status = .committed, .begin_timestamp = 10, .created_at_ns = 11, .commit_version = 20, .finalized_at_ns = 20, .prepared = true, .intents_resolved = true, .digest = @splat(7) },
@@ -375,6 +376,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                     if (terminal.status == .aborted or !self.suppress_resolution) self.resolved[index] = true;
                 },
                 .acknowledge_many => |value| {
+                    self.acknowledgments += 1;
                     if (self.state.status == .committed) {
                         try std.testing.expect(self.published[0] and self.published[1]);
                     } else {
@@ -413,6 +415,11 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     fake.state.retain_terminal = false;
     try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
     fake.state.retain_terminal = true;
+    try std.testing.expectEqual(@as(usize, 2), fake.acknowledgments);
+    fake.state.acknowledgments_pending = false;
+    try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
+    try std.testing.expectEqual(@as(usize, 2), fake.acknowledgments);
+    fake.state.acknowledgments_pending = true;
     try std.testing.expectEqual(@as(usize, 1), fake.resolves);
     try std.testing.expectEqual(@as(usize, 2), fake.publishes);
     try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));

@@ -128,6 +128,7 @@ pub const Port = struct {
         try observation.validate(lookup);
         const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
         if (decision.record.status == .pending) return error.SourceOutcomeUnresolved;
+        if (!decision.record.acknowledgments_pending) return;
         const admission = decision.admission.admission;
         const owner = try admission.recoveryOwner(admission.coordinator_namespace);
         const coordinator = try admission.member(admission.coordinator_namespace);

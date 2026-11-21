@@ -52,15 +52,23 @@ pub const Record = struct {
     digest: [32]u8,
     /// Whether an external durable session owns the final coordinator acknowledgment.
     retain_terminal: bool = true,
+    /// A fresh coordinator read can prove that no recovery acknowledgments remain.
+    acknowledgments_pending: bool = true,
     /// Retained source ownership, independent of ordinary expiry/recovery jobs.
     source_purpose: ?[32]u8 = null,
     source_scope: ?@import("source_scope.zig").Reference = null,
     pub fn jsonStringify(self: Record, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(Record).@"struct".field_names) |name| {
-            if ((!std.mem.eql(u8, name, "retain_terminal") or !self.retain_terminal) and (!std.mem.eql(u8, name, "source_purpose") or self.source_purpose != null) and (!std.mem.eql(u8, name, "source_scope") or self.source_scope != null)) {
+            const value = @field(self, name);
+            const write_field = switch (@TypeOf(value)) {
+                bool => if (comptime std.mem.eql(u8, name, "retain_terminal") or std.mem.eql(u8, name, "acknowledgments_pending")) !value else true,
+                ?[32]u8, ?@import("source_scope.zig").Reference => value != null,
+                else => true,
+            };
+            if (write_field) {
                 try stream.objectField(name);
-                try stream.write(@field(self, name));
+                try stream.write(value);
             }
         }
         try stream.endObject();

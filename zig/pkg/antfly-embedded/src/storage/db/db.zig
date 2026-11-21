@@ -27239,7 +27239,9 @@ pub const DB = struct {
         defer admission.deinit();
         const record_key = completion.record_prefix.* ++ query.transaction_id;
         const record_raw = txn.get(&record_key) catch |err| return if (err == error.NotFound) error.HistoryCorrupt else err;
-        reply.decision = .{ .record = try transactions_mod.completionCoordinatorRecord(record_raw), .admission = admission.value };
+        var record = try transactions_mod.completionCoordinatorRecord(record_raw);
+        if (record.status != .pending) record.acknowledgments_pending = try transactions_mod.completionAcknowledgmentsPending(&txn, admission.value.admission, record.retain_terminal);
+        reply.decision = .{ .record = record, .admission = admission.value };
         return wire.encodeReply(allocator, query, reply);
     }
 
