@@ -153,7 +153,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         }
     else
         .{};
-    const target = b.standardTargetOptions(.{ .default_target = default_target });
+    const target = requireCx16(b, b.standardTargetOptions(.{ .default_target = default_target }));
     const optimize = b.standardOptimizeOption(.{});
     const vopr_dep = b.dependency("vopr", .{ .target = target, .optimize = optimize });
     const vopr_mod = vopr_dep.module("vopr");
@@ -1691,4 +1691,14 @@ pub fn finalizeMediaClients(b: *std.Build, original: AntflyRootImports) AntflyRo
             @field(result.storage_boundary, field) = clients.rewrite(@field(result.storage_boundary, field));
     }
     return result;
+}
+
+/// Lite's cross-process lock region swaps 128-bit words (holder and ticket
+/// slots carry a claim generation beside the pid), so x86_64 builds need
+/// CMPXCHG16B. Every x86_64 CPU since roughly 2008 has it (x86-64-v2 and up).
+fn requireCx16(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.ResolvedTarget {
+    if (target.result.cpu.arch != .x86_64 or std.Target.x86.featureSetHas(target.result.cpu.features, .cx16)) return target;
+    var query = target.query;
+    query.cpu_features_add.addFeature(@backingInt(std.Target.x86.Feature.cx16));
+    return b.resolveTargetQuery(query);
 }

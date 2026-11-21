@@ -56,7 +56,11 @@ fn collect(step: *std.Build.Step, runs: *std.ArrayList(*std.Build.Step.Run), vis
     for (step.dependencies.items) |dependency| collect(dependency, runs, visited, allocator);
 }
 
-fn cloneModule(b: *std.Build, original: *std.Build.Module, copies: *std.AutoHashMap(*std.Build.Module, *std.Build.Module)) *std.Build.Module {
+/// Recursively clone a module graph, memoizing visited modules so cycles
+/// (e.g. a consumer root re-imported under another name through one of its
+/// own dependents) resolve to the same clone instead of a mix of clones and
+/// originals that would make the same source file the root of two modules.
+pub fn cloneModule(b: *std.Build, original: *std.Build.Module, copies: *std.AutoHashMap(*std.Build.Module, *std.Build.Module)) *std.Build.Module {
     if (copies.get(original)) |existing| return existing;
     const copy = source_owner.cloneModule(b, original);
     copy.import_table = .empty;

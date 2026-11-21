@@ -415,7 +415,14 @@ fn acknowledgeAgenda(storage: anytype, marker: []const u8, comptime native: type
         }
     };
     var ack = Ack{ .key_bytes = marker };
-    try storage.submitIndexMutation(&ack, Ack.apply, true);
+    // Ride-along, not a standalone durable commit (lite-single-commit-
+    // write-path.md §3.2a/§3.3c "recovery-agenda obligations"): losing this
+    // acknowledgement in a crash just means the marker is still there on the
+    // next recovery turn, which re-scans and re-acknowledges it again --
+    // never the only record of completed recovery work, so it is safe to
+    // redo. It joins whatever foreground group commits next (or this
+    // owner's own idle-flush/close barrier) instead of forcing its own sync.
+    try storage.submitIndexMutation(&ack, Ack.apply, false);
 }
 
 /// Native schema publication creates durable activation progress. Reuse the

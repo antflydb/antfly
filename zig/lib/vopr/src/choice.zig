@@ -218,9 +218,24 @@ pub const PrefixedSeeded = struct {
 /// This models the fairness of an ordinary event loop: explicit clock-fault
 /// scenarios can still choose time independently, while a clean history does
 /// not expire healthy sockets with packets or wakeups already pending.
+///
+/// "Postpones" is bounded, not indefinite: like `PrefixedCooperativeSeeded`
+/// below, a `time_advance` transition is forced once `non_time_choices`
+/// reaches `max_non_time_choices`, so a busy scenario (one that always has
+/// *some* non-time transition enabled -- the ordinary case once a handful of
+/// concurrent fibers are live) cannot starve every timer-driven wait for the
+/// rest of its transition budget. Without this, any deadline whose only path
+/// to firing is a `time_advance` transition -- a client request timeout, a
+/// server-side catalog/read-index wait with a deadline, a lease renewal --
+/// never fires as long as the scenario stays busy, indistinguishable from a
+/// true hang. See DETERMINISM_AUDIT.md.
 pub const PrefixedFairSeeded = struct {
+    pub const default_max_non_time_choices: usize = PrefixedCooperativeSeeded.default_max_non_time_choices;
+
     prefix: []const ids.StableId,
     cursor: usize = 0,
+    non_time_choices: usize = 0,
+    max_non_time_choices: usize = default_max_non_time_choices,
     fallback: Seeded,
 
     pub fn init(prefix: []const ids.StableId, seed: u64) PrefixedFairSeeded {
@@ -237,31 +252,52 @@ pub const PrefixedFairSeeded = struct {
             defer self.cursor += 1;
             return self.prefix[self.cursor];
         }
+        if (self.non_time_choices >= self.max_non_time_choices) {
+            for (request.enabled) |candidate| {
+                if (PrefixedCooperativeSeeded.isTimeAdvance(candidate.name))
+                    return self.noteSelection(request, candidate.id);
+            }
+        }
         var runnable_count: usize = 0;
         var weighted = false;
         var total_weight: u64 = 0;
         for (request.enabled) |candidate| {
-            if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance") or
-                std.mem.eql(u8, candidate.name, "runtime.time_advance")) continue;
+            if (PrefixedCooperativeSeeded.isTimeAdvance(candidate.name)) continue;
             runnable_count += 1;
             if (candidate.weight == 0) return error.InvalidTransitionWeight;
             weighted = weighted or candidate.weight != 1;
             total_weight = std.math.add(u64, total_weight, candidate.weight) catch
                 return error.ChoiceWeightOverflow;
         }
-        if (runnable_count == 0) return Seeded.choose(&self.fallback, request);
-        var ordinal = if (weighted)
-            self.fallback.prng.random().uintLessThan(u64, total_weight)
-        else
-            self.fallback.prng.random().intRangeLessThan(u64, 0, runnable_count);
+        const selected_id = if (runnable_count == 0)
+            try Seeded.choose(&self.fallback, request)
+        else blk: {
+            var ordinal = if (weighted)
+                self.fallback.prng.random().uintLessThan(u64, total_weight)
+            else
+                self.fallback.prng.random().intRangeLessThan(u64, 0, runnable_count);
+            for (request.enabled) |candidate| {
+                if (PrefixedCooperativeSeeded.isTimeAdvance(candidate.name)) continue;
+                const width: u64 = if (weighted) candidate.weight else 1;
+                if (ordinal < width) break :blk candidate.id;
+                ordinal -= width;
+            }
+            unreachable;
+        };
+        return self.noteSelection(request, selected_id);
+    }
+
+    fn noteSelection(self: *PrefixedFairSeeded, request: Request, selected_id: ids.StableId) ids.StableId {
         for (request.enabled) |candidate| {
-            if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance") or
-                std.mem.eql(u8, candidate.name, "runtime.time_advance")) continue;
-            const width: u64 = if (weighted) candidate.weight else 1;
-            if (ordinal < width) return candidate.id;
-            ordinal -= width;
+            if (candidate.id != selected_id) continue;
+            if (PrefixedCooperativeSeeded.isTimeAdvance(candidate.name)) {
+                self.non_time_choices = 0;
+            } else {
+                self.non_time_choices +|= 1;
+            }
+            break;
         }
-        unreachable;
+        return selected_id;
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -996,6 +1032,40 @@ test "prefixed fair seeded source postpones time while application work is runna
         .occurrence = 1,
         .enabled = &enabled,
     }));
+    try source.finish();
+}
+
+test "prefixed fair seeded source eventually forces time_advance when work never stops being runnable" {
+    // "Postpones" must be bounded, not indefinite (see the gap this closes:
+    // a client-side HTTP timeout, or any other timer-driven wait, could not
+    // fire under VOPR's full-cluster scenarios because `request.ready` -- or
+    // in production, whichever transition models "there is still unrelated
+    // work to do" -- was always enabled, starving `time_advance` for the
+    // scenario's entire transition budget). Keep choosing while a non-time
+    // transition stays continuously enabled; time_advance must win within
+    // max_non_time_choices + 1 choices, not never.
+    const enabled = [_]transition.Transition{
+        .{ .id = 1, .name = "vopr-io.time_advance", .kind = .scheduler },
+        .{ .id = 2, .name = "request.ready", .kind = .workload },
+    };
+    var prefixed = PrefixedFairSeeded.init(&.{}, 29);
+    const source = prefixed.source();
+    var saw_time_advance = false;
+    var occurrence: u64 = 0;
+    while (occurrence <= PrefixedFairSeeded.default_max_non_time_choices) : (occurrence += 1) {
+        const selected = try source.choose(.{
+            .site_id = 9,
+            .site_name = "prefixed-fair-starvation",
+            .occurrence = occurrence,
+            .enabled = &enabled,
+        });
+        if (selected == 1) {
+            saw_time_advance = true;
+            break;
+        }
+        try std.testing.expectEqual(@as(u64, 2), selected);
+    }
+    try std.testing.expect(saw_time_advance);
     try source.finish();
 }
 

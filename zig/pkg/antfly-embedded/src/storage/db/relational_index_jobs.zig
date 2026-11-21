@@ -173,7 +173,10 @@ fn getOptional(txn: anytype, key: []const u8) !?[]const u8 {
     };
 }
 
-pub fn ownership(txn: *docstore.DocStore.Txn) !Digest {
+/// Generic over `DocStore.Txn` and `DocStore.Batch`: `Page.commit` below
+/// calls this against a ride-along `Batch` (§3.2a), while `prepare`/`status`
+/// call it against an ordinary read `Txn`. Both expose the same `.get`.
+pub fn ownership(txn: anytype) !Digest {
     const range = (try getOptional(txn, range_state.range_key)) orelse &full_range;
     const identity = @import("doc_identity.zig");
     const namespace = (try identity.loadNamespaceTxn(txn)) orelse identity.default_namespace;
@@ -536,7 +539,13 @@ pub const Page = struct {
         // before that generation existed can still publish a new tuple. Apply
         // serializes this drain check with later intent admission.
         if (self.next.state == .ready and try manager.hasPendingIntents()) return error.IntentConflict;
-        var txn = try core.store.beginWriteTxn();
+        // §3.2a ride-along: this page's whole lifetime is this one owner-only
+        // maintenance turn, under apply-exclusive. Losing it on a crash just
+        // redoes the same bounded scan from its last durable progress -- the
+        // same "safe to lose and redo" argument the design doc gives for
+        // retirement/reclamation/merge/catch-up. Never force its own fsync;
+        // it becomes durable on the next foreground commit or idle flush.
+        var txn = try core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
         errdefer txn.abort();
         if (!std.mem.eql(u8, &self.next.owner, &(try ownership(&txn)))) return error.PreparedGenerationChanged;
         const control = try maintenance.readControl(&txn, self.next.id);

@@ -228,6 +228,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db mixed extraction batches retain document checkpoint ownership in either order",
         "storage.db.db.test.db asset consuming asset validates upstream references at admission",
         "generic scalar chunks reject stale upstream and fence publication",
+        "grouped source upstream receipt narrows to the group unit, not the whole raw document",
         "asset preparation is lazy and byte bounded across retryable provider batches",
         "asset planning groups interleaved providers",
         "asset producer neighbor context samples local graph adjacency into the input and skip state",
@@ -689,6 +690,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter",
         "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic",
         "target advance stuck tracking records first-seen time and clears on success",
+        "WS5 hosted replay retirement is leader-gated: the leader bounds the journal, a non-leader never retires",
+        "WS5 runUntilIdle drains journal retirement to completion at credit capacity",
     });
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,
