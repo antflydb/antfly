@@ -141,6 +141,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     }
     provider.index_attribution = .{ .ptr = &channel, .snapshot = AuthorityChannel.indexSnapshot };
     var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = read_tables.items, .release_read = AuthorityChannel.releaseRead, .channel = channel.rpcChannel() };
+    defer if (writer.execution_plan) |*plan| plan.deinit();
     errdefer if (writer.receipt) |receipt| {
         write_outcome.* = switch (receipt.status) {
             .aborted => .aborted,

@@ -22,7 +22,7 @@ const sessions = @import("transactions.zig");
 const contract = local.api_local_transaction_contract;
 pub const Status = enum { committed, committed_pending, committed_repair_required, aborted, unknown };
 pub const Result = struct { status: Status, outcome: ?contract.CommitOutcome = null, failure: ?anyerror = null };
-pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: local.api_operation.RequestContext, id: local.storage_db_types.TxnId, tables: []const contract.TableCommitRequest, alloc: std.mem.Allocator) !Result {
+pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: local.api_operation.RequestContext, id: local.storage_db_types.TxnId, tables: []const contract.TableCommitRequest, alloc: std.mem.Allocator, retained_plan: *?sessions.ExecutionPlan) !Result {
     const owned = server.alloc;
     const registry = &server.txn_sessions;
     const info = registry.beginForPrincipalWithSettingsAndId(owned, .{ .sync_level = .full_index }, server.localSessionNodeId(), http.transactionPrincipal(identity), &.{}, null, id) catch |err| {
@@ -61,15 +61,10 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         return err;
     };
     defer prepared.deinit();
-    var proof_arena = std.heap.ArenaAllocator.init(alloc);
-    defer proof_arena.deinit();
-    const signed = server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, context) catch |err| {
-        std.log.warn("graph receipt principal preparation failed err={s}", .{@errorName(err)});
-        return err;
-    };
     unexecuted = null;
-    var plan = (registry.sealExecutionPlan(owned, guard, signed) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
-    defer plan.deinit();
+    retained_plan.* = (registry.sealExecutionPlan(owned, guard, prepared.tables) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
+    // The response can borrow coordinator and conflict fields from the sealed plan.
+    const plan = &retained_plan.*.?;
     const writer = server.table_writes orelse return .{ .status = .unknown };
     const normalized = context.platformDeadline() catch return .{ .status = .unknown };
     const outcome = (writer.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, .full_index, plan.firstAttempt(), normalized.cancellation) catch |err| {
@@ -89,7 +84,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     }) orelse return .{ .status = .unknown };
     switch (outcome) {
         .conflict => {
-            _ = registry.recordTerminalAbort(owned, id) catch return .{ .status = .unknown, .outcome = outcome };
+            _ = (registry.recordAttemptAbort(owned, id, plan.publication) catch null) orelse return .{ .status = .unknown };
             return .{ .status = .aborted, .outcome = outcome };
         },
         .committed => |committed| {

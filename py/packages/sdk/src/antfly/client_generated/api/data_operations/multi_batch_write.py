@@ -79,6 +79,8 @@ def _parse_response(
         return response_404
 
     if response.status_code == 409:
+        if response.headers.get("content-type", "").partition(";")[0].strip().lower() == "text/plain":
+            return response.text
         response_409 = TransactionCommitResponse.from_dict(response.json())
 
         return response_409

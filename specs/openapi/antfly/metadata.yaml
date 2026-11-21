@@ -14102,11 +14102,14 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
-          description: Transaction aborted because a predicate, topology fence, or participant state conflicted
+          description: Transaction conflict. Preparation diagnostics are returned as plain text.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TransactionCommitResponse"
+            text/plain:
+              schema:
+                type: string
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "404":
@@ -14325,11 +14328,14 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: Transaction aborted due to version conflict
+          description: Transaction conflict. Preparation diagnostics are returned as plain text.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TransactionCommitResponse"
+            text/plain:
+              schema:
+                type: string
         "503":
           $ref: "#/components/responses/WriteTemporarilyUnavailable"
         "500":
@@ -14651,11 +14657,14 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: Session commit conflict
+          description: Session commit conflict. A plain-text response describes a mismatched retry body or table identity.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TransactionSessionCommitResponse"
+            text/plain:
+              schema:
+                type: string
         "503":
           $ref: "#/components/responses/WriteTemporarilyUnavailable"
         "500":

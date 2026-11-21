@@ -388,11 +388,12 @@ pub const OwnedTransactionCommitRequest = struct {
 };
 
 pub const ExecutionPlan = struct {
+    pub const Publication = struct { version: DurableSessionStore.Version, guard: Mutation };
     const Parsed = std.json.Parsed([]const distributed_txn.TableCommitRequest);
     arena: *std.heap.ArenaAllocator,
     value: []const distributed_txn.TableCommitRequest,
     // Only the caller that durably chose this plan can prove a first dispatch.
-    publication: ?DurableSessionStore.Version = null,
+    publication: ?ExecutionPlan.Publication = null,
 
     pub fn firstAttempt(self: @This()) bool {
         return self.publication != null;
@@ -1946,6 +1947,8 @@ pub const DurableSessionStore = struct {
             const encoded = try std.json.Stringify.valueAlloc(self.alloc, renewed, .{});
             defer self.alloc.free(encoded);
             try txn.put(lease_key, encoded);
+        } else if (options.guard) |admitted| {
+            try admitted.checkLeaseTxn(self.alloc, txn);
         }
         const expiry_key = try makeSessionExpiryKey(self.alloc, session.last_touched_timestamp, session.txn_id);
         defer self.alloc.free(expiry_key);
@@ -2251,14 +2254,7 @@ pub const DurableSessionStore = struct {
             break :n std.mem.readInt(u64, bytes[0..8], .little);
         } else n: {
             if (capacity == null) return;
-            var cursor = try txn.openCursor();
-            defer cursor.close();
-            var entry = try cursor.seekAtOrAfter(session_prefix);
-            var nrows: u64 = 0;
-            while (entry) |row| : (entry = try cursor.next()) {
-                if (!std.mem.startsWith(u8, row.key, session_prefix)) break;
-                nrows += 1;
-            }
+            const nrows = try txn.countPrefix(session_prefix);
             if (nrows >= capacity.?) {
                 try putSessionCount(txn, nrows);
                 return error.SessionCountInitializedAtLimit;
@@ -2842,6 +2838,110 @@ pub const SessionRegistry = struct {
         return .{ .session = (try durable.load(txn_id)) orelse return null, .owned_by = durable.alloc };
     }
 
+    pub const SqlAdmission = struct {
+        state: SqlState,
+        guard: Mutation,
+    };
+
+    pub fn admitSql(self: *SessionRegistry, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8, owner: u64, connection: ?[32]u8, prior: ?Mutation) !SqlAdmission {
+        const lock = self.sessionLock(id);
+        lock.lock();
+        defer lock.unlock();
+        self.mutex.lock();
+        const cached = self.sessions.get(id);
+        self.mutex.unlock();
+        if (!self.durableMissIsAuthoritative()) {
+            if (cached) |value| {
+                return self.admitSqlState(alloc, null, &value, principal, owner, connection, prior);
+            }
+        }
+        const durable = self.durable orelse return error.SqlTransactionNotActive;
+        return self.admitDurableSql(alloc, durable, id, principal, owner, connection, prior, cached) catch |err| switch (err) {
+            error.LegacyReaderLease => blk: {
+                try self.lease_store.?.certifyReader(alloc, id, owner);
+                break :blk self.admitDurableSql(alloc, durable, id, principal, owner, connection, prior, cached);
+            },
+            else => err,
+        };
+    }
+
+    fn admitDurableSql(self: *SessionRegistry, alloc: std.mem.Allocator, durable: *DurableSessionStore, id: db_mod.types.TxnId, principal: ?[]const u8, owner: u64, connection: ?[32]u8, prior: ?Mutation, cached: ?Session) !SqlAdmission {
+        switch (durable.backend) {
+            .docstore => |store| {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                return self.admitSqlTxn(alloc, &txn, id, principal, owner, connection, prior, cached);
+            },
+            .runtime => |store| {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                return self.admitSqlTxn(alloc, &txn, id, principal, owner, connection, prior, cached);
+            },
+        }
+    }
+
+    fn admitSqlState(self: *SessionRegistry, alloc: std.mem.Allocator, txn: anytype, session: *const Session, principal: ?[]const u8, owner: u64, connection: ?[32]u8, prior: ?Mutation) !SqlAdmission {
+        if (!principalsEqual(session.principal, principal)) return error.SqlTransactionNotActive;
+        if (!std.meta.eql(session.connection_id, connection)) return error.SqlConnectionNotFound;
+        if (session.owner_node_id != owner) return error.SessionLeaseLost;
+        const guard: Mutation = if (@TypeOf(txn) != @TypeOf(null) and self.hasColocatedLease())
+            .{ .id = session.txn_id, .owner = owner, .tenure = try readLeaseTenure(alloc, txn, session.txn_id, owner) }
+        else
+            try self.mutation(alloc, session.txn_id, owner);
+        if (prior) |admitted| if (!std.meta.eql(admitted, guard)) return error.SessionLeaseLost;
+        return .{ .state = (try SqlState.fromSession(alloc, session)) orelse return error.SqlTransactionNotActive, .guard = guard };
+    }
+
+    fn admitSqlTxn(self: *SessionRegistry, alloc: std.mem.Allocator, txn: anytype, id: db_mod.types.TxnId, principal: ?[]const u8, owner: u64, connection: ?[32]u8, prior: ?Mutation, cached: ?Session) !SqlAdmission {
+        const key = try makeSessionKey(alloc, id);
+        defer alloc.free(key);
+        // The stripe keeps the cached session alive. Validate its canonical
+        // version and the current lease on this same read transaction.
+        var full: ?[]const u8 = null;
+        if (cached) |value| {
+            const narrow = narrow: {
+                var scope = txn.openReadScope(alloc) catch |err| switch (err) {
+                    error.Unsupported => break :narrow null,
+                    else => return err,
+                };
+                defer scope.close();
+                const bytes = scope.getRange(key, 0, connection_prefix_len) catch |err| switch (err) {
+                    error.NotFound => return error.SqlTransactionNotActive,
+                    error.Unsupported, error.EndOfStream => break :narrow null,
+                    else => return err,
+                };
+                break :narrow try parseSqlPrefix(bytes, if (value.connection_id != null) connection_field else sql_field);
+            };
+            // A legacy backend may lack range reads. Compare its borrowed
+            // record prefix before paying to decode staged mutations.
+            const packed_state = narrow orelse legacy: {
+                full = txn.get(key) catch |err| return if (err == error.NotFound) error.SqlTransactionNotActive else err;
+                break :legacy try parseSqlPrefix(full.?, if (value.connection_id != null) connection_field else sql_field);
+            };
+            if (packed_state) |bytes| {
+                if (std.mem.eql(u8, &bytes, &try sqlPrefixPayload(&value))) return self.admitSqlState(alloc, txn, &value, principal, owner, connection, prior);
+            }
+        }
+        const durable = self.durable.?;
+        const bytes = full orelse txn.get(key) catch |err| return if (err == error.NotFound) error.SqlTransactionNotActive else err;
+        var value = try decodeSessionRecord(durable.alloc, id, bytes);
+        var retain = false;
+        defer if (!retain) value.deinit(durable.alloc);
+        var admission = try self.admitSqlState(alloc, txn, &value, principal, owner, connection, prior);
+        errdefer admission.state.deinit(alloc);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.sessions.getPtr(id)) |entry| {
+            entry.deinitOwned();
+            entry.* = value;
+        } else {
+            try self.reserveSessionSlotLocked(durable.alloc);
+            self.sessions.putAssumeCapacity(id, value);
+        }
+        retain = true;
+        return admission;
+    }
+
     pub fn getSqlState(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SqlState {
         return self.readSqlState(alloc, txn_id, null);
     }
@@ -3363,7 +3463,7 @@ pub const SessionRegistry = struct {
         return {};
     }
 
-    pub fn recordAttemptAbort(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, publication: ?DurableSessionStore.Version) !?DurableSessionStore.Version {
+    pub fn recordAttemptAbort(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, publication: ?ExecutionPlan.Publication) !?DurableSessionStore.Version {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
@@ -3371,10 +3471,10 @@ pub const SessionRegistry = struct {
         errdefer candidate.deinit(alloc);
         if (candidate.terminal_commit != null or !candidate.commit_execution_started) return error.SqlTransactionOutcomeUnknown;
         const expected = DurableSessionStore.Version.of(candidate);
-        if (publication) |version| if (!std.meta.eql(version, expected)) return error.SessionLeaseLost;
+        if (publication) |first| if (!std.meta.eql(first.version, expected) or !std.meta.eql(first.guard.id, txn_id)) return error.SessionLeaseLost;
         candidate.terminal_abort = true;
         touchSession(&candidate);
-        try self.persistOwnedVersion(candidate, expected);
+        try self.persistMutation(candidate, expected, if (publication) |first| first.guard else null);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -3382,11 +3482,11 @@ pub const SessionRegistry = struct {
         return DurableSessionStore.Version.of(publish_target.*);
     }
 
-    pub fn publishAbortAndRetire(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, publication: ?DurableSessionStore.Version) !void {
+    pub fn publishAbortAndRetire(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, publication: ?ExecutionPlan.Publication) !void {
         const terminal = (try self.recordAttemptAbort(alloc, txn_id, publication)) orelse return error.SessionLeaseLost;
         // The abort is durable even when an attached connection or a concurrent
         // operation prevents immediate retirement.
-        _ = self.removeMode(alloc, txn_id, false, false, terminal, null) catch false;
+        _ = self.removeMode(alloc, txn_id, false, false, terminal, if (publication) |first| first.guard else null) catch false;
     }
 
     pub fn getExecutionPlan(self: *SessionRegistry, alloc: std.mem.Allocator, guard: Mutation) !?ExecutionPlan {
@@ -3438,7 +3538,7 @@ pub const SessionRegistry = struct {
         errdefer result.deinit();
         candidate.commit_execution_started = true;
         touchSession(&candidate);
-        if (!expected.executing) result.publication = DurableSessionStore.Version.of(candidate);
+        if (!expected.executing) result.publication = .{ .version = DurableSessionStore.Version.of(candidate), .guard = guard };
         // The storage transaction observes both the original unsealed row and
         // its lease. Only its successful publisher may take first-attempt paths.
         try self.persistMutation(candidate, expected, guard);
@@ -6295,6 +6395,7 @@ fn readerPayload(session: *const Session) [reader_payload_len]u8 {
 // Attached sessions pack recovery state and reader identity into a single
 // bounded prefix. Older records remain readable on the same snapshot.
 const connection_field = "\"c1\":\"";
+const sql_field = "\"s1\":\"";
 const payload_len = 65;
 const encoded_len = std.base64.standard.Encoder.calcSize(payload_len);
 const connection_prefix_len = session_record.bound_session_header.len + connection_field.len + encoded_len + 2;
@@ -6309,9 +6410,23 @@ pub const ConnectionLifecycle = struct {
 };
 
 fn parseConnectionPrefix(bytes: []const u8) !?[payload_len]u8 {
+    return parseSqlPrefix(bytes, connection_field);
+}
+
+fn sqlPrefixPayload(session: *const Session) ![payload_len]u8 {
+    var bytes: [payload_len]u8 = @splat(0);
+    bytes[0..41].* = readerPayload(session);
+    if (session.commit_execution_started) bytes[0] |= 2;
+    if (session.terminal_commit != null or session.terminal_abort) bytes[0] |= 4;
+    std.mem.writeInt(u64, bytes[41..49], session.last_touched_timestamp, .little);
+    if (session.connection_id) |id| _ = std.fmt.hexToBytes(bytes[49..65], &id) catch return error.InvalidTransactionSessionRecord;
+    return bytes;
+}
+
+fn parseSqlPrefix(bytes: []const u8, name: []const u8) !?[payload_len]u8 {
     const header = if (std.mem.startsWith(u8, bytes, session_record.bound_session_header)) @as([]const u8, session_record.bound_session_header) else "{";
-    if (!std.mem.startsWith(u8, bytes, header) or !std.mem.startsWith(u8, bytes[header.len..], connection_field)) return null;
-    const field = bytes[header.len + connection_field.len ..];
+    if (!std.mem.startsWith(u8, bytes, header) or !std.mem.startsWith(u8, bytes[header.len..], name)) return null;
+    const field = bytes[header.len + name.len ..];
     if (field.len < encoded_len + 2 or !std.mem.startsWith(u8, field[encoded_len..], "\",")) return error.InvalidTransactionSessionRecord;
     var result: [payload_len]u8 = undefined;
     std.base64.standard.Decoder.decode(&result, field[0..encoded_len]) catch return error.InvalidTransactionSessionRecord;
@@ -6321,6 +6436,7 @@ fn parseConnectionPrefix(bytes: []const u8) !?[payload_len]u8 {
 
 fn checkReaderPrefix(bytes: []const u8, principal: []const u8, owner: u64) !bool {
     if (try parseConnectionPrefix(bytes)) |payload| return checkReaderIdentity(payload[0..41], principal, owner);
+    if (try parseSqlPrefix(bytes, sql_field)) |payload| return checkReaderIdentity(payload[0..41], principal, owner);
     const header: []const u8 = if (std.mem.startsWith(u8, bytes, session_record.bound_session_header)) session_record.bound_session_header else "{";
     if (!std.mem.startsWith(u8, bytes, header) or !std.mem.startsWith(u8, bytes[header.len..], reader_field)) return false;
     const encoded = bytes[header.len + reader_field.len ..];
@@ -6435,15 +6551,10 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         break :blk false;
     };
     try out.appendSlice(alloc, if (bound) session_record.bound_session_header else "{");
-    if (session.connection_id != null and session.sql != null) {
-        var bytes: [payload_len]u8 = undefined;
-        bytes[0..41].* = readerPayload(&session);
-        if (session.commit_execution_started) bytes[0] |= 2;
-        if (session.terminal_commit != null or session.terminal_abort) bytes[0] |= 4;
-        std.mem.writeInt(u64, bytes[41..49], session.last_touched_timestamp, .little);
-        _ = std.fmt.hexToBytes(bytes[49..65], &session.connection_id.?) catch return error.InvalidTransactionSessionRecord;
+    if (session.connection_id != null or session.sql != null) {
+        const bytes = try sqlPrefixPayload(&session);
         var encoded: [encoded_len]u8 = undefined;
-        try out.appendSlice(alloc, connection_field);
+        try out.appendSlice(alloc, if (session.connection_id != null) connection_field else sql_field);
         try out.appendSlice(alloc, std.base64.standard.Encoder.encode(&encoded, &bytes));
     } else {
         try out.appendSlice(alloc, reader_field);
@@ -7342,7 +7453,10 @@ test "distributed txn expired publisher cannot overwrite an adopted execution pl
     var chosen = try parseExecutionPlan(a, saved.execution_plan.?);
     defer chosen.deinit();
     try std.testing.expectEqualStrings("docs", chosen.value[0].table_name);
-    try std.testing.expect(try old.adoptIfLeaseExpired(a, id, 9, nextTxnTimestamp() + 5 * std.time.ns_per_s));
+    _ = try next.renewOwnedLeases(10, nextTxnTimestamp() + 4 * std.time.ns_per_s);
+    try std.testing.expectError(error.SessionLeaseLost, next.recordAttemptAbort(a, id, winner.publication));
+    try std.testing.expect(!(try next.readInfo(id)).?.terminal_abort);
+    try std.testing.expect(try old.adoptIfLeaseExpired(a, id, 9, nextTxnTimestamp() + 7 * std.time.ns_per_s));
     try std.testing.expectError(error.SessionLeaseLost, next.recordAttemptAbort(a, id, winner.publication));
 }
 
@@ -7872,10 +7986,20 @@ test "SQL session metadata mutation requires the admitted owner and exact tenure
     next.durable_scope = .cluster_shared;
     const begun = try former.beginForPrincipal(a, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 1, "alice");
     const guard = try former.mutation(a, begun.txn_id, 1);
+    var cold = try next.admitSql(a, begun.txn_id, "alice", 1, null, null);
+    defer cold.state.deinit(a);
+    try std.testing.expectEqualDeep(guard, cold.guard);
+    try former.setSqlFailed(a, guard, true);
+    var refreshed = try next.admitSql(a, begun.txn_id, "alice", 1, null, guard);
+    defer refreshed.state.deinit(a);
+    try std.testing.expect(refreshed.state.metadata.failed);
+    try former.setSqlFailed(a, guard, false);
+    try std.testing.expectError(error.SqlTransactionNotActive, next.admitSql(a, begun.txn_id, "bob", 1, null, guard));
     try std.testing.expect(try next.adopt(a, begun.txn_id, 2));
     try std.testing.expectError(error.SessionLeaseLost, former.createNamedSavepoint(a, guard, "stale"));
     try std.testing.expect(try former.adopt(a, begun.txn_id, 1));
     try std.testing.expectError(error.SessionLeaseLost, former.setSqlFailed(a, guard, true));
+    try std.testing.expectError(error.SessionLeaseLost, next.admitSql(a, begun.txn_id, "alice", 1, null, guard));
     var current = (try next.getSqlState(a, begun.txn_id)).?;
     defer current.deinit(a);
     try std.testing.expect(!current.metadata.failed);

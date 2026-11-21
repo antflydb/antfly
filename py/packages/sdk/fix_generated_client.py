@@ -181,7 +181,11 @@ def fix_generated_client(root: Path) -> None:
     for operation in WRITE_OPERATIONS:
         path = root / f"api/data_operations/{operation}.py"
         source = path.read_text(encoding="utf-8")
-        for status in (403, 503):
+        for status in (
+            (403, 409, 503)
+            if operation in {"multi_batch_write", "commit_transaction", "commit_transaction_session"}
+            else (403, 503)
+        ):
             branch = f"    if response.status_code == {status}:"
             if source.count(branch) != 1 or "TransactionWriteError.from_dict" not in source:
                 raise RuntimeError(f"unexpected generated write response in {operation}: {status}")

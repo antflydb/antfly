@@ -320,33 +320,13 @@ pub const Adapter = struct {
                 zig017_return_error = error.SqlTransactionNotActive;
                 break :zig017_failure error.SqlTransactionNotActive;
             };
-            if ((self.server.txn_sessions.principalAccess(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*)) catch |zig017_err| {
-                zig017_return_error = zig017_err;
-                return zig017_err;
-            }) != .allowed) return zig017_failure: {
-                zig017_return_error = error.SqlTransactionNotActive;
-                break :zig017_failure error.SqlTransactionNotActive;
-            };
-            self.admitted_mutation = self.server.txn_sessions.mutation(self.server.alloc, id, self.server.localSessionNodeId()) catch |err| {
+            const admission = self.server.txn_sessions.admitSql(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*), self.server.localSessionNodeId(), self.connection_id, self.connection_mutation) catch |err| {
                 if (err == error.SessionLeaseLost) self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
                 return err;
             };
-            if (self.connection_mutation) |guard| if (!std.meta.eql(guard, self.admitted_mutation.?)) {
-                self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
-                return error.SessionLeaseLost;
-            };
-            inherited = ((self.server.txn_sessions.getSqlState(self.server.alloc, id) catch |zig017_err| {
-                zig017_return_error = zig017_err;
-                return zig017_err;
-            })) orelse return zig017_failure: {
-                zig017_return_error = error.SqlTransactionNotActive;
-                break :zig017_failure error.SqlTransactionNotActive;
-            };
+            self.admitted_mutation = admission.guard;
+            inherited = admission.state;
             if (inherited.?.metadata.accepted_lake_reads) self.lake_visibility = .accepted;
-            if (!std.meta.eql(inherited.?.connection_id, self.connection_id)) return zig017_failure: {
-                zig017_return_error = error.SqlConnectionNotFound;
-                break :zig017_failure error.SqlConnectionNotFound;
-            };
             if (self.inherit_session_database) self.database = inherited.?.metadata.database;
             if (self.inherit_session_namespace) self.namespace = inherited.?.metadata.namespace;
             self.setting_overlay = (attachedSettingOverlay(self.setting_overlay_source, self.setting_overlay, inherited.?.setting_active.items) catch |zig017_err| {
@@ -357,15 +337,10 @@ pub const Adapter = struct {
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
         var owner = session_api.Adapter{ .admitted = self.admitted_mutation, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
-        if (self.session_id) |encoded| {
-            const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
-                zig017_return_error = error.SqlTransactionNotActive;
-                break :zig017_failure error.SqlTransactionNotActive;
-            };
-            session.attach(id) catch |err| {
-                if (err == error.SessionLeaseLost) self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
-                return err;
-            };
+        if (inherited) |state| {
+            if (!std.mem.eql(u8, state.metadata.database, session.scope.database) or !std.mem.eql(u8, state.metadata.namespace, session.scope.namespace)) return error.SqlTransactionNotActive;
+            const id = self.admitted_mutation.?.id;
+            try session.attachInspected(id, session_api.Adapter.inspected(id, state));
         }
         // A request only borrows the durable session. Dropping an HTTP request
         // must not abandon it; pgwire disconnect is the explicit owner release.

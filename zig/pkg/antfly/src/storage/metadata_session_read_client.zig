@@ -47,6 +47,14 @@ const Read = struct {
         if (response.len > 32 << 20) return error.TransactionTooLarge;
         return a.dupe(u8, response.slice());
     }
+    fn countPrefix(ptr: *anyopaque, key: []const u8) !u64 {
+        const self = cast(ptr);
+        var response: abi.OwnedBytes = .{};
+        try status(abi.antfly_metadata_session_read_invoke(self.handle, &.{ .operation = .count_prefix, .key = .fromSlice(key) }, &response));
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        if (response.len != 8) return error.StorageKernelFailure;
+        return std.mem.readInt(u64, response.slice()[0..8], .little);
+    }
     fn scope(a: A, ptr: *anyopaque) !erased.ReadScope {
         const read = cast(ptr);
         _ = read.refs.fetchAdd(1, .monotonic);
@@ -84,7 +92,7 @@ pub fn open(a: A, store: ?*anyopaque, group: u64) !erased.ReadTxn {
     const native = handle orelse return error.StorageKernelFailure;
     const read = try a.create(Read);
     read.* = .{ .handle = native, .arena = std.heap.ArenaAllocator.init(a) };
-    return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope } };
+    return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope, .count_prefix = Read.countPrefix } };
 }
 fn status(value: abi.Status) !void {
     return identity.statusToError(value);

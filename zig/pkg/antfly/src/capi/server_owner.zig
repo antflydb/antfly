@@ -2792,11 +2792,18 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     upper[read.prefix.len - 1] += 1;
     const upper_bound = upper[0..read.prefix.len];
     const bounded = switch (request.operation) {
-        .get, .get_range, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
+        .get, .get_range, .count_prefix, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
         else => false,
     };
     const upper_seek = request.operation == .seek_at_or_before and std.mem.eql(u8, key, upper_bound);
     if (bounded and ((!std.mem.startsWith(u8, key, read.prefix) and !upper_seek) or key.len > read.prefix.len + 512)) return .invalid_argument;
+    if (request.operation == .count_prefix) {
+        const count = read.txn.countPrefix(key) catch |err| return storageOwnerStatusFromError(err);
+        const bytes = read.alloc.alloc(u8, 8) catch return .out_of_memory;
+        std.mem.writeInt(u64, bytes[0..8], count, .little);
+        out_value.* = .{ .ptr = bytes.ptr, .len = 8 };
+        return .ok;
+    }
     if (request.operation == .get or request.operation == .get_range) {
         var scope = if (request.operation == .get_range) read.txn.openReadScope(read.alloc) catch |err| return storageOwnerStatusFromError(err) else null;
         defer if (scope) |*s| s.close();
@@ -2819,7 +2826,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     var cursor = read.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
     defer cursor.close();
     var entry = switch (request.operation) {
-        .get, .get_range => unreachable,
+        .get, .get_range, .count_prefix => unreachable,
         .first => cursor.seekAtOrAfter(read.prefix),
         .last => cursor.seekAtOrBefore(upper_bound),
         .next, .seek_at_or_after => cursor.seekAtOrAfter(key),

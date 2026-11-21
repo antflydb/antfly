@@ -43,7 +43,7 @@ pub const Store = struct {
     }
     fn beginRead(a: A, ptr: *anyopaque) !erased.ReadTxn {
         const read = try Read.create(a, cast(ptr));
-        return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope } };
+        return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope, .count_prefix = Read.countPrefix } };
     }
     fn beginWrite(a: A, ptr: *anyopaque) !erased.WriteTxn {
         const self = cast(ptr);
@@ -62,7 +62,7 @@ pub const Store = struct {
             break :blk std.mem.readInt(u64, value[0..8], .little);
         } else 0;
         write.* = .{ .read = read, .term = term, .epoch = epoch };
-        return .{ .allocator = a, .ptr = write, .vtable = &.{ .abort = Write.abort, .commit = Write.commit, .get = Write.get, .put = Write.put, .delete = Write.delete, .open_cursor = Write.cursor } };
+        return .{ .allocator = a, .ptr = write, .vtable = &.{ .abort = Write.abort, .commit = Write.commit, .get = Write.get, .put = Write.put, .delete = Write.delete, .open_cursor = Write.cursor, .count_prefix = Write.countPrefix } };
     }
     fn beginBatch(a: A, ptr: *anyopaque) !erased.Batch {
         const write = try beginWrite(a, ptr);
@@ -134,6 +134,19 @@ const Read = struct {
             self.physical.close();
         }
     };
+    fn countPrefix(ptr: *anyopaque, prefix: []const u8) !u64 {
+        const self = cast(ptr);
+        const a = self.arena.child_allocator;
+        if (!std.mem.startsWith(u8, prefix, record.session_prefix)) {
+            var logical = try cursor(a, ptr);
+            defer logical.close();
+            return logical.countPrefix(prefix);
+        }
+        // A session-record prefix cannot include any hidden metadata indexes.
+        const physical = try record.keyAlloc(a, self.store.group, prefix);
+        defer a.free(physical);
+        return self.physical.countPrefix(physical);
+    }
     fn cursor(a: A, ptr: *anyopaque) !erased.Cursor {
         return Cursor.create(a, cast(ptr), null);
     }
@@ -195,6 +208,23 @@ const Write = struct {
     }
     fn delete(ptr: *anyopaque, key: []const u8) !void {
         (try cast(ptr).observe(key)).value = null;
+    }
+    fn countPrefix(ptr: *anyopaque, prefix: []const u8) !u64 {
+        const self = cast(ptr);
+        self.scanned = true;
+        // The session namespace cannot overlap the hidden physical indexes.
+        if (!std.mem.startsWith(u8, prefix, record.session_prefix)) {
+            var merged = try cursor(self.read.arena.child_allocator, ptr);
+            defer merged.close();
+            return merged.countPrefix(prefix);
+        }
+        var total = try Read.countPrefix(self.read, prefix);
+        for (self.changes.items) |change| {
+            if (!std.mem.startsWith(u8, change.key, prefix)) continue;
+            if (change.expected == null and change.value != null) total += 1;
+            if (change.expected != null and change.value == null) total -= 1;
+        }
+        return total;
     }
     fn cursor(a: A, ptr: *anyopaque) !erased.Cursor {
         const self = cast(ptr);
@@ -435,7 +465,22 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         var legacy = try logical.beginWrite();
         errdefer legacy.abort();
         try legacy.put(record.session_prefix ++ "legacy", "session");
+        try std.testing.expectEqual(@as(u64, 1), try legacy.countPrefix(record.session_prefix));
         try legacy.commit();
+    }
+    {
+        var read = try logical.beginRead();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 1), try read.countPrefix(record.session_prefix));
+        try std.testing.expectEqual(@as(u64, 0), try retained.countPrefix(record.session_prefix));
+        var overlay = try logical.beginWrite();
+        defer overlay.abort();
+        try overlay.put(record.session_prefix ++ "legacy", "updated");
+        try std.testing.expectEqual(@as(u64, 1), try overlay.countPrefix(record.session_prefix));
+        try overlay.delete(record.session_prefix ++ "legacy");
+        try std.testing.expectEqual(@as(u64, 0), try overlay.countPrefix(record.session_prefix));
+        try overlay.put(record.session_prefix ++ "new", "created");
+        try std.testing.expectEqual(@as(u64, 1), try overlay.countPrefix(record.session_prefix));
     }
     {
         var repair = try logical.beginWrite();

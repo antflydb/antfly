@@ -67,6 +67,11 @@ pub const Session = struct {
     pub fn attach(self: *Session, id: Id) !void {
         if (self.transaction_id != null) return error.SqlTransactionAlreadyActive;
         const transaction = try self.owner.vtable.inspect(self.owner.ptr, self.scope, id);
+        return self.attachInspected(id, transaction);
+    }
+
+    pub fn attachInspected(self: *Session, id: Id, transaction: Transaction) !void {
+        if (self.transaction_id != null) return error.SqlTransactionAlreadyActive;
         if (!std.mem.eql(u8, &transaction.id, &id)) return error.InvalidSqlBackendResponse;
         switch (transaction.state) {
             .committed, .aborted => return error.SqlTransactionNotActive,

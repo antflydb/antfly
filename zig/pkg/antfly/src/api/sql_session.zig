@@ -70,11 +70,8 @@ pub const Coordinator = struct {
         const source = server.table_writes orelse return error.UnsupportedSqlExecution;
         var prepared = try server.preparePublicCommitWithIntegrity(alloc, tables, self.context);
         defer prepared.deinit();
-        var proof_arena = std.heap.ArenaAllocator.init(alloc);
-        defer proof_arena.deinit();
-        const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, self.context);
         if (self.context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
-        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, guard, signed)) orelse return error.SqlTransactionNotActive;
+        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, guard, prepared.tables)) orelse return error.SqlTransactionNotActive;
         defer plan.deinit();
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.
@@ -102,7 +99,7 @@ pub const Coordinator = struct {
                 // connection detachment is a separate fallible publication.
                 // Persist the abort before responding so a lost detach can be
                 // reconciled without treating a missing txn as an abort.
-                _ = (server.txn_sessions.recordTerminalAbort(alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
+                _ = (server.txn_sessions.recordAttemptAbort(alloc, id, plan.publication) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
                 return .{ .outcome = .aborted, .reconciliation_id = id };
             },
             .committed => |committed| {
@@ -148,16 +145,10 @@ pub const Adapter = struct {
 
     fn check(self: *Adapter, scope: sql.Scope, id: sql.Id) !transactions.SessionRegistry.SqlState {
         const principal: ?[]const u8 = if (scope.principal.len == 0) null else scope.principal;
-        if (try self.registry.principalAccess(self.alloc, id, principal) != .allowed) return error.SqlTransactionNotActive;
-        var state = (try self.registry.getSqlState(self.alloc, id)) orelse return error.SqlTransactionNotActive;
-        errdefer state.deinit(self.alloc);
-        if (!std.meta.eql(state.connection_id, self.connection_id)) return error.SqlConnectionNotFound;
-        if (state.owner_node_id != self.node_id) return error.SessionLeaseLost;
-        const current = try self.registry.mutation(self.alloc, id, self.node_id);
-        if (self.admitted) |prior| {
-            if (std.mem.eql(u8, &prior.id, &id) and prior.tenure != current.tenure) return error.SessionLeaseLost;
-        }
-        self.admitted = current;
+        var admission = try self.registry.admitSql(self.alloc, id, principal, self.node_id, self.connection_id, self.admitted);
+        errdefer admission.state.deinit(self.alloc);
+        self.admitted = admission.guard;
+        const state = admission.state;
         if (!std.mem.eql(u8, state.metadata.database, scope.database) or !std.mem.eql(u8, state.metadata.namespace, scope.namespace)) return error.SqlTransactionNotActive;
         return state;
     }
@@ -189,6 +180,7 @@ pub const Adapter = struct {
             self.registry.rollbackConnectionBeforeExecution(info.txn_id, connection, info.version, .beginning) catch {};
             return err;
         };
+        self.admitted = null;
         return .{ .id = info.txn_id, .state = .active, .isolation = options.isolation, .mode = options.mode };
     }
 
@@ -196,6 +188,10 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
+        return inspected(id, state);
+    }
+
+    pub fn inspected(id: sql.Id, state: transactions.SessionRegistry.SqlState) sql.Transaction {
         return .{ .id = id, .isolation = state.metadata.isolation, .mode = state.metadata.mode, .savepoints = state.savepoints, .state = if (state.terminal_abort) .aborted else if (state.terminal != null) .committed else if (state.execution_started) .uncertain else if (state.metadata.failed) .failed else .active };
     }
 

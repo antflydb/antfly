@@ -1293,7 +1293,7 @@ pub fn executeCrossGroup(
         .restore_staging_plan_id = req.restore_staging_plan_id,
         .relational_repair = req.relational_repair,
     }};
-    const outcome = try executeMultiTableCommit(
+    const outcome = executeMultiTableCommit(
         alloc,
         catalog,
         worker,
@@ -1303,10 +1303,10 @@ pub fn executeCrossGroup(
         &tables,
         .propose,
         trace_writer,
-    );
+    ) catch |err| return if (err == error.PreDispatchCatalogGenerationChanged) error.CatalogGenerationChanged else err;
     return switch (outcome) {
         .committed => |committed| .{ .participant_count = committed.participant_count },
-        .conflict => error.IntentConflict,
+        .conflict => |conflict| if (conflict.phase == .begin and std.mem.eql(u8, conflict.message, "topology changed")) error.TopologyChanged else error.IntentConflict,
     };
 }
 
@@ -1368,9 +1368,12 @@ fn executeMultiTableCommitOnce(
         participants.deinit(alloc);
     }
 
-    const admitted = routeParticipants(alloc, catalog, tables, &participants, options.retain_terminal) catch |err| {
+    var rejected_table: []const u8 = "";
+    const admitted = routeParticipants(alloc, catalog, tables, &participants, options.retain_terminal, &rejected_table) catch |err| {
         // Only this call site proves that BEGIN has not been dispatched.
-        if (options.fresh_retained_id and err == error.CatalogGenerationChanged) return error.PreDispatchCatalogGenerationChanged;
+        if (err == error.TopologyChanged and rejected_table.len != 0 and (!options.retain_terminal or options.fresh_retained_id))
+            return .{ .conflict = .{ .table_name = rejected_table, .key = "", .message = "topology changed", .phase = .begin, .retryable = true } };
+        if ((!options.retain_terminal or options.fresh_retained_id) and err == error.CatalogGenerationChanged) return error.PreDispatchCatalogGenerationChanged;
         if (err == error.CatalogRouteFenceUnsupported) {
             if (!options.retain_terminal or options.fresh_retained_id) return error.PreDispatchDecisionAdmissionUnavailable;
             return error.StorageReadTemporarilyUnavailable;
@@ -2319,8 +2322,12 @@ test "distributed txn batched admission checks legacy owner groups and ignores t
         for (descriptors) |table| try selected.put(arena.allocator(), table.name, .{ .requirements = .{ .table_name = table.name } });
         if (phase != 0) merges[0].phase = .finalized;
         if (phase == 2) splits[0].phase = .rolled_back;
-        const admitted = loadTableRoutes(arena.allocator(), &selected, &snapshot, null);
-        if (phase == 2) try admitted else try std.testing.expectError(error.TopologyChanged, admitted);
+        var rejected: []const u8 = "";
+        const admitted = loadTableRoutes(arena.allocator(), &selected, &snapshot, &rejected);
+        if (phase == 2) try admitted else {
+            try std.testing.expectError(error.TopologyChanged, admitted);
+            try std.testing.expectEqualStrings(if (phase == 0) "a" else "b", rejected);
+        }
     }
 }
 
@@ -2388,7 +2395,7 @@ fn bindParticipantRoute(participant: *ParticipantTxn, identity: RoutingIdentity,
     }
 }
 
-fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn), retain_terminal: bool) !?RoutingIdentity {
+fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn), retain_terminal: bool, failure: ?*[]const u8) !?RoutingIdentity {
     if (tables.len == 0) return null;
     var workspace = std.heap.ArenaAllocator.init(alloc);
     defer workspace.deinit();
@@ -2419,13 +2426,13 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
             try id.requireIncarnation(bound_incarnation);
             const checks = try a.alloc(AdmissionRequest.TableCheck, by_name.count());
             for (by_name.keys(), by_name.values(), checks) |name, *routes, *check| {
-                const table = try indexed.tableRoutingView(name, budget);
+                const table = indexed.tableRoutingView(name, budget) catch |err| return tableRoutingFailure(failure, name, err);
                 routes.ranges = indexed.tableRanges(table.table_id);
                 if (routes.ranges.len == 0) return error.TableNotFound;
                 routes.epoch = table.topology_epoch;
                 check.* = .{ .table_id = table.table_id, .table_name = name, .topology_epoch = table.topology_epoch };
             }
-            if (try validateTableBatch(authority, id, checks, null)) |revision| {
+            if (try validateTableBatch(authority, id, checks, failure)) |revision| {
                 id.verified_revision = revision;
                 break :selected id;
             }
@@ -2443,12 +2450,15 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         admin = try catalog.adminSnapshot();
         const id = RoutingIdentity.from(&admin.?);
         try id.requireIncarnation(bound_incarnation);
-        try loadTableRoutes(a, &by_name, &admin.?, null);
+        try loadTableRoutes(a, &by_name, &admin.?, failure);
         break :selected id;
     };
     // Enlist in original request order: the first participant is the coordinator.
     for (tables) |table| {
         const routes = by_name.getPtr(table.table_name).?;
+        errdefer if (failure) |out| {
+            out.* = table.table_name;
+        };
         const groups = &routes.groups;
         const topology_epoch = routes.epoch;
         try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
@@ -2546,6 +2556,9 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
     defer enlisted.deinit(alloc);
     for (by_name.values()) |*routes| {
         const table = routes.requirements;
+        errdefer if (failure) |out| {
+            out.* = table.table_name;
+        };
         const groups = &routes.groups;
         const topology_epoch = routes.epoch;
         if (identity.verified_revision != null and groups.count() != 0)
@@ -6171,7 +6184,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), recorder.integrity_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.semantic_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.activation_prepares);
-            try std.testing.expectError(error.CatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .bound_catalog_incarnation = @splat(0xaa), .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null));
+            try std.testing.expectError(error.PreDispatchCatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .bound_catalog_incarnation = @splat(0xaa), .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null));
             try std.testing.expectError(error.PreDispatchCatalogGenerationChanged, executeMultiTableCommitWithOptions(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .bound_catalog_incarnation = @splat(0xaa), .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null, .{ .retain_terminal = true, .fresh_retained_id = true }));
             var routing = (try table_catalog.transactionRoutingSnapshot(std.testing.allocator, FakeCatalog.iface(), "docs")).?;
             defer routing.deinit(std.testing.allocator);
@@ -6200,7 +6213,7 @@ fn consumerTests() type {
                 generation: *table_catalog.RoutingGeneration,
                 checks: usize = 0,
                 recheck_failure: ?anyerror = null,
-                reject_second_table: bool = false,
+                reject_on_check: ?usize = null,
                 supports_batch: bool = true,
                 supports_single: bool = true,
                 fn acquire(ptr: *anyopaque, _: table_catalog.RoutingBudget, authoritative: bool) !*table_catalog.RoutingGeneration {
@@ -6219,7 +6232,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(u64, if (self.checks == 0) 9 else 10), batch.verified_revision);
                     self.checks += 1;
                     if (self.checks == 2) if (self.recheck_failure) |err| return err;
-                    const rejected = self.checks == 2 and self.reject_second_table;
+                    const rejected = self.checks == self.reject_on_check;
                     return .{ .tables_checked = true, .stable = !rejected, .rejected_table_id = if (rejected) batch.tables[1].table_id else null, .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 10 };
                 }
             };
@@ -6237,7 +6250,7 @@ fn consumerTests() type {
                 const stamp = try routeParticipants(arena.allocator(), compact_source, &.{
                     .{ .table_name = "docs", .bound_catalog_incarnation = @splat(0x11), .writes = &.{.{ .key = "a", .value = "{}" }} },
                     .{ .table_name = "audit", .writes = &.{.{ .key = "b", .value = "{}" }} },
-                }, &enlisted_participants, true);
+                }, &enlisted_participants, true, null);
                 for (enlisted_participants.items) |participant| try std.testing.expectEqual(participant.group_id, participant.route_fence.?.route.group_id);
                 try validateParticipantEpochs(arena.allocator(), compact_source, enlisted_participants.items, stamp, null);
                 try std.testing.expectEqual(@as(usize, 2), compact.checks);
@@ -6260,7 +6273,7 @@ fn consumerTests() type {
                 _ = try routeParticipants(std.testing.allocator, FakeCatalog.iface(), &.{
                     .{ .table_name = "docs", .commit_requires = .direct_enrichments },
                     .{ .table_name = "docs", .commit_requires = .none, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
-                }, &participants, false);
+                }, &participants, false, null);
                 try std.testing.expectEqual(@as(usize, 1), participants.items.len);
                 try std.testing.expectEqual(@as(u64, 7002), participants.items[0].group_id);
                 try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, participants.items[0].commit_requires.?);
@@ -6275,7 +6288,7 @@ fn consumerTests() type {
                     .{ .table_name = "docs", .commit_requires = .direct_enrichments },
                     .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
                     .{ .table_name = "docs", .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
-                }, &participants, true);
+                }, &participants, true, null);
                 try std.testing.expectEqual(@as(usize, 3), participants.items.len);
                 try std.testing.expectEqual(@as(u64, 7001), participants.items[0].group_id);
                 try std.testing.expectEqual(@as(u64, 7002), participants.items[2].group_id);
@@ -6299,15 +6312,15 @@ fn consumerTests() type {
                 snapshot.tables = &duplicate;
                 try std.testing.expectError(error.CatalogGenerationChanged, loadTableRoutes(arena.allocator(), &names, &snapshot, null));
             }
-            try std.testing.expectError(error.CatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(4), 60_000, 60_001, &.{
+            try std.testing.expectError(error.PreDispatchCatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(4), 60_000, 60_001, &.{
                 .{ .table_name = "docs", .schema_version = 7, .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
                 .{ .table_name = "docs", .schema_version = 8, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
             }, .write, null));
             var stale = observation;
             stale.fence.route.range_id +%= 1;
-            try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(3), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = &.{ stale, observation } }}, .write, null));
+            try std.testing.expectEqualStrings("docs", (try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(3), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = &.{ stale, observation } }}, .write, null)).conflict.table_name);
             observation.fence.metadata_incarnation = @splat('2');
-            try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("50112233445566778899aabbccddeeff"), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = (&observation)[0..1] }}, .write, null));
+            try std.testing.expectEqualStrings("docs", (try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("50112233445566778899aabbccddeeff"), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = (&observation)[0..1] }}, .write, null)).conflict.table_name);
             try std.testing.expectEqual(prior_begins, recorder.begins.items.len);
             // Admit all three writes on the compact generation itself. The
             // post-prepare check is the only injected routing failure.
@@ -6330,9 +6343,19 @@ fn consumerTests() type {
             }
             compact.checks = 0;
             compact.recheck_failure = null;
-            compact.reject_second_table = true;
+            compact.reject_on_check = 2;
             const rejected = try executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(8), 80_000, 80_001, &recheck_tables, .write, null, .{ .retain_terminal = true, .fresh_retained_id = true });
             try std.testing.expectEqualStrings("audit", rejected.conflict.table_name);
+            compact.reject_on_check = 1;
+            const begins = recorder.begins.items.len;
+            for ([_]bool{ false, true }) |retained| {
+                compact.checks = 0;
+                const early = try executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(9), 90_000, 90_001, &recheck_tables, .write, null, .{ .retain_terminal = retained, .fresh_retained_id = retained });
+                try std.testing.expectEqualStrings("audit", early.conflict.table_name);
+            }
+            compact.checks = 0;
+            try std.testing.expectError(error.TopologyChanged, executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(9), 90_000, 90_001, &recheck_tables, .write, null, .{ .retain_terminal = true }));
+            try std.testing.expectEqual(begins, recorder.begins.items.len);
         }
 
         test "stable distributed transaction retry resumes a durable commit decision" {

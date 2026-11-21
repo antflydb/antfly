@@ -26,6 +26,7 @@ pub const Provider = struct {
     server: *server_mod.ApiHttpServer,
     context: local.api_operation.RequestContext,
     identity: *?server_mod.AuthenticatedIdentity,
+    execution_plan: ?@import("transactions.zig").ExecutionPlan = null,
     receipt: ?@import("graph_write_receipt.zig").Result = null,
     graph: cypher.catalog.Graph,
     tables: []const port.GraphTable,
@@ -99,7 +100,7 @@ pub const Provider = struct {
         var id: types.TxnId = undefined;
         if (self.request_id) |encoded| id = try @import("distributed_txn.zig").parseTxnIdHex(encoded) else try self.server.embedding_provider_runtime.io.randomSecure(&id);
         self.transaction_id = id;
-        const receipt = try @import("graph_write_receipt.zig").execute(self.server, self.identity.*, self.context, id, requests, a);
+        const receipt = try @import("graph_write_receipt.zig").execute(self.server, self.identity.*, self.context, id, requests, a, &self.execution_plan);
         self.receipt = receipt;
         self.outcome = receipt.outcome;
         if (receipt.status == .aborted) return receipt.failure orelse error.CypherTransactionConflict;

@@ -34303,13 +34303,14 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Transaction aborted because a predicate, topology fence, or participant state conflicted */
+            /** @description Transaction conflict. Preparation diagnostics are returned as plain text. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
+                    "text/plain": string;
                 };
             };
             500: components["responses"]["StatelessTransactionFailure"];
@@ -34472,13 +34473,14 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Transaction aborted due to version conflict */
+            /** @description Transaction conflict. Preparation diagnostics are returned as plain text. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
+                    "text/plain": string;
                 };
             };
             500: components["responses"]["StatelessTransactionFailure"];
@@ -34824,13 +34826,14 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Session commit conflict */
+            /** @description Session commit conflict. A plain-text response describes a mismatched retry body or table identity. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TransactionSessionCommitResponse"];
+                    "text/plain": string;
                 };
             };
             500: components["responses"]["InternalServerError"];

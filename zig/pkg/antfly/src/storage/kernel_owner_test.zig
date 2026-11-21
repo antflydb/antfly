@@ -3994,6 +3994,11 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     var scoped = try recovered.openReadScope(a);
     defer scoped.close();
     try std.testing.expectEqualStrings("header", try scoped.getRange(session_key, 0, 6));
+    const prefix = try records.keyAlloc(a, group, records.session_prefix);
+    defer a.free(prefix);
+    try std.testing.expectEqual(@as(u64, 0), try retained.countPrefix(prefix));
+    try std.testing.expectEqual(@as(u64, 1), try recovered.countPrefix(prefix));
+    try std.testing.expectError(error.InvalidArgument, recovered.countPrefix("outside-session-namespace"));
 }
 
 test "opaque metadata apply owner preserves semantic error identity" {

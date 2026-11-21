@@ -14809,27 +14809,33 @@ pub const ApiHttpServer = struct {
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
         var preparation_request = request;
         if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
-        const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse
+        const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse {
+            if (hasRowPolicyWritePrincipal(request)) return error.RowPolicyCatalogChanged;
             return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
+        };
         var snapshot = selected.snapshot;
         defer self.source.freeAdminSnapshot(&snapshot);
-        if (selected.coordinated) {
-            try ensureTableOperationActive(request);
-            const reader = self.table_reads orelse return error.IntegrityCatalogUnavailable;
-            var prepared = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request) catch |err| blk: {
-                if (err != error.PreparedGenerationChanged) return err;
-                const authoritative = try self.authoritativeIntegritySnapshot(preparation_request);
-                self.source.freeAdminSnapshot(&snapshot);
-                snapshot = authoritative;
-                if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables))
-                    return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
-                break :blk try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request);
-            };
-            errdefer prepared.deinit();
-            try self.authorizeIntegrityMutations(request, prepared.tables);
-            return prepared;
-        }
-        return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
+        var coordinated = selected.coordinated;
+        var prepared: integrity.Prepared = prepared: {
+            if (coordinated) {
+                try ensureTableOperationActive(request);
+                const reader = self.table_reads orelse return error.IntegrityCatalogUnavailable;
+                break :prepared integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request) catch |err| retry: {
+                    if (err != error.PreparedGenerationChanged) return err;
+                    const authoritative = try self.authoritativeIntegritySnapshot(preparation_request);
+                    self.source.freeAdminSnapshot(&snapshot);
+                    snapshot = authoritative;
+                    coordinated = try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables);
+                    if (!coordinated) break :retry .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
+                    break :retry try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request);
+                };
+            }
+            break :prepared .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
+        };
+        errdefer prepared.deinit();
+        if (coordinated) try self.authorizeIntegrityMutations(request, prepared.tables);
+        prepared.tables = try self.signRowPolicyMutationParticipants(prepared.arena.allocator(), prepared.tables, snapshot.tables, request);
+        return prepared;
     }
 
     fn hasRowPolicyWritePrincipal(request: api_operation.RequestContext) bool {
@@ -14848,58 +14854,61 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
     ) ![]const distributed_txn.TableCommitRequest {
         if (!hasRowPolicyWritePrincipal(request)) return tables;
-        const a = alloc;
-        const signed = try a.dupe(distributed_txn.TableCommitRequest, tables);
-        var indices: std.ArrayList(usize) = .empty;
-        var names: std.ArrayList([]const u8) = .empty;
-        for (tables, 0..) |table, index| {
-            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0 and table.graph_writes.len == 0 and table.graph_deletes.len == 0 and table.predicates.len == 0 and table.range_guards.len == 0 and table.integrity_commands.len == 0) continue;
-            try indices.append(a, index);
-            try names.append(a, table.table_name);
+        const Participant = struct {
+            table_id: ?u64 = null,
+            schema_version: ?u32 = null,
+            proof: []const u8 = "",
+            database: []const u8 = "",
+            admitted_at: i64 = 0,
+        };
+        var participants: std.StringArrayHashMapUnmanaged(Participant) = .empty;
+        for (tables) |table| {
+            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0 and table.graph_writes.len == 0 and table.graph_deletes.len == 0 and table.predicates.len == 0 and table.range_guards.len == 0 and table.integrity_commands.len == 0 and table.integrity.len == 0) continue;
+            const slot = try participants.getOrPut(alloc, table.table_name);
+            if (!slot.found_existing) slot.value_ptr.* = .{};
+            if (table.relational_schema_version) |version| {
+                if (slot.value_ptr.schema_version) |prior| if (version != prior) return error.PreparedGenerationChanged;
+                slot.value_ptr.schema_version = version;
+            }
+        }
+        if (participants.count() == 0) return tables;
+        for (catalog_tables) |record| {
+            if (participants.getPtr(record.name)) |participant| {
+                if (participant.table_id != null) return error.RowPolicyCatalogChanged;
+                participant.table_id = record.table_id;
+            }
         }
         var revision: ?u64 = null;
         var start: usize = 0;
-        while (start < names.items.len) {
-            const end = @min(names.items.len, start + 256);
-            const chunk = names.items[start..end];
-            const bytes = try self.source.systemCatalog(a, request, .{ .resolve_many = .{ .storage_names = chunk, .expected_revision = revision } });
-            const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
-            if (resolved.logical_names.len != chunk.len) return error.RowPolicyCatalogChanged;
+        while (start < participants.count()) {
+            const end = @min(participants.count(), start + 256);
+            const names = participants.keys()[start..end];
+            const bytes = try self.source.systemCatalog(alloc, request, .{ .resolve_many = .{ .storage_names = names, .expected_revision = revision } });
+            const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{});
+            if (resolved.logical_names.len != names.len) return error.RowPolicyCatalogChanged;
             revision = resolved.revision;
-            for (chunk, resolved.logical_names, indices.items[start..end]) |physical, logical, index| {
-                const table = for (catalog_tables) |record| {
-                    if (std.mem.eql(u8, record.name, physical)) break record;
-                } else return error.RowPolicyCatalogChanged;
+            for (names, resolved.logical_names, participants.values()[start..end]) |physical, logical, *participant| {
+                const id = participant.table_id orelse return error.RowPolicyCatalogChanged;
                 const target = try system_catalog.Target.parse(logical orelse return error.RowPolicyCatalogChanged);
-                if (try self.rowPolicyWriteProof(a, request, table.table_id, physical, target.database, signed[index].relational_schema_version)) |proof| {
-                    signed[index].row_policy_principal_proof = proof;
-                    signed[index].row_policy_database = target.database;
-                    signed[index].row_policy_admitted_at_seconds = @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s));
+                if (try self.rowPolicyWriteProof(alloc, request, id, physical, target.database, participant.schema_version)) |proof| {
+                    participant.proof = proof;
+                    participant.database = target.database;
+                    participant.admitted_at = @intCast(@divFloor(self.internalAuthRealtimeNs(), std.time.ns_per_s));
                 }
             }
             start = end;
         }
+        // All fragments routed to the same owner must carry one identical admission.
+        const signed = try alloc.dupe(distributed_txn.TableCommitRequest, tables);
+        for (signed) |*table| {
+            const participant = participants.getPtr(table.table_name) orelse continue;
+            table.row_policy_principal_proof = participant.proof;
+            table.row_policy_database = participant.database;
+            table.row_policy_admitted_at_seconds = participant.admitted_at;
+        }
         return signed;
     }
 
-    /// An explicit SQL transaction seals this signed plan durably before the
-    /// coordinator executes. Recovery replays the same admission timestamp.
-    pub fn signCurrentRowPolicyMutationParticipants(
-        self: *ApiHttpServer,
-        alloc: std.mem.Allocator,
-        tables: []const distributed_txn.TableCommitRequest,
-        request: api_operation.RequestContext,
-    ) ![]const distributed_txn.TableCommitRequest {
-        if (!hasRowPolicyWritePrincipal(request)) return tables;
-        var snapshot_opt = try self.source.cachedAdminSnapshot();
-        if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
-        var snapshot = snapshot_opt orelse return error.RowPolicyCatalogChanged;
-        defer self.source.freeAdminSnapshot(&snapshot);
-        return self.signRowPolicyMutationParticipants(alloc, tables, snapshot.tables, request);
-    }
-
-    /// Ordinary public batches retain proof storage through the synchronous
-    /// commit proposal; the transaction path instead seals the signed bytes.
     fn authoritativeIntegritySnapshot(self: *ApiHttpServer, request: api_operation.RequestContext) !metadata_api.AdminSnapshot {
         // A remote source must use the read-indexed catalog barrier. Local
         // sources without that capability already read their owning metadata
@@ -38406,6 +38415,64 @@ test "ordinary reads and writes distinguish absent policy from unavailable autho
     }
 }
 
+test "distributed txn public commit preparation signs physical participants and rechecks revoked grants" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        table: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs" }},
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.table, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            switch (call) {
+                .resolve_many => |request| {
+                    try std.testing.expectEqual(@as(usize, 1), request.storage_names.len);
+                    try std.testing.expectEqualStrings("docs", request.storage_names[0]);
+                    return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 4, .tables = &.{}, .logical_names = &.{"docs"} }, .{});
+                },
+                .policy_publication_status => |table_id| {
+                    try std.testing.expect(context.row_policy_install_authority);
+                    return std.json.Stringify.valueAlloc(alloc, @import("antfly_local_sources").system_catalog_policies.PublicationStamp{ .table_id = table_id, .schema_version = 1, .generation = 2, .catalog_epoch = 3, .phase = .active }, .{});
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+    const secret = "0123456789abcdef0123456789abcdef";
+    const issuer = "test";
+    var fixture = Fixture{};
+    var server = ApiHttpServer.init(a, .{ .trusted_principal_secret = secret, .trusted_principal_issuer = issuer }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .system_catalog = Fixture.catalog } }, null, null);
+    defer server.deinit();
+    var auth = try initTestAuthManager(a);
+    try bindTestAuthManager(a, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var grant = try usermgr.Permission.initOwned(a, .table, "docs", .write);
+    defer grant.deinit(a);
+    var user = try auth.manager.createUser("writer", "secret", &.{grant});
+    defer user.deinit(a);
+    var permissions = [_]usermgr.Permission{grant};
+    const identity: ?AuthenticatedIdentity = .{ .username = @constCast("writer"), .credential_principal = @constCast("basic:writer"), .permissions = &permissions, .live_user_manager = &auth.manager };
+    const context: api_operation.RequestContext = .{ .row_policy_credential = &identity };
+    const tables = [_]distributed_txn.TableCommitRequest{
+        .{ .table_name = "docs", .writes = &.{.{ .key = "row", .value = "{}" }} },
+        .{ .table_name = "docs", .deletes = &.{"other"} },
+    };
+    var prepared = try server.preparePublicCommitWithIntegrity(a, &tables, context);
+    defer prepared.deinit();
+    const signed = prepared.tables[0];
+    try std.testing.expectEqualStrings(signed.row_policy_principal_proof, prepared.tables[1].row_policy_principal_proof);
+    var verified = try usermgr.row_policy_authority.verify(a, secret, issuer, .{ .access = .write, .table_id = 7, .table = "docs", .database = system_catalog.default_database_name, .policy_generation = 2, .catalog_epoch = 3 }, @intCast(signed.row_policy_admitted_at_seconds), signed.row_policy_principal_proof);
+    defer verified.deinit();
+    try std.testing.expectEqualStrings("writer", verified.value.principal);
+    try auth.manager.removePermissionFromUser("writer", "docs", .table);
+    try std.testing.expectError(error.Forbidden, server.preparePublicCommitWithIntegrity(a, &tables, context));
+}
+
 test "api http server authenticates trusted principal" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -45716,6 +45783,50 @@ test "api http server retries stable terminal commits without replaying writes" 
     var abort = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = abort_uri, .content_type = "application/json", .body = "" });
     defer abort.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), abort.status);
+
+    // Fail only the durable read under commit execution. Earlier routing and
+    // authorization reads must succeed so both handlers reach that inspection.
+    const Fault = struct {
+        registry: *transactions_api.SessionRegistry,
+        id: db_mod.types.TxnId,
+        native: *backend_erased.Store,
+        failures: usize = 0,
+        fn read(_: std.mem.Allocator, ptr: *anyopaque) !backend_erased.ReadTxn {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.registry.tryAcquireCommitExecution(self.id)) |lease| {
+                lease.release();
+                return self.native.beginRead();
+            }
+            self.failures += 1;
+            return error.StorageReadTemporarilyUnavailable;
+        }
+    };
+    var memory = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
+    defer memory.close();
+    var native = try memory.runtimeStore(alloc, .{ .name = "receipt-inspection" });
+    defer native.deinit();
+    var backing = transactions_api.DurableSessionStore.initRuntime(alloc, &native);
+    const id = try distributed_txn.parseTxnIdHex(parsed_begin.value.transaction_id);
+    try backing.saveForTest(server.txn_sessions.sessions.get(id).?, null);
+    var fault = Fault{ .registry = &server.txn_sessions, .id = id, .native = &native };
+    var callbacks = native.vtable.*;
+    callbacks.begin_read = Fault.read;
+    var failing: backend_erased.Store = .{ .allocator = alloc, .ptr = &fault, .vtable = &callbacks };
+    var shared = transactions_api.DurableSessionStore.initRuntime(alloc, &failing);
+    const previous = server.txn_sessions.durable;
+    const scope = server.txn_sessions.durable_scope;
+    server.txn_sessions.durable = &shared;
+    server.txn_sessions.durable_scope = .cluster_shared;
+    defer {
+        server.txn_sessions.durable_scope = scope;
+        server.txn_sessions.durable = previous;
+    }
+    for ([_][]const u8{ commit_uri, abort_uri }) |uri| {
+        var response = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = "" });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fault.failures);
 }
 
 test "api session maintenance recovers crash window after durable 2pc commit" {

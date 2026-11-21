@@ -39,6 +39,11 @@ def write_generated_files(root: Path, signature_count: int) -> None:
             "def parse(response) -> Error | TransactionWriteError:\n"
             "    if response.status_code == 403:\n        return TransactionWriteError.from_dict(response.json())\n"
             "    if response.status_code == 503:\n        return TransactionWriteError.from_dict(response.json())\n"
+            + (
+                "    if response.status_code == 409:\n        return TransactionSessionCommitResponse.from_dict(response.json())\n"
+                if operation in {"multi_batch_write", "commit_transaction", "commit_transaction_session"}
+                else ""
+            )
         )
     path = root / SCOPED_MERGE
     path.parent.mkdir(parents=True, exist_ok=True)

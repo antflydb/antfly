@@ -26,7 +26,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 92 requires native batch decoders to preserve commit prerequisites.
 // Version 93 adds capture-only direct preparation and immutable effect replay.
 // Version 95 adds ranged reads on retained metadata session snapshots.
-pub const abi_version: u32 = 95;
+// Version 96 counts a prefix on a retained metadata session snapshot.
+pub const abi_version: u32 = 96;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1758,7 +1759,7 @@ pub extern fn antfly_metadata_apply_store_projection(
     request: *const MetadataProjectionRequest,
     out_json: *OwnedBytes,
 ) callconv(.c) Status;
-pub const MetadataSessionReadOperation = enum(u32) { get, first, last, next, prev, seek_at_or_after, seek_at_or_before, get_range };
+pub const MetadataSessionReadOperation = enum(u32) { get, first, last, next, prev, seek_at_or_after, seek_at_or_before, get_range, count_prefix };
 pub const MetadataSessionReadRequest = extern struct {
     version: u32 = abi_version,
     operation: MetadataSessionReadOperation,
