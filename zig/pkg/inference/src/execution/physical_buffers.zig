@@ -2690,6 +2690,25 @@ pub const Frame = struct {
         self.bound_input_count = 0;
     }
 
+    fn replayBankBound(self: *const Frame, backend: ops.ComputeBackend, id: buffers.AllocationId) bool {
+        const allocation = self.pool.plan.allocationById(id) orelse return false;
+        if (id >= self.storages.len) return false;
+        const lease = self.storages[id] orelse return false;
+        return lease.backend.ptr == backend.ptr and lease.backend.vtable == backend.vtable and
+            allocation.backend == .cuda and lease.byte_size >= allocation.byte_size;
+    }
+
+    fn replayWorkspaceBound(self: *const Frame, backend: ops.ComputeBackend, index: usize, bytes: usize, alignment: u32) bool {
+        if (bytes == 0) return true;
+        const id = self.pool.workspaceBank(index, bytes, alignment) orelse return false;
+        return self.replayBankBound(backend, id);
+    }
+
+    fn replayMissingBanks(self: *Frame) bool {
+        self.stats.replay_decision = .incomplete_bindings;
+        return false;
+    }
+
     pub fn beginReplayCapture(self: *Frame) !bool {
         if (!self.hostProofsCurrent()) return error.MissingCurrentHostIndexProof;
         if (!self.warmed or self.replay_ready) return false;
@@ -2697,8 +2716,16 @@ pub const Frame = struct {
         const backend = self.pool.backends[index];
         if (self.pool.coverage_reachable) |reachable| if (reachable.len != self.pool.kernels.len) return error.InvalidReachabilityTable;
         for (self.pool.regions, self.region_assigned) |installed, resources| {
-            if (installed.owner.requirements.capture != .supported or
-                (installed.owner.vtable.prepare_assigned != null and resources == null)) return false;
+            const need = installed.owner.requirements;
+            if (need.capture != .supported or installed.backend_index != index) return false;
+            // A successful warm call must have used every captured bank.
+            // Never allocate a missing output or workspace in the recorder.
+            if (installed.owner.vtable.prepare_assigned != null and resources == null) return self.replayMissingBanks();
+            const alignment = @max(need.dispatch_workspace.alignment, need.preparation_workspace.alignment);
+            if (!self.replayWorkspaceBound(backend, index, installed.workspace_bytes, alignment)) return self.replayMissingBanks();
+            for (installed.outputs) |output| {
+                if (!self.replayBankBound(backend, output.slot.allocation)) return self.replayMissingBanks();
+            }
         }
         for (self.pool.kernels, 0..) |maybe, node| if (maybe) |kernel| {
             if (self.pool.coverage_reachable) |reachable| if (!reachable[node]) continue;
@@ -2706,12 +2733,19 @@ pub const Frame = struct {
                 if (installed.owner.requirements.capture != .supported) return false;
                 continue;
             }
-            const allowed = if (self.pool.preparedKernelRoute(@intCast(node))) |owned| owned.requirements.capture == .supported else backend.vtable.kernels.?.physicalReplayKernelSupported.?(backend.ptr, &kernel.descriptor);
-            if (!allowed) {
+            const owned = self.pool.preparedKernelRoute(@intCast(node));
+            const allowed = if (owned) |route_owner| route_owner.requirements.capture == .supported else backend.vtable.kernels.?.physicalReplayKernelSupported.?(backend.ptr, &kernel.descriptor);
+            if (!allowed or kernel.backend_index != index) {
                 self.stats.replay_decision = .unsupported_graph;
                 self.replay_disabled = .unsupported_graph;
                 return false;
             }
+            const alignment = if (owned) |route_owner| @max(route_owner.requirements.workspace.alignment, route_owner.requirements.probe_workspace.alignment) else 1;
+            if (!self.replayBankBound(backend, kernel.output_allocation) or
+                !self.replayWorkspaceBound(backend, index, kernel.workspace_bytes, alignment)) return self.replayMissingBanks();
+            for (kernel.auxiliaries) |maybe_auxiliary| if (maybe_auxiliary) |auxiliary| {
+                if (!self.replayBankBound(backend, auxiliary.allocation)) return self.replayMissingBanks();
+            };
         };
         if (self.replay == null) self.replay = (try self.pool.backends[index].vtable.kernels.?.createPhysicalReplay.?(self.pool.backends[index].ptr)) orelse return false;
         const started = try self.replay.?.begin(self.storages);
