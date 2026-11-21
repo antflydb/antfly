@@ -51925,7 +51925,30 @@ const owned_payload_services = @import("../kernel_backend.zig").OwnedPayloadServ
     .available = ownedPayloadAvailable,
     .input = ownedPayloadInput,
     .route = ownedPayloadRoute,
+    .region = ownedPayloadRegion,
 };
+fn ownedPayloadRegion(ctx: *anyopaque, owned: *const @import("../../execution/region_route.zig").Owned) bool {
+    if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
+    const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const need = owned.requirements;
+    if (need.dispatch_workspace.host_byte_size != 0 or need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0) return false;
+    if (owned.vtable == &AssignedHeadNormRope.table) {
+        const program: *const AssignedHeadNormRope = @ptrCast(@alignCast(owned.context));
+        return program.compute == compute and program.policy_key == owned.policy_key and need.dispatch_workspace.byte_size == 0 and
+            owned.covered_nodes.ptr == &program.program.covered and owned.covered_nodes.len == program.program.covered.len and
+            owned.input_nodes.ptr == &program.inputs and owned.input_nodes.len == program.inputs.len and
+            need.outputs.ptr == &program.outputs and need.outputs.len == program.outputs.len;
+    }
+    if (owned.vtable != &AssignedProjectionGroup.table and owned.vtable != &AssignedProjectionGroup.q4_table) return false;
+    const program: *const AssignedProjectionGroup = @ptrCast(@alignCast(owned.context));
+    return program.compute == compute and program.policy_key == owned.policy_key and
+        need.dispatch_workspace.byte_size == program.workspace_bytes and
+        need.dispatch_workspace.alignment == buffer_mod.DeviceBuffer.allocation_alignment and
+        owned.covered_nodes.ptr == &program.head.covered and owned.covered_nodes.len == program.head.covered_count and
+        owned.input_nodes.ptr == &program.inputs and owned.input_nodes.len == program.weightCount() + 1 and
+        need.outputs.ptr == &program.outputs and need.outputs.len == program.output_count;
+}
+
 fn ownedPayloadAvailable(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     // Init-once owner link, not a mutable capture/mirror/route snapshot.
@@ -60916,10 +60939,12 @@ test "CUDA borrowed quantized metadata preserves logical shape without physical 
 fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, comptime independent: bool, comptime vendor: bool, comptime bf16_gated: bool, comptime down: bool) !void {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const compute = try a.create(CudaCompute);
-    defer a.destroy(compute);
-    compute.* = try CudaCompute.testing.init(a);
-    defer compute.deinit();
+    const shared = @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer shared.release();
+    const compute = shared.ctx.cuda;
     // Generic BF16 regions must work without any model-specific native plan.
     if (!bf16_gated) compute.gemma4_native_plan = .{ .projection = .packed_q4, .geometry = .{ .donor_layers = 24 } };
     compute.tuned_route_gates.q4_0_cublas_prefill = vendor;
@@ -61038,8 +61063,15 @@ fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, compti
             var selected_groups = false;
             if (pool.variant_cache) |variants| for (variants.entries.items) |variant| {
                 if (variant.pool.regions.len != 8) continue;
+                if (vendor and !independent) {
+                    try std.testing.expect(variant.pool.completeOwnedPayload() != null);
+                }
                 var complete = true;
                 for (variant.pool.regions) |installed| {
+                    try std.testing.expect(ownedPayloadRegion(compute, installed.owner));
+                    var changed = installed.owner.*;
+                    changed.requirements.dispatch_workspace.byte_size +|= 4;
+                    try std.testing.expect(!ownedPayloadRegion(compute, &changed));
                     complete = complete and installed.owner.requirements.outputs.len == (if (bf16_gated) @as(usize, 1) else if (independent) 3 else 2);
                     if (bf16_gated) {
                         const program: *const AssignedProjectionGroup = @ptrCast(@alignCast(installed.owner.context));
