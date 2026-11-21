@@ -38874,7 +38874,12 @@ const PhysicalReplay = struct {
     fn begin(raw: *anyopaque, leases: []const ?*ops.physical_storage.Lease) !bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const compute = self.compute;
-        if (self.graph != null or self.active or compute.execution_scope != null or compute.debug_cuda_graph_capture_active or compute.capturing_physical_storage.values.items.len != 0 or try compute.ctx.streamCaptureActive()) return false;
+        if (self.graph != null or self.active or compute.execution_scope != null or compute.debug_cuda_graph_capture_active or compute.capturing_physical_storage.values.items.len != 0) return false;
+        for (leases) |maybe| if (maybe) |lease| {
+            if (lease.backend.ptr != @as(*anyopaque, @ptrCast(compute))) continue;
+            if (!acceptsPhysicalImplementation(lease.backend.vtable)) return false;
+        };
+        if (try compute.ctx.streamCaptureActive()) return false;
         errdefer compute.capturing_physical_storage.deinitWithCleanup(compute.allocator, physicalScopeCleanup(compute));
         for (leases) |maybe| if (maybe) |lease| {
             if (lease.backend.ptr == @as(*anyopaque, @ptrCast(compute))) try compute.capturing_physical_storage.retain(compute.allocator, lease);
@@ -39139,6 +39144,14 @@ fn retainPhysicalCaptureTensor(self: *CudaCompute, value: CT) !void {
     if (!self.debug_cuda_graph_capture_active) return;
     if (tensorFromCt(value).physical_lease) |lease| try self.capturing_physical_storage.retain(self.allocator, lease);
     for (tensorFromCt(value).auxiliary_leases) |maybe_lease| if (maybe_lease) |lease| try self.capturing_physical_storage.retain(self.allocator, lease);
+}
+
+inline fn retainAssignedCaptureOperands(self: *CudaCompute, request: ops.kernel_descriptor.Invocation, output: CT) !void {
+    if (!self.debug_cuda_graph_capture_active) return;
+    for (request.inputs) |input| try retainPhysicalCaptureTensor(self, input);
+    try retainPhysicalCaptureTensor(self, output);
+    if (request.workspace) |workspace| try retainPhysicalCaptureTensor(self, workspace);
+    for (request.auxiliaries) |auxiliary| try retainPhysicalCaptureTensor(self, auxiliary.tensor);
 }
 
 fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
@@ -39853,6 +39866,8 @@ fn runAssignedDenseAttention(self: *CudaCompute, request: ops.kernel_descriptor.
     if (bytes != 0) {
         const workspace = tensorFromCt(request.workspace orelse return error.MissingAssignedWorkspace);
         if (workspace.physical_lease == null or workspace.dtype != .f32 or workspace.buffer.len < bytes or cudaTensorReadOnly(workspace)) return error.InvalidShape;
+        const alignment = if (plan.grouped) @alignOf(f32) else @alignOf(i64);
+        if (workspace.buffer.ptr % alignment != 0) return error.UnsupportedPhysicalWorkspaceAlignment;
         scratch = .{ .ptr = workspace.buffer.ptr, .len = bytes };
         if (kernel_geometry.byteRangesOverlap(scratch.ptr, bytes, output.buffer.ptr, try checkedMul(output.elem_count, 4))) return error.InvalidAssignedAlias;
     }
@@ -39861,6 +39876,8 @@ fn runAssignedDenseAttention(self: *CudaCompute, request: ops.kernel_descriptor.
         const span = try checkedMul(tensor.elem_count, 4);
         if (kernel_geometry.byteRangesOverlap(output.buffer.ptr, try checkedMul(output.elem_count, 4), tensor.buffer.ptr, span) or (bytes != 0 and kernel_geometry.byteRangesOverlap(scratch.ptr, bytes, tensor.buffer.ptr, span))) return error.InvalidAssignedAlias;
     }
+    if (self.debug_cuda_graph_capture_active and !plan.grouped) return error.CudaGraphCaptureUnsafeHostCopy;
+    try retainAssignedCaptureOperands(self, request, out_ct);
     var mask_device = buffer_mod.DeviceBuffer{};
     if (mask) |values| if (!allOnesI64(values)) {
         const mask_bytes = try checkedMul(keys, @sizeOf(i64));
@@ -40040,10 +40057,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         }
     }
     if (descriptor.operation == .gather and host_gather == null) try validateAssignedGatherIndices(self, tensorFromCt(request.inputs[1]), descriptor.operation.gather.geometry.extent, request.host_workspace);
-    for (request.inputs) |input| try retainPhysicalCaptureTensor(self, input);
-    try retainPhysicalCaptureTensor(self, output_ct);
-    if (request.workspace) |workspace| try retainPhysicalCaptureTensor(self, workspace);
-    for (request.auxiliaries) |auxiliary| try retainPhysicalCaptureTensor(self, auxiliary.tensor);
+    try retainAssignedCaptureOperands(self, request, output_ct);
     const a = tensorFromCt(request.inputs[0]);
     switch (descriptor.operation) {
         .paged_attention, .dense_attention_prefix, .dense_attention_rows => return false,
@@ -40559,6 +40573,13 @@ test "CUDA physical capture scopes reject nesting and retain operand addresses" 
     compute.allocator = a;
     defer compute.capturing_physical_storage.deinit(a);
     const leases = [_]?*ops.physical_storage.Lease{lease};
+    var wrong_provider = lease.*;
+    wrong_provider.backend.ptr = &compute;
+    var replay = PhysicalReplay{ .compute = &compute };
+    // A reused context pointer does not identify the numerical provider.
+    // Reject before sampling a CUDA context or retaining any storage.
+    try std.testing.expect(!try replay.begin(&.{&wrong_provider}));
+    try std.testing.expectEqual(@as(usize, 0), compute.capturing_physical_storage.values.items.len);
     try physicalExecutionScopeOp(&compute, &leases);
     try std.testing.expectError(error.PhysicalExecutionScopeActive, physicalExecutionScopeOp(&compute, &leases));
     try physicalExecutionScopeOp(&compute, null);

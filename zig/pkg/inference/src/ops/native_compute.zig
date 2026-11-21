@@ -57732,7 +57732,7 @@ test "Native transpose broadcast and full slice retain lazy alias schedules" {
 /// Physical banks guarantee the alignment of every qualified logical view.
 /// DenseStorage records the original allocation contract for its final free;
 /// ordinary/adopted F32 buffers continue to use their original alignment.
-const physical_storage_policy: ops.physical_storage.Policy = .{ .allocate = allocatePhysicalRequest };
+const physical_storage_policy: ops.physical_storage.Policy = .{ .minimum_alignment = 8, .allocate = allocatePhysicalRequest };
 fn allocatePhysicalRequest(ctx: *anyopaque, request: ops.physical_storage.Request) anyerror!?CT {
     // Existing Native/CUDA input banks have the same storage representation.
     return allocateNativePhysicalStorageOp(ctx, request.byte_size);

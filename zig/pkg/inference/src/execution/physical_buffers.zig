@@ -251,6 +251,7 @@ pub const Pool = struct {
                 if (functions.assignedKernelSupported) |supported| if (!supported(backend.ptr, &descriptor)) continue;
                 const workspace = if (backend.vtable.kernels.?.assignedKernelWorkspace) |requirement| try requirement(backend.ptr, &descriptor) else kernels.WorkspaceRequirement{};
                 if (workspace.byte_size % @sizeOf(f32) != 0) return error.InvalidWorkspaceSize;
+                try validateAlignment(workspace.alignment);
                 scratch_requirements[backend_index].byte_size = @max(scratch_requirements[backend_index].byte_size, workspace.byte_size);
                 scratch_requirements[backend_index].alignment = @max(scratch_requirements[backend_index].alignment, workspace.alignment);
                 host_workspace_bytes = @max(host_workspace_bytes, workspace.host_byte_size);
@@ -334,7 +335,9 @@ pub const Pool = struct {
         errdefer allocator.free(workspace_ids);
         @memset(workspace_ids, buffers.invalid_allocation);
         for (owned_backends, scratch_requirements, 0..) |backend, requirement, index| {
-            if (requirement.byte_size != 0) workspace_ids[index] = try plan.addWorkspace(backend.kind(), requirement.byte_size, requirement.alignment);
+            if (requirement.byte_size == 0) continue;
+            try validateDeviceWorkspaceAlignment(backend, requirement.alignment);
+            workspace_ids[index] = try plan.addWorkspace(backend.kind(), requirement.byte_size, requirement.alignment);
         }
         const host_workspace_allocation = if (host_workspace_bytes != 0) try plan.addHostWorkspace(host_workspace_bytes) else buffers.invalid_allocation;
         const reshape_sources = try allocator.alloc(NodeId, graph.nodeCount());
@@ -1588,22 +1591,34 @@ pub const Pool = struct {
         if (required.byte_size % @sizeOf(f32) != 0) return error.InvalidWorkspaceSize;
         if (required.byte_size != 0) {
             const id = &self.workspace_allocations[backend_index];
-            // Provider banks establish device alignment; assigned-resource
-            // validation checks the actual address before numerical dispatch.
-            if (id.* == buffers.invalid_allocation) id.* = try self.plan.addWorkspace(self.backends[backend_index].kind(), required.byte_size, @min(required.alignment, @alignOf(f32))) else try self.growAllocation(id.*, required.byte_size);
+            const backend = self.backends[backend_index];
+            try validateDeviceWorkspaceAlignment(backend, required.alignment);
+            if (id.* == buffers.invalid_allocation) {
+                id.* = try self.plan.addWorkspace(backend.kind(), required.byte_size, required.alignment);
+            } else {
+                try self.growAllocation(id.*, required.byte_size);
+                const bank = &self.plan.allocations[id.*];
+                bank.alignment = @max(bank.alignment, required.alignment);
+            }
         }
         if (required.host_byte_size != 0) {
             const alignment = std.mem.Alignment.fromByteUnits(host_alignment);
             if (@backingInt(alignment) > @backingInt(self.host_alignment)) self.host_alignment = alignment;
             if (self.host_workspace_allocation == buffers.invalid_allocation) {
-                const rounded = try std.math.add(usize, required.host_byte_size, 3);
-                self.host_workspace_allocation = try self.plan.addHostWorkspace(rounded / 4 * 4);
+                self.host_workspace_allocation = try self.plan.addHostWorkspace(required.host_byte_size);
             } else try self.growAllocation(self.host_workspace_allocation, required.host_byte_size);
         }
     }
 
     fn validateAlignment(value: u32) !void {
         if (value == 0 or !std.math.isPowerOfTwo(value)) return error.InvalidPreparedKernelAlignment;
+    }
+
+    fn validateDeviceWorkspaceAlignment(backend: ops.ComputeBackend, required: u32) !void {
+        // A legacy F32 allocator promises the alignment of the view type.
+        // Greater alignment must come from the exact provider's base policy.
+        const guaranteed = @max(@alignOf(f32), try storage.minimumAlignment(backend));
+        if (required > guaranteed) return error.UnsupportedPhysicalWorkspaceAlignment;
     }
 
     fn applyRouteRequirements(self: *Pool) !bool {
@@ -1624,7 +1639,7 @@ pub const Pool = struct {
             try validateAlignment(required.probe_host_alignment);
             try validateAlignment(required.workspace.alignment);
             try validateAlignment(required.probe_workspace.alignment);
-            if (kind == .native and (required.primary_alignment > @alignOf(u64) or required.workspace.alignment > @alignOf(f32) or required.probe_workspace.alignment > @alignOf(f32))) return error.UnsupportedPhysicalWorkspaceAlignment;
+            if (kind == .native and required.primary_alignment > @alignOf(u64)) return error.UnsupportedPhysicalWorkspaceAlignment;
             try self.growAllocation(kernel.output_allocation, required.primary_bytes);
             const workspace_bytes = @max(required.workspace.byte_size, required.probe_workspace.byte_size);
             if (workspace_bytes % 4 != 0) return error.InvalidWorkspaceSize;

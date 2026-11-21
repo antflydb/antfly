@@ -131,7 +131,11 @@ fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: rou
     const device = @max(needed.workspace.byte_size, needed.probe_workspace.byte_size);
     const host = @max(needed.workspace.host_byte_size, needed.probe_workspace.host_byte_size);
     if (kernel.workspace_bytes != device or kernel.host_workspace_bytes != host) return false;
-    if (device != 0 and (kernel.backend_index >= pool.workspace_allocations.len or !allocation(pool, pool.workspace_allocations[kernel.backend_index], device, .workspace, false))) return false;
+    if (device != 0) {
+        if (kernel.backend_index >= pool.workspace_allocations.len) return false;
+        const bank = pool.workspace_allocations[kernel.backend_index];
+        if (!allocation(pool, bank, device, .workspace, false) or pool.plan.allocations[bank].alignment < @max(needed.workspace.alignment, needed.probe_workspace.alignment)) return false;
+    }
     if (host != 0 and (!allocation(pool, pool.host_workspace_allocation, host, .workspace, true) or pool.host_alignment.toByteUnits() < @max(needed.host_alignment, needed.probe_host_alignment))) return false;
     var count: usize = 0;
     for (kernel.auxiliaries) |maybe| if (maybe) |aux| {

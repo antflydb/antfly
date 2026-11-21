@@ -478,7 +478,7 @@ test "prepared physical workspace is declared once reused and owned by its frame
     const a = std.testing.allocator;
     const ScratchKernel = struct {
         fn requirement(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) !ops.kernel_descriptor.WorkspaceRequirement {
-            return .{ .byte_size = descriptor.elements() * @sizeOf(f32) };
+            return .{ .byte_size = descriptor.elements() * @sizeOf(f32), .alignment = 8 };
         }
         fn run(raw: *anyopaque, request: ops.kernel_descriptor.Invocation) !bool {
             const compute: *Native = @ptrCast(@alignCast(raw));
@@ -521,6 +521,7 @@ test "prepared physical workspace is declared once reused and owned by its frame
     const allocation = executable.runtime.buffer_plan.?.allocations[scratch_id];
     try std.testing.expectEqual(@import("../graph/buffer_plan.zig").AllocationKind.workspace, allocation.kind);
     try std.testing.expectEqual(@as(u64, 32), allocation.byte_size);
+    try std.testing.expectEqual(@as(u32, 8), allocation.alignment);
     try std.testing.expect(allocation.first_use == 0 and allocation.last_use >= program.graph.nodeCount());
     const input = try cb.fromFloat32Shape(&.{ -4, -3, -2, -1, 0, 1, 2, 3 }, &.{ 2, 4 });
     defer cb.free(input);
