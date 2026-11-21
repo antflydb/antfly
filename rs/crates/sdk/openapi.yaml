@@ -44030,7 +44030,8 @@ components:
             hybrid `merge_config`, `reranker`, `filter_query`, `exclusion_query`, `order_by`, `graph_queries`,
             ...) with `{"$source":"/pointer"}` bindings anywhere, executed by the table's query engine.
             `limit` (at most 1000) is the member count. `table`, paging (`offset`, `search_after`, `search_before`),
-            `count`, and `aggregations` are rejected.
+            `count`, and `aggregations` are rejected. Distributed tables refuse `semantic_search` (data
+            servers have no query embedder); pass precomputed vectors in `embeddings` instead.
         text:
           description: Query text literal or `{"$source":"/pointer"}`.
         text_field:
@@ -44119,7 +44120,7 @@ components:
           default: live
           description: '`live` registers subscriptions and keeps dependents current. `snapshot` registers
             nothing: dependents publish with freshness `unverified` (never `current`), rebuild on `refresh_interval`
-            or manually, and `require_current` reads refuse them. Required for `search`.'
+            or manually, and `freshness=require_current` dependency reads refuse them. Required for `search`.'
         refresh_interval:
           type: string
           pattern: ^[0-9]+(ms|s|m|h)$
@@ -44381,7 +44382,7 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/EnrichmentContextSource'
           maxProperties: 16
-          description: Named cross-document context consumed by this asset producer, rendered as a canonical
+          description: 'Named cross-document context consumed by this asset producer, rendered as a canonical
             `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state.
             Changes to consumed inputs (projected fields, query membership, insertion of a first match,
             deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild
@@ -44389,7 +44390,10 @@ components:
             whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table
             Lite) and by distributed tables, where context sources are declared through the artifact enrichment
             endpoint (not inline at table creation) and admission resolves table names and rejects cross-table
-            generated-input cycles.
+            generated-input cycles. Context reads execute as the declaring principal: it must be able
+            to read every source table, and its row filter on each is conjoined into query and search
+            sources at declaration (document and graph sources are refused where a row filter applies).
+            Re-declare the enrichment to re-capture changed policies.'
         refresh:
           $ref: '#/components/schemas/EnrichmentRefreshConfig'
         execution:

@@ -75,7 +75,10 @@ class EnrichmentConfig:
                 unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt
                 text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where
                 context sources are declared through the artifact enrichment endpoint (not inline at table creation) and
-                admission resolves table names and rejects cross-table generated-input cycles.
+                admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the
+                declaring principal: it must be able to read every source table, and its row filter on each is conjoined into
+                query and search sources at declaration (document and graph sources are refused where a row filter applies). Re-
+                declare the enrichment to re-capture changed policies.
             refresh (EnrichmentRefreshConfig | Unset): Rebuild policy for context-source invalidation. Invalidation (stale
                 freshness) is always reported immediately; debounce only coalesces rebuild work.
             execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance

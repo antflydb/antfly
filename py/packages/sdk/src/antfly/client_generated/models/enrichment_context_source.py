@@ -56,8 +56,8 @@ class EnrichmentContextSource:
             overflow (EnrichmentContextSourceOverflow | Unset):  Default: EnrichmentContextSourceOverflow.ERROR.
             tracking (EnrichmentContextSourceTracking | Unset): `live` registers subscriptions and keeps dependents current.
                 `snapshot` registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild on
-                `refresh_interval` or manually, and `require_current` reads refuse them. Required for `search`. Default:
-                EnrichmentContextSourceTracking.LIVE.
+                `refresh_interval` or manually, and `freshness=require_current` dependency reads refuse them. Required for
+                `search`. Default: EnrichmentContextSourceTracking.LIVE.
             refresh_interval (str | Unset): Snapshot sources only: rebuild interval (at least 1s).
     """
 

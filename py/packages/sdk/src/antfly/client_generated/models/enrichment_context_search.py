@@ -26,7 +26,8 @@ class EnrichmentContextSearch:
                 `semantic_search` with `indexes`, hybrid `merge_config`, `reranker`, `filter_query`, `exclusion_query`,
                 `order_by`, `graph_queries`, ...) with `{"$source":"/pointer"}` bindings anywhere, executed by the table's query
                 engine. `limit` (at most 1000) is the member count. `table`, paging (`offset`, `search_after`, `search_before`),
-                `count`, and `aggregations` are rejected.
+                `count`, and `aggregations` are rejected. Distributed tables refuse `semantic_search` (data servers have no
+                query embedder); pass precomputed vectors in `embeddings` instead.
             text (Any | Unset): Query text literal or `{"$source":"/pointer"}`.
             text_field (str | Unset):
             vector (EnrichmentContextSearchVector | Unset): `{"$source":"/pointer"}` to the query vector in the dependent
