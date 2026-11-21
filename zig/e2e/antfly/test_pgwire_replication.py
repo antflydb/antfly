@@ -776,6 +776,14 @@ def test_pg_recvlogical_resume_after_restart(
                         )
                         return leader, quote(table["name"], safe=""), ranges
 
+                    def has_range_count(count):
+                        try:
+                            return len(topology_snapshot()[2]) == count
+                        except (requests.Timeout, requests.ConnectionError):
+                            # Leadership and catalog reads can briefly stall
+                            # while the topology command is being applied.
+                            return False
+
                     def request_topology(operation, body):
                         leader, physical_name, _ = topology_snapshot()
                         response = requests.post(
@@ -816,7 +824,7 @@ def test_pg_recvlogical_resume_after_restart(
                     # This internal endpoint takes a physical document key.
                     request_topology("split", {"split_key": "doc:m"})
                     assert wait_until(
-                        lambda: len(topology_snapshot()[2]) == 2,
+                        lambda: has_range_count(2),
                         timeout_s=180,
                         interval_s=0.5,
                     ), server.debug_logs()
@@ -840,7 +848,7 @@ def test_pg_recvlogical_resume_after_restart(
                         },
                     )
                     assert wait_until(
-                        lambda: len(topology_snapshot()[2]) == 1,
+                        lambda: has_range_count(1),
                         timeout_s=180,
                         interval_s=0.5,
                     ), server.debug_logs()
