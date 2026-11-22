@@ -536,7 +536,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     source_inputs[1].intent.completion_source_checkpoint = .{ .binding = scope_ref.binding, .purpose = actor_purpose, .sequence = 1, .checkpoint = "initial", .accepted_at_ns = 11, .receipt_window = 3 };
     var prepared = (try coordinator.prepare(a, admission.transaction_id, 10, &source_inputs, .{})).?;
     defer prepared.deinit();
-    try std.testing.expectEqualDeep(owners[1], try prepared.plan.admission.recoveryOwner(prepared.plan.admission.coordinator_namespace));
+    try std.testing.expectEqualDeep(owners[1], try prepared.plan.admission.coordinatorOwner());
     try std.testing.expectEqualDeep(scope_ref, prepared.plan.source_scope.?);
     const encoded_prepared = try prepared.plan.encodeFrozen(a);
     defer a.free(encoded_prepared);
@@ -564,7 +564,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     var routed = try routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }}, .deletes = &.{"z"} }}, grant, .{});
     defer routed.deinit();
     try std.testing.expectEqual(@as(usize, 2), routed.plan.participants.len);
-    try std.testing.expectEqualDeep(owners[1], try routed.plan.admission.recoveryOwner(routed.plan.admission.coordinator_namespace));
+    try std.testing.expectEqualDeep(owners[1], try routed.plan.admission.coordinatorOwner());
     var first_input = try routed.plan.prepare(a, 0);
     defer first_input.deinit(a);
     var second_input = try routed.plan.prepare(a, 1);
@@ -577,14 +577,14 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     defer empty_source.deinit();
     try std.testing.expectEqual(@as(usize, 1), empty_source.plan.participants.len);
     try std.testing.expectEqualDeep(scope_ref, empty_source.plan.source_scope.?);
-    try std.testing.expectEqualDeep(owners[1], try empty_source.plan.admission.recoveryOwner(empty_source.plan.admission.coordinator_namespace));
+    try std.testing.expectEqualDeep(owners[1], try empty_source.plan.admission.coordinatorOwner());
     // Durable checkpoint identity permits a fresh plan's current fences,
     // without permitting a different physical root generation.
     var old_fences = grant;
     old_fences.authority.owner.topology_epoch += 1;
     var fresh_checkpoint = try routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{}, old_fences, .{});
     defer fresh_checkpoint.deinit();
-    try std.testing.expectEqualDeep(owners[1], try fresh_checkpoint.plan.admission.recoveryOwner(fresh_checkpoint.plan.admission.coordinator_namespace));
+    try std.testing.expectEqualDeep(owners[1], try fresh_checkpoint.plan.admission.coordinatorOwner());
     var missing_checkpoint = grant;
     missing_checkpoint.authority.table_name = "missing";
     var releases_before_missing = fake.admin_frees;

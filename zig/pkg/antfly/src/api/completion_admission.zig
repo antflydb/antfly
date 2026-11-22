@@ -188,7 +188,7 @@ pub const Coordinator = struct {
             if (!std.meta.eql(qualified.owner, participant.owner)) return error.SourceBindingConflict;
             if (reservation > qualified.observation.retention_limit_bytes) return error.HistoryTooLarge;
             route.* = .{ .owner = participant.owner, .fence = fence, .table_name = try scratch.dupe(u8, locator.table_name), .retention_limit_bytes = qualified.observation.retention_limit_bytes };
-            if (std.mem.eql(u8, &participant.owner.namespace, &plan.admission.coordinator_namespace)) coordinator_index = index;
+            if (std.mem.eql(u8, &participant.owner.digest(), &plan.admission.coordinator_fence)) coordinator_index = index;
         }
         try context.ensureActive();
         return .{ .arena = arena, .plan = plan, .routes = routes, .coordinator_index = coordinator_index orelse return error.InvalidParticipant };

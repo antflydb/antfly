@@ -223,6 +223,9 @@ pub const Admission = struct {
         try self.validate();
         return self.findFenced(self.coordinator_namespace, self.coordinator_fence) orelse error.InvalidParticipant;
     }
+    pub fn coordinatorOwner(self: Admission) !RoutedOwner {
+        return (try self.coordinatorMember()).routed_owner orelse error.ChangefeedCapabilityUnsupported;
+    }
     pub fn member(self: Admission, namespace: Namespace) !Participant {
         try self.validate();
         return self.find(namespace) orelse error.InvalidParticipant;

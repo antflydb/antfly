@@ -92,7 +92,7 @@ pub const Port = struct {
         if (decision.record.status == .pending) return error.SourceOutcomeUnresolved;
         if (index >= admission.participants.len) return error.InvalidParticipant;
         const member = admission.participants[index];
-        const owner = try admission.recoveryOwner(member.namespace);
+        const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
         const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
         try validateParticipantFence(owner, locator.group_id, fence);
         var parsed: ?std.json.Parsed(completion.Envelope) = null;
@@ -130,14 +130,14 @@ pub const Port = struct {
         if (decision.record.status == .pending) return error.SourceOutcomeUnresolved;
         if (!decision.record.acknowledgments_pending) return;
         const admission = decision.admission.admission;
-        const owner = try admission.recoveryOwner(admission.coordinator_namespace);
+        const owner = try admission.coordinatorOwner();
         const coordinator = try admission.coordinatorMember();
         const locator = local.api_local_transaction_contract.parseParticipantRef(coordinator.locator) orelse return error.InvalidParticipant;
         try validateParticipantFence(owner, locator.group_id, fence);
         var pending: [64][]const u8 = undefined;
         var count: usize = 0;
         for (admission.participants) |member| {
-            if (std.mem.eql(u8, &member.namespace, &admission.coordinator_namespace)) continue;
+            if (std.mem.eql(u8, &member.owner_fence, &admission.coordinator_fence)) continue;
             pending[count] = member.locator;
             count += 1;
             if (count == pending.len) {
@@ -169,7 +169,7 @@ pub const Port = struct {
         if (decision.record.source_purpose != null) return error.SourceOutcomeUnresolved;
         const admission = decision.admission.admission;
         const member = try admission.coordinatorMember();
-        const owner = try admission.recoveryOwner(member.namespace);
+        const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
         const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
         try validateParticipantFence(owner, locator.group_id, fence);
         const request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .source_purpose = decision.record.source_purpose, .source_scope = decision.record.source_scope, .txn_id = admission.transaction_id, .status = .aborted, .commit_version = timestamp_ns } } };

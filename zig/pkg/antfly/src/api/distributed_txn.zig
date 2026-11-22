@@ -1607,7 +1607,7 @@ pub fn prepareSourceCommit(
     try context.ensureActive();
     var prepared = (try coordinator.prepare(alloc, txn_id, begin_timestamp, inputs, context)) orelse return error.ChangefeedCapabilityUnsupported;
     errdefer prepared.deinit();
-    const captured = try prepared.plan.admission.recoveryOwner(prepared.plan.admission.coordinator_namespace);
+    const captured = try prepared.plan.admission.coordinatorOwner();
     try grant.authority.requireOwner(captured);
     try context.ensureActive();
     return prepared;

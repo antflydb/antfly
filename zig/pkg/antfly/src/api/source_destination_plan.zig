@@ -81,9 +81,9 @@ pub const Manifest = struct {
         if (!std.meta.eql(plan.source_scope, @as(?local.storage_source_scope.Reference, self.source_scope)) or
             !std.mem.eql(u8, &plan.admission.digest(), &self.admission_digest) or
             !std.mem.eql(u8, &plan.admission.transaction_id, &self.transaction_id) or plan.begin_timestamp != self.begin_timestamp) return error.SourceTransactionIdentityConflict;
-        const owner = try plan.admission.recoveryOwner(plan.admission.coordinator_namespace);
+        const owner = try plan.admission.coordinatorOwner();
         if (!std.meta.eql(owner, self.owner)) return error.SourceTransactionIdentityConflict;
-        const member = try plan.admission.member(owner.namespace);
+        const member = try plan.admission.memberForOwner(owner);
         const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
         if (!std.mem.eql(u8, locator.table_name, self.checkpoint_authority.table_name)) return error.SourceBindingConflict;
         for (plan.participants, 0..) |participant, index| if (std.mem.eql(u8, &participant.owner.namespace, &owner.namespace)) {
@@ -136,7 +136,7 @@ pub const Frozen = struct {
     /// The observation must be qualified for this exact captured coordinator.
     /// Capacity remains provisional until native artifact BEGIN commits.
     pub fn init(a: A, plan: *const plans.Plan, checkpoint_authority: authority.Spec, quota: control.Observation, commit_version: u64) !Frozen {
-        const owner = try plan.admission.recoveryOwner(plan.admission.coordinator_namespace);
+        const owner = try plan.admission.coordinatorOwner();
         try checkpoint_authority.requireOwner(owner);
         try quota.validate(.{ .root = try entry.rootFor(owner), .minimum_applied_index = 1 });
         if (quota.quota.active == storage.max_active) return error.SourceAdmissionBackpressure;

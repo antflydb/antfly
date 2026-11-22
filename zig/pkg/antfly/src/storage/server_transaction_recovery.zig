@@ -167,7 +167,7 @@ fn runRecoveryPageWithConfig(
             };
             summary.notification_attempts += 1;
             enqueue(config.resolver_ctx.?, .{
-                .owner = try admission.recoveryOwner(admission.coordinator_namespace),
+                .owner = try admission.coordinatorOwner(),
                 .transaction_id = txn.txn_id,
                 .admission_digest = retained.value.digest,
                 .coordinator_locator = coordinator.locator,

@@ -146,7 +146,7 @@ pub const Plan = struct {
         ids[0] = (try admission.coordinatorMember()).locator;
         var follower: usize = 1;
         for (participants) |participant| {
-            if (std.mem.eql(u8, &participant.owner.namespace, &coordinator.namespace)) continue;
+            if (std.mem.eql(u8, &participant.owner.digest(), &coordinator.digest())) continue;
             ids[follower] = participant.locator;
             follower += 1;
         }
@@ -195,7 +195,7 @@ pub const Plan = struct {
                 has_checkpoint_command = true;
                 has_checkpoint_receipts = checkpoint.receipt_window != 0;
             }
-            if (!std.mem.eql(u8, &participant.owner.namespace, &self.admission.coordinator_namespace)) {
+            if (!std.mem.eql(u8, &participant.owner.digest(), &self.admission.coordinator_fence)) {
                 if (follower >= self.participant_ids.len or !std.mem.eql(u8, self.participant_ids[follower], participant.locator)) return error.InvalidParticipant;
                 follower += 1;
             }
@@ -255,7 +255,7 @@ pub const Plan = struct {
         defer parsed.deinit();
         const admission = parsed.value.admission;
         if (admission.version != 3 or admission.participants.len != count) return error.InvalidTxnRecord;
-        const coordinator = try admission.recoveryOwner(admission.coordinator_namespace);
+        const coordinator = try admission.coordinatorOwner();
         const inputs = try a.alloc(Input, count);
         defer a.free(inputs);
         const requests = try a.alloc(batch.OwnedBatchRequest, count);
