@@ -1075,7 +1075,7 @@ pub const Session = struct {
         const staged = self.staged orelse return;
         // Cap both the input traversal and scratch allocations on the write path.
         // Large records can still be listed from their canonical staged request.
-        const budget = @min(if (limit) |max| max / 2 else 32 << 10, 32 << 10);
+        const budget: usize = @min(if (limit) |max| max / 2 else 32 << 10, 32 << 10);
         var remaining = budget -| 256;
         remaining -|= staged.read_set.len *| 32;
         if (remaining == 0) return;
