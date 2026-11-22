@@ -26933,7 +26933,19 @@ pub const Node = struct {
         };
         var combined = Combined{ .backend = &backend, .validation = &validation };
         const text_control: @import("antfly_extracting").text_processing.Checkpoint = .{ .ptr = &backend, .check_fn = StructuredGeneration.textCheck };
-        const planned = try extractor.planWithLimit(a, config, texts, text_control, if (registered != null) hosted_extraction_max_windows else null);
+        const planned = extractor.planWithLimit(a, config, texts, text_control, if (registered != null) hosted_extraction_max_windows else null) catch |err| {
+            if (registered == null) return err;
+            return switch (err) {
+                error.BoundaryTextLimitExceeded,
+                error.InvalidLongDocumentLimits,
+                error.LongDocumentWindowingRequired,
+                error.LongDocumentWindowLimitExceeded,
+                error.LongDocumentWorkLimitExceeded,
+                => error.GeneratedExtractionLimitExceeded,
+                error.InvalidUtf8 => error.InvalidGeneratedExtractorConfig,
+                else => err,
+            };
+        };
         const instructions = try std.fmt.allocPrint(a, "Extract only entities and relations grounded in each input. Use literal source surface forms. Relations reference entity positions. Set present=false for absent candidates. Never invent offsets or confidence. {s}", .{config.instructions});
         const generated = try c.execute(a, .{ .require_all = registered != null, .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
         const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
