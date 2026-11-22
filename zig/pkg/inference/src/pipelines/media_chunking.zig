@@ -919,7 +919,7 @@ pub const Runner = struct {
         const source = &planning_source;
         const transport = try media.transport_stream.isTransportSource(source);
         const webm = if (transport) false else detect: {
-            var prefix = try source.readMetadata(0, @intCast(@min(4, source.length())));
+            var prefix = try source.readSparse(0, @intCast(@min(4, source.length())));
             defer prefix.deinit();
             break :detect std.mem.eql(u8, prefix.bytes, "\x1a\x45\xdf\xa3");
         };

@@ -116,7 +116,7 @@ pub const ReadAhead = struct {
     reads: usize = 0,
     hits: usize = 0,
     pub fn range(self: *ReadAhead) source.Range {
-        return .{ .context = self, .read_at = readAt, .metadata_read_at = readMetadataAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
+        return .{ .context = self, .read_at = readAt, .sparse_read_at = readSparseAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
     }
     pub fn deinit(self: *ReadAhead) void {
         if (self.buffer) |bytes| self.allocator.free(bytes);
@@ -128,7 +128,7 @@ pub const ReadAhead = struct {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
         return self.readWindow(offset, out, control, self.window_bytes);
     }
-    fn readMetadataAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
+    fn readSparseAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
         // Coalesce adjacent EBML headers without pulling whole video blocks.
         return self.readWindow(offset, out, control, @min(self.window_bytes, @max(256, out.len)));

@@ -85,11 +85,11 @@ pub fn isTransportStream(bytes: []const u8) bool {
 pub fn isTransportSource(input: *source.Source) !bool {
     if (input.storage == .borrowed) return isTransportStream(input.storage.borrowed);
     if (input.length() < 188 or input.length() % 188 != 0) return false;
-    var first = try input.readMetadata(0, 1);
+    var first = try input.readSparse(0, 1);
     const sync = first.bytes[0] == 0x47;
     first.deinit();
     if (!sync or input.length() == 188) return sync;
-    var next = try input.readMetadata(188, 1);
+    var next = try input.readSparse(188, 1);
     defer next.deinit();
     return next.bytes[0] == 0x47;
 }

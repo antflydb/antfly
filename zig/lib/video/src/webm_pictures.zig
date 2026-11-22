@@ -309,7 +309,7 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
         try reader.input.control.check();
         if (packet.size > options.decoder.max_packet_bytes) return error.ResourceLimitExceeded;
         if (reader.track.codec == .vp8) {
-            var lease = try reader.input.readMetadata(packet.offset, @min(10, packet.size));
+            var lease = try reader.input.readSparse(packet.offset, @min(10, packet.size));
             defer lease.deinit();
             const bytes = lease.bytes;
             if (bytes.len < 3) return error.InvalidVideoData;
@@ -344,16 +344,16 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
             const vp9 = @import("codecs/vp9_header.zig");
             // Geometry inspection only consumes the uncompressed prefix.
             // Use the suffix independently to validate superframe extents.
-            var prefix = try reader.input.readMetadata(packet.offset, @min(32, packet.size));
+            var prefix = try reader.input.readSparse(packet.offset, @min(32, packet.size));
             defer prefix.deinit();
             const tail_size = @min(vp9.Extents.max_tail_bytes, packet.size);
-            var tail = try reader.input.readMetadata(packet.offset + (packet.size - tail_size), tail_size);
+            var tail = try reader.input.readSparse(packet.offset + (packet.size - tail_size), tail_size);
             defer tail.deinit();
             const parts = try vp9.splitExtents(tail.bytes, packet.size);
             if (parts.len != 1) collector.apple_packet_layout = false;
             var offset = packet.offset;
             for (parts.sizes[0..parts.len], 0..) |part_size, part_id| {
-                var header = if (part_id != 0) try reader.input.readMetadata(offset, @min(32, part_size)) else null;
+                var header = if (part_id != 0) try reader.input.readSparse(offset, @min(32, part_size)) else null;
                 defer if (header) |*lease| lease.deinit();
                 const bytes = if (header) |lease| lease.bytes else prefix.bytes[0..@min(prefix.bytes.len, part_size)];
                 const picture = try vp9.inspect(bytes, &references, options.decoder.max_pixels);

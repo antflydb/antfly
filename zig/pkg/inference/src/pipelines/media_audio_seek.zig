@@ -269,7 +269,7 @@ const WebmFlac = struct {
             const begin: usize = @intCast(offset - extent.logical);
             const size = @min(out.len, extent.size - begin, self.input.limits.max_read_bytes, self.input.limits.max_retained_bytes);
             if (size == 0) return error.ResourceLimitExceeded;
-            var lease = try self.input.readControlled(extent.physical + begin, size, control);
+            var lease = try self.input.readSparseControlled(extent.physical + begin, size, control);
             defer lease.deinit();
             @memcpy(out[0..size], lease.bytes);
             return size;

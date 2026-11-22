@@ -235,7 +235,7 @@ pub const Track = struct {
         };
         if (source.length() < 4) return error.UnsupportedAudioFormat;
         const prefix = sniff: {
-            var lease = try source.readMetadata(0, 4);
+            var lease = try source.readSparse(0, 4);
             defer lease.deinit();
             break :sniff lease.bytes[0..4].*;
         };
