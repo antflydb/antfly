@@ -28,6 +28,17 @@ pub fn inspect(alloc: std.mem.Allocator, manifest: []const u8) !Coverage {
     return inspectValue(parsed.value);
 }
 
+/// Complete means published, error-free and fully covered, not just converged.
+pub fn isComplete(alloc: std.mem.Allocator, manifest: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
+    const status = parsed.value.object.get("merge_status") orelse return false;
+    if (status != .string or !std.mem.eql(u8, status.string, "converged")) return false;
+    if (parsed.value.object.get("last_error")) |err| if (err != .null) return false;
+    return !(try inspectValue(parsed.value)).failed;
+}
+
 fn inspectValue(value: std.json.Value) !Coverage {
     if (value != .object) return error.InvalidDocumentExtractionManifest;
     var coverage: Coverage = .{};
@@ -142,4 +153,11 @@ test "publication health separates readable partial and pending extraction from 
     inline for (.{ "\"ocr_failed_count\":1", "\"ocr_failed_page_numbers\":[7]", "\"ocr_failure_details\":[{\"retryable\":false}]", "\"incomplete_unit_count\":1", "\"unsupported_reason\":\"missing_transcriber\"", "\"last_error\":{\"code\":\"ReadTransientFailure\"}" }) |failure|
         try std.testing.expectEqual(PublicationState.failed, try publicationState(a, prefix ++ failure ++ "}"));
     try std.testing.expectEqual(PublicationState.pending, try publicationState(a, "{\"route_type\":\"pdf\",\"merge_plan\":{\"status\":\"in_progress\"}}"));
+}
+
+test "incomplete selection preserves only published error-free coverage" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try isComplete(a, "{\"merge_status\":\"converged\",\"ocr_failed_count\":0}"));
+    inline for (.{ "{}", "{\"merge_status\":\"pending\"}", "{\"merge_status\":\"converged\",\"ocr_failed_count\":1}", "{\"merge_status\":\"converged\",\"incomplete_unit_count\":1}", "{\"merge_status\":\"converged\",\"last_error\":{\"code\":\"Canceled\"}}" }) |manifest|
+        try std.testing.expect(!try isComplete(a, manifest));
 }

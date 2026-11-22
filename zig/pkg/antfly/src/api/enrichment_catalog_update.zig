@@ -15,6 +15,37 @@
 
 const std = @import("std");
 
+/// Read-modify-write of public descriptors cannot round-trip write-only
+/// producer JSON. Omission retains the admitted producer of the same kind;
+/// explicit producer configuration still replaces it.
+pub fn inheritProducer(alloc: std.mem.Allocator, root: std.json.ObjectMap, name: []const u8, replacement: *std.json.Value) !void {
+    if (replacement.* != .object or replacement.object.contains("producer_json") or replacement.object.contains("producer")) return;
+    const kind = replacement.object.get("kind") orelse return;
+    if (kind != .string) return;
+    if (root.get("enrichments")) |items| if (try inheritFrom(alloc, items, name, kind.string, replacement)) return;
+    var entries = root.iterator();
+    while (entries.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const items = entry.value_ptr.object.get("enrichments") orelse continue;
+        if (try inheritFrom(alloc, items, name, kind.string, replacement)) return;
+    }
+}
+
+fn inheritFrom(alloc: std.mem.Allocator, items: std.json.Value, name: []const u8, kind: []const u8, replacement: *std.json.Value) !bool {
+    if (items != .array) return false;
+    for (items.array.items) |entry| {
+        if (entry != .object) continue;
+        const candidate = entry.object.get("name") orelse continue;
+        const old_kind = entry.object.get("kind") orelse continue;
+        if (candidate != .string or old_kind != .string or !std.mem.eql(u8, candidate.string, name) or !std.mem.eql(u8, old_kind.string, kind)) continue;
+        for ([_][]const u8{ "producer_json", "producer" }) |field| if (entry.object.get(field)) |value| {
+            try replacement.object.put(alloc, field, value);
+            return true;
+        };
+    }
+    return false;
+}
+
 /// Artifact names identify a table-wide producer, including declarations
 /// originally installed inline with an index. Replace every inline copy before
 /// validating the merged catalog, so an obsolete producer does not prevent its
@@ -82,4 +113,19 @@ test "replacement repairs every inline producer without touching index sources o
     try std.testing.expectEqual(@as(usize, 1), remaining.len);
     try std.testing.expectEqualStrings("other", remaining[0].object.get("name").?.string);
     try std.testing.expectEqual(@as(usize, 0), catalog.value.object.get("second").?.object.get("enrichments").?.array.items.len);
+}
+
+test "execution update retains omitted private producer from root or inline declaration" {
+    const a = std.testing.allocator;
+    inline for (.{ "{\"enrichments\":[{\"name\":\"units\",\"kind\":\"asset\",\"producer_json\":\"private recipe\"}]}", "{\"text\":{\"enrichments\":[{\"name\":\"units\",\"kind\":\"asset\",\"producer_json\":\"private recipe\"}]}}" }) |raw| {
+        var catalog = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer catalog.deinit();
+        var replacement = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"units\",\"kind\":\"asset\",\"execution\":{\"max_output_tokens_per_item\":8192}}", .{});
+        defer replacement.deinit();
+        try inheritProducer(replacement.arena.allocator(), catalog.value.object, "units", &replacement.value);
+        try std.testing.expectEqualStrings("private recipe", replacement.value.object.get("producer_json").?.string);
+        try replacement.value.object.put(replacement.arena.allocator(), "producer_json", .{ .string = "replacement" });
+        try inheritProducer(replacement.arena.allocator(), catalog.value.object, "units", &replacement.value);
+        try std.testing.expectEqualStrings("replacement", replacement.value.object.get("producer_json").?.string);
+    }
 }

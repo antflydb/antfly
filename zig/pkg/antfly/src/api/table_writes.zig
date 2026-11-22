@@ -936,6 +936,7 @@ fn documentArtifactReprocessRequestForCursor(
         .from_key = cursor.next_key,
         .resume_from_key = true,
         .to_key = req.to_key,
+        .selection = req.selection,
         .limit = if (cursor.limit != 0) cursor.limit else req.limit,
     };
 }
@@ -943,7 +944,7 @@ fn documentArtifactReprocessRequestForCursor(
 test "privacy reprocess continuations preserve empty IDs across shard and owner transport" {
     const a = std.testing.allocator;
     for ([_][]const u8{ "", "\x00", "after" }) |key| {
-        const req = documentArtifactReprocessRequestForCursor(.{ .to_key = "end", .limit = 100 }, .{ .group_id = 1, .next_key = key, .limit = 1 });
+        const req = documentArtifactReprocessRequestForCursor(.{ .to_key = "end", .limit = 100, .selection = .incomplete }, .{ .group_id = 1, .next_key = key, .limit = 1 });
         try std.testing.expect(req.resume_from_key);
         try std.testing.expectEqual(@as(u32, 1), req.limit);
         const raw = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", req);
@@ -951,6 +952,7 @@ test "privacy reprocess continuations preserve empty IDs across shard and owner 
         var decoded = try std.json.parseFromSlice(StorageKernelArtifactRangeRequest, a, raw, .{});
         defer decoded.deinit();
         try std.testing.expect(decoded.value.request.resume_from_key);
+        try std.testing.expectEqual(.incomplete, decoded.value.request.selection);
         try std.testing.expectEqualStrings(key, decoded.value.request.from_key);
         try std.testing.expectEqualStrings("end", decoded.value.request.to_key);
     }
@@ -28673,6 +28675,19 @@ fn putArtifactEnrichmentInDb(
 ) !void {
     var parsed = try parseArtifactEnrichmentConfig(alloc, artifact_name, enrichment_json);
     defer parsed.deinit();
+    // Metadata admission retained omitted write-only producer configuration.
+    // Apply the same inheritance locally before catalog validation.
+    if (parsed.value.producer_json.len == 0) {
+        var input = try std.json.parseFromSlice(std.json.Value, alloc, enrichment_json, .{});
+        defer input.deinit();
+        if (!input.value.object.contains("producer_json") and !input.value.object.contains("producer")) {
+            if (try db.getEnrichment(alloc, parsed.value.kind, artifact_name)) |value| {
+                var existing = value;
+                defer existing.deinit(alloc);
+                parsed.value.producer_json = try parsed.arena.allocator().dupe(u8, existing.producer_json);
+            }
+        }
+    }
     _ = try db.upsertEnrichment(parsed.value);
 }
 

@@ -37130,6 +37130,7 @@ pub fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentCo
 fn parsePublicExecutionConfig(alloc: Allocator, execution_json: []const u8) !types.EnrichmentExecutionConfig {
     const policy = try enrichment_types.parseExecutionPolicyJson(alloc, execution_json);
     return .{
+        .max_output_tokens_per_item = policy.max_output_tokens_per_item,
         .batch_items = if (policy.batch_items) |value| std.math.cast(u32, value) orelse return error.InvalidEnrichmentConfig else null,
         .batch_bytes = if (policy.batch_bytes) |value| std.math.cast(u64, value) orelse return error.InvalidEnrichmentConfig else null,
         .max_document_pages = if (policy.max_document_pages) |value| std.math.cast(u32, value) orelse return error.InvalidEnrichmentConfig else null,

@@ -2000,3 +2000,66 @@ MAYBE/later:
   compression still leaves high compaction rewrite cost.
 - Query and lookup paths must continue returning the public JSON shape after
   any transparent decompression.
+
+## Execution policy and selective regeneration
+
+Extraction recipe identity and execution policy are separate. Model revision,
+prompt, sampling, rendering/preprocessing, routing rules and native-text quality
+policy can change the produced content. Keep them in the producer recipe.
+`execution` controls how a producer is invoked and is excluded from artifact and
+catalog semantic hashes. Its `max_output_tokens_per_item` overrides the reader or
+generator `max_tokens` only for an invocation, including document-extraction OCR
+pages. Discovery, memory admission and execution see the same effective budget;
+node and provider ceilings still apply. Batching and document-page admission
+limits retain their existing non-semantic behavior.
+
+An increase does not invalidate an accepted complete result. A decrease also
+applies prospectively: it is not an instruction to reject or regenerate older
+accepted output. Explicit regeneration is a separate operation. Extraction
+manifests record the declared execution policy for newly produced generations;
+older manifests do not establish the budget that produced them.
+
+For existing tables, retain the original producer JSON byte-for-byte, including
+any existing `max_tokens`, and set the override under `execution`. Removing the
+legacy recipe field would itself change its fingerprint. `PUT` of an existing
+same-kind enrichment preserves omitted write-only `producer_json`/`producer`
+fields, so an operator can round-trip the public descriptor without recovering
+credentials or reconstructing its old recipe. Explicit producer fields still
+replace the recipe. Preserve the descriptor's other source and projection fields.
+
+The existing APIs express three distinct scopes:
+
+| Scope | Operation | Accepted complete output |
+| --- | --- | --- |
+| Future invocations | Update `execution` only | Retained; no regeneration submission |
+| Incomplete work | Reprocess range/job with `selection: incomplete` | Skipped |
+| Regenerate selected range | Reprocess with `selection: all` | Explicitly regenerated |
+
+For compatibility, omitted reprocess selection remains `all`; operators should
+name the selection explicitly. `incomplete` is supported for
+`document_extraction` assets (PDFs, images, text and transcripts). Other producer
+kinds reject it. Missing manifests, errors, non-converged publication, and failed
+or incomplete units qualify. Publication convergence alone is not completion:
+failed OCR pages must be retried even when embedded text was published. Selection
+is checked again during mutation preparation; generation-fenced submission
+protects concurrent publication. Cursor continuations and durable job transitions
+retain the selection, including after restart. All API coordinators and data owners must support the
+new selector before using it in a mixed-version deployment; do not resume such
+jobs on an older coordinator after rollback; unsupported request
+fields fail admission rather than silently selecting all.
+
+Selection is at source-record/artifact granularity. Reprocessing an incomplete
+multi-page record can redo pages within that record; this API does not promise
+page-only retries. It does preserve complete artifacts in other source records.
+A 202 response and a finished submission job certify acceptance, not successful
+inference. Verify the artifact generation, per-unit failure counts, and the
+readiness of every consumer index afterwards.
+
+Secret-value rotation behind an unchanged reference and node scheduling,
+concurrency, timeout/retry, queue and memory-policy changes do not require OCR.
+Changing a secret reference, endpoint or source locator inside a stored recipe
+is not automatically an identity-preserving migration. Source relocation reuse
+requires verified content identity and unchanged routing predicates. Chunking,
+embeddings, summaries and graph projections can consume existing text but must
+rebuild their own changed artifacts. Native-text thresholds may select additional
+pages for OCR; DPI, sampling, model and prompt changes remain semantic.

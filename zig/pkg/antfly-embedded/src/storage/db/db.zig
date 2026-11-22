@@ -10856,7 +10856,7 @@ pub const DB = struct {
         artifact_name: []const u8,
     ) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifact", .{ self, alloc, doc_key, artifact_name });
-        return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false);
+        return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false, false);
     }
 
     fn reprocessDocumentArtifactWithCompletionWait(
@@ -10865,6 +10865,7 @@ pub const DB = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
         wait_for_completion: bool,
+        only_incomplete: bool,
     ) !bool {
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
             return self.reprocessEmbeddingArtifactIssue(alloc, .{
@@ -10895,6 +10896,7 @@ pub const DB = struct {
         }, null, .{
             .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
+            .force_only_incomplete_assets = only_incomplete,
         });
         return true;
     }
@@ -12826,7 +12828,7 @@ pub const DB = struct {
     ) !bool {
         return switch (issue.artifact_kind) {
             .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue, true),
-            .asset => try self.reprocessDocumentArtifactWithCompletionWait(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name, true),
+            .asset => try self.reprocessDocumentArtifactWithCompletionWait(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name, true, false),
             .chunk => try self.reprocessChunkArtifactIssue(alloc, issue),
             .graph, .full_text, .algebraic => false,
         };
@@ -19860,6 +19862,12 @@ pub const DB = struct {
             (try self.getEnrichment(alloc, .embedding, artifact_name)) orelse return error.NotFound;
         defer cfg.deinit(alloc);
 
+        if (req.selection == .incomplete) {
+            if (cfg.kind != .asset) return error.InvalidArgument;
+            var producer = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+            defer producer.deinit(alloc);
+            if (producer.type != .document_extraction) return error.InvalidArgument;
+        }
         var effective_req = req;
         if (req.shard_cursors.len > 0) {
             if (req.shard_cursors.len != 1) return error.InvalidArgument;
@@ -19869,6 +19877,7 @@ pub const DB = struct {
                 .from_key = cursor.next_key,
                 .resume_from_key = true,
                 .to_key = req.to_key,
+                .selection = req.selection,
                 .limit = if (cursor.limit != 0) cursor.limit else req.limit,
             };
         }
@@ -19898,7 +19907,21 @@ pub const DB = struct {
         const process_len = @min(scanned.documents.len, @as(usize, @intCast(limit)));
         for (scanned.documents[0..process_len]) |doc| {
             result.scanned += 1;
-            const handled = self.reprocessDocumentArtifact(alloc, doc.id, artifact_name) catch |err| switch (err) {
+            if (effective_req.selection == .incomplete) {
+                // Select against published coverage, not repair counters or
+                // merge convergence: a converged PDF can contain failed pages.
+                if (try self.getDocumentArtifactManifest(alloc, doc.id, artifact_name)) |value| {
+                    var manifest = value;
+                    defer manifest.deinit(alloc);
+                    if (manifest.last_error_code == null and std.mem.eql(u8, manifest.merge_status, "converged") and
+                        !(try @import("enrichment/document_extraction_completion.zig").inspect(alloc, manifest.manifest_json)).failed)
+                    {
+                        result.skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            const handled = self.reprocessDocumentArtifactWithCompletionWait(alloc, doc.id, artifact_name, false, effective_req.selection == .incomplete) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     result.failed += 1;
@@ -54378,8 +54401,10 @@ test "db document extraction failure manifest preserves prior artifacts" {
         "RemoteDocumentFetchFailed",
         "remote content download failed",
         "remote_content_download",
+        "{\"max_output_tokens_per_item\":8192}",
     );
     defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"execution\":{\"max_output_tokens_per_item\":8192}") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"chunk_count\":1") != null);
@@ -92486,6 +92511,40 @@ test "db document extraction manifest inspection and reprocess API" {
     var range_after_b = (try db.getDocumentArtifactManifest(alloc, "doc:b", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer range_after_b.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), range_after_b.generation);
+
+    // A non-semantic update must leave accepted generations untouched.
+    var producer = (try db.getEnrichment(alloc, .asset, "document_units_v1")).?;
+    defer producer.deinit(alloc);
+    const semantic_hash = types.enrichmentConfigHash(producer);
+    producer.execution = .{ .max_output_tokens_per_item = 8192 };
+    try std.testing.expectEqual(semantic_hash, types.enrichmentConfigHash(producer));
+    _ = try db.upsertEnrichment(producer);
+    var incomplete = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .selection = .incomplete });
+    defer incomplete.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), incomplete.skipped);
+    try std.testing.expectEqual(@as(usize, 0), incomplete.reprocessed);
+    try db.runUntilIdle();
+    var kept = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")).?;
+    defer kept.deinit(alloc);
+    try std.testing.expectEqual(range_after_a.generation, kept.generation);
+
+    // Publication convergence alone does not make a truncated page complete.
+    const partial_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:b", "asset", "document_units_v1");
+    defer alloc.free(partial_key);
+    var partial = try std.json.parseFromSlice(std.json.Value, alloc, range_after_b.manifest_json, .{});
+    defer partial.deinit();
+    try partial.value.object.put(partial.arena.allocator(), "ocr_failed_count", .{ .integer = 1 });
+    const partial_bytes = try std.json.Stringify.valueAlloc(alloc, partial.value, .{});
+    defer alloc.free(partial_bytes);
+    try db.core.store.put(partial_key, partial_bytes);
+    var retry = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .selection = .incomplete });
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), retry.skipped);
+    try std.testing.expectEqual(@as(usize, 1), retry.reprocessed);
+    try db.runUntilIdle();
+    var repaired = (try db.getDocumentArtifactManifest(alloc, "doc:b", "document_units_v1")).?;
+    defer repaired.deinit(alloc);
+    try std.testing.expectEqual(range_after_b.generation + 1, repaired.generation);
 }
 
 test "db generic artifact repair queue reprocesses document asset artifacts" {
@@ -103658,7 +103717,7 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
             defer a.free(value);
             try db.batchInternal(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .enrichments }, null, .{ .force_generated_artifact_names = &.{"vectors"}, .wait_for_sync_level = false });
         } else {
-            try std.testing.expect(if (synchronous) try db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "vectors", true) else try db.reprocessDocumentArtifact(a, "doc", "vectors"));
+            try std.testing.expect(if (synchronous) try db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "vectors", true, false) else try db.reprocessDocumentArtifact(a, "doc", "vectors"));
             try db.runUntilIdle();
         }
     }

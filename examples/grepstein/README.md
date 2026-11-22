@@ -217,8 +217,12 @@ parallelism as well: an image-only 8192-token LightOn request uses 36 work units
 so four independent requests need 144 units with the current admission policy.
 Completed short pages still stop at EOS.
 The 8192-token value is the first-call budget, not a retry-only allowance. Keep
-it explicit in the producer: the runtime's omitted-value default is separate
-from the deployment's maximum. Dense HTML tables can consume many tokens even
+it explicit in the reader file: new tables move this value into the artifact's
+`execution.max_output_tokens_per_item` policy, separate from the semantic producer
+recipe and the deployment's maximum. For existing tables, update that execution
+field through artifact PUT while retaining the stored producer, then use
+`selection: incomplete` in a bounded reprocess job. Completed source artifacts
+are preserved; incomplete PDFs may repeat pages within that source artifact. Dense HTML tables can consume many tokens even
 when their visible word count is modest. Do not change sampling, rendering,
 model revision, or source identity while comparing output-budget policies.
 Use the [same-fixture policy benchmark](../../docs/guides/inference-policy-benchmark.md)

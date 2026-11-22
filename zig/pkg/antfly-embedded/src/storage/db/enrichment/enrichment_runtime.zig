@@ -12619,6 +12619,7 @@ const SharedPdfWindowScheduler = struct {
         consumer.config = try document_extraction_mod.parseConfig(alloc, outer.config_json);
         consumer.owned_config = true;
         applyDocumentExtractionRuntimePolicy(&consumer.config);
+        try document_extraction_mod.applyExecutionPolicy(alloc, &consumer.config, request.execution_json);
         try document_extraction_mod.applySourceMetadataFromJson(alloc, &consumer.config, raw);
         if (!document_extraction_mod.ocrEnabledForRoute(consumer.config, "pdf")) return;
         // Custom dispatch may select a non-PDF extractor even for PDF bytes.
@@ -12719,6 +12720,7 @@ const SharedPdfWindowScheduler = struct {
             var other = document_extraction_mod.parseConfig(self.runtime.alloc, outer.config_json) catch continue;
             defer other.deinit(self.runtime.alloc);
             applyDocumentExtractionRuntimePolicy(&other);
+            try document_extraction_mod.applyExecutionPolicy(self.runtime.alloc, &other, request.execution_json);
             try document_extraction_mod.applySourceMetadataFromJson(self.runtime.alloc, &other, raw);
             if (other.routes.len != 0 or other.route_preset != .mixed_files or
                 !std.mem.eql(u8, config.credentials, other.credentials) or
@@ -15348,6 +15350,7 @@ const DocumentPreparationPipeline = struct {
             if (job.budgeted) |*budgeted|
                 job.reclaimer_id = try budgeted.reservation.manager.registerReclaimer(.document_extraction_working_set, job, Job.reclaim);
             applyDocumentExtractionRuntimePolicy(&job.config);
+            try document_extraction_mod.applyExecutionPolicy(description, &job.config, request.execution_json);
             if (self.runtime.config.remote_content) |remote| job.remote_snapshot = try remote.acquire();
             if (job.remote_snapshot) |snapshot| job.remote_config = snapshot.config.*;
             job.remote_config.runtime = null;
@@ -17837,6 +17840,12 @@ fn processAsset(
             }
         }
     }
+    if (producer_cfg.type == .reader or producer_cfg.type == .generator) {
+        if (try enrichment_types.withGenerationBudgetAlloc(runtime.alloc, producer_cfg.config_json, request.execution_json)) |updated| {
+            runtime.alloc.free(producer_cfg.config_json);
+            producer_cfg.config_json = updated;
+        }
+    }
     const config_json = producer_cfg.config_json;
     producer_cfg.config_json = "";
     var config_json_owned = true;
@@ -19650,6 +19659,7 @@ fn processDocumentExtractionAsset(
     var config = try document_extraction_mod.parseConfig(runtime.alloc, config_json);
     defer config.deinit(runtime.alloc);
     applyDocumentExtractionRuntimePolicy(&config);
+    try document_extraction_mod.applyExecutionPolicy(runtime.alloc, &config, request.execution_json);
     try document_extraction_mod.applySourceMetadataFromJson(runtime.alloc, &config, raw_doc);
 
     const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
@@ -19732,6 +19742,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -19762,6 +19773,7 @@ fn processDocumentExtractionAsset(
                 previous_child_ranges,
                 existing_state,
                 from_generation,
+                request.execution_json,
                 window,
             );
             try recordIsolatedRequestErrorFor(runtime, window, request, error.RemoteDocumentFetchFailed, scope.attemptNumber(runtime));
@@ -19794,6 +19806,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, raw_err, scope.attemptNumber(runtime));
@@ -19881,6 +19894,7 @@ fn processDocumentExtractionAsset(
                 previous_child_ranges,
                 existing_state,
                 from_generation,
+                request.execution_json,
                 window,
             );
             try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -20036,6 +20050,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -20193,6 +20208,7 @@ fn processDocumentExtractionAsset(
         ocr_failure_details[index] = summary.borrowed();
     }
     const streamed_extraction = document_extraction_mod.Result{
+        .execution_json = request.execution_json,
         .content_type = collect_ctx.info.content_type,
         .route_type = collect_ctx.info.route_type,
         .unsupported_reason = collect_ctx.info.unsupported_reason,
@@ -20264,6 +20280,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -20427,6 +20444,7 @@ fn writeDocumentExtractionFailureManifest(
     previous_child_ranges: []const types.DocumentArtifactChildRange,
     existing_state: ?[]const u8,
     from_generation: u64,
+    execution_json: []const u8,
     window: *GeneratedReplayWindow,
 ) !void {
     var previous_state = RuntimeDocumentExtractionPreviousState{};
@@ -20437,6 +20455,7 @@ fn writeDocumentExtractionFailureManifest(
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
     const failed_extraction = document_extraction_mod.Result{
+        .execution_json = execution_json,
         .content_type = @constCast(content_type),
         .route_type = @constCast("error"),
         .units = @constCast(empty_units[0..]),
@@ -37687,6 +37706,10 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
     try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
     try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+    if (extraction.execution_json.len > 0) {
+        try appendJsonFieldName(alloc, &out, &first, "execution");
+        try out.appendSlice(alloc, extraction.execution_json);
+    }
     if (extraction.unsupported_reason.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
     }

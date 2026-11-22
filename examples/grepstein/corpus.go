@@ -26,6 +26,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -496,6 +498,7 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 	}
 	// Without a reader config, extraction keeps native text only.
 	var ocr map[string]any
+	var execution map[string]any
 	if language != "" {
 		data, err := os.ReadFile(language)
 		if err != nil {
@@ -525,6 +528,15 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 				return nil, err
 			}
 			reader["api_key"] = secretRef
+		}
+		// Generation capacity is an execution policy, not part of the OCR recipe.
+		if value, exists := reader["max_tokens"]; exists {
+			budget, ok := value.(float64)
+			if !ok || budget < 1 || budget > math.MaxUint32 || budget != math.Trunc(budget) {
+				return nil, fmt.Errorf("reader max_tokens must be a positive uint32")
+			}
+			execution = map[string]any{"max_output_tokens_per_item": uint32(budget)}
+			delete(reader, "max_tokens")
 		}
 		ocr = map[string]any{"mode": "auto", "render": map[string]any{"dpi": 150}, "reader": reader}
 		if profile.Name == "images" {
@@ -570,6 +582,9 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 		map[string]any{"name": corpusUnits, "kind": "asset", "field": "url", "content_type": "application/json", "producer_json": string(producerJSON)},
 		map[string]any{"name": corpusChunks, "kind": "chunk", "field": "text", "source_artifact_name": corpusUnits, "chunk_size": 512, "chunk_overlap": 50},
 	}}}
+	if execution != nil {
+		indexes[corpusTextIndex].(map[string]any)["enrichments"].([]any)[0].(map[string]any)["execution"] = execution
+	}
 	// The server owns and creates full_text_index_v0. Including its reserved
 	// name in a public create request is rejected, even with default settings.
 	if semantic {
@@ -1077,7 +1092,20 @@ func corpusTableSchema() map[string]any {
 }
 
 func corpusDescription(indexes map[string]any, pagesPerRecord int) string {
-	encoded, _ := json.Marshal([]any{indexes[corpusTextIndex], pagesPerRecord})
+	// Resume identity follows the recipe; policy changes must not require
+	// loading or extracting the same accepted source records again.
+	semantic := maps.Clone(indexes[corpusTextIndex].(map[string]any))
+	delete(semantic, "execution")
+	if enrichments, ok := semantic["enrichments"].([]any); ok {
+		copies := make([]any, len(enrichments))
+		for i, item := range enrichments {
+			copy := maps.Clone(item.(map[string]any))
+			delete(copy, "execution")
+			copies[i] = copy
+		}
+		semantic["enrichments"] = copies
+	}
+	encoded, _ := json.Marshal([]any{semantic, pagesPerRecord})
 	sum := sha256.Sum256(encoded)
 	return "grepstein-corpus-v1:" + hex.EncodeToString(sum[:])
 }
