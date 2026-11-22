@@ -1289,8 +1289,14 @@ components:
     ExecutionPolicy:
       type: object
       additionalProperties: false
-      description: "Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity."
+      description: "Non-semantic execution policy for one producer or index maintenance operation. Updates affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply."
       properties:
+        max_output_tokens_per_item:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 4294967295
+          description: "Invocation output-token budget for reader/generator assets and document-extraction OCR pages. Overrides producer max_tokens at execution only; it does not change the stored recipe, source fingerprint, or completed outputs. A lower value does not retroactively reject accepted output. Omit to use the producer budget."
         batch_items:
           x-go-type-skip-optional-pointer: true
           type: integer

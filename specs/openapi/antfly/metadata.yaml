@@ -3464,7 +3464,7 @@ components:
           description: Human-readable last extraction or materialization error summary, when available.
         manifest_json:
           type: string
-          description: Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses.
+          description: "Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it."
         state_json:
           type: string
           nullable: true
@@ -4016,6 +4016,11 @@ components:
       type: object
       description: Bounded request for reprocessing a derived artifact across source rows in key order.
       properties:
+        selection:
+          type: string
+          enum: [all, incomplete]
+          default: all
+          description: "all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion."
         from_key:
           type: string
           description: Exclusive lower bound source document key. Use the prior response next_key to continue.
@@ -4145,6 +4150,11 @@ components:
       type: object
       description: Request to create a durable table artifact reprocess job.
       properties:
+        selection:
+          type: string
+          enum: [all, incomplete]
+          default: all
+          description: "all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion."
         from_key:
           type: string
           description: Exclusive lower bound source document key.
@@ -4186,6 +4196,11 @@ components:
         - last_updated_at_millis
         - expires_at_millis
       properties:
+        selection:
+          type: string
+          enum: [all, incomplete]
+          default: all
+          description: "all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion."
         job_id:
           type: integer
           format: uint64
@@ -17458,7 +17473,13 @@ paths:
       summary: Register or replace an artifact enrichment
       description: |
         Registers a table-level generated artifact definition. Reusing the same
-        artifact name replaces the existing mapping. Chunk or asset enrichments
+        artifact name replaces the existing mapping.
+        Omitting the write-only producer_json/producer fields on an existing
+        same-kind artifact retains its admitted producer. This permits execution
+        policy updates without reading credentials or reconstructing its recipe.
+        Changing execution alone preserves completed artifacts; changing producer
+        semantics may invalidate them. Use explicit reprocessing for incomplete
+        or all existing work. Chunk or asset enrichments
         may set `full_text_index: true` to map generated text into the table's
         default full-text index.
       tags:

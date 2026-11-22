@@ -29,7 +29,9 @@ class GraphArtifactProducerConfig:
             document field; template sources render a Handlebars template.
         content_type (str | Unset):
         execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-            operation. These fields tune how work is batched and do not change generated artifact identity.
+            operation. Updates affect future invocations without invalidating accepted artifacts. To retry incomplete
+            extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings
+            still apply.
         producer (EnrichmentProducerConfig | Unset):
         producer_json (GraphArtifactProducerConfigProducerJson | Unset): Write-only producer configuration; it may
             contain credentials and is never returned.

@@ -67,7 +67,9 @@ class EnrichmentConfig:
                 ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed
                 adjacency re-runs the producer.
             execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-                operation. These fields tune how work is batched and do not change generated artifact identity.
+                operation. Updates affect future invocations without invalidating accepted artifacts. To retry incomplete
+                extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings
+                still apply.
             transcriber (TranscriberEnrichmentConfig | Unset): Speech-to-text provider for the `transcriber` enrichment
                 shorthand.
 

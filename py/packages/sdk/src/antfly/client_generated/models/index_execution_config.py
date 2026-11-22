@@ -20,9 +20,13 @@ class IndexExecutionConfig:
 
     Attributes:
         chunking (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-            operation. These fields tune how work is batched and do not change generated artifact identity.
+            operation. Updates affect future invocations without invalidating accepted artifacts. To retry incomplete
+            extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings
+            still apply.
         embedding (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-            operation. These fields tune how work is batched and do not change generated artifact identity.
+            operation. Updates affect future invocations without invalidating accepted artifacts. To retry incomplete
+            extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings
+            still apply.
     """
 
     chunking: ExecutionPolicy | Unset = UNSET

@@ -96,7 +96,13 @@ def sync_detailed(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk or asset enrichments
+    artifact name replaces the existing mapping.
+    Omitting the write-only producer_json/producer fields on an existing
+    same-kind artifact retains its admitted producer. This permits execution
+    policy updates without reading credentials or reconstructing its recipe.
+    Changing execution alone preserves completed artifacts; changing producer
+    semantics may invalidate them. Use explicit reprocessing for incomplete
+    or all existing work. Chunk or asset enrichments
     may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
@@ -138,7 +144,13 @@ def sync(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk or asset enrichments
+    artifact name replaces the existing mapping.
+    Omitting the write-only producer_json/producer fields on an existing
+    same-kind artifact retains its admitted producer. This permits execution
+    policy updates without reading credentials or reconstructing its recipe.
+    Changing execution alone preserves completed artifacts; changing producer
+    semantics may invalidate them. Use explicit reprocessing for incomplete
+    or all existing work. Chunk or asset enrichments
     may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
@@ -175,7 +187,13 @@ async def asyncio_detailed(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk or asset enrichments
+    artifact name replaces the existing mapping.
+    Omitting the write-only producer_json/producer fields on an existing
+    same-kind artifact retains its admitted producer. This permits execution
+    policy updates without reading credentials or reconstructing its recipe.
+    Changing execution alone preserves completed artifacts; changing producer
+    semantics may invalidate them. Use explicit reprocessing for incomplete
+    or all existing work. Chunk or asset enrichments
     may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
@@ -215,7 +233,13 @@ async def asyncio(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk or asset enrichments
+    artifact name replaces the existing mapping.
+    Omitting the write-only producer_json/producer fields on an existing
+    same-kind artifact retains its admitted producer. This permits execution
+    policy updates without reading credentials or reconstructing its recipe.
+    Changing execution alone preserves completed artifacts; changing producer
+    semantics may invalidate them. Use explicit reprocessing for incomplete
+    or all existing work. Chunk or asset enrichments
     may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 

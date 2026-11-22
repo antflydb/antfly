@@ -804,6 +804,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             extracted_rows,
                             generatedPrecomputeMode(req),
                             opts.force_generated_artifact_names,
+                            opts.force_only_incomplete_assets,
                             &preparation.generated_plan.?,
                             generated_memo,
                         );
@@ -899,6 +900,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         extracted_rows[0..extracted_rows_initialized],
                         generatedPrecomputeMode(effective_req),
                         opts.force_generated_artifact_names,
+                        opts.force_only_incomplete_assets,
                         null,
                         generated_memo,
                     );
@@ -974,7 +976,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
                 if (preparation.write_plan == null) preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                 if (preparation.generated == null and preparation.document_generated == null)
-                    preparation.document_generated = try prepareGeneratedEnrichments(self, preparation_alloc, effective_req, &.{}, .direct, &.{}, null, generated_memo);
+                    preparation.document_generated = try prepareGeneratedEnrichments(self, preparation_alloc, effective_req, &.{}, .direct, &.{}, false, null, generated_memo);
                 try capturePreparedEnrichments(self, capture, effective_req, preparation.write_plan.?.plan(), if (preparation.generated) |*generated| generated else &preparation.document_generated.?);
                 errdefer if (capture.json) |json| {
                     capture.alloc.free(json);
@@ -2405,6 +2407,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         extracted[0..extracted_initialized],
                         generatedPrecomputeMode(effective_req),
                         opts.force_generated_artifact_names,
+                        opts.force_only_incomplete_assets,
                         null,
                         generated_memo,
                     );

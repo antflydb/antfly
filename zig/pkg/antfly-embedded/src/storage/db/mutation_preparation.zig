@@ -1153,6 +1153,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             extracted: []const mapper.ExtractedWrite,
             precompute_mode: GeneratedPrecomputeMode,
             force_generated_artifact_names: []const []const u8,
+            only_incomplete_assets: bool,
             preplanned: ?*const GeneratedBatchWritePlan,
             generated_memo: ?*GeneratedEmbeddingMemo,
         ) !PrecomputedGeneratedBatch {
@@ -1370,6 +1371,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     null;
                 defer if (document_execution) |execution| execution.destroy();
                 for (generated, 0..) |request, request_index| {
+                    if (only_incomplete_assets and request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request))) {
+                        const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
+                        defer alloc.free(key);
+                        const manifest = S.ownerField(self, "core").*.store.get(alloc, key) catch |err| switch (err) {
+                            error.NotFound => null,
+                            else => return err,
+                        };
+                        defer if (manifest) |raw| alloc.free(raw);
+                        if (manifest) |raw| if (try @import("enrichment/document_extraction_completion.zig").isComplete(alloc, raw)) continue;
+                    }
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
                         if (request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request))) {
                             var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);

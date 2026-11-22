@@ -712,3 +712,14 @@ then let normal Antfly enrichments operate on the derived units.
 ```
 
 This gives Antfly a single story for files, pages, sections, chunks, embeddings, full-text search, OCR, and graph extraction while preserving distributed scale.
+
+## Execution policy and selective regeneration
+
+Output budgets are invocation policy, separate from the extraction recipe. Use
+`execution.max_output_tokens_per_item` to raise the OCR budget without changing
+accepted artifact identity. Keep existing producer JSON intact. Incomplete-only
+reprocessing selects missing or partially failed document-extraction artifacts;
+publication convergence alone does not certify complete OCR coverage. New
+generations record their declared execution policy in the raw manifest. See
+[execution policy and selective regeneration](ENRICHMENTS.md#execution-policy-and-selective-regeneration)
+for scope, compatibility, downstream reuse, and operator controls.
