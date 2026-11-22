@@ -2550,14 +2550,19 @@ pub const Region = struct {
     /// A fair lease is ready once its own claim has published the WAL cut.
     /// A different live publisher may belong to an earlier lease.
     pub fn hasReadyLogWriter(self: *const Region) bool {
+        return self.readyLogState() != null;
+    }
+
+    pub fn readyLogState(self: *const Region) ?LogState {
         const holder = self.header().writer_holder.load(.acquire);
-        if (holder == 0) return false;
-        const state = self.readLogStateChecked() orelse return false;
+        if (holder == 0) return null;
+        const state = self.readLogStateChecked() orelse return null;
         const publisher = self.logPublisher().load(.seq_cst);
         if (@as(u32, @truncate(publisher)) != holderLivenessSlot(holder) or
-            @as(u32, @truncate(publisher >> 32)) != holderClaimGeneration(holder)) return false;
-        return self.isLogStateLive(state) and publisher == self.logPublisher().load(.seq_cst) and
-            holder == self.header().writer_holder.load(.acquire);
+            @as(u32, @truncate(publisher >> 32)) != holderClaimGeneration(holder)) return null;
+        if (!self.isLogStateLive(state) or publisher != self.logPublisher().load(.seq_cst) or
+            holder != self.header().writer_holder.load(.acquire)) return null;
+        return state;
     }
 
     pub fn writerClaim(self: *const Region) u128 {
