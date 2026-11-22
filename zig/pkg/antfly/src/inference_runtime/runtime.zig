@@ -710,6 +710,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         while (entries.next()) |entry| {
             const reader = entry.value_ptr.*;
             if (reader.provider != .openai) continue;
+            const endpoint = reader.base_url orelse reader.resolvedUrl() orelse return error.InvalidReaderConfig;
+            if (!inference.server.isHostedInferenceEndpoint(endpoint)) return error.InvalidReaderConfig;
             try image_readers.append(alloc, .{ .name = entry.key_ptr.*, .config = reader });
         }
     }
@@ -726,6 +728,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .generation_batching = inference.server.GenerationBatchingConfig.fromSettings(if (loaded_config) |cfg| cfg.inference.generation_batching else .{}),
         .max_work_units = resource_policy.inference.admission.workCapacity(),
         .request_limits = resource_policy.inference.request_limits,
+        .content_security = if (loaded_config) |cfg| cfg.inference.content_security else null,
+        .s3_credentials = if (loaded_config) |cfg| cfg.inference.s3_credentials else null,
         .http_max_body_bytes = try inference.server.httpBodyLimitBytesFromMib(if (loaded_config) |cfg| cfg.inference.http_max_body_mb else 10),
         .pool_size = if (loaded_config) |cfg| cfg.inference.pool_size else 2,
         .process_memory_limit_bytes = process_memory_resolution.limit_bytes,

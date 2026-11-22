@@ -478,8 +478,8 @@ pub fn responseValue(a: A, model: []const u8, inputs: []const V, outcomes: []con
     try c.put(a, &response, "model", .{ .string = model });
     try c.put(a, &response, "data", data);
     var usage = c.object();
-    try c.put(a, &usage, "input_tokens", .{ .integer = @intCast(execution.input_tokens) });
-    try c.put(a, &usage, "output_tokens", .{ .integer = @intCast(execution.output_tokens) });
+    try c.put(a, &usage, "input_tokens", .{ .integer = std.math.cast(i64, execution.input_tokens) orelse return error.InvalidExtractorUsage });
+    try c.put(a, &usage, "output_tokens", .{ .integer = std.math.cast(i64, execution.output_tokens) orelse return error.InvalidExtractorUsage });
     try c.put(a, &response, "usage", usage);
     return response;
 }

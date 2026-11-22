@@ -520,6 +520,7 @@ fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
 }
 
 pub const RemoteOptions = struct {
+    image_first: bool = false,
     json_size_hint: ?usize = null,
     max_request_bytes: ?usize = null,
     max_attachments: ?usize = null,
@@ -1082,7 +1083,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             state.* = .{ .alloc = alloc, .http = http, .options = options, .base_url = "", .model = "", .max_tokens = cfg.max_tokens };
             errdefer state.deinitState();
             state.gateway_id = try dupOpt(alloc, cfg.gateway_id);
-            state.base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
+            state.base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse (if (provider == .openai) cfg.resolvedUrl() else null) orelse switch (provider) {
                 .openai => "https://api.openai.com/v1",
                 .vertex => "https://aiplatform.googleapis.com/v1",
                 else => unreachable,
@@ -1176,8 +1177,10 @@ fn CloudReaderState(comptime provider: Provider) type {
                 content.deinit();
             }
             const prompt = req.prompt orelse self.prompt orelse "Read the image and return the text.";
-            if (prompt.len > 0) try appendTextPart(alloc, &content, prompt);
+            const include_prompt = prompt.len > 0 or provider != .openai;
+            if (include_prompt and !self.options.image_first) try appendTextPart(alloc, &content, prompt);
             for (req.images) |image| try appendImageUrlPart(alloc, &content, image);
+            if (include_prompt and self.options.image_first) try appendTextPart(alloc, &content, prompt);
             const messages = [_]struct { role: []const u8, content: std.json.Value }{
                 .{ .role = "user", .content = .{ .array = content } },
             };
@@ -1192,7 +1195,7 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .max_tokens = req.max_tokens orelse self.max_tokens,
             });
             defer alloc.free(body);
-            const url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{self.base_url});
+            const url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{std.mem.trimEnd(u8, self.base_url, "/")});
             defer alloc.free(url);
             var headers = std.ArrayList([2][]const u8).empty;
             defer headers.deinit(alloc);
@@ -2055,7 +2058,8 @@ test "hosted reader transports enforce complete OCR and retain measured usage fo
                 .provider = provider,
                 .account_id = if (provider == .cloudflare) "account" else null,
                 .model = if (provider == .cloudflare) "@cf/mistralai/mistral-small-3.1-24b-instruct" else "reader",
-                .base_url = server.baseUrl(),
+                .base_url = if (provider == .openai) null else server.baseUrl(),
+                .url = if (provider == .openai) server.baseUrl() else null,
                 .prompt = if (provider == .openai) "" else null,
                 .bearer_token = "fixture",
                 .project_id = "project",

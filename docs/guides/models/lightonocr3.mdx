@@ -134,7 +134,15 @@ zig-out/bin/antfly-inference run --config inference.json
 ```
 
 llama.cpp owns GPU execution in this deployment. The inference-only listener
-defaults to `127.0.0.1:8090` and dispatches one upstream completion per image. For a standalone database deployment, enable [public inference](/docs/reference/inference-gateway#public-execution-policy) to call that route.
+defaults to `127.0.0.1:8090`. Configured image readers require an explicit HTTP
+or HTTPS endpoint. Endpoint precedence is `base_url`, then `url`, then
+`api_url`. The listener validates the full image batch before sending one
+completion per page. Set `hosted_parallelism` between 1 and 8 to match the
+upstream's available slots. It defaults to 1, and results retain input order.
+These aliases accept `images` without artifact retention.
+For a standalone database deployment, enable
+[public inference](/docs/reference/inference-gateway#public-execution-policy)
+to call that route.
 For inline ingestion configuration, use the same reader object under `ocr.reader`.
 If llama-server runs on a separate machine, set `base_url` to an endpoint
 reachable from Antfly, such as a local SSH forwarded port.
@@ -177,8 +185,43 @@ Pass the text from the reader to `POST /ai/v1/extract`:
 
 The named extractor uses its configured entity and relation schema. Antfly
 checks the returned structure and aligns entity text to spans in the input.
+Hosted reading and extraction time out after two minutes or the caller's
+shorter deadline. If a deployment sets an input-token limit, the upstream must
+report prompt usage. An extractor call checks the entire upstream batch prompt,
+including schema and instructions, against that limit. This accounting occurs
+after the call because the upstream owns tokenization.
 `GET /ai/v1/models` lists the reader under `readers` and the extractor under
 `extractors`, with their accepted input modalities.
+
+### Compare precision and working memory on Metal
+
+Use the same llama.cpp build and source checkpoints for all precisions. The
+benchmark expects `LightOnOCR-3-{size}-{precision}.gguf` and
+`mmproj-LightOnOCR-3-{size}-{precision}.gguf` in the model directory. Convert the
+original safetensors with llama.cpp's `convert_hf_to_gguf.py --outtype bf16
+--no-nextn` for each BF16 decoder, and use `--mmproj --outtype q8_0` for each
+quantized vision artifact. All baseline runs use the same F16 vision projector.
+Use a tokenizer implementation compatible with the pinned tokenizer JSON if the
+converter's Transformers version predates the checkpoint's tokenizer class.
+
+From `zig/`, render the synthetic fixtures and run the sweep:
+
+```sh
+uv run --with pillow pkg/inference/scripts/lightonocr3/make_corpus.py \
+  --output-dir .ocr-models/corpus --dense
+python3 pkg/inference/scripts/lightonocr3/benchmark_llama_memory.py \
+  --models-dir .ocr-models --cases .ocr-models/corpus/cases.json \
+  --output .ocr-models/memory.json --parallel 1 4 --grounding
+```
+
+The sweep compares BF16, Q4, and Q8 decoders and tests smaller context and
+prefill batches, a lower image-token cap, Q8 K/V, and a Q8 vision projector
+independently. It reports warm idle, phase-sampled RSS and physical footprint,
+whole-process peaks, completed pages per second, latency, and OCR checks.
+Process startup is cold within each run. The system file cache is shared across
+runs. The synthetic pages cover small print and tables, with a separate
+grounding probe. They do not establish broad OCR accuracy.
+
 
 ## Read documents during ingestion
 
