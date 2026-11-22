@@ -15514,7 +15514,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     }
 
     {
-        var begun_failed = try Route.statement(alloc, &handler, alice_auth, connection_id, "BEGIN");
+        var begun_failed = try Route.statement(alloc, &handler, alice_auth, connection_id, "BEGIN ISOLATION LEVEL READ COMMITTED");
         defer begun_failed.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 200), begun_failed.status);
         var begin_result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, begun_failed.body, .{});
