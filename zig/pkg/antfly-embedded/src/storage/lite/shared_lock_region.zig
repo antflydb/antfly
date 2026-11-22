@@ -636,6 +636,8 @@ const max_unidentified_descriptors = 8;
 const DescriptorReserve = [max_unidentified_descriptors]?*FdEntry;
 var unidentified_by_device: std.AutoHashMapUnmanaged(u64, DescriptorReserve) = .empty;
 var pending_opens: usize = 0;
+var descriptor_admission_epoch: std.atomic.Value(u32) = .init(0);
+var descriptor_admission_waiters: std.atomic.Value(usize) = .init(0);
 var test_fail_process_fd_identity = false;
 var test_fail_specific_process_fd: ?std.posix.fd_t = null;
 
@@ -693,7 +695,31 @@ fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![
 /// NAME_MAX on every supported filesystem.
 const max_name_bytes = 255;
 
-fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
+fn acquireProcessFd(io: Io, region_path: []const u8) !*FdEntry {
+    return acquireProcessFdUntil(io, region_path, null);
+}
+
+fn acquireProcessFdUntil(io: Io, region_path: []const u8, deadline: ?Io.Timestamp) !*FdEntry {
+    var until = deadline;
+    var attempted_repair = false;
+    while (true) {
+        const epoch = descriptor_admission_epoch.load(.acquire);
+        return acquireProcessFdOnce(io, region_path, &attempted_repair) catch |err| switch (err) {
+            error.DescriptorOpening => {
+                const now = Io.Clock.now(.awake, io);
+                if (until == null) until = now.addDuration(.fromSeconds(30));
+                if (now.compare(.gte, until.?)) return error.Timeout;
+                _ = descriptor_admission_waiters.fetchAdd(1, .seq_cst);
+                defer _ = descriptor_admission_waiters.fetchSub(1, .seq_cst);
+                try antfly_platform.sync.futexWaitSharedBounded(io, &descriptor_admission_epoch.raw, epoch, until.?);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool) (RegionError || error{DescriptorOpening})!*FdEntry {
     // A name past the filesystem limit cannot exist or be created. Refuse it
     // before `statFile`: Linux's statx wrapper treats ENAMETOOLONG as a
     // caller bug and panics in safe builds.
@@ -721,11 +747,18 @@ fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
     }
     const has_reserve = unidentified_by_device.contains(device);
     fd_registry_mutex.unlock(io);
-    if (has_reserve) resolveUnidentifiedDescriptors(io, device);
+    if (has_reserve and !attempted_repair.*) {
+        attempted_repair.* = true;
+        resolveUnidentifiedDescriptors(io, device);
+    }
 
-    const pending = try reserveDescriptor(io, device, region_path);
+    const pending = try reserveDescriptor(io, device, region_path, path_identity, sampled_generation);
     const opened = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = path_identity == null }, 0o600);
     const actual = if (opened) |fd| processFdIdentity(fd) catch null else |_| null;
+    defer {
+        _ = descriptor_admission_epoch.fetchAdd(1, .seq_cst);
+        if (descriptor_admission_waiters.load(.seq_cst) != 0) futexWakeShared(&descriptor_admission_epoch.raw);
+    }
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
     pending_opens -= 1;
@@ -743,10 +776,29 @@ fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
     return RegionError.RegionUnavailable;
 }
 
-fn reserveDescriptor(io: Io, device: u64, path: []const u8) RegionError!*FdEntry {
+fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_identity.NativeFileIdentity, sampled_generation: u64) (RegionError || error{DescriptorOpening})!*FdEntry {
     const page = std.heap.page_allocator;
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
+    // A first opener may have published between our cache lookup and
+    // reservation. Resample the name before opening another descriptor.
+    if (identity) |known| {
+        if (fd_registry.contains(known)) return error.DescriptorOpening;
+    } else if (fd_registry_generation.load(.monotonic) > sampled_generation) return error.DescriptorOpening;
+
+    if (unidentified_by_device.getPtr(device)) |bucket| {
+        var opening = false;
+        var occupied: usize = 0;
+        for (bucket) |slot| {
+            const entry = slot orelse continue;
+            if (std.mem.eql(u8, entry.unresolved_path.?, path)) {
+                return if (entry.fd == -1) error.DescriptorOpening else error.RegionUnavailable;
+            }
+            occupied += 1;
+            opening = opening or entry.fd == -1;
+        }
+        if (occupied == bucket.len) return if (opening) error.DescriptorOpening else error.RegionUnavailable;
+    }
     fd_registry.ensureUnusedCapacity(page, @intCast(pending_opens + 1)) catch return error.RegionUnavailable;
     const pending = page.create(FdEntry) catch return error.RegionUnavailable;
     errdefer page.destroy(pending);
@@ -754,13 +806,9 @@ fn reserveDescriptor(io: Io, device: u64, path: []const u8) RegionError!*FdEntry
     errdefer page.free(owned_path);
     const bucket = unidentified_by_device.getOrPut(page, device) catch return error.RegionUnavailable;
     if (!bucket.found_existing) bucket.value_ptr.* = @splat(null);
-    var free: ?*?*FdEntry = null;
-    for (bucket.value_ptr) |*slot| {
-        if (slot.*) |entry| {
-            if (entry.fd != -1 and std.mem.eql(u8, entry.unresolved_path.?, path)) return error.RegionUnavailable;
-        } else free = slot;
-    }
-    const slot = free orelse return error.RegionUnavailable;
+    const slot = for (bucket.value_ptr) |*slot| {
+        if (slot.* == null) break slot;
+    } else unreachable;
     pending.* = .{ .identity = undefined, .fd = -1, .unresolved_path = owned_path, .probing_identity = true };
     slot.* = pending;
     pending_opens += 1;
@@ -1492,7 +1540,7 @@ pub const Region = struct {
         // every `fcntl` lock this process holds on it, including the
         // liveness slots of this process's other live handles, and a peer
         // would then see their writer or tickets as dead.
-        const fd_entry = try acquireProcessFd(io, region_path);
+        const fd_entry = try acquireProcessFdUntil(io, region_path, deadline);
         const raw_fd = fd_entry.fd;
         errdefer releaseProcessFd(io, fd_entry);
         const setup_file: Io.File = .{ .handle = raw_fd, .flags = .{ .nonblocking = false } };
@@ -2082,45 +2130,17 @@ pub const Region = struct {
         }
     }
 
-    /// Waits (bounded by `deadline`) until the writer word next looks
-    /// free, without taking a ticket or attempting the CAS itself --
-    /// for a caller that only needs a wake signal in place of busy-
-    /// polling the real kernel flock, not a second admission decision of
-    /// its own. Returns normally (not an error) on a plain deadline
-    /// expiry -- exactly like `acquireWriterFairBounded`'s own futex
-    /// waits, this is a wake signal, not a decision, so the caller's own
-    /// next real attempt is what decides success or `FileBusy`.
-    ///
-    /// Not yet wired to a caller: `native.zig`'s own `waitPathLockWithIo`
-    /// (nested under a ticket its own caller's `plainWriterLockUntil`
-    /// loop already resolved, or called with no ticket at all) would be
-    /// the natural one, but it has no `Region` of its own to call this
-    /// on -- opening a fresh one per retry iteration serializes every
-    /// concurrent retrier through `Region.open`'s own one-time setup
-    /// lock and was measured to intermittently blow a 10 s per-attempt
-    /// deadline under three-way contention. Reusing the caller's own
-    /// already-open `Region` needs that reference threaded through (a
-    /// signature change to this function or `plainWriterLockUntil`),
-    /// deliberately left for that decision rather than guessed at here.
-    ///
-    /// `releaseWriter` only wakes `writer_release_epoch` when a ticket is
-    /// outstanding (its own doc comment: "the fully uncontended release
-    /// stays a single store with no syscall") -- a caller here may have
-    /// no ticket, and nobody else may ever take one either, so this
-    /// cannot rely purely on that wake arriving. It re-checks on a short,
-    /// bounded step (`dead_ticket_check_step_ms`, the same cadence
-    /// `acquireWriter`'s own phase-1 dead-ticket poll already uses)
-    /// whenever no real wake arrives sooner.
-    pub fn waitWriterFreeBounded(self: *const Region, io: Io, deadline: Io.Timestamp) error{Canceled}!void {
+    /// Wait for one bounded step before retrying the authoritative flock.
+    /// A crashed holder can leave the mapped word set after the flock is free.
+    pub fn waitWriterStep(self: *const Region, io: Io, deadline: Io.Timestamp) error{Canceled}!void {
         const hdr = self.header();
-        while (hdr.writer_holder.load(.acquire) != 0) {
-            if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return;
-            const epoch = hdr.writer_release_epoch.load(.acquire);
-            if (hdr.writer_holder.load(.acquire) == 0) return;
-            const step_deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(dead_ticket_check_step_ms));
-            const bounded_deadline = if (step_deadline.compare(.lt, deadline)) step_deadline else deadline;
-            countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, bounded_deadline) catch return error.Canceled;
-        }
+        const now = Io.Clock.now(.awake, io);
+        if (now.compare(.gte, deadline)) return;
+        const epoch = hdr.writer_release_epoch.load(.acquire);
+        if (hdr.writer_holder.load(.acquire) == 0) return;
+        const step = now.addDuration(.fromMilliseconds(dead_ticket_check_step_ms));
+        const until = if (step.compare(.lt, deadline)) step else deadline;
+        try countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, until);
     }
 
     /// Bound on how many of this region's own tickets may be
@@ -3689,7 +3709,11 @@ test "shared lock region checks the expected data identity before creating a sid
 test "shared lock region: descriptor reserves are independent per device" {
     const io = std.testing.io;
     var reservations: [max_unidentified_descriptors]*FdEntry = undefined;
-    for (&reservations) |*reservation| reservation.* = try reserveDescriptor(io, 1, "device-one");
+    for (&reservations, 0..) |*reservation, i| {
+        var buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "device-one-{d}", .{i});
+        reservation.* = try reserveDescriptor(io, 1, path, null, std.math.maxInt(u64));
+    }
     defer {
         fd_registry_mutex.lockUncancelable(io);
         defer fd_registry_mutex.unlock(io);
@@ -3699,8 +3723,9 @@ test "shared lock region: descriptor reserves are independent per device" {
             std.heap.page_allocator.destroy(reservation);
         }
     }
-    try std.testing.expectError(error.RegionUnavailable, reserveDescriptor(io, 1, "device-one-extra"));
-    const other = try reserveDescriptor(io, 2, "device-two");
+    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-0", null, std.math.maxInt(u64)));
+    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-extra", null, std.math.maxInt(u64)));
+    const other = try reserveDescriptor(io, 2, "device-two", null, std.math.maxInt(u64));
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
     pending_opens -= 1;
@@ -5049,9 +5074,9 @@ test "shared lock region: concurrent same-process opens of a fresh region share 
             };
         }
     };
-    var regions: [6]?Region = @splat(null);
-    var failed: [6]bool = @splat(false);
-    var threads: [6]std.Thread = undefined;
+    var regions: [12]?Region = @splat(null);
+    var failed: [12]bool = @splat(false);
+    var threads: [12]std.Thread = undefined;
     for (&threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, Opener.run, .{ path, &regions[i], &failed[i] });
     for (threads) |thread| thread.join();
     defer for (&regions) |*r| if (r.*) |*region| region.close();
@@ -5059,9 +5084,25 @@ test "shared lock region: concurrent same-process opens of a fresh region share 
     // A ticket claimed through one handle is visible through every other:
     // no opener truncated and rebuilt a region another had mapped.
     const first = &regions[0].?;
+    for (regions) |r| try std.testing.expectEqual(first.fd_entry, r.?.fd_entry);
+    try std.testing.expect(first.fd_entry.spare_descriptors == null);
     const ticket = first.tryClaimTicket(first.header().writer_ticket_tail.load(.monotonic), @bitCast(std.c.getpid())).?;
     for (&regions) |*r| try std.testing.expectEqual(ticket +% 1, @as(u32, @truncate(r.*.?.header().writer_ticket_tail.load(.acquire))));
     first.finishTurn(ticket);
+}
+
+test "shared lock region: a plain writer waits one step even if the holder never clears" {
+    var fixture = try TicketFixture.init("region-plain-writer-step.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const io = std.testing.io;
+    try std.testing.expect(region.tryAcquireWriterFair(@bitCast(std.c.getpid())));
+    defer region.releaseWriter();
+    const before = testWriterFutexCounters().wait;
+    const deadline = Io.Clock.now(.awake, io).addDuration(.fromSeconds(1));
+    try region.waitWriterStep(io, deadline);
+    try std.testing.expectEqual(before + 1, testWriterFutexCounters().wait);
+    try std.testing.expect(region.writerWordHeld());
 }
 
 test "shared lock region: the queue keeps admitting contended writers across the 32-bit head wrap" {

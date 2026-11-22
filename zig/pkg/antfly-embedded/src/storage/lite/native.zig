@@ -6956,6 +6956,7 @@ pub const NativeFile = struct {
     lifetime_writer_region: ?*shared_lock_region.Region = null,
     lifetime_writer_claimed: bool = false,
     lifetime_writer_observed: ?shared_lock_region.Region.WriterAdmissionState = null,
+    lifetime_writer_retry_ns: i96 = 0,
     /// The embedded connection layer holds the path lease around complete calls.
     externally_locked: bool = false,
     reader_coordinator: ?*ReaderCoordinator = null,
@@ -10574,11 +10575,12 @@ pub const NativeFile = struct {
         // atomics and never opens a second region on the commit path.
         self.lifetime_writer_region = region;
         const state = region.writerAdmissionState();
-        if (self.lifetime_writer_observed) |previous| {
-            if (std.meta.eql(previous, state)) return;
-        }
-        self.lifetime_writer_observed = state;
         if (state.holder != 0 or state.head != state.tail) {
+            const now = std.Io.Clock.awake.now(self.runtimeIo()).nanoseconds;
+            if (self.lifetime_writer_observed) |previous| {
+                if (std.meta.eql(previous, state) and now < self.lifetime_writer_retry_ns) return;
+            }
+            self.lifetime_writer_retry_ns = now + 50 * std.time.ns_per_ms;
             region.repairWriterAdmission();
             const repaired = region.writerAdmissionState();
             self.lifetime_writer_observed = repaired;
@@ -10609,6 +10611,7 @@ pub const NativeFile = struct {
         self.lifetime_writer_region = null;
         self.lifetime_writer_claimed = false;
         self.lifetime_writer_observed = null;
+        self.lifetime_writer_retry_ns = 0;
     }
 
     /// Seal pending commits before handing lifetime ownership back to the
@@ -23528,10 +23531,21 @@ pub const NativeFile = struct {
         if (std.mem.eql(u8, self.path, prepared.path) or self.sameDataFile(prepared)) return error.InvalidNativeSnapshotPath;
 
         const io = self.runtimeIo();
+        const destination = try realPathAlloc(self.allocator, io, self.path);
+        defer self.allocator.free(destination);
+        if (self.writer_lock_file) |lease| {
+            const lock_path = try appendLockSuffix(self.allocator, destination);
+            defer self.allocator.free(lock_path);
+            const named_lock = try storage_file_identity.nativePathIdentity(lock_path);
+            if (!std.meta.eql(sidecarIdentity(lease), @as(?SidecarIdentity, named_lock))) return error.FileBusy;
+        }
+        const source = try realPathAlloc(self.allocator, io, prepared.path);
+        defer self.allocator.free(source);
+        const live_identity = self.dataIdentity() orelse return error.InvalidTransactionState;
         const prepared_entry = prepared.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
-        var binding: ?[]u8 = try inode_lock.prepareRebind(prepared_entry, io, prepared.file, self.path);
+        var binding: ?[]u8 = try inode_lock.prepareRebind(prepared_entry, io, prepared.file, destination);
         defer if (binding) |owned| std.heap.page_allocator.free(owned);
-        try prepared.preparePrivatePublication(self.path);
+        try prepared.preparePrivatePublication(destination);
         var adopted_redo: ?RedoCommitState = null;
         if (prepared.header.redo_log_capacity != 0) {
             const tip = prepared.activeCheckpoint();
@@ -23547,9 +23561,10 @@ pub const NativeFile = struct {
             // the registry entry names the destination before borrowing it.
             prepared_entry.mutex.lockUncancelable(io);
             defer prepared_entry.mutex.unlock(io);
-            const named = try storage_file_identity.nativePathIdentity(prepared.path);
-            if (!std.meta.eql(named, prepared_entry.identity)) return error.FileBusy;
-            try renameFilePath(io, prepared.path, self.path);
+            const named = try storage_file_identity.nativePathIdentity(source);
+            const live_named = try storage_file_identity.nativePathIdentity(destination);
+            if (!std.meta.eql(named, prepared_entry.identity) or !std.meta.eql(live_named, live_identity)) return error.FileBusy;
+            try renameFilePath(io, source, destination);
             inode_lock.installRebindLocked(prepared_entry, binding.?);
             binding = null;
         }
@@ -23641,7 +23656,7 @@ pub const NativeFile = struct {
                 std.log.err("Lite restore published but parent directory sync failed path={s} class={s}", .{ self.path, @errorName(error.InjectedGenerationDirectorySyncFailure) });
                 return .durability_unknown;
             }
-            fs_paths.syncDirPortable(io, std.fs.path.dirname(self.path) orelse ".") catch |err| {
+            fs_paths.syncDirPortable(io, std.fs.path.dirname(destination) orelse ".") catch |err| {
                 std.log.err("Lite restore published but parent directory sync failed path={s} class={s}", .{ self.path, @errorName(err) });
                 return .durability_unknown;
             };
@@ -24046,7 +24061,7 @@ pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
 /// admission decision of its own, since whatever ticket mattered for
 /// fairness was already won (or never needed) by whichever top-level
 /// constructor called `plainWriterLockUntil` in the first place. A first
-/// attempt at migrating this one onto `Region.waitWriterFreeBounded`
+/// attempt at migrating this one onto `Region.waitWriterStep`
 /// opened a *fresh* `Region` on every retry iteration -- `Region.open`'s
 /// own one-time setup section takes a real, blocking `fcntl` lock
 /// (`setup_lock_offset`) that serializes against every other `openSized`
@@ -24408,7 +24423,7 @@ fn sidecarWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, pat
         // reader leaves the word clear, so the wait would return at once
         // and spin; that case joins the kernel's own wait queue below.
         if (cached) |c| if (c.region.writerWordHeld()) {
-            c.region.waitWriterFreeBounded(wait_io, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
+            c.region.waitWriterStep(wait_io, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
             };
             continue;
@@ -28667,6 +28682,37 @@ test "lite native vacuum atomically replaces file and keeps writer handle usable
     const after = (try reopened.getDocumentAlloc(allocator, "doc:after-vacuum")).?;
     defer allocator.free(after);
     try std.testing.expectEqualStrings("writer still attached", after);
+}
+
+test "lite native prepared generation through a symlink keeps the writer lease" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target = try testPath(allocator, tmp, "publication-target.aflite");
+    defer allocator.free(target);
+    const alias = try testPath(allocator, tmp, "publication-alias.aflite");
+    defer allocator.free(alias);
+    const staging = try testPath(allocator, tmp, "publication-staging.aflite");
+    defer allocator.free(staging);
+    {
+        var initial = try NativeFile.create(allocator, target);
+        defer initial.close();
+    }
+    const canonical_target = try realPathAlloc(allocator, io, target);
+    defer allocator.free(canonical_target);
+    try std.Io.Dir.cwd().symLink(io, canonical_target, alias, .{});
+    var live = try NativeFile.openWithIo(allocator, io, alias, .{});
+    defer live.close();
+    var prepared = try NativeFile.create(allocator, staging);
+    defer prepared.close();
+    const identity = prepared.dataIdentity().?;
+    try std.testing.expectEqual(.complete, try live.replaceWithPreparedGeneration(&prepared));
+    const resolved_alias = try realPathAlloc(allocator, io, alias);
+    defer allocator.free(resolved_alias);
+    try std.testing.expectEqualStrings(canonical_target, resolved_alias);
+    try std.testing.expectEqual(identity, try storage_file_identity.nativePathIdentity(target));
+    try std.testing.expectError(error.WouldBlock, lockWriterPathWithIo(allocator, io, alias));
 }
 
 test "lite redo prepared generation preflight failure keeps the live name and writer" {
@@ -41117,6 +41163,30 @@ fn exerciseDeadLifetimeWriterRecovery(has_records: bool) !void {
     defer successor.close();
     try std.testing.expect(successor.lifetime_writer_claimed);
     try std.testing.expectEqual(successor.durableSequence(), observer.readyLogState().?.durable_sequence);
+}
+
+test "lite redo lifetime writer rechecks an unchanged claim after its holder dies" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "redo-holder-dies-after-probe.aflite");
+    defer allocator.free(path);
+    var writer = try NativeFile.createWithRedoLog(allocator, io, path, .{}, 64 * 1024);
+    defer writer.close();
+    writer.releaseLifetimeWriterRegion();
+    const region = (try writer.regionForInode()).?;
+    {
+        var contender = try shared_lock_region.Region.open(allocator, io, path);
+        defer contender.close();
+        try std.testing.expect(contender.tryAcquireWriterFair(antfly_platform.process.currentId() orelse 0));
+        writer.claimLifetimeWriterRegion(region);
+        try std.testing.expect(!writer.lifetime_writer_claimed);
+    }
+    try std.testing.expectEqual(writer.lifetime_writer_observed.?, region.writerAdmissionState());
+    writer.lifetime_writer_retry_ns = 0;
+    writer.claimLifetimeWriterRegion(region);
+    try std.testing.expect(writer.lifetime_writer_claimed);
 }
 
 test "lite redo lifetime writer keeps its mapping while a fair claimant holds the region" {
