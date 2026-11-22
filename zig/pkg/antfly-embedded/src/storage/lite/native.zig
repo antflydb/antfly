@@ -8392,6 +8392,9 @@ pub const NativeFile = struct {
         var pctx: PopulateCtx = undefined;
         var recovered_under_writer_fence = false;
         var read_frontier_needs_barrier = false;
+        var read_frontier_to_seal: ?redo_log.Frontier = null;
+        var writer_frontier: ?redo_log.Frontier = null;
+        const full_recovery_sync = self.durability_policy == .full_fsync;
         var published_fold_start: u64 = 0;
         var published_reset_generation: u32 = 0;
         // Where this open's scans began: past any superseded prefix.
@@ -8541,6 +8544,8 @@ pub const NativeFile = struct {
             recovered_under_writer_fence = protected and owns_recovery_fence;
             var persisted_frontier: ?redo_log.Frontier = null;
             read_frontier_needs_barrier = false;
+            read_frontier_to_seal = null;
+            writer_frontier = null;
             if (protected and (replay_ceiling == null or use_persisted_frontier)) {
                 observed_checkpoint = folded_through;
                 published_fold_start = 0;
@@ -8551,7 +8556,15 @@ pub const NativeFile = struct {
                 promised_durable = frontier.sequence;
                 if (frontier.sequence > folded_through) {
                     persisted_frontier = frontier;
-                    read_frontier_needs_barrier = self.read_only and !live_watermark;
+                    if (recovered_under_writer_fence) writer_frontier = frontier;
+                    if (self.read_only and !live_watermark) {
+                        const already_synced = if (scan_region) |r|
+                            r.hasSyncedFrontier(frontier.sequence, frontier.generation, frontier.end_offset, full_recovery_sync)
+                        else
+                            false;
+                        read_frontier_needs_barrier = !already_synced;
+                        if (read_frontier_needs_barrier) read_frontier_to_seal = frontier;
+                    }
                     if (frontier.end_offset == 0 or frontier.end_offset > self.header.redo_log_capacity) return error.NativeRedoLogCorrupt;
                     durable_ceiling_offset = frontier.end_offset;
                     published_offset = frontier.end_offset;
@@ -8748,6 +8761,9 @@ pub const NativeFile = struct {
         if (!pctx.synced and (read_frontier_needs_barrier or
             (needs_barrier and replay_ceiling == null and coldScanFoundSuffix(outcome, @max(checkpoint.commit_sequence, folded_through)))))
             try self.coldRecoverySync(io);
+        if (read_frontier_to_seal) |frontier| {
+            if (scan_region) |r| r.noteSyncedFrontier(frontier.sequence, frontier.generation, frontier.end_offset, full_recovery_sync);
+        }
         if (pctx.compact orelse meta_ctx.compact) |compact| {
             // perf/lwa-restore-open-txn: a bare (non-Txn) commit (schema/
             // catalog bookkeeping, a transaction-manager intent record,
@@ -8878,7 +8894,12 @@ pub const NativeFile = struct {
                     published.?.durable_sequence != redo.durable_sequence or published.?.checkpoint_sequence != redo.checkpoint_sequence or
                     published.?.durable_offset != redo.writer.tail or published.?.segment != segment)
                 {
-                    try self.syncRedoData();
+                    const already_synced = if (writer_frontier) |frontier|
+                        frontier.sequence == redo.durable_sequence and
+                            region.hasSyncedFrontier(frontier.sequence, frontier.generation, frontier.end_offset, full_recovery_sync)
+                    else
+                        false;
+                    if (!already_synced) try self.syncRedoData();
                     self.publishRedoLogState();
                 }
             } else if (outcome.valid_count != 0) {
@@ -23740,7 +23761,7 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
 /// data file at all (only `.reader` does), so this cannot self-conflict
 /// with any lock a concurrent reader or this same process's own already-
 /// open `NativeFile` might hold.
-fn recoverCrashedWriterDataFile(allocator: Allocator, io: std.Io, path: []const u8, region: ?*shared_lock_region.Region) !void {
+fn recoverCrashedWriterDataFile(allocator: Allocator, io: std.Io, path: []const u8, region: ?*shared_lock_region.Region, policy: ?antfly_platform.filesystem.DurabilityPolicy) !void {
     const opened = try openDataFile(io, path, .writer, true);
     const file = opened.file;
     defer file.close(io);
@@ -23751,7 +23772,7 @@ fn recoverCrashedWriterDataFile(allocator: Allocator, io: std.Io, path: []const 
     header.checkpoints = loadCheckpointSlots(file, io, header.page_size, file_size);
     const recovered = try recoverActiveCheckpoint(file, io, header, file_size, !header.protected_redo);
     header.active_checkpoint = recovered.index;
-    if (region) |r| if (header.redo_log_capacity != 0) try recoverCrashedWriterRedoState(allocator, io, file, header, header.checkpoints[recovered.index], r);
+    if (region) |r| if (header.redo_log_capacity != 0) try recoverCrashedWriterRedoState(allocator, io, file, header, header.checkpoints[recovered.index], r, policy);
 }
 
 /// Rebuilds the redo watermark a crashed writer may have left stale or torn
@@ -23779,7 +23800,7 @@ fn discardTornRedoAppend(file: std.Io.File, io: std.Io, log_offset: u64, capacit
     return true;
 }
 
-fn recoverCrashedWriterRedoState(allocator: Allocator, io: std.Io, file: std.Io.File, header: Header, checkpoint: CheckpointSlot, region: *shared_lock_region.Region) !void {
+fn recoverCrashedWriterRedoState(allocator: Allocator, io: std.Io, file: std.Io.File, header: Header, checkpoint: CheckpointSlot, region: *shared_lock_region.Region, policy: ?antfly_platform.filesystem.DurabilityPolicy) !void {
     const folded_through = checkpoint.redo_folded_through;
     const persisted = if (header.protected_redo)
         (try NativeFile.redoFrontierSlots(header).readLatest(file, io)) orelse return error.NativeRedoLogCorrupt
@@ -23812,7 +23833,15 @@ fn recoverCrashedWriterRedoState(allocator: Allocator, io: std.Io, file: std.Io.
     if (published) |current| {
         if (current.durable_sequence == durable_sequence and current.durable_offset == outcome.valid_bytes and current.checkpoint_sequence == folded_through) return;
     }
-    try file.sync(io);
+    if (policy) |durability| {
+        try antfly_platform.filesystem.syncData(file.handle, durability);
+    } else {
+        try file.sync(io);
+    }
+    if (persisted) |seal| {
+        const frontier = seal.frontier;
+        region.noteSyncedFrontier(frontier.sequence, frontier.generation, frontier.end_offset, policy == .full_fsync);
+    }
     region.publishLogState(.{
         .checkpoint_sequence = folded_through,
         .durable_sequence = durable_sequence,
@@ -23839,7 +23868,9 @@ fn fairLockRecoverDeadWriter(ctx_ptr: ?*anyopaque) anyerror!void {
     // A writer admitted by the sidecar flock alone (no region slot) may be
     // writing right now; recovery must exclude it before touching the file.
     if (ctx.lease == null) ctx.lease = try sidecarWriterLockUntil(ctx.allocator, ctx.io, ctx.wait_io, ctx.path, ctx.deadline_ns, false);
-    try recoverCrashedWriterDataFile(ctx.allocator, ctx.io, ctx.path, ctx.region);
+    // The lease has no NativeFile options yet. Use the strongest
+    // supported policy before exposing recovery to concurrent readers.
+    try recoverCrashedWriterDataFile(ctx.allocator, ctx.io, ctx.path, ctx.region, .full_fsync);
 }
 
 pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
@@ -39911,7 +39942,7 @@ test "lite redo log dead-writer recovery rebuilds a torn watermark" {
     region.resetLogStateForTest();
     region.tearLogStateForTest();
     try std.testing.expect(region.readLogStateChecked() == null);
-    try recoverCrashedWriterDataFile(a, io, path, &region);
+    try recoverCrashedWriterDataFile(a, io, path, &region, null);
     const rebuilt = region.readLogStateChecked() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(expected.durable_sequence, rebuilt.durable_sequence);
     try std.testing.expectEqual(expected.durable_offset, rebuilt.durable_offset);
@@ -40002,7 +40033,7 @@ test "lite redo log dead-writer recovery keeps the published prefix past a torn 
     }
     var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
     defer region.close();
-    try recoverCrashedWriterDataFile(a, io, path, &region);
+    try recoverCrashedWriterDataFile(a, io, path, &region, null);
     try std.testing.expectEqual(tail, region.readLogStateChecked().?.durable_offset);
     {
         var writer = try NativeFile.openWithIo(a, io, path, .{});
@@ -40025,7 +40056,7 @@ test "lite redo log dead-writer recovery keeps the published prefix past a torn 
         const flipped: [8]u8 = @splat(0xFF);
         try data.writePositionalAll(io, &flipped, log_offset + redo_log.header_len + 8);
     }
-    try std.testing.expectError(error.NativeRedoLogCorrupt, recoverCrashedWriterDataFile(a, io, path, &region));
+    try std.testing.expectError(error.NativeRedoLogCorrupt, recoverCrashedWriterDataFile(a, io, path, &region, null));
 }
 
 // A torn publication may belong to a live writer descheduled mid-publish,
@@ -40141,7 +40172,7 @@ test "lite redo log dead-writer recovery refuses a log shorter than the publishe
     }
     var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
     defer region.close();
-    try std.testing.expectError(error.NativeRedoLogCorrupt, recoverCrashedWriterDataFile(a, io, path, &region));
+    try std.testing.expectError(error.NativeRedoLogCorrupt, recoverCrashedWriterDataFile(a, io, path, &region, null));
     const after = region.readLogStateChecked().?;
     try std.testing.expectEqual(published.durable_sequence, after.durable_sequence);
     try std.testing.expectEqual(published.durable_offset, after.durable_offset);
@@ -40335,11 +40366,17 @@ test "lite redo durable frontier failure retains redo for recovery" {
         unexpected.close();
         return error.TestUnexpectedResult;
     } else |err| try std.testing.expectEqual(error.InputOutput, err);
-    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    {
+        var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+        defer reader.close();
+        try std.testing.expectEqual(@as(u32, 2), test_cold_recovery_sync.count);
+        try expectRedoDocument(&reader, "alpha", "one");
+        try expectRedoDocument(&reader, "beta", "two");
+    }
+    var next_reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer next_reader.close();
+    try expectRedoDocument(&next_reader, "beta", "two");
     try std.testing.expectEqual(@as(u32, 2), test_cold_recovery_sync.count);
-    defer reader.close();
-    try expectRedoDocument(&reader, "alpha", "one");
-    try expectRedoDocument(&reader, "beta", "two");
 }
 
 test "lite redo segment rotation switches extents and recovers the selected extent" {

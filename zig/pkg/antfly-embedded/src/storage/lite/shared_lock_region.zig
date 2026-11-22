@@ -942,8 +942,43 @@ pub const Region = struct {
         return logPublisherOffset(max_readers) + 2 * @sizeOf(std.atomic.Value(u128));
     }
 
-    fn regionBytesFor(max_readers: u32) u64 {
+    fn publisherRegionBytes(max_readers: u32) u64 {
         return logNonceOffset(max_readers) + @as(u64, max_readers) * @sizeOf(std.atomic.Value(u64));
+    }
+
+    fn frontierProofOffset(max_readers: u32) u64 {
+        return std.mem.alignForward(u64, publisherRegionBytes(max_readers), @alignOf(std.atomic.Value(u128)));
+    }
+
+    fn regionBytesFor(max_readers: u32) u64 {
+        return frontierProofOffset(max_readers) + 2 * @sizeOf(std.atomic.Value(u128));
+    }
+
+    fn frontierProof(self: *const Region, full_sync: bool) *std.atomic.Value(u128) {
+        const offset = frontierProofOffset(self.header().max_readers) + @as(u64, @intFromBool(full_sync)) * @sizeOf(std.atomic.Value(u128));
+        return @ptrCast(@alignCast(self.mapping.ptr + @as(usize, @intCast(offset))));
+    }
+
+    // A full fingerprint makes a torn extension write a cache miss.
+    // This proof is written only after completion of the data barrier.
+    fn frontierFingerprint(sequence: u64, generation: u64, end_offset: u64) u128 {
+        var raw: [24]u8 = undefined;
+        std.mem.writeInt(u64, raw[0..8], sequence, .little);
+        std.mem.writeInt(u64, raw[8..16], generation, .little);
+        std.mem.writeInt(u64, raw[16..24], end_offset, .little);
+        var digest: [16]u8 = undefined;
+        std.crypto.hash.Blake3.hash(&raw, &digest, .{});
+        return std.mem.readInt(u128, &digest, .little) | 1;
+    }
+
+    pub fn hasSyncedFrontier(self: *const Region, sequence: u64, generation: u64, end_offset: u64, full_sync: bool) bool {
+        const proof = frontierFingerprint(sequence, generation, end_offset);
+        return self.frontierProof(true).load(.acquire) == proof or
+            (!full_sync and self.frontierProof(false).load(.acquire) == proof);
+    }
+
+    pub fn noteSyncedFrontier(self: *Region, sequence: u64, generation: u64, end_offset: u64, full_sync: bool) void {
+        self.frontierProof(full_sync).store(frontierFingerprint(sequence, generation, end_offset), .release);
     }
 
     fn logPublisher(self: *const Region) *std.atomic.Value(u128) {
@@ -1338,7 +1373,7 @@ pub const Region = struct {
                 .magic = magic,
                 .format_version = format_version,
                 .header_checksum = 0,
-                .region_bytes = region_bytes,
+                .region_bytes = legacyRegionBytes(max_readers),
                 .db_inode = db_inode,
                 .max_readers = max_readers,
                 .writer_holder = .init(0),
@@ -1370,32 +1405,15 @@ pub const Region = struct {
             // is here to rule back out.
         }
 
-        if (!need_init) {
-            const old: *const Header = @ptrCast(@alignCast(&existing_raw));
-            if (old.region_bytes == legacyRegionBytes(old.max_readers)) {
-                // Extend the mapping without moving any v5 lock or slot.
-                // Peers using the old length can continue using those slots.
-                const bytes = regionBytesFor(old.max_readers);
-                try setup_file.setLength(io, bytes);
-                var extended = old.*;
-                extended.region_bytes = bytes;
-                extended.header_checksum = headerChecksum(&extended);
-                const start = @offsetOf(Header, "header_checksum");
-                const end = @offsetOf(Header, "db_inode");
-                try setup_file.writePositionalAll(io, std.mem.asBytes(&extended)[start..end], start);
-            }
-        }
-
-        // Re-read the header fresh: `need_init` above may have just set
-        // `region_bytes`, and this is the only place that decides how
-        // much of the file to map. An existing region's `max_readers` (and
-        // therefore `region_bytes`) is authoritative regardless of what
-        // this call's own `max_readers` argument asked for.
-        var final_raw: [header_bytes]u8 = undefined;
-        _ = try setup_file.readPositionalAll(io, &final_raw, 0);
-        const final_header: *const Header = @ptrCast(@alignCast(&final_raw));
-        const map_len: usize = @intCast(final_header.region_bytes);
-        const final_max_readers = final_header.max_readers;
+        // Extension fields follow the original slot table. Their presence
+        // is derived from file length, leaving the checksummed header valid
+        // throughout growth, including for peers with older mappings.
+        const final_max_readers = if (need_init) max_readers else blk: {
+            const existing: *const Header = @ptrCast(@alignCast(&existing_raw));
+            break :blk existing.max_readers;
+        };
+        const map_len: usize = @intCast(regionBytesFor(final_max_readers));
+        if (!need_init and size < map_len) try setup_file.setLength(io, map_len);
 
         const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
         errdefer std.posix.munmap(mapping);
@@ -1504,7 +1522,7 @@ pub const Region = struct {
         if (!std.mem.eql(u8, &h.magic, &magic)) return false;
         if (h.format_version != format_version) return false;
         return h.max_readers != 0 and
-            (h.region_bytes == legacyRegionBytes(h.max_readers) or h.region_bytes == regionBytesFor(h.max_readers)) and
+            (h.region_bytes == legacyRegionBytes(h.max_readers) or h.region_bytes == publisherRegionBytes(h.max_readers) or h.region_bytes == regionBytesFor(h.max_readers)) and
             h.header_checksum == headerChecksum(h);
     }
 
@@ -5186,6 +5204,15 @@ test "shared lock region extends the publisher proof without invalidating existi
     var observer = try Region.open(a, io, db_path);
     defer observer.close();
     try std.testing.expectEqual(state, observer.readLogState());
+    try std.testing.expectEqual(Region.legacyRegionBytes(observer.header().max_readers), observer.header().region_bytes);
+
+    observer.noteSyncedFrontier(5, 7, 512, false);
+    try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, false));
+    try std.testing.expect(!observer.hasSyncedFrontier(5, 7, 512, true));
+    try std.testing.expect(!observer.hasSyncedFrontier(5, 8, 512, false));
+    try std.testing.expect(!observer.hasSyncedFrontier(5, 7, 1024, false));
+    observer.noteSyncedFrontier(5, 7, 512, true);
+    try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
     try std.testing.expect(!observer.isLogStateLive(state));
     {
         var publisher = try Region.open(a, io, db_path);
