@@ -1908,7 +1908,7 @@ pub const AntflyApiHandler = struct {
         var headers: std.ArrayList(http_common.RequestHeader) = .empty;
         defer headers.deinit(ctx.allocator);
         const limits = @import("antfly_public_limits").Execution;
-        for ([_][]const u8{ http_server_mod.trusted_principal_header, "X-Antfly-SQL-Fence", "X-Antfly-SQL-Resource-Hop", "X-Antfly-SQL-Transaction-Protocol", "x-antfly-sql-connection-id", limits.timeout_header, limits.scan_rows_header, limits.memory_header, limits.spill_header }) |name| {
+        for ([_][]const u8{ http_server_mod.trusted_principal_header, "X-Antfly-SQL-Fence", "X-Antfly-SQL-Resource-Hop", "x-antfly-sql-connection-id", limits.timeout_header, limits.scan_rows_header, limits.memory_header, limits.spill_header }) |name| {
             if (ctx.header(name)) |value| try headers.append(ctx.allocator, .{ .name = name, .value = value });
         }
         const completion = try requestCompletion(ctx);
@@ -2265,7 +2265,6 @@ pub const AntflyApiHandler = struct {
             ) catch {};
         }
         return .{
-            .sql_prepared_completion_only = if (ctx.header("X-Antfly-SQL-Transaction-Protocol")) |version| std.mem.eql(u8, version, "prepared-v1") else false,
             .sql_completion = if (ctx.getData("antfly-sql-completion-admission")) |raw| if (@as(*RequestCompletion, @ptrCast(@alignCast(raw))).server != null) .{ .ptr = raw, .prepare_transaction = RequestCompletion.prepareTransaction, .prepare_metadata = RequestCompletion.prepareMetadata, .reject_metadata = RequestCompletion.rejectMetadata } else null else null,
             .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null) .{
                 .ptr = ctx,
@@ -15423,7 +15422,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     const Route = struct {
-        const Kind = enum { open, sql, prepare, execute, close };
+        const Kind = enum { open, sql, fenced_sql, prepare, execute, close };
         const Reply = struct {
             status: u16,
             body: []u8,
@@ -15435,12 +15434,13 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
             var request = try httpx.Request.init(allocator, if (kind == .close) .DELETE else .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             try request.headers.append("authorization", authorization);
+            if (kind == .fenced_sql) try request.headers.set("X-Antfly-SQL-Fence", "connection-test");
             request.body = body;
             var ctx = httpx.Context.init(allocator, std.testing.io, &request);
             defer ctx.deinit();
             var response = switch (kind) {
                 .open => try api.openSQLConnection(&ctx),
-                .sql => try api.executeSQL(&ctx),
+                .sql, .fenced_sql => try api.executeSQL(&ctx),
                 .prepare => try api.prepareSQL(&ctx),
                 .execute => try api.executePreparedSQL(&ctx, id.?),
                 .close => try api.closeSQLConnection(&ctx, id.?),
@@ -15549,7 +15549,9 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var second_connection = try std.json.parseFromSlice(sql_wire.SQLConnectionResponse, alloc, second_open.body, .{});
     defer second_connection.deinit();
     const uncertain_id = second_connection.value.connection_id;
-    var begun = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    const begin_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "BEGIN ISOLATION LEVEL READ COMMITTED", .connection_id = uncertain_id }, .{});
+    defer alloc.free(begin_body);
+    var begun = try Route.call(alloc, &handler, alice_auth, .fenced_sql, null, begin_body);
     defer begun.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), begun.status);
     const principal = "connection_alice";
@@ -15560,6 +15562,9 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var active = try connections.load(&durable, alloc, id, principal, node, now_ms);
     defer active.deinit();
     const txn_id = active.value.active_txn.?;
+    var stored = (try durable.load(txn_id)).?;
+    defer stored.deinit(alloc);
+    try std.testing.expect(stored.prepared_completion_only);
     const guard = try server.txn_sessions.mutation(alloc, txn_id, node);
     // The execution seal may have committed while the independent connection
     // transition is still active. This retry only observes the sealed attempt.

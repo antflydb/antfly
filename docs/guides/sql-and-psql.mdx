@@ -270,9 +270,9 @@ Either way, the wire protocol is not a promise of full PostgreSQL compatibility.
 
 ## Prepared completion for HTTP transactions
 
-On upgraded owners, clients that use the SQL completion protocol can opt in at `BEGIN` by sending `X-Antfly-SQL-Transaction-Protocol: prepared-v1` alongside their SQL fence on a durable HTTP connection. Keep using the SQL fence on `COMMIT`. The owner persists the mode with the transaction and requires completion registration before any ambiguous commit work. Expired abort receipts for these transactions leave no legacy settlement marker.
+Durable HTTP connections use prepared completion when `BEGIN` carries a SQL fence. Keep using the SQL fence on `COMMIT`. The owner persists the mode with the transaction and requires completion registration before any ambiguous commit work. Expired abort receipts for these transactions leave no legacy settlement marker.
 
-Enable this only on routes whose transaction owners and failover targets understand `prepared-v1`. Older owners cannot open a tagged transaction. Existing transactions and their legacy markers retain their original behavior.
+Transaction owners and failover targets must understand the prepared completion record format. Existing transactions and transactions begun without a SQL fence retain legacy settlement behavior.
 
 ## Standalone SQL completion upgrades
 
