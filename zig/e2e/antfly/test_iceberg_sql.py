@@ -445,6 +445,33 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
                 assert connection.execute(
                     "SELECT id, title FROM ice_events WHERE region = 'east' ORDER BY id"
                 ).fetchall() == [(4, "four"), (6, "six")]
+        before_rewrite = sql("SELECT id, title FROM ice_events ORDER BY id")
+        previous_snapshot = table.current_snapshot().snapshot_id
+        table.overwrite(table.scan().to_arrow())
+        rewritten_snapshot = table.current_snapshot().snapshot_id
+        assert rewritten_snapshot != previous_snapshot
+        _export_table(table, root)
+
+        detail = requests.get(
+            server.api_url + "/tables/ice_events",
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            timeout=30,
+        )
+        detail.raise_for_status()
+        reconciled = request(
+            "/tables/ice_events/lake/reconcile", {"table_id": detail.json()["table_id"]}
+        )
+        assert str(reconciled["snapshot_id"]) == str(rewritten_snapshot)
+        assert sql("SELECT id, title FROM ice_events ORDER BY id") == before_rewrite
+        rewritten_feed = requests.post(
+            server.api_url + "/changefeeds",
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            headers={"Idempotency-Key": "external-iceberg-rewritten-snapshot"},
+            json={"tables": ["ice_events"], "include": "rows"},
+            timeout=30,
+        )
+        assert rewritten_feed.status_code == 501, rewritten_feed.text
+        assert rewritten_feed.json()["error"] == "changefeed_capability_unsupported"
         failed = False
     finally:
         server.stop(test_failed=failed)
