@@ -1399,9 +1399,11 @@ pub const Region = struct {
 
         const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
         errdefer std.posix.munmap(mapping);
-        const claimed = try claimLivenessSlot(io, fd_entry, mapping, final_max_readers);
+        // The lock and mapping are process coordination primitives. Use
+        // system entropy even when the data file uses an I/O adapter.
         var nonce: u64 = undefined;
-        io.random(std.mem.asBytes(&nonce));
+        try Io.Threaded.global_single_threaded.io().randomSecure(std.mem.asBytes(&nonce));
+        const claimed = try claimLivenessSlot(io, fd_entry, mapping, final_max_readers);
         logNonces(mapping, final_max_readers)[claimed.slot].store(nonce, .release);
         fcntlUnlock(raw_fd, setup_lock_offset);
         return .{ .mapping = mapping, .fd_entry = fd_entry, .own_liveness_slot = claimed.slot, .own_liveness_generation = claimed.generation, .io = io };
