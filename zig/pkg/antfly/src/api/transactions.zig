@@ -4051,7 +4051,7 @@ pub const SessionRegistry = struct {
         if (self.durable) |durable| {
             self.mutex.lock();
             const index_after = self.recovery_index_cursor;
-            const audit_after: ?std.mem.Allocator.Error![]u8 = if (self.recovery_audit_cursor) |key| alloc.dupe(u8, key) else null;
+            const audit_after: ?(std.mem.Allocator.Error![]u8) = if (self.recovery_audit_cursor) |key| alloc.dupe(u8, key) else null;
             self.mutex.unlock();
             const audit_start = if (audit_after) |copy| copy catch |err| {
                 std.log.warn("legacy recovery continuation unavailable err={s}", .{@errorName(err)});

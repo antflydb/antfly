@@ -15847,10 +15847,11 @@ pub const StoreRootEnrollmentRequest = struct {
     signature: []const u8,
 };
 
-/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
+/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "query": Wait for durable application and document full-text query visibility - "full_text": Compatibility alias for query - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
 pub const SyncLevel = enum {
     propose,
     write,
+    query,
     full_text,
     enrichments,
     full_index,
@@ -15859,6 +15860,7 @@ pub const SyncLevel = enum {
         const s = switch (self) {
             .propose => "propose",
             .write => "write",
+            .query => "query",
             .full_text => "full_text",
             .enrichments => "enrichments",
             .full_index => "full_index",
@@ -15874,6 +15876,7 @@ pub const SyncLevel = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "propose", .propose },
             .{ "write", .write },
+            .{ "query", .query },
             .{ "full_text", .full_text },
             .{ "enrichments", .enrichments },
             .{ "full_index", .full_index },
