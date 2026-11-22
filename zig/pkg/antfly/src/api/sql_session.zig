@@ -134,6 +134,7 @@ pub const Adapter = struct {
     commit_context: *anyopaque,
     commit_fn: *const fn (*anyopaque, sql.Scope, transactions.Mutation) anyerror!sql.CommitResult,
     supports_range_guards: bool = false,
+    observed_execution_started: bool = false,
     failed_commit_completion: @FieldType(operation.RequestContext, "sql_completion") = null,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
@@ -197,6 +198,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
+        self.observed_execution_started = state.execution_started;
         return inspected(id, state);
     }
 
@@ -209,7 +211,10 @@ pub const Adapter = struct {
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
         if (state.terminal_abort) return .{ .outcome = .aborted, .reconciliation_id = id };
-        if (state.execution_started or state.terminal != null) return error.SqlTransactionOutcomeUnknown;
+        if (state.execution_started or state.terminal != null) {
+            self.observed_execution_started = state.execution_started;
+            return error.SqlTransactionOutcomeUnknown;
+        }
         if (state.metadata.failed) return error.SqlTransactionAborted;
         const result = try self.commit_fn(self.commit_context, scope, self.admitted.?);
         if (self.connection_id) |connection| {

@@ -139,9 +139,11 @@ pub fn reconcileExpired(
     }
     if (expired == 0) return;
     const batch = @min(expired, 8);
-    const start = registry.connection_sweep_offset.fetchAdd(batch, .monotonic) % expired;
-    for (0..batch) |offset| {
-        const entry = entries[(start + offset) % expired];
+    for (0..batch) |_| {
+        // Advance only as far as we inspect. Errors or early successes must
+        // not skip the same unvisited suffix of a batch every sweep.
+        const offset = registry.connection_sweep_offset.fetchAdd(1, .monotonic) % expired;
+        const entry = entries[offset];
         const observed: ?Owned = switch (store.backend) {
             .docstore => |backend| blk: {
                 var txn = try backend.beginReadTxn();

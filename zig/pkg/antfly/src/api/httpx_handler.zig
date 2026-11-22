@@ -6719,7 +6719,6 @@ pub const AntflyApiHandler = struct {
         diagnostic_message_buffer: [256]u8 = undefined,
         compile_diagnostic_valid: bool = false,
         execution_entered: bool = false,
-        reports_existing_commit: bool = false,
         is_write: bool = false,
         preparation: *RequestAdmission.Lease,
         prepared_mode: SQLPreparedMode = .statement,
@@ -6852,7 +6851,7 @@ pub const AntflyApiHandler = struct {
                     if (connection.state == .uncertain) {
                         if (self.prepared_mode != .statement or self.parameters.len != 0 or
                             !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlConnectionBusy;
-                        self.reports_existing_commit = true;
+                        self.adapter.reports_existing_commit = true;
                         self.adapter.outcome_transaction_id = self.connection_session_hex;
                         return error.SqlTransactionOutcomeUnknown;
                     }
@@ -7363,12 +7362,12 @@ pub const AntflyApiHandler = struct {
         @import("protected_future.zig").wait(runtime_io, &future);
         completion.unknown = false;
         if (job.failure) |err| {
-            if (job.reports_existing_commit) {
+            if (job.adapter.reports_existing_commit) {
                 const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
                 owned.reports_existing_commit = true;
             }
             const diagnostic = sql_execution.diagnostic(err);
-            if (!job.reports_existing_commit and std.mem.eql(u8, diagnostic.code, "40003")) completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
+            if (!job.adapter.reports_existing_commit and std.mem.eql(u8, diagnostic.code, "40003")) completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
             if (std.mem.eql(u8, diagnostic.code, "53300")) try ctx.setHeader("Retry-After", "1");
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
@@ -15532,6 +15531,34 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     defer active.deinit();
     const txn_id = active.value.active_txn.?;
     const guard = try server.txn_sessions.mutation(alloc, txn_id, node);
+    // The execution seal may have committed while the independent connection
+    // transition is still active. This retry only observes the sealed attempt.
+    var staged = try transactions_api.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{}}}}}");
+    defer staged.deinit(alloc);
+    _ = (try server.txn_sessions.stage(alloc, guard, &staged)).?;
+    var sealed_request = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, null)).?;
+    defer sealed_request.deinit(alloc);
+    const tables = try sealed_request.distributedTables(alloc);
+    defer tables.deinit();
+    var plan = (try server.txn_sessions.sealExecutionPlan(alloc, guard, tables.tables)).?;
+    defer plan.deinit();
+    {
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .connection_id = uncertain_id }, .{});
+        defer alloc.free(body);
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        try request.headers.append("authorization", alice_auth);
+        try request.headers.set("X-Antfly-SQL-Fence", "commit-retry");
+        request.body = body;
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var observed = try handler.executeSQL(&ctx);
+        defer observed.deinit();
+        try std.testing.expectEqual(@as(u16, 409), observed.status.code);
+        const completion = try AntflyApiHandler.requestCompletion(&ctx);
+        try std.testing.expect(!completion.unknown);
+        try std.testing.expectEqual(@as(usize, 0), completion.outcomes.items.len);
+    }
     _ = try connections.mutate(&durable, .{ .uncertain = .{ .id = id, .guard = guard } }, principal, node, now_ms);
     var blocked_read = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "SELECT 1");
     defer blocked_read.deinit(alloc);

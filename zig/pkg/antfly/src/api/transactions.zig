@@ -1091,19 +1091,6 @@ pub const Session = struct {
             remaining -|= 64 +| ((binding.logical.len +| binding.physical.len) *| 6);
             if (remaining == 0) return;
         }
-        if (limit) |max| {
-            var record_remaining = max -| budget;
-            if (record_remaining == 0) return;
-            var remaining_writes: usize = 1024;
-            for (staged.tables) |table| {
-                remaining_writes -|= table.batch.writes.len;
-                if (remaining_writes == 0) return;
-                for (table.batch.writes) |write| {
-                    record_remaining -|= write.value.len;
-                    if (record_remaining == 0) return;
-                }
-            }
-        }
         const tables = try sessionTableDetails(alloc, staged, false);
         defer {
             for (tables) |*table| table.deinit(alloc);
@@ -2235,7 +2222,7 @@ pub const DurableSessionStore = struct {
             error.NotFound => return false,
             else => return err,
         };
-        var receipt = try decodeSessionRecord(self.alloc, id, raw);
+        var receipt = try decodeSqlAbortReceipt(self.alloc, id, raw);
         defer receipt.deinit(self.alloc);
         if (receipt.last_touched_timestamp >= cutoff) return false;
         if (!try self.sqlAbortProofExists(txn, id)) try self.putSqlAbortProof(txn, id);
@@ -5108,6 +5095,10 @@ pub const SessionRegistry = struct {
         for (page.ids) |id| {
             const expired = durable.expireSqlAbortReceipt(id, cutoff_ns) catch |err| switch (err) {
                 error.SessionLeaseLost => continue,
+                error.InvalidTransactionSessionRecord => {
+                    std.log.warn("invalid SQL abort receipt retained txn_id={x} err={s}", .{ id, @errorName(err) });
+                    continue;
+                },
                 else => return err,
             };
             if (expired) removed += 1;
@@ -7617,6 +7608,17 @@ fn readStatusTxn(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: db
     return result;
 }
 
+fn decodeSqlAbortReceipt(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw: []const u8) !Session {
+    var receipt = decodeSessionRecord(alloc, id, raw) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidTransactionSessionRecord,
+    };
+    errdefer receipt.deinit(alloc);
+    if (!DurableSessionStore.isLegacySqlAbortReceipt(receipt) or receipt.terminal_commit != null)
+        return error.InvalidTransactionSessionRecord;
+    return receipt;
+}
+
 fn readSqlAbortStatus(txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, filter: SessionRegistry.StatusPrincipalFilter) !GraphStatusLookup {
     const key = try makeSqlAbortReceiptKey(alloc, id);
     defer alloc.free(key);
@@ -7624,7 +7626,7 @@ fn readSqlAbortStatus(txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.T
         error.NotFound => return .absent,
         else => return err,
     };
-    var receipt = try decodeSessionRecord(alloc, id, raw);
+    var receipt = try decodeSqlAbortReceipt(alloc, id, raw);
     defer receipt.deinit(alloc);
     switch (filter) {
         .all => {},
@@ -8933,6 +8935,22 @@ test "distributed txn migrates legacy detached SQL aborts out of live quota" {
     try std.testing.expect((try durable.load(id)) == null);
     try std.testing.expectEqual(SessionDisposition.aborted, (try registry.getStatusForPrincipal(a, id, "alice")).?.disposition);
     _ = try registry.begin(a, .{}, 1);
+
+    const invalid_id: db_mod.types.TxnId = @splat(0);
+    const invalid_receipt_key = try makeSqlAbortReceiptKey(a, invalid_id);
+    defer a.free(invalid_receipt_key);
+    const invalid_expiry_key = try makeExpiryKey(a, sql_abort_expiry_prefix, 1, invalid_id);
+    defer a.free(invalid_expiry_key);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(invalid_receipt_key, "{}");
+        try write.put(invalid_expiry_key, &.{});
+        try write.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpiredSqlAbortReceipts(a, std.math.maxInt(u64)));
+    try std.testing.expect((try registry.getStatusForPrincipal(a, id, "alice")) == null);
+    try std.testing.expect(!try durable.completionSettled(invalid_id));
 }
 
 test "distributed txn listing summary preserves status, table permissions and a matching co-located lease" {

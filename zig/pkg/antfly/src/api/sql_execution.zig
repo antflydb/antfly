@@ -174,6 +174,7 @@ pub const Adapter = struct {
     missing_target_epoch: ?@import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch = null,
     target: ?system_catalog.Target = null,
     outcome_transaction_id: ?[32]u8 = null,
+    reports_existing_commit: bool = false,
     session_id: ?[]const u8 = null,
     /// Durable idle HTTP connection identity, never an alias for session_id.
     connection_id: ?[32]u8 = null,
@@ -406,6 +407,7 @@ pub const Adapter = struct {
             if (command == .commit) owner.failed_commit_completion = self.context.sql_completion;
             const outcome = (session.execute(command) catch |zig017_err| {
                 if (zig017_err == error.SqlTransactionOutcomeUnknown) {
+                    self.reports_existing_commit = command == .commit and owner.observed_execution_started;
                     if (session.transaction_id) |id| self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
                 }
                 zig017_return_error = zig017_err;
