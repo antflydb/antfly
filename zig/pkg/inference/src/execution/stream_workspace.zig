@@ -144,11 +144,15 @@ pub const Scope = struct {
     /// owned storage. Capture continues to use the stable arena address.
     pub fn bindPublishedOutput(self: *Scope, pointer: DevicePointer, bytes: usize) !void {
         const slot = self.plan.output orelse return error.InvalidExecutionPlan;
-        if (self.bound_start == 0 or !self.valid or self.cursor != 0 or self.published_ptr != 0 or
-            pointer == 0 or pointer % alignment != 0 or bytes != self.plan.allocations[slot].bytes or
-            pointer > std.math.maxInt(DevicePointer) - bytes) return error.InvalidExecutionPlan;
-        if (pointer < self.bound_end and self.bound_start < pointer + bytes) return error.InvalidExecutionPlan;
+        if (!self.valid or self.cursor != 0 or self.published_ptr != 0 or pointer % alignment != 0 or
+            bytes != self.plan.allocations[slot].bytes or !self.disjointBacking(pointer, bytes)) return error.InvalidExecutionPlan;
         self.published_ptr = pointer;
+    }
+
+    pub fn disjointBacking(self: *const Scope, pointer: DevicePointer, bytes: usize) bool {
+        if (self.bound_start == 0 or pointer == 0 or bytes == 0) return false;
+        const end = std.math.add(DevicePointer, pointer, bytes) catch return false;
+        return end <= self.bound_start or pointer >= self.bound_end;
     }
 
     pub fn owns(self: *const Scope, pointer: DevicePointer) bool {
