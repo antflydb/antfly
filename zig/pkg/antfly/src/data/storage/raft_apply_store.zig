@@ -2468,7 +2468,7 @@ pub const RaftApplyStore = struct {
         }
         if (applying == .source_scope_control) {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
-            try operations.append(alloc, .{ .require_batch_protocol = @import("../source_scope_entry.zig").required_protocol_version });
+            try operations.append(alloc, .{ .require_batch_protocol = applying.source_scope_control.value().protocol });
             return;
         }
         if (applying == .source_plan) {

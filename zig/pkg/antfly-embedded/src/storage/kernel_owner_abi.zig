@@ -48,7 +48,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 125 includes immutable direct preparation and retained history.
 // Version 127 includes retained metadata session snapshot ranges and counts.
 // Version 128 adds source recovery scope lookup to the metadata owner.
-pub const abi_version: u32 = 128;
+// Version 129 supports first source binding after an ordered native drain check.
+pub const abi_version: u32 = 129;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

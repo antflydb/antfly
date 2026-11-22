@@ -2152,7 +2152,7 @@ const RaftTableApplyStateMachine = struct {
             error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
             else => return err,
         };
-        if (floor < @import("source_scope_entry.zig").required_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        if (floor < control.protocol) return error.UnsupportedBatchProtocolVersion;
         const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
         const outcome = owner.applyPreparedOrderedSourceScopeControlGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.source_scope_control, term, index) catch |err| switch (err) {
             error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
@@ -14553,7 +14553,7 @@ pub const DataServer = struct {
         const required = switch (kind) {
             .history => @import("history_control_entry.zig").requiredProtocol(command),
             .source_plan => @import("source_plan_entry.zig").required_protocol_version,
-            .source_scope => @import("source_scope_entry.zig").required_protocol_version,
+            .source_scope => @import("source_scope_entry.zig").requiredProtocol(command),
             .source_retirement => @import("source_retirement_entry.zig").required_protocol_version,
             .producer_closure => @import("source_producer_closure_entry.zig").required_protocol_version,
             .legacy_terminal => @import("source_legacy_terminal_entry.zig").required_protocol_version,

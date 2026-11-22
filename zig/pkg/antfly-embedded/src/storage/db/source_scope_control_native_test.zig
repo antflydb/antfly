@@ -101,3 +101,26 @@ pub fn run(a: std.mem.Allocator, path: []const u8) !void {
     }
     try @import("source_scope_retirement_db_test.zig").run(a, path, options, owner);
 }
+
+pub fn verifyFirstBind(a: std.mem.Allocator, path: []const u8) !void {
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 14 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    var owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = undefined, .table_binding = @splat(2), .root_generation = 0, .group_id = 2, .topology_epoch = 3 };
+    owner.namespace = @import("online_source_contract.zig").namespaceBytes(options.identity_namespace.?);
+    var db = try db_mod.DB.open(a, path, options);
+    defer db.close();
+    owner.root_generation = db.core.root_generation;
+    var command: control.Command = .{
+        .version = 2,
+        .intent = .{ .version = 1, .owner = owner, .spec = .{ .actor_table_id = 3, .source_id = @splat(4), .generation = 1, .binding = @splat(5), .checkpoint_owner = try scope.Basis.fromOwner(owner) }, .minimum_metadata_index = 10, .action = .bind },
+        .metadata_cut = .{ .group_id = 1, .incarnation = owner.metadata_incarnation, .index = 10 },
+    };
+    try std.testing.expectEqual(ordered.Rejection.pending, (try db.applyOrderedSourceScopeControl(command, .{ .term = 1, .index = 1 }, false)).rejected);
+    _ = try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 2 }, false);
+    command.version = 1;
+    try std.testing.expectEqual(ordered.Rejection.pending, (try db.applyOrderedSourceScopeControl(command, .{ .term = 1, .index = 3 }, false)).rejected);
+    command.version = 2;
+    const bound = try db.applyOrderedSourceScopeControl(command, .{ .term = 1, .index = 4 }, false);
+    try std.testing.expect(bound.applied.header.strict);
+    try std.testing.expectEqual(@as(u64, 10), bound.applied.record.?.bound_metadata_index);
+    try std.testing.expectEqualDeep(bound, try db.applyOrderedSourceScopeControl(command, .{ .term = 1, .index = 4 }, false));
+}

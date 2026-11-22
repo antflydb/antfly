@@ -41,7 +41,7 @@ pub const Command = struct {
     metadata_cut: scope.MetadataCut,
     pub fn validate(self: Command) !void {
         try self.intent.validate();
-        if (self.version != 1 or self.metadata_cut.index < self.intent.minimum_metadata_index or self.metadata_cut.group_id != self.intent.owner.metadata_group_id or !std.meta.eql(self.metadata_cut.incarnation, self.intent.owner.metadata_incarnation)) return error.InvalidSourceAdmission;
+        if ((self.version != 1 and (self.version != 2 or self.intent.action != .bind)) or self.metadata_cut.index < self.intent.minimum_metadata_index or self.metadata_cut.group_id != self.intent.owner.metadata_group_id or !std.meta.eql(self.metadata_cut.incarnation, self.intent.owner.metadata_incarnation)) return error.InvalidSourceAdmission;
     }
 };
 pub const Query = struct {

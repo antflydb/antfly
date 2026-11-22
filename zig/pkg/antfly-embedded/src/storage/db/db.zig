@@ -26889,13 +26889,16 @@ pub const DB = struct {
             },
             .apply => {},
         }
-        // Strict roots no longer need migration authorization. A scalar metadata
-        // cut, empty scope registry or absent source txn cannot establish that
-        // old unlabelled production CDC writes have drained. Genuine persisted
-        // worker handover must replace this gate before first activation opens.
+        // Version one retains its historical rejection on first bind. The
+        // new command checks the durable closure and transaction records in
+        // this exact writer, independently of the metadata authorization.
         const Handover = struct {
-            pub fn requireLegacyDrained(_: @This(), _: anytype, _: control.scope.Basis) !void {
-                return error.SourcePendingWork;
+            alloc: Allocator,
+            command_version: u8,
+
+            pub fn requireLegacyDrained(gate: @This(), writer: anytype, basis: control.scope.Basis) !void {
+                if (gate.command_version != 2) return error.SourcePendingWork;
+                try transactions_mod.TxnManager.requireLegacyDrainedInWriter(gate.alloc, writer, basis);
             }
         };
         var rejection: ?ordered.Rejection = null;
@@ -26909,7 +26912,7 @@ pub const DB = struct {
             try @import("../source_authority.zig").bind(&txn, .raft, root.namespace);
             _ = try self.requireSourcePlanRoot(&txn, root);
             const outcome: ordered.Outcome = if (rejection) |reason| .{ .rejected = reason } else .{
-                .applied = control.apply(self.alloc, &txn, Handover{}, command, cut) catch |err| {
+                .applied = control.apply(self.alloc, &txn, Handover{ .alloc = self.alloc, .command_version = command.version }, command, cut) catch |err| {
                     rejection = ordered.Rejection.fromError(err) orelse return err;
                     continue;
                 },
@@ -160088,6 +160091,12 @@ test "db ordered source scope controls fence legacy activation and recover nativ
     var directory = try TestDirectory.init("source-scope-control");
     defer directory.cleanup();
     try @import("source_scope_control_native_test.zig").run(std.testing.allocator, directory.path());
+}
+
+test "db ordered source scope controls activate after versioned native drainage" {
+    var directory = try TestDirectory.init("source-scope-first-bind");
+    defer directory.cleanup();
+    try @import("source_scope_control_native_test.zig").verifyFirstBind(std.testing.allocator, directory.path());
 }
 
 test "index alias storage fences reject same-name replacement and survive query leases" {

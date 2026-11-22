@@ -21,6 +21,12 @@ const local = @import("antfly_local_sources");
 pub const wire = local.storage_source_scope_ordered;
 const completion = local.api_local_table_writes.table_write_source.history_resolution_wire.completion;
 pub const required_protocol_version = @import("../common/data_raft_protocol.zig").batch_source_scope_control_protocol_version;
+pub fn requiredProtocol(command: wire.control.Command) u16 {
+    return if (command.version == 2)
+        @import("../common/data_raft_protocol.zig").batch_source_drained_bind_protocol_version
+    else
+        required_protocol_version;
+}
 pub const max_bytes = 16 * 1024 * 1024;
 pub const Entry = struct {
     table: []const u8,
@@ -30,7 +36,7 @@ pub const Entry = struct {
     source_owner: completion.RoutedOwner,
     source_scope_control: wire.control.Command,
     pub fn validate(self: Entry) !void {
-        if (self.batch != null or self.protocol != required_protocol_version or self.source_scope_control.version != 1) return error.UnsupportedRaftBatchProtocolVersion;
+        if (self.batch != null or self.protocol != requiredProtocol(self.source_scope_control)) return error.UnsupportedRaftBatchProtocolVersion;
         if (self.table.len == 0 or self.table.len > 1024 or !std.unicode.utf8ValidateSlice(self.table) or std.mem.indexOfScalar(u8, self.table, 0) != null) return error.InvalidReplicatedBatch;
         const owner = self.storage_owner;
         if (owner.identity.table_id == 0 or owner.identity.shard_id == 0 or owner.identity.range_id == 0 or owner.schema_json.len > 1024 * 1024 or owner.indexes_json.len > 1024 * 1024) return error.InvalidReplicatedBatch;
@@ -52,7 +58,7 @@ pub const Owned = struct {
     }
 };
 pub fn encode(a: std.mem.Allocator, entry: Entry, activated: u16) ![]u8 {
-    if (activated < required_protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
+    if (activated < requiredProtocol(entry.source_scope_control)) return error.UnsupportedRaftBatchProtocolVersion;
     try entry.validate();
     const command = try wire.control.encodeCommand(a, entry.source_scope_control);
     defer a.free(command);
@@ -112,4 +118,19 @@ test "source scope entry requires activation and complete immutable owner bindin
     const mixed = try std.fmt.allocPrint(a, "{s},\"history_control\":{{}}}}", .{bytes[0 .. bytes.len - 1]});
     defer a.free(mixed);
     try std.testing.expectError(error.UnknownField, @import("raft_batch.zig").decodeForApply(a, mixed));
+
+    var drained = entry;
+    drained.source_scope_control.version = 2;
+    const drain_protocol = requiredProtocol(drained.source_scope_control);
+    try std.testing.expect(drain_protocol > required_protocol_version);
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, drained, drain_protocol));
+    drained.protocol = drain_protocol;
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, drained, drain_protocol - 1));
+    const drain_bytes = try encode(a, drained, drain_protocol);
+    defer a.free(drain_bytes);
+    var drain_apply = try @import("raft_batch.zig").decodeForApply(a, drain_bytes);
+    defer drain_apply.deinit(a);
+    try std.testing.expectEqualDeep(drained, drain_apply.source_scope_control.value());
+    drained.source_scope_control.intent.action = .close;
+    try std.testing.expectError(error.InvalidSourceAdmission, encode(a, drained, drain_protocol));
 }
