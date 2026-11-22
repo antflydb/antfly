@@ -28,6 +28,7 @@ const platform_time = @import("antfly_platform").time;
 const session_record = @import("../metadata/transaction_session_record.zig");
 const session_prefix = session_record.session_prefix;
 const session_lease_prefix = "\x00\x00__api_txn_session_leases__:";
+const sql_abort_proof_prefix = "\x00\x00__api_txn_completion__:";
 const sql_legacy_pin_fence_key = "\x00\x00__api_sql_legacy_pin_fence__";
 const sql_abort_expiry_prefix = "\x00\x00__api_sql_abort_expiry__:";
 const session_expiry_prefix = "\x00\x00__api_txn_session_expiry__:";
@@ -1594,6 +1595,66 @@ pub const DurableSessionStore = struct {
         if (producer.active != 0 or self.reserved_registrations != 0) return error.CompletionIssuerNotDrained;
         try txn.put(key, "sealed-v1");
         return true;
+    }
+
+    pub fn reclaimStandaloneSqlAbortProofs(self: *DurableSessionStore) !usize {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        return switch (self.backend) {
+            .docstore => |store| result: {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                if (!try legacySqlPinsFenced(&txn)) {
+                    txn.abort();
+                    break :result 0;
+                }
+                const count = scan: {
+                    var cursor = try txn.openPhysicalKeyCursorAdapter();
+                    defer cursor.close();
+                    break :scan try reclaimSqlAbortProofsTxn(&txn, &cursor);
+                };
+                if (count != 0) try txn.commit() else txn.abort();
+                break :result count;
+            },
+            .runtime => |store| result: {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                if (!try legacySqlPinsFenced(&txn)) {
+                    txn.abort();
+                    break :result 0;
+                }
+                const count = scan: {
+                    var cursor = try txn.openCursor();
+                    defer cursor.close();
+                    break :scan try reclaimSqlAbortProofsTxn(&txn, &cursor);
+                };
+                if (count != 0) try txn.commit() else txn.abort();
+                break :result count;
+            },
+        };
+    }
+
+    fn reclaimSqlAbortProofsTxn(txn: anytype, cursor: anytype) !usize {
+        const key_len = sql_abort_proof_prefix.len + 32;
+        var keys: [128][key_len]u8 = undefined;
+        var count: usize = 0;
+        cursor.setKeysOnly();
+        var next = try cursor.seekAtOrAfter(sql_abort_proof_prefix);
+        while (next) |entry| : (next = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, sql_abort_proof_prefix)) break;
+            if (entry.key.len != key_len) return error.InvalidTransactionSessionRecord;
+            keys[count] = entry.key[0..key_len].*;
+            count += 1;
+            if (count == keys.len) break;
+        }
+        // Finish the cursor walk before staging any deletes on its transaction.
+        for (keys[0..count]) |key| {
+            const value = try txn.get(&key);
+            if (!std.mem.eql(u8, value, "settled-v1")) return error.InvalidTransactionSessionRecord;
+            try txn.delete(&key);
+        }
+        return count;
     }
 
     fn sqlAbortProofExists(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId) !bool {
@@ -9002,9 +9063,19 @@ test "distributed txn standalone SQL pin fence drains and persists across issuer
     try durable.reserveRegistrations(1);
     try std.testing.expectError(error.CompletionIssuerNotDrained, durable.sealStandaloneLegacySqlPins());
     durable.releaseRegistrations(1);
+    const old_marker: db_mod.types.TxnId = @splat(8);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try durable.putSqlAbortProof(&write, old_marker);
+        try write.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), try durable.reclaimStandaloneSqlAbortProofs());
     try durable.sealStandaloneLegacySqlPins();
 
     var reopened = DurableSessionStore.initRuntime(a, &store);
+    try std.testing.expectEqual(@as(usize, 1), try reopened.reclaimStandaloneSqlAbortProofs());
+    try std.testing.expect(!try reopened.completionSettled(old_marker));
     const missing: db_mod.types.TxnId = @splat(7);
     {
         var write = try store.beginWrite();
@@ -11097,7 +11168,7 @@ fn sessionCompletionSettled(session: Session) bool {
 }
 fn makeSessionCompletionKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]u8 {
     const encoded = std.fmt.bytesToHex(txn_id, .lower);
-    return std.fmt.allocPrint(alloc, "\x00\x00__api_txn_completion__:{s}", .{&encoded});
+    return std.fmt.allocPrint(alloc, "{s}{s}", .{ sql_abort_proof_prefix, &encoded });
 }
 
 fn completionDirectoryKey(alloc: std.mem.Allocator, id: db_mod.types.TxnId) ![]u8 {

@@ -10250,6 +10250,12 @@ pub const ApiHttpServer = struct {
             std.log.warn("legacy SQL abort receipt migration deferred err={s}", .{@errorName(err)});
         };
         _ = try self.txn_sessions.cleanupExpiredSqlAbortReceipts(self.alloc, now_ns -| retention_ns);
+        if (self.cfg.deployment_mode == .standalone and self.txn_sessions.durable_scope == .node_local and
+            self.cfg.session_executor == null and self.cfg.hot_standby_mutation_policy_source == null and self.mutationBackgroundExecutionPermitted())
+        {
+            const store = self.txn_sessions.durable.?;
+            _ = try store.reclaimStandaloneSqlAbortProofs();
+        }
     }
 
     fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
