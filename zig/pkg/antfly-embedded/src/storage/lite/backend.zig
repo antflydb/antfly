@@ -74,7 +74,7 @@ pub const EngineSelection = enum {
 };
 
 pub const OpenOptions = struct {
-    redo_recovery_base: ?*const native.NativeFile = null,
+    redo_recovery_base: ?native.RedoRecoveryCursor = null,
     externally_locked: bool = false,
     reclamation: docstore.reclamation.Options = .{},
     engine: EngineSelection = .auto,

@@ -2846,7 +2846,7 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
 }
 
 pub const OpenOptions = struct {
-    redo_recovery_base: ?*const native.NativeFile = null,
+    redo_recovery_base: ?native.RedoRecoveryCursor = null,
     externally_locked: bool = false,
     reclamation: reclamation.Options = .{},
     read_only: bool = false,

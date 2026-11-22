@@ -2276,6 +2276,7 @@ pub const Owner = struct {
     wake: std.Io.Event = .unset,
     maintenance_activity: @import("maintenance_activity.zig").Activity = .{},
     current: ?*h.Handle = null,
+    redo_recovery_cursor: ?native.RedoRecoveryCursor = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
     /// Non-null for the duration of a hosted/non-independent `maintenanceTurn`
@@ -2525,8 +2526,6 @@ pub const Owner = struct {
     fn refreshImpl(self: *Owner, fast_only: bool) !?*h.Handle {
         wal_trace.recordOp(.serving_runtime_refresh);
         if (comptime h.builtin.is_test) _ = self.test_refresh_count.fetchAdd(1, .release);
-        var recovered_probe: ?native.NativeFile = null;
-        defer if (recovered_probe) |*probe| probe.close();
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
             if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
@@ -2536,7 +2535,8 @@ pub const Owner = struct {
             const can_reuse = !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and
                 maintenance_references_clear and !needsOutcomeReconciliation(current) and
                 file.adoptionEpoch() == current.lite_refresh_adoption_epoch;
-            if (can_reuse) {
+            if (can_reuse and current.lane_pins.load(.acquire) == 0) {
+                if (file.redoRecoveryCursor()) |cursor| self.redo_recovery_cursor = cursor;
                 if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |inode| {
                     self.reader_coordinator.observeCurrent(inode, file.headerFingerprint());
                     if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
@@ -2544,12 +2544,14 @@ pub const Owner = struct {
                     return current;
                 }
             }
-            recovered_probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{
+            var recovered_probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{
                 .read_only = true,
                 .internal_reader = true,
-                .redo_recovery_base = if (can_reuse) file else null,
+                .redo_recovery_base = self.redo_recovery_cursor,
             });
-            const probe = &recovered_probe.?;
+            defer recovered_probe.close();
+            const probe = &recovered_probe;
+            self.redo_recovery_cursor = probe.redoRecoveryCursor();
             const probe_inode = (try probe.file.stat(probe.runtime())).inode;
             // Establish the fenced tip before opening any new read pins.
             // Existing readers of an unknown peer publication remain poisoned.
@@ -2633,7 +2635,7 @@ pub const Owner = struct {
         if (fast_only) return null;
         var options = self.options;
         options.externally_locked = true;
-        options.redo_recovery_base = if (recovered_probe) |*probe| probe else null;
+        options.redo_recovery_base = self.redo_recovery_cursor;
         if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
         // Certify before opening index sources, whose lease publications can
         // advance the header. The probe is borrowed only by synchronous open.
@@ -2647,7 +2649,7 @@ pub const Owner = struct {
                 .internal_reader = true,
                 .redo_recovery_base = options.redo_recovery_base,
             });
-            options.redo_recovery_base = &certified.?;
+            options.redo_recovery_base = certified.?.redoRecoveryCursor();
             certified.?.allocator_cancel_token = &self.verification_cancel;
             if (self.current) |previous| {
                 // Only an idle serving wrapper can donate. Active cursors,
@@ -2746,6 +2748,7 @@ pub const Owner = struct {
         replacement.lite_refresh_adoption_epoch = replacement.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
         replacement.lite_runtime_sequence = replacement.owned_lite_backend.?.native_docstore.?.file.committedSequence();
         self.installStoreHooks(replacement);
+        self.redo_recovery_cursor = replacement.owned_lite_backend.?.native_docstore.?.file.redoRecoveryCursor();
         self.current = replacement;
         for (self.connections.items) |connection| {
             connection.current = replacement;
@@ -5388,6 +5391,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         if (initial) |root| {
             root.lite_refresh_adoption_epoch = root.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
             root.lite_runtime_sequence = root.owned_lite_backend.?.native_docstore.?.file.committedSequence();
+            owner.redo_recovery_cursor = root.owned_lite_backend.?.native_docstore.?.file.redoRecoveryCursor();
             owner.installStoreHooks(root);
         }
     }

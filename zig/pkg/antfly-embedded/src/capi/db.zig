@@ -3175,7 +3175,7 @@ pub const StorageKind = enum {
 };
 
 pub const LiteResolvedOpenOptions = struct {
-    redo_recovery_base: ?*const lite_backend.native.NativeFile = null,
+    redo_recovery_base: ?lite_backend.native.RedoRecoveryCursor = null,
     storage_kind: StorageKind = .lite,
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
     profile: lite_backend.Profile = .native,

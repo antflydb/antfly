@@ -1344,13 +1344,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         pub fn last(self: *@This()) !?backend_adapter.Entry {
             const entry = try self.findLast();
-            if (entry) |e| {
-                try self.initForwardPositions(e.key, true);
-                self.current_key = e.key;
-            } else {
-                self.current_key = null;
-            }
-            return entry;
+            return self.positionAtReverseMatch(entry);
         }
 
         pub fn next(self: *@This()) !?backend_adapter.Entry {
@@ -1364,13 +1358,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         pub fn prev(self: *@This()) !?backend_adapter.Entry {
             const key = self.current_key orelse return null;
             const entry = try self.findAtOrBefore(key, false);
-            if (entry) |e| {
-                try self.initForwardPositions(e.key, true);
-                self.current_key = e.key;
-            } else {
-                self.current_key = null;
-            }
-            return entry;
+            return self.positionAtReverseMatch(entry);
         }
 
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
@@ -1409,13 +1397,18 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
             const entry = try self.findAtOrBefore(key, true);
-            if (entry) |e| {
-                try self.initForwardPositions(e.key, true);
-                self.current_key = e.key;
-            } else {
-                self.current_key = null;
-            }
-            return entry;
+            return self.positionAtReverseMatch(entry);
+        }
+
+        fn positionAtReverseMatch(self: *@This(), entry: ?backend_adapter.Entry) !?backend_adapter.Entry {
+            self.current_key = null;
+            const match = entry orelse return null;
+            // Repositioning may release the block or key copy found by
+            // the backward search. Return the forward heap's fresh view.
+            try self.initForwardPositions(match.key, true);
+            const positioned = try self.selectVisibleForward();
+            self.current_key = if (positioned) |found| found.key else null;
+            return positioned;
         }
 
         fn initForwardPositions(self: *@This(), target: []const u8, inclusive: bool) !void {
@@ -2086,7 +2079,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 const entry = self.source_entries[source_index] orelse continue;
                 if (!std.mem.eql(u8, entry.key, key)) continue;
                 if (entry.tombstone) return null;
-                self.last_value_len = entry.value.len;
+                self.last_value_len = entry.logical_value_len orelse entry.value.len;
                 return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
             }
             return null;
@@ -13322,6 +13315,19 @@ test "lsm length-only forward cursor uses spilled lengths and retains the advanc
             try std.testing.expectEqual(loads_before, backend.snapshotReadStats().cursor_block_loads);
     }
     try std.testing.expect(entry == null);
+
+    entry = try cursor.last();
+    for ([_][]const u8{ "e", "d", "c", "b", "a" }, [_]usize{ 5, 4, 0, 3, 1 }) |key, length| {
+        try std.testing.expectEqualStrings(key, entry.?.key);
+        try std.testing.expectEqualStrings("", entry.?.value);
+        try std.testing.expectEqual(length, cursor.valueLen(entry.?));
+        entry = try cursor.prev();
+    }
+    try std.testing.expect(entry == null);
+    const at = (try cursor.seekAtOrBefore("d")).?;
+    try std.testing.expectEqualStrings("d", at.key);
+    try std.testing.expectEqual(@as(usize, 4), cursor.valueLen(at));
+    try std.testing.expectEqualStrings("e", (try cursor.next()).?.key);
 }
 
 test "public graph metric borrowed wire LSM write presence and key cursor preserve snapshots" {
