@@ -461,6 +461,7 @@ pub const RedoAppendCursor = struct {
     log_offset: u64,
     capacity: u64,
     tail: u64,
+    last_record_start: ?u64 = null,
     last_sequence: u64,
     salt: u64,
 };

@@ -243,6 +243,38 @@ noinline fn nativeActivationBodyEnabled(activation: []const u8, vector_width: us
 const MetalDispatchSink = *const fn (usize, usize, u32, u64, u64, u64, u64, u64, u64, bool) callconv(.c) void;
 extern fn termite_metal_observation_exchange_dispatch_sink(sink: ?MetalDispatchSink) ?MetalDispatchSink;
 
+/// A ready serial schedule's actual execution selection on the submitting
+/// thread. The bank gauges describe the latest selected plan, not a request peak.
+pub const SerialWorkspaceObservation = struct {
+    scope: enum { metal_ready_serial_schedule_callbacks } = .metal_ready_serial_schedule_callbacks,
+    successful_replays: u64 = 0,
+    successful_eager_calls: u64 = 0,
+    latest: Banks,
+
+    pub const Banks = struct {
+        planned_output_bytes: usize,
+        planned_scratch_bytes: usize,
+        arena_backing_bytes: usize,
+        bound_scratch_bytes: usize,
+        charged_backend_bytes: usize,
+    };
+};
+
+pub inline fn metalSerialWorkspace(replayed: bool, banks: SerialWorkspaceObservation.Banks) void {
+    if (active_kernels == null) return;
+    metalSerialWorkspaceEnabled(replayed, banks);
+}
+
+noinline fn metalSerialWorkspaceEnabled(replayed: bool, banks: SerialWorkspaceObservation.Banks) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{ .latest = banks };
+        const value = &scope.metal_serial_workspace.?;
+        value.latest = banks;
+        if (replayed) value.successful_replays +|= 1 else value.successful_eager_calls +|= 1;
+    }
+}
+
 pub const KernelScope = struct {
     previous: ?*KernelScope = null,
     previous_metal_sink: ?MetalDispatchSink = null,
@@ -257,6 +289,7 @@ pub const KernelScope = struct {
     native_fallbacks: NativeFallbacks = .{},
     native_programs: NativePrograms = .{},
     native_program_bank: ?NativeProgramBank = null,
+    metal_serial_workspace: ?SerialWorkspaceObservation = null,
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {

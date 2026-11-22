@@ -293,6 +293,11 @@ const default_text_projection_source_build_target_bytes: usize = 8 * 1024 * 1024
 const default_text_build_memory_target_bytes: usize = 96 * 1024 * 1024;
 const default_text_doc_scratch_retained_bytes: usize = 1024 * 1024;
 const force_merge_max_segments_at_once = 16;
+/// Level-0 folds: at least this many records, at most this many records
+/// and bytes per merge.
+const level0_fold_min_records = 4;
+const level0_fold_max_records = 256;
+const level0_fold_max_bytes: u64 = 8 * 1024 * 1024;
 
 const TextSegmentSinkBuildContext = struct {
     alloc: Allocator,
@@ -15507,29 +15512,13 @@ pub const IndexManager = struct {
                     owned_embedding_names.items,
                 );
                 defer artifact_cleanup.deinit();
-                // #1216: a native-catalog HBC index's own metadata (dims,
-                // root node, postings) lives under a fixed, name-derived
-                // scope, independent of the generated-artifact cleanup
-                // above. Its deletes commit in the same transaction as the
-                // catalog mutation below: a crash can never leave the
-                // catalog naming "img" over an erased scope, nor "img" gone
-                // while its stale dims survive underneath a later
-                // re-admission -- see `HBCIndex.nativeCatalogScopeDeletesForRemoval`.
-                // perf/lwa-maint-serialize: background maintenance must not
-                // write the scope between loading those deletes and the
-                // commit -- see `HBCIndex.pauseMaintenanceAcrossRemoval`.
+                // Keep maintenance out until the scope and catalog removal
+                // publish together. The native writer deletes the scope in
+                // private batches inside that transaction.
                 entry.index.pauseMaintenanceAcrossRemoval();
-                // Only valid while `entry.index` itself still is --
-                // `retireDenseIndexEntry` below destroys it, so the
-                // success path below resumes explicitly, *before* that
-                // call, instead of via `defer`; this `errdefer` covers
-                // every early-return failure path above that point, where
-                // `entry.index` is still live.
                 errdefer entry.index.resumeMaintenanceAcrossRemoval();
-                var scope_deletes = try entry.index.nativeCatalogScopeDeletesForRemoval();
-                defer if (scope_deletes) |*deletes| deletes.deinit();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
-                try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, name, null, commit_mutation, if (scope_deletes) |*deletes| deletes else null);
+                try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, name, null, commit_mutation, entry.index.nativeCatalogScope());
                 entry.index.resumeMaintenanceAcrossRemoval();
                 const replicated_leann = if (entry.index.leann) |leann_store| leann_store.isReplicated() else false;
                 self.retireDenseIndexEntry(entry);
@@ -25541,8 +25530,8 @@ pub const IndexManager = struct {
         return kept.toOwnedSlice(self.alloc);
     }
 
-    /// `scope_deletes`, when given, commit in the same native transaction.
-    fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation, scope_deletes: ?*const native_catalog_backend.ScopeDeletes) !void {
+    /// A native scope deletion commits in the same transaction.
+    fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation, delete_scope: ?[]const u8) !void {
         const data = if (self.get(excluded_name) != null)
             try serializeCatalogExcluding(self.alloc, self, excluded_name)
         else
@@ -25565,7 +25554,7 @@ pub const IndexManager = struct {
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
-        if (scope_deletes) |deletes| try txn.putIndexCatalogBatch(deletes.scope, deletes.mutations);
+        if (delete_scope) |scope| try txn.deleteIndexCatalogScope(scope);
         var retiring_names: std.ArrayList([]const u8) = .empty;
         defer retiring_names.deinit(self.alloc);
         const primary_retiring = if (removed_config) |config|
@@ -27214,7 +27203,26 @@ pub const IndexManager = struct {
         if (infos.items.len < 2) return null;
 
         const policy = activeTextMergePolicy();
-        const planned = (try policy.plan(self.alloc, infos.items)) orelse blk: {
+        // Inline writes publish one small level-0 record each. Fold them
+        // wide and first: a tier-sized merge of ten cannot keep up with
+        // them, and producer admission counts every one.
+        const level0_plan = level0: {
+            var picked = std.ArrayListUnmanaged(usize).empty;
+            errdefer picked.deinit(self.alloc);
+            var bytes: u64 = 0;
+            for (infos.items) |info| {
+                if (!persistent_mod.isL0SegmentId(snap.segments[info.index].id)) continue;
+                if (picked.items.len >= level0_fold_max_records or bytes + info.size > level0_fold_max_bytes) break;
+                try picked.append(self.alloc, info.index);
+                bytes += info.size;
+            }
+            if (picked.items.len < level0_fold_min_records) {
+                picked.deinit(self.alloc);
+                break :level0 null;
+            }
+            break :level0 try picked.toOwnedSlice(self.alloc);
+        };
+        const planned = level0_plan orelse (try policy.plan(self.alloc, infos.items)) orelse blk: {
             // The tiered policy found nothing to merge (for example every
             // eligible segment floors to the same effective size under
             // floor_segment_size, or no pair fits under max_segment_size)

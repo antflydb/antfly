@@ -25,6 +25,17 @@ pub const Codec = enum {
 /// blocks. `access_units` borrow directly from the caller's `audio_bytes` and
 /// are only valid for as long as that buffer lives; only the slice of slices
 /// itself is owned and must be freed via `deinit`.
+pub const BlockPadding = struct { first: usize, end: usize, ns: i64 };
+
+pub fn playbackGap(time_ns: u64, delay: usize, rate: u32, cursor: usize) usize {
+    const wanted = sampleCount(time_ns, rate) -| delay;
+    return if (wanted > cursor +| @max(1, rate / 1000)) wanted - cursor else 0;
+}
+
+pub fn sampleCount(ns: u64, rate: u32) usize {
+    return std.math.cast(usize, @as(u128, ns) * rate / std.time.ns_per_s) orelse std.math.maxInt(usize);
+}
+
 pub const DemuxedAudio = struct {
     codec: Codec,
     channels: u16,
@@ -37,12 +48,13 @@ pub const DemuxedAudio = struct {
     /// timecode, scaled by TimestampScale. Same length as `access_units`;
     /// laced frames share their block's time.
     access_unit_times_ns: []u64,
-    discard_padding_ns: i64,
+    padding: []BlockPadding = &.{},
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *const DemuxedAudio) void {
         self.allocator.free(self.access_units);
         self.allocator.free(self.access_unit_times_ns);
+        self.allocator.free(self.padding);
     }
 };
 
@@ -110,6 +122,7 @@ pub fn demux(allocator: std.mem.Allocator, audio_bytes: []const u8) !DemuxedAudi
     var state = DemuxState{};
     errdefer state.access_units.deinit(allocator);
     errdefer state.access_unit_times_ns.deinit(allocator);
+    errdefer state.padding.deinit(allocator);
 
     try parseSegment(allocator, segment_payload, &state);
 
@@ -121,6 +134,7 @@ pub fn demux(allocator: std.mem.Allocator, audio_bytes: []const u8) !DemuxedAudi
     const access_units = try state.access_units.toOwnedSlice(allocator);
     errdefer allocator.free(access_units);
     const access_unit_times_ns = try state.access_unit_times_ns.toOwnedSlice(allocator);
+    errdefer allocator.free(access_unit_times_ns);
 
     return .{
         .codec = codec,
@@ -130,7 +144,7 @@ pub fn demux(allocator: std.mem.Allocator, audio_bytes: []const u8) !DemuxedAudi
         .codec_private = track.codec_private,
         .access_units = access_units,
         .access_unit_times_ns = access_unit_times_ns,
-        .discard_padding_ns = state.discard_padding_ns,
+        .padding = try state.padding.toOwnedSlice(allocator),
         .allocator = allocator,
     };
 }
@@ -184,7 +198,7 @@ pub const DemuxState = struct {
     access_units: std.ArrayList([]const u8) = .empty,
     access_unit_times_ns: std.ArrayList(u64) = .empty,
     timestamp_scale_ns: u64 = default_timestamp_scale_ns,
-    discard_padding_ns: i64 = 0,
+    padding: std.ArrayList(BlockPadding) = .empty,
 };
 
 pub fn parseSegment(allocator: std.mem.Allocator, payload: []const u8, state: *DemuxState) !void {
@@ -205,7 +219,7 @@ pub fn parseSegment(allocator: std.mem.Allocator, payload: []const u8, state: *D
                     &state.access_units,
                     &state.access_unit_times_ns,
                     state.timestamp_scale_ns,
-                    &state.discard_padding_ns,
+                    &state.padding,
                 );
                 cursor = elem.data_start + consumed;
                 continue;
@@ -331,7 +345,7 @@ pub fn parseCluster(
     access_units: *std.ArrayList([]const u8),
     access_unit_times_ns: *std.ArrayList(u64),
     timestamp_scale_ns: u64,
-    discard_padding_ns: *i64,
+    padding: *std.ArrayList(BlockPadding),
 ) !usize {
     const limit: usize = if (known_size) |sz| blk: {
         const cast_size = std.math.cast(usize, sz) orelse return error.UnsupportedAudioFormat;
@@ -367,7 +381,7 @@ pub fn parseCluster(
                 access_unit_times_ns,
                 cluster_ticks,
                 timestamp_scale_ns,
-                discard_padding_ns,
+                padding,
             ),
             else => {},
         }
@@ -388,17 +402,16 @@ pub fn parseBlockGroup(
     access_unit_times_ns: *std.ArrayList(u64),
     cluster_ticks: u64,
     timestamp_scale_ns: u64,
-    discard_padding_ns: *i64,
+    padding: *std.ArrayList(BlockPadding),
 ) !void {
     var cursor: usize = 0;
-    var matched = false;
+    const first = access_units.items.len;
     var pending_discard: ?[]const u8 = null;
 
     while (cursor < payload.len) {
         const elem = try readElementHeader(payload, cursor);
         switch (elem.id) {
             block_id => {
-                const before = access_units.items.len;
                 try parseBlockIntoAccessUnits(
                     try elementPayload(payload, elem),
                     target_track,
@@ -408,7 +421,6 @@ pub fn parseBlockGroup(
                     cluster_ticks,
                     timestamp_scale_ns,
                 );
-                matched = access_units.items.len > before;
             },
             discard_padding_id => pending_discard = try elementPayload(payload, elem),
             else => {},
@@ -416,9 +428,10 @@ pub fn parseBlockGroup(
         cursor = elem.data_end orelse return error.UnsupportedAudioFormat;
     }
 
-    if (matched) {
-        if (pending_discard) |bytes| discard_padding_ns.* = try readSignedInt(bytes);
-    }
+    if (access_units.items.len > first) if (pending_discard) |bytes| {
+        const ns = try readSignedInt(bytes);
+        if (ns != 0) try padding.append(allocator, .{ .first = first, .end = access_units.items.len, .ns = ns });
+    };
 }
 
 /// Parses a Block/SimpleBlock body: a vint track number, a 2-byte signed
@@ -436,99 +449,311 @@ pub fn parseBlockIntoAccessUnits(
     cluster_ticks: u64,
     timestamp_scale_ns: u64,
 ) !void {
-    var cursor: usize = 0;
-    const track_vint = try readVint(block_bytes, 0);
-    cursor += track_vint.len;
-    if (cursor + 3 > block_bytes.len) return error.UnsupportedAudioFormat;
+    var reader = BlockCursor{ .bytes = block_bytes };
+    const block = try describeBlock(&reader, block_bytes.len, target_track, cluster_ticks, timestamp_scale_ns) orelse return;
+    var offset = reader.position;
+    for (block.sizes[0..block.count]) |size| {
+        try access_units.append(allocator, block_bytes[offset..][0..size]);
+        try access_unit_times_ns.append(allocator, block.time_ns);
+        offset += size;
+    }
+}
 
-    const relative_ticks = @as(i16, @bitCast(std.mem.readInt(u16, block_bytes[cursor..][0..2], .big)));
-    const flags = block_bytes[cursor + 2];
-    cursor += 3;
-    if (track_vint.value != target_track) return;
+const BlockCursor = struct {
+    bytes: []const u8,
+    position: usize = 0,
 
-    // A block before its cluster's timestamp is clamped to the start; the
-    // alternative is a negative position on the timeline.
-    const absolute_ticks: u64 = if (relative_ticks < 0)
-        cluster_ticks -| @as(u64, @intCast(-@as(i32, relative_ticks)))
-    else
-        cluster_ticks + @as(u64, @intCast(relative_ticks));
-    const time_ns = std.math.mul(u64, absolute_ticks, timestamp_scale_ns) catch
-        return error.UnsupportedAudioFormat;
-
-    const lacing: u2 = @intCast((flags & 0x06) >> 1);
-    if (lacing == 0) {
-        const frame = block_bytes[cursor..];
-        if (frame.len == 0) return error.UnsupportedAudioFormat;
-        try access_units.append(allocator, frame);
-        try access_unit_times_ns.append(allocator, time_ns);
-        return;
+    fn byte(self: *BlockCursor) !u8 {
+        if (self.position == self.bytes.len) return error.UnsupportedAudioFormat;
+        const value = self.bytes[self.position];
+        self.position += 1;
+        return value;
     }
 
-    if (cursor >= block_bytes.len) return error.UnsupportedAudioFormat;
-    const frame_count = @as(usize, block_bytes[cursor]) + 1;
-    cursor += 1;
-    if (frame_count == 0) return error.UnsupportedAudioFormat;
+    fn vint(self: anytype) !SizeResult {
+        var bytes: [8]u8 = undefined;
+        bytes[0] = try self.byte();
+        const len = try vintLength(bytes[0]);
+        for (bytes[1..len]) |*value| value.* = try self.byte();
+        return readVint(bytes[0..len], 0);
+    }
+};
 
-    const sizes = try allocator.alloc(usize, frame_count);
-    defer allocator.free(sizes);
+const BlockLayout = struct {
+    sizes: [256]usize = undefined,
+    count: usize,
+    time_ns: u64,
+};
 
+fn describeBlock(reader: anytype, length: usize, target: u64, ticks: u64, scale: u64) !?BlockLayout {
+    const track = try BlockCursor.vint(reader);
+    if (track.is_unknown) return error.UnsupportedAudioFormat;
+    if (track.value != target) return null;
+    const high = try reader.byte();
+    const low = try reader.byte();
+    const relative = std.mem.readInt(i16, &.{ high, low }, .big);
+    const flags = try reader.byte();
+    const absolute = if (relative < 0) ticks -| @as(u64, @intCast(-@as(i32, relative))) else try std.math.add(u64, ticks, @intCast(relative));
+    var result = BlockLayout{ .count = 1, .time_ns = try std.math.mul(u64, absolute, scale) };
+    const lacing: u2 = @truncate(flags >> 1);
+    if (lacing != 0) result.count = @as(usize, try reader.byte()) + 1;
+    var total: usize = 0;
     switch (lacing) {
-        1 => { // Xiph lacing.
-            var total: usize = 0;
-            for (0..frame_count - 1) |i| {
-                var size: usize = 0;
-                while (true) {
-                    if (cursor >= block_bytes.len) return error.UnsupportedAudioFormat;
-                    const b = block_bytes[cursor];
-                    cursor += 1;
-                    size += b;
-                    if (b != 0xff) break;
-                }
-                sizes[i] = size;
-                total += size;
+        1 => for (result.sizes[0 .. result.count - 1]) |*size| {
+            size.* = 0;
+            while (true) {
+                const value = try reader.byte();
+                size.* = try std.math.add(usize, size.*, value);
+                if (value != 255) break;
             }
-            const remaining = block_bytes.len - cursor;
-            if (total > remaining) return error.UnsupportedAudioFormat;
-            sizes[frame_count - 1] = remaining - total;
+            total = try std.math.add(usize, total, size.*);
         },
-        2 => { // Fixed-size lacing.
-            const remaining = block_bytes.len - cursor;
-            if (remaining % frame_count != 0) return error.UnsupportedAudioFormat;
-            const each = remaining / frame_count;
-            for (0..frame_count) |i| sizes[i] = each;
+        2 => {
+            const remaining = length - reader.position;
+            if (remaining % result.count != 0) return error.UnsupportedAudioFormat;
+            @memset(result.sizes[0..result.count], remaining / result.count);
+            total = remaining - result.sizes[0];
         },
-        3 => { // EBML lacing.
-            if (frame_count >= 2) {
-                const first = try readVint(block_bytes, cursor);
-                cursor += first.len;
-                sizes[0] = std.math.cast(usize, first.value) orelse return error.UnsupportedAudioFormat;
-                var prev_signed: i64 = @intCast(first.value);
-                var total: usize = sizes[0];
-                for (1..frame_count - 1) |i| {
-                    const delta_vint = try readVint(block_bytes, cursor);
-                    cursor += delta_vint.len;
-                    const bias: i64 = (@as(i64, 1) << @intCast(7 * delta_vint.len - 1)) - 1;
-                    const delta: i64 = @as(i64, @intCast(delta_vint.value)) - bias;
-                    const size_signed = prev_signed + delta;
-                    if (size_signed < 0) return error.UnsupportedAudioFormat;
-                    sizes[i] = @intCast(size_signed);
-                    total += sizes[i];
-                    prev_signed = size_signed;
-                }
-                const remaining = block_bytes.len - cursor;
-                if (total > remaining) return error.UnsupportedAudioFormat;
-                sizes[frame_count - 1] = remaining - total;
-            } else {
-                sizes[0] = block_bytes.len - cursor;
+        3 => if (result.count > 1) {
+            const first = try BlockCursor.vint(reader);
+            if (first.is_unknown) return error.UnsupportedAudioFormat;
+            var previous: i64 = @intCast(first.value);
+            result.sizes[0] = std.math.cast(usize, previous) orelse return error.UnsupportedAudioFormat;
+            total = result.sizes[0];
+            for (result.sizes[1 .. result.count - 1]) |*size| {
+                const encoded = try BlockCursor.vint(reader);
+                if (encoded.is_unknown) return error.UnsupportedAudioFormat;
+                const bias = (@as(i64, 1) << @intCast(7 * encoded.len - 1)) - 1;
+                previous = try std.math.add(i64, previous, @as(i64, @intCast(encoded.value)) - bias);
+                size.* = std.math.cast(usize, previous) orelse return error.UnsupportedAudioFormat;
+                total = try std.math.add(usize, total, size.*);
             }
         },
-        else => unreachable,
+        0 => {},
+    }
+    const remaining = length - reader.position;
+    if (total > remaining) return error.UnsupportedAudioFormat;
+    result.sizes[result.count - 1] = remaining - total;
+    for (result.sizes[0..result.count]) |size| if (size == 0) return error.UnsupportedAudioFormat;
+    return result;
+}
+
+const Source = @import("source.zig").Source;
+const Webm = @import("webm.zig");
+pub const Packet = struct {
+    offset: u64,
+    time_ns: u64,
+    size: usize,
+    prefix: [16]u8 = @splat(0),
+};
+
+pub const PacketSource = struct {
+    source: *Source,
+    packets: []const Packet,
+    seek_pre_roll_ns: u64 = 0,
+
+    pub fn read(self: PacketSource, index: usize) !@import("source.zig").Lease {
+        if (index >= self.packets.len) return error.UnsupportedAudioFormat;
+        const packet = self.packets[index];
+        return self.source.readSparse(packet.offset, packet.size);
+    }
+};
+
+/// Immutable packet geometry. The directory holds no source or payload lease.
+pub const Directory = struct {
+    track: TrackInfo,
+    packets: []Packet,
+    padding: []BlockPadding,
+    allocator: std.mem.Allocator,
+
+    pub fn init(a: std.mem.Allocator, source: *Source, limits: Webm.Limits) !Directory {
+        return initWithFlacPacketLimit(a, source, limits, limits.max_packet_bytes);
     }
 
-    for (sizes) |size| {
-        if (size > block_bytes.len - cursor) return error.UnsupportedAudioFormat;
-        try access_units.append(allocator, block_bytes[cursor .. cursor + size]);
-        try access_unit_times_ns.append(allocator, time_ns);
-        cursor += size;
+    /// FLAC packets may hold multiple frames and need not fit in one read.
+    pub fn initWithFlacPacketLimit(a: std.mem.Allocator, source: *Source, limits: Webm.Limits, max_flac_packet_bytes: usize) !Directory {
+        var scan = Webm.Scan{ .input = source, .limits = limits };
+        const header = try scan.rawHeader(0, source.length());
+        if (header.id != ebml_header_id or header.unknown) return error.UnsupportedAudioFormat;
+        var offset = header.end;
+        while (offset < source.length()) {
+            const element = try scan.rawHeader(offset, source.length());
+            if (element.id == segment_id) return scanSegment(a, &scan, element, max_flac_packet_bytes);
+            if (element.unknown) return error.UnsupportedAudioFormat;
+            offset = element.end;
+        }
+        return error.UnsupportedAudioFormat;
+    }
+
+    pub fn deinit(self: Directory) void {
+        self.allocator.free(self.track.codec_private);
+        self.allocator.free(self.packets);
+        self.allocator.free(self.padding);
+    }
+};
+
+const RangeBlock = struct {
+    source: *Source,
+    start: u64,
+    length: usize,
+    position: usize = 0,
+    lease: ?@import("source.zig").Lease = null,
+    lease_start: usize = 0,
+
+    fn byte(self: *RangeBlock) !u8 {
+        if (self.position == self.length) return error.UnsupportedAudioFormat;
+        if (self.lease == null or self.position - self.lease_start >= self.lease.?.bytes.len) {
+            self.close();
+            self.lease_start = self.position;
+            self.lease = try self.source.readSparse(self.start + self.position, @min(if (self.position == 0) @as(usize, 12) else 64, self.length - self.position));
+        }
+        const value = self.lease.?.bytes[self.position - self.lease_start];
+        self.position += 1;
+        return value;
+    }
+
+    fn close(self: *RangeBlock) void {
+        if (self.lease) |*lease| lease.deinit();
+        self.lease = null;
+    }
+};
+
+fn scanSegment(a: std.mem.Allocator, scan: *Webm.Scan, segment: Webm.Element, max_flac_packet_bytes: usize) !Directory {
+    var state = DemuxState{};
+    defer if (state.track) |track| a.free(track.codec_private);
+    var packets: std.ArrayList(Packet) = .empty;
+    defer packets.deinit(a);
+    defer state.padding.deinit(a);
+    var pos = segment.payload;
+    while (pos < segment.end) {
+        const elem = try scan.rawHeader(pos, segment.end);
+        if (elem.id == cluster_id) {
+            const track = state.track orelse return error.UnsupportedAudioFormat;
+            const packet_limit = if (track.codec == .flac) max_flac_packet_bytes else scan.limits.max_packet_bytes;
+            pos = try scanCluster(a, scan, elem, track, state.timestamp_scale_ns, &packets, &state.padding, packet_limit);
+            continue;
+        }
+        if (elem.unknown) return error.UnsupportedAudioFormat;
+        const size = elem.end - elem.payload;
+        if (elem.id == info_id or (elem.id == tracks_id and state.track == null)) {
+            if (size > scan.limits.max_metadata_bytes) return error.ResourceLimitExceeded;
+            var lease = try scan.input.readSparse(elem.payload, @intCast(size));
+            defer lease.deinit();
+            if (elem.id == info_id) {
+                try parseInfo(lease.bytes, &state);
+            } else {
+                var parsed = DemuxState{};
+                try parseTracks(lease.bytes, &parsed);
+                if (parsed.track) |track| {
+                    if (track.codec == null or track.codec_private.len == 0) return error.UnsupportedAudioFormat;
+                    var owned = track;
+                    owned.codec_private = try a.dupe(u8, track.codec_private);
+                    state.track = owned;
+                }
+            }
+        }
+        pos = elem.end;
+    }
+    const track = state.track orelse return error.UnsupportedAudioFormat;
+    if (packets.items.len == 0) return error.UnsupportedAudioFormat;
+    const owned = try packets.toOwnedSlice(a);
+    errdefer a.free(owned);
+    const padding = try state.padding.toOwnedSlice(a);
+    state.track = null;
+    return .{ .track = track, .packets = owned, .padding = padding, .allocator = a };
+}
+
+fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, track: TrackInfo, scale: u64, packets: *std.ArrayList(Packet), padding: *std.ArrayList(BlockPadding), packet_limit: usize) !u64 {
+    var ticks: u64 = 0;
+    var pos = cluster.payload;
+    while (pos < cluster.end) {
+        const child = try scan.rawHeader(pos, cluster.end);
+        if (cluster.unknown and !isClusterChildId(child.id)) break;
+        if (child.unknown) return error.UnsupportedAudioFormat;
+        const before = packets.items.len;
+        switch (child.id) {
+            timecode_id => {
+                if (child.end - child.payload > 8) return error.UnsupportedAudioFormat;
+                var lease = try scan.input.readSparse(child.payload, @intCast(child.end - child.payload));
+                defer lease.deinit();
+                ticks = try readUint(lease.bytes);
+            },
+            simple_block_id => try indexBlock(a, scan, child, track, ticks, scale, packets, packet_limit),
+            block_group_id => {
+                var discard: ?Webm.Element = null;
+                var nested = child.payload;
+                while (nested < child.end) {
+                    const field = try scan.rawHeader(nested, child.end);
+                    if (field.unknown) return error.UnsupportedAudioFormat;
+                    switch (field.id) {
+                        block_id => try indexBlock(a, scan, field, track, ticks, scale, packets, packet_limit),
+                        discard_padding_id => discard = field,
+                        else => {},
+                    }
+                    nested = field.end;
+                }
+                if (packets.items.len != before) if (discard) |field| {
+                    if (field.end - field.payload > 8) return error.UnsupportedAudioFormat;
+                    var lease = try scan.input.readSparse(field.payload, @intCast(field.end - field.payload));
+                    defer lease.deinit();
+                    const ns = try readSignedInt(lease.bytes);
+                    if (ns != 0) try padding.append(a, .{ .first = before, .end = packets.items.len, .ns = ns });
+                };
+            },
+            else => {},
+        }
+        pos = child.end;
+    }
+    return pos;
+}
+
+fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track: TrackInfo, ticks: u64, scale: u64, packets: *std.ArrayList(Packet), packet_limit: usize) !void {
+    const length = std.math.cast(usize, elem.end - elem.payload) orelse return error.ResourceLimitExceeded;
+    var reader = RangeBlock{ .source = scan.input, .start = elem.payload, .length = length };
+    defer reader.close();
+    const block = try describeBlock(&reader, length, track.number, ticks, scale) orelse return;
+    const limit = @min(scan.limits.max_packets, scan.limits.max_index_bytes / @sizeOf(Packet));
+    const count = packets.items.len + block.count;
+    if (count > limit) return error.ResourceLimitExceeded;
+    if (count > packets.capacity) try packets.ensureTotalCapacityPrecise(a, @min(limit, @max(count, packets.capacity *| 2)));
+    var offset = reader.position;
+    for (block.sizes[0..block.count]) |size| {
+        if (size > packet_limit) return error.ResourceLimitExceeded;
+        var packet = Packet{ .offset = elem.payload + offset, .time_ns = block.time_ns, .size = size };
+        reader.position = offset;
+        for (packet.prefix[0..@min(size, if (track.codec == .flac) packet.prefix.len else 2)]) |*value| value.* = try reader.byte();
+        packets.appendAssumeCapacity(packet);
+        offset += size;
+    }
+}
+
+test "WebM borrowed and range indexes preserve signed block padding" {
+    const a = std.testing.allocator;
+    const track = TrackInfo{ .number = 1, .codec = .opus };
+    const padded_block = [_]u8{ 0xa0, 0x8b, 0xa1, 0x85, 0x81, 0, 0, 0, 0, 0x75, 0xa2, 0x81, 1 };
+    const plain_block = [_]u8{ 0xa3, 0x85, 0x81, 0, 0, 0, 0 };
+    for ([_][]const u8{ &(padded_block ++ plain_block), &padded_block }) |contents| {
+        var bytes: [padded_block.len + plain_block.len]u8 = undefined;
+        @memcpy(bytes[0..contents.len], contents);
+        const interior = contents.len != padded_block.len;
+        if (!interior) bytes[padded_block.len - 1] = 0xff;
+
+        var units: std.ArrayList([]const u8) = .empty;
+        defer units.deinit(a);
+        var times: std.ArrayList(u64) = .empty;
+        defer times.deinit(a);
+        var borrowed_padding: std.ArrayList(BlockPadding) = .empty;
+        defer borrowed_padding.deinit(a);
+        _ = try parseCluster(bytes[0..contents.len], contents.len, track.number, a, &units, &times, default_timestamp_scale_ns, &borrowed_padding);
+
+        var source = Source{ .allocator = a, .identity = "block-padding", .storage = .{ .borrowed = bytes[0..contents.len] } };
+        var scan = Webm.Scan{ .input = &source, .limits = .{} };
+        var packets: std.ArrayList(Packet) = .empty;
+        defer packets.deinit(a);
+        var range_padding: std.ArrayList(BlockPadding) = .empty;
+        defer range_padding.deinit(a);
+        _ = try scanCluster(a, &scan, .{ .id = cluster_id, .payload = 0, .end = contents.len, .unknown = false }, track, default_timestamp_scale_ns, &packets, &range_padding, 1024);
+        try std.testing.expectEqualSlices(BlockPadding, &.{.{ .first = 0, .end = 1, .ns = if (interior) 1 else -1 }}, borrowed_padding.items);
+        try std.testing.expectEqualSlices(BlockPadding, borrowed_padding.items, range_padding.items);
     }
 }

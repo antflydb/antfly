@@ -10013,7 +10013,8 @@ export interface components {
          * @description Response acknowledgment/publication barrier, independent of commit_requires:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
          *     - "write": Wait for durable application to the local key-value store
-         *     - "full_text": Wait for full-text index WAL write
+         *     - "query": Wait for durable application and document full-text query visibility
+         *     - "full_text": Compatibility alias for query
          *     - "enrichments": Wait for this write's enrichment publication
          *     - "full_index": Wait for full-text, enrichment and vector-index publication
          *     A post-commit wait failure never rolls back the source. Terminal background
@@ -10023,7 +10024,7 @@ export interface components {
          * @default propose
          * @enum {string}
          */
-        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "full_index";
+        SyncLevel: "propose" | "write" | "query" | "full_text" | "enrichments" | "full_index";
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };

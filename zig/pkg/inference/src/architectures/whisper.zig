@@ -821,6 +821,7 @@ const WeightFetcher = struct {
     cold: ?NativeColdWeights = null,
 
     fn prepareCold(self: *WeightFetcher, name: []const u8) !void {
+        if (comptime !@import("build_options").enable_native) return;
         const source = self.cold orelse return;
         if (self.cb.kind() == .cuda) {
             // CUDA's original acquired cache handle pins stable headers and

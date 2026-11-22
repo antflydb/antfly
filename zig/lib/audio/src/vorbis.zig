@@ -954,12 +954,16 @@ pub const WindowIndex = struct {
         return bytes;
     }
     pub fn visitWindow(self: *const WindowIndex, a: std.mem.Allocator, first: usize, last: usize, sink: @import("pcm_sink.zig").Sink) !void {
+        return self.visitWindowPackets(a, first, last, sink, null);
+    }
+
+    pub fn visitWindowPackets(self: *const WindowIndex, a: std.mem.Allocator, first: usize, last: usize, sink: @import("pcm_sink.zig").Sink, packets: ?@import("antfly_media").webm_audio.PacketSource) !void {
         if (last < first or last > self.samples) return error.UnsupportedAudioFormat;
         if (first == last) return;
-        return visitDemuxedWindow(a, self.demuxed, self.centers, first, last, sink);
+        return visitDemuxedWindow(a, self.demuxed, self.centers, first, last, sink, packets);
     }
 };
-fn visitDemuxedWindow(allocator: std.mem.Allocator, demuxed: Demuxed, centers: []const usize, window_first: usize, window_last: usize, sink: @import("pcm_sink.zig").Sink) !void {
+fn visitDemuxedWindow(allocator: std.mem.Allocator, demuxed: Demuxed, centers: []const usize, window_first: usize, window_last: usize, sink: @import("pcm_sink.zig").Sink, packets: ?@import("antfly_media").webm_audio.PacketSource) !void {
     const channels = demuxed.headers.identification.channels;
     if (channels == 0 or demuxed.audio_packets.len == 0) return error.UnsupportedAudioFormat;
     const small = demuxed.headers.identification.blocksize_small;
@@ -991,7 +995,9 @@ fn visitDemuxedWindow(allocator: std.mem.Allocator, demuxed: Demuxed, centers: [
         const center = centers[index];
         try @import("work_control.zig").check();
         if (center < base or center - base + packet.header.blocksize / 2 > capacity) return error.UnsupportedAudioFormat;
-        const block = try decodeAudioPacketBlockAlloc(allocator, &scratch, demuxed.headers, packet.bytes, short_plan, long_plan);
+        var lease = if (packets) |input| try input.read(index) else null;
+        defer if (lease) |*owned| owned.deinit();
+        const block = try decodeAudioPacketBlockAlloc(allocator, &scratch, demuxed.headers, if (lease) |owned| owned.bytes else packet.bytes, short_plan, long_plan);
         try addPacketBlockToTimelineWithWindow(timeline, capacity, channels, block, center - base, small, packet.header);
         const safe = if (index + 1 == demuxed.audio_packets.len) center + packet.header.blocksize / 2 else center + (packet.header.blocksize + @as(usize, demuxed.audio_packets[index + 1].header.blocksize)) / 4 -| large / 2;
         const end = @min(stop, @max(base, safe));

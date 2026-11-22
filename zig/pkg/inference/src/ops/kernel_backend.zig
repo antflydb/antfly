@@ -26,6 +26,7 @@ pub const OwnedPayloadServices = struct {
     available: *const fn (*anyopaque) bool,
     input: *const fn (*anyopaque, @import("../execution/kernel_route.zig").Binding, @import("ml").graph.Shape) anyerror!bool,
     route: *const fn (*anyopaque, *const @import("../execution/kernel_route.zig").Owned) bool,
+    region: ?*const fn (*anyopaque, *const @import("../execution/region_route.zig").Owned) bool = null,
 };
 /// Target-owned preparation of the original unfused F32 dense decoder.
 /// All queries are metadata-only. Projection application writes only the
@@ -92,6 +93,8 @@ pub const VTable = struct {
     /// Exact optional host staging and synchronous initialization, before literal
     /// publication. Null retains the original compatibility workspace floor.
     physicalLiteralInitializer: ?*const fn (*anyopaque, usize) anyerror!?physical_storage.LiteralInitializer = null,
+    validatePhysicalIndexInput: ?*const fn (ctx: *anyopaque, source: CT, extent: usize) anyerror!void = null,
+    copyPhysicalIndexInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,
     copyPhysicalInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,
     createPhysicalReplay: ?*const fn (ctx: *anyopaque) anyerror!?physical_storage.Replay = null,
     physicalReplayTensorSupported: ?*const fn (ctx: *anyopaque, tensor: CT) bool = null,
@@ -120,6 +123,14 @@ pub const VTable = struct {
     /// Metadata-only gate for borrowing shared literals in this invocation.
     /// Metal declines foreign active frames whose quota lifetime is unowned.
     physicalLiteralBindingSupported: ?*const fn (ctx: *anyopaque) bool = null,
+    writePhysicalIntegerLiteral: ?*const fn (ctx: *anyopaque, output: CT, input: []const u8) anyerror!void = null,
     writePhysicalFloat32: ?*const fn (ctx: *anyopaque, output: CT, input: []const f32) anyerror!void = null,
     retainImmutableTensor: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
+    /// Whole provider-owned output that can outlive its publishing invocation.
+    standaloneOutputBytes: ?*const fn (ctx: *anyopaque, tensor: CT) ?usize = null,
+    /// Pack whole dense device tensors into an already admitted destination.
+    gatherDeviceRows: ?*const fn (ctx: *anyopaque, output: CT, sources: []const CT) anyerror!void = null,
+    /// Borrow the exact physical bank kept alive by retainImmutableTensor.
+    /// A live view prevents the frame from reusing this bank.
+    pooledOutputStorage: ?*const fn (ctx: *anyopaque, tensor: CT) ?*const physical_storage.Lease = null,
 };

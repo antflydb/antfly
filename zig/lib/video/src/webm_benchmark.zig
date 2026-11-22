@@ -143,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
     const bytes = (try file.stat(init.io)).size;
     if (bytes == 0 or bytes > 1024 * 1024 * 1024) return error.ResourceLimitExceeded;
     var provider = media.source.FileRange{ .file = file, .io = init.io };
-    var input = media.source.Source{ .allocator = a, .identity = path, .storage = .{ .range = .{ .context = &provider, .read_at = media.source.FileRange.readAt, .length = bytes } }, .admission_pool = &pool, .limits = .{ .max_total_bytes = 16 * 1024 * 1024 * 1024 } };
+    var input = media.source.Source{ .allocator = a, .identity = path, .storage = .{ .range = provider.range(bytes) }, .admission_pool = &pool, .limits = .{ .max_total_bytes = 16 * 1024 * 1024 * 1024 } };
     const index_start = now(init.io);
     var reader = try media.webm.Reader.init(a, &input, .{});
     defer reader.deinit();

@@ -433,7 +433,7 @@ pub const TranscriptionPipeline = struct {
         // belongs to a fused batch; queued requests must not prepay idle peaks.
         var encoder_permit: ?@import("../backends/session.zig").RunPermit = if (self.native_workspace != null) null else try self.encoder.admit(planned);
         defer if (encoder_permit) |*permit| permit.deinit();
-        if (encoder_permit) |*permit| try stage_runtime.prepareEncoderPermit(self.encoder, self.decoder, self.batch_dispatch, self.execution_control, true, permit);
+        if (encoder_permit) |*permit| try stage_runtime.prepareEncoderPermit(self.encoder, self.decoder, self.batch_dispatch, self.execution_control, .incremental, permit);
 
         const mel_started = platform.time.monotonicNs();
         const mel = try audio.whisperMelFromPcmSecondsMels(allocator, samples, sample_rate, context_seconds, @intCast(n_mels));
@@ -660,6 +660,7 @@ pub const TranscriptionPipeline = struct {
         const rules_active = self.config.timestamps and rules.timestamp_begin >= 0 and
             @as(usize, @intCast(rules.timestamp_begin)) < self.config.vocab_size;
 
+        var decoder_position: usize = 0;
         var completed = false;
         var termination: Termination = .context_limit;
         while (dec_len < max_len) {
@@ -706,7 +707,8 @@ pub const TranscriptionPipeline = struct {
                     .suppress = suppress_scratch.items,
                 };
             }
-            var decoder_row = try decoder_runtime.step(dec_ids[0..dec_len], stats_request, self.batch_dispatch);
+            var decoder_row = try decoder_runtime.step(dec_ids[0..dec_len], decoder_position, stats_request, self.batch_dispatch);
+            decoder_position = dec_len;
             defer decoder_row.deinit();
             const step_stats = decoder_row.stats;
             const last_logits = decoder_row.logits;

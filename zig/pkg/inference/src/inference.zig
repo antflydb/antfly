@@ -176,6 +176,7 @@ test {
     // Keep host-only ownership/descriptor tests reachable under narrow filters.
     if (!build_options.enable_wasm) _ = @import("ops/cuda/embedded_module.zig");
     _ = @import("ops/kernel_geometry.zig");
+    _ = @import("backends/onnx_projection_pack.zig");
     _ = @import("ops/gpu_hosted_store.zig");
     _ = @import("models/loaded_runtime.zig");
     _ = @import("ops/index_metadata.zig");
@@ -479,6 +480,10 @@ test "raw CUDA attention differential surface reports output drift" {
     try std.testing.expect(stats.max_abs >= 0.5);
     try std.testing.expect(stats.max_ulp > 0);
     try std.testing.expectError(error.InvalidHeadDim, cuda_attention_diff.parseConfig(&.{ "--head-dim", "128" }));
+}
+
+test "model aware media WebM response declarations" {
+    if (!build_options.skip_openapi) _ = @import("server/chunk_response.zig");
 }
 
 // Keep model-family tests reachable under compile-time test filtering.

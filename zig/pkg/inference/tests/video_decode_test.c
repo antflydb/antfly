@@ -60,6 +60,16 @@ static CUresult CUDAAPI fake_destroy_parser(CUvideoparser parser) {
     assert(parser); parser_destroy_attempts++;
     return fail_parser_destroy ? (CUresult)2 : CUDA_SUCCESS;
 }
+static CUresult CUDAAPI fake_decode(CUvideodecoder decoder, CUVIDPICPARAMS *picture) {
+    assert(decoder && picture);
+    return CUDA_SUCCESS;
+}
+static void decode_sample(Decoder *d, int slot, int64_t tag) {
+    CUVIDPICPARAMS picture = {0};
+    picture.CurrPicIdx = slot;
+    d->single_picture_packet = 1; d->decoded_in_packet = 0; d->packet_tag = tag;
+    assert(decode(d, &picture) == 1);
+}
 static CUresult CUDAAPI fake_map(CUvideodecoder decoder, int index, unsigned long long *device, unsigned *pitch, CUVIDPROCPARAMS *p) {
     (void)index; (void)p; assert(decoder);
     *device = 1234; *pitch = 256; maps++; return CUDA_SUCCESS;
@@ -97,7 +107,7 @@ static Decoder decoder(void) {
     d.reserve_budget = fake_reserve; d.release_budget = fake_release;
     d.caps = fake_caps; d.create_decoder = fake_create; d.destroy_decoder = fake_destroy;
     d.destroy_parser = fake_destroy_parser;
-    d.map = fake_map; d.unmap = fake_unmap; d.status = fake_status; d.frame = fake_frame;
+    d.decode = fake_decode; d.map = fake_map; d.unmap = fake_unmap; d.status = fake_status; d.frame = fake_frame;
     return d;
 }
 // The same driver-death contract applies to legacy and prepared callers.
@@ -182,11 +192,15 @@ int main(void) {
     d.sequence_seen = 0; d.failed = 0;
     assert(sequence(&d, &f) == 5 && creates == 2 && destroys == 1);
     CUVIDPARSERDISPINFO picture = {0}; picture.progressive_frame = 1;
+    d.remaining_pictures = 3;
+    decode_sample(&d, 1, 17);
+    decode_sample(&d, 0, 9);
+    assert(d.surface_tag[0] == 9 && d.surface_tag[1] == 17);
     selection = 0;
     assert(display(&d, &picture) == 1 && maps == 0);
-    selection = 1;
+    selection = 1; picture.picture_index = 1;
     assert(display(&d, &picture) == 1 && consumes == 1 && maps == 1 && unmaps == 1);
-    consume_result = -1;
+    consume_result = -1; decode_sample(&d, 1, 23);
     assert(display(&d, &picture) == 0 && d.failed == 4 && maps == 2 && unmaps == 2);
     picture.progressive_frame = 0;
     assert(display(&d, &picture) == 0 && d.failed == 2 && maps == 2);
@@ -222,7 +236,7 @@ int main(void) {
             case 7: f.display_area.right = 158; break;
             case 8: f.video_signal_description.matrix_coefficients = 1; d.matrix_override = 6; break;
         }
-        assert(sequence(&d, &f) == 0 && d.failed == 2 && !d.decoder);
+        assert(sequence(&d, &f) == 0 && d.failed == (i == 4 ? 7 : 2) && !d.decoder);
     }
 
     // Main 10 HDR decodes to P016 when the device offers it, and declines otherwise.

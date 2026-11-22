@@ -36,6 +36,7 @@ pub const Task = enum {
 pub const Dispatch = struct {
     ptr: *anyopaque,
     task: Task,
+    run_stage_fn: ?*const fn (*anyopaque, Task, std.mem.Allocator, session_mod.Session, []const session_mod.StageInput, ?Control) anyerror!session_mod.ResidentOutputs = null,
     run_resident_fn: ?*const fn (*anyopaque, Task, std.mem.Allocator, session_mod.Session, ?*session_mod.RunPermit, ?*std.atomic.Mutex, []const Tensor, ?Control) anyerror!?session_mod.ResidentOutputs = null,
     run_fn: *const fn (*anyopaque, Task, std.mem.Allocator, session_mod.Session, ?*session_mod.RunPermit, ?*std.atomic.Mutex, []const Tensor, ?Control) anyerror![]Tensor,
 
@@ -109,6 +110,19 @@ pub fn eligible(session: session_mod.Session, inputs: []const Tensor) bool {
 
 /// One stage entry for task-installed scheduling and the serial Source owner.
 /// A custom dispatcher is authoritative; never replay it on a different route.
+pub fn hasDispatcher(dispatch: anytype) bool {
+    if (comptime @TypeOf(dispatch) == @TypeOf(null)) return false;
+    if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) return dispatch != null;
+    return true;
+}
+
+pub fn stageDispatcher(dispatch: anytype) ?Dispatch {
+    if (comptime @TypeOf(dispatch) == @TypeOf(null)) return null;
+    const selected = if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) dispatch orelse return null else dispatch;
+    if (comptime @TypeOf(selected) != Dispatch) return null;
+    return if (selected.run_stage_fn != null) selected else null;
+}
+
 pub fn run(allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: ?*std.atomic.Mutex, inputs: []const Tensor, control: ?Control, dispatch: anytype) ![]Tensor {
     if (comptime @TypeOf(dispatch) != @TypeOf(null)) {
         if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) {

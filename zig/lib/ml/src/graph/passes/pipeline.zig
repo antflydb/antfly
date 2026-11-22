@@ -419,3 +419,29 @@ test "pipeline exposes attention after primitive softmax recognition" {
     }
     try std.testing.expect(found_sdpa);
 }
+
+test "optimization packs row-major literal projections before execution" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 2 }));
+    const w1 = try b.tensorConst(&.{ 1, 2, 3, 4 }, Shape.init(.f32, &.{ 2, 2 }));
+    const w2 = try b.tensorConst(&.{ 5, 6 }, Shape.init(.f32, &.{ 2, 1 }));
+    try graph.markOutput(try b.matmul(x, w1));
+    try graph.markOutput(try b.matmul(x, w2));
+    var result = try Pipeline.default.run(a, &graph);
+    defer result.deinit();
+    var grouped: usize = 0;
+    for (result.graph.nodes.items) |node| switch (node.op) {
+        .fused_linear_no_bias => |attrs| {
+            if (attrs.num_projections != 2) continue;
+            const packed_weight = result.graph.node(node.inputs[1]).op.constant;
+            try std.testing.expectEqualSlices(f32, &.{ 1, 3, 2, 4, 5, 6 }, result.graph.constantData(packed_weight.data_offset, packed_weight.data_len));
+            grouped += 1;
+        },
+        .transpose, .concat_prim => return error.UnexpectedRuntimeWeightPacking,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), grouped);
+}

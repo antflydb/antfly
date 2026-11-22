@@ -1037,6 +1037,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             namespace_name: ?[]const u8,
             key: []const u8,
             value: []const u8,
+            logical_value_len: ?usize = null,
             tombstone: bool,
         };
         const cursor_storage_alignment = @max(
@@ -1088,6 +1089,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         backend_locked: bool = false,
         record_scan_value_stats: bool = true,
         keys_only: bool = false,
+        last_value_len: usize = 0,
         bounded_run_block_residency: bool = false,
         resident_run_source: ?usize = null,
 
@@ -1281,6 +1283,14 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             self.boundPersistedRunBlockResidency();
         }
 
+        pub fn setLengthOnly(self: *@This()) void {
+            self.setKeysOnly();
+        }
+
+        pub fn lastValueLen(self: *const @This()) usize {
+            return self.last_value_len;
+        }
+
         pub fn close(self: *@This()) void {
             defer if (self.cursor_reservation) |*lease| lease.release();
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
@@ -1334,13 +1344,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         pub fn last(self: *@This()) !?backend_adapter.Entry {
             const entry = try self.findLast();
-            if (entry) |e| {
-                try self.initForwardPositions(e.key, true);
-                self.current_key = e.key;
-            } else {
-                self.current_key = null;
-            }
-            return entry;
+            return self.positionAtReverseMatch(entry);
         }
 
         pub fn next(self: *@This()) !?backend_adapter.Entry {
@@ -1354,13 +1358,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         pub fn prev(self: *@This()) !?backend_adapter.Entry {
             const key = self.current_key orelse return null;
             const entry = try self.findAtOrBefore(key, false);
-            if (entry) |e| {
-                try self.initForwardPositions(e.key, true);
-                self.current_key = e.key;
-            } else {
-                self.current_key = null;
-            }
-            return entry;
+            return self.positionAtReverseMatch(entry);
         }
 
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
@@ -1399,13 +1397,18 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
             const entry = try self.findAtOrBefore(key, true);
-            if (entry) |e| {
-                try self.initForwardPositions(e.key, true);
-                self.current_key = e.key;
-            } else {
-                self.current_key = null;
-            }
-            return entry;
+            return self.positionAtReverseMatch(entry);
+        }
+
+        fn positionAtReverseMatch(self: *@This(), entry: ?backend_adapter.Entry) !?backend_adapter.Entry {
+            self.current_key = null;
+            const match = entry orelse return null;
+            // Repositioning may release the block or key copy found by
+            // the backward search. Return the forward heap's fresh view.
+            try self.initForwardPositions(match.key, true);
+            const positioned = try self.selectVisibleForward();
+            self.current_key = if (positioned) |found| found.key else null;
+            return positioned;
         }
 
         fn initForwardPositions(self: *@This(), target: []const u8, inclusive: bool) !void {
@@ -1430,11 +1433,12 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     self.current_visible_source = null;
                     return null;
                 }
-                try self.makeRunSourceResident(winner_source);
+                if (!self.keys_only) try self.makeRunSourceResident(winner_source);
                 const entry = self.source_entries[winner_source].?;
                 if (!entry.tombstone) {
                     self.current_visible_source = winner_source;
                     self.recordVisibleValueStat(winner_source);
+                    self.last_value_len = entry.logical_value_len orelse entry.value.len;
                     return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
                 }
                 self.current_visible_source = null;
@@ -1597,6 +1601,15 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         fn advanceForwardSourcesAtKey(self: *@This(), key: []const u8) !void {
             const match_count = self.collectForwardHeapSourcesAtKey(key);
+            if (self.keys_only and match_count != 0) {
+                // Keep the winner's next block resident once advancement
+                // actually needs it. Selecting a spilled key needs no read.
+                const winner = self.advance_sources[0];
+                if (self.isPersistedRunSource(winner) and self.resident_run_source != winner) {
+                    if (self.resident_run_source) |resident| try self.spillRunSource(resident);
+                    self.resident_run_source = winner;
+                }
+            }
             for (self.advance_sources[0..match_count]) |source_index| {
                 const idx = self.positions[source_index] orelse continue;
                 try self.advanceSource(source_index, idx);
@@ -1666,7 +1679,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn selectSpanRun(self: *@This(), source_index: usize, run_index: usize) void {
             const span = &self.run_spans[source_index];
             if (span.current == run_index) return;
-            self.clearSourceBlock(source_index);
+            self.resetRunSourceResidency(source_index);
             self.clearSourceRunLease(source_index);
             if (self.source_table_index_handles[source_index]) |*handle| handle.release();
             self.source_table_index_handles[source_index] = null;
@@ -1822,7 +1835,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 if (self.positions[source_index] == null) {
                     self.clearSourceBlock(source_index);
                 } else if (self.bounded_run_block_residency) {
-                    try self.spillRunSource(source_index);
+                    if (self.keys_only and self.resident_run_source == null) {
+                        self.resident_run_source = source_index;
+                    } else {
+                        try self.spillRunSource(source_index);
+                    }
                 }
                 return;
             }
@@ -1899,9 +1916,9 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     try self.sourceEntryAt(source_index, idx)
                 else
                     null;
+                self.clearSourceKeyCopy(source_index);
                 if (self.positions[source_index] == null) {
                     self.clearSourceBlock(source_index);
-                    self.clearSourceKeyCopy(source_index);
                     if (self.resident_run_source == source_index) self.resident_run_source = null;
                 } else if (self.bounded_run_block_residency and self.resident_run_source != source_index) {
                     try self.spillRunSource(source_index);
@@ -2046,12 +2063,14 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             } else if (self.mutable.findIndex(self.namespace, key)) |idx| {
                 const entry = self.mutable.entryAt(idx);
                 if (entry.tombstone) return null;
+                self.last_value_len = entry.value.len;
                 return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
             }
             for (self.immutable_memtables) |state| {
                 if (state.findIndex(self.namespace, key)) |idx| {
                     const entry = state.entryAt(idx);
                     if (entry.tombstone) return null;
+                    self.last_value_len = entry.value.len;
                     return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
                 }
             }
@@ -2060,6 +2079,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 const entry = self.source_entries[source_index] orelse continue;
                 if (!std.mem.eql(u8, entry.key, key)) continue;
                 if (entry.tombstone) return null;
+                self.last_value_len = entry.logical_value_len orelse entry.value.len;
                 return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
             }
             return null;
@@ -2147,6 +2167,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .namespace_name = copied_namespace,
                 .key = copied_key,
                 .value = copied_value,
+                .logical_value_len = entry.value.len,
                 .tombstone = entry.tombstone,
             };
         }
@@ -2211,6 +2232,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const idx = self.mutable.findIndex(self.namespace, key) orelse return .absent;
             const entry = self.mutable.entryAt(idx);
             if (entry.tombstone) return .tombstone;
+            self.last_value_len = entry.value.len;
             const value_len = if (self.keys_only) @as(usize, 0) else entry.value.len;
             const bytes = try self.backend.allocator.alloc(u8, entry.key.len + value_len);
             errdefer self.backend.allocator.free(bytes);
@@ -2249,9 +2271,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn isPersistedRunSource(self: *const @This(), source_index: usize) bool {
             const offset = self.runSourceOffset();
             if (source_index < offset) return false;
-            const run_index = source_index - offset;
-            if (run_index >= self.runs.len) return false;
-            const run = self.runs[run_index];
+            const run = self.run_spans[source_index].descriptor orelse return false;
             return run.state == null and run.path != null;
         }
 
@@ -2269,6 +2289,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .namespace_name = self.namespace.name,
                 .key = key,
                 .value = &.{},
+                .logical_value_len = entry.logical_value_len orelse entry.value.len,
                 .tombstone = entry.tombstone,
             };
             self.clearSourceBlock(source_index);
@@ -10040,6 +10061,7 @@ test "lsm bounded merge cursor spills inactive persisted block" {
     cursor.boundPersistedRunBlockResidency();
 
     const run_source = cursor.runSourceOffset();
+    _ = try cursor.runForSource(run_source);
     cursor.positions[run_source] = 0;
     cursor.source_entries[run_source] = .{
         .namespace_name = "docs",
@@ -10060,6 +10082,7 @@ test "lsm bounded merge cursor spills inactive persisted block" {
     try std.testing.expectEqual(@as(?usize, null), cursor.source_block_indices[run_source]);
     try std.testing.expectEqualStrings("replay:1", cursor.source_key_copies[run_source].?);
     try std.testing.expectEqual(@as(usize, 0), cursor.source_entries[run_source].?.value.len);
+    try std.testing.expectEqual(@as(?usize, "payload".len), cursor.source_entries[run_source].?.logical_value_len);
 }
 
 test "graph metric batch presence uses directory backed runs without a flat projection" {
@@ -13247,6 +13270,66 @@ test "lsm presence probes avoid value copies across source tiers (#1095)" {
             }
         }
     }
+}
+
+test "lsm length-only forward cursor uses spilled lengths and retains the advancing block" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try Backend.open(a, "/length-only", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{});
+    defer store.deinit();
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("b", "bb");
+        try write.put("d", "dddd");
+        try write.put("e", "eeeee");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("a", "a");
+        try write.put("b", "new");
+        try write.put("c", "");
+        try write.commit();
+    }
+
+    while (try backend.runMaintenanceStep()) {}
+    try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
+
+    var read = try store.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    cursor.setLengthOnly();
+    var entry = try cursor.first();
+    for ([_][]const u8{ "a", "b", "c", "d", "e" }, [_]usize{ 1, 3, 0, 4, 5 }) |key, length| {
+        try std.testing.expectEqualStrings(key, entry.?.key);
+        try std.testing.expectEqualStrings("", entry.?.value);
+        try std.testing.expectEqual(length, cursor.valueLen(entry.?));
+        const loads_before = backend.snapshotReadStats().cursor_block_loads;
+        entry = try cursor.next();
+        if (std.mem.eql(u8, key, "a") or std.mem.eql(u8, key, "e"))
+            try std.testing.expectEqual(loads_before, backend.snapshotReadStats().cursor_block_loads);
+    }
+    try std.testing.expect(entry == null);
+
+    entry = try cursor.last();
+    for ([_][]const u8{ "e", "d", "c", "b", "a" }, [_]usize{ 5, 4, 0, 3, 1 }) |key, length| {
+        try std.testing.expectEqualStrings(key, entry.?.key);
+        try std.testing.expectEqualStrings("", entry.?.value);
+        try std.testing.expectEqual(length, cursor.valueLen(entry.?));
+        entry = try cursor.prev();
+    }
+    try std.testing.expect(entry == null);
+    const at = (try cursor.seekAtOrBefore("d")).?;
+    try std.testing.expectEqualStrings("d", at.key);
+    try std.testing.expectEqual(@as(usize, 4), cursor.valueLen(at));
+    try std.testing.expectEqualStrings("e", (try cursor.next()).?.key);
 }
 
 test "public graph metric borrowed wire LSM write presence and key cursor preserve snapshots" {

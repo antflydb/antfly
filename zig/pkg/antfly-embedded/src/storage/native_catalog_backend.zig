@@ -118,6 +118,9 @@ pub const Sink = struct {
     /// the commit at the file's tip. When false, the backend resolves them
     /// against its own view before submitting (a single-process sink).
     resolves: bool = false,
+    /// Like loadAllAlloc, with empty values allocated by the same allocator.
+    loadKeysAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
+    deleteScope: ?*const fn (ptr: *anyopaque, scope: []const u8) anyerror!void = null,
     /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
     /// fakes below): like `submit`, but for `durable = false` only, and
     /// never blocks waiting for the underlying group commit to apply --
@@ -253,6 +256,7 @@ fn isStagedOnly(namespace: ?[]const u8) bool {
 /// saying the index is gone while its stale scope survives underneath a
 /// later re-admission. A no-op when nothing is committed under `scope`.
 pub fn deleteAllForScope(allocator: Allocator, sink: Sink, scope: []const u8) !void {
+    if (sink.deleteScope) |delete_scope| return delete_scope(sink.ptr, scope);
     var deletes = try ScopeDeletes.load(allocator, sink, scope);
     defer deletes.deinit();
     if (deletes.mutations.len == 0) return;
@@ -269,7 +273,7 @@ pub const ScopeDeletes = struct {
     mutations: []Mutation,
 
     pub fn load(allocator: Allocator, sink: Sink, scope: []const u8) !ScopeDeletes {
-        const mirrored = try sink.loadAllAlloc(sink.ptr, allocator, scope);
+        const mirrored = try (sink.loadKeysAlloc orelse sink.loadAllAlloc)(sink.ptr, allocator, scope);
         const loaded = if (sink.loadTipAlloc) |load_tip| blk: {
             errdefer freeLoaded(allocator, mirrored);
             const tip = try load_tip(sink.ptr, allocator, scope);

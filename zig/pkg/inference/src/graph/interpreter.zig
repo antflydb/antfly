@@ -250,6 +250,7 @@ pub const ExecuteOptions = struct {
     /// External/debug plans retain validation unless their owner proves this.
     cached_buffer_plan_validated: bool = false,
     physical_frame: ?*@import("../execution/physical_buffers.zig").Frame = null,
+    require_assigned_kernels: bool = false,
     storage_admission: ?@import("../execution/storage_admission.zig").Capability = null,
     prepared_routes: ?*@import("../execution/prepared_routes.zig").PreparedRoutes = null,
     physical_frame_claim: ?*@import("../execution/physical_buffers.zig").FrameClaim = null,
@@ -2550,6 +2551,47 @@ fn disentangledMaskFromBias(
     return mask;
 }
 
+/// Materialize a validated graph literal without losing its dtype or rank.
+pub fn materializeConstant(graph: *const Graph, cb: *const ComputeBackend, shape: Shape, attrs: ml.graph.node.ConstantAttrs, strict_integer: bool) !CT {
+    if (shape.rank() > 8) return error.UnsupportedShape;
+    const byte_count = std.math.mul(usize, attrs.data_len, shape.dtype.byteSize()) catch return error.UnsupportedShape;
+    if (attrs.data_offset > graph.constant_pool.items.len or byte_count > graph.constant_pool.items.len - attrs.data_offset) return error.UnsupportedShape;
+    const elements = shape.numElements() orelse return error.UnsupportedShape;
+    if (elements != attrs.data_len) return error.UnsupportedShape;
+    if (try cb.fromReadOnlyBytes(graph.constant_pool.items[attrs.data_offset..][0..byte_count], shape.dtype, shape.dims[0..shape.rank()])) |tensor| return tensor;
+    if (strict_integer) switch (shape.dtype) {
+        .i32 => {
+            const data = graph.constantDataAs(i32, attrs.data_offset, attrs.data_len);
+            if (shape.rank() > 8) return error.UnsupportedShape;
+            var dimensions: [8]i32 = undefined;
+            var fallback_elements: usize = 1;
+            for (0..shape.rank()) |axis| {
+                const dimension = shape.dim(@intCast(axis));
+                if (dimension < 0) return error.UnsupportedShape;
+                dimensions[axis] = std.math.cast(i32, dimension) orelse return error.UnsupportedShape;
+                fallback_elements = std.math.mul(usize, fallback_elements, @intCast(dimension)) catch return error.UnsupportedShape;
+            }
+            if (fallback_elements != data.len) return error.UnsupportedShape;
+            return (try cb.fromInt32Shape(data, dimensions[0..shape.rank()])) orelse return error.UnsupportedIntegerTensor;
+        },
+        .i8, .i16, .i64, .u8, .bool_ => return error.UnsupportedIntegerTensor,
+        else => {},
+    };
+    const constant = try graph.constantDataAsF32(
+        graph.allocator,
+        shape.dtype,
+        attrs.data_offset,
+        attrs.data_len,
+    );
+    defer constant.deinit(graph.allocator);
+    var shape_buf: [8]i32 = undefined;
+    const rank = shape.rank();
+    for (0..rank) |axis| {
+        shape_buf[axis] = std.math.cast(i32, shape.dim(@intCast(axis))) orelse return error.UnsupportedShape;
+    }
+    return cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
+}
+
 pub fn executeNode(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -2561,6 +2603,8 @@ pub fn executeNode(
         if (try frame.execute(cb, values, node_id, if (graph.node(node_id).op == .fused_rope) (try ropePositionOverride(state.options.attention)) else null)) |output| return output;
     }
     const n = graph.node(node_id);
+    if (state.options.require_assigned_kernels and !(n.op == .constant and n.output_shape.dtype == .f32 and
+        n.output_shape.numElements() == 0 and n.op.constant.data_len == 0)) return error.UnsupportedCompiledGraphRuntime;
     const ins = n.getInputs();
 
     // Helper to get a computed input CT
@@ -2592,45 +2636,7 @@ pub fn executeNode(
             return value;
         },
 
-        .constant => |attrs| {
-            if (n.output_shape.rank() > 8) return error.UnsupportedShape;
-            const byte_count = std.math.mul(usize, attrs.data_len, n.output_shape.dtype.byteSize()) catch return error.UnsupportedShape;
-            if (attrs.data_offset > graph.constant_pool.items.len or byte_count > graph.constant_pool.items.len - attrs.data_offset) return error.UnsupportedShape;
-            const elements = n.output_shape.numElements() orelse return error.UnsupportedShape;
-            if (elements != attrs.data_len) return error.UnsupportedShape;
-            if (try cb.fromConstantBytes(graph.constant_pool.items[attrs.data_offset..][0..byte_count], n.output_shape.dtype, n.output_shape.dims[0..n.output_shape.rank()])) |tensor| return tensor;
-            if (state.options.strict_integer_constants) switch (n.output_shape.dtype) {
-                .i32 => {
-                    const data = graph.constantDataAs(i32, attrs.data_offset, attrs.data_len);
-                    if (n.output_shape.rank() > 8) return error.UnsupportedShape;
-                    var dimensions: [8]i32 = undefined;
-                    var fallback_elements: usize = 1;
-                    for (0..n.output_shape.rank()) |axis| {
-                        const dimension = n.output_shape.dim(@intCast(axis));
-                        if (dimension < 0) return error.UnsupportedShape;
-                        dimensions[axis] = std.math.cast(i32, dimension) orelse return error.UnsupportedShape;
-                        fallback_elements = std.math.mul(usize, fallback_elements, @intCast(dimension)) catch return error.UnsupportedShape;
-                    }
-                    if (fallback_elements != data.len) return error.UnsupportedShape;
-                    return (try cb.fromInt32Shape(data, dimensions[0..n.output_shape.rank()])) orelse return error.UnsupportedIntegerTensor;
-                },
-                .i8, .i16, .i64, .u8, .bool_ => return error.UnsupportedIntegerTensor,
-                else => {},
-            };
-            const constant = try graph.constantDataAsF32(
-                graph.allocator,
-                n.output_shape.dtype,
-                attrs.data_offset,
-                attrs.data_len,
-            );
-            defer constant.deinit(graph.allocator);
-            var shape_buf: [8]i32 = undefined;
-            const rank = n.output_shape.rank();
-            for (0..rank) |axis| {
-                shape_buf[axis] = std.math.cast(i32, n.output_shape.dim(@intCast(axis))) orelse return error.UnsupportedShape;
-            }
-            return cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
-        },
+        .constant => |attrs| materializeConstant(graph, cb, n.output_shape, attrs, state.options.strict_integer_constants),
 
         // ── Fused ops → backend dispatch ──────────────────────────────
 
@@ -2890,6 +2896,10 @@ pub fn executeNode(
                     if (head_dim == 0 and actual[2] > 0) head_dim = @intCast(actual[2]);
                     if (batch == 0 and num_heads > 0 and actual[0] > 0) batch = @intCast(@divFloor(actual[0], @as(i64, @intCast(num_heads))));
                 }
+            }
+            if (cb.kind() == .cuda and state.options.sdpa_mask == null and batch != 0 and seq_len != 0 and num_heads != 0 and head_dim != 0) {
+                if (try cb.scaledDotProductAttentionFull(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), V.getOpt(if (n.num_inputs == 4) ins[3] else null_node), batch, seq_len, num_heads, head_dim)) |output|
+                    return output;
             }
             var synthesized_mask: ?[]i64 = null;
             defer if (synthesized_mask) |buf| std.heap.page_allocator.free(buf);
@@ -4170,6 +4180,10 @@ pub fn executeNode(
                 null;
             defer if (scalar_indices) |value| cb.free(value);
             const result = try cb.primGather(V.get(ins[0]), scalar_indices orelse V.get(ins[1]), attrs.axis, in_shape);
+            if (ensureDeclaredShape(cb, result, n.output_shape)) |restored| {
+                if (restored != result) cb.free(result);
+                return restored;
+            }
             return result;
         },
         .slice => |attrs| {

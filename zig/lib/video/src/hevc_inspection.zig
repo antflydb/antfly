@@ -33,8 +33,9 @@ const Picture = struct {
     signal: config.Signal,
 };
 const PictureResult = anyerror!Picture;
-const PpsResult = anyerror!u4;
-const Selection = struct { sps: u4, picture: Picture };
+const SliceLayout = struct { sps: u4, output_flag: bool, extra_bits: u3 };
+const PpsResult = anyerror!SliceLayout;
+const Selection = struct { sps: u4, picture: Picture, irap: bool = false, hidden: bool = false };
 
 fn picture(bits: *Bits) !Picture {
     const sps = try params.parseSps(bits);
@@ -84,13 +85,13 @@ const State = struct {
                     // failure, but only the active PPS->SPS chain decides policy.
                     self.sps[id] = picture(&bits);
                 } else if (array.nal_unit_type == 34) {
-                    self.pps[id] = ppsSps(&bits);
+                    self.pps[id] = sliceLayout(&bits);
                 }
             }
         }
     }
     fn select(self: *const State, pps: u6) !Selection {
-        const sps = try (self.pps[pps] orelse return error.MissingVideoParameterSet);
+        const sps = (try (self.pps[pps] orelse return error.MissingVideoParameterSet)).sps;
         return .{ .sps = sps, .picture = try (self.sps[sps] orelse return error.MissingVideoParameterSet) };
     }
     fn checkParameter(self: *const State, a: std.mem.Allocator, kind: u6, unit: []const u8, control: media.source.Control) !void {
@@ -106,8 +107,11 @@ fn digest(unit: []const u8) [32]u8 {
     std.crypto.hash.sha2.Sha256.hash(unit, &hash, .{});
     return hash;
 }
-fn ppsSps(bits: *Bits) !u4 {
-    return @intCast(try bits.ueBounded(15));
+fn sliceLayout(bits: *Bits) !SliceLayout {
+    const sps: u4 = @intCast(try bits.ueBounded(15));
+    _ = try bits.flag(); // dependent_slice_segments_enabled_flag
+    const output_flag = try bits.flag();
+    return .{ .sps = sps, .output_flag = output_flag, .extra_bits = @intCast(try bits.read(3)) };
 }
 fn parameterId(bits: *Bits, kind: u6) !u6 {
     return @intCast(switch (kind) {
@@ -126,7 +130,7 @@ fn parameterBits(a: std.mem.Allocator, unit: []const u8, kind: u6, control: medi
 
 // Slice activation precedes all geometry-dependent syntax. At most fifteen bits
 // identify a bounded PPS; de-escape only the small prefix that can contain them.
-fn slicePps(prefix: []const u8, kind: u6) !struct { first: bool, pps: u6 } {
+fn slicePps(prefix: []const u8, kind: u6, state: *const State) !struct { first: bool, pps: u6, hidden: bool } {
     if (prefix.len < 3) return error.MalformedVideoPacket;
     var bytes: [8]u8 = undefined;
     var count: usize = 0;
@@ -145,7 +149,15 @@ fn slicePps(prefix: []const u8, kind: u6) !struct { first: bool, pps: u6 } {
     var bits = Bits{ .allocator = undefined, .bytes = bytes[0..count], .end = count * 8 };
     const first = try bits.flag();
     if (kind >= 16 and kind <= 23) _ = try bits.flag();
-    return .{ .first = first, .pps = @intCast(try bits.ueBounded(63)) };
+    const pps: u6 = @intCast(try bits.ueBounded(63));
+    const layout = try (state.pps[pps] orelse return error.MissingVideoParameterSet);
+    var hidden = false;
+    if (first and layout.output_flag) {
+        _ = try bits.read(layout.extra_bits);
+        _ = try bits.ueBounded(2); // slice_type
+        hidden = !try bits.flag();
+    }
+    return .{ .first = first, .pps = pps, .hidden = hidden };
 }
 
 fn range(reader: *media.mp4.Reader, packet: media.mp4.Packet, offset: usize, size: usize, borrowed: ?[]const u8) !media.source.Lease {
@@ -180,13 +192,15 @@ fn inspectPacket(a: std.mem.Allocator, reader: *media.mp4.Reader, packet: media.
             defer parameter.deinit();
             try state.checkParameter(a, kind, parameter.bytes, reader.input.control);
         } else if (kind < 32) {
-            const slice = try slicePps(unit, kind);
+            const slice = try slicePps(unit, kind, state);
             if (selected_pps) |pps| {
                 if (slice.first or pps != slice.pps) return error.MixedVideoPictures;
             } else {
                 if (!slice.first) return error.IncompleteVideoPicture;
                 selected_pps = slice.pps;
                 selected = try state.select(slice.pps);
+                selected.?.hidden = slice.hidden;
+                selected.?.irap = kind >= 16 and kind <= 23;
                 if (expected) |policy| if (!std.meta.eql(policy, selected.?.picture)) return error.UnsupportedDynamicVideoConfig;
             }
         }
@@ -196,7 +210,12 @@ fn inspectPacket(a: std.mem.Allocator, reader: *media.mp4.Reader, packet: media.
 }
 
 pub fn resolveReader(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
-    if (reader.track.codec != .hevc or reader.track.hevc_policy_validated or reader.packets.len == 0) return null;
+    return resolve(a, reader, false);
+}
+
+/// Only an unpublished, exclusively owned packet index may replace sync hints.
+pub fn resolve(a: std.mem.Allocator, reader: *media.mp4.Reader, exclusive: bool) !?[]u8 {
+    if (reader.track.codec != .hevc or (reader.track.hevc_policy_validated and (!exclusive or reader.track.hevc_sync_validated)) or reader.packets.len == 0) return null;
     try reader.input.control.check();
     var owned: ?[]u8 = null;
     errdefer if (owned) |bytes| a.free(bytes);
@@ -216,7 +235,18 @@ pub fn resolveReader(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
     };
     // All later probes skip VCL payloads. Repeated parameter sets are bounded by
     // identity and hash, and no packet lease or decoded frame survives a probe.
-    for (reader.packets[1..]) |packet| _ = try inspectPacket(a, reader, packet, &state, first.picture, null);
+    if (exclusive) {
+        reader.packets[0].sync = first.irap;
+        reader.packets[0].hidden = first.hidden;
+    }
+    for (reader.packets[1..]) |*packet| {
+        const selected = try inspectPacket(a, reader, packet.*, &state, first.picture, null);
+        if (exclusive) {
+            packet.sync = selected.irap;
+            packet.hidden = selected.hidden;
+        }
+    }
+    reader.track.hevc_sync_validated = exclusive;
     if (owned) |bytes| reader.track.codec_config = bytes;
     reader.track.hevc_policy_validated = true;
     return owned;
@@ -242,6 +272,15 @@ test "HEVC activation selects the referenced SPS and reuses validated inspection
 
 fn syntheticPacket(offset: u64, size: u32) media.mp4.Packet {
     return .{ .offset = offset, .size = size, .dts = 0, .media_pts = 0, .pts = 0, .duration = 1, .sync = true };
+}
+
+test "HEVC first slice accounts for PPS reserved bits before pic_output_flag" {
+    var state = State{};
+    state.pps[0] = SliceLayout{ .sps = 0, .extra_bits = 2, .output_flag = true };
+    // first=1, pps_id=0, reserved=00, slice_type=P(010), pic_output_flag.
+    const hidden = try slicePps(&.{ 2, 1, 0b11000100 }, 1, &state);
+    try std.testing.expect(hidden.first and hidden.hidden);
+    try std.testing.expect(!(try slicePps(&.{ 2, 1, 0b11000101 }, 1, &state)).hidden);
 }
 
 test "HEVC activation permits equivalent PPS switches and refuses incompatible or missing references" {

@@ -39,6 +39,9 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(_: *Runtime) void {}
+    pub fn deinitWithCleanup(self: *Runtime, _: @import("cleanup_context.zig").Context) void {
+        self.deinit();
+    }
 
     pub fn execute(
         self: *Runtime,

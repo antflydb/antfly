@@ -195,6 +195,9 @@ pub const Cursor = struct {
         seek_at_or_before: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         set_upper_bound: ?*const fn (*anyopaque, ?[]const u8) void = null,
         set_keys_only: ?*const fn (*anyopaque) void = null,
+        set_length_only: ?*const fn (*anyopaque) void = null,
+        last_value_len: ?*const fn (*anyopaque) usize = null,
+        bound_persisted_run_block_residency: ?*const fn (*anyopaque) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -231,9 +234,25 @@ pub const Cursor = struct {
         if (self.vtable.set_upper_bound) |set_upper_bound| set_upper_bound(self.ptr, upper);
     }
 
+    /// Keep decoded persisted blocks only for the active merge source.
+    /// Call before the first move and consume each value before advancing.
+    pub fn boundPersistedRunBlockResidency(self: *Cursor) void {
+        if (self.vtable.bound_persisted_run_block_residency) |bound| bound(self.ptr);
+    }
+
     /// Call before the first move. Unsupported adapters retain normal reads.
     pub fn setKeysOnly(self: *Cursor) void {
         if (self.vtable.set_keys_only) |set| set(self.ptr);
+    }
+
+    /// Use lengths without loading external values when the backend can
+    /// supply them. Other backends keep returning ordinary entries.
+    pub fn setLengthOnly(self: *Cursor) void {
+        if (self.vtable.set_length_only) |set| set(self.ptr);
+    }
+
+    pub fn valueLen(self: *Cursor, entry: Entry) usize {
+        return if (self.vtable.last_value_len) |len| len(self.ptr) else entry.value.len;
     }
 
     /// Count borrowed keys on this snapshot without retaining or copying values.
@@ -856,6 +875,7 @@ pub const WriteTxn = struct {
         contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
         get_index_catalog: ?*const fn (*anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
+        delete_index_catalog_scope: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
         count_prefix: ?*const fn (*anyopaque, []const u8) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
@@ -863,6 +883,11 @@ pub const WriteTxn = struct {
     /// Stages index-catalog mutations to commit in this transaction's own
     /// native commit, as `Batch.putIndexCatalogBatch` does. `error.Unsupported`
     /// on every backend but Lite.
+    pub fn deleteIndexCatalogScope(self: *WriteTxn, scope: []const u8) !void {
+        const delete_scope = self.vtable.delete_index_catalog_scope orelse return error.Unsupported;
+        try BoundaryAbi.call("delete_index_catalog_scope", self.boundary_dispatch, delete_scope, .{ self.ptr, scope });
+    }
+
     pub fn putIndexCatalogBatch(self: *WriteTxn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
         const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
         try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
@@ -1189,6 +1214,8 @@ pub const Batch = struct {
             // the pre-split contract that a failed `commit` leaves `self`
             // safely abortable, even though there is nothing left to abort.
             self.vtable = &consumed_vtable;
+            if (self.write_gate) |gate| gate.unlock();
+            self.write_gate = null;
             return ticket;
         }
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
@@ -1293,6 +1320,36 @@ pub const Batch = struct {
         return try BoundaryAbi.call("get_index_catalog", self.boundary_dispatch, get_index_catalog, .{ self.ptr, allocator, scope, namespace, key });
     }
 };
+
+test "erased staged batch releases its write gate at handoff" {
+    const Stage = struct {
+        fn run(_: Allocator, ptr: *anyopaque) !Ticket {
+            const fail: *bool = @ptrCast(@alignCast(ptr));
+            if (fail.*) return error.TestStageFailed;
+            return Ticket.alreadyDurable();
+        }
+    };
+    var fail = true;
+    var vtable = Batch.consumed_vtable;
+    vtable.commit_staged = Stage.run;
+    var gate: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(gate.tryLock());
+    var batch: Batch = .{
+        .allocator = std.testing.allocator,
+        .ptr = &fail,
+        .vtable = &vtable,
+        .write_gate = &gate,
+    };
+    try std.testing.expectError(error.TestStageFailed, batch.commitStaged());
+    try std.testing.expect(!gate.tryLock());
+    fail = false;
+    const ticket = try batch.commitStaged();
+    try std.testing.expect(gate.tryLock());
+    batch.abort();
+    try std.testing.expect(!gate.tryLock());
+    gate.unlock();
+    try ticket.wait();
+}
 
 test "ordered artifact inventory erased batches reject unsupported commit participants" {
     const Raw = struct {
@@ -1855,8 +1912,20 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             };
         }
 
+        pub fn boundPersistedRunBlockResidency(ptr: *anyopaque) void {
+            unbox(ptr).handle.boundPersistedRunBlockResidency();
+        }
+
         pub fn setKeysOnly(ptr: *anyopaque) void {
             unbox(ptr).handle.setKeysOnly();
+        }
+
+        fn setLengthOnly(ptr: *anyopaque) void {
+            unbox(ptr).handle.setLengthOnly();
+        }
+
+        fn lastValueLen(ptr: *anyopaque) usize {
+            return unbox(ptr).handle.lastValueLen();
         }
 
         pub fn setUpperBound(ptr: *anyopaque, upper: ?[]const u8) void {
@@ -1877,6 +1946,9 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             .seek_at_or_before = vt.seekAtOrBefore,
             .set_upper_bound = if (@hasDecl(Handle, "setUpperBound")) vt.setUpperBound else null,
             .set_keys_only = if (@hasDecl(Handle, "setKeysOnly")) vt.setKeysOnly else null,
+            .set_length_only = if (@hasDecl(Handle, "setLengthOnly") and @hasDecl(Handle, "lastValueLen")) vt.setLengthOnly else null,
+            .last_value_len = if (@hasDecl(Handle, "setLengthOnly") and @hasDecl(Handle, "lastValueLen")) vt.lastValueLen else null,
+            .bound_persisted_run_block_residency = if (@hasDecl(Handle, "boundPersistedRunBlockResidency")) vt.boundPersistedRunBlockResidency else null,
         },
     };
 }
@@ -2208,6 +2280,10 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
 
+        pub fn deleteIndexCatalogScope(ptr: *anyopaque, scope: []const u8) anyerror!void {
+            return unbox(ptr).handle.deleteIndexCatalogScope(scope);
+        }
+
         pub fn putIndexCatalogBatch(ptr: *anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void {
             return unbox(ptr).handle.putIndexCatalogBatch(scope, mutations);
         }
@@ -2233,6 +2309,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
             .put_index_catalog = if (@hasDecl(Handle, "putIndexCatalogBatch")) vt.putIndexCatalogBatch else null,
             .get_index_catalog = if (@hasDecl(Handle, "getIndexCatalogAlloc")) vt.getIndexCatalogAlloc else null,
+            .delete_index_catalog_scope = if (@hasDecl(Handle, "deleteIndexCatalogScope")) vt.deleteIndexCatalogScope else null,
         },
     };
 }
@@ -2358,18 +2435,18 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             parent.finalizing = true;
             parent.mutex.unlock();
 
-            const payload = parent.handle.commitStaged() catch |err| {
+            errdefer {
                 platform.sync.lockYielding(&parent.mutex);
                 parent.finalizing = false;
                 parent.mutex.unlock();
-                return err;
-            };
-
+            }
             const TicketBox = struct {
                 parent: *ParentBox(Handle),
-                payload: @TypeOf(payload),
+                payload: @typeInfo(@typeInfo(@TypeOf(Handle.commitStaged)).@"fn".return_type.?).error_union.payload,
             };
             const box = try ticket_allocator.create(TicketBox);
+            errdefer ticket_allocator.destroy(box);
+            const payload = try parent.handle.commitStaged();
             box.* = .{ .parent = parent, .payload = payload };
             return .{
                 .allocator = ticket_allocator,

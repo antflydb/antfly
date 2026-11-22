@@ -61,7 +61,7 @@ pub fn durableKeyAlloc(allocator: Allocator, scope: []const u8, namespace: ?[]co
     });
 }
 
-fn scopePrefixAlloc(allocator: Allocator, scope: []const u8) ![]u8 {
+pub fn scopePrefixAlloc(allocator: Allocator, scope: []const u8) ![]u8 {
     return try std.mem.concat(allocator, u8, &.{ reserved_prefix, scope, &.{0} });
 }
 
@@ -79,9 +79,13 @@ fn decodeAlloc(allocator: Allocator, scope: []const u8, full_key: []const u8, va
     const sep = std.mem.indexOfScalar(u8, remainder, 0) orelse return error.InvalidNativeCatalogKey;
     const ns = remainder[0..sep];
     const key = remainder[sep + 1 ..];
+    const owned_ns = if (ns.len == 0) null else try allocator.dupe(u8, ns);
+    errdefer if (owned_ns) |n| allocator.free(n);
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
     return .{
-        .namespace = if (ns.len == 0) null else try allocator.dupe(u8, ns),
-        .key = try allocator.dupe(u8, key),
+        .namespace = owned_ns,
+        .key = owned_key,
         .value = try allocator.dupe(u8, value),
     };
 }
@@ -251,6 +255,8 @@ pub const Sink = struct {
             .loadOneAlloc = loadOneAlloc,
             .loadTipAlloc = loadTipAlloc,
             .resolves = true,
+            .loadKeysAlloc = loadKeysAlloc,
+            .deleteScope = deleteScope,
             .submitDeferred = submitDeferred,
             .pauseMaintenance = pauseMaintenance,
             .resumeMaintenance = resumeMaintenance,
@@ -331,21 +337,44 @@ pub const Sink = struct {
 
     fn completedWait(_: *anyopaque) anyerror!void {}
 
+    fn deleteScope(ptr: *anyopaque, scope: []const u8) anyerror!void {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        const prefix = try scopePrefixAlloc(self.allocator, scope);
+        defer self.allocator.free(prefix);
+        const Request = struct {
+            prefix: []const u8,
+            fn run(context: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(context));
+                try file.deleteIndexCatalogPrefix(request.prefix, null);
+            }
+        };
+        var request = Request{ .prefix = prefix };
+        try self.store.submitIndexScopeDeletion(scope, prefix, &request, Request.run);
+    }
+
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        return loadEntriesAlloc(ptr, allocator, scope, false);
+    }
+
+    fn loadKeysAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        return loadEntriesAlloc(ptr, allocator, scope, true);
+    }
+
+    fn loadEntriesAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8, comptime keys_only: bool) ![]native_catalog_backend.Entry {
         const self: *Sink = @ptrCast(@alignCast(ptr));
         // Unconditional: a maintenance snapshot's DB loads its indexes during
         // open, before the snapshot is given its write target.
         self.store.noteLoadedIndexScope(scope);
         // The doc map is read through `loadOneAlloc` only; never mirrored.
-        return try self.loadScopeAlloc(allocator, scope, .mirrored);
+        return try self.loadScopeAlloc(allocator, scope, .mirrored, keys_only);
     }
 
     fn loadTipAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
         const self: *Sink = @ptrCast(@alignCast(ptr));
-        return try self.loadScopeAlloc(allocator, scope, .tip);
+        return try self.loadScopeAlloc(allocator, scope, .tip, false);
     }
 
-    fn loadScopeAlloc(self: *Sink, allocator: Allocator, scope: []const u8, which: enum { mirrored, tip }) ![]native_catalog_backend.Entry {
+    fn loadScopeAlloc(self: *Sink, allocator: Allocator, scope: []const u8, which: enum { mirrored, tip }, comptime keys_only: bool) ![]native_catalog_backend.Entry {
         var txn = try self.store.beginRead();
         defer txn.abort();
         const file = try txn.readFile();
@@ -365,19 +394,27 @@ pub const Sink = struct {
             }
             result.deinit(allocator);
         }
-        while (try cursor.nextRecordAlloc(allocator)) |record| {
-            defer allocator.free(record.key);
-            defer allocator.free(record.value);
-            if (try decodeAlloc(allocator, scope, record.key, record.value)) |entry| {
-                const is_tip = if (entry.namespace) |n| std.mem.eql(u8, n, native_catalog_backend.tip_namespace) else false;
-                if (is_tip != (which == .tip)) {
-                    if (entry.namespace) |n| allocator.free(n);
-                    allocator.free(entry.key);
-                    allocator.free(entry.value);
-                    continue;
-                }
-                try result.append(allocator, entry);
+        while (true) {
+            try result.ensureUnusedCapacity(allocator, 1);
+            const decoded = if (keys_only) entry: {
+                const record = (try cursor.next()) orelse break;
+                defer file.allocator.free(record.key);
+                break :entry try decodeAlloc(allocator, scope, record.key, "");
+            } else entry: {
+                const record = (try cursor.nextRecordAlloc(allocator)) orelse break;
+                defer allocator.free(record.key);
+                defer allocator.free(record.value);
+                break :entry try decodeAlloc(allocator, scope, record.key, record.value);
+            };
+            const entry = decoded orelse continue;
+            const is_tip = if (entry.namespace) |n| std.mem.eql(u8, n, native_catalog_backend.tip_namespace) else false;
+            if (is_tip != (which == .tip)) {
+                if (entry.namespace) |n| allocator.free(n);
+                allocator.free(entry.key);
+                allocator.free(entry.value);
+                continue;
             }
+            result.appendAssumeCapacity(entry);
         }
         return try result.toOwnedSlice(allocator);
     }
@@ -534,4 +571,12 @@ test "native catalog sink: a mid-stream index admission is visible to loadAllAll
     try std.testing.expectEqualStrings("seg-two", findEntry(reloaded, "segments", "range:0002").?);
     try std.testing.expectEqualStrings("seg-three", findEntry(reloaded, "segments", "range:0003").?);
     try std.testing.expectEqualStrings("768", findEntry(reloaded, "meta", "dims").?);
+
+    const keys = try iface.loadKeysAlloc.?(iface.ptr, a, scope);
+    defer freeEntries(a, keys);
+    try std.testing.expectEqual(reloaded.len, keys.len);
+    for (keys) |entry| {
+        try std.testing.expectEqualStrings("", entry.value);
+        try std.testing.expect(findEntry(reloaded, entry.namespace.?, entry.key) != null);
+    }
 }

@@ -69,30 +69,37 @@ const Row = struct {
     slices: usize = 0,
 };
 pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: options_mod.Options, registry: ?*dynamic.Session) !options_mod.Index {
+    var temporary = media.admission.TrackedAllocator{ .backing = a, .limit = options.decode.max_parameter_bytes, .reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{}) else .{} };
+    defer temporary.reservation.deinit();
+    defer std.debug.assert(temporary.live == 0);
+    return planHeaders(a, temporary.allocator(), reader, options, registry) catch |err| return if (err == error.OutOfMemory) temporary.denied orelse err else err;
+}
+
+fn planHeaders(a: std.mem.Allocator, scratch: std.mem.Allocator, reader: *media.mp4.Reader, options: options_mod.Options, registry: ?*dynamic.Session) !options_mod.Index {
     try reader.input.control.check();
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     if (reader.packets.len == 0) return error.EmptyVideo;
     if (reader.packets.len > options.max_packets or options.max_pictures == 0) return error.ResourceLimitExceeded;
-    const cfg0 = try h264.configParse(a, reader.track.avcc);
-    defer cfg0.groups.deinit(a);
+    const cfg0 = if (registry == null) try h264.configParse(a, reader.track.avcc) else null;
+    defer if (cfg0) |cfg| cfg.groups.deinit(a);
     const capacity = @min(reader.packets.len, options.max_pictures);
-    // Exact row storage plus a conservative hash-table/transient allocation
-    // allowance; no pixel/decode reservation is needed for this phase.
-    const bound = try std.math.mul(usize, capacity, @sizeOf(Row) + @sizeOf(h264.Picture) + 256);
+    // Frame-coded pictures finish within their access unit. In that case the
+    // only clip-sized allocation is the compact output index.
+    const fields = if (cfg0) |cfg| !cfg.frame_only else fields: {
+        for (registry.?.entries.items) |entry| if (!entry.config.frame_only) break :fields true;
+        break :fields false;
+    };
+    const row_bytes: usize = if (fields) @sizeOf(Row) + 256 else 0;
+    const bound = try std.math.mul(usize, capacity, @sizeOf(h264.Picture) + row_bytes);
     var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
     errdefer reservation.deinit();
-    // Header/coalescing temporaries have a separate fixed admitted ceiling;
-    // sparse reads must not hide uncharged ownership behind source leases.
-    var temporary_reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = options.decode.max_parameter_bytes }) else media.admission.Token{};
-    defer temporary_reservation.deinit();
-    var temporary = @import("decode_budget.zig").Budget{ .backing = a, .limit = options.decode.max_parameter_bytes };
-    defer std.debug.assert(temporary.live == 0);
-    const scratch = temporary.allocator();
-    const rows = try a.alloc(Row, capacity);
+    const rows = try a.alloc(Row, if (fields) capacity else 0);
     defer a.free(rows);
+    const pictures = try a.alloc(h264.Picture, capacity);
+    errdefer a.free(pictures);
     var lookup: std.AutoHashMap(u64, usize) = .init(a);
     defer lookup.deinit();
-    try lookup.ensureTotalCapacity(std.math.cast(u32, capacity) orelse return error.ResourceLimitExceeded);
+    if (fields) try lookup.ensureTotalCapacity(std.math.cast(u32, capacity) orelse return error.ResourceLimitExceeded);
     var count: usize = 0;
     var packet_index: usize = 0;
     var generation: u32 = 0;
@@ -107,7 +114,7 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
             }
         }
         if (reader.packets[packet_index].size > options.decode.max_packet_bytes) return error.ResourceLimitExceeded;
-        const cached = if (registry) |owner| (if (owner.header_packets.items.len == reader.packets.len) owner.header_packets.items else null) else null;
+        const cached = if (registry) |owner| owner.planningHeaders() else null;
         const bytes_before = reader.input.total_bytes;
         const bytes = if (cached) |packets| packets[packet_index] else try @import("h264_prefix.zig").packet(scratch, reader, packet_index, options.decode.max_packet_bytes);
         defer if (cached == null) scratch.free(bytes);
@@ -117,6 +124,7 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
         payload += initial_reads + span.extra_read_bytes;
         try @import("avc.zig").validatePortablePacket(span.bytes, reader.track.nal_length_bytes);
         var at: usize = 0;
+        var current: Row = undefined;
         var packet_row: ?usize = null;
         while (at < span.bytes.len) {
             try reader.input.control.check();
@@ -131,7 +139,7 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
                 const id = owner.packet_configs[packet_index];
                 if (id >= owner.entries.items.len) return error.MalformedVideoConfig;
                 break :blk owner.entries.items[id].config;
-            } else cfg0;
+            } else cfg0.?;
             const h = try header(nal, cfg);
             if (h.redundant != 0) continue;
             const lane: usize = @as(usize, h.plane) * 2 + h.parity;
@@ -139,7 +147,7 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
             var key = (@as(u64, generation) << 32) | (@as(u64, h.frame) << 1) | @intFromBool(h.reference);
             var existing = if (h.field) lookup.get(key) else packet_row;
             if (existing) |id| {
-                const row = &rows[id];
+                const row = if (fields) &rows[id] else &current;
                 if (row.lanes[lane]) |old| {
                     if (!std.meta.eql(old.poc, h.poc) or old.idr != h.idr or old.idr_id != h.idr_id or (h.first == 0 and row.starts & bit != 0 and row.picture.last_packet.? < packet_index)) {
                         if (row.mask != row.required) return error.IncompleteVideoPicture;
@@ -155,13 +163,14 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
                 if (count == capacity) return error.ResourceLimitExceeded;
                 const id = count;
                 count += 1;
-                rows[id] = .{ .picture = .{ .first_packet = packet_index, .last_packet = span.last, .pts = reader.packets[packet_index].pts, .duration = 0, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .bit_depth = cfg.bit_depth, .chroma_format = cfg.chroma_format }, .end = reader.packets[packet_index].pts, .required = if (cfg.separate_planes) (if (h.field) 63 else 21) else (if (h.field) 3 else 1) };
-                try lookup.put(key, id);
+                const row = if (fields) &rows[id] else &current;
+                row.* = .{ .picture = .{ .first_packet = packet_index, .last_packet = span.last, .pts = reader.packets[packet_index].pts, .duration = 0, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .bit_depth = cfg.bit_depth, .chroma_format = cfg.chroma_format }, .end = reader.packets[packet_index].pts, .required = if (cfg.separate_planes) (if (h.field) 63 else 21) else (if (h.field) 3 else 1) };
+                if (fields) try lookup.put(key, id);
                 break :blk id;
             };
             if (packet_row) |previous| if (previous != id) return error.MixedVideoPictures;
             packet_row = id;
-            const row = &rows[id];
+            const row = if (fields) &rows[id] else &current;
             if (row.picture.width != cfg.width or row.picture.height != cfg.height or row.picture.bit_depth != cfg.bit_depth or row.required != (if (cfg.separate_planes) (if (h.field) @as(u6, 63) else 21) else (if (h.field) @as(u6, 3) else 1))) return error.MixedVideoPictures;
             if (row.slices >= try std.math.mul(usize, options.decode.max_slices, if (cfg.separate_planes) 3 else 1)) return error.ResourceLimitExceeded;
             row.slices += 1;
@@ -169,29 +178,37 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
             if (h.first == 0) row.starts |= bit;
             row.lanes[lane] = h;
             row.picture.last_packet = span.last;
+        }
+        if (packet_row) |id| {
+            const row = if (fields) &rows[id] else &current;
             const members = if (span.partitioned) span.members.items else &.{packet_index};
             for (members) |member| {
                 const part = reader.packets[member];
                 row.picture.pts = @min(row.picture.pts, part.pts);
                 row.end = @max(row.end, try std.math.add(i64, part.pts, part.duration));
             }
+            if (!fields) pictures[id] = try finishRow(current);
         }
         packet_index = span.last;
     }
-    const pictures = try a.alloc(h264.Picture, count);
-    errdefer a.free(pictures);
-    for (rows[0..count], pictures) |row, *picture| {
-        if (row.mask != row.required) return error.IncompleteVideoPicture;
-        picture.* = row.picture;
-        picture.duration = std.math.cast(u32, std.math.sub(i64, row.end, row.picture.pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;
-    }
+    if (fields) for (rows[0..count], pictures[0..count]) |row, *picture| {
+        picture.* = try finishRow(row);
+    };
     const Less = struct {
         fn less(_: void, l: h264.Picture, r: h264.Picture) bool {
             return l.last_packet.? < r.last_packet.? or (l.last_packet.? == r.last_packet.? and l.first_packet < r.first_packet);
         }
     };
-    std.mem.sort(h264.Picture, pictures, {}, Less.less);
+    if (fields) std.mem.sort(h264.Picture, pictures[0..count], {}, Less.less);
     // Keep the peak reservation through deferred row/hash destruction. The
     // returned token is reduced by the caller after those owners are gone.
-    return .{ .allocator = a, .pictures = pictures, .timescale = reader.track.timescale, .packet_count = reader.packets.len, .payload_bytes = payload, .reservation = reservation };
+    const storage = if (count < capacity and a.resize(pictures, count)) pictures[0..count] else pictures;
+    return .{ .allocator = a, .pictures = storage[0..count], .storage = storage, .timescale = reader.track.timescale, .packet_count = reader.packets.len, .payload_bytes = payload, .reservation = reservation };
+}
+
+fn finishRow(row: Row) !h264.Picture {
+    if (row.mask != row.required) return error.IncompleteVideoPicture;
+    var picture = row.picture;
+    picture.duration = std.math.cast(u32, @as(i128, row.end) - picture.pts) orelse return error.TimestampOverflow;
+    return picture;
 }

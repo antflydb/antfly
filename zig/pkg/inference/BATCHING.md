@@ -245,15 +245,14 @@ all copies commit together, and capacity/allocation failures retain the original
 cache. This does not implement device-resident cache execution or multi-survivor
 device gather/scatter.
 
-`pipelines/seq2seq_decode.zig` provides request-owned incremental execution for
+`execution/seq2seq_runtime.zig` provides request-owned incremental execution for
 qualified merged exports with `use_cache_branch`, matching `past_key_values` /
 `present` self/cross-attention tensors, and concrete head dimensions. Generic
 seq2seq and transcription pipelines submit only newly appended tokens after
 prefill and reuse encoder K/V when subsequent outputs are empty. The adapter
-reuses `graph/onnx_kv_cache.zig`, preserves tensor lifetime/admission ownership,
-and reserves host KV residency against the existing KV ceiling before forwarding.
-Planning includes old-cache/replacement overlap. Cache state stays bound to one
-encoder context and request; it is not a second cross-request prefix cache.
+retains K/V in backend-owned storage and uses `graph/onnx_kv_cache.zig` to match
+cache input and output names. Admission accounts for overlapping previous and
+replacement K/V. Cache state belongs to a single encoder context and request.
 
 Existing native generation prefix caching and Florence incremental caching are
 unchanged. Other seq2seq layouts retain their existing path. Separate init/past

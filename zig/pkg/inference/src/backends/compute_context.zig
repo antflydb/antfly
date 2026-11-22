@@ -210,6 +210,10 @@ pub const BackendContext = union(enum) {
             .cuda => {
                 var owned = tensor;
                 defer owned.deinit();
+                if (owned.dtype == .f32) {
+                    const cb = self.computeBackend();
+                    return (try cb.fromReadOnlyBytes(owned.data, .f32, owned.shape)) orelse error.UnsupportedTensorType;
+                }
                 return self.importHostTensor(allocator, &owned);
             },
             .native => |*ctx| if (comptime build_options.enable_native)
@@ -245,10 +249,10 @@ pub const BackendContext = union(enum) {
                 defer allocator.free(values);
                 if (dtype != .f32) return error.UnsupportedTensorType;
                 const cb = self.computeBackend();
-                return (try cb.fromConstantBytes(std.mem.sliceAsBytes(values), .f32, shape)) orelse error.UnsupportedTensorType;
+                return (try cb.fromReadOnlyBytes(std.mem.sliceAsBytes(values), .f32, shape)) orelse error.UnsupportedTensorType;
             },
             .native => |*ctx| if (comptime build_options.enable_native)
-                ctx.compute.importOwnedDenseTensor("", dtype, shape, .{ .values = values, .allocator = allocator })
+                ctx.compute.importOwnedStaticDenseTensor("", dtype, shape, .{ .values = values, .allocator = allocator })
             else
                 unreachable,
             .metal_hosted => |*ctx| {
@@ -419,13 +423,25 @@ pub const SharedBackendContext = struct {
         return self.importHostTensorWithOperation(allocator, tensor, null);
     }
     pub fn importHostTensorWithOperation(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: *const Tensor, token: ?@import("../execution/backend_operation.zig").Borrowed) anyerror!ops_mod.CT {
+        return self.importHostTensorScoped(allocator, tensor, token, false);
+    }
+
+    pub fn importReadOnlyHostTensor(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: *const Tensor) anyerror!ops_mod.CT {
+        return self.importHostTensorScoped(allocator, tensor, null, true);
+    }
+
+    fn importHostTensorScoped(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: *const Tensor, token: ?@import("../execution/backend_operation.zig").Borrowed, read_only: bool) anyerror!ops_mod.CT {
         var scope: @import("../execution/backend_operation.zig").Scope = undefined;
         try @import("../execution/backend_operation.zig").enterInto(&self.backend, null, token, .legacy_unknown_frame, &scope);
         var succeeded = false;
         defer {
             if (succeeded) scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         }
-        const result = try self.ctx.importHostTensor(allocator, tensor);
+        const uploaded = if (read_only and self.backend.vtable.fromReadOnlyBytes != null and (tensor.dtype == .i32 or tensor.dtype == .i64))
+            try self.backend.fromReadOnlyBytes(tensor.data, if (tensor.dtype == .i32) .i32 else .i64, tensor.shape)
+        else
+            null;
+        const result = uploaded orelse try self.ctx.importHostTensor(allocator, tensor);
         succeeded = true;
         return result;
     }

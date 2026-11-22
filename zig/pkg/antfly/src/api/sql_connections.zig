@@ -100,10 +100,13 @@ fn reconcile(store: *transactions.DurableSessionStore, registry: *transactions.S
                 error.SessionLeaseLost, error.SqlTransactionOutcomeUnknown => return false,
                 else => return err,
             };
-        } else _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
-            error.SqlConnectionBusy => return false,
-            else => return err,
-        };
+        } else {
+            _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
+                error.SqlConnectionBusy => return false,
+                else => return err,
+            };
+            registry.evictDetachedSqlSession(txn_id);
+        }
     } else return false;
     return true;
 }
@@ -139,9 +142,11 @@ pub fn reconcileExpired(
     }
     if (expired == 0) return;
     const batch = @min(expired, 8);
-    const start = registry.connection_sweep_offset.fetchAdd(batch, .monotonic) % expired;
-    for (0..batch) |offset| {
-        const entry = entries[(start + offset) % expired];
+    for (0..batch) |_| {
+        // Advance only as far as we inspect. Errors or early successes must
+        // not skip the same unvisited suffix of a batch every sweep.
+        const offset = registry.connection_sweep_offset.fetchAdd(1, .monotonic) % expired;
+        const entry = entries[offset];
         const observed: ?Owned = switch (store.backend) {
             .docstore => |backend| blk: {
                 var txn = try backend.beginReadTxn();
@@ -412,6 +417,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             next.revision += 1;
             if (session.terminal_commit != null) next.overlay = session.setting_committed.items;
             try record.putTxn(txn, alloc, next);
+            try store.compactDetachedSqlSessionTxn(txn, session);
             break :blk 0;
         },
         .overlay => |change| blk: {
@@ -624,15 +630,19 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
     defer native.deinit();
     var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
     var registry = transactions.SessionRegistry.initWithLeaseTtl(&store, transactions.SessionLeaseStore.initFromDurable(&store), 60 * std.time.ns_per_s);
-    registry.durable_scope = .cluster_shared;
+    registry.max_sessions = 1;
     defer registry.deinit(alloc);
 
-    for ([_]bool{ false, true }, [_]u8{ 'a', 'b' }) |request_persisted, digit| {
+    try reconcileExpired(&store, &registry, alloc, 1);
+    var transaction_ids: [2][16]u8 = undefined;
+    for ([_]bool{ false, true }, [_]u8{ 'a', 'b' }, &transaction_ids) |request_persisted, digit, *saved_id| {
         const id: [32]u8 = @splat(digit);
         const txn_id = transactions.newSessionTxnId(7);
+        saved_id.* = txn_id;
+        registry.durable_scope = if (request_persisted) .cluster_shared else .node_local;
         _ = try mutate(&store, .{ .create = .{ .id = id, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 1);
         _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 1, .txn_id = txn_id } }, "alice", 7, 2);
-        _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
+        _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .prepared_completion_only = request_persisted, .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
         _ = try mutate(&store, .{ .bind = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2);
         const guard = try registry.mutation(alloc, txn_id, 7);
         if (request_persisted) {
@@ -640,6 +650,11 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
             defer session.deinit(alloc);
             session.commit_body_digest = @splat(4);
             try store.saveForTest(session, null);
+        }
+        const reference: [16]u8 = @splat(digit);
+        if (request_persisted) {
+            try std.testing.expectError(error.CompletionUnavailable, store.pinCompletion(txn_id, reference));
+            _ = try store.changeCompletionReference(txn_id, reference, false, null, .prepare);
         }
         if (request_persisted) _ = try mutate(&store, .{ .uncertain = .{ .id = id, .guard = guard } }, "alice", 7, 2);
         try reconcileExpired(&store, &registry, alloc, 999);
@@ -652,9 +667,22 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
         try std.testing.expectEqual(transactions.SessionDisposition.aborted, disposition.disposition);
         try std.testing.expectEqual(@as(u64, 0), disposition.lease_expires_at);
         try std.testing.expect((try registry.getStatusForPrincipal(alloc, txn_id, "bob")) == null);
-        var receipt = (try store.load(txn_id)).?;
-        defer receipt.deinit(alloc);
-        try std.testing.expect(receipt.terminal_abort and receipt.staged == null and receipt.execution_plan == null);
+        try std.testing.expect((try store.load(txn_id)) == null);
+        if (!request_persisted) try store.pinCompletion(txn_id, reference);
+        try std.testing.expect(try store.completionReferenceSettled(txn_id, reference));
+    }
+    try std.testing.expectEqual(@as(usize, 2), try registry.cleanupExpiredSqlAbortReceipts(alloc, std.math.maxInt(u64)));
+    for (transaction_ids, [_]u8{ 'c', 'd' }) |id, digit| {
+        try std.testing.expect((try registry.getStatusForPrincipal(alloc, id, "alice")) == null);
+        const delayed_reference: [16]u8 = @splat(digit);
+        if (digit == 'c') {
+            try store.pinCompletion(id, delayed_reference);
+            try std.testing.expect(try store.completionReferenceSettled(id, delayed_reference));
+        } else {
+            try std.testing.expectError(error.SqlTransactionOutcomeUnknown, store.pinCompletion(id, delayed_reference));
+            try std.testing.expect(!try store.completionSettled(id));
+            try std.testing.expect(try store.completionReferenceSettled(id, @splat('b')));
+        }
     }
 }
 

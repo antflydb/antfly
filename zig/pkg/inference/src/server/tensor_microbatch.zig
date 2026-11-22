@@ -19,7 +19,10 @@
 const std = @import("std");
 const platform = @import("antfly_platform");
 const session_mod = @import("../backends/session.zig");
-const Tensor = @import("../backends/tensor.zig").Tensor;
+const tensor_mod = @import("../backends/tensor.zig");
+const Tensor = tensor_mod.Tensor;
+const ops = @import("../ops/ops.zig");
+const StageInput = session_mod.StageInput;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const micro = @import("executor_microbatch.zig");
 
@@ -33,7 +36,20 @@ const ResidentBatch = struct {
     outputs: *session_mod.ResidentOutputs,
     columns: []Column,
     total: usize,
-    const Column = struct { shape: []i64, flat: @import("../ops/ops.zig").CT, width: usize };
+    const Column = struct { shape: []i64, flat: ?@import("../ops/ops.zig").CT, width: usize };
+
+    fn omittedCrossCache(session: session_mod.Session, name: []const u8, shape: []const i64, total: usize) bool {
+        if (session.cached_decoder_geometry == null or shape.len != 4) return false;
+        const suffix = @import("../graph/onnx_kv_cache.zig").presentOutputSuffix(name) orelse return false;
+        if (std.mem.indexOf(u8, suffix, ".encoder.") == null) return false;
+        if (shape[0] != 0 and shape[0] != total) return false;
+        var empty = false;
+        for (shape) |dim| {
+            if (dim < 0) return false;
+            empty = empty or dim == 0;
+        }
+        return empty;
+    }
 
     fn reshape(backend: *const @import("../ops/ops.zig").ComputeBackend, value: @import("../ops/ops.zig").CT, shape: []const i64) !@import("../ops/ops.zig").CT {
         switch (backend.kind()) {
@@ -60,7 +76,7 @@ const ResidentBatch = struct {
         var built: usize = 0;
         errdefer {
             for (columns[0..built]) |column| {
-                outputs.backend.free(column.flat);
+                if (column.flat) |flat| outputs.backend.free(flat);
                 allocator.free(column.shape);
             }
             allocator.free(columns);
@@ -69,6 +85,13 @@ const ResidentBatch = struct {
             if (info.dtype != .f32 or try outputs.backend.tensorDType(value) != .f32) return error.InvalidFusedOutputShape;
             const shape = try outputs.backend.tensorShape(value, allocator);
             errdefer allocator.free(shape);
+            if (omittedCrossCache(session, info.name, shape, total)) {
+                // An omitted cross-cache has no rows to gather. Keep the
+                // empty value so each request can reuse its previous cache.
+                column.* = .{ .shape = shape, .flat = null, .width = 0 };
+                built += 1;
+                continue;
+            }
             if (shape.len == 0 or shape.len > 8 or shape[0] != total) return error.InvalidFusedOutputShape;
             var width: usize = 1;
             for (shape[1..]) |dim| {
@@ -91,7 +114,7 @@ const ResidentBatch = struct {
         // scope as construction; no nested gate acquisition or network wait.
         defer self.operation_scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         for (self.columns) |column| {
-            self.outputs.backend.free(column.flat);
+            if (column.flat) |flat| self.outputs.backend.free(flat);
             self.allocator.free(column.shape);
         }
         self.allocator.free(self.columns);
@@ -107,18 +130,90 @@ const ResidentBatch = struct {
             self.allocator.free(views);
         }
         for (self.columns, views) |column, *view| {
-            const slice = try cb.vtable.sliceRows2D.?(cb.ptr, column.flat, start, count, column.width);
-            defer cb.free(slice);
             var shape: [8]i64 = undefined;
             @memcpy(shape[0..column.shape.len], column.shape);
-            shape[0] = std.math.cast(i64, count) orelse return error.ResourceLimitExceeded;
-            view.* = try reshape(cb, slice, shape[0..column.shape.len]);
+            if (shape[0] != 0) shape[0] = std.math.cast(i64, count) orelse return error.ResourceLimitExceeded;
+            if (column.flat) |flat| {
+                const slice = try cb.vtable.sliceRows2D.?(cb.ptr, flat, start, count, column.width);
+                defer cb.free(slice);
+                view.* = try reshape(cb, slice, shape[0..column.shape.len]);
+            } else {
+                // Construct the zero-byte value directly. Reshape may use
+                // ONNX's zero-as-copy-dimension rule for an empty tensor.
+                var dimensions: [8]i32 = undefined;
+                for (shape[0..column.shape.len], 0..) |dim, axis| dimensions[axis] = std.math.cast(i32, dim) orelse return error.ResourceLimitExceeded;
+                view.* = try cb.fromFloat32Shape(&.{}, dimensions[0..column.shape.len]);
+            }
             built += 1;
         }
         // Failure leaves the newly created CTs/vector owned by this function.
         return self.outputs.ownViewsOf(self.allocator, views);
     }
 };
+
+test "tensor microbatch recognizes only qualified omitted cross-cache columns" {
+    var marker: u8 = 0;
+    const session: session_mod.Session = .{ .ptr = &marker, .vtable = undefined, .cached_decoder_geometry = .{ .vocab_size = 4 } };
+    try std.testing.expect(ResidentBatch.omittedCrossCache(session, "present.0.encoder.key", &.{ 0, 2, 0, 4 }, 3));
+    try std.testing.expect(ResidentBatch.omittedCrossCache(session, "present.0.encoder.value", &.{ 3, 2, 0, 4 }, 3));
+    try std.testing.expect(!ResidentBatch.omittedCrossCache(session, "present.0.decoder.key", &.{ 0, 2, 0, 4 }, 3));
+    try std.testing.expect(!ResidentBatch.omittedCrossCache(session, "present.0.encoder.key", &.{ 1, 2, 0, 4 }, 3));
+    try std.testing.expect(!ResidentBatch.omittedCrossCache(session, "present.0.encoder.key", &.{ 3, 2, -1, 4 }, 3));
+}
+
+test "tensor microbatch resident output scatters empty cross-cache without slicing" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        fn outputInfo(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{
+                .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1, 2 } },
+                .{ .name = "present.0.encoder.key", .dtype = .f32, .shape = &.{ -1, 2, -1, 4 } },
+            };
+        }
+    };
+    for ([_]@import("../backends/backends.zig").BackendType{ .native, .metal }) |kind| {
+        const options = @import("build_options");
+        if (kind == .native and comptime !options.enable_native) continue;
+        if (kind == .metal and comptime !options.enable_metal) continue;
+        if (kind == .metal and !@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
+        var provider = try @import("../backends/compute_context.zig").BackendContext.init(a, kind, null);
+        defer provider.deinit(a);
+        const backend = provider.computeBackend();
+        var marker: u8 = 0;
+        const session: session_mod.Session = .{
+            .ptr = &marker,
+            .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = Probe.outputInfo, .backend = undefined, .close = undefined },
+            .cached_decoder_geometry = .{ .vocab_size = 2 },
+        };
+        for ([_]i64{ 0, 2 }) |batch| {
+            var logits = try Tensor.initFloat32(a, "logits", &.{ 2, 1, 2 }, &.{ 1, 2, 3, 4 });
+            defer logits.deinit();
+            var empty = try Tensor.initFloat32(a, "present.0.encoder.key", &.{ batch, 2, 0, 4 }, &.{});
+            defer empty.deinit();
+            const outputs = try a.alloc(@import("../ops/ops.zig").CT, 2);
+            {
+                errdefer a.free(outputs);
+                outputs[0] = try provider.importHostTensor(a, &logits);
+                errdefer backend.free(outputs[0]);
+                outputs[1] = try provider.importHostTensor(a, &empty);
+            }
+            var owner: session_mod.ResidentOutputs = .{ .outputs = outputs, .backend = &backend, .allocator = a };
+            defer owner.deinit();
+            var row = output: {
+                var batch_outputs = try ResidentBatch.init(a, &owner, session, 2);
+                defer batch_outputs.deinit();
+                break :output try batch_outputs.rows(1, 1);
+            };
+            defer row.deinit();
+            const shape = try backend.tensorShape(row.outputs[1], a);
+            defer a.free(shape);
+            try std.testing.expectEqualSlices(i64, &.{ if (batch == 0) 0 else 1, 2, 0, 4 }, shape);
+            const values = try backend.toFloat32(row.outputs[0], a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, values);
+        }
+    }
+}
 
 const Ticket = struct {
     session: session_mod.Session,
@@ -127,6 +222,7 @@ const Ticket = struct {
     inputs: []const Tensor,
     control: ?Control,
     rows: usize,
+    stage: ?[]const StageInput = null,
 };
 
 test "tensor microbatch retained cross output does not pin obsolete columns" {
@@ -157,12 +253,9 @@ test "tensor microbatch retained cross output does not pin obsolete columns" {
     first[0].deinit();
     second[0].deinit();
     try std.testing.expectEqual(retained.host_scratch_bytes / 2, controller.snapshot().host_scratch_bytes);
-    try std.testing.expect(!try session.compactExclusiveRows(alloc, second[1..], 0, null));
+
     first[1].deinit();
     try std.testing.expectEqual(retained.host_scratch_bytes / 2, controller.snapshot().host_scratch_bytes);
-    try std.testing.expect(try session.compactExclusiveRows(alloc, second[1..], 0, null));
-    try std.testing.expectEqual(@as(usize, 24), controller.snapshot().hostTotalBytes());
-    try std.testing.expectEqual(second[1].data.len, second[1].shared_storage.?.len);
     try std.testing.expectEqualSlices(f32, &.{ 7, 8 }, second[1].asFloat32());
     second[1].deinit();
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
@@ -183,13 +276,6 @@ const SharedOutputs = struct {
         owner: *SharedOutputs,
         index: usize,
         refs: std.atomic.Value(usize) = .init(1),
-
-        fn isExclusive(raw: *anyopaque) bool {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            // The producer's root reference prevents exclusivity until all
-            // views have been published. No new views can be created afterward.
-            return self.refs.load(.acquire) == 1;
-        }
 
         fn release(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -237,7 +323,7 @@ const SharedOutputs = struct {
                 .allocator = self.allocator,
                 .owns_data = false,
                 .owns_shape = true,
-                .lifetime = .{ .context = column, .release = Column.release, .is_exclusive = Column.isExclusive },
+                .lifetime = .{ .context = column, .release = Column.release },
                 .shared_storage = tensor.data,
                 .admitted_storage_domain = if (self.permit) |permit| if (permit.lease) |lease| lease.controller else null else null,
             };
@@ -269,11 +355,94 @@ test "tensor microbatch explicit collection override preserves zero and bounded 
 }
 
 pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) ![]Tensor {
-    return runMode(.host, broker, allocator, io, task, session, permit, gate, inputs, control, deadline, wait_us);
+    return runMode(.host, broker, allocator, io, task, session, permit, gate, inputs, null, control, deadline, wait_us);
 }
 
 pub fn runResident(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) !session_mod.ResidentOutputs {
-    return runMode(.resident, broker, allocator, io, task, session, permit, gate, inputs, control, deadline, wait_us);
+    return runMode(.resident, broker, allocator, io, task, session, permit, gate, inputs, null, control, deadline, wait_us);
+}
+
+pub fn runStage(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, gate: *std.atomic.Mutex, inputs: []const StageInput, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) !session_mod.ResidentOutputs {
+    if (!session.supportsStageInputs(inputs)) return error.UnexpectedResidentStageDecline;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const views = try arena.allocator().alloc(Tensor, inputs.len);
+    for (inputs, session.inputInfo(), views) |value, info, *view| {
+        view.* = switch (value) {
+            .host => |host| host,
+            .resident => |resident| .{
+                .name = info.name,
+                .dtype = info.dtype,
+                .shape = if (resident.shape.len != 0) resident.shape else try resident.backend.tensorShape(resident.value, arena.allocator()),
+                .data = &.{},
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            },
+        };
+    }
+    return runMode(.resident, broker, allocator, io, task, session, null, gate, views, inputs, control, deadline, wait_us);
+}
+
+fn eligibleStage(session: session_mod.Session, views: []const Tensor, inputs: []const StageInput) bool {
+    if (session.cached_decoder_geometry == null or session.run_admission == null or session.vtable.independentBatchRows != null or inputs.len == 0) return false;
+    const policy = session.run_admission.?;
+    const domain = if (session.model_lifetime) |model| model.admission_domain else null;
+    if (domain == null or domain.?.controller() != policy.controller) return false;
+    const shared = session.shared_compute_context orelse return false;
+    const backend = shared.stableBackend();
+    if ((backend.kind() != .native and backend.kind() != .metal and backend.kind() != .cuda) or backend.vtable.copyRows2D == null or backend.vtable.sliceRows2D == null) return false;
+    const kernels = backend.vtable.kernels orelse return false;
+    if (!kernels.accepts(backend.vtable) or kernels.physical_storage_policy == null or kernels.physicalTensorView == null or
+        (backend.kind() == .cuda and kernels.createPhysicalCompletion == null)) return false;
+    const first = views[0].shape;
+    if (first.len == 0 or first[0] < 1) return false;
+    for (inputs, views, session.inputInfo()) |value, view, declared| {
+        if (view.shape.len > 8 or view.shape.len != declared.shape.len) return false;
+        if (session.isBroadcastInput(view.name)) {
+            if (value != .host or !validTensor(view) or view.data.len == 0 or view.data.len > 8 or !std.mem.eql(i64, view.shape, declared.shape)) return false;
+            continue;
+        }
+        if (view.shape.len == 0 or view.shape[0] != first[0] or declared.shape[0] > 0) return false;
+        for (view.shape[1..], declared.shape[1..]) |actual, expected| if (actual < 0 or (expected > 0 and expected != actual)) return false;
+        switch (value) {
+            .host => if (!validTensor(view)) return false,
+            .resident => |resident| if (declared.dtype != .f32 or resident.estimated_bytes != (denseBytes(view.shape, @sizeOf(f32)) catch return false) or !denseDeviceInput(backend, resident.value, view.shape)) return false,
+        }
+    }
+    for (session.outputInfo()) |info| if (info.dtype != .f32 or info.shape.len == 0 or info.shape[0] > 0) return false;
+    return true;
+}
+
+fn denseDeviceInput(backend: *const ops.ComputeBackend, value: ops.CT, shape: []const i64) bool {
+    const ownership = @import("../execution/storage_ownership.zig");
+    const Proof = struct {
+        const Self = @This();
+        kind: @import("../graph/backend_contracts.zig").BackendKind,
+        shape: @import("ml").graph.Shape,
+        valid: bool = false,
+
+        fn visit(raw: *anyopaque, report: ownership.Report) !void {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            const plane = switch (report) {
+                .plane => |span| span,
+                .backing => return,
+            };
+            if (plane.role != .primary) return;
+            const backing = plane.backing orelse return;
+            if (backing.base == 0 or (backing.kind == .host) != (self.kind == .native) or plane.descriptor.resident_backend != self.kind or
+                plane.descriptor.current_backend != self.kind or plane.descriptor.quant_format != null) return;
+            const actual = plane.descriptor.shape;
+            if (actual.rank() > actual.dims.len) return;
+            const dense = @import("../graph/backend_contracts.zig").TensorStrides.dense(self.shape);
+            if (plane.descriptor.strides.rank != dense.rank or !std.mem.eql(i64, plane.descriptor.strides.values[0..dense.rank], dense.values[0..dense.rank])) return;
+            self.valid = @import("../execution/assigned_kernel_route.zig").denseShapeExtentMatches(self.shape, actual.dtype, actual.dims[0..actual.rank()], plane.logical_bytes, plane.readable_bytes, null);
+        }
+    };
+    var proof: Proof = .{ .kind = backend.kind(), .shape = @import("ml").graph.Shape.init(.f32, shape) };
+    const query = backend.vtable.kernels.?.storageOwnership orelse return false;
+    const coverage = query(backend.ptr, value, .{ .context = &proof, .visit = Proof.visit }) catch return false;
+    return coverage == .complete and proof.valid;
 }
 
 const OutputPlacement = enum { host, resident };
@@ -287,18 +456,23 @@ fn destroyMode(comptime placement: OutputPlacement, allocator: std.mem.Allocator
     }
 }
 
-fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) !OutputType(placement) {
+fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, stage: ?[]const StageInput, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) !OutputType(placement) {
     if (control) |active| try active.check();
     // A resident result owns its execution lease. Keep a reusable supplied
     // permit in yielded input-residency mode even on the direct path.
     if (comptime placement == .resident) if (permit) |borrowed| {
         if (!try borrowed.yieldExecution() and borrowed.lease != null) return error.MissingRunRequest;
     };
-    if (!eligible(session, inputs)) return directMode(placement, allocator, .{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = 1 });
+    const ticket = Ticket{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = if (inputs.len != 0 and inputs[0].shape.len != 0 and inputs[0].shape[0] > 0) @intCast(inputs[0].shape[0]) else 1, .stage = stage };
+    // CPU packing has no device-transfer savings. Use the serial resident
+    // path by default until fused CPU decoding is qualified on real models.
+    const serial_cpu_stage = stage != null and session.backend() == .native and (wait_us orelse 0) == 0;
+    if (serial_cpu_stage or !(if (stage) |mixed| eligibleStage(session, inputs, mixed) else eligible(session, inputs)))
+        return directMode(placement, allocator, ticket);
     const alloc = std.heap.smp_allocator;
     var signature = std.Io.Writer.Allocating.init(allocator);
     defer signature.deinit();
-    try signature.writer.print("{s};", .{@tagName(placement)});
+    try signature.writer.print("{s};{s};", .{ @tagName(placement), if (stage != null) "stage" else "tensor" });
     try signature.writer.print("{d}:{d};", .{ @intFromPtr(session.vtable), @intFromPtr(gate) });
     try std.json.Stringify.value(session.output_geometry, .{}, &signature.writer);
     try std.json.Stringify.value(session.cached_decoder_geometry, .{}, &signature.writer);
@@ -314,18 +488,22 @@ fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator
         .backend = admission.backend_class,
         .limits = admission.limits,
         .workspace = admission.static_workspace_bytes,
+        .workspace_kind = admission.static_workspace_kind,
+        .opaque_workspace = admission.opaque_workspace_bytes,
         .workspace_reserved = admission.backend_workspace_reserved,
+        .required_residency = admission.required_residency,
+        .residency_source = if (admission.residency_source) |source| @intFromPtr(source) else 0,
         .profile = admission.model_profile,
         .check_live_memory = admission.check_live_memory,
     }, .{}, &signature.writer);
     var bytes: usize = 0;
-    for (inputs) |tensor| {
-        bytes = try std.math.add(usize, bytes, tensor.data.len);
+    for (inputs, 0..) |tensor, column| {
+        const device_bytes = if (stage) |mixed| if (mixed[column] == .resident) mixed[column].resident.estimated_bytes else 0 else 0;
+        bytes = try std.math.add(usize, bytes, try std.math.add(usize, tensor.data.len, device_bytes));
         const broadcast = session.isBroadcastInput(tensor.name);
-        try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = if (broadcast) tensor.shape else tensor.shape[1..], .value = if (broadcast) tensor.data else &.{} }, .{}, &signature.writer);
+        try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = if (broadcast) tensor.shape else tensor.shape[1..], .value = if (broadcast) tensor.data else &.{}, .device = if (stage) |mixed| mixed[column] == .resident else false }, .{}, &signature.writer);
     }
-    const ticket = Ticket{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = @intCast(inputs[0].shape[0]) };
-    const policy = session.forwardBatchPolicy(inputs);
+    const policy: session_mod.ForwardBatchPolicy = if (stage != null) .{} else session.forwardBatchPolicy(inputs);
     const max_items = @min(@as(usize, 8), policy.max_items);
     const max_rows = @min(@as(usize, 64), policy.max_rows);
     if (max_items == 0 or max_rows == 0) return error.InvalidMicrobatchLimits;
@@ -397,6 +575,18 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
 pub const runSerial = @import("../execution/tensor_dispatch.zig").runSerial;
 const runPreparedHost = @import("../execution/tensor_dispatch.zig").runHost;
 
+fn stageInfo(allocator: std.mem.Allocator, tensors: []const Tensor) ![]tensor_mod.TensorInfo {
+    const info = try allocator.alloc(tensor_mod.TensorInfo, tensors.len);
+    for (info, tensors) |*target, tensor| target.* = .{ .name = tensor.name, .dtype = tensor.dtype, .shape = tensor.shape };
+    return info;
+}
+
+fn admitStage(session: session_mod.Session, tensors: []const Tensor, inputs: []const StageInput, rows: usize, allocator: std.mem.Allocator, control: ?Control) !session_mod.RunPermit {
+    const info = try stageInfo(allocator, tensors);
+    defer allocator.free(info);
+    return session.admitShapeRequestBeforeExecution(.{ .stage_inputs = .{ .info = info, .values = inputs } }, try session.planShapes(info, rows), allocator, control);
+}
+
 fn directMode(comptime placement: OutputPlacement, allocator: std.mem.Allocator, ticket: Ticket) !OutputType(placement) {
     if (comptime placement == .host) if (ticket.permit == null) return runPreparedHost(allocator, ticket.session, ticket.gate, ticket.inputs, ticket.control);
     const control = ticket.control orelse Control{};
@@ -414,6 +604,8 @@ fn directMode(comptime placement: OutputPlacement, allocator: std.mem.Allocator,
     // quota policy. Only request-owning permits split off fresh execution.
     var owned_execution: ?session_mod.RunPermit = if (ticket.permit) |permit|
         if (permit.request != null) try permit.acquireExecutionInputsBeforeExecution(.{ .host = ticket.inputs }, allocator, ticket.control) else null
+    else if (ticket.stage) |mixed|
+        try admitStage(ticket.session, ticket.inputs, mixed, ticket.rows, allocator, ticket.control)
     else
         try ticket.session.admitInputsBeforeExecution(ticket.inputs, allocator, ticket.control);
     defer if (owned_execution) |*execution| execution.deinitWithCleanup(.{ .boundary = cleanup_owner.epoch() });
@@ -427,7 +619,10 @@ fn directMode(comptime placement: OutputPlacement, allocator: std.mem.Allocator,
     try ticket.session.acquireSelectedCohort(control, &cohort_waiter);
     defer ticket.session.releaseSelectedCohortGate(&cohort_waiter);
     if (comptime placement == .resident) {
-        var outputs = (try execution.runResidentWithControl(ticket.inputs, allocator, ticket.control)) orelse return error.UnexpectedResidentStageDecline;
+        var outputs = (if (ticket.stage) |mixed|
+            try execution.runStageInputsWithControl(mixed, allocator, ticket.control)
+        else
+            try execution.runResidentWithControl(ticket.inputs, allocator, ticket.control)) orelse return error.UnexpectedResidentStageDecline;
         errdefer outputs.deinitWithBoundary(cleanup_owner.epoch());
         _ = try cleanup_owner.retainThroughBackend(outputs.backend);
         if (owned_execution != null and outputs.resource_lease == null) {
@@ -504,6 +699,155 @@ fn subdivideMode(comptime placement: OutputPlacement, items: []const micro.Execu
     }
 }
 
+const GatheredInputs = struct {
+    backend: *const ops.ComputeBackend,
+    values: []StageInput,
+    initialized: usize = 0,
+    allocator: std.mem.Allocator,
+    has_device_storage: bool = false,
+
+    fn deinit(self: *GatheredInputs, epoch: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        for (self.values[0..self.initialized]) |input| if (input == .resident) self.backend.freeWithBoundary(input.resident.value, epoch);
+        self.allocator.free(self.values);
+    }
+};
+
+fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, tensors: []const Tensor, allocator: std.mem.Allocator, control: Control, waiter: *@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter, epoch: *const @import("../execution/retirement_sink.zig").Epoch) !GatheredInputs {
+    const storage = @import("../ops/physical_storage.zig");
+    const fatal = platform.inference_process_supervisor.restartWorker;
+    const backend = first.session.shared_compute_context.?.stableBackend();
+    const kernels = backend.vtable.kernels.?;
+    const prepared_storage = @import("../execution/prepared_storage_admission.zig");
+    var requirements: std.ArrayList(prepared_storage.Requirement) = .empty;
+    defer requirements.deinit(allocator);
+    var bytes: usize = 0;
+    for (first.stage.?, tensors) |source, tensor| if (source == .resident) {
+        const size = try denseBytes(tensor.shape, @sizeOf(f32));
+        const bound = try storage.reservationBytes(backend.*, .{ .byte_size = size, .admitted = true });
+        bytes = try std.math.add(usize, bytes, bound);
+        try requirements.append(allocator, .{ .backend = backend.kind(), .class = .activation, .bytes = bound });
+    };
+    const storage_admission = @import("../execution/storage_admission.zig");
+    const Reserve = struct {
+        lease: *@import("../runtime/tier/memory.zig").AdmissionLease,
+        policy: storage_admission.Policy,
+        credit: @import("../runtime/tier/memory.zig").AdmissionAmounts,
+
+        fn take(raw: *anyopaque, a: std.mem.Allocator, backend_kind: @import("../graph/backend_contracts.zig").BackendKind, class: @import("../execution/storage_accounting.zig").Class, size: usize) !storage_admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return storage_admission.fromRunLease(a, self.lease, self.policy, backend_kind, class, size);
+        }
+    };
+    const values = try allocator.alloc(StageInput, tensors.len);
+    var result = GatheredInputs{ .backend = backend, .values = values, .allocator = allocator, .has_device_storage = bytes != 0 };
+    errdefer result.deinit(epoch);
+    if (bytes == 0) {
+        for (tensors, values) |tensor, *value| value.* = .{ .host = tensor };
+        result.initialized = values.len;
+        return result;
+    }
+
+    const host = backend.kind() == .native;
+    var permit = try first.session.admitRetainedMedia(if (host) bytes else 0, if (host) 0 else bytes);
+    defer permit.deinit();
+    const policy = first.session.run_admission.?;
+    var domain = if (first.session.model_lifetime) |model| model.retainAdmissionDomain(policy.controller) else null;
+    defer if (domain) |*pin| pin.release();
+    var reserve: Reserve = .{
+        .lease = if (permit.lease) |*lease| lease else return error.ResidentGatherUnavailable,
+        .policy = .{
+            .controller = policy.controller,
+            .backend_class = policy.backend_class,
+            .limits = policy.limits,
+            .check_live_memory = policy.check_live_memory,
+            .lifetime = if (domain) |pin| storage_admission.Lifetime.forAdmissionDomain(pin) else null,
+        },
+        .credit = if (host) .{ .host_scratch_bytes = bytes } else .{ .backend_scratch_bytes = bytes },
+    };
+    reserve.policy.credit = &reserve.credit;
+    const identity: storage_admission.Identity = .{ .controller = policy.controller, .backend_class = policy.backend_class };
+    const prepared = (try prepared_storage.Prepared.prepare(.{
+        .identity = identity,
+        .context = &reserve,
+        .services = &.{ .reserve = Reserve.take },
+    }, requirements.items)) orelse return error.ResidentGatherUnavailable;
+    defer prepared.finishInvocationWithBoundary(epoch);
+    try prepared.bindConstructionEpoch(epoch);
+    const capability = prepared_storage.Prepared.forDispatch(prepared, identity);
+    var protection = try control.enterUninterruptible(first.session.interruption());
+    defer protection.deinit();
+    try first.session.acquireSelectedCohort(control, waiter);
+    defer first.session.releaseSelectedCohortGate(waiter);
+    var scope = try @import("../execution/backend_operation.zig").enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame);
+    defer scope.deinitChecked() catch fatal();
+    if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return error.ResidentGatherUnavailable;
+
+    for (first.stage.?, tensors, values) |source, tensor, *value| {
+        value.* = if (source == .resident) blk: {
+            const size = try denseBytes(tensor.shape, @sizeOf(f32));
+            const lease = (try storage.Lease.createAdmitted(allocator, backend.*, size, null, .activation, capability)) orelse return error.ResidentGatherUnavailable;
+            defer lease.releaseWithBoundary(epoch);
+            if (lease.backing_byte_size == null) return error.ResidentGatherUnavailable;
+            var dims: [8]i32 = undefined;
+            for (tensor.shape, dims[0..tensor.shape.len]) |dim, *dest| dest.* = std.math.cast(i32, dim) orelse return error.ResidentGatherUnavailable;
+            const ct = (try kernels.physicalTensorView.?(backend.ptr, .{ .storage = lease, .shape = dims[0..tensor.shape.len] })) orelse return error.ResidentGatherUnavailable;
+            break :blk .{ .resident = .{ .value = ct, .backend = backend, .shape = tensor.shape, .estimated_bytes = size } };
+        } else .{ .host = tensor };
+        result.initialized += 1;
+    }
+
+    // One completion covers every packed cache column. No source or
+    // destination may retire until all queued copies have completed.
+    const event = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
+    defer if (event) |completion| completion.deinit();
+    {
+        defer if (event) |completion| {
+            completion.record() catch fatal();
+            completion.wait() catch fatal();
+        };
+        const metal_frame = backend.kind() == .metal and try backend.decoderRuntimeBeginFrame();
+        var recording = metal_frame;
+        defer if (recording and backend.decoderRuntimeHasActiveFrame()) backend.decoderRuntimeCancelFrame() catch fatal();
+        const transfers = @import("../execution/transfer_audit.zig");
+        var audit: transfers.Audit = .{ .forbid_device_host_access = true };
+        try transfers.begin(&audit);
+        defer transfers.end();
+        for (values, 0..) |destination, column| if (destination == .resident) {
+            const width = try denseBytes(destination.resident.shape[1..], 1);
+            if (kernels.gatherDeviceRows) |gather| {
+                var sources: [8]ops.CT = undefined;
+                for (items, sources[0..items.len]) |item, *source| source.* = item.payloadAs(Ticket).stage.?[column].resident.value;
+                try gather(backend.ptr, destination.resident.value, sources[0..items.len]);
+            } else {
+                const target = if (backend.kind() == .native)
+                    (kernels.pooledOutputStorage.?(backend.ptr, destination.resident.value) orelse return error.ResidentGatherUnavailable).tensor
+                else
+                    destination.resident.value;
+                var start: usize = 0;
+                for (items) |item| {
+                    const ticket = item.payloadAs(Ticket);
+                    const source = ticket.stage.?[column].resident;
+                    if (!try backend.vtable.copyRows2D.?(backend.ptr, target, start, source.value, 0, ticket.rows, width)) return error.ResidentGatherUnavailable;
+                    start += ticket.rows;
+                }
+            }
+        };
+        if (metal_frame) {
+            try backend.decoderRuntimeSubmitFrame();
+            recording = false;
+            try backend.decoderRuntimeWaitSubmittedFrame();
+        }
+    }
+    try scope.finish();
+    return result;
+}
+
+fn denseBytes(shape: []const i64, element_bytes: usize) !usize {
+    var size = element_bytes;
+    for (shape) |dim| size = try std.math.mul(usize, size, std.math.cast(usize, dim) orelse return error.InvalidInputShape);
+    return size;
+}
+
 fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.ExecuteItem) !void {
     if (items.len == 0) return;
     if (items.len == 1) {
@@ -524,10 +868,11 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
             bytes = try std.math.add(usize, bytes, tensor.data.len);
         }
     }
-    var request = try first.session.planRun(first.inputs, rows);
+    var request = if (first.stage == null) try first.session.planRun(first.inputs, rows) else session_mod.RunRequest{ .batch = rows };
     request.input_bytes = bytes;
     request.pre_admitted_host_bytes = 0;
     for (first.inputs, 0..) |_, column| {
+        if (first.stage) |mixed| if (mixed[column] == .resident) continue;
         const borrowing = sharedColumn(items, column) != null;
         if (!borrowing and !first.session.isBroadcastInput(first.inputs[column].name)) {
             packed_input_bytes = try std.math.add(usize, packed_input_bytes, try std.math.mul(usize, first.inputs[column].data.len / first.rows, rows));
@@ -615,6 +960,11 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
         const shape = try alloc.dupe(i64, input.shape);
         errdefer alloc.free(shape);
         shape[0] = @intCast(rows);
+        if (first.stage) |mixed| if (mixed[column] == .resident) {
+            batch_inputs[column] = .{ .data = &.{}, .shape = shape, .dtype = input.dtype, .name = input.name, .allocator = alloc, .owns_data = false, .owns_shape = true };
+            initialized += 1;
+            continue;
+        };
         const shared = sharedColumn(items, column);
         const data = shared orelse try alloc.alloc(u8, input.data.len / first.rows * rows);
         var offset: usize = 0;
@@ -626,8 +976,36 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
         batch_inputs[column] = .{ .data = data, .shape = shape, .dtype = input.dtype, .name = input.name, .allocator = alloc, .owns_data = shared == null, .owns_shape = true };
         initialized += 1;
     }
-    var permit = first.session.admitShapeRequestBeforeExecution(.{ .tensors = batch_inputs }, request, alloc, control) catch |err| switch (err) {
+    var gathered: ?GatheredInputs = null;
+    defer if (gathered) |*owned| owned.deinit(cleanup_owner.epoch());
+    if (first.stage != null) {
+        gathered = gatherStageInputs(first, items, batch_inputs, alloc, control, &cohort_waiter, cleanup_owner.epoch().?) catch |err| switch (err) {
+            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.ResidentGatherUnavailable, error.PhysicalStorageAllocationDeclined => {
+                destroy(alloc, batch_inputs);
+                owns_inputs = false;
+                preparation.deinit();
+                preparation_open = false;
+                first.session.leaveSelectedCohort(&cohort_waiter);
+                cohort_owned = false;
+                return subdivideMode(placement, items);
+            },
+            else => return err,
+        };
+    }
+    const mixed_info = if (gathered != null) try stageInfo(alloc, batch_inputs) else null;
+    defer if (mixed_info) |owned| alloc.free(owned);
+    if (mixed_info) |declared| {
+        const pre_admitted = request.pre_admitted_host_bytes;
+        const host_preprocess = request.host_preprocess_bytes;
+        request = try first.session.planShapes(declared, rows);
+        request.pre_admitted_host_bytes = pre_admitted;
+        request.host_preprocess_bytes = host_preprocess;
+    }
+    const input_shapes: session_mod.ShapeInputs = if (gathered) |owned| .{ .stage_inputs = .{ .info = mixed_info.?, .values = owned.values } } else .{ .tensors = batch_inputs };
+    var permit = first.session.admitShapeRequestBeforeExecution(input_shapes, request, alloc, control) catch |err| switch (err) {
         error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => {
+            if (gathered) |*owned| owned.deinit(cleanup_owner.epoch());
+            gathered = null;
             destroy(alloc, batch_inputs);
             owns_inputs = false;
             preparation.deinit();
@@ -651,8 +1029,12 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
     var locked = true;
     defer if (locked) first.session.releaseSelectedCohortGate(&cohort_waiter);
     if (comptime placement == .resident) {
-        var outputs = (try permit.runResidentWithControl(batch_inputs, alloc, control)) orelse return error.UnexpectedResidentStageDecline;
+        var outputs = (if (gathered) |owned|
+            try permit.runStageInputsWithControl(owned.values, alloc, control)
+        else
+            try permit.runResidentWithControl(batch_inputs, alloc, control)) orelse return error.UnexpectedResidentStageDecline;
         defer outputs.deinitWithBoundary(cleanup_owner.epoch());
+        if (gathered) |owned| outputs.physical_backing_requires_epoch = owned.has_device_storage;
         _ = try cleanup_owner.retainThroughBackend(outputs.backend);
         var batch = try ResidentBatch.init(alloc, &outputs, first.session, rows);
         var batch_open = true;
@@ -693,6 +1075,8 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
         first.session.releaseSelectedCohortGate(&cohort_waiter);
         locked = false;
         permit.retireExecutionWithCleanup(.{ .boundary = cleanup_owner.epoch() });
+        if (gathered) |*owned| owned.deinit(cleanup_owner.epoch());
+        gathered = null;
         // Publication/cancellation probes can enter the actual provider now.
         // A receiver never wakes while this actor owns its numerical lane.
         for (items, prepared[0..items.len]) |item, *row| {
@@ -1793,4 +2177,196 @@ test "resident serving cohort releases actual provider before publishing receive
         try std.testing.expectEqualSlices(f32, if (index == 0) &.{ 2, 4 } else &.{ 6, 8 }, actual);
     }
     try receiver.finish();
+}
+
+test "tensor microbatch CPU gathers backend-owned ONNX decoder cache" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try checkDecoderGather(.native);
+}
+
+test "tensor microbatch Metal gathers ONNX decoder cache inputs on device" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    try checkDecoderGather(.metal);
+}
+
+test "tensor microbatch CUDA gathers ONNX decoder cache inputs on device" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    checkDecoderGather(.cuda) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+}
+
+fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !void {
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const ids = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{ -1, 1 }));
+    const encoder = try builder.parameter("encoder_hidden_states", ml.graph.Shape.init(.f32, &.{ -1, 1, 4 }));
+    const past = try builder.parameter("past_key_values.0.decoder.key", ml.graph.Shape.init(.f32, &.{ -1, 1, -1, 4 }));
+    const token = try builder.reshape(try builder.convertDtype(ids, .f32), ml.graph.Shape.init(.f32, &.{ -1, 1, 1 }));
+    const logits = try builder.add(encoder, token);
+    const next = try builder.reshape(logits, ml.graph.Shape.init(.f32, &.{ -1, 1, 1, 4 }));
+    const present = try builder.concat(past, next, 2);
+    graph.nodes.items[present].output_shape.dims[2] = -1;
+    try graph.markOutput(logits);
+    try graph.markOutput(present);
+    const model = try @import("onnx_graph").exportGraph(a, &graph, .{ .node_name_overrides = &.{
+        .{ .node_id = logits, .name = "logits" },
+        .{ .node_id = present, .name = "present.0.decoder.key" },
+    } });
+    defer a.free(model);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "decoder.onnx", .data = model });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "decoder.onnx" });
+    defer a.free(path);
+
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, path, kind, .{});
+    defer session.close();
+    try session.model_lifetime.?.prepareFinalResources();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.cached_decoder_geometry = .{ .vocab_size = 4 };
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = if (kind == .native) .cpu else .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false };
+    const shared = session.shared_compute_context.?;
+    const backend = shared.stableBackend();
+    const control: Control = .{ .native_call_policy = .in_process };
+    var external_gate: std.atomic.Mutex = .unlocked;
+    const gate = session.execution_gate orelse &external_gate;
+    const count = 4;
+    var data: [256 * 4]f32 = undefined;
+    const ids_shape = [_]i64{ 1, 1 };
+    const host_ids = [_]i64{ 1, 2, 3, 4 };
+    var host_encoder = try Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 1, 4 }, &.{ 1, 2, 3, 4 });
+    defer host_encoder.deinit();
+    const past_shape = [_]i64{ 1, 1, 256, 4 };
+    var sources: [count]ops.CT = undefined;
+    var created: usize = 0;
+    defer for (sources[0..created]) |value| backend.free(value);
+    var stage: [count][3]StageInput = undefined;
+    var views: [count][3]Tensor = undefined;
+    var tickets: [count]Ticket = undefined;
+    for (0..count) |index| {
+        @memset(&data, @floatFromInt(10 + index));
+        var input = try Tensor.initFloat32(a, "past_key_values.0.decoder.key", &past_shape, &data);
+        defer input.deinit();
+        sources[index] = try shared.importHostTensor(a, &input);
+        created += 1;
+        const ids_tensor: Tensor = .{
+            .name = "input_ids",
+            .dtype = .i64,
+            .shape = &ids_shape,
+            .data = @constCast(std.mem.sliceAsBytes(host_ids[index..][0..1])),
+            .allocator = a,
+            .owns_data = false,
+            .owns_shape = false,
+        };
+        views[index] = .{ ids_tensor, host_encoder, input.borrowedView(input.name) };
+        views[index][2].data = &.{};
+        views[index][2].shape = &past_shape;
+        stage[index] = .{ .{ .host = ids_tensor }, .{ .host = host_encoder }, .{ .resident = .{
+            .value = sources[index],
+            .backend = backend,
+            .shape = &past_shape,
+            .estimated_bytes = @sizeOf(@TypeOf(data)),
+        } } };
+        try std.testing.expect(eligibleStage(session, &views[index], &stage[index]));
+        tickets[index] = .{ .session = session, .permit = null, .gate = gate, .inputs = &views[index], .control = control, .rows = 1, .stage = &stage[index] };
+    }
+
+    const Bench = struct {
+        fn run(t: *[count]Ticket, fused: bool, validate: bool) !void {
+            var outputs: [count]session_mod.ResidentOutputs = undefined;
+            var open: [count]bool = @splat(false);
+            defer for (&outputs, &open) |*output, *live| {
+                if (live.*) output.deinit();
+            };
+            if (fused) {
+                var slots: [count]micro.ResultSlot = undefined;
+                var items: [count]micro.ExecuteItem = undefined;
+                for (&items, &slots, &outputs, t) |*item, *slot, *output, *ticket| {
+                    slot.* = .{ .output = output };
+                    item.* = .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = ticket, .slot = slot, .control = .{ .io = std.testing.io } };
+                }
+                try executeGroupMode(.resident, &items);
+                for (&slots, &open) |*slot, *live| live.* = slot.completed and slot.err == null;
+                for (&slots) |*slot| {
+                    if (slot.err) |err| return err;
+                    try std.testing.expectEqual(micro.Execution.native_batch, slot.execution);
+                }
+            } else for (t, &outputs, &open) |*ticket, *output, *live| {
+                output.* = try directMode(.resident, std.heap.smp_allocator, ticket.*);
+                live.* = true;
+            }
+            for (&outputs, 0..) |*output, i| {
+                const logits_value = try output.backend.toFloat32(output.outputs[0], std.testing.allocator);
+                defer std.testing.allocator.free(logits_value);
+                if (!validate) continue;
+                const cache_value = try output.backend.toFloat32(output.outputs[1], std.testing.allocator);
+                defer std.testing.allocator.free(cache_value);
+                try std.testing.expectEqual(@as(usize, 4), logits_value.len);
+                try std.testing.expectEqual(@as(usize, 257 * 4), cache_value.len);
+                for (logits_value, 0..) |value, j| try std.testing.expectEqual(@as(f32, @floatFromInt(2 + i + j)), value);
+                for (cache_value[0 .. 256 * 4]) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(10 + i)), value);
+                try std.testing.expectEqualSlices(f32, logits_value, cache_value[256 * 4 ..]);
+            }
+        }
+    };
+    const Submit = struct {
+        ticket: *const Ticket,
+        broker: *micro.Broker,
+        output: ?session_mod.ResidentOutputs = null,
+        failure: ?anyerror = null,
+
+        fn call(self: *@This()) void {
+            const ticket = self.ticket;
+            self.output = runStage(self.broker, std.heap.smp_allocator, std.testing.io, .rewrite, ticket.session, ticket.gate, ticket.stage.?, ticket.control, null, 20_000) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var broker = micro.Broker.init(a);
+    defer broker.deinit();
+    if (kind == .native) {
+        var serial = try runStage(&broker, a, std.testing.io, .rewrite, session, gate, &stage[0], control, null, null);
+        defer serial.deinit();
+        try std.testing.expectEqual(@as(u64, 0), broker.snapshot(std.testing.io).native_batches);
+    }
+    var group = std.Io.Group.init;
+    defer group.cancel(std.testing.io);
+    var callers: [count]Submit = undefined;
+    for (&callers, &tickets) |*caller, *ticket| caller.* = .{ .ticket = ticket, .broker = &broker };
+    defer for (&callers) |*caller| if (caller.output) |*output| output.deinit();
+
+    try Bench.run(&tickets, false, true);
+    try Bench.run(&tickets, true, true);
+    var serial_ns: i96 = 0;
+    var fused_ns: i96 = 0;
+    for (0..12) |iteration| {
+        for ([_]bool{ iteration % 2 == 0, iteration % 2 != 0 }) |fused| {
+            const start = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+            try Bench.run(&tickets, fused, false);
+            const elapsed = start.durationTo(std.Io.Clock.Timestamp.now(std.testing.io, .awake)).raw.nanoseconds;
+            if (fused) fused_ns += elapsed else serial_ns += elapsed;
+        }
+    }
+    std.debug.print("\n{s} decoder serving executor, 48 rows each: serial {d} ns, fused {d} ns\n", .{ @tagName(kind), serial_ns, fused_ns });
+    for (&callers) |*caller| try group.concurrent(std.testing.io, Submit.call, .{caller});
+    try group.await(std.testing.io);
+    for (&callers, 0..) |*caller, index| {
+        if (caller.failure) |err| return err;
+        const output = caller.output orelse return error.MissingMergedDecoderResult;
+        const cache = try output.backend.toFloat32(output.outputs[1], a);
+        defer a.free(cache);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(10 + index)), cache[0]);
+    }
+    const report = broker.snapshot(std.testing.io);
+    try std.testing.expectEqual(@as(u64, count), report.native_items);
+    try std.testing.expectEqual(@as(u64, 1), report.native_batches);
 }
