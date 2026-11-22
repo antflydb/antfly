@@ -148,7 +148,7 @@ class CancellationE2E(unittest.TestCase):
         status, result = self.request(
             "POST", "/ai/v1/embed", {"model": self.model, "input": ["ab"]}
         )
-        self.assertEqual(status, 200, result)
+        self.assertEqual(status, 200, (result, self.read_log()))
         return result
 
     def rerank(self):
@@ -157,7 +157,7 @@ class CancellationE2E(unittest.TestCase):
             "/ai/v1/rerank",
             {"model": self.model, "query": "ab", "prompts": ["ab"]},
         )
-        self.assertEqual(status, 200, result)
+        self.assertEqual(status, 200, (result, self.read_log()))
         return result
 
     def exercise(self, mode):
@@ -235,7 +235,7 @@ class CancellationE2E(unittest.TestCase):
             expected = self.embed()
         else:
             status, expected = self.request("POST", path, {})
-            self.assertEqual(status, 200, expected)
+            self.assertEqual(status, 200, (expected, self.read_log()))
         baseline = self.wait_state(
             lambda s: s["requests"] == 0 and s["units"] == 0 and s["active"] == 0
         )
@@ -343,8 +343,9 @@ class CancellationE2E(unittest.TestCase):
             {"Content-Type": "application/json"},
         )
         response = connection.getresponse()
-        self.assertEqual(response.status, 502)
-        self.assertEqual(json.loads(response.read())["error"], "READER_UPSTREAM_FAILED")
+        result = json.loads(response.read())
+        self.assertEqual(response.status, 502, (result, self.read_log()))
+        self.assertEqual(result["error"], "READER_UPSTREAM_FAILED")
         self.assertTrue(blocked.is_set())
         self.assertFalse(release.is_set())
         self.assertFalse(unexpected.is_set())
