@@ -3664,8 +3664,11 @@ test "shared lock region: identity failures are isolated to the unresolved path"
     defer test_fail_process_fd_identity = false;
     try std.testing.expectError(error.RegionUnavailable, acquireProcessFd(io, retry_path));
     const device = (try file_identity.nativePathIdentity(retry_path)).device;
-    const pending_slot = max_unidentified_descriptors - 1;
-    const pending = unidentified_by_device.get(device).?[pending_slot] orelse return error.MissingSpareDescriptor;
+    const bucket = unidentified_by_device.get(device) orelse return error.MissingSpareDescriptor;
+    const pending_slot = for (bucket, 0..) |entry, i| {
+        if (entry != null) break i;
+    } else return error.MissingSpareDescriptor;
+    const pending = bucket[pending_slot].?;
     for (0..3) |_| {
         try std.testing.expectError(error.RegionUnavailable, acquireProcessFd(io, retry_path));
         try std.testing.expect(unidentified_by_device.get(device).?[pending_slot] == pending);
