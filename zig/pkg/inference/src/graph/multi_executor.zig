@@ -430,6 +430,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                         const transferred = try transferTensor(allocator, rt_val, src_entry.backend, cb);
                         values[i] = transferred;
                         try owned_runtime_transfers.put(allocator, node_id, {});
+                        if (collect_stats) exec_stats.runtime_input_transfers += 1;
                     } else {
                         values[i] = rt_val;
                     }

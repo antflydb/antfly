@@ -67,8 +67,9 @@ fn copyImpl(
     defer if (owned_shape_i64) |shape| allocator.free(shape);
     const shape_i64 = owned_shape_i64 orelse known_shape.?;
     if (trace) std.debug.print("graph_executor_transfer_stage: shape_i64={any}\n", .{shape_i64});
-    const shape_i32 = try tensorShapeI32(allocator, shape_i64);
-    defer allocator.free(shape_i32);
+    var inline_dimensions: [ml.graph.shape.max_rank]i32 = undefined;
+    const shape_i32 = try tensorShapeI32(allocator, shape_i64, &inline_dimensions);
+    defer if (shape_i64.len > inline_dimensions.len) allocator.free(shape_i32);
     if (trace) std.debug.print("graph_executor_transfer_stage: shape_i32={any}\n", .{shape_i32});
     const dtype = if (allow_untyped_float32 and from.vtable.tensorDType == null) .f32 else try from.tensorDType(value);
     switch (dtype) {
@@ -111,8 +112,9 @@ fn copyImpl(
 pub fn copyHostFloat32(allocator: std.mem.Allocator, value: CT, from: *const ComputeBackend, to: *const ComputeBackend) !CT {
     const dimensions = try from.tensorShape(value, allocator);
     defer allocator.free(dimensions);
-    const shape_i32 = try tensorShapeI32(allocator, dimensions);
-    defer allocator.free(shape_i32);
+    var inline_dimensions: [ml.graph.shape.max_rank]i32 = undefined;
+    const shape_i32 = try tensorShapeI32(allocator, dimensions, &inline_dimensions);
+    defer if (dimensions.len > inline_dimensions.len) allocator.free(shape_i32);
     return copyFloat32(allocator, value, from, to, shape_i32);
 }
 
@@ -122,11 +124,25 @@ fn copyFloat32(allocator: std.mem.Allocator, value: CT, from: *const ComputeBack
     return to.fromFloat32Shape(data, shape_i32);
 }
 
-fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
-    const out = try allocator.alloc(i32, shape.len);
-    errdefer allocator.free(out);
+fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64, inline_dimensions: []i32) ![]i32 {
+    const borrowed = shape.len <= inline_dimensions.len;
+    const out = if (borrowed) inline_dimensions[0..shape.len] else try allocator.alloc(i32, shape.len);
+    errdefer if (!borrowed) allocator.free(out);
     for (shape, 0..) |dim, i| {
         out[i] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
     }
     return out;
+}
+
+test "transfer dimensions borrow inline storage and retain checked overflow fallback" {
+    var inline_dimensions: [2]i32 = undefined;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const borrowed = try tensorShapeI32(failing.allocator(), &.{ 3, 5 }, &inline_dimensions);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 5 }, borrowed);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectError(error.OutOfMemory, tensorShapeI32(failing.allocator(), &.{ 3, 5, 7 }, &inline_dimensions));
+    const owned = try tensorShapeI32(std.testing.allocator, &.{ 3, 5, 7 }, &inline_dimensions);
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 5, 7 }, owned);
+    try std.testing.expectError(error.UnsupportedShape, tensorShapeI32(std.testing.allocator, &.{ 3, 5, std.math.maxInt(i64) }, &inline_dimensions));
 }
