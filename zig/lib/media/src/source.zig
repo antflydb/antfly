@@ -57,6 +57,9 @@ pub const Range = struct {
     /// Null requests the ordinary read_at path (for example across extents).
     borrow_at: ?*const fn (*anyopaque, u64, usize, Control) anyerror!?[]const u8 = null,
     context: *anyopaque,
+    /// Set when the provider accepts every in-bounds request size without
+    /// applying an independent byte quota.
+    accepts_full_read_size: bool = false,
     /// May return a short read. Returning zero before the declared end is EOF.
     /// RemoteReadBudgetExceeded rejects a request before transferring bytes.
     /// A provider that transferred a prefix can report it as a short read.

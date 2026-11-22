@@ -32,6 +32,12 @@ pub const Fork = struct {
         self.destroy(self.context);
     }
 };
+pub const FrameCheckpointSession = struct {
+    snapshot: ?@import("media_audio_plan.zig").Snapshot = null,
+    identity: [32]u8 = undefined,
+    generation: usize = 0,
+};
+
 pub const Provider = struct {
     context: *anyopaque,
     samples: usize,
@@ -43,6 +49,8 @@ pub const Provider = struct {
     /// Retains PCM for [first, last) while probing through lookahead.
     /// An empty retained interval only discovers the end of the stream.
     probe_window: ?*const fn (*anyopaque, std.mem.Allocator, usize, usize, usize) anyerror!?Lease = null,
+    restore_frames: ?*const fn (*anyopaque, std.mem.Allocator, @import("media_audio_plan.zig").Store.Context, *FrameCheckpointSession) void = null,
+    save_frames: ?*const fn (*anyopaque, std.mem.Allocator, @import("media_audio_plan.zig").Store.Context, *FrameCheckpointSession) void = null,
     sample_rate: u32,
     read: *const fn (*anyopaque, std.mem.Allocator, usize, usize) anyerror!Lease,
 };

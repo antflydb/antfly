@@ -338,14 +338,29 @@ pub const Store = struct {
     pub const max_file_bytes = 40 + 2 * (max_encoded_bytes + record_overhead);
     /// Internally derived canonical delta; value is its merge with base_digest.
     pub const Update = struct { base_digest: [32]u8, delta: Snapshot };
-    pub const Context = struct { store: *Store, io: std.Io, models_dir: []const u8 };
+    pub const Context = struct {
+        store: *Store,
+        io: std.Io,
+        models_dir: []const u8,
+        directory: enum { windows, flac_frames } = .windows,
+
+        fn directoryName(self: Context) []const u8 {
+            return switch (self.directory) {
+                .windows => ".antfly-audio-plans",
+                .flac_frames => ".antfly-flac-frames",
+            };
+        }
+        fn pathFor(self: Context, buffer: []u8, identity: [32]u8, suffix: []const u8) ![]const u8 {
+            return std.fmt.bufPrint(buffer, "{s}/{s}/{x:0>2}{s}", .{ self.models_dir, self.directoryName(), identity[0], suffix });
+        }
+    };
     fn path(buffer: []u8, root: []const u8, identity: [32]u8, temporary: bool) ![]const u8 {
         return std.fmt.bufPrint(buffer, "{s}/.antfly-audio-plans/{x:0>2}{s}", .{ root, identity[0], if (temporary) ".pending" else ".plan" });
     }
     pub fn load(context: Context, a: std.mem.Allocator, identity: [32]u8) !Snapshot {
         if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const bytes = try readPrefix(context.io, a, try path(&buffer, context.models_dir, identity, false));
+        const bytes = try readPrefix(context.io, a, try context.pathFor(&buffer, identity, ".plan"));
         defer a.free(bytes);
         if (bytes.len < 40 or !std.mem.eql(u8, bytes[0..8], "AFAP0003")) return decode(a, identity, bytes);
         if (!std.mem.eql(u8, bytes[8..40], &identity)) return error.InvalidAudioPlan;
@@ -435,7 +450,7 @@ pub const Store = struct {
         if (value.stride == 0 or update.delta.stride == 0) return false;
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
         if (comptime @import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return false;
-        const name = try path(&buffer, context.models_dir, identity, false);
+        const name = try context.pathFor(&buffer, identity, ".plan");
         if (std.mem.indexOfScalar(u8, name, 0) != null) return false;
         var terminated_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
         const terminated = try std.fmt.bufPrintSentinel(&terminated_buffer, "{s}", .{name}, 0);
@@ -467,9 +482,9 @@ pub const Store = struct {
         try mutex.lock(context.io);
         defer mutex.unlock(context.io);
         var directory: [std.fs.max_path_bytes]u8 = undefined;
-        try std.Io.Dir.cwd().createDirPath(context.io, try std.fmt.bufPrint(&directory, "{s}/.antfly-audio-plans", .{context.models_dir}));
+        try std.Io.Dir.cwd().createDirPath(context.io, try std.fmt.bufPrint(&directory, "{s}/{s}", .{ context.models_dir, context.directoryName() }));
         var lock_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const lock_file = try std.Io.Dir.cwd().createFile(context.io, try std.fmt.bufPrint(&lock_buffer, "{s}/.antfly-audio-plans/{x:0>2}.lock", .{ context.models_dir, identity[0] }), .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true });
+        const lock_file = try std.Io.Dir.cwd().createFile(context.io, try context.pathFor(&lock_buffer, identity, ".lock"), .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true });
         defer lock_file.close(context.io);
         if (update) |change| if (try append(context, a, identity, value, change)) return;
         var merged = Buffer{};
@@ -484,8 +499,8 @@ pub const Store = struct {
         if (previous_digest) |prior| if (std.mem.eql(u8, &prior, &digest)) return;
         var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var pending_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const target = try path(&target_buffer, context.models_dir, identity, false);
-        const pending = try path(&pending_buffer, context.models_dir, identity, true);
+        const target = try context.pathFor(&target_buffer, identity, ".plan");
+        const pending = try context.pathFor(&pending_buffer, identity, ".pending");
         const bytes = try frame(a, identity, merged.snapshot(), @splat(0), digest, 1);
         defer a.free(bytes);
         defer std.Io.Dir.cwd().deleteFile(context.io, pending) catch {};

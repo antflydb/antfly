@@ -231,6 +231,12 @@ pub const ReadAhead = struct {
                 if (self.valid >= required) break;
                 return error.RemoteRequestBudgetExceeded;
             }
+            // A rejected speculative fill can consume an upstream attempt.
+            // Reserve the final attempt for bytes the caller actually needs.
+            if (!self.upstream.accepts_full_read_size and self.max_reads - self.reads == 1) {
+                if (self.valid >= required) break;
+                wanted = required;
+            }
             const n = self.fetchAt(self.start + self.valid, self.buffer.?[self.valid..wanted], control) catch |err| {
                 if (err == error.RemoteReadBudgetExceeded) {
                     self.prefetch_limited = true;
@@ -371,7 +377,7 @@ test "remote prefetch returns demanded bytes on the last short upstream request"
     var lease = try input.readSparse(0, 4);
     defer lease.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1 }, lease.bytes);
-    try std.testing.expectEqual(@as(usize, 8), cache.valid);
+    try std.testing.expectEqual(@as(usize, 4), cache.valid);
 }
 
 test "remote prefetch tolerates upstream quota only after satisfying demand" {
@@ -425,6 +431,14 @@ test "remote retries an oversized prefetch with only the demand suffix" {
     try std.testing.expectError(error.RemoteReadBudgetExceeded, ReadAhead.readAt(&cache, 8, &out, .{}));
     try std.testing.expectEqual(@as(u64, 8), cache.transferred_bytes);
     try std.testing.expectEqual(@as(u64, 8), cache.charged_bytes);
+
+    provider = .{};
+    var last = ReadAhead{ .allocator = std.testing.allocator, .upstream = cache.upstream, .max_bytes = 16, .max_reads = 1 };
+    defer last.deinit();
+    try std.testing.expectEqual(out.len, try ReadAhead.readAt(&last, 0, &out, .{}));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, &out);
+    try std.testing.expectEqual(@as(usize, 1), last.reads);
+    try std.testing.expectEqual(@as(u64, 4), last.charged_bytes);
 }
 
 test "remote isolated look-behind preserves the forward cache" {
@@ -523,7 +537,7 @@ test "sparse forward scans coalesce before exhausting requests" {
         }
     };
     var marker: u8 = 0;
-    var cache = ReadAhead{ .allocator = std.testing.allocator, .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 8192 }, .window_bytes = 4096, .max_bytes = 8192, .max_reads = 4 };
+    var cache = ReadAhead{ .allocator = std.testing.allocator, .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 8192, .accepts_full_read_size = true }, .window_bytes = 4096, .max_bytes = 8192, .max_reads = 4 };
     defer cache.deinit();
     var input = source.Source{ .allocator = std.testing.allocator, .identity = "sparse", .storage = .{ .range = cache.range() } };
     var offset: u64 = 0;

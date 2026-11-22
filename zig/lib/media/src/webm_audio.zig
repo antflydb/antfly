@@ -348,6 +348,8 @@ pub fn parseCluster(
             if (!isClusterChildId(peek.id)) break;
         }
         const elem = try readElementHeader(remaining, cursor);
+        const before = access_units.items.len;
+        const padded_tail = discard_padding_ns.* != 0;
         switch (elem.id) {
             timecode_id => cluster_ticks = try readUint(try elementPayload(remaining, elem)),
             simple_block_id => try parseBlockIntoAccessUnits(
@@ -371,6 +373,7 @@ pub fn parseCluster(
             ),
             else => {},
         }
+        if (padded_tail and access_units.items.len != before) return error.UnsupportedStreamingAudioProfile;
         cursor = elem.data_end orelse {
             if (known_size == null) break;
             return error.UnsupportedAudioFormat;
@@ -417,8 +420,16 @@ pub fn parseBlockGroup(
     }
 
     if (matched) {
-        if (pending_discard) |bytes| discard_padding_ns.* = try readSignedInt(bytes);
+        if (pending_discard) |bytes| discard_padding_ns.* = try trailingPadding(bytes);
     }
+}
+
+// Current playback timelines can represent trailing padding only. Reject
+// unsupported placement before mapping it to the wrong samples.
+fn trailingPadding(bytes: []const u8) !i64 {
+    const padding = try readSignedInt(bytes);
+    if (padding < 0) return error.UnsupportedStreamingAudioProfile;
+    return padding;
 }
 
 /// Parses a Block/SimpleBlock body: a vint track number, a 2-byte signed
@@ -653,6 +664,8 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
         const child = try scan.rawHeader(pos, cluster.end);
         if (cluster.unknown and !isClusterChildId(child.id)) break;
         if (child.unknown) return error.UnsupportedAudioFormat;
+        const before = packets.items.len;
+        const padded_tail = padding.* != 0;
         switch (child.id) {
             timecode_id => {
                 if (child.end - child.payload > 8) return error.UnsupportedAudioFormat;
@@ -662,7 +675,6 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
             },
             simple_block_id => try indexBlock(a, scan, child, track, ticks, scale, packets, packet_limit),
             block_group_id => {
-                const before = packets.items.len;
                 var discard: ?Webm.Element = null;
                 var nested = child.payload;
                 while (nested < child.end) {
@@ -679,11 +691,12 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
                     if (field.end - field.payload > 8) return error.UnsupportedAudioFormat;
                     var lease = try scan.input.readSparse(field.payload, @intCast(field.end - field.payload));
                     defer lease.deinit();
-                    padding.* = try readSignedInt(lease.bytes);
+                    padding.* = try trailingPadding(lease.bytes);
                 };
             },
             else => {},
         }
+        if (padded_tail and packets.items.len != before) return error.UnsupportedStreamingAudioProfile;
         pos = child.end;
     }
     return pos;
@@ -706,5 +719,32 @@ fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track:
         for (packet.prefix[0..@min(size, if (track.codec == .flac) packet.prefix.len else 2)]) |*value| value.* = try reader.byte();
         packets.appendAssumeCapacity(packet);
         offset += size;
+    }
+}
+
+test "WebM borrowed and range indexes reject padding outside the track tail" {
+    const a = std.testing.allocator;
+    const track = TrackInfo{ .number = 1, .codec = .opus };
+    const padded_block = [_]u8{ 0xa0, 0x8b, 0xa1, 0x85, 0x81, 0, 0, 0, 0, 0x75, 0xa2, 0x81, 1 };
+    const plain_block = [_]u8{ 0xa3, 0x85, 0x81, 0, 0, 0, 0 };
+    for ([_][]const u8{ &(padded_block ++ plain_block), &padded_block }) |contents| {
+        var bytes: [padded_block.len + plain_block.len]u8 = undefined;
+        @memcpy(bytes[0..contents.len], contents);
+        const interior = contents.len != padded_block.len;
+        if (!interior) bytes[padded_block.len - 1] = 0xff;
+
+        var units: std.ArrayList([]const u8) = .empty;
+        defer units.deinit(a);
+        var times: std.ArrayList(u64) = .empty;
+        defer times.deinit(a);
+        var borrowed_padding: i64 = 0;
+        try std.testing.expectError(error.UnsupportedStreamingAudioProfile, parseCluster(bytes[0..contents.len], contents.len, track.number, a, &units, &times, default_timestamp_scale_ns, &borrowed_padding));
+
+        var source = Source{ .allocator = a, .identity = "block-padding", .storage = .{ .borrowed = bytes[0..contents.len] } };
+        var scan = Webm.Scan{ .input = &source, .limits = .{} };
+        var packets: std.ArrayList(Packet) = .empty;
+        defer packets.deinit(a);
+        var range_padding: i64 = 0;
+        try std.testing.expectError(error.UnsupportedStreamingAudioProfile, scanCluster(a, &scan, .{ .id = cluster_id, .payload = 0, .end = contents.len, .unknown = false }, track, default_timestamp_scale_ns, &packets, &range_padding, 1024));
     }
 }

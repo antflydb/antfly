@@ -585,6 +585,9 @@ pub const Runner = struct {
         }
     }
     fn soundWindows(self: *Runner, provider: @import("media_chunking_audio.zig").Provider) !void {
+        var frames: @import("media_chunking_audio.zig").FrameCheckpointSession = .{};
+        if (self.request.audio_plan_store) |store| if (provider.restore_frames) |restore| restore(provider.context, self.allocator, store, &frames);
+        defer if (self.request.audio_plan_store) |store| if (provider.save_frames) |save| save(provider.context, self.allocator, store, &frames);
         self.emitSoundWindows(provider) catch |err| {
             if (!self.stopPageOnReadPressure(err)) return err;
         };
