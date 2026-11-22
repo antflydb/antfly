@@ -128,7 +128,9 @@ pub const Control = struct {
         if (self.check_fn) |f| try f(self.context);
     }
 };
-pub const webm_playback_recipe = "webm-audio-playback-v2";
+// Container dispatch can sniff the payload after a metadata-only plan probe.
+// Scope the revision to all audio and video plans so both routes agree.
+pub const media_playback_recipe = "media-playback-v3";
 
 pub const Identity = struct {
     source: [32]u8,

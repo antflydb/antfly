@@ -821,7 +821,7 @@ test "WebM AV1 range header walking skips padded packet payload" {
     };
     var padded = Padded{ .packet = first.bytes };
     const length = first.bytes.len + Padded.header.len + 1024 * 1024;
-    var ahead = media.remote.ReadAhead{ .allocator = a, .upstream = .{ .context = &padded, .read_at = Padded.read, .length = length }, .max_bytes = 32 * 1024 };
+    var ahead = media.remote.ReadAhead{ .allocator = a, .upstream = .{ .context = &padded, .read_at = Padded.read, .length = length, .accepts_full_read_size = true }, .max_bytes = 32 * 1024 };
     defer ahead.deinit();
     var source = media.source.Source{ .allocator = a, .storage = .{ .range = ahead.range() }, .identity = "padded-av1" };
     const buffered = try Av1.Session.create(a, .{ .max_pixels = 16_384 * 16_384 });

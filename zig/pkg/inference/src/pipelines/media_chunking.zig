@@ -161,8 +161,6 @@ pub const Runner = struct {
     page_rotation: ?i32 = null,
     audio_provider: ?@import("media_chunking_audio.zig").Provider = null,
     audio_failure: ?anyerror = null,
-    sniffed_webm: ?bool = null,
-    source_probe_failure: ?anyerror = null,
     video_audio: ?*VideoAudio = null,
     pub fn init(a: std.mem.Allocator, request: Request, executor: Executor, control: Control, sink: Sink) !Runner {
         try control.check();
@@ -195,31 +193,10 @@ pub const Runner = struct {
         defer if (speaker_identity) |value| a.free(value);
         if (speaker_identity) |value| planning_model.planning_identity = value;
         const base_identity = if (request.native_source) |source| try planning.Identity.initPinned(source.identity, mime, request.source_version, planning_model, request.policy) else try planning.Identity.init(bytes, mime, request.source_version, planning_model, request.policy);
-        // Output execution and masks can change during repair. WebM playback
-        // semantics belong to the source plan, independent of those flags.
-        const declared_webm = audio.detectFormatFromMime(mime) == .webm;
-        const video_input = std.ascii.startsWithIgnoreCase(mime, "video/");
-        const audio_input = std.ascii.startsWithIgnoreCase(mime, "audio/");
-        var source_probe_failure: ?anyerror = null;
-        const sniffed_webm: ?bool = if (!declared_webm) sniff: {
-            if (request.native_source) |source| {
-                // Only the container dispatchers can accept EBML under
-                // another declaration. Codec-specific audio paths must
-                // keep metadata-only and warm seek requests byte-free.
-                if (!video_input and !(audio_input and audio.detectFormatFromMime(mime) == .mp4)) break :sniff null;
-                const input_control = control.imageWorkControl();
-                var prefix = source.readSparseControlled(0, @intCast(@min(4, source.length())), .{ .context = input_control.context, .check_fn = input_control.check_fn }) catch |err| {
-                    source_probe_failure = err;
-                    break :sniff null;
-                };
-                defer prefix.deinit();
-                break :sniff isWebmPrefix(prefix.bytes);
-            }
-            break :sniff if (video_input or audio_input) isWebmPrefix(bytes) else null;
-        } else null;
-        const identity = if (declared_webm or (sniffed_webm orelse false)) base_identity.withPlaybackRecipe(planning.webm_playback_recipe) else base_identity;
-        const start = if (source_probe_failure == null and request.continuation != null) try identity.parseContinuation(request.continuation.?) else 0;
-        var self = Runner{ .allocator = a, .executor = executor, .request = request, .control = control, .sink = sink, .summary = .{ .identity = identity, .start_ordinal = start, .next_ordinal = start }, .pool = .{ .limits = .{ .host_bytes = request.max_working_bytes } }, .sniffed_webm = sniffed_webm, .source_probe_failure = source_probe_failure };
+        const temporal_media = std.ascii.startsWithIgnoreCase(mime, "video/") or std.ascii.startsWithIgnoreCase(mime, "audio/");
+        const identity = if (temporal_media) base_identity.withPlaybackRecipe(planning.media_playback_recipe) else base_identity;
+        const start = if (request.continuation) |cursor| try identity.parseContinuation(cursor) else 0;
+        var self = Runner{ .allocator = a, .executor = executor, .request = request, .control = control, .sink = sink, .summary = .{ .identity = identity, .start_ordinal = start, .next_ordinal = start }, .pool = .{ .limits = .{ .host_bytes = request.max_working_bytes } } };
         if (request.outputs) |config| {
             self.summary.output_count = config.targets.len;
             for (config.targets, 0..) |target, i| {
@@ -409,7 +386,6 @@ pub const Runner = struct {
         return true;
     }
     pub fn run(self: *Runner) !Summary {
-        if (self.source_probe_failure) |err| return err;
         defer self.finishSpeakers();
         const scope = image.work_control.Scope.enter(self.control.imageWorkControl());
         defer scope.deinit();
@@ -1019,7 +995,7 @@ pub const Runner = struct {
         var planning_source = physical.view(physical.allocator, physical.admission_pool, physical.control);
         const source = &planning_source;
         const transport = try media.transport_stream.isTransportSource(source);
-        const webm = if (transport) false else self.sniffed_webm orelse detect: {
+        const webm = if (transport) false else detect: {
             var prefix = try source.readSparse(0, @intCast(@min(4, source.length())));
             defer prefix.deinit();
             break :detect isWebmPrefix(prefix.bytes);
@@ -1662,16 +1638,20 @@ test "model aware media WebM playback rejects pre-upgrade continuations" {
     };
     var marker: u8 = 0;
     var source = media.source.Source{ .allocator = a, .identity = "mislabeled-webm", .storage = .{ .range = .{ .context = &marker, .read_at = Fixture.read, .length = 4, .immutable_binding = @splat(44) } } };
-    request.input = .{ .binary = .{ .mime_type = "video/mp4", .data = &.{} } };
     request.native_source = &source;
     request.source_version = "version";
-    const old_pinned = try planning.Identity.initPinned(source.identity, "video/mp4", request.source_version, executor.model, request.policy);
-    request.continuation = old_pinned.cursor(3, &token);
-    try std.testing.expectError(error.StaleChunkContinuation, Runner.init(a, request, executor, .{}, sink));
-    request.continuation = null;
-    const pinned = try Runner.init(a, request, executor, .{}, sink);
-    try std.testing.expectEqual(true, pinned.sniffed_webm.?);
-    try std.testing.expectEqual(old_pinned.source, pinned.summary.identity.source);
+    for ([_][]const u8{ "video/mp4", "audio/mpeg" }) |mime| {
+        request.input = .{ .binary = .{ .mime_type = mime, .data = &.{} } };
+        const old_pinned = try planning.Identity.initPinned(source.identity, mime, request.source_version, executor.model, request.policy);
+        request.continuation = old_pinned.cursor(3, &token);
+        try std.testing.expectError(error.StaleChunkContinuation, Runner.init(a, request, executor, .{}, sink));
+        request.continuation = old_pinned.withPlaybackRecipe("webm-audio-playback-v2").cursor(3, &token);
+        try std.testing.expectError(error.StaleChunkContinuation, Runner.init(a, request, executor, .{}, sink));
+        request.continuation = null;
+        const pinned = try Runner.init(a, request, executor, .{}, sink);
+        try std.testing.expectEqual(old_pinned.source, pinned.summary.identity.source);
+    }
+    try std.testing.expectEqual(@as(usize, 0), source.reads);
 }
 
 test "model aware media streams text coverage and source-bound continuations without duplicate delivery" {
@@ -2971,12 +2951,13 @@ test "model aware media audio pages reuse admitted indexes and bind only the cur
     }
 }
 
-test "model aware media generation observation reads no audio source bytes" {
+test "model aware media generation observation reads no audio or video source bytes" {
     const Cache = @import("media_index_cache.zig").Cache;
     const memory = @import("../runtime/tier/memory.zig");
     const Provider = struct {
         bytes: []const u8,
         read_bytes: usize = 0,
+        deny_reads: bool = false,
         controller: memory.AdmissionController = .{},
         fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -2985,6 +2966,7 @@ test "model aware media generation observation reads no audio source bytes" {
         fn read(raw: *anyopaque, offset: u64, out: []u8, control: media.source.Control) !usize {
             try control.check();
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.deny_reads) return error.RemoteReadBudgetExceeded;
             const first: usize = @intCast(offset);
             const count = @min(out.len, self.bytes.len - first);
             @memcpy(out[0..count], self.bytes[first..][0..count]);
@@ -3024,7 +3006,7 @@ test "model aware media generation observation reads no audio source bytes" {
         const mp3 = std.mem.endsWith(u8, name, ".mp3");
         var first = Qualification{};
         const config = output_types.Config{ .boundary_model = "embedding", .targets = &.{.{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = 2, .execute = false }} };
-        const request = Request{ .input = .{ .binary = .{ .mime_type = if (mp3) "audio/mpeg" else "audio/flac", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1, .execute = false, .execute_outputs = true, .observe_only = true, .outputs = config, .output_executor = .{ .context = &first, .execute = Observer.execute } };
+        var request = Request{ .input = .{ .binary = .{ .mime_type = if (mp3) "audio/mpeg" else "audio/flac", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1, .execute = false, .execute_outputs = true, .observe_only = true, .outputs = config, .output_executor = .{ .context = &first, .execute = Observer.execute } };
         var runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = ProbeSink.accept });
         const summary = try runner.run();
         try std.testing.expectEqual(@as(u64, 0), summary.next_ordinal);
@@ -3032,6 +3014,13 @@ test "model aware media generation observation reads no audio source bytes" {
         try std.testing.expectEqual(@as(usize, 0), provider.read_bytes);
         std.debug.print("generation observation {s}: read={d} source={d} outputs={d}\n", .{ name, provider.read_bytes, bytes.len, first.seen });
         try std.testing.expectEqual(@as(usize, 1), first.seen);
+        provider.deny_reads = true;
+        request.input.binary.mime_type = "video/mp4";
+        runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = ProbeSink.accept });
+        const video_summary = try runner.run();
+        try std.testing.expectEqual(@as(u64, 0), video_summary.next_ordinal);
+        try std.testing.expectEqual(@as(usize, 0), source.reads);
+        try std.testing.expectEqual(@as(usize, 2), first.seen);
     }
 }
 

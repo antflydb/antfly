@@ -563,7 +563,7 @@ const WebmFlac = struct {
             const self: *FrameRefill = @ptrCast(@alignCast(raw));
             if (end > self.limit) return error.UnsupportedAudioFormat;
             var available = self.buffer.prefix(self.limit).len;
-            const wanted = @min(self.limit, @max(end, 256, available *| 2));
+            const wanted = if (self.input.supportsPreferredSparseRead()) @min(self.limit, @max(end, 256, available *| 2)) else end;
             while (available < end) {
                 const limits = self.input.remaining();
                 const cap = @min(limits.max_read_bytes, limits.max_retained_bytes, limits.max_total_bytes);
@@ -1010,7 +1010,7 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
         }
     };
     var context = Source{ .bytes = webm, .boundary = boundary };
-    const upstream = media.source.Range{ .context = &context, .read_at = Source.read, .length = webm.len + void_header.len + 1024 * 1024 };
+    const upstream = media.source.Range{ .context = &context, .read_at = Source.read, .length = webm.len + void_header.len + 1024 * 1024, .accepts_full_read_size = true };
     var transport = media.remote.ReadAhead{ .allocator = a, .upstream = upstream, .max_bytes = webm.len * 2 };
     defer transport.deinit();
     var source = media.source.Source{ .allocator = a, .identity = "ranged-opus", .storage = .{ .range = transport.range() } };

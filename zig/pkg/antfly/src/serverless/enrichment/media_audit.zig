@@ -42,7 +42,7 @@ pub fn recipe(a: Allocator, config: chunking.types.Config, field: []const u8, di
     hash.update("serverless-media-recipe-v2");
     // The witness carries only a source digest. Include the playback
     // revision here so even the no-provider audit path sees upgrades.
-    for ([_][]const u8{ canonical, field, &digest, @import("inference_chunker").planning.webm_playback_recipe }) |part| {
+    for ([_][]const u8{ canonical, field, &digest, @import("inference_chunker").planning.media_playback_recipe }) |part| {
         var length: [8]u8 = undefined;
         std.mem.writeInt(u64, &length, part.len, .little);
         hash.update(&length);

@@ -162,11 +162,19 @@ pub const Source = struct {
     pub fn readIsolated(self: *Source, offset: u64, size: usize) !Lease {
         return self.readWithControl(offset, size, .{}, null, .isolated);
     }
+    pub fn supportsPreferredSparseRead(self: *const Source) bool {
+        return switch (self.storage) {
+            .borrowed => true,
+            .range => |range| range.sparse_read_preferring != null or range.accepts_full_read_size,
+        };
+    }
+
     /// Satisfy the required prefix and accept extra bytes delivered in the
     /// same read. Optional fill must never require a follow-up call.
     pub fn readSparsePreferring(self: *Source, offset: u64, required: usize, preferred: usize, control: Control) !Lease {
         if (required > preferred) return error.InvalidSourceRead;
         if (offset > self.length() or required > self.length() - offset) return error.UnexpectedEndOfSource;
+        if (!self.supportsPreferredSparseRead()) return self.readSparseControlled(offset, required, control);
         const limits = self.remaining();
         const size: usize = if (limits.max_reads <= 1) required else @intCast(@max(required, @min(preferred, self.length() - offset, limits.max_read_bytes, limits.max_retained_bytes, limits.max_total_bytes)));
         return self.readSpanWithControl(offset, required, size, control, null, .sparse) catch |err| {
@@ -399,7 +407,7 @@ pub const FileRange = struct {
     file: std.Io.File,
     io: std.Io,
     pub fn range(self: *FileRange, length: u64) Range {
-        return .{ .concurrent = true, .context = self, .read_at = readAt, .length = length };
+        return .{ .concurrent = true, .context = self, .read_at = readAt, .length = length, .accepts_full_read_size = true };
     }
     pub fn readAt(context: *anyopaque, offset: u64, bytes: []u8, control: Control) !usize {
         try control.check();
@@ -699,7 +707,7 @@ test "preferred sparse reads keep a short reply and account for its owned alloca
         }
     };
     var owner: u8 = 0;
-    var source = Source{ .allocator = a, .identity = "preferred-prefix", .storage = .{ .range = .{ .context = &owner, .read_at = Provider.read, .length = 16 } } };
+    var source = Source{ .allocator = a, .identity = "preferred-prefix", .storage = .{ .range = .{ .context = &owner, .read_at = Provider.read, .length = 16, .accepts_full_read_size = true } } };
     {
         var lease = try source.readSparsePreferring(0, 2, 8, .{});
         defer lease.deinit();
@@ -709,4 +717,24 @@ test "preferred sparse reads keep a short reply and account for its owned alloca
         try std.testing.expectEqual(@as(usize, 8), source.retained_bytes);
     }
     try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
+}
+
+test "preferred sparse reads send only demand to a legacy adapter with one attempt" {
+    const Provider = struct {
+        used: bool = false,
+        fn read(raw: *anyopaque, _: u64, out: []u8, _: Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.used) return error.RemoteRequestBudgetExceeded;
+            self.used = true;
+            if (out.len > 2) return error.RemoteReadBudgetExceeded;
+            @memset(out, 42);
+            return out.len;
+        }
+    };
+    var provider = Provider{};
+    var source = Source{ .allocator = std.testing.allocator, .identity = "legacy-prefix", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = 16 } } };
+    var lease = try source.readSparsePreferring(0, 2, 8, .{});
+    defer lease.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 42, 42 }, lease.bytes);
+    try std.testing.expectEqual(@as(usize, 1), source.reads);
 }
