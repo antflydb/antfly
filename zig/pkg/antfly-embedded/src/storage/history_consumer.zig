@@ -513,6 +513,23 @@ pub fn retire(txn: anytype, closed: Retirement) !void {
     try txn.put(key, &state.encode());
 }
 
+/// Older enrollment can retain history through a durable grant before a
+/// root-wide policy is explicitly configured. Carry that grant's authority
+/// and the observed native limit into the new successor's initial policy.
+pub fn splitPolicy(txn: anytype, namespace: Namespace) !?history.Policy {
+    if (try history.loadPolicy(txn)) |policy| return policy;
+    const grants = (try load(txn)) orelse return null;
+    var retained = (try history.load(txn)) orelse return error.HistoryCorrupt;
+    if (!same(grants.namespace, namespace) or !same(retained.namespace, namespace))
+        return error.HistoryResynchronizationRequired;
+    for (grants.leases) |lease| {
+        if (lease.epoch == 0) continue;
+        _ = try retained.findConsumer(lease.id, lease.epoch);
+        return .{ .namespace = namespace, .authority = grants.authority, .previous_revision = 0, .revision = 1, .limit = retained.limit };
+    }
+    return null;
+}
+
 pub const PolicySnapshot = struct {
     revision: u64,
     limit: u64,

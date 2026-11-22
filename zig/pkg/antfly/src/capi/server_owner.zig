@@ -5118,11 +5118,11 @@ pub fn storageOwnerSplitHistoryPolicy(
     out_response.* = .{};
     const handle = asHandle(owner) orelse return .invalid_argument;
     const local = @import("antfly_local_sources");
-    const history = local.storage_committed_history;
     var read = handle.db.core.store.beginReadTxn() catch |err| return storageOwnerStatusFromError(err);
     defer read.abort();
-    const policy = (history.loadPolicy(&read) catch |err| return storageOwnerStatusFromError(err)) orelse return .ok;
     const namespace = local.storage_db_online_source_contract.namespaceBytes(handle.db.core.identity_namespace);
+    const consumers = local.api_local_table_writes.table_write_source.history_consumer;
+    const policy = (consumers.splitPolicy(&read, namespace) catch |err| return storageOwnerStatusFromError(err)) orelse return .ok;
     if (!std.mem.eql(u8, &namespace, &policy.namespace)) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
     _ = local.storage_source_authority.require(&read, .raft, namespace) catch |err| return storageOwnerStatusFromError(err);
     const raw = policy.encode() catch |err| return storageOwnerStatusFromError(err);
