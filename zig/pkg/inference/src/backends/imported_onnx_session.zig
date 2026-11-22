@@ -7516,3 +7516,51 @@ fn stopT5CudaProfile(profile: *?std.DynLib) void {
         profile.* = null;
     }
 }
+
+test "complete Imported Metal RMS scope uses assigned output beside layout and elementwise ops" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const runtime = @import("../backends/metal_runtime.zig");
+    if (!runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = Shape.init(.f32, &.{ 8, 64 });
+    const input_node = try builder.parameter("x", shape);
+    const gamma_node = try builder.parameter("gamma", Shape.init(.f32, &.{64}));
+    const normalized = try builder.rmsNorm(input_node, gamma_node, 64, 1e-5);
+    const activated = try builder.neg(normalized);
+    try graph.markOutput(try builder.reshape(activated, Shape.init(.f32, &.{512})));
+    const encoded = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(encoded);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "rms-scope.onnx", .data = encoded });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "rms-scope.onnx" });
+    defer a.free(path);
+    var session = try createSessionWithOptions(a, path, .metal, .{ .graph_runtime_strategy = .partitioned });
+    defer session.close();
+    const impl: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    if (!runtime.antfly_metal_host_input_shared_supported(impl.shared_backend_ctx.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime)) return error.SkipZigTest;
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    const values: [512]f32 = @splat(2);
+    const gains: [64]f32 = @splat(3);
+    var input = try Tensor.initFloat32(a, "x", &.{ 8, 64 }, &values);
+    defer input.deinit();
+    var gamma = try Tensor.initFloat32(a, "gamma", &.{64}, &gains);
+    defer gamma.deinit();
+    const inputs = [_]Tensor{ input, gamma };
+    var proof = (try prepared_mod.prepare(session, .{ .tensors = &inputs }, a, null)) orelse return error.MissingPreparedMetalFrame;
+    defer proof.deinit();
+    try std.testing.expect(proof.hasCompleteOwnedPayload());
+    var result = (try session.runResident(&inputs, a)) orelse return error.MissingResidentResult;
+    defer result.deinit();
+    const stats = session.executionDiagnostics().?.execution.?;
+    try std.testing.expect(stats.assigned_kernel_dispatches >= 2);
+    try std.testing.expectEqual(@as(u64, 0), stats.graph_plan_slots_reserved);
+    try std.testing.expectEqual(@as(u64, 0), stats.actual_download_bytes);
+    const actual = try result.backend.toFloat32(result.outputs[0], a);
+    defer a.free(actual);
+    const expected: f32 = -6.0 / @sqrt(@as(f32, 4.0 + 1e-5));
+    for (actual) |item| try std.testing.expectApproxEqAbs(expected, item, 2e-5);
+}

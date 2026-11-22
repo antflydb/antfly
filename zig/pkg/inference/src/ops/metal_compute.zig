@@ -11931,9 +11931,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (self.audio_capture != null or !self.provider_impl.hasDecoderRuntime() or !supportsAssignedDescriptor(descriptor)) return false;
         return switch (descriptor.operation) {
-            // Slot-prepared linears, dot vendor schedules, mutable norm state,
-            // and typed/index data-dependent gathers need their own contracts.
-            .linear, .dot, .norm, .gather => false,
+            // Slot-prepared linears, dot vendor schedules, and data-dependent
+            // gathers need separate provider contracts.
+            .linear, .dot, .gather => false,
+            .norm => |norm| norm.kind == .rms and !disableRuntimeElementwise() and
+                descriptor.input_shapes[0].eq(descriptor.output_shape) and
+                (!(self.require_f32_linears and norm.dim % 4 == 0 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) or
+                    metal_runtime.antfly_metal_norm_clamp_ready(self.provider_impl.raw_decode_runtime) != 0),
             .rope => |r| metal_runtime.regularRopeAvailable(self.provider_impl, r),
             else => true,
         };
