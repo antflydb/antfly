@@ -15503,8 +15503,34 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
             var result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, reply.body, .{});
             defer result.deinit();
             try std.testing.expectEqualStrings(step.tag.?, result.value.command_tag);
+            if (std.mem.eql(u8, step.sql, "COMMIT")) {
+                const committed_id = try distributed_txn.parseTxnIdHex(result.value.transaction_id.?);
+                const status = (try server.txn_sessions.getStatusForPrincipal(alloc, committed_id, "connection_alice")).?;
+                try std.testing.expectEqual(transactions_api.SessionDisposition.committed, status.disposition);
+                try std.testing.expect(!try durable.completionSettled(committed_id));
+            }
             if (step.value) |value| try std.testing.expectEqualStrings(value, result.value.rows[0][0].string);
         }
+    }
+
+    {
+        var begun_failed = try Route.statement(alloc, &handler, alice_auth, connection_id, "BEGIN");
+        defer begun_failed.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), begun_failed.status);
+        var begin_result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, begun_failed.body, .{});
+        defer begin_result.deinit();
+        const failed_id = try distributed_txn.parseTxnIdHex(begin_result.value.session_id.?);
+        const failed_guard = try server.txn_sessions.mutation(alloc, failed_id, server.localSessionNodeId());
+        try server.txn_sessions.setSqlFailed(alloc, failed_guard, true);
+        var failed_commit = try Route.statement(alloc, &handler, alice_auth, connection_id, "COMMIT");
+        defer failed_commit.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), failed_commit.status);
+        var commit_result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, failed_commit.body, .{});
+        defer commit_result.deinit();
+        try std.testing.expectEqualStrings("ROLLBACK", commit_result.value.command_tag);
+        const status = (try server.txn_sessions.getStatusForPrincipal(alloc, failed_id, "connection_alice")).?;
+        try std.testing.expectEqual(transactions_api.SessionDisposition.aborted, status.disposition);
+        try std.testing.expect(!try durable.completionSettled(failed_id));
     }
 
     const prepare_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SELECT current_setting('app.limit')", .connection_id = connection_id }, .{});

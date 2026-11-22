@@ -325,7 +325,7 @@ pub const Adapter = struct {
             });
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
-        var owner = session_api.Adapter{ .admitted = self.admitted_mutation, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay, .begin_prepared_completion_only = self.connection_id != null and self.context.sql_completion != null };
+        var owner = session_api.Adapter{ .admitted = self.admitted_mutation, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay, .begin_prepared_completion_only = self.connection_id != null };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (inherited) |state| {
             if (!std.mem.eql(u8, state.metadata.database, session.scope.database) or !std.mem.eql(u8, state.metadata.namespace, session.scope.namespace)) return error.SqlTransactionNotActive;
@@ -375,8 +375,6 @@ pub const Adapter = struct {
             else => null,
         };
         if (control) |command| {
-            if (command == .commit and inherited != null and inherited.?.prepared_completion_only and self.context.sql_completion == null)
-                return error.SqlWriteCapacityUnavailable;
             if (parameters.len != 0) return zig017_failure: {
                 zig017_return_error = error.InvalidSqlParameters;
                 break :zig017_failure error.InvalidSqlParameters;
@@ -406,7 +404,10 @@ pub const Adapter = struct {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             })) == .failed;
-            if (command == .commit) owner.failed_commit_completion = self.context.sql_completion;
+            if (command == .commit) {
+                owner.rollback_for_commit = true;
+                owner.failed_commit_completion = self.context.sql_completion;
+            }
             const outcome = (session.execute(command) catch |zig017_err| {
                 if (zig017_err == error.SqlTransactionOutcomeUnknown) {
                     self.reports_existing_commit = command == .commit and owner.observed_execution_started;

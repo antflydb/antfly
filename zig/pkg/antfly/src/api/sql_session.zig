@@ -29,7 +29,7 @@ pub const Coordinator = struct {
     context: operation.RequestContext,
 
     fn retire(self: *Coordinator, guard: transactions.Mutation, version: transactions.DurableSessionStore.Version, commit_settings: bool) !sql.CommitResult {
-        const retired = self.server.txn_sessions.retireBeforeExecution(self.server.alloc, guard, version, commit_settings) catch |err| switch (err) {
+        const retired = self.server.txn_sessions.finishSqlCommitBeforeExecution(self.server.alloc, guard, version, commit_settings) catch |err| switch (err) {
             error.SessionLeaseLost => return err,
             else => false,
         };
@@ -136,6 +136,7 @@ pub const Adapter = struct {
     supports_range_guards: bool = false,
     observed_execution_started: bool = false,
     begin_prepared_completion_only: bool = false,
+    rollback_for_commit: bool = false,
     failed_commit_completion: @FieldType(operation.RequestContext, "sql_completion") = null,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
@@ -236,8 +237,12 @@ pub const Adapter = struct {
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
         if (self.failed_commit_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
-        const retired = self.registry.retireBeforeExecution(self.alloc, self.admitted.?, state.version, false) catch |err| switch (err) {
-            error.SessionWriteOutcomeUnknown => if (self.failed_commit_completion != null) return error.SqlTransactionOutcomeUnknown else return err,
+        const retirement = if (self.rollback_for_commit)
+            self.registry.finishSqlCommitBeforeExecution(self.alloc, self.admitted.?, state.version, false)
+        else
+            self.registry.retireBeforeExecution(self.alloc, self.admitted.?, state.version, false);
+        const retired = retirement catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown => if (self.rollback_for_commit) return error.SqlTransactionOutcomeUnknown else return err,
             else => return err,
         };
         if (!retired)

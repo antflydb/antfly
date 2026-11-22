@@ -1664,7 +1664,7 @@ pub const DurableSessionStore = struct {
         const key = try makeSqlAbortReceiptKey(self.alloc, id);
         defer self.alloc.free(key);
         const raw = txn.get(key) catch |err| if (err == error.NotFound) return false else return err;
-        var receipt = try decodeSqlAbortReceipt(self.alloc, id, raw);
+        var receipt = try decodeSqlTerminalReceipt(self.alloc, id, raw);
         defer receipt.deinit(self.alloc);
         return !receipt.prepared_completion_only;
     }
@@ -2058,12 +2058,13 @@ pub const DurableSessionStore = struct {
     pub const DetachCondition = union(enum) {
         beginning,
         active,
+        commit,
         expired: struct { state: sql_connection_record.State, cutoff_ms: u64 },
 
         fn matches(self: DetachCondition, connection: sql_connection_record.Record, owner: u64) bool {
             return switch (self) {
                 .beginning => connection.state == .beginning and connection.owner_node_id == owner,
-                .active => connection.state == .active and connection.owner_node_id == owner,
+                .active, .commit => connection.state == .active and connection.owner_node_id == owner,
                 .expired => |expiry| (expiry.state == .beginning or expiry.state == .active or expiry.state == .uncertain) and
                     connection.state == expiry.state and connection.expires_at_ms <= expiry.cutoff_ms,
             };
@@ -2117,7 +2118,9 @@ pub const DurableSessionStore = struct {
         detached.revision += 1;
         if (commit_settings) detached.overlay = session.setting_committed.items;
         try sql_connection_record.putTxn(txn, self.alloc, detached);
-        if (condition == .expired and connection.value.state != .beginning) {
+        if ((condition == .commit and session.prepared_completion_only) or
+            (condition == .expired and connection.value.state != .beginning))
+        {
             // The uncertain-state update may itself have lost its acknowledgement.
             // Keep the abort proof for either state and release the connection
             // and lease in the same fenced storage transaction.
@@ -2131,7 +2134,8 @@ pub const DurableSessionStore = struct {
                 .last_touched_timestamp = session.last_touched_timestamp,
                 .sync_level = session.sync_level,
                 .commit_execution_started = true,
-                .terminal_abort = true,
+                .terminal_abort = !commit_settings,
+                .terminal_commit = if (commit_settings) .{ .status = .committed } else null,
             };
             touchSession(&receipt);
             if (!separate_receipt and !session.prepared_completion_only) {
@@ -2363,7 +2367,7 @@ pub const DurableSessionStore = struct {
             error.NotFound => return false,
             else => return err,
         };
-        var receipt = try decodeSqlAbortReceipt(self.alloc, id, raw);
+        var receipt = try decodeSqlTerminalReceipt(self.alloc, id, raw);
         defer receipt.deinit(self.alloc);
         if (receipt.last_touched_timestamp >= cutoff) return false;
         if (!receipt.prepared_completion_only and !try self.sqlAbortProofExists(txn, id)) try self.putSqlAbortProof(txn, id);
@@ -4218,7 +4222,7 @@ pub const SessionRegistry = struct {
         // The abort is durable even when an attached connection or a concurrent
         // operation prevents immediate retirement.
         if (terminal.retain) return;
-        _ = self.removeMode(alloc, txn_id, false, false, terminal.version, if (publication) |first| first.guard else guard) catch false;
+        _ = self.removeMode(alloc, txn_id, false, false, .active, terminal.version, if (publication) |first| first.guard else guard) catch false;
     }
 
     pub fn getExecutionPlan(self: *SessionRegistry, alloc: std.mem.Allocator, guard: Mutation) !?ExecutionPlan {
@@ -5309,7 +5313,7 @@ pub const SessionRegistry = struct {
     }
 
     pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
-        return self.removeMode(alloc, txn_id, false, false, null, null) catch false;
+        return self.removeMode(alloc, txn_id, false, false, .active, null, null) catch false;
     }
 
     /// A no-participant COMMIT still publishes non-LOCAL setting mutations.
@@ -5317,7 +5321,11 @@ pub const SessionRegistry = struct {
     /// share one durable transaction; failed preflight/rollback use the abort
     /// variant above and leave the idle overlay unchanged.
     pub fn retireBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, guard: Mutation, expected: DurableSessionStore.Version, commit_settings: bool) !bool {
-        return self.removeMode(alloc, guard.id, true, commit_settings, expected, guard);
+        return self.removeMode(alloc, guard.id, true, commit_settings, .active, expected, guard);
+    }
+
+    pub fn finishSqlCommitBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, guard: Mutation, expected: DurableSessionStore.Version, commit_settings: bool) !bool {
+        return self.removeMode(alloc, guard.id, true, commit_settings, .commit, expected, guard);
     }
 
     pub fn rollbackConnectionBeforeExecution(self: *SessionRegistry, txn_id: db_mod.types.TxnId, connection_id: [32]u8, expected: DurableSessionStore.Version, condition: DurableSessionStore.DetachCondition) !void {
@@ -5335,7 +5343,7 @@ pub const SessionRegistry = struct {
         }
     }
 
-    fn removeMode(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, before_execution_only: bool, commit_settings: bool, observed: ?DurableSessionStore.Version, guard: ?Mutation) !bool {
+    fn removeMode(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, before_execution_only: bool, commit_settings: bool, condition: DurableSessionStore.DetachCondition, observed: ?DurableSessionStore.Version, guard: ?Mutation) !bool {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
@@ -5351,7 +5359,7 @@ pub const SessionRegistry = struct {
             // must share one native commit, regardless of which caller asked.
             if (current.commit_execution_started or current.terminal_commit != null or current.terminal_abort) return false;
             const durable = self.durable orelse return false;
-            try durable.deleteAndDetachConnection(txn_id, connection_id, commit_settings, expected, .active, guard, false);
+            try durable.deleteAndDetachConnection(txn_id, connection_id, commit_settings, expected, condition, guard, false);
         } else {
             if (before_execution_only and (current.commit_execution_started or current.terminal_commit != null or current.terminal_abort)) return false;
             try self.deletePersistent(txn_id, expected, null, guard);
@@ -7759,13 +7767,16 @@ fn readStatusTxn(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: db
     return result;
 }
 
-fn decodeSqlAbortReceipt(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw: []const u8) !Session {
+fn decodeSqlTerminalReceipt(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw: []const u8) !Session {
     var receipt = decodeSessionRecord(alloc, id, raw) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidTransactionSessionRecord,
     };
     errdefer receipt.deinit(alloc);
-    if (!DurableSessionStore.isLegacySqlAbortReceipt(receipt) or receipt.terminal_commit != null)
+    if (receipt.terminal_abort and receipt.terminal_commit == null and DurableSessionStore.isLegacySqlAbortReceipt(receipt)) return receipt;
+    const terminal = receipt.terminal_commit orelse return error.InvalidTransactionSessionRecord;
+    if (!receipt.prepared_completion_only or receipt.connection_id == null or receipt.sql != null or receipt.staged != null or
+        receipt.terminal_abort or !sessionCompletionSettled(receipt) or terminal.coordinator_group_id != null)
         return error.InvalidTransactionSessionRecord;
     return receipt;
 }
@@ -7777,7 +7788,7 @@ fn readSqlAbortStatus(txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.T
         error.NotFound => return .absent,
         else => return err,
     };
-    var receipt = try decodeSqlAbortReceipt(alloc, id, raw);
+    var receipt = try decodeSqlTerminalReceipt(alloc, id, raw);
     defer receipt.deinit(alloc);
     switch (filter) {
         .all => {},
