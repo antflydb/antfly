@@ -33,6 +33,7 @@ pub const Ticket = struct { slot: usize, entry: Entry };
 /// Preflight owns these tickets until all producers and model inputs drain.
 /// Only preflight mutates the set; workers borrow it read-only. Cache entries
 /// cannot be reclaimed between planning and consumption (including cancellation).
+pub const WebmAppleAdmission = enum { eligible, unsupported, replay_limit };
 pub const Pins = struct {
     cache: ?*Cache,
     tickets: [128]?Ticket = @splat(null),
@@ -41,24 +42,29 @@ pub const Pins = struct {
     // shortcut around validating mutable/unverified sources on a new request.
     bindings: [128]struct { input: [32]u8, clip: [32]u8 } = undefined,
     binding_count: usize = 0,
-    webm_windows: [64]struct { key: WindowKey, apple: bool } = undefined,
+    webm_windows: [64]struct { key: WindowKey, apple: WebmAppleAdmission } = undefined,
     webm_window_count: usize = 0,
 
-    pub const WindowKey = struct { index: *const anyopaque, policy: @import("antfly_video").sampling.TimestampPolicy };
+    pub const WindowKey = struct {
+        index: *const anyopaque,
+        policy: @import("antfly_video").sampling.TimestampPolicy,
+        coded_limit: usize,
+        continuation: ?*const anyopaque,
+    };
 
-    pub fn webmApple(self: *const Pins, key: WindowKey) ?bool {
+    pub fn webmApple(self: *const Pins, key: WindowKey) ?WebmAppleAdmission {
         for (self.webm_windows[0..self.webm_window_count]) |entry| {
             if (std.meta.eql(entry.key, key)) return entry.apple;
         }
         return null;
     }
 
-    pub fn rememberWebmApple(self: *Pins, key: WindowKey, apple: bool) bool {
+    pub fn rememberWebmApple(self: *Pins, key: WindowKey, apple: WebmAppleAdmission) ?WebmAppleAdmission {
         if (self.webmApple(key)) |existing| return existing;
-        if (self.webm_window_count == self.webm_windows.len) return false;
+        if (self.webm_window_count == self.webm_windows.len) return null;
         self.webm_windows[self.webm_window_count] = .{ .key = key, .apple = apple };
         self.webm_window_count += 1;
-        return true;
+        return apple;
     }
 
     pub fn binding(self: *const Pins, input: [32]u8) ?[32]u8 {

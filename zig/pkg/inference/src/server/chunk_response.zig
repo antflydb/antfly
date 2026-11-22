@@ -146,8 +146,9 @@ pub const Collector = struct {
         const source = std.fmt.bytesToHex(summary.identity.source, .lower);
         const plan = std.fmt.bytesToHex(summary.identity.plan, .lower);
         var cursor: [85]u8 = undefined;
-        const resumable = !request.observe_only and if (execution.failure) |err| pipeline.abort(err) or err == error.ChunkOutputTooLarge or err == error.ResourceLimitExceeded or err == error.StreamTooLong else !summary.source_complete;
-        const partial = if (execution.failure) |err| (err == error.ChunkOutputTooLarge or err == error.ChunkEventBudgetExceeded) else !summary.complete;
+        const failure: ?anyerror = execution.failure orelse if (summary.cold_resume_blocked) error.ChunkCodedWindowBudgetExceeded else null;
+        const resumable = !request.observe_only and !summary.cold_resume_blocked and if (failure) |err| pipeline.abort(err) or err == error.ChunkOutputTooLarge or err == error.ResourceLimitExceeded or err == error.StreamTooLong else !summary.source_complete;
+        const partial = if (failure) |err| (err == error.ChunkOutputTooLarge or err == error.ChunkEventBudgetExceeded) else !summary.complete;
         const output_coverage = try a.alloc(api.ChunkOutputCoverage, summary.output_count);
         for (output_coverage, summary.output_counts[0..summary.output_count]) |*dest, count| dest.* = .{ .name = count.name, .required = count.required, .complete = @intCast(count.complete), .failed = @intCast(count.failed), .skipped = @intCast(count.skipped) };
         return .{
@@ -157,7 +158,7 @@ pub const Collector = struct {
             .source_complete = summary.source_complete,
             .output_coverage = if (output_coverage.len != 0) output_coverage else null,
             .degraded = summary.degraded,
-            .status = if (execution.failure != null and !partial) "failed" else if (partial) "partial" else "complete",
+            .status = if (failure != null and !partial) "failed" else if (partial) "partial" else "complete",
             .source_reference = try sourceReference(request),
             .source_id = request.source_id,
             .source_fingerprint = try a.dupe(u8, &source),
@@ -171,7 +172,7 @@ pub const Collector = struct {
             .policy = wirePolicy(request.policy),
             .start_ordinal = @intCast(summary.start_ordinal),
             .covered_through_ordinal = @intCast(summary.next_ordinal),
-            .@"error" = if (execution.failure) |err| .{ .code = @errorName(err), .message = "chunk execution stopped before source completion" } else null,
+            .@"error" = if (failure) |err| .{ .code = @errorName(err), .message = "chunk execution stopped before source completion" } else null,
             .next_continuation = if (resumable) try a.dupe(u8, summary.identity.cursor(summary.next_ordinal, &cursor)) else null,
             .gaps = self.gaps.items,
         };
@@ -264,6 +265,7 @@ pub const NativeCollector = struct {
     pub fn finishPage(self: *@This(), request: pipeline.Request, target: Target, execution: Execution) !@import("inference_chunker").types.ChunkPage {
         if (execution.failure) |err| return err;
         const summary = execution.summary;
+        if (summary.cold_resume_blocked) return error.ChunkCodedWindowBudgetExceeded;
         if (summary.next_ordinal - summary.start_ordinal != self.chunks.items.len or
             (!summary.complete and self.chunks.items.len == 0) or (request.observe_only and self.observation == null)) return error.IncompleteChunkCoverage;
         const a = self.allocator;
@@ -355,4 +357,18 @@ test "model aware media generation observations own metadata without claiming in
     try std.testing.expectEqual(@as(usize, 0), response.data.len);
     try std.testing.expectEqual(@as(i64, 0), response.covered_through_ordinal);
     try std.testing.expect(!response.source_complete.?);
+}
+
+test "model aware media WebM response omits an unusable cold continuation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var wire = Collector{ .allocator = arena.allocator() };
+    const identity = planning.Identity{ .plan = @splat(1), .source = @splat(2) };
+    const execution = Execution{ .summary = .{ .identity = identity, .start_ordinal = 0, .next_ordinal = 1, .emitted = 1, .cold_resume_blocked = true }, .model_identity = @splat('3'), .model_revision = @splat('4'), .dimensions = 2 };
+    const request = Request{ .input = .{ .text = "unused" }, .max_chunks = 1 };
+    const response = try wire.response(request, .{ .model = "model" }, execution);
+    try std.testing.expect(response.next_continuation == null);
+    try std.testing.expectEqualStrings("ChunkCodedWindowBudgetExceeded", response.@"error".?.code);
+    var native = NativeCollector{ .allocator = arena.allocator() };
+    try std.testing.expectError(error.ChunkCodedWindowBudgetExceeded, native.finishPage(request, .{ .model = "model" }, execution));
 }
