@@ -50077,13 +50077,8 @@ test "hosted image reader releases admission after upstream parsing exhausts the
     });
     defer node.deinit();
 
-    const image = @embedFile("../models/testdata/lightonocr3/invoice.png");
-    const encoder = std.base64.standard.Encoder;
-    const encoded = try a.alloc(u8, encoder.calcSize(image.len));
-    defer a.free(encoded);
-    _ = encoder.encode(encoded, image);
-    const body = try std.fmt.allocPrint(a, "{{\"model\":\"readers/ocr\",\"images\":[{{\"url\":\"data:image/png;base64,{s}\"}},{{\"url\":\"data:image/png;base64,{s}\"}}]}}", .{ encoded, encoded });
-    defer a.free(body);
+    const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC";
+    const body = "{\"model\":\"readers/ocr\",\"images\":[{\"url\":\"" ++ image ++ "\"},{\"url\":\"" ++ image ++ "\"}]}";
 
     var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
     defer request.deinit();
