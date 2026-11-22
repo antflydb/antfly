@@ -363,6 +363,7 @@ def policy_budgets(case):
 
 def record_result(args, store, case, endpoint, row, vector, sha):
     row["fixture_sha256"] = sha
+    row.update(model=case["model"], task=case["task"], kind=case.get("kind", "text"))
     if vector is not None:
         if case["id"] not in store.references:
             if endpoint != args.reference_endpoint or not row["warmup"]:
@@ -716,17 +717,19 @@ def main():
         if case["task"] == "read" and case["kind"] == "image"
     )
     with state.CampaignStore(args.report, identity, args.resume) as store:
-        succeeded = False
+        measurement_success = False
         try:
             run_campaign(args, store, cases, hashes)
-            succeeded = len(store.samples) == planned and all(
+            measurement_success = len(store.samples) == planned and all(
                 acceptable(row) for row in store.rows
             )
         finally:
             pairs = compare_policies(store.rows)
+            succeeded = measurement_success and len(pairs) == planned_pairs
             report = dict(
                 identity=identity,
                 success=succeeded,
+                measurement_success=measurement_success,
                 rows=store.rows,
                 coverage=dict(
                     planned_samples=planned,

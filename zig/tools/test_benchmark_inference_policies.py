@@ -192,8 +192,10 @@ class PolicyBenchmarkTests(unittest.TestCase):
         self.assertEqual(first["coverage"]["recorded_samples"], 1)
         fake.models.clear()
         fake.generation = 100
-        self.assertEqual(self.run_bench(argv + ["--resume"], fake), 0)
+        self.assertEqual(self.run_bench(argv + ["--resume"], fake), 1)
         report = self.report()
+        self.assertTrue(report["measurement_success"])
+        self.assertFalse(report["success"])
         self.assertEqual(report["epochs"], 2)
         measured = [r for r in report["rows"] if not r["warmup"]]
         self.assertEqual(len(measured), 2)

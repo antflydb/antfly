@@ -125,7 +125,9 @@ Report per-page distributions and completeness, not just a corpus average.
 An interrupted or evicted pair is excluded rather than silently pairing different
 worker incarnations. Coverage includes planned/matched policy pairs, and
 `policy_comparison_complete` and warnings expose missing pairs even when all
-individual timed measurements pass. Start a new campaign when a complete paired
+individual timed measurements pass (`measurement_success: true`). The command
+succeeds only when both the measurements and requested paired comparisons pass;
+it does not return success for incomplete policy coverage. Start a new campaign when a complete paired
 policy estimate is needed; recorded timed calls are never silently repeated.
 
 Use the identical command with `--resume` after interruption. Recorded timed
