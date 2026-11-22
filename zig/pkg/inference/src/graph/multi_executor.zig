@@ -23,6 +23,7 @@
 // Partitions execute sequentially in plan order. True pipeline overlap
 // (concurrent stages) is a future extension requiring std.Thread.
 
+const tensor_transfer = @import("../execution/tensor_transfer.zig");
 const std = @import("std");
 const ml = @import("ml");
 const build_options = @import("build_options");
@@ -128,77 +129,7 @@ pub const MultiExecutionResult = struct {
     }
 };
 
-/// Transfer a tensor without changing dtype. Try direct device copy first;
-/// otherwise stage its exact bytes (f32 may use the numeric host path).
-pub fn transferTensor(
-    allocator: std.mem.Allocator,
-    value: CT,
-    from: *const ComputeBackend,
-    to: *const ComputeBackend,
-) !CT {
-    return transferTensorWithKnownShape(allocator, value, from, to, null);
-}
-
-fn transferTensorWithKnownShape(
-    allocator: std.mem.Allocator,
-    value: CT,
-    from: *const ComputeBackend,
-    to: *const ComputeBackend,
-    known_shape: ?[]const i64,
-) !CT {
-    const trace = traceTransfersEnabled();
-    if (trace) std.debug.print("graph_executor_transfer_stage: begin from={s} to={s}\n", .{ @tagName(from.kind()), @tagName(to.kind()) });
-    if (try to.copyTensorFromBackend(from, value)) |copied| return copied;
-    const runtime_shape_needed = if (known_shape) |shape| blk: {
-        for (shape) |dim| if (dim < 0) break :blk true;
-        break :blk false;
-    } else true;
-    const owned_shape_i64 = if (runtime_shape_needed) try from.tensorShape(value, allocator) else null;
-    defer if (owned_shape_i64) |shape| allocator.free(shape);
-    const shape_i64 = owned_shape_i64 orelse known_shape.?;
-    if (trace) std.debug.print("graph_executor_transfer_stage: shape_i64={any}\n", .{shape_i64});
-    const shape_i32 = try tensorShapeI32(allocator, shape_i64);
-    defer allocator.free(shape_i32);
-    if (trace) std.debug.print("graph_executor_transfer_stage: shape_i32={any}\n", .{shape_i32});
-    const dtype = try from.tensorDType(value);
-    switch (dtype) {
-        inline .i8, .i16, .i32, .i64, .u8, .bool_, .f16, .bf16, .f64 => |tag| {
-            const exported = (try from.exportTensorData(value, allocator)) orelse return error.UnsupportedTensorType;
-            const bytes = switch (exported.payload) {
-                .bytes => |bytes| bytes,
-                .quantized_f32 => |quant| {
-                    allocator.free(quant.raw_bytes);
-                    allocator.free(quant.shape);
-                    return error.UnsupportedTensorType;
-                },
-            };
-            defer allocator.free(bytes);
-            if (exported.dtype != dtype) return error.UnsupportedTensorType;
-            if (try to.fromConstantBytes(bytes, @field(ml.graph.DType, @tagName(tag)), shape_i64)) |exact| return exact;
-            if (dtype != .i32 or bytes.len % 4 != 0) return error.UnsupportedTensorType;
-            const integers = try allocator.alloc(i32, bytes.len / 4);
-            defer allocator.free(integers);
-            for (integers, 0..) |*integer, i| integer.* = std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little);
-            return (try to.fromInt32Shape(integers, shape_i32)) orelse return error.UnsupportedTensorType;
-        },
-        else => {},
-    }
-    const f32_data = try from.toFloat32(value, allocator);
-    defer allocator.free(f32_data);
-    if (trace) std.debug.print("graph_executor_transfer_stage: f32_len={d}\n", .{f32_data.len});
-    const transferred = try to.fromFloat32Shape(f32_data, shape_i32);
-    errdefer to.free(transferred);
-    if (trace) std.debug.print("graph_executor_transfer_stage: from_float32_shape_done\n", .{});
-    if (to.kind() == .metal) {
-        if (try metal_partition_executor.makeMetalDeviceResident(to, transferred)) |device_transferred| {
-            to.free(transferred);
-            if (trace) std.debug.print("graph_executor_transfer_stage: made_metal_device_resident\n", .{});
-            return device_transferred;
-        }
-    }
-    if (trace) std.debug.print("graph_executor_transfer_stage: end host_resident\n", .{});
-    return transferred;
-}
+pub const transferTensor = tensor_transfer.copy;
 
 fn graphShapeDims(shape: ml.graph.Shape, buf: *[ml.graph.shape.max_rank]i64) ![]const i64 {
     const rank = shape.rank();
@@ -207,21 +138,8 @@ fn graphShapeDims(shape: ml.graph.Shape, buf: *[ml.graph.shape.max_rank]i64) ![]
     return buf[0..rank];
 }
 
-fn traceTransfersEnabled() bool {
-    return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_TRANSFERS", false);
-}
-
 fn traceOutputsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_OUTPUTS", false);
-}
-
-fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
-    const out = try allocator.alloc(i32, shape.len);
-    errdefer allocator.free(out);
-    for (shape, 0..) |dim, i| {
-        out[i] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
-    }
-    return out;
 }
 
 /// Partitions may schedule independent branches in a different order from
@@ -426,7 +344,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                     try frame.transfer(src_entry.backend, cb, src_val, ext_in.node_id, @intCast(part_idx))
                 else
                     null;
-                const transferred = planned_transfer orelse try transferTensorWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
+                const transferred = planned_transfer orelse try tensor_transfer.copyWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
                 if (collect_stats) exec_stats.cross_device_transfers += 1;
                 if (collect_stats and cb.kind() == .metal and metal_partition_executor.isMetalDeviceResident(cb, transferred)) {
                     exec_stats.device_resident_transfers += 1;
@@ -1255,7 +1173,7 @@ test "multi-executor retains inputs when partitions reorder independent consumer
     try std.testing.expectEqualSlices(f32, &.{ 1, 4, 9, 16 }, square_values);
 }
 
-test "transferTensor preserves floating storage without numeric conversion" {
+test "transferTensor preserves typed storage without numeric conversion" {
     const a = std.testing.allocator;
     var weights = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weights, a);
@@ -1293,8 +1211,13 @@ test "transferTensor preserves floating storage without numeric conversion" {
     };
     const doubles = [_]f64{ 1.0000000000000002, -1.23456789012345e100 };
     const halves = [_]u16{ 0x7e19, 0x8000 };
-    for ([_]DType{ .f16, .bf16, .f64 }) |dtype| {
-        var probe = Probe{ .dtype = dtype, .bytes = if (dtype == .f64) std.mem.sliceAsBytes(&doubles) else std.mem.sliceAsBytes(&halves) };
+    const indices = [_]i64{ 16777219, -9007199254740993 };
+    for ([_]DType{ .f16, .bf16, .f64, .i64 }) |dtype| {
+        var probe = Probe{ .dtype = dtype, .bytes = switch (dtype) {
+            .f64 => std.mem.sliceAsBytes(&doubles),
+            .i64 => std.mem.sliceAsBytes(&indices),
+            else => std.mem.sliceAsBytes(&halves),
+        } };
         var vtable = native.vtable.*;
         vtable.backendKind = Probe.kind;
         vtable.tensorDType = Probe.dtypeOf;

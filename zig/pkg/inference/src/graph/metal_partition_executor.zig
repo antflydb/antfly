@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const tensor_transfer = @import("../execution/tensor_transfer.zig");
 const std = @import("std");
 const ml = @import("ml");
 const build_options = @import("build_options");
@@ -16629,7 +16630,7 @@ fn materializePartitionRuntimeInputs(
                 "graph_executor_node_trace: materialize_runtime_input_transfer_host node={d} from_backend={s} to_backend={s}\n",
                 .{ node_id, @tagName(src_entry.backend.kind()), @tagName(cb.kind()) },
             );
-            const transferred = try transferTensorHostBacked(allocator, rt_val, src_entry.backend, cb);
+            const transferred = try tensor_transfer.copyHostFloat32(allocator, rt_val, src_entry.backend, cb);
             values[i] = transferred;
             if (exec_ctx.owned_runtime_transfers) |owned| try owned.put(allocator, node_id, {});
             if (exec_ctx.stats) |stats| stats.runtime_input_transfers += 1;
@@ -16640,7 +16641,7 @@ fn materializePartitionRuntimeInputs(
                 "graph_executor_node_trace: materialize_runtime_input_transfer node={d} from_backend={s} to_backend={s}\n",
                 .{ node_id, @tagName(src_entry.backend.kind()), @tagName(cb.kind()) },
             );
-            const transferred = try transferTensor(allocator, rt_val, src_entry.backend, cb);
+            const transferred = try tensor_transfer.copyRuntimeInput(allocator, rt_val, src_entry.backend, cb);
             values[i] = transferred;
             if (exec_ctx.owned_runtime_transfers) |owned| try owned.put(allocator, node_id, {});
             if (exec_ctx.stats) |stats| {
@@ -17264,51 +17265,6 @@ fn ownedRuntimeTransferContains(
 ) bool {
     const owned = exec_ctx.owned_runtime_transfers orelse return false;
     return owned.contains(node_id);
-}
-
-fn transferTensor(
-    allocator: std.mem.Allocator,
-    value: CT,
-    from: *const ComputeBackend,
-    to: *const ComputeBackend,
-) !CT {
-    const shape_i64 = try from.tensorShape(value, allocator);
-    defer allocator.free(shape_i64);
-    const shape_i32 = try tensorShapeI32(allocator, shape_i64);
-    defer allocator.free(shape_i32);
-    const f32_data = try from.toFloat32(value, allocator);
-    defer allocator.free(f32_data);
-    const transferred = try to.fromFloat32Shape(f32_data, shape_i32);
-    errdefer to.free(transferred);
-    if (try makeMetalDeviceResident(to, transferred)) |device_transferred| {
-        to.free(transferred);
-        return device_transferred;
-    }
-    return transferred;
-}
-
-fn transferTensorHostBacked(
-    allocator: std.mem.Allocator,
-    value: CT,
-    from: *const ComputeBackend,
-    to: *const ComputeBackend,
-) !CT {
-    const shape_i64 = try from.tensorShape(value, allocator);
-    defer allocator.free(shape_i64);
-    const shape_i32 = try tensorShapeI32(allocator, shape_i64);
-    defer allocator.free(shape_i32);
-    const f32_data = try from.toFloat32(value, allocator);
-    defer allocator.free(f32_data);
-    return to.fromFloat32Shape(f32_data, shape_i32);
-}
-
-fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
-    const out = try allocator.alloc(i32, shape.len);
-    errdefer allocator.free(out);
-    for (shape, 0..) |dim, i| {
-        out[i] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
-    }
-    return out;
 }
 
 const native_compute = @import("../ops/native_compute.zig");
