@@ -64,6 +64,8 @@ pub const parsePublicSyncLevelJson = @import("mutation_values.zig").parsePublicS
 pub const publicSyncLevelText = @import("mutation_values.zig").publicSyncLevelText;
 
 test "public sync level text accepts full_index and rejects removed aknn alias" {
+    try std.testing.expectEqual(SyncLevel.full_text, parsePublicSyncLevelText("query").?);
+    try std.testing.expectEqual(SyncLevel.full_text, parsePublicSyncLevelText("full_text").?);
     try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
     try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("full_index").?);
     try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.full_index));

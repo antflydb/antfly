@@ -2276,6 +2276,7 @@ pub const Owner = struct {
     wake: std.Io.Event = .unset,
     maintenance_activity: @import("maintenance_activity.zig").Activity = .{},
     current: ?*h.Handle = null,
+    redo_recovery_cursor: ?native.RedoRecoveryCursor = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
     /// Non-null for the duration of a hosted/non-independent `maintenanceTurn`
@@ -2522,16 +2523,47 @@ pub const Owner = struct {
         return self.refreshImpl(true);
     }
 
+    fn rememberRedoRecoveryCursor(self: *Owner, candidate: native.RedoRecoveryCursor) void {
+        if (self.redo_recovery_cursor) |saved| {
+            if (saved.inode == candidate.inode and
+                saved.checkpoint.commit_sequence > candidate.checkpoint.commit_sequence) return;
+        }
+        self.redo_recovery_cursor = candidate;
+    }
+
     fn refreshImpl(self: *Owner, fast_only: bool) !?*h.Handle {
         wal_trace.recordOp(.serving_runtime_refresh);
         if (comptime h.builtin.is_test) _ = self.test_refresh_count.fetchAdd(1, .release);
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
             if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
-            var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
-            defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
+            const maintenance_references_clear = current.maintenance_references == 0 or
+                (current == self.maintenance_turn_root and current.maintenance_references == 1);
+            const can_reuse = !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and
+                maintenance_references_clear and !needsOutcomeReconciliation(current) and
+                file.adoptionEpoch() == current.lite_refresh_adoption_epoch;
+            if (can_reuse and current.lane_pins.load(.acquire) == 0) {
+                if (file.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
+                if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |inode| {
+                    self.reader_coordinator.observeCurrent(inode, file.headerFingerprint());
+                    if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
+                        try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                    return current;
+                }
+            }
+            var recovered_probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{
+                .read_only = true,
+                .internal_reader = true,
+                .redo_recovery_base = self.redo_recovery_cursor,
+            });
+            defer recovered_probe.close();
+            const probe = &recovered_probe;
             const probe_inode = (try probe.file.stat(probe.runtime())).inode;
+            if (self.redo_recovery_cursor) |saved| {
+                if (saved.inode != probe_inode) self.redo_recovery_cursor = null;
+            }
+            if (probe.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
             // Establish the fenced tip before opening any new read pins.
             // Existing readers of an unknown peer publication remain poisoned.
             self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
@@ -2563,8 +2595,6 @@ pub const Owner = struct {
             // with the reference it is itself holding. Treat that one
             // self-held reference as if it were absent; a reference any
             // other caller holds on `current` still forces a reopen below.
-            const maintenance_references_clear = current.maintenance_references == 0 or
-                (current == self.maintenance_turn_root and current.maintenance_references == 1);
             // An uncertain publication can fail before writing anything, so an
             // unchanged header does not prove the runtime is reusable: reopen
             // to reconcile from durable state.
@@ -2585,8 +2615,8 @@ pub const Owner = struct {
             // prove no primary/index root moved; that is sufficient on a
             // non-redo file, which has no logical watermark separate from
             // the physical one for `sequence_unchanged` to protect.
-            const fast2_metadata_unchanged = try file.runtimeMetadataUnchanged(&probe);
-            const fast2_index_unchanged = try loadedIndexInputsUnchanged(current, file, &probe);
+            const fast2_metadata_unchanged = try file.runtimeMetadataUnchanged(probe);
+            const fast2_index_unchanged = try loadedIndexInputsUnchanged(current, file, probe);
             if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
                 fast2_metadata_unchanged and fast2_index_unchanged)
             {
@@ -2608,38 +2638,15 @@ pub const Owner = struct {
                 if (std.meta.eql(probe.header, captured.header) and
                     (try probe.file.stat(probe.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) known_maintenance = snapshot;
             }
-            // perf/lwa-xproc-refresh: neither fast path above fired, so a
-            // reopen is already decided -- `file` (this Owner's own,
-            // possibly long-idle serving instance) is about to be
-            // discarded for `replacement`, a brand-new `NativeFile` on the
-            // same inode. That reopen's own `recoverRedoLog` trusts an
-            // already-populated, same-pid `SharedRedoOverlay` verbatim and
-            // never re-populates it (`inode_lock.ensureRedoOverlay`'s own
-            // doc comment): correct for a same-process sibling, whose own
-            // commits already wrote straight into that one shared
-            // instance, but not for a commit made by a genuinely different
-            // process -- that overlay is this process's own, and nothing
-            // in this process ever applied a foreign process's logical
-            // mutations to it, so `replacement` would silently inherit the
-            // exact same, still-incomplete instance and gain nothing from
-            // reopening. Calling the one primitive that actually walks the
-            // log past this process's own last-applied sequence (via the
-            // shared lock region's published watermark, §9.3b) and decodes
-            // whatever is new directly into that shared overlay closes
-            // that gap -- called here, on the *old* `file`, while its own
-            // bound is still genuinely behind (this is the only place
-            // where that is true: `replacement`'s own cold open would
-            // already have advanced a fresh instance's bound via its
-            // independent physical log scan before any caller could
-            // intervene, making this same call on `replacement` itself a
-            // guaranteed no-op). A cheap no-op here too whenever nothing
-            // new was actually published since this process's own overlay
-            // was last caught up.
-            if (file.redo != null) try file.refreshCrossProcessRedoOverlay();
+            // Protected recovery already applied the missing suffix using
+            // the probe's verified frontier. Legacy recovery can still
+            // need the mapped catch-up before opening another runtime.
+            if (file.redo != null and !file.header.protected_redo) try file.refreshCrossProcessRedoOverlay();
         }
         if (fast_only) return null;
         var options = self.options;
         options.externally_locked = true;
+        options.redo_recovery_base = self.redo_recovery_cursor;
         if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
         // Certify before opening index sources, whose lease publications can
         // advance the header. The probe is borrowed only by synchronous open.
@@ -2648,7 +2655,12 @@ pub const Owner = struct {
         var retained_turn = false;
         defer if (retained_turn) self.releaseMaintenanceTurnAssumeLocked();
         if (self.options.profile == .native and self.options.open_mode == .writer) {
-            certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
+            certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{
+                .read_only = true,
+                .internal_reader = true,
+                .redo_recovery_base = options.redo_recovery_base,
+            });
+            options.redo_recovery_base = certified.?.redoRecoveryCursor();
             certified.?.allocator_cancel_token = &self.verification_cancel;
             if (self.current) |previous| {
                 // Only an idle serving wrapper can donate. Active cursors,
@@ -2747,6 +2759,7 @@ pub const Owner = struct {
         replacement.lite_refresh_adoption_epoch = replacement.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
         replacement.lite_runtime_sequence = replacement.owned_lite_backend.?.native_docstore.?.file.committedSequence();
         self.installStoreHooks(replacement);
+        self.redo_recovery_cursor = replacement.owned_lite_backend.?.native_docstore.?.file.redoRecoveryCursor();
         self.current = replacement;
         for (self.connections.items) |connection| {
             connection.current = replacement;
@@ -5353,7 +5366,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         var resolved = resolved_options;
         resolved.externally_locked = true;
         initial = try api.openLiteHandleAllocWithRuntime(alloc, path, resolved, true, h.handleLockIo(), null);
-        initial.?.owned_lite_backend.?.native_docstore.?.file.releaseWriterOwnership();
+        try initial.?.owned_lite_backend.?.native_docstore.?.file.releaseWriterOwnership();
         // Marks this instance subject to the `active_writer` backstop
         // (native.zig's `publishCheckpoint`/inode_lock.zig's own doc
         // comment): this becomes `owner.current` below, the Owner's own
@@ -5389,6 +5402,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         if (initial) |root| {
             root.lite_refresh_adoption_epoch = root.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
             root.lite_runtime_sequence = root.owned_lite_backend.?.native_docstore.?.file.committedSequence();
+            owner.redo_recovery_cursor = root.owned_lite_backend.?.native_docstore.?.file.redoRecoveryCursor();
             owner.installStoreHooks(root);
         }
     }

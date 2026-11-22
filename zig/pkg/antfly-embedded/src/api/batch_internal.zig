@@ -2957,7 +2957,7 @@ fn syncLevelFromValue(value: std.json.Value) !db_mod.types.SyncLevel {
     const level = value.string;
     if (std.mem.eql(u8, level, "propose")) return .propose;
     if (std.mem.eql(u8, level, "write")) return .write;
-    if (std.mem.eql(u8, level, "full_text")) return .full_text;
+    if (std.mem.eql(u8, level, "query") or std.mem.eql(u8, level, "full_text")) return .full_text;
     if (std.mem.eql(u8, level, "enrichments")) return .enrichments;
     if (std.mem.eql(u8, level, "full_index")) return .full_index;
     return error.InvalidBatchRequest;

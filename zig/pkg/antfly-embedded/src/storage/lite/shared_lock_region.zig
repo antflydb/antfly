@@ -567,6 +567,7 @@ fn fcntlLockUntil(io: Io, fd: std.posix.fd_t, offset: i64, lock_type: i16, deadl
 /// for this one-time section, avoids that cross-mechanism conflict
 /// entirely rather than working around it.
 const setup_lock_offset: i64 = 1 << 48;
+const frontier_barrier_lock_offset = setup_lock_offset + 1;
 
 /// The byte-range liveness probe §8.4 describes: `true` means the
 /// recorded holder at this byte is dead (the kernel already dropped its
@@ -612,6 +613,7 @@ const FdEntry = struct {
     /// Serializes this process's region setup on this inode
     /// (`openSizedUntil`); the fcntl setup byte alone does not.
     setup_mutex: Io.Mutex = .init,
+    frontier_barrier_mutex: Io.Mutex = .init,
 };
 
 // `Io.Mutex`, matching `inode_lock.zig`'s own registry mutex -- never a
@@ -928,8 +930,122 @@ pub const Region = struct {
     /// rebuild-from-scratch sizing and `ensureNoLivePeer`'s own "does the
     /// claimed slot count even fit the file" sanity check can't drift
     /// apart from each other or from the real per-array offsets above.
-    fn regionBytesFor(max_readers: u32) u64 {
+    fn legacyRegionBytes(max_readers: u32) u64 {
         return @as(u64, @intCast(ticketAbandonedOffset(max_readers, 0))) + @as(u64, max_readers);
+    }
+
+    // The extension follows the old slot table. Its generation binds a
+    // publisher to one seqlock tuple, including when a legacy peer writes.
+    fn logPublisherOffset(max_readers: u32) u64 {
+        return std.mem.alignForward(u64, legacyRegionBytes(max_readers), @alignOf(std.atomic.Value(u128)));
+    }
+
+    fn logNonceOffset(max_readers: u32) u64 {
+        return logPublisherOffset(max_readers) + 2 * @sizeOf(std.atomic.Value(u128));
+    }
+
+    fn publisherRegionBytes(max_readers: u32) u64 {
+        return logNonceOffset(max_readers) + @as(u64, max_readers) * @sizeOf(std.atomic.Value(u64));
+    }
+
+    fn previousRegionBytes(max_readers: u32) u64 {
+        return std.mem.alignForward(u64, publisherRegionBytes(max_readers), @alignOf(std.atomic.Value(u128))) + 2 * @sizeOf(std.atomic.Value(u128));
+    }
+
+    // Use the padding between the publisher generation and its nonce table.
+    // An older publisher can resize the sidecar to its original length while
+    // other processes are mapped.
+    fn frontierProofField(self: *const Region, comptime T: type, offset: usize) *std.atomic.Value(T) {
+        const base: usize = @intCast(logPublisherOffset(self.header().max_readers));
+        return @ptrCast(@alignCast(self.mapping.ptr + base + offset));
+    }
+
+    fn frontierFingerprint(sequence: u64, generation: u64, end_offset: u64, full_sync: bool) [12]u8 {
+        var raw: [25]u8 = undefined;
+        std.mem.writeInt(u64, raw[0..8], sequence, .little);
+        std.mem.writeInt(u64, raw[8..16], generation, .little);
+        std.mem.writeInt(u64, raw[16..24], end_offset, .little);
+        raw[24] = @intFromBool(full_sync);
+        var digest: [12]u8 = undefined;
+        std.crypto.hash.Blake3.hash(&raw, &digest, .{});
+        digest[0] |= 1;
+        return digest;
+    }
+
+    fn matchesFrontierProof(self: *const Region, sequence: u64, generation: u64, end_offset: u64, full_sync: bool) bool {
+        const tag = self.frontierProofField(u32, 20).load(.acquire);
+        if (tag == 0) return false;
+        const proof = frontierFingerprint(sequence, generation, end_offset, full_sync);
+        return tag == std.mem.readInt(u32, proof[0..4], .little) and
+            self.frontierProofField(u64, 24).load(.acquire) == std.mem.readInt(u64, proof[4..12], .little);
+    }
+
+    pub fn hasSyncedFrontier(self: *const Region, sequence: u64, generation: u64, end_offset: u64, full_sync: bool) bool {
+        return self.matchesFrontierProof(sequence, generation, end_offset, true) or
+            (!full_sync and self.matchesFrontierProof(sequence, generation, end_offset, false));
+    }
+
+    pub fn noteSyncedFrontier(self: *Region, sequence: u64, generation: u64, end_offset: u64, full_sync: bool) void {
+        if (!full_sync and self.matchesFrontierProof(sequence, generation, end_offset, true)) return;
+        const proof = frontierFingerprint(sequence, generation, end_offset, full_sync);
+        self.frontierProofField(u64, 24).store(std.mem.readInt(u64, proof[4..12], .little), .release);
+        self.frontierProofField(u32, 20).store(std.mem.readInt(u32, proof[0..4], .little), .release);
+    }
+
+    // Cold recoverers already hold a shared writer fence. This separate
+    // byte lets one complete the missing barrier while the others wait.
+    pub fn lockFrontierBarrier(self: *Region) !void {
+        try self.fd_entry.frontier_barrier_mutex.lock(self.io);
+        errdefer self.fd_entry.frontier_barrier_mutex.unlock(self.io);
+        try fcntlLockBlocking(self.io, self.fd_entry.fd, frontier_barrier_lock_offset, std.c.F.WRLCK);
+    }
+
+    pub fn unlockFrontierBarrier(self: *Region) void {
+        fcntlUnlock(self.fd_entry.fd, frontier_barrier_lock_offset);
+        self.fd_entry.frontier_barrier_mutex.unlock(self.io);
+    }
+
+    fn logPublisher(self: *const Region) *std.atomic.Value(u128) {
+        return @ptrCast(@alignCast(self.mapping.ptr + @as(usize, @intCast(logPublisherOffset(self.header().max_readers)))));
+    }
+
+    fn logPublisherGeneration(self: *const Region) *std.atomic.Value(u32) {
+        const offset = logPublisherOffset(self.header().max_readers) + @sizeOf(std.atomic.Value(u128));
+        return @ptrCast(@alignCast(self.mapping.ptr + @as(usize, @intCast(offset))));
+    }
+
+    fn logNonces(mapping: []align(std.heap.page_size_min) u8, max_readers: u32) []std.atomic.Value(u64) {
+        const base: [*]std.atomic.Value(u64) = @ptrCast(@alignCast(mapping.ptr + @as(usize, @intCast(logNonceOffset(max_readers)))));
+        return base[0..max_readers];
+    }
+
+    /// A publication from a live claim is current for this coordination
+    /// session, even while a later commit is syncing. Guard the liveness
+    /// check against a concurrent slot claim still initializing its nonce.
+    pub fn isLogStateLive(self: *const Region, state: LogState) bool {
+        const hdr = self.header();
+        const generation = hdr.log_generation.load(.seq_cst);
+        if (generation == 0 or generation & 1 != 0 or generation != self.logPublisherGeneration().load(.seq_cst)) return false;
+        const publisher = self.logPublisher().load(.seq_cst);
+        if (publisher == 0) return false;
+        const slot: u32 = @truncate(publisher);
+        if (slot >= hdr.max_readers) return false;
+        const nonce: u64 = @truncate(publisher >> 64);
+        const claim: u32 = @truncate(publisher >> 32);
+        const nonces = logNonces(self.mapping, hdr.max_readers);
+        if (nonces[slot].load(.acquire) != nonce) return false;
+
+        if (slot != self.own_liveness_slot) {
+            if (!self.fd_entry.setup_mutex.tryLock()) return false;
+            defer self.fd_entry.setup_mutex.unlock(self.io);
+            const fd = self.fd_entry.fd;
+            if (!fcntlTryLock(fd, setup_lock_offset, std.c.F.RDLCK)) return false;
+            defer fcntlUnlock(fd, setup_lock_offset);
+            if (nonces[slot].load(.acquire) != nonce or self.isReferenceDead(slot, claim)) return false;
+        } else if (claim != self.own_liveness_generation) return false;
+
+        const current = self.readLogStateChecked() orelse return false;
+        return generation == hdr.log_generation.load(.seq_cst) and std.meta.eql(current, state);
     }
 
     /// v5: the per-liveness-slot claim-generation array immediately after
@@ -1254,7 +1370,7 @@ pub const Region = struct {
                 // exactly like corruption -- same liveness proof before
                 // rebuilding, same `RegionCorrupt` if that proof fails.
                 const existing_header: *const Header = @ptrCast(@alignCast(&existing_raw));
-                if (existing_header.db_inode != 0 and db_inode != 0 and existing_header.db_inode != db_inode) {
+                if (existing_header.region_bytes > size or (existing_header.db_inode != 0 and db_inode != 0 and existing_header.db_inode != db_inode)) {
                     need_init = true;
                 }
             }
@@ -1267,8 +1383,7 @@ pub const Region = struct {
             try ensureNoLivePeer(io, fd_entry, &existing_raw, size);
         }
         if (need_init) {
-            // `regionBytesFor`'s own doc comment has the per-slot layout.
-            const region_bytes = regionBytesFor(max_readers);
+            const region_bytes = publisherRegionBytes(max_readers);
             // Rebuild from a clean slate: a corrupt region's leftover
             // reader-slot/liveness bytes are never trusted either, only
             // the header's own validity was checked above. `setLength(0)`
@@ -1281,7 +1396,7 @@ pub const Region = struct {
                 .magic = magic,
                 .format_version = format_version,
                 .header_checksum = 0,
-                .region_bytes = region_bytes,
+                .region_bytes = legacyRegionBytes(max_readers),
                 .db_inode = db_inode,
                 .max_readers = max_readers,
                 .writer_holder = .init(0),
@@ -1313,20 +1428,24 @@ pub const Region = struct {
             // is here to rule back out.
         }
 
-        // Re-read the header fresh: `need_init` above may have just set
-        // `region_bytes`, and this is the only place that decides how
-        // much of the file to map. An existing region's `max_readers` (and
-        // therefore `region_bytes`) is authoritative regardless of what
-        // this call's own `max_readers` argument asked for.
-        var final_raw: [header_bytes]u8 = undefined;
-        _ = try setup_file.readPositionalAll(io, &final_raw, 0);
-        const final_header: *const Header = @ptrCast(@alignCast(&final_raw));
-        const map_len: usize = @intCast(final_header.region_bytes);
-        const final_max_readers = final_header.max_readers;
+        // Extension fields follow the original slot table. Their presence
+        // is derived from file length, leaving the checksummed header valid
+        // throughout growth, including for peers with older mappings.
+        const final_max_readers = if (need_init) max_readers else blk: {
+            const existing: *const Header = @ptrCast(@alignCast(&existing_raw));
+            break :blk existing.max_readers;
+        };
+        const map_len: usize = @intCast(publisherRegionBytes(final_max_readers));
+        if (!need_init and size < map_len) try setup_file.setLength(io, map_len);
 
         const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
         errdefer std.posix.munmap(mapping);
+        // The lock and mapping are process coordination primitives. Use
+        // system entropy even when the data file uses an I/O adapter.
+        var nonce: u64 = undefined;
+        try Io.Threaded.global_single_threaded.io().randomSecure(std.mem.asBytes(&nonce));
         const claimed = try claimLivenessSlot(io, fd_entry, mapping, final_max_readers);
+        logNonces(mapping, final_max_readers)[claimed.slot].store(nonce, .release);
         fcntlUnlock(raw_fd, setup_lock_offset);
         return .{ .mapping = mapping, .fd_entry = fd_entry, .own_liveness_slot = claimed.slot, .own_liveness_generation = claimed.generation, .io = io };
     }
@@ -1369,7 +1488,7 @@ pub const Region = struct {
         if (claimed_max_readers == 0 or claimed_max_readers > max_sane_readers) {
             return RegionError.RegionCorrupt;
         }
-        const implied_bytes = regionBytesFor(claimed_max_readers);
+        const implied_bytes = legacyRegionBytes(claimed_max_readers);
         if (implied_bytes > actual_file_bytes) {
             // The claimed slot count doesn't even fit the file's actual
             // size -- the header is corrupt enough that this count can't
@@ -1425,7 +1544,9 @@ pub const Region = struct {
         const h: *const Header = @ptrCast(@alignCast(raw));
         if (!std.mem.eql(u8, &h.magic, &magic)) return false;
         if (h.format_version != format_version) return false;
-        return h.header_checksum == headerChecksum(h);
+        return h.max_readers != 0 and
+            (h.region_bytes == legacyRegionBytes(h.max_readers) or h.region_bytes == publisherRegionBytes(h.max_readers) or h.region_bytes == previousRegionBytes(h.max_readers)) and
+            h.header_checksum == headerChecksum(h);
     }
 
     /// Uncontended fast path: one CAS, no syscall. Returns `true` if
@@ -2404,6 +2525,8 @@ pub const Region = struct {
         durable_offset: u64,
         /// See `Header.log_fold_start_offset`.
         fold_start_offset: u64 = 0,
+        /// Selected extent for the offsets in this publication.
+        segment: u1 = 0,
         /// See `Header.log_reset_generation`.
         reset_generation: u32 = 0,
     };
@@ -2421,6 +2544,41 @@ pub const Region = struct {
     /// tuple older than the published one (a lower durable or checkpoint
     /// sequence) is dropped: the watermark never moves backwards.
     pub fn publishLogState(self: *Region, state: LogState) void {
+        self.publishLogStateWithPublisher(state, 0);
+    }
+
+    /// A fair lease is ready once its own claim has published the WAL cut.
+    /// A different live publisher may belong to an earlier lease.
+    pub fn hasReadyLogWriter(self: *const Region) bool {
+        const holder = self.header().writer_holder.load(.acquire);
+        if (holder == 0) return false;
+        const state = self.readLogStateChecked() orelse return false;
+        const publisher = self.logPublisher().load(.seq_cst);
+        if (@as(u32, @truncate(publisher)) != holderLivenessSlot(holder) or
+            @as(u32, @truncate(publisher >> 32)) != holderClaimGeneration(holder)) return false;
+        return self.isLogStateLive(state) and publisher == self.logPublisher().load(.seq_cst) and
+            holder == self.header().writer_holder.load(.acquire);
+    }
+
+    pub fn writerClaim(self: *const Region) u128 {
+        return self.header().writer_holder.load(.acquire);
+    }
+
+    pub fn publishReadyLogState(self: *Region, state: LogState) void {
+        self.publishReadyLogStateForClaim(state, null);
+    }
+
+    pub fn publishReadyLogStateForClaim(self: *Region, state: LogState, own_claim: ?u128) void {
+        const holder = self.writerClaim();
+        const owns_fair_claim = holder != 0 and holder == own_claim and holderLivenessSlot(holder) < self.header().max_readers;
+        const slot = if (owns_fair_claim) holderLivenessSlot(holder) else self.own_liveness_slot;
+        const claim = if (owns_fair_claim) holderClaimGeneration(holder) else self.own_liveness_generation;
+        const nonce = logNonces(self.mapping, self.header().max_readers)[slot].load(.acquire);
+        const publisher = (@as(u128, nonce) << 64) | (@as(u128, claim) << 32) | slot;
+        self.publishLogStateWithPublisher(state, publisher);
+    }
+
+    fn publishLogStateWithPublisher(self: *Region, state: LogState, publisher: u128) void {
         const hdr = self.header();
         // Sequentially consistent throughout: the generation brackets the
         // payload in one total order, and a fold's publish followed by its
@@ -2454,13 +2612,21 @@ pub const Region = struct {
         hdr.log_checkpoint_sequence.store(state.checkpoint_sequence, .seq_cst);
         hdr.log_durable_sequence.store(state.durable_sequence, .seq_cst);
         hdr.log_durable_offset.store(state.durable_offset, .seq_cst);
-        hdr.log_fold_start_offset.store(state.fold_start_offset, .seq_cst);
+        const segment_bit = @as(u64, state.segment) << 63;
+        std.debug.assert(state.fold_start_offset < @as(u64, 1) << 63);
+        hdr.log_fold_start_offset.store(state.fold_start_offset | segment_bit, .seq_cst);
         hdr.log_reset_generation.store(@max(hdr.log_reset_generation.load(.seq_cst), state.reset_generation), .seq_cst);
+        self.logPublisher().store(publisher, .seq_cst);
+        self.logPublisherGeneration().store(publishing +% 1, .seq_cst);
         hdr.log_generation.store(publishing +% 1, .seq_cst);
     }
 
     /// Test support: a region whose log publication was never made (one
     /// reinitialized after every process exited).
+    pub fn resetSyncedFrontierForTest(self: *Region) void {
+        self.frontierProofField(u32, 20).store(0, .release);
+    }
+
     pub fn resetLogStateForTest(self: *Region) void {
         const hdr = self.header();
         const publishing = hdr.log_generation.load(.acquire) | 1;
@@ -2513,11 +2679,13 @@ pub const Region = struct {
     /// was published.
     pub fn readLogStateRaw(self: *const Region) LogState {
         const hdr = self.header();
+        const extent = hdr.log_fold_start_offset.load(.seq_cst);
         return .{
             .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.seq_cst),
             .durable_sequence = hdr.log_durable_sequence.load(.seq_cst),
             .durable_offset = hdr.log_durable_offset.load(.seq_cst),
-            .fold_start_offset = hdr.log_fold_start_offset.load(.seq_cst),
+            .fold_start_offset = extent & (std.math.maxInt(u64) >> 1),
+            .segment = @intCast(extent >> 63),
             .reset_generation = hdr.log_reset_generation.load(.seq_cst),
         };
     }
@@ -2542,11 +2710,13 @@ pub const Region = struct {
                 std.atomic.spinLoopHint();
                 continue;
             }
+            const extent = hdr.log_fold_start_offset.load(.seq_cst);
             const state: LogState = .{
                 .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.seq_cst),
                 .durable_sequence = hdr.log_durable_sequence.load(.seq_cst),
                 .durable_offset = hdr.log_durable_offset.load(.seq_cst),
-                .fold_start_offset = hdr.log_fold_start_offset.load(.seq_cst),
+                .fold_start_offset = extent & (std.math.maxInt(u64) >> 1),
+                .segment = @intCast(extent >> 63),
                 .reset_generation = hdr.log_reset_generation.load(.seq_cst),
             };
             const after = hdr.log_generation.load(.seq_cst);
@@ -5059,6 +5229,60 @@ test "shared lock region: Header stays exactly header_bytes with the §9.3b WAL-
     // 128 since v5 widened `writer_holder` to 128 bits and `_log_reserved`
     // to match (`format_version`'s own v5 comment).
     try std.testing.expectEqual(@as(usize, 128), @sizeOf(Header));
+}
+
+test "shared lock region extends the publisher proof without invalidating existing WAL state" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-publisher.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+    const state: Region.LogState = .{ .checkpoint_sequence = 3, .durable_sequence = 5, .durable_offset = 512 };
+
+    {
+        var original = try Region.open(a, io, db_path);
+        defer original.close();
+        original.publishLogState(state);
+        const file: Io.File = .{ .handle = original.fd_entry.fd, .flags = .{ .nonblocking = false } };
+        var header = original.header().*;
+        header.region_bytes = Region.legacyRegionBytes(header.max_readers);
+        header.header_checksum = headerChecksum(&header);
+        try file.writePositionalAll(io, std.mem.asBytes(&header), 0);
+        try file.setLength(io, header.region_bytes);
+    }
+    var observer = try Region.open(a, io, db_path);
+    defer observer.close();
+    try std.testing.expectEqual(state, observer.readLogState());
+    try std.testing.expectEqual(Region.legacyRegionBytes(observer.header().max_readers), observer.header().region_bytes);
+
+    observer.noteSyncedFrontier(5, 7, 512, false);
+    try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, false));
+    try std.testing.expect(!observer.hasSyncedFrontier(5, 7, 512, true));
+    try std.testing.expect(!observer.hasSyncedFrontier(5, 8, 512, false));
+    try std.testing.expect(!observer.hasSyncedFrontier(5, 7, 1024, false));
+    observer.noteSyncedFrontier(5, 7, 512, true);
+    try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
+    observer.noteSyncedFrontier(5, 7, 512, false);
+    try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
+    // An older extension-aware opener can shrink a file that still
+    // advertises the legacy size. Keep every live proof field mapped.
+    const file: Io.File = .{ .handle = observer.fd_entry.fd, .flags = .{ .nonblocking = false } };
+    const publisher_bytes = Region.publisherRegionBytes(observer.header().max_readers);
+    try std.testing.expectEqual(publisher_bytes, (try file.stat(io)).size);
+    try file.setLength(io, Region.previousRegionBytes(observer.header().max_readers));
+    try file.setLength(io, publisher_bytes);
+    try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
+    try std.testing.expect(!observer.isLogStateLive(state));
+    {
+        var publisher = try Region.open(a, io, db_path);
+        defer publisher.close();
+        publisher.publishReadyLogState(state);
+        try std.testing.expect(observer.isLogStateLive(state));
+    }
+    try std.testing.expect(!observer.isLogStateLive(state));
 }
 
 test "shared lock region: publishLogState/readLogState round-trip a consistent triple" {
