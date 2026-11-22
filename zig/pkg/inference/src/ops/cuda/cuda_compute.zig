@@ -60160,6 +60160,7 @@ test "public source audio linear recreates input bank through actual learning ca
             return result;
         }
     };
+    const transfer_audit = @import("../../execution/transfer_audit.zig");
     var run = Run{ .cb = cb };
     var held: [2]?CT = @splat(null);
     defer for (held) |entry| if (entry) |output| cb.free(output);
@@ -60187,7 +60188,12 @@ test "public source audio linear recreates input bank through actual learning ca
         const ordinary_pointer = compute.source_linear_scratch.buffer.ptr;
         try std.testing.expect(ordinary_pointer != 0 and compute.source_linear_scratch.active);
         const before_calls = run.calls;
-        const output = (try cb.audioExecution(0x303, &.{ projected, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
+        var transfers = transfer_audit.Audit{};
+        const output = observed: {
+            try transfer_audit.begin(&transfers);
+            defer transfer_audit.end();
+            break :observed (try cb.audioExecution(0x303, &.{ projected, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
+        };
         const retain_output = iteration == 3 or iteration == 4;
         defer if (!retain_output) cb.free(output);
         if (retain_output) held[iteration - 3] = output;
@@ -60198,11 +60204,14 @@ test "public source audio linear recreates input bank through actual learning ca
         }
         if (iteration == 3 or iteration == 6) {
             try std.testing.expectEqual(before_calls, run.calls); // actual replay bypasses host body
+            try std.testing.expectEqual(@as(u64, 3), transfers.device_copy_calls);
+            try std.testing.expectEqual(@as(u64, 3 * @sizeOf([4]f32)), transfers.device_copy_bytes);
             try std.testing.expectEqual(@as(u64, if (iteration == 3) 1 else 2), compute.audio_graph_replays);
             try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);
         }
         if (iteration == 4 or iteration == 5) {
             try std.testing.expectEqual(before_calls + 1, run.calls);
+            try std.testing.expectEqual(@as(u64, 0), transfers.device_copy_calls);
             try std.testing.expectEqual(run.output_pointer, tensorFromCt(output).buffer.ptr);
             try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);
         }
