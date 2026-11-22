@@ -74,6 +74,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     RaftBatchWriteOutcomeUnknown,
     OnlineMergeArtifactCatalogUncoordinated,
     DecisionConflict,
+    DecisionNotProposed,
     TransactionConflict,
     TransactionTooLarge,
     EnrichmentWaitCanceled,
@@ -550,6 +551,8 @@ pub const Operations = struct {
                 .{ .ignore_unknown_fields = false },
             ) catch return error.InvalidArgument;
             parsed_fence.?.value.validate() catch return error.InvalidArgument;
+            if (parsed_fence.?.value.protocol == metadata_api.CatalogRouteFence.decision_protocol and
+                (input.transaction == null or input.transaction.? != .resolve)) return error.InvalidArgument;
             if (parsed_fence.?.value.route.group_id != group_id) return error.InvalidArgument;
             parsed_fence.?.value.admission_deadline_ns = request.deadline_ns;
             parsed_fence.?.value.admission_deadline_io = request.deadline_io;
@@ -657,6 +660,7 @@ pub const Operations = struct {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
+            error.DecisionNotProposed => return error.DecisionNotProposed,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
@@ -764,6 +768,7 @@ pub const Operations = struct {
             const validator = self.txn_validator orelse return error.Unavailable;
             validator.validate(request, table_name, input.req.writes) catch |err| switch (err) {
                 error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+                error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
                 error.TableNotFound => return error.NotFound,
                 error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
                 error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
@@ -785,6 +790,7 @@ pub const Operations = struct {
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -824,6 +830,7 @@ pub const Operations = struct {
         _ = (distributed_txn.resolveGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
             error.OnlineSourcePinPending => return error.EnrichmentRetryInProgress,
             error.RetainedEffectsFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
+            error.DecisionNotProposed => return error.DecisionNotProposed,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -1560,6 +1567,8 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
+            source.failure = error.StorageReadTemporarilyUnavailable;
+            try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             const execution_errors = @import("antfly_local_sources").schema_relational_expression_errors.Error || @import("relational_row_errors.zig").PolicyError;
             inline for (@typeInfo(execution_errors).error_set.error_names.?) |field| {
                 source.failure = @field(execution_errors, field);

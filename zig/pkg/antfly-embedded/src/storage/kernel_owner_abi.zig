@@ -25,7 +25,9 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 91 fences selected-role merge-readiness projection responses.
 // Version 92 requires native batch decoders to preserve commit prerequisites.
 // Version 93 adds capture-only direct preparation and immutable effect replay.
-pub const abi_version: u32 = 94;
+// Version 95 adds ranged reads on retained metadata session snapshots.
+// Version 96 counts a prefix on a retained metadata session snapshot.
+pub const abi_version: u32 = 96;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1757,17 +1759,25 @@ pub extern fn antfly_metadata_apply_store_projection(
     request: *const MetadataProjectionRequest,
     out_json: *OwnedBytes,
 ) callconv(.c) Status;
-pub const MetadataSessionReadOperation = enum(u32) { get, first, last, next, prev, seek_at_or_after, seek_at_or_before };
+/// Stored receipts may exceed one Raft frame after a bounded splice.
+pub const metadata_session_max_value_bytes = (32 << 20) + (64 << 10);
+pub const MetadataSessionReadOperation = enum(u32) { get, first, last, next, prev, seek_at_or_after, seek_at_or_before, get_range, count_prefix, prefix_page, probe_prefix };
 pub const MetadataSessionReadRequest = extern struct {
     version: u32 = abi_version,
     operation: MetadataSessionReadOperation,
     key: BorrowedBytes = .{},
+    offset: u64 = 0,
+    length: u32 = 0,
 };
 /// A retained, namespace-scoped metadata read. Concrete transactions remain
 /// kernel-owned; cursor replies are binary key-length/key/value envelopes.
 pub extern fn antfly_metadata_session_read_open(store: ?*anyopaque, request: *const MetadataApplyGroupRequest, out_read: *?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_metadata_session_read_invoke(read: ?*anyopaque, request: *const MetadataSessionReadRequest, out_value: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_metadata_session_read_close(read: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_metadata_session_cursor_open(read: ?*anyopaque, out_cursor: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_metadata_session_cursor_invoke(cursor: ?*anyopaque, request: *const MetadataSessionReadRequest, out_value: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_metadata_session_cursor_close(cursor: ?*anyopaque) callconv(.c) void;
+
 pub extern fn antfly_metadata_apply_store_add_listeners(
     store: ?*anyopaque,
     request: *const MetadataListenerRequest,

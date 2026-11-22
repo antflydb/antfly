@@ -61,6 +61,10 @@ pub const CatalogRouteFence = struct {
     admission_deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     admission_cancellation: CancellationToken = .none,
 
+    // Version one recipients reject this before dispatch. Ordinary routed
+    // operations retain their existing wire version throughout an upgrade.
+    pub const decision_protocol: u16 = 2;
+
     const Wire = struct {
         protocol: u16 = catalog_route_fence_protocol_current,
         metadata_group_id: u64,
@@ -107,7 +111,7 @@ pub const CatalogRouteFence = struct {
     }
 
     pub fn validate(self: @This()) !void {
-        if (self.protocol != catalog_route_fence_protocol_current) return error.UnsupportedCatalogRouteFence;
+        if (self.protocol != catalog_route_fence_protocol_current and self.protocol != decision_protocol) return error.UnsupportedCatalogRouteFence;
         if (self.metadata_group_id == 0 or self.table_id == 0 or self.route.group_id == 0) return error.InvalidCatalogRouteFence;
         if (self.route.identity_namespace.table_id != self.table_id) return error.InvalidCatalogRouteFence;
     }

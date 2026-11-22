@@ -389,6 +389,27 @@ pub const RaftApplyStore = struct {
         return result;
     }
 
+    pub fn decisionAdmission(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/api.zig").DecisionAdmissionRequest, budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget) !@import("../metadata/api.zig").DecisionAdmission {
+        try budget.checkpoint();
+        const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(budget);
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .decision_admission = request }, .{});
+        defer alloc.free(bytes);
+        const result = try self.projectionWithAllocator(@import("../metadata/api.zig").DecisionAdmission, alloc, .{
+            .kind = .system_catalog,
+            .group_id = group_id,
+            .key = .fromSlice(bytes),
+            .control = .{ .execution_deadline_ns = deadline orelse 0, .has_execution_deadline = @intFromBool(deadline != null), .cancellation_ctx = @ptrCast(@constCast(&budget.cancellation)), .cancellation_fn = Callback.cancelled },
+        });
+        try budget.checkpoint();
+        return result;
+    }
+
     pub fn ownerReadinessTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/api.zig").OwnerReadinessRequest, budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget) ![]@import("../metadata/api.zig").OwnerTransitionCheck {
         try budget.checkpoint();
         const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(budget);
