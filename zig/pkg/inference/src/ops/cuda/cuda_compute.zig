@@ -21526,9 +21526,7 @@ const SourceLinearTemporary = struct {
     fn preflightCapture(self: *CudaCompute) !bool {
         const capture = self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or try self.ctx.streamCaptureActive();
         try validateCaptureStorage(self, capture);
-        if (self.execution_scope) |scope| {
-            if (self.source_linear_scratch.in_use) return error.SourceStorageInUse;
-        }
+        if (self.execution_scope != null and self.source_linear_scratch.in_use) return error.SourceStorageInUse;
         return capture;
     }
     fn acquireKnownCapture(self: *CudaCompute, bytes: usize, steady_bytes: usize, actual_capture: bool) !@This() {
