@@ -306,7 +306,7 @@ const Side = struct {
         });
         if (envFlag("ANTFLY_LITE_REDO_ORACLE_TRACE")) {
             if (self.store.file.inode_lock_ref.load(.acquire)) |entry| {
-                std.debug.print("TRACE reopen inode={d} redo_null={} redo_log_capacity={d}\n", .{ entry.inode, self.store.file.redo == null, self.store.file.header.redo_log_capacity });
+                std.debug.print("TRACE reopen inode={d} redo_null={} redo_log_capacity={d}\n", .{ entry.identity.inode, self.store.file.redo == null, self.store.file.header.redo_log_capacity });
             }
         }
     }
@@ -383,7 +383,7 @@ fn applyOp(side: *Side, op: Op) !void {
             _ = try side.store.vacuum();
             if (envFlag("ANTFLY_LITE_REDO_ORACLE_TRACE")) {
                 if (side.store.file.inode_lock_ref.load(.acquire)) |entry| {
-                    std.debug.print("TRACE vacuum inode={d} redo_null={} redo_log_capacity={d}\n", .{ entry.inode, side.store.file.redo == null, side.store.file.header.redo_log_capacity });
+                    std.debug.print("TRACE vacuum inode={d} redo_null={} redo_log_capacity={d}\n", .{ entry.identity.inode, side.store.file.redo == null, side.store.file.header.redo_log_capacity });
                 }
             }
         },

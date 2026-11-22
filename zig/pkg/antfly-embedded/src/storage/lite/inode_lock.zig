@@ -128,7 +128,7 @@ const DebugAcquisition = struct {
 /// unconditionally without disturbing its own control flow.
 fn debugDumpOutstanding(entry: *Entry, why: []const u8) void {
     if (!debug_tracking) return;
-    std.debug.print("inode_lock: {s} entry={*} inode={d} shared={d} blocking_shared={d} exclusive={d} refs={d} outstanding={d}\n", .{ why, entry, entry.inode, entry.shared_count, entry.blocking_shared_count, entry.exclusive_count, entry.refs, entry.debug_outstanding.items.len });
+    std.debug.print("inode_lock: {s} entry={*} inode={d} shared={d} blocking_shared={d} exclusive={d} refs={d} outstanding={d}\n", .{ why, entry, entry.identity.inode, entry.shared_count, entry.blocking_shared_count, entry.exclusive_count, entry.refs, entry.debug_outstanding.items.len });
     for (entry.debug_outstanding.items, 0..) |acq, i| {
         std.debug.print("  [{d}] mode={s} site={s}\n", .{ i, @tagName(acq.mode), acq.site });
     }
@@ -208,8 +208,11 @@ pub const fairness_quantum_ns: i128 = 1 * std.time.ns_per_s;
 /// transient hold.
 pub const shared_fail_fast_retry_ns: i128 = 40 * std.time.ns_per_ms;
 
+const file_identity = @import("../lsm_backend/storage_io.zig");
+pub const FileIdentity = file_identity.NativeFileIdentity;
+
 pub const Entry = struct {
-    inode: Io.File.INode,
+    identity: FileIdentity,
     /// Reopened lazily to get this entry's own dedicated fd (see
     /// `ensureFd`), and the string `ensureRegion` derives the shared lock
     /// region's own sidecar name from -- the one canonical truth both
@@ -660,6 +663,7 @@ pub fn ensureRegion(entry: *Entry, io: Io) !*shared_lock_region.Region {
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
     if (entry.region == null) {
+        if (!std.meta.eql(entry.identity, try file_identity.nativePathIdentity(entry.path))) return error.FileBusy;
         entry.region = try shared_lock_region.Region.open(std.heap.page_allocator, io, entry.path);
     }
     return &entry.region.?;
@@ -692,7 +696,7 @@ pub fn isRegionUnusable(err: anyerror) bool {
 }
 
 var registry_mutex: Io.Mutex = .init;
-var registry: std.AutoHashMapUnmanaged(Io.File.INode, *Entry) = .empty;
+var registry: std.AutoHashMapUnmanaged(FileIdentity, *Entry) = .empty;
 
 /// Resolves `path` to an absolute, symlink-resolved path for `Entry.path`
 /// (see that field's own doc comment for the full reasoning: this is
@@ -763,11 +767,18 @@ fn canonicalParentJoin(allocator: std.mem.Allocator, io: Io, path: []const u8) !
 /// this call already confirms exists, or to the common warm case of
 /// reopening an inode this process already has open.
 pub fn open(io: Io, path: []const u8) !*Entry {
+    return openIdentity(io, path, try file_identity.nativePathIdentity(path));
+}
+
+pub fn openForFile(io: Io, path: []const u8, file: Io.File) !*Entry {
+    return openIdentity(io, path, try file_identity.nativeFileIdentity(file.handle));
+}
+
+fn openIdentity(io: Io, path: []const u8, identity: FileIdentity) !*Entry {
     const page = std.heap.page_allocator;
-    const inode = (try Io.Dir.cwd().statFile(io, path, .{})).inode;
     registry_mutex.lockUncancelable(io);
     defer registry_mutex.unlock(io);
-    if (registry.get(inode)) |entry| {
+    if (registry.get(identity)) |entry| {
         entry.mutex.lockUncancelable(io);
         entry.refs += 1;
         entry.mutex.unlock(io);
@@ -777,8 +788,8 @@ pub fn open(io: Io, path: []const u8) !*Entry {
     errdefer page.free(canonical_path);
     const entry = try page.create(Entry);
     errdefer page.destroy(entry);
-    entry.* = .{ .inode = inode, .path = canonical_path, .refs = 1 };
-    try registry.put(page, inode, entry);
+    entry.* = .{ .identity = identity, .path = canonical_path, .refs = 1 };
+    try registry.put(page, identity, entry);
     return entry;
 }
 
@@ -1033,7 +1044,7 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
             entry.redo_overlay = null;
         }
     }
-    if (destroy) _ = registry.remove(entry.inode);
+    if (destroy) _ = registry.remove(entry.identity);
     registry_mutex.unlock(io);
     if (destroy) {
         if (fd) |held| held.close(io);
@@ -1064,6 +1075,7 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
 /// at this path. The next `ensureRegion` call lazily reopens a fresh region
 /// against `new_path`, exactly mirroring `ensureFd`'s own lazy-reopen shape.
 pub fn rebind(entry: *Entry, io: Io, new_path: []const u8) !void {
+    if (!std.meta.eql(entry.identity, try file_identity.nativePathIdentity(new_path))) return error.FileBusy;
     const page = std.heap.page_allocator;
     // Canonicalize here too, for the exact reason `open` does: the next
     // `ensureRegion`/`ensureFd` reopens lazily, at some later and
@@ -1124,8 +1136,22 @@ fn ensureFd(entry: *Entry, io: Io) !Io.File {
     // separately, right after, so `lock`/`tryLock`'s "assumes unlocked"
     // precondition holds for this fresh fd.
     const fd = try Io.Dir.cwd().openFile(io, entry.path, .{ .mode = .read_write });
+    errdefer fd.close(io);
+    if (!std.meta.eql(entry.identity, try file_identity.nativeFileIdentity(fd.handle))) return error.FileBusy;
     entry.fd = fd;
     return fd;
+}
+
+test "inode_lock separates equal inodes on different devices" {
+    const io = std.testing.io;
+    const first = try openIdentity(io, "first-device.data", .{ .device = 1, .inode = 73 });
+    defer unref(first, io);
+    const second = try openIdentity(io, "second-device.data", .{ .device = 2, .inode = 73 });
+    defer unref(second, io);
+    const again = try openIdentity(io, "first-device.data", first.identity);
+    defer unref(again, io);
+    try std.testing.expect(first != second);
+    try std.testing.expect(first == again);
 }
 
 test "ensureRegion opens the shared lock region once and shares it across references" {

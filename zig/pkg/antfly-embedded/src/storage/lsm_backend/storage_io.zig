@@ -3548,18 +3548,7 @@ pub const NativeFileIdentity = struct {
 
 pub fn nativeFileIdentity(fd: std.posix.fd_t) !NativeFileIdentity {
     if (comptime builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        while (true) {
-            var statx = std.mem.zeroes(linux.Statx);
-            switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &statx))) {
-                .SUCCESS => {
-                    if (!statx.mask.INO) return error.Unexpected;
-                    return .{ .device = (@as(u64, statx.dev_major) << 32) | statx.dev_minor, .inode = statx.ino };
-                },
-                .INTR => continue,
-                else => |err| return posixStatError(err),
-            }
-        }
+        return linuxFileIdentity(fd, "", std.os.linux.AT.EMPTY_PATH);
     } else {
         var stat: std.posix.Stat = undefined;
         while (true) {
@@ -3568,6 +3557,36 @@ pub fn nativeFileIdentity(fd: std.posix.fd_t) !NativeFileIdentity {
                 .INTR => continue,
                 else => |err| return posixStatError(err),
             }
+        }
+    }
+}
+
+pub fn nativePathIdentity(path: []const u8) !NativeFileIdentity {
+    if (std.fs.path.basename(path).len > 255) return error.NameTooLong;
+    const terminated = try std.posix.toPosixPath(path);
+    if (comptime builtin.os.tag == .linux) {
+        return linuxFileIdentity(std.os.linux.AT.FDCWD, &terminated, 0);
+    } else {
+        var stat: std.c.Stat = undefined;
+        while (true) switch (std.posix.errno(std.c.stat(&terminated, &stat))) {
+            .SUCCESS => return .{ .device = @bitCast(@as(i64, stat.dev)), .inode = @intCast(stat.ino) },
+            .INTR => continue,
+            else => |err| return posixStatError(err),
+        };
+    }
+}
+
+fn linuxFileIdentity(fd: std.posix.fd_t, path: [*:0]const u8, flags: u32) !NativeFileIdentity {
+    const linux = std.os.linux;
+    while (true) {
+        var statx = std.mem.zeroes(linux.Statx);
+        switch (linux.errno(linux.statx(fd, path, flags, .{ .INO = true }, &statx))) {
+            .SUCCESS => {
+                if (!statx.mask.INO) return error.Unexpected;
+                return .{ .device = (@as(u64, statx.dev_major) << 32) | statx.dev_minor, .inode = statx.ino };
+            },
+            .INTR => continue,
+            else => |err| return posixStatError(err),
         }
     }
 }

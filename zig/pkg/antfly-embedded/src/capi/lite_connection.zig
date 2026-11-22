@@ -2525,7 +2525,7 @@ pub const Owner = struct {
 
     fn rememberRedoRecoveryCursor(self: *Owner, candidate: native.RedoRecoveryCursor) void {
         if (self.redo_recovery_cursor) |saved| {
-            if (saved.inode == candidate.inode and
+            if (std.meta.eql(saved.identity, candidate.identity) and
                 saved.checkpoint.commit_sequence > candidate.checkpoint.commit_sequence) return;
         }
         self.redo_recovery_cursor = candidate;
@@ -2562,13 +2562,13 @@ pub const Owner = struct {
             const probe = &recovered_probe;
             const probe_inode = (try probe.file.stat(probe.runtime())).inode;
             if (self.redo_recovery_cursor) |saved| {
-                if (saved.inode != probe_inode) self.redo_recovery_cursor = null;
+                if (!std.meta.eql(probe.dataIdentity(), @as(@TypeOf(probe.dataIdentity()), saved.identity))) self.redo_recovery_cursor = null;
             }
             if (probe.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
             // Establish the fenced tip before opening any new read pins.
             // Existing readers of an unknown peer publication remain poisoned.
             self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
-            const same_inode = probe_inode == (try file.file.stat(file.runtime())).inode;
+            const same_inode = probe.sameDataFile(file);
             // Under the redo log, an ordinary commit advances the logical
             // commit sequence (`NativeFile.committedSequence()`, whose own
             // doc comment warns about exactly this) without ever touching
@@ -2635,7 +2635,7 @@ pub const Owner = struct {
             if (self.maintenance_snapshot) |snapshot| {
                 const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
                 if (std.meta.eql(probe.header, captured.header) and
-                    (try probe.file.stat(probe.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) known_maintenance = snapshot;
+                    probe.sameDataFile(captured)) known_maintenance = snapshot;
             }
             // Protected recovery already applied the missing suffix using
             // the probe's verified frontier. Legacy recovery can still
@@ -2782,7 +2782,7 @@ pub const Owner = struct {
         defer backend.deinit();
         const store = backend.native_docstore orelse return false;
         if (!std.meta.eql(store.file.header, tip.header) or
-            (try store.file.file.stat(store.file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) return false;
+            !store.file.sameDataFile(tip)) return false;
         // Initializing a missing root is a mutation, even with no indexes.
         if (try backend.existingRootIncarnation("root") == null) return false;
         var read = try store.beginRead();

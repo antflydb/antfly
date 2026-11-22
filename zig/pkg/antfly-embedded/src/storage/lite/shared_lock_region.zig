@@ -594,8 +594,10 @@ fn probeDead(fd: std.posix.fd_t, offset: i64) bool {
 /// pair in this codebase: exactly one fd per (process, inode),
 /// reference-counted, closed only when the last handle referencing it
 /// goes away.
+const file_identity = @import("../lsm_backend/storage_io.zig");
+
 const FdEntry = struct {
-    inode: Io.File.INode,
+    identity: file_identity.NativeFileIdentity,
     fd: std.posix.fd_t,
     refs: usize = 0,
     /// Liveness slot indices *this process* has already claimed through
@@ -625,7 +627,7 @@ const FdEntry = struct {
 // `fcntl(F_SETLK)` call, never `F_SETLKW`), so `lockUncancelable` is
 // appropriate here the same way it is in `inode_lock.zig`'s own `open`.
 var fd_registry_mutex: Io.Mutex = .init;
-var fd_registry: std.AutoHashMapUnmanaged(Io.File.INode, *FdEntry) = .empty;
+var fd_registry: std.AutoHashMapUnmanaged(file_identity.NativeFileIdentity, *FdEntry) = .empty;
 
 /// Resolves `db_path` to an absolute, symlink-resolved path before
 /// `openSized` derives its own `<db_path>.aflite-lock` sidecar name from
@@ -688,8 +690,8 @@ fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
     if (std.fs.path.basename(region_path).len > max_name_bytes or region_path.len >= std.fs.max_path_bytes) return RegionError.RegionUnavailable;
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
-    if (Io.Dir.cwd().statFile(io, region_path, .{})) |st| {
-        if (fd_registry.get(st.inode)) |entry| {
+    if (file_identity.nativePathIdentity(region_path)) |identity| {
+        if (fd_registry.get(identity)) |entry| {
             entry.refs += 1;
             return entry;
         }
@@ -699,12 +701,11 @@ fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
     // by a separate open: this process holds no fd on the file yet.
     const raw_fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600) catch return RegionError.RegionUnavailable;
     errdefer _ = std.posix.system.close(raw_fd);
-    const setup_file: Io.File = .{ .handle = raw_fd, .flags = .{ .nonblocking = false } };
-    const inode = (setup_file.stat(io) catch return RegionError.RegionUnavailable).inode;
+    const identity = file_identity.nativeFileIdentity(raw_fd) catch return RegionError.RegionUnavailable;
     const page = std.heap.page_allocator;
     const entry = page.create(FdEntry) catch return RegionError.RegionUnavailable;
-    entry.* = .{ .inode = inode, .fd = raw_fd, .refs = 1 };
-    fd_registry.put(page, inode, entry) catch {
+    entry.* = .{ .identity = identity, .fd = raw_fd, .refs = 1 };
+    fd_registry.put(page, identity, entry) catch {
         page.destroy(entry);
         return RegionError.RegionUnavailable;
     };
@@ -722,7 +723,7 @@ fn releaseProcessFd(io: Io, entry: *FdEntry) void {
     entry.refs -= 1;
     if (entry.refs == 0) {
         _ = std.posix.system.close(entry.fd);
-        _ = fd_registry.remove(entry.inode);
+        _ = fd_registry.remove(entry.identity);
         entry.claimed_slots.deinit(std.heap.page_allocator);
         std.heap.page_allocator.destroy(entry);
     }
@@ -2563,6 +2564,17 @@ pub const Region = struct {
         if (!self.isLogStateLive(state) or publisher != self.logPublisher().load(.seq_cst) or
             holder != self.header().writer_holder.load(.acquire)) return null;
         return state;
+    }
+
+    pub const WriterAdmissionState = struct { holder: u128, head: u32, tail: u32 };
+
+    pub fn writerAdmissionState(self: *const Region) WriterAdmissionState {
+        const hdr = self.header();
+        return .{
+            .holder = hdr.writer_holder.load(.acquire),
+            .head = hdr.writer_ticket_head.load(.acquire),
+            .tail = @truncate(hdr.writer_ticket_tail.load(.acquire)),
+        };
     }
 
     pub fn writerClaim(self: *const Region) u128 {
