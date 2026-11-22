@@ -64,12 +64,13 @@ pub fn Bridge(comptime Host: type) type {
         const Lease = struct {
             parent: *Self,
             allocator: std.mem.Allocator,
-            bytes: []u8,
+            batch: retained.Batch,
+            chunks: [retained.max_batch_messages]backend.ReplicationChunk = undefined,
             fn release(raw: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.parent.pages -= 1;
                 const a = self.allocator;
-                a.free(self.bytes);
+                self.batch.deinit();
                 a.destroy(self);
             }
         };
@@ -86,18 +87,24 @@ pub fn Bridge(comptime Host: type) type {
             // nested metadata and artifact read in this poll.
             const backing = request.scratch_allocator orelse a;
             // A failed read leaves the frontier at the last emitted byte.
-            var page = self.owner.poll(self.host.service, self.host.registry, self.host, backing, @backingInt(after), maximum, req) catch |err|
+            const lease = try backing.create(Lease);
+            errdefer backing.destroy(lease);
+            const batch = self.owner.pollBatch(self.host.service, self.host.registry, self.host, backing, @backingInt(after), maximum, req) catch |err|
                 return if (temporaryTransportFailure(err)) error.ReplicationReadDeferred else err;
-            defer page.deinit();
-            var result: backend.ReplicationPoll = .{ .end_lsn = @fromBackingInt(page.end_lsn) };
-            if (page.bytes) |bytes| {
-                const lease = try backing.create(Lease);
-                lease.* = .{ .parent = self, .allocator = backing, .bytes = bytes };
-                page.bytes = null;
-                self.pages += 1;
-                result.chunk = .{ .start_lsn = @fromBackingInt(page.start_lsn), .bytes = bytes };
-                result.owner = .{ .context = lease, .release = Lease.release };
+            var result: backend.ReplicationPoll = .{ .end_lsn = @fromBackingInt(batch.end_lsn) };
+            if (batch.count == 0) {
+                backing.destroy(lease);
+                return result;
             }
+            lease.* = .{ .parent = self, .allocator = backing, .batch = batch };
+            var frontier = batch.start_lsn;
+            for (batch.messages[0..batch.count], lease.chunks[0..batch.count]) |bytes, *chunk| {
+                chunk.* = .{ .start_lsn = @fromBackingInt(frontier), .bytes = bytes };
+                frontier += bytes.len;
+            }
+            self.pages += 1;
+            result.chunks = lease.chunks[0..batch.count];
+            result.owner = .{ .context = lease, .release = Lease.release };
             return result;
         }
         fn feedback(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, value: backend.pgoutput.Feedback) !void {

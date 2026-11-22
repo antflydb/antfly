@@ -301,6 +301,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                     };
                     const bytes = try size(a, event);
                     if (envelope_budget + event_bytes + bytes + events.items.len > limits.bytes or events.items.len >= limits.events) {
+                        if (consumed == 0 and envelope_budget + bytes > delivery.max_page_bytes) return error.ChangefeedEventTooLarge;
                         if (original != null or consumed == 0) return error.ChangefeedBackpressure;
                         break;
                     }
@@ -423,6 +424,7 @@ pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
                     const envelope_bytes = try size(a, Envelope{ .events = &.{}, .transaction = .{ .transaction_id = transaction_id, .complete = complete } });
                     const total = envelope_bytes + event_bytes + bytes + events.items.len;
                     if (total > limits.bytes or events.items.len >= limits.events) {
+                        if (consumed == 0 and envelope_bytes + bytes > delivery.max_page_bytes) return error.ChangefeedEventTooLarge;
                         if (original != null or consumed == 0) return error.ChangefeedBackpressure;
                         break;
                     }

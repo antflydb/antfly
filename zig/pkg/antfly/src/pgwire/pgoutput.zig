@@ -187,6 +187,25 @@ pub fn encode(a: A, message: Message, limit: usize) ![]u8 {
 
 pub const WalData = struct { start: Lsn, end: Lsn, server_time: i64, payload: []const u8 };
 pub const Keepalive = struct { end: Lsn, server_time: i64, request_reply: bool };
+pub const wal_header_bytes = 30;
+
+/// Encode the XLogData frame header separately so a buffered spool message
+/// can be sent without copying the payload into another connection allocation.
+pub fn walHeader(message: WalData) ![wal_header_bytes]u8 {
+    if (@backingInt(message.end) < @backingInt(message.start) or message.payload.len > max_message_bytes)
+        return error.InvalidPgoutput;
+    // PostgreSQL uses InvalidXLogRecPtr for type and relation descriptions.
+    const schema_description = message.payload.len != 0 and (message.payload[0] == 'R' or message.payload[0] == 'Y');
+    var header: [wal_header_bytes]u8 = undefined;
+    header[0] = 'd';
+    std.mem.writeInt(u32, header[1..5], @intCast(header.len - 1 + message.payload.len), .big);
+    header[5] = 'w';
+    std.mem.writeInt(u64, header[6..14], if (schema_description) 0 else @backingInt(message.start), .big);
+    std.mem.writeInt(u64, header[14..22], if (schema_description) 0 else @backingInt(message.end), .big);
+    std.mem.writeInt(i64, header[22..30], message.server_time, .big);
+    return header;
+}
+
 /// A complete backend CopyData frame. The caller bounds and spools individual
 /// logical messages before invoking this function; no transaction-sized buffer
 /// is required by the codec.
@@ -198,16 +217,8 @@ pub fn copyData(a: A, message: union(enum) { wal: WalData, keepalive: Keepalive 
     try e.int(u32, 0);
     switch (message) {
         .wal => |m| {
-            if (@backingInt(m.end) < @backingInt(m.start)) return error.InvalidPgoutput;
-            // PostgreSQL's logical WAL sender advertises InvalidXLogRecPtr
-            // for type and relation descriptions. They occupy spool bytes
-            // but clients must be able to decode them while locating a
-            // previously saved row or commit position.
-            const schema_description = m.payload.len != 0 and (m.payload[0] == 'R' or m.payload[0] == 'Y');
-            try e.byte('w');
-            try e.int(u64, if (schema_description) 0 else @backingInt(m.start));
-            try e.int(u64, if (schema_description) 0 else @backingInt(m.end));
-            try e.int(i64, m.server_time);
+            e.data.clearRetainingCapacity();
+            try e.bytes(&(try walHeader(m)));
             try e.bytes(m.payload);
         },
         .keepalive => |m| {

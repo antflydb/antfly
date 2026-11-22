@@ -7371,6 +7371,120 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/changefeeds": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create or resume enrollment for a durable changefeed */
+        post: operations["createChangefeed"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/changefeeds/{feed_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        /** Inspect a changefeed's lease and acknowledged progress */
+        get: operations["inspectChangefeed"];
+        put?: never;
+        post?: never;
+        /** Close a feed and release its retention grants */
+        delete: operations["closeChangefeed"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/changefeeds/{feed_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        /** Read or replay a bounded changefeed page */
+        get: operations["pullChangefeed"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/changefeeds/{feed_id}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge a successfully applied page */
+        post: operations["acknowledgeChangefeed"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/changefeeds/{feed_id}/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Extend the retention lease for a streaming feed */
+        post: operations["renewChangefeed"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/sources/managed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read managed-source configuration, progress, and destination capabilities */
+        get: operations["getManagedSources"];
+        put?: never;
+        /** Replace managed-source configuration using the current table ID and source hash */
+        post: operations["replaceManagedSources"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -19907,6 +20021,11 @@ export interface components {
                 order?: "asc" | "desc";
             }[];
             storage_mode?: components["schemas"]["TableStorageMode"];
+            /**
+             * @description PostgreSQL logical replication identity for native relational tables. Default uses the primary key. Full emits the complete old row.
+             * @enum {string}
+             */
+            replica_identity?: "default" | "full";
             /** @description External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables. */
             base_source?: components["schemas"]["ExternalLakeTableSource"];
             /**
@@ -30909,6 +31028,192 @@ export interface components {
             error: string;
             retryable: boolean;
         };
+        ChangefeedCursor: string;
+        ChangefeedError: {
+            error: string;
+        };
+        ChangefeedCreate: {
+            tables: string[];
+            selectors?: components["schemas"]["ChangefeedSelector"][];
+            /**
+             * @default now
+             * @enum {string}
+             */
+            start?: "now" | "snapshot_then_changes";
+            events?: ("document_committed" | "artifact_published" | "publication_activated")[];
+            /**
+             * @default keys_and_versions
+             * @enum {string}
+             */
+            include?: "keys_and_versions" | "rows";
+            /** @default 3600 */
+            lease_seconds?: number;
+        };
+        ChangefeedSelector: {
+            table: string;
+            fields?: string[];
+            predicates?: components["schemas"]["ChangefeedPredicate"][];
+        };
+        ChangefeedPredicate: {
+            field: string;
+            /** @description A JSON scalar or null. Missing and null are distinct. */
+            value: unknown;
+        };
+        ChangefeedCreated: {
+            id: string;
+            cursor: components["schemas"]["ChangefeedCursor"];
+            /** Format: int64 */
+            expires_at: number;
+        };
+        ChangefeedCheckpoint: {
+            cursor: components["schemas"]["ChangefeedCursor"];
+        };
+        ChangefeedLease: {
+            /** Format: int64 */
+            expires_at: number;
+        };
+        ChangefeedProgress: {
+            /** @enum {string} */
+            phase: "enrolling" | "bootstrap" | "streaming" | "reset_required" | "closing" | "deleted";
+            acknowledged_cursor: components["schemas"]["ChangefeedCursor"];
+            unacknowledged_deliveries: number;
+            /** Format: int64 */
+            oldest_unacknowledged_at?: number | null;
+            cursor_window: number;
+            /** Format: int64 */
+            cursor_byte_limit: number;
+            /** Format: int64 */
+            expires_at: number;
+            /** Format: int64 */
+            bootstrap_expires_at?: number | null;
+        };
+        ChangefeedPage: {
+            /** @enum {integer} */
+            version: 1;
+            events: components["schemas"]["ChangefeedEvent"][];
+            transaction?: {
+                transaction_id: string;
+                complete: boolean;
+            } | null;
+            snapshot?: {
+                complete: boolean;
+            };
+        };
+        ChangefeedEvent: {
+            event_id: string;
+            table_id: string;
+            transaction_id?: string;
+            version?: string;
+            /** @enum {string} */
+            operation?: "insert" | "enter" | "update" | "leave" | "delete";
+            /** @enum {string} */
+            kind?: "document_snapshot" | "document_committed" | "artifact_published" | "publication_activated";
+            key?: components["schemas"]["ChangefeedKey"];
+            before?: {
+                [key: string]: unknown;
+            } | null;
+            after?: {
+                [key: string]: unknown;
+            } | null;
+        } & {
+            [key: string]: unknown;
+        };
+        ChangefeedKey: {
+            /** @enum {string} */
+            encoding: "utf8" | "base64url";
+            value: string;
+        };
+        ManagedSourceReplacement: {
+            /** Format: uint64 */
+            table_id: number;
+            expected_sources_hash: string;
+            replication_sources: components["schemas"]["ReplicationSource"][];
+        };
+        ManagedSourceConfigured: {
+            /** Format: uint64 */
+            table_id: number;
+            sources_hash: string;
+            /** @enum {string} */
+            state: "configured";
+        };
+        ManagedSourceStatus: {
+            /** Format: uint64 */
+            table_id: number;
+            sources_hash: string;
+            /** @description Source definitions with credential material redacted. */
+            replication_sources: {
+                [key: string]: unknown;
+            }[];
+            progress: components["schemas"]["ManagedSourceProgress"][];
+            destination_contract: components["schemas"]["ManagedSourceDestinationContract"];
+            index_publication?: {
+                /** Format: uint64 */
+                published_generation?: number | null;
+                published_snapshot?: string | null;
+                /** Format: uint64 */
+                building_generation?: number | null;
+                /** Format: uint64 */
+                failed_generation?: number | null;
+            } | null;
+            cdc_supported: boolean;
+            cdc_unsupported_reason: string;
+        };
+        ManagedSourceProgress: {
+            /** Format: uint64 */
+            table_id: number;
+            source_ordinal: number;
+            source_kind: string;
+            external_table?: string;
+            cutover_mode?: string;
+            slot_name?: string;
+            publication_name?: string;
+            phase: string;
+            /** @description Opaque destination progress token. */
+            checkpoint?: string;
+            /** Format: uint64 */
+            snapshot_offset?: number;
+            prepared_checkpoint?: string;
+            stream_checkpoint?: string;
+            accepted_stream_checkpoint?: string | null;
+            failure_class?: string;
+            last_error?: string;
+            /** Format: uint64 */
+            lag_records?: number;
+            /** Format: uint64 */
+            lag_millis?: number;
+            /** Format: uint64 */
+            consecutive_failures?: number;
+            /** Format: uint64 */
+            last_source_commit_at_ms?: number;
+            /** Format: uint64 */
+            last_success_at_ms?: number;
+            /** Format: uint64 */
+            last_change_applied_at_ms?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        ManagedSourceDestinationContract: {
+            /** @enum {integer} */
+            version: 1;
+            /** @enum {string|null} */
+            adapter?: "native" | "writable_iceberg" | null;
+            /** @enum {string} */
+            input: "row_transactions" | "committed_snapshots" | "unavailable";
+            /** @enum {string} */
+            accepted_by: "native_transaction" | "iceberg_ingress" | "none";
+            /** @enum {string} */
+            committed_by: "native_transaction" | "iceberg_catalog_snapshot" | "external_snapshot" | "none";
+            /** @enum {string} */
+            transaction_scope: "native_transaction" | "iceberg_table" | "none";
+            /** @enum {string} */
+            committed_history: "native_rows_when_enrolled" | "iceberg_committed_wal" | "unavailable";
+            outbound: {
+                document_committed: boolean;
+                snapshot_then_changes: boolean;
+                artifact_published: boolean;
+                publication_activated: boolean;
+            };
+        };
         ChunkSourceReference: {
             /** @enum {string} */
             type: "source";
@@ -32743,6 +33048,33 @@ export interface components {
                 "application/json": components["schemas"]["InferenceTransientCapacityError"];
             };
         };
+        /** @description The request was rejected or the runtime could not serve it */
+        ChangefeedError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ChangefeedError"];
+            };
+        };
+        /** @description Retry a conflicting request, or resynchronize after expiry, invalidation, or an oversized event */
+        ChangefeedRecovery: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ChangefeedError"];
+            };
+        };
+        /** @description Acknowledge outstanding pages or retry with a larger page budget */
+        ChangefeedBackpressure: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ChangefeedError"];
+            };
+        };
     };
     parameters: {
         TransactionId: string;
@@ -32752,6 +33084,7 @@ export interface components {
         KeyIdPathParameter: string;
         /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
         SubjectPathParameter: string;
+        ChangefeedId: string;
     };
     requestBodies: never;
     headers: never;
@@ -54530,6 +54863,213 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryError"];
                 };
             };
+        };
+    };
+    createChangefeed: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangefeedCreate"];
+            };
+        };
+        responses: {
+            /** @description The initial cursor and lease */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedCreated"];
+                };
+            };
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    inspectChangefeed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current feed progress */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedProgress"];
+                };
+            };
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    closeChangefeed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The feed is closed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    pullChangefeed: {
+        parameters: {
+            query: {
+                after: components["schemas"]["ChangefeedCursor"];
+                limit?: number;
+                max_bytes?: number;
+            };
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The page and its successor cursor */
+            200: {
+                headers: {
+                    "Antfly-Changefeed-Cursor": components["schemas"]["ChangefeedCursor"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedPage"];
+                };
+            };
+            409: components["responses"]["ChangefeedRecovery"];
+            429: components["responses"]["ChangefeedBackpressure"];
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    acknowledgeChangefeed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangefeedCheckpoint"];
+            };
+        };
+        responses: {
+            /** @description The durable acknowledged cursor */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedCheckpoint"];
+                };
+            };
+            409: components["responses"]["ChangefeedRecovery"];
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    renewChangefeed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangefeedLease"];
+            };
+        };
+        responses: {
+            /** @description Effective expiry in Unix seconds */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedLease"];
+                };
+            };
+            409: components["responses"]["ChangefeedRecovery"];
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    getManagedSources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current managed sources and their destination contract */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedSourceStatus"];
+                };
+            };
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    replaceManagedSources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManagedSourceReplacement"];
+            };
+        };
+        responses: {
+            /** @description The resulting configuration revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedSourceConfigured"];
+                };
+            };
+            default: components["responses"]["ChangefeedError"];
         };
     };
 }

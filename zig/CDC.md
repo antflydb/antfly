@@ -34,6 +34,11 @@ two-table cases also exercise transaction rollback and rollback to savepoint.
 The stream-only case verifies a stored generated value and replays rows from
 before and after adding a nullable column, with relation metadata for the
 schema that encoded each retained row.
+The replication transport can send a complete pgoutput message up to 16 MiB
+in one XLogData frame. It reads up to four messages per retained-storage
+round, while preserving each message's frame and byte position. A transaction
+outside the spool's supported message or history budget invalidates the slot.
+Recreate the slot and bootstrap after resolving the oversized transaction.
 The cross-node case kills a data node mid-stream, verifies the confirmed LSN
 on a surviving node, and streams a later commit with stock `pg_recvlogical`.
 The topology case uses the same slot through a live range split and merge. It
@@ -155,6 +160,8 @@ Read `GET /db/v1/changefeeds/{id}/events?after={cursor}` and advance using
 cursor, current phase, outstanding delivery count and expiry with
 `GET /db/v1/changefeeds/{id}`. The outstanding count measures deliveries
 already issued to the client. Delete the feed to release its retention grants.
+The metadata maintenance worker propagates durable native acknowledgments and
+resumes bounded collection when a client disconnects after an ACK.
 
 Extend a streaming feed with `POST /db/v1/changefeeds/{id}/renew` and a
 JSON `expires_at` Unix timestamp in seconds. A successful reply confirms the
@@ -162,6 +169,13 @@ expiry at every root. The metadata worker retries an interrupted renewal.
 Repeating the requested timestamp is safe and preserves the acknowledged cursor. Bootstrap deadlines stay
 fixed. Active pgoutput sessions renew their one-hour history lease before
 it expires. Disconnected slots remain subject to their recorded expiry.
+
+An event that cannot fit in the 16 MiB HTTP page limit returns
+`409 changefeed_event_too_large` without advancing the cursor. Re-enroll and
+resynchronize using a narrower field selection or `keys_and_versions` for
+oversized row images. If the event fits a larger page, the server returns
+`429 changefeed_backpressure` and the same cursor can be retried with a
+larger byte limit.
 
 Expired or invalidated cuts require resynchronization. A native partition
 split or merge can invalidate an existing cut. Each read rechecks current
@@ -331,6 +345,14 @@ Writable Iceberg publishes acceptance after its WAL admits the transaction.
 The committed checkpoint advances after the catalog commit. Treat checkpoints
 as opaque provider values. A new routed
 source can use this path after a destination closes legacy CDC intake.
+
+PostgreSQL progress tokens bind a slot position to the enrolled table
+incarnation and publication filter. Publication recreation with the same
+membership and filter preserves progress. Changing membership, column
+projection, or the filter requires an explicit source reseed. Captures are
+bounded at 32 MiB of decoded pgoutput payload and 65,536 messages per poll.
+The receiver advances only through complete transactions. A transaction
+that alone exceeds the capture budget reports a terminal source error.
 
 Use `GET /db/v1/tables/{table}/sources/managed` to read the destination
 contract, source configuration hash, and per-source progress. For a managed

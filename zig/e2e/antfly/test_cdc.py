@@ -2943,17 +2943,23 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
                 {"insert", "delete", "update"} if mixed else {"insert", "delete"}
             )
             events = {}
+            transaction_pages = {}
             for _ in range(len(expected_operations)):
                 params = {"after": cursor}
+                if mixed:
+                    params["limit"] = 1
                 page = _changefeed_call(client, "GET", f"{feed}/events", params=params)
                 replay = _changefeed_call(
-                    client, "GET", f"{feed}/events", params=params
+                    client, "GET", f"{feed}/events", params={"after": cursor}
                 )
                 assert replay.content == page.content
                 cursor = page.headers["Antfly-Changefeed-Cursor"]
                 assert replay.headers["Antfly-Changefeed-Cursor"] == cursor
                 body = page.json()
-                assert body["transaction"]["complete"]
+                transaction = body["transaction"]
+                transaction_pages.setdefault(transaction["transaction_id"], []).append(
+                    transaction["complete"]
+                )
                 for event in body["events"]:
                     assert event["operation"] not in events
                     events[event["operation"]] = event
@@ -2961,6 +2967,9 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
                 if set(events) == expected_operations:
                     break
             assert set(events) == expected_operations
+            assert sorted(transaction_pages.values()) == (
+                [[False, True], [True]] if mixed else [[True]]
+            )
             assert events["delete"]["before"] == {
                 "id": "user-1",
                 "name": "Alice",
@@ -3784,5 +3793,75 @@ def test_public_changefeed_backpressure_isolated_until_acknowledgment():
             assert page.json()["transaction"]["complete"]
             for path in (active_path, stalled_path):
                 _changefeed_call(client, "DELETE", path)
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_oversized_update_requires_narrower_projection():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            api = server.api_url
+            table = f"{api}/tables/feed_large_event"
+            feeds = f"{api}/changefeeds"
+            _changefeed_call(client, "POST", table, json={"num_shards": 1})
+
+            def write(label):
+                response = client.post(
+                    f"{table}/batch",
+                    json={
+                        "inserts": {
+                            "large": {"label": label, "payload": "x" * (9 * 1024**2)}
+                        }
+                    },
+                    timeout=60,
+                )
+                assert response.ok, response.text
+
+            def subscribe(key, fields=None, start="now"):
+                definition = {
+                    "tables": ["feed_large_event"],
+                    "include": "rows",
+                    "start": start,
+                }
+                if fields is not None:
+                    definition["selectors"] = [
+                        {"table": "feed_large_event", "fields": fields}
+                    ]
+                return _changefeed_call(
+                    client,
+                    "POST",
+                    feeds,
+                    headers={"Idempotency-Key": key},
+                    json=definition,
+                ).json()
+
+            write("before")
+            full = subscribe("large-full")
+            full_path = f"{feeds}/{full['id']}"
+            write("after")
+            rejected = client.get(
+                f"{full_path}/events",
+                params={"after": full["cursor"], "max_bytes": 16 * 1024**2},
+                timeout=60,
+            )
+            assert rejected.status_code == 409, rejected.text
+            assert rejected.json()["error"] == "changefeed_event_too_large"
+            assert "Antfly-Changefeed-Cursor" not in rejected.headers
+            _changefeed_call(client, "DELETE", full_path)
+
+            narrowed = subscribe("large-narrowed", ["label"], "snapshot_then_changes")
+            narrow_path = f"{feeds}/{narrowed['id']}"
+            snapshot = _changefeed_call(
+                client,
+                "GET",
+                f"{narrow_path}/events",
+                params={"after": narrowed["cursor"]},
+            )
+            (event,) = snapshot.json()["events"]
+            assert event["after"] == {"label": "after"}
+            _changefeed_call(client, "DELETE", narrow_path)
     finally:
         server.stop()

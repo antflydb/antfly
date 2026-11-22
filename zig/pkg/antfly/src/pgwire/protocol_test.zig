@@ -30,6 +30,7 @@ const Mock = struct {
     invalid_slot_reply: enum { none, name, lsn, snapshot, plugin } = .none,
     replication_commands: usize = 0,
     replication_stream_enabled: bool = false,
+    replication_large_payload: []const u8 = "",
     replication_stream_opens: usize = 0,
     replication_stream_closes: usize = 0,
     replication_polls: usize = 0,
@@ -178,9 +179,16 @@ const Mock = struct {
         try request.check();
         self.replication_stream_opens += 1;
         const resume_position = @max(@as(u64, 1), @backingInt(start.position));
-        if (resume_position > 48) return error.ChangefeedResynchronizationRequired;
-        return .{ .context = self, .initial_lsn = @fromBackingInt(if (resume_position == 48) @as(u64, 48) else @as(u64, 1)), .resume_lsn = @fromBackingInt(resume_position), .initial_end_lsn = @fromBackingInt(48), .poll = replicationPoll, .feedback = replicationFeedback, .close = replicationStreamClose };
+        const end = self.replicationEnd();
+        if (resume_position > end) return error.ChangefeedResynchronizationRequired;
+        return .{ .context = self, .initial_lsn = @fromBackingInt(if (resume_position == end) end else @as(u64, 1)), .resume_lsn = @fromBackingInt(resume_position), .initial_end_lsn = @fromBackingInt(end), .poll = replicationPoll, .feedback = replicationFeedback, .close = replicationStreamClose };
     }
+    fn replicationEnd(self: *const Mock) u64 {
+        // Start LSN 1, 21-byte Begin and 26-byte Commit. A text Insert has
+        // 13 bytes of framing plus the payload itself.
+        return 48 + if (self.replication_large_payload.len == 0) @as(u64, 0) else @as(u64, self.replication_large_payload.len + 13);
+    }
+
     fn replicationPoll(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, after: backend.pgoutput.Lsn, maximum: u32) !backend.ReplicationPoll {
         const self: *Mock = @ptrCast(@alignCast(raw));
         try request.check();
@@ -191,11 +199,20 @@ const Mock = struct {
         }
         if (self.replication_revoke_after_poll) self.replication_denied = true;
         const offset = @backingInt(after);
-        if (self.replication_wait_for_feedback and self.replication_feedbacks == 0) return .{ .end_lsn = @fromBackingInt(48) };
-        if (offset == 48) return .{ .end_lsn = @fromBackingInt(48) };
-        const bytes = if (offset == 1) try backend.pgoutput.encode(a, .{ .begin = .{ .final_lsn = @fromBackingInt(22), .commit_time = 0, .xid = 42 } }, maximum) else if (offset == 22) try backend.pgoutput.encode(a, .{ .commit = .{ .commit_lsn = @fromBackingInt(22), .end_lsn = @fromBackingInt(48), .commit_time = 0 } }, maximum) else return error.TestUnexpectedResult;
+        const end = self.replicationEnd();
+        if (self.replication_wait_for_feedback and self.replication_feedbacks == 0) return .{ .end_lsn = @fromBackingInt(end) };
+        if (offset == end) return .{ .end_lsn = @fromBackingInt(end) };
+        const commit: backend.pgoutput.Lsn = @fromBackingInt(end - 26);
+        const bytes = if (offset == 1)
+            try backend.pgoutput.encode(a, .{ .begin = .{ .final_lsn = commit, .commit_time = 0, .xid = 42 } }, maximum)
+        else if (offset == @backingInt(commit))
+            try backend.pgoutput.encode(a, .{ .commit = .{ .commit_lsn = commit, .end_lsn = @fromBackingInt(end), .commit_time = 0 } }, maximum)
+        else if (offset == 22 and self.replication_large_payload.len != 0)
+            try backend.pgoutput.encode(a, .{ .insert = .{ .relation = 42, .values = &.{.{ .text = self.replication_large_payload }} } }, maximum)
+        else
+            return error.TestUnexpectedResult;
         self.replication_live_chunks += 1;
-        return .{ .end_lsn = @fromBackingInt(48), .chunk = .{ .start_lsn = after, .bytes = bytes }, .owner = .{ .context = self, .release = replicationChunkRelease } };
+        return .{ .end_lsn = @fromBackingInt(end), .chunk = .{ .start_lsn = after, .bytes = bytes }, .owner = .{ .context = self, .release = replicationChunkRelease } };
     }
     fn replicationChunkRelease(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -3404,7 +3421,7 @@ const ReplicationWireFrame = struct {
 fn replicationRead(reader: *std.Io.Reader) !ReplicationWireFrame {
     const tag = try reader.takeByte();
     const length = try reader.takeInt(u32, .big);
-    if (length < 4 or length > 1024 * 1024) return error.ProtocolViolation;
+    if (length < 4 or length > backend.pgoutput.max_message_bytes + backend.pgoutput.wal_header_bytes - 1) return error.ProtocolViolation;
     return .{ .tag = tag, .bytes = try reader.readAlloc(std.testing.allocator, length - 4) };
 }
 fn replicationClientStart(stream: std.Io.net.Stream, reader: *std.Io.Reader) !struct { pid: i32, key: i32 } {
@@ -3507,6 +3524,44 @@ test "pgwire CopyBoth sends committed messages accepts duplex feedback and prese
         try std.testing.expectEqual(@as(usize, 0), mock.executions);
     }
 }
+test "pgwire CopyBoth transports a pgoutput message larger than the SQL frame limit" {
+    const alloc = std.testing.allocator;
+    const payload = try alloc.alloc(u8, 1024 * 1024 + 1);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .replication_large_payload = payload };
+    var listener = try @import("server.zig").start(alloc, .{
+        .io = std.testing.io,
+        .backend = mock.source(),
+        .bind_port = 0,
+        .limits = replication_test_limits,
+    });
+    defer listener.deinit();
+    const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+    defer socket.close(std.testing.io);
+    var buffer: [8192]u8 = undefined;
+    var reader = socket.reader(std.testing.io, &buffer);
+    _ = try replicationClientStart(socket, &reader.interface);
+    var received_insert = false;
+    while (true) {
+        var response = try replicationRead(&reader.interface);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+        if (response.bytes[0] != 'w') continue;
+        switch (response.bytes[25]) {
+            'B' => {},
+            'I' => {
+                try std.testing.expectEqual(payload.len + 13 + 25, response.bytes.len);
+                try std.testing.expect(std.mem.eql(u8, payload, response.bytes[38..]));
+                received_insert = true;
+            },
+            'C' => break,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect(received_insert);
+}
+
 test "pgwire CopyBoth rejects future feedback and authorization revocation before payload" {
     for ([_]bool{ false, true }) |revoke| {
         var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .replication_revoke_after_poll = revoke };

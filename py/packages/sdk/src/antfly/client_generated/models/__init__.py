@@ -111,6 +111,29 @@ from .catalog_tablespace_binding_request import CatalogTablespaceBindingRequest
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
+from .changefeed_checkpoint import ChangefeedCheckpoint
+from .changefeed_create import ChangefeedCreate
+from .changefeed_create_events_item import ChangefeedCreateEventsItem
+from .changefeed_create_include import ChangefeedCreateInclude
+from .changefeed_create_start import ChangefeedCreateStart
+from .changefeed_created import ChangefeedCreated
+from .changefeed_error import ChangefeedError
+from .changefeed_event import ChangefeedEvent
+from .changefeed_event_after_type_0 import ChangefeedEventAfterType0
+from .changefeed_event_before_type_0 import ChangefeedEventBeforeType0
+from .changefeed_event_kind import ChangefeedEventKind
+from .changefeed_event_operation import ChangefeedEventOperation
+from .changefeed_key import ChangefeedKey
+from .changefeed_key_encoding import ChangefeedKeyEncoding
+from .changefeed_lease import ChangefeedLease
+from .changefeed_page import ChangefeedPage
+from .changefeed_page_snapshot import ChangefeedPageSnapshot
+from .changefeed_page_transaction_type_0 import ChangefeedPageTransactionType0
+from .changefeed_page_version import ChangefeedPageVersion
+from .changefeed_predicate import ChangefeedPredicate
+from .changefeed_progress import ChangefeedProgress
+from .changefeed_progress_phase import ChangefeedProgressPhase
+from .changefeed_selector import ChangefeedSelector
 from .chat_gpt_account import ChatGPTAccount
 from .chat_gpt_accounts import ChatGPTAccounts
 from .chat_gpt_authorize import ChatGPTAuthorize
@@ -1331,6 +1354,22 @@ from .lsm_storage_status import LsmStorageStatus
 from .maintain_lake_table_body import MaintainLakeTableBody
 from .maintain_lake_table_body_action import MaintainLakeTableBodyAction
 from .maintain_lake_table_response_200 import MaintainLakeTableResponse200
+from .managed_source_configured import ManagedSourceConfigured
+from .managed_source_configured_state import ManagedSourceConfiguredState
+from .managed_source_destination_contract import ManagedSourceDestinationContract
+from .managed_source_destination_contract_accepted_by import ManagedSourceDestinationContractAcceptedBy
+from .managed_source_destination_contract_adapter import ManagedSourceDestinationContractAdapter
+from .managed_source_destination_contract_committed_by import ManagedSourceDestinationContractCommittedBy
+from .managed_source_destination_contract_committed_history import ManagedSourceDestinationContractCommittedHistory
+from .managed_source_destination_contract_input import ManagedSourceDestinationContractInput
+from .managed_source_destination_contract_outbound import ManagedSourceDestinationContractOutbound
+from .managed_source_destination_contract_transaction_scope import ManagedSourceDestinationContractTransactionScope
+from .managed_source_destination_contract_version import ManagedSourceDestinationContractVersion
+from .managed_source_progress import ManagedSourceProgress
+from .managed_source_replacement import ManagedSourceReplacement
+from .managed_source_status import ManagedSourceStatus
+from .managed_source_status_index_publication_type_0 import ManagedSourceStatusIndexPublicationType0
+from .managed_source_status_replication_sources_item import ManagedSourceStatusReplicationSourcesItem
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
 from .match_none_query import MatchNoneQuery
@@ -2564,6 +2603,7 @@ from .table_schema_document_schemas import TableSchemaDocumentSchemas
 from .table_schema_index_sort_item import TableSchemaIndexSortItem
 from .table_schema_index_sort_item_order import TableSchemaIndexSortItemOrder
 from .table_schema_patch import TableSchemaPatch
+from .table_schema_replica_identity import TableSchemaReplicaIdentity
 from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
@@ -2818,6 +2858,29 @@ __all__ = (
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
+    "ChangefeedCheckpoint",
+    "ChangefeedCreate",
+    "ChangefeedCreated",
+    "ChangefeedCreateEventsItem",
+    "ChangefeedCreateInclude",
+    "ChangefeedCreateStart",
+    "ChangefeedError",
+    "ChangefeedEvent",
+    "ChangefeedEventAfterType0",
+    "ChangefeedEventBeforeType0",
+    "ChangefeedEventKind",
+    "ChangefeedEventOperation",
+    "ChangefeedKey",
+    "ChangefeedKeyEncoding",
+    "ChangefeedLease",
+    "ChangefeedPage",
+    "ChangefeedPageSnapshot",
+    "ChangefeedPageTransactionType0",
+    "ChangefeedPageVersion",
+    "ChangefeedPredicate",
+    "ChangefeedProgress",
+    "ChangefeedProgressPhase",
+    "ChangefeedSelector",
     "ChatGPTAccount",
     "ChatGPTAccounts",
     "ChatGPTAuthorize",
@@ -4030,6 +4093,22 @@ __all__ = (
     "MaintainLakeTableBody",
     "MaintainLakeTableBodyAction",
     "MaintainLakeTableResponse200",
+    "ManagedSourceConfigured",
+    "ManagedSourceConfiguredState",
+    "ManagedSourceDestinationContract",
+    "ManagedSourceDestinationContractAcceptedBy",
+    "ManagedSourceDestinationContractAdapter",
+    "ManagedSourceDestinationContractCommittedBy",
+    "ManagedSourceDestinationContractCommittedHistory",
+    "ManagedSourceDestinationContractInput",
+    "ManagedSourceDestinationContractOutbound",
+    "ManagedSourceDestinationContractTransactionScope",
+    "ManagedSourceDestinationContractVersion",
+    "ManagedSourceProgress",
+    "ManagedSourceReplacement",
+    "ManagedSourceStatus",
+    "ManagedSourceStatusIndexPublicationType0",
+    "ManagedSourceStatusReplicationSourcesItem",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
     "MatchesQuery",
@@ -5047,6 +5126,7 @@ __all__ = (
     "TableSchemaIndexSortItem",
     "TableSchemaIndexSortItemOrder",
     "TableSchemaPatch",
+    "TableSchemaReplicaIdentity",
     "TableShards",
     "TablespaceCatalogRecord",
     "TableStatistics",

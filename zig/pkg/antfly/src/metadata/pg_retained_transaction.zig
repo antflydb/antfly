@@ -193,6 +193,13 @@ pub fn Producer(comptime Policy: type) type {
         source: @import("../api/history_roots.zig").Source,
         page_events: u32 = 1024,
         byte_limit: usize,
+        prepared: ?Encoded = null,
+
+        pub fn deinit(self: *Self) void {
+            if (self.prepared) |*encoded| encoded.deinit();
+            self.prepared = null;
+        }
+
         const Self = @This();
         const Spec = feeds.pg_slot.spool_control.Spec;
 
@@ -299,32 +306,36 @@ pub fn Producer(comptime Policy: type) type {
         }
 
         pub fn prepare(self: *Self, a: A, state: feeds.State, request: anytype) !?upload.Candidate {
-            var encoded = (try self.transaction(a, state, request)) orelse return null;
-            defer encoded.deinit();
-            var candidate = encoded.candidate;
+            self.deinit();
+            self.prepared = try self.transaction(self.allocator, state, request);
+            var candidate = (self.prepared orelse return null).candidate;
             candidate.delivery.advances = try a.dupe(feeds.Advance, candidate.delivery.advances);
             return candidate;
         }
 
-        pub fn verify(self: *Self, state: feeds.State, spec: Spec, request: anytype) !void {
-            var iterator = try self.open(self.allocator, state, spec, request);
-            iterator.deinit();
-        }
-
-        pub fn open(self: *Self, a: A, state: feeds.State, spec: Spec, request: anytype) !Iterator {
-            var encoded = (try self.transaction(a, state, request)) orelse return error.ChangefeedResynchronizationRequired;
-            errdefer encoded.deinit();
+        fn checkedEncoding(self: *Self, state: feeds.State, spec: Spec, request: anytype) !*const Encoded {
+            try self.authorize(state, request);
+            if (self.prepared == null)
+                self.prepared = (try self.transaction(self.allocator, state, request)) orelse return error.ChangefeedResynchronizationRequired;
+            const encoded = &self.prepared.?;
             const candidate = try encoded.candidate.serializationSpec(state, spec.storage);
             if (!std.meta.eql(candidate, spec)) return error.PgSpoolWireMismatch;
-            return .{ .encoded = encoded };
+            return encoded;
+        }
+
+        pub fn verify(self: *Self, state: feeds.State, spec: Spec, request: anytype) !void {
+            _ = try self.checkedEncoding(state, spec, request);
+        }
+
+        pub fn open(self: *Self, _: A, state: feeds.State, spec: Spec, request: anytype) !Iterator {
+            return .{ .encoded = try self.checkedEncoding(state, spec, request) };
         }
 
         pub const Iterator = struct {
-            encoded: Encoded,
+            encoded: *const Encoded,
             position: usize = 0,
 
             pub fn deinit(self: *Iterator) void {
-                self.encoded.deinit();
                 self.* = undefined;
             }
 

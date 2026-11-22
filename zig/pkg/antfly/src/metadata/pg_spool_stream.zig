@@ -45,6 +45,22 @@ pub const Page = struct {
         self.* = undefined;
     }
 };
+pub const max_batch_messages = 4;
+const batch_bytes = 1024 * 1024;
+
+pub const Batch = struct {
+    allocator: A,
+    end_lsn: u64,
+    start_lsn: u64,
+    messages: [max_batch_messages][]u8 = undefined,
+    count: usize = 0,
+
+    pub fn deinit(self: *Batch) void {
+        for (self.messages[0..self.count]) |bytes| self.allocator.free(bytes);
+        self.* = undefined;
+    }
+};
+
 fn load(svc: anytype, a: A, id: control.Id, request: anytype) !control.Parsed {
     try request.ensureActive();
     const bytes = try control.readOnService(svc, a, id, request);
@@ -105,6 +121,8 @@ pub const Owner = struct {
     end_lsn: u64,
     ceiling: u64,
     closed: bool = false,
+    reader: ?spool.Reader = null,
+
     pub fn open(svc: anytype, registry: anytype, policy: anytype, a: A, id: control.Id, name: []const u8, actor: control.Id, requested: u64, binding: slot_control.Binding, config: Config, request: anytype) !Owner {
         try config.validate();
         try binding.validate();
@@ -162,6 +180,18 @@ pub const Owner = struct {
         return now;
     }
     pub fn poll(self: *Owner, svc: anytype, registry: anytype, policy: anytype, a: A, after: u64, maximum: u32, request: anytype) !Page {
+        var batch = try self.readBatch(svc, registry, policy, a, after, maximum, 1, request);
+        defer batch.deinit();
+        const bytes = if (batch.count == 0) null else batch.messages[0];
+        batch.count = 0; // Transfer the single message to Page.
+        return .{ .allocator = a, .end_lsn = batch.end_lsn, .start_lsn = batch.start_lsn, .bytes = bytes };
+    }
+
+    pub fn pollBatch(self: *Owner, svc: anytype, registry: anytype, policy: anytype, a: A, after: u64, maximum: u32, request: anytype) !Batch {
+        return self.readBatch(svc, registry, policy, a, after, maximum, max_batch_messages, request);
+    }
+
+    fn readBatch(self: *Owner, svc: anytype, registry: anytype, policy: anytype, a: A, after: u64, maximum: u32, count: usize, request: anytype) !Batch {
         var phase: enum { metadata, authorize, artifact_store, manifest, message, recheck_metadata, reauthorize } = .metadata;
         errdefer std.log.debug("retained replication poll failed phase={s}", .{@tagName(phase)});
         const retained_span = span: {
@@ -194,11 +224,30 @@ pub const Owner = struct {
         var reader_store = try artifacts.Adapter.init(store, .{ .domain = record.scope.domain, .attempt = record.scope.attempt }, .read, cancellation.token());
         if (self.config.require_shared) try reader_store.requireShared();
         phase = .manifest;
-        const reader = try spool.Reader.open(a, &reader_store, record.manifest, .{ .feed = record.spec.feed, .epoch = record.spec.epoch, .definition = record.spec.definition, .projection = record.spec.projection, .storage = record.spec.storage });
+        const reader = if (self.reader != null and same(self.reader.?.seal.identity, record.manifest))
+            self.reader.?
+        else
+            try spool.Reader.open(a, &reader_store, record.manifest, .{ .feed = record.spec.feed, .epoch = record.spec.epoch, .definition = record.spec.definition, .projection = record.spec.projection, .storage = record.spec.storage });
         if (!record.spec.matchesPlan(reader.seal.plan) or !same(reader.seal.serialization, record.content) or reader.seal.root.messages != record.spec.messages) return error.PgSpoolCorrupt;
+        self.reader = reader;
         phase = .message;
-        const bytes = (try reader.message(a, &reader_store, after - entry.start_lsn, maximum)) orelse return error.PgSpoolCorrupt;
-        errdefer a.free(bytes);
+        var batch: Batch = .{ .allocator = a, .end_lsn = self.end_lsn, .start_lsn = after };
+        errdefer batch.deinit();
+        var frontier = after;
+        while (batch.count < count and frontier < entry.end_lsn) {
+            try request.ensureActive();
+            const consumed = frontier - after;
+            const remaining: u32 = if (batch.count == 0) maximum else @intCast(@min(maximum, batch_bytes -| consumed));
+            if (remaining == 0) break;
+            const bytes = (reader.message(a, &reader_store, frontier - entry.start_lsn, remaining) catch |err| switch (err) {
+                error.PgSpoolMessageTooLarge => if (batch.count > 0) break else return err,
+                else => return err,
+            }) orelse return error.PgSpoolCorrupt;
+            batch.messages[batch.count] = bytes;
+            batch.count += 1;
+            frontier = std.math.add(u64, frontier, bytes.len) catch return error.PgSpoolCorrupt;
+            if (frontier > entry.end_lsn) return error.PgSpoolCorrupt;
+        }
         phase = .recheck_metadata;
         var current = try load(svc, a, self.id, request);
         defer current.deinit();
@@ -206,11 +255,11 @@ pub const Owner = struct {
         _ = try self.check(policy, current.value, request);
         const retained = current.value.slot.?.spool.find(record.id) orelse return error.ChangefeedConflict;
         if (retained.phase != .live or !same(retained.manifest, record.manifest) or !same(retained.content, record.content)) return error.ChangefeedConflict;
-        self.frontier = std.math.add(u64, after, bytes.len) catch return error.PgSpoolCorrupt;
-        if (self.frontier > entry.end_lsn) return error.PgSpoolCorrupt;
+        self.frontier = frontier;
         self.ceiling = @max(self.ceiling, self.frontier);
         self.end_lsn = current.value.slot.?.next_lsn;
-        return .{ .allocator = a, .end_lsn = self.end_lsn, .start_lsn = after, .bytes = bytes };
+        batch.end_lsn = self.end_lsn;
+        return batch;
     }
     pub fn feedback(self: *Owner, svc: anytype, policy: anytype, a: A, positions: Positions, request: anytype) !void {
         if (positions.written > self.ceiling or positions.flushed > self.ceiling or positions.applied > self.ceiling) return error.ChangefeedConflict;

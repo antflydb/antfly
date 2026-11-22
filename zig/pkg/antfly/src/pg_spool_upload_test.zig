@@ -389,6 +389,7 @@ pub fn runRetainedUpload() !void {
         }, @splat(0)),
     };
     var producer: retained.Producer(Policy) = .{ .policy = &policy, .allocator = a, .source = policy.source(), .page_events = 1, .byte_limit = 1024 };
+    defer producer.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -28,9 +28,12 @@ const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
 const Budget = @import("budget.zig").Budget;
 
+// A pgoutput message occupies one XLogData frame. Use the producer's limit.
+const replication_frame_bytes: u32 = pgoutput.max_message_bytes + pgoutput.wal_header_bytes;
+
 pub const Limits = struct {
     frame_bytes: u32 = 1024 * 1024,
-    connection_bytes: usize = 16 * 1024 * 1024,
+    connection_bytes: usize = 32 * 1024 * 1024,
     prepared_statements: u16 = 64,
     portals: u16 = 16,
     parameters: u16 = 256,
@@ -1042,13 +1045,13 @@ pub const Session = struct {
         self.replicationDeadline(deadline);
     }
     fn replicationKeepalive(self: *Session, a: std.mem.Allocator, end: pgoutput.Lsn, reply: bool, deadline: i64) !void {
-        const bytes = try pgoutput.copyData(a, .{ .keepalive = .{ .end = end, .server_time = try pgoutput.postgresTime(std.Io.Clock.real.now(self.io).nanoseconds), .request_reply = reply } }, self.limits.frame_bytes);
+        const bytes = try pgoutput.copyData(a, .{ .keepalive = .{ .end = end, .server_time = try pgoutput.postgresTime(std.Io.Clock.real.now(self.io).nanoseconds), .request_reply = reply } }, replication_frame_bytes);
         defer a.free(bytes);
         try self.replicationWrite(bytes, deadline);
     }
     fn replicationCopy(self: *Session, a: std.mem.Allocator, statement: []const u8, owner: backend.ReplicationSession, command_value: replication_commands.Command) !void {
         const limits = self.limits;
-        if (limits.replication_timeout_ms == 0 or limits.replication_keepalive_ms == 0 or limits.replication_keepalive_ms >= limits.replication_timeout_ms or limits.replication_poll_ms == 0 or limits.replication_callback_ms == 0 or limits.replication_write_ms == 0 or limits.frame_bytes < 31 or limits.frame_bytes > pgoutput.max_message_bytes + 30) return error.InvalidParameter;
+        if (limits.replication_timeout_ms == 0 or limits.replication_keepalive_ms == 0 or limits.replication_keepalive_ms >= limits.replication_timeout_ms or limits.replication_poll_ms == 0 or limits.replication_callback_ms == 0 or limits.replication_write_ms == 0) return error.InvalidParameter;
         var deadline = self.replicationNow() +| @as(i64, limits.replication_timeout_ms) * std.time.ns_per_ms;
         var request_value = self.replicationRequest(statement, deadline);
         const stream = try owner.openStream(a, request_value, command_value.start);
@@ -1129,7 +1132,7 @@ pub const Session = struct {
                     // reader can report a retryable result.
                     self.replicationDeadline(deadline);
                     try owner.authorizeRequest(scratch.allocator(), request_value, command_value);
-                    var poll = stream.readMessage(scratch.allocator(), self.replicationRequest(statement, deadline), sent, limits.frame_bytes - 30) catch |err| {
+                    var poll = stream.readMessage(scratch.allocator(), self.replicationRequest(statement, deadline), sent, pgoutput.max_message_bytes) catch |err| {
                         if (err == error.ReplicationReadDeferred and !self.cancel_requested.load(.acquire) and self.replicationNow() < deadline) {
                             // The backend guarantees that this failure moved
                             // no cursor. Require a fresh authorized read before
@@ -1146,12 +1149,18 @@ pub const Session = struct {
                     observed_end = poll.end_lsn;
                     try owner.authorizeRequest(scratch.allocator(), self.replicationRequest(statement, deadline), command_value);
                     self.replicationDeadline(deadline);
-                    if (poll.chunk) |chunk| {
-                        if (@backingInt(chunk.start_lsn) != @backingInt(sent) or chunk.bytes.len == 0 or chunk.bytes.len > limits.frame_bytes - 30) return error.InvalidResult;
+                    if (poll.chunk != null and poll.chunks.len != 0) return error.InvalidResult;
+                    const chunks = if (poll.chunk) |chunk| &[_]backend.ReplicationChunk{chunk} else poll.chunks;
+                    for (chunks) |chunk| {
+                        if (@backingInt(chunk.start_lsn) != @backingInt(sent) or chunk.bytes.len == 0 or chunk.bytes.len > pgoutput.max_message_bytes) return error.InvalidResult;
                         const next = std.math.add(u64, @backingInt(sent), chunk.bytes.len) catch return error.InvalidResult;
                         if (next > @backingInt(observed_end)) return error.InvalidResult;
-                        const bytes = try pgoutput.copyData(scratch.allocator(), .{ .wal = .{ .start = chunk.start_lsn, .end = observed_end, .server_time = try pgoutput.postgresTime(std.Io.Clock.real.now(self.io).nanoseconds), .payload = chunk.bytes } }, limits.frame_bytes);
-                        try self.replicationWrite(bytes, deadline);
+                        const header = try pgoutput.walHeader(.{ .start = chunk.start_lsn, .end = observed_end, .server_time = try pgoutput.postgresTime(std.Io.Clock.real.now(self.io).nanoseconds), .payload = chunk.bytes });
+                        self.replicationDeadline(@min(deadline, self.replicationNow() +| @as(i64, limits.replication_write_ms) * std.time.ns_per_ms));
+                        try self.writer.writeAll(&header);
+                        try self.writer.writeAll(chunk.bytes);
+                        try self.writer.flush();
+                        self.replicationDeadline(deadline);
                         sent = @fromBackingInt(next);
                         if (next > @backingInt(feedback_ceiling)) feedback_ceiling = sent;
                     }
@@ -1162,7 +1171,7 @@ pub const Session = struct {
                         last_keepalive = self.replicationNow();
                     }
                     const elapsed_ms: u32 = @intCast(@min(@as(i64, limits.replication_keepalive_ms), @divTrunc(@max(0, self.replicationNow() - last_keepalive), std.time.ns_per_ms)));
-                    const delay: u32 = if (poll.chunk != null) 0 else @min(limits.replication_poll_ms, @max(1, limits.replication_keepalive_ms - elapsed_ms));
+                    const delay: u32 = if (chunks.len != 0) 0 else @min(limits.replication_poll_ms, @max(1, limits.replication_keepalive_ms - elapsed_ms));
                     try select.concurrent(.tick, replicationTick, .{ self.io, delay });
                 },
             }
@@ -2430,7 +2439,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.HistoryPreparedTransactionsPresent,
         => "55000",
         error.ChangefeedBackpressure, error.HistoryFull, error.HistoryConsumerLimit => "53300",
-        error.HistoryTooLarge => "54000",
+        error.HistoryTooLarge, error.PgoutputMessageTooLarge, error.PgSpoolMessageTooLarge => "54000",
         error.ChangefeedCapabilityUnsupported => "0A000",
         error.ActiveSqlTransaction => "25001",
         error.OutOfMemory, error.ProgramLimitExceeded => "54000",

@@ -4130,6 +4130,331 @@ pub const ChainLink = struct {
     }
 };
 
+pub const ChangefeedCheckpoint = struct {
+    cursor: ChangefeedCursor,
+};
+
+pub const ChangefeedCreate = struct {
+    tables: []const []const u8,
+    selectors: ?[]const ChangefeedSelector = null,
+    start: ?[]const u8 = null,
+    events: ?[]const []const u8 = null,
+    include: ?[]const u8 = null,
+    lease_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "tables", "tables", false },
+        .{ "selectors", "selectors", true },
+        .{ "start", "start", true },
+        .{ "events", "events", true },
+        .{ "include", "include", true },
+        .{ "lease_seconds", "lease_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("tables");
+        try jw.write(self.tables);
+        if (self.selectors) |value| {
+            try jw.objectField("selectors");
+            try jw.write(value);
+        }
+        if (self.start) |value| {
+            try jw.objectField("start");
+            try jw.write(value);
+        }
+        if (self.events) |value| {
+            try jw.objectField("events");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        if (self.lease_seconds) |value| {
+            try jw.objectField("lease_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedCreated = struct {
+    id: []const u8,
+    cursor: ChangefeedCursor,
+    expires_at: i64,
+};
+
+pub const ChangefeedCursor = []const u8;
+
+pub const ChangefeedError = struct {
+    @"error": []const u8,
+};
+
+pub const ChangefeedEvent = struct {
+    event_id: []const u8,
+    table_id: []const u8,
+    transaction_id: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    operation: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    key: ?ChangefeedKey = null,
+    before: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    after: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "table_id", "table_id", false },
+        .{ "transaction_id", "transaction_id", true },
+        .{ "version", "version", true },
+        .{ "operation", "operation", true },
+        .{ "kind", "kind", true },
+        .{ "key", "key", true },
+        .{ "before", "before", false },
+        .{ "after", "after", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        if (self.transaction_id) |value| {
+            try jw.objectField("transaction_id");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.operation) |value| {
+            try jw.objectField("operation");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.key) |value| {
+            try jw.objectField("key");
+            try jw.write(value);
+        }
+        switch (self.before) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("before");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("before");
+                try jw.write(value);
+            },
+        }
+        switch (self.after) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("after");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("after");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedKey = struct {
+    encoding: []const u8,
+    value: []const u8,
+};
+
+pub const ChangefeedLease = struct {
+    expires_at: i64,
+};
+
+pub const ChangefeedPage = struct {
+    version: i64,
+    events: []const ChangefeedEvent,
+    transaction: OpenApiOptionalNullable(std.json.Value) = .absent,
+    snapshot: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "events", "events", false },
+        .{ "transaction", "transaction", false },
+        .{ "snapshot", "snapshot", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("events");
+        try jw.write(self.events);
+        switch (self.transaction) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("transaction");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("transaction");
+                try jw.write(value);
+            },
+        }
+        if (self.snapshot) |value| {
+            try jw.objectField("snapshot");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedPredicate = struct {
+    field: []const u8,
+    /// A JSON scalar or null. Missing and null are distinct.
+    value: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field", "field", false },
+        .{ "value", "value", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("field");
+        try jw.write(self.field);
+        try jw.objectField("value");
+        try jw.write(self.value);
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedProgress = struct {
+    phase: []const u8,
+    acknowledged_cursor: ChangefeedCursor,
+    unacknowledged_deliveries: i64,
+    oldest_unacknowledged_at: OpenApiOptionalNullable(i64) = .absent,
+    cursor_window: i64,
+    cursor_byte_limit: i64,
+    expires_at: i64,
+    bootstrap_expires_at: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("acknowledged_cursor");
+        try jw.write(self.acknowledged_cursor);
+        try jw.objectField("unacknowledged_deliveries");
+        try jw.write(self.unacknowledged_deliveries);
+        switch (self.oldest_unacknowledged_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("oldest_unacknowledged_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("oldest_unacknowledged_at");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("cursor_window");
+        try jw.write(self.cursor_window);
+        try jw.objectField("cursor_byte_limit");
+        try jw.write(self.cursor_byte_limit);
+        try jw.objectField("expires_at");
+        try jw.write(self.expires_at);
+        switch (self.bootstrap_expires_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("bootstrap_expires_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("bootstrap_expires_at");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedSelector = struct {
+    table: []const u8,
+    fields: ?[]const []const u8 = null,
+    predicates: ?[]const ChangefeedPredicate = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "fields", "fields", true },
+        .{ "predicates", "predicates", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.predicates) |value| {
+            try jw.objectField("predicates");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ChatGPTAccount = struct {
     connection_id: []const u8,
     email: []const u8,
@@ -37602,6 +37927,247 @@ pub const LsmStorageStatus = struct {
             try jw.objectField("direct_bulk_ingest_fallback_below_threshold_count");
             try jw.write(value);
         }
+        try jw.endObject();
+    }
+};
+
+pub const ManagedSourceConfigured = struct {
+    table_id: u64,
+    sources_hash: []const u8,
+    state: []const u8,
+};
+
+pub const ManagedSourceDestinationContract = struct {
+    version: i64,
+    adapter: OpenApiOptionalNullable([]const u8) = .absent,
+    input: []const u8,
+    accepted_by: []const u8,
+    committed_by: []const u8,
+    transaction_scope: []const u8,
+    committed_history: []const u8,
+    outbound: std.json.Value,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        switch (self.adapter) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("adapter");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("adapter");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("input");
+        try jw.write(self.input);
+        try jw.objectField("accepted_by");
+        try jw.write(self.accepted_by);
+        try jw.objectField("committed_by");
+        try jw.write(self.committed_by);
+        try jw.objectField("transaction_scope");
+        try jw.write(self.transaction_scope);
+        try jw.objectField("committed_history");
+        try jw.write(self.committed_history);
+        try jw.objectField("outbound");
+        try jw.write(self.outbound);
+        try jw.endObject();
+    }
+};
+
+pub const ManagedSourceProgress = struct {
+    table_id: u64,
+    source_ordinal: i64,
+    source_kind: []const u8,
+    external_table: ?[]const u8 = null,
+    cutover_mode: ?[]const u8 = null,
+    slot_name: ?[]const u8 = null,
+    publication_name: ?[]const u8 = null,
+    phase: []const u8,
+    /// Opaque destination progress token.
+    checkpoint: ?[]const u8 = null,
+    snapshot_offset: ?u64 = null,
+    prepared_checkpoint: ?[]const u8 = null,
+    stream_checkpoint: ?[]const u8 = null,
+    accepted_stream_checkpoint: OpenApiOptionalNullable([]const u8) = .absent,
+    failure_class: ?[]const u8 = null,
+    last_error: ?[]const u8 = null,
+    lag_records: ?u64 = null,
+    lag_millis: ?u64 = null,
+    consecutive_failures: ?u64 = null,
+    last_source_commit_at_ms: ?u64 = null,
+    last_success_at_ms: ?u64 = null,
+    last_change_applied_at_ms: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table_id", "table_id", false },
+        .{ "source_ordinal", "source_ordinal", false },
+        .{ "source_kind", "source_kind", false },
+        .{ "external_table", "external_table", true },
+        .{ "cutover_mode", "cutover_mode", true },
+        .{ "slot_name", "slot_name", true },
+        .{ "publication_name", "publication_name", true },
+        .{ "phase", "phase", false },
+        .{ "checkpoint", "checkpoint", true },
+        .{ "snapshot_offset", "snapshot_offset", true },
+        .{ "prepared_checkpoint", "prepared_checkpoint", true },
+        .{ "stream_checkpoint", "stream_checkpoint", true },
+        .{ "accepted_stream_checkpoint", "accepted_stream_checkpoint", false },
+        .{ "failure_class", "failure_class", true },
+        .{ "last_error", "last_error", true },
+        .{ "lag_records", "lag_records", true },
+        .{ "lag_millis", "lag_millis", true },
+        .{ "consecutive_failures", "consecutive_failures", true },
+        .{ "last_source_commit_at_ms", "last_source_commit_at_ms", true },
+        .{ "last_success_at_ms", "last_success_at_ms", true },
+        .{ "last_change_applied_at_ms", "last_change_applied_at_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("source_ordinal");
+        try jw.write(self.source_ordinal);
+        try jw.objectField("source_kind");
+        try jw.write(self.source_kind);
+        if (self.external_table) |value| {
+            try jw.objectField("external_table");
+            try jw.write(value);
+        }
+        if (self.cutover_mode) |value| {
+            try jw.objectField("cutover_mode");
+            try jw.write(value);
+        }
+        if (self.slot_name) |value| {
+            try jw.objectField("slot_name");
+            try jw.write(value);
+        }
+        if (self.publication_name) |value| {
+            try jw.objectField("publication_name");
+            try jw.write(value);
+        }
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        if (self.snapshot_offset) |value| {
+            try jw.objectField("snapshot_offset");
+            try jw.write(value);
+        }
+        if (self.prepared_checkpoint) |value| {
+            try jw.objectField("prepared_checkpoint");
+            try jw.write(value);
+        }
+        if (self.stream_checkpoint) |value| {
+            try jw.objectField("stream_checkpoint");
+            try jw.write(value);
+        }
+        switch (self.accepted_stream_checkpoint) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("accepted_stream_checkpoint");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("accepted_stream_checkpoint");
+                try jw.write(value);
+            },
+        }
+        if (self.failure_class) |value| {
+            try jw.objectField("failure_class");
+            try jw.write(value);
+        }
+        if (self.last_error) |value| {
+            try jw.objectField("last_error");
+            try jw.write(value);
+        }
+        if (self.lag_records) |value| {
+            try jw.objectField("lag_records");
+            try jw.write(value);
+        }
+        if (self.lag_millis) |value| {
+            try jw.objectField("lag_millis");
+            try jw.write(value);
+        }
+        if (self.consecutive_failures) |value| {
+            try jw.objectField("consecutive_failures");
+            try jw.write(value);
+        }
+        if (self.last_source_commit_at_ms) |value| {
+            try jw.objectField("last_source_commit_at_ms");
+            try jw.write(value);
+        }
+        if (self.last_success_at_ms) |value| {
+            try jw.objectField("last_success_at_ms");
+            try jw.write(value);
+        }
+        if (self.last_change_applied_at_ms) |value| {
+            try jw.objectField("last_change_applied_at_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ManagedSourceReplacement = struct {
+    table_id: u64,
+    expected_sources_hash: []const u8,
+    replication_sources: []const ReplicationSource,
+};
+
+pub const ManagedSourceStatus = struct {
+    table_id: u64,
+    sources_hash: []const u8,
+    /// Source definitions with credential material redacted.
+    replication_sources: []const std.json.ArrayHashMap(std.json.Value),
+    progress: []const ManagedSourceProgress,
+    destination_contract: ManagedSourceDestinationContract,
+    index_publication: OpenApiOptionalNullable(std.json.Value) = .absent,
+    cdc_supported: bool,
+    cdc_unsupported_reason: []const u8,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("sources_hash");
+        try jw.write(self.sources_hash);
+        try jw.objectField("replication_sources");
+        try jw.write(self.replication_sources);
+        try jw.objectField("progress");
+        try jw.write(self.progress);
+        try jw.objectField("destination_contract");
+        try jw.write(self.destination_contract);
+        switch (self.index_publication) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("index_publication");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("index_publication");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("cdc_supported");
+        try jw.write(self.cdc_supported);
+        try jw.objectField("cdc_unsupported_reason");
+        try jw.write(self.cdc_unsupported_reason);
         try jw.endObject();
     }
 };

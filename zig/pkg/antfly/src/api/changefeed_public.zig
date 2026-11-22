@@ -212,14 +212,17 @@ fn executeIceberg(client: *config.Client, a: A, selection: Selection, limits: ?d
         if (live.epoch != confirmed.epoch or !same(live.authority, confirmed.authority)) return error.ChangefeedResynchronizationRequired;
         if (live.phase == .streaming) {
             var driver: RootPolicy(Policy) = .{ .access = policy.*, .io = policy.api.inferenceIo(), .source = factory.source, .allocator = a };
-            for (factory.captured.roots) |route| {
-                const item = live.roots[try live.rootIndex(route.namespace)];
+            for (live.roots) |item| {
+                if (item.released or isIcebergRoot(live.definition.?, item.namespace)) continue;
                 if (item.snapshot != null and !item.snapshot_released) {
-                    try releaseStreamingSnapshot(client, &driver, a, live, route, request);
+                    try releaseStreamingSnapshot(client, &driver, a, live, try factory.captured.findInstalled(item), request);
                     break;
                 }
             }
-            for (factory.captured.roots) |route| _ = try source_api.flushAcknowledged(client, &driver, a, live, route, request);
+            for (live.roots) |item| {
+                if (item.released or isIcebergRoot(live.definition.?, item.namespace)) continue;
+                _ = try source_api.flushAcknowledged(client, &driver, a, live, try factory.captured.findInstalled(item), request);
+            }
         }
     }
     return .{ .acknowledged = confirmed.acknowledged_cursor };
@@ -727,8 +730,6 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         return .{ .acknowledged = acknowledged.value.acknowledged_cursor };
     }
     if (allIceberg(definition)) {
-        if (state.value.roots.len != definition.tables.len or (state.value.phase != .streaming and state.value.phase != .bootstrap))
-            return error.ChangefeedCapabilityUnsupported;
         const access = try authorizedIcebergTables(api, scratch, identity, definition, internal);
         var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
         return executeIceberg(&client, a, selection, limits, &policy, null, internal);
@@ -991,14 +992,14 @@ fn RootPolicy(comptime Access: type) type {
         source: source_api.Source,
         allocator: A,
         closing: bool = false,
-        renewing: bool = false,
+        maintain_streaming: bool = false,
         retirement_collected: bool = false,
 
         pub fn authorizeRoot(self: *@This(), state: control.State, _: control.Namespace, request: Context) !void {
             if (!self.closing) {
                 if (Access != void) return self.access.authorize(state, request);
                 try requireMaintenancePrincipal(request);
-                if (!self.renewing or state.slot != null or state.phase != .streaming or state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return error.Forbidden;
+                if (!self.maintain_streaming or state.slot != null or state.phase != .streaming or state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return error.Forbidden;
                 return;
             }
             try request.ensureActive();
@@ -1786,7 +1787,7 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
             var captured = try source.capturePhysical(a, state.definition.?, request);
             defer captured.deinit();
             try captured.validateInstalledRoutes(state);
-            var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .renewing = true };
+            var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .maintain_streaming = true };
             for (state.roots) |item| {
                 if (item.released) continue;
                 if (isIcebergRoot(state.definition.?, item.namespace)) continue;
@@ -1798,6 +1799,15 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
         if (state.pendingCatalogAcknowledgment() != null and !state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) {
             try requireMaintenancePrincipal(request);
             return settleCatalogAcknowledgment(&client, a, state, catalog_owner orelse return error.ReadUnavailable, request);
+        }
+        if (state.pendingNativeAcknowledgment()) |item| {
+            if (state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return;
+            try requireMaintenancePrincipal(request);
+            var captured = try source.capturePhysical(a, state.definition.?, request);
+            defer captured.deinit();
+            var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .maintain_streaming = true };
+            _ = try source_api.flushAcknowledged(&client, &policy, a, state, try captured.findInstalled(item), request);
+            return;
         }
         for (state.roots) |item| {
             if (item.snapshot == null or item.snapshot_released) continue;

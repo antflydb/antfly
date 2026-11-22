@@ -80,3 +80,80 @@ pub fn lookupSnapshotRow(
     }
     return if (image) |value| try clone(a, value) else null;
 }
+
+pub const LookupKey = struct { identity: []const u8, row: std.json.Value };
+
+/// Open one scan for a window of scalar CDC keys. The shared dynamic filter
+/// prunes matching key domains before materializing the complete row images.
+pub fn lookupSnapshotRows(
+    a: std.mem.Allocator,
+    table: catalog.Table,
+    snapshot_id: i64,
+    metadata: @FieldType(configured.BindingObjectStoreOpenOptions, "retained_catalog_metadata"),
+    keys: []const []const u8,
+    requested: []const LookupKey,
+    context: operation.RequestContext,
+    options: configured.BindingObjectStoreOpenOptions,
+) !?[]?std.json.Value {
+    const sources = @import("antfly_local_sources");
+    const Datum = sources.sql_scalar.Datum;
+    const dynamic = sources.sql_dynamic_filter;
+    const result = try a.alloc(?std.json.Value, requested.len);
+    @memset(result, null);
+    if (requested.len == 0) return result;
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const columns = try scratch.alloc(dynamic.Column, keys.len);
+    for (keys, columns) |name, *column| {
+        const physical = try table.column(name);
+        switch (physical.type) {
+            .integer, .string, .boolean => {},
+            else => return null, // Use exact typed point comparisons for other key types.
+        }
+        column.* = .{ .name = name, .type = physical.type, .element_type = physical.element_type };
+    }
+
+    const filter = try dynamic.Filter.create(scratch, columns, 4096);
+    defer filter.close();
+    const cells = try scratch.alloc(Datum, keys.len);
+    var indexes: std.StringHashMap(usize) = .init(scratch);
+    const keyIdentity = @import("../serverless/lake_ingestion.zig").rowId;
+    for (requested, 0..) |item, index| {
+        if (item.row != .object) return error.InvalidLakeKey;
+        for (columns, cells) |column, *cell| {
+            const value = item.row.object.get(column.name) orelse return error.InvalidLakeKey;
+            if (value == .null) return error.InvalidLakeKey;
+            cell.* = try column.datum(scratch, Datum.fromJson(value));
+        }
+        try filter.add(cells);
+        try indexes.put(item.identity, index);
+    }
+    if (!filter.exact_complete) return null;
+    filter.sealed = true;
+
+    const fields = try scratch.alloc([]const u8, table.columns.len);
+    for (table.columns, fields) |column, *field| field.* = column.name;
+    const cursor = try openSnapshot(scratch, table, snapshot_id, metadata, .{ .fields = fields, .limit = 4 }, context, options);
+    defer cursor.close(cursor.ptr);
+    const apply = cursor.set_dynamic_filter orelse return null;
+    if (!try apply(cursor.ptr, filter)) return null;
+    const json = @import("../metadata/changefeed_json.zig");
+    var retained_bytes: u64 = 0;
+    while (true) {
+        try context.ensureActive();
+        const page = try cursor.next(cursor.ptr, a, 4);
+        defer page.deinit();
+        for (page.rows) |row| {
+            const identity = try keyIdentity(scratch, keys, row.value);
+            const index = indexes.get(identity) orelse return null;
+            if (result[index] != null) return error.InvalidLakeKey;
+            retained_bytes +|= try json.size(row.value);
+            if (retained_bytes > @import("../metadata/changefeed_delivery.zig").max_page_bytes) return null;
+            result[index] = try sources.api_json_helpers.cloneJsonValue(a, row.value);
+        }
+        if (page.after == null) break;
+    }
+    return result;
+}

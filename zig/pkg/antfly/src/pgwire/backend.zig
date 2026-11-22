@@ -340,9 +340,9 @@ pub const ReplicationSession = struct {
     }
 };
 
-/// All methods run serially on the connection coordinator. poll returns at
-/// most one complete pgoutput message from durable committed spooling at the
-/// exact requested byte frontier; it must not retain an entire transaction in
+/// All methods run serially on the connection coordinator. poll returns a
+/// bounded batch of whole pgoutput messages from durable committed spooling at
+/// the exact requested byte frontier. It must not retain an entire transaction in
 /// connection RAM or advance an acknowledgement. No-data returns immediately.
 /// feedback validates the slot fence and maps only complete issued intervals
 /// to durable acknowledgement. close runs after all reader/writer tasks join.
@@ -371,9 +371,11 @@ pub const ReplicationStream = struct {
         return Boundary.callRemote("feedback", self.boundary_dispatch, self.feedback, .{ self.context, a, request, value });
     }
 };
+pub const ReplicationChunk = struct { start_lsn: pgoutput.Lsn, bytes: []const u8 };
 pub const ReplicationPoll = struct {
     end_lsn: pgoutput.Lsn,
-    chunk: ?struct { start_lsn: pgoutput.Lsn, bytes: []const u8 } = null,
+    chunk: ?ReplicationChunk = null,
+    chunks: []const ReplicationChunk = &.{},
     owner: ?struct { context: *anyopaque, release: *const fn (*anyopaque) void } = null,
     pub fn deinit(self: *@This()) void {
         if (self.owner) |owner| owner.release(owner.context);

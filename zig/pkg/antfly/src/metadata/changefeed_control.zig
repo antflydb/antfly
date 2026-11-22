@@ -30,6 +30,7 @@ pub const physical_history_protocol_version: u16 = 126;
 pub const shared_namespace_plan_protocol_version: u16 = 127;
 pub const slot_recreation_protocol_version: u16 = 133;
 pub const retired_slot_root_protocol_version: u16 = 134;
+pub const native_collection_protocol_version: u16 = 135;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -219,7 +220,7 @@ fn writePhysicalRootRecord(value: anytype, writer: anytype) @TypeOf(writer.*).Er
                 try writer.objectField(name);
                 try writer.write(physical);
             }
-        } else if (comptime (std.mem.eql(u8, name, "split_handoff") or std.mem.eql(u8, name, "split_grant_sequence") or std.mem.eql(u8, name, "split_consumer_epoch") or std.mem.eql(u8, name, "storage_namespace") or std.mem.eql(u8, name, "merge_drain"))) {
+        } else if (comptime (std.mem.eql(u8, name, "split_handoff") or std.mem.eql(u8, name, "split_grant_sequence") or std.mem.eql(u8, name, "split_consumer_epoch") or std.mem.eql(u8, name, "storage_namespace") or std.mem.eql(u8, name, "merge_drain") or std.mem.eql(u8, name, "native_collected_through"))) {
             if (@field(value, name)) |handoff| {
                 try writer.objectField(name);
                 try writer.write(handoff);
@@ -243,6 +244,8 @@ pub const Root = struct {
     /// Whole-frame ACK propagated to this native consumer. Other consumers
     /// may still retain these frames in the shared physical log.
     reclaimed_through: u64 = 0,
+    /// Completion of bounded collection passes, separate from the root ACK.
+    native_collected_through: ?u64 = null,
     renewed_through: u64 = 0,
     snapshot: ?Snapshot = null,
     snapshot_delivered: BootstrapPosition = .{},
@@ -401,12 +404,27 @@ pub const State = struct {
             .bootstrap => self.bootstrapComplete() or self.expiryDue(now),
             .streaming => for (self.roots) |root| {
                 if (root.snapshot != null and !root.snapshot_released) break true;
-            } else self.renewal_pending or self.pendingCatalogAcknowledgment() != null or self.expiryDue(now),
+            } else self.renewal_pending or self.pendingCatalogAcknowledgment() != null or self.pendingNativeAcknowledgment() != null or self.expiryDue(now),
             .reset_required => for (self.roots) |root| {
                 if (!root.released or (root.snapshot != null and !root.snapshot_released)) break true;
             } else if (self.slot) |slot| slot.spool.records.len != 0 else false,
             else => self.expiryDue(now),
         };
+    }
+
+    pub fn pendingNativeAcknowledgment(self: State) ?Root {
+        const definition = self.definition orelse return null;
+        if (self.slot != null or definition.events != 1) return null;
+        for (self.roots) |root| {
+            if (root.released or (root.native_collected_through orelse root.start) >= root.acknowledged.sequence) continue;
+            const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
+            for (definition.tables) |table| {
+                if (table.table_id != table_id) continue;
+                if (table.contract == .native_document or table.contract == .native_relational) return root;
+                break;
+            }
+        }
+        return null;
     }
 
     pub fn pendingCatalogAcknowledgment(self: State) ?Table {
@@ -555,6 +573,9 @@ pub const State = struct {
                 const physical = root.physical orelse return error.InvalidChangefeed;
                 if (!nz(namespace) or !std.mem.eql(u8, namespace[0..8], root.namespace[0..8]) or
                     !equal(root.namespace, splitStreamNamespace(namespace, physical))) return error.InvalidChangefeed;
+            }
+            if (root.native_collected_through) |through| {
+                if (through <= root.start or through > root.reclaimed_through) return error.InvalidChangefeed;
             }
             if (root.renewed_through > self.expires_at or (root.consumer_epoch == 0 and root.renewed_through != 0)) return error.InvalidChangefeed;
             if (root.consumer_epoch == 0) {
@@ -707,6 +728,7 @@ pub const Mutation = union(enum) {
     issue: Delivery,
     acknowledge: Digest,
     reclaimed: struct { namespace: Namespace, consumer_epoch: u64, previous: u64, next: u64 },
+    native_collected: struct { namespace: Namespace, consumer_epoch: u64, through: u64 },
     // Retained for replay of entries admitted before certified cutover.
     finish_bootstrap: struct { proof: Digest },
     finish_verified_bootstrap: struct { proof: Digest },
@@ -724,6 +746,7 @@ pub const Mutation = union(enum) {
     pub fn requiredProtocol(self: Mutation) u16 {
         switch (self) {
             .retire_absent_slot_root => return retired_slot_root_protocol_version,
+            .native_collected => return native_collection_protocol_version,
             .recreate_slot => return slot_recreation_protocol_version,
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
@@ -829,6 +852,7 @@ pub const Mutation = union(enum) {
             },
             .acknowledge => |value| if (!nz(value)) return error.InvalidChangefeed,
             .reclaimed => |value| if (!nz(value.namespace) or value.consumer_epoch == 0 or value.next < value.previous) return error.InvalidChangefeed,
+            .native_collected => |value| if (!nz(value.namespace) or value.consumer_epoch == 0 or value.through == 0) return error.InvalidChangefeed,
             .finish_bootstrap => |value| if (!nz(value.proof)) return error.InvalidChangefeed,
             .finish_verified_bootstrap => |value| if (!nz(value.proof)) return error.InvalidChangefeed,
             .start_exported_slot => |value| if (!nz(value.name.feed) or !nz(value.name.proof) or value.now == 0) return error.InvalidChangefeed,
@@ -1370,6 +1394,23 @@ pub const Mutation = union(enum) {
                 if (progress.next == progress.previous) return state;
                 const roots = try a.dupe(Root, state.roots);
                 roots[index].reclaimed_through = progress.next;
+                next.roots = roots;
+            },
+            .native_collected => |progress| {
+                if (state.phase != .streaming or state.slot != null or state.definition.?.events != 1) return error.ChangefeedConflict;
+                const index = try state.rootIndex(progress.namespace);
+                const root = state.roots[index];
+                if (root.released or root.consumer_epoch != progress.consumer_epoch or progress.through > root.reclaimed_through)
+                    return error.ChangefeedConflict;
+                const table_id = std.mem.readInt(u64, progress.namespace[0..8], .big);
+                for (state.definition.?.tables) |table| {
+                    if (table.table_id != table_id) continue;
+                    if (table.contract != .native_document and table.contract != .native_relational) return error.ChangefeedConflict;
+                    break;
+                } else return error.ChangefeedConflict;
+                if (progress.through <= (root.native_collected_through orelse root.start)) return state;
+                const roots = try a.dupe(Root, state.roots);
+                roots[index].native_collected_through = progress.through;
                 next.roots = roots;
             },
             .finish_bootstrap => |completion| {
@@ -1987,8 +2028,14 @@ test "changefeed control separates partial delivery ACK and native reclamation" 
     state = try step(scratch, state, .{ .issue = second });
     state = try step(scratch, state, .{ .acknowledge = second.cursor });
     try std.testing.expect(state.atDeliveryBoundary());
+    try std.testing.expectEqual(@as(u64, 11), state.pendingNativeAcknowledgment().?.acknowledged.sequence);
+    try std.testing.expect(state.needsMaintenance(102));
     state = try step(scratch, state, .{ .reclaimed = .{ .namespace = testNamespace(7), .consumer_epoch = 6, .previous = 10, .next = 11 } });
     try std.testing.expectEqual(@as(u64, 11), state.roots[0].reclaimed_through);
+    try std.testing.expect(state.pendingNativeAcknowledgment() != null);
+    state = try step(scratch, state, .{ .native_collected = .{ .namespace = testNamespace(7), .consumer_epoch = 6, .through = 11 } });
+    try std.testing.expect(state.pendingNativeAcknowledgment() == null);
+    try std.testing.expect(!state.needsMaintenance(102));
     try std.testing.expectError(error.ChangefeedCursorExpired, step(scratch, state, .{ .acknowledge = first.cursor }));
     const encoded = try encode(a, state);
     defer a.free(encoded);

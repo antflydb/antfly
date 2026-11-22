@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.table_schema_replica_identity import TableSchemaReplicaIdentity
 from ..models.table_storage_mode import TableStorageMode
 from ..types import UNSET, Unset
 
@@ -41,6 +42,8 @@ class TableSchema:
             enforce_types; explicitly setting enforce_types to false is invalid.
             Existing JSON document write and read APIs remain available. This
             setting alone does not declare primary keys or unique constraints.
+        replica_identity (TableSchemaReplicaIdentity | Unset): PostgreSQL logical replication identity for native
+            relational tables. Default uses the primary key. Full emits the complete old row.
         base_source (ExternalLakeTableSource | Unset): Authoritative Parquet or Iceberg source. A serving statement pins
             its inventory and object versions before returning rows. Iceberg catalog commits require an explicit writable
             catalog binding; ordinary row mutations remain unsupported.
@@ -98,6 +101,7 @@ class TableSchema:
     version: int | Unset = UNSET
     index_sort: list[TableSchemaIndexSortItem] | Unset = UNSET
     storage_mode: TableStorageMode | Unset = UNSET
+    replica_identity: TableSchemaReplicaIdentity | Unset = UNSET
     base_source: ExternalLakeTableSource | Unset = UNSET
     column_defaults: list[RelationalColumnExpression] | Unset = UNSET
     generated_columns: list[RelationalColumnExpression] | Unset = UNSET
@@ -129,6 +133,10 @@ class TableSchema:
         storage_mode: str | Unset = UNSET
         if not isinstance(self.storage_mode, Unset):
             storage_mode = self.storage_mode.value
+
+        replica_identity: str | Unset = UNSET
+        if not isinstance(self.replica_identity, Unset):
+            replica_identity = self.replica_identity.value
 
         base_source: dict[str, Any] | Unset = UNSET
         if not isinstance(self.base_source, Unset):
@@ -212,6 +220,8 @@ class TableSchema:
             field_dict["index_sort"] = index_sort
         if storage_mode is not UNSET:
             field_dict["storage_mode"] = storage_mode
+        if replica_identity is not UNSET:
+            field_dict["replica_identity"] = replica_identity
         if base_source is not UNSET:
             field_dict["base_source"] = base_source
         if column_defaults is not UNSET:
@@ -274,6 +284,13 @@ class TableSchema:
             storage_mode = UNSET
         else:
             storage_mode = TableStorageMode(_storage_mode)
+
+        _replica_identity = d.pop("replica_identity", UNSET)
+        replica_identity: TableSchemaReplicaIdentity | Unset
+        if isinstance(_replica_identity, Unset):
+            replica_identity = UNSET
+        else:
+            replica_identity = TableSchemaReplicaIdentity(_replica_identity)
 
         _base_source = d.pop("base_source", UNSET)
         base_source: ExternalLakeTableSource | Unset
@@ -381,6 +398,7 @@ class TableSchema:
             version=version,
             index_sort=index_sort,
             storage_mode=storage_mode,
+            replica_identity=replica_identity,
             base_source=base_source,
             column_defaults=column_defaults,
             generated_columns=generated_columns,

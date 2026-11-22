@@ -178,15 +178,18 @@ pub fn drive(svc: anytype, registry: anytype, producer: anytype, a: A, id: contr
         var sha = WireHasher.init();
         var count: u32 = 0;
         while (true) {
-            try checkBuild(svc, producer, a, granted.value, grant, token, session, &lease, request);
+            try request.ensureActive();
+            // The uploading attempt is private. Revalidate owner and policy
+            // periodically and again before sealing, independent of message size.
+            if (count % 16 == 0) try checkBuild(svc, producer, a, granted.value, grant, token, session, &lease, request);
             const message = (try iterator.next(a, spool.max_message_bytes, request)) orelse break;
             defer a.free(message);
-            try checkBuild(svc, producer, a, granted.value, grant, token, session, &lease, request);
             if (count == record.spec.messages) return error.PgSpoolWireMismatch;
             count += 1;
             try sha.add(message);
             try builder.append(&writer, message);
         }
+        try checkBuild(svc, producer, a, granted.value, grant, token, session, &lease, request);
         if (count != record.spec.messages or !same(sha.final(), record.spec.wire)) return error.PgSpoolWireMismatch;
         const sealed = try builder.finish(&writer);
         const verified = try spool.Reader.open(a, &writer, sealed.identity, sealed.plan.binding);

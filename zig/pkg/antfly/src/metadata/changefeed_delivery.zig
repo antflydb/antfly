@@ -24,11 +24,13 @@
 const std = @import("std");
 const control = @import("changefeed_control.zig");
 const A = std.mem.Allocator;
+pub const max_page_bytes = 16 * 1024 * 1024;
+
 pub const Limits = struct {
     events: u32 = 256,
     bytes: u32 = 1024 * 1024,
     pub fn validate(self: Limits) !void {
-        if (self.events == 0 or self.events > 1024 or self.bytes == 0 or self.bytes > 16 * 1024 * 1024) return error.InvalidChangefeed;
+        if (self.events == 0 or self.events > 1024 or self.bytes == 0 or self.bytes > max_page_bytes) return error.InvalidChangefeed;
     }
 };
 pub const Prepared = struct {

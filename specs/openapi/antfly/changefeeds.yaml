@@ -1,0 +1,381 @@
+openapi: "3.0.3"
+info:
+  title: Antfly changefeeds and managed sources
+  version: v1
+tags:
+  - name: changefeeds
+    description: Retained committed changes and managed PostgreSQL sources.
+paths:
+  /db/v1/changefeeds:
+    post:
+      tags: [changefeeds]
+      operationId: createChangefeed
+      summary: Create or resume enrollment for a durable changefeed
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ChangefeedCreate"}
+      responses:
+        "201":
+          description: The initial cursor and lease
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChangefeedCreated"}
+        default: {$ref: "#/components/responses/ChangefeedError"}
+  /db/v1/changefeeds/{feed_id}:
+    parameters:
+      - $ref: "#/components/parameters/ChangefeedId"
+    get:
+      tags: [changefeeds]
+      operationId: inspectChangefeed
+      summary: Inspect a changefeed's lease and acknowledged progress
+      responses:
+        "200":
+          description: Current feed progress
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChangefeedProgress"}
+        default: {$ref: "#/components/responses/ChangefeedError"}
+    delete:
+      tags: [changefeeds]
+      operationId: closeChangefeed
+      summary: Close a feed and release its retention grants
+      responses:
+        "204": {description: The feed is closed}
+        default: {$ref: "#/components/responses/ChangefeedError"}
+  /db/v1/changefeeds/{feed_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/ChangefeedId"
+    get:
+      tags: [changefeeds]
+      operationId: pullChangefeed
+      summary: Read or replay a bounded changefeed page
+      parameters:
+        - in: query
+          name: after
+          required: true
+          schema: {$ref: "#/components/schemas/ChangefeedCursor"}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 1024, default: 256}
+        - in: query
+          name: max_bytes
+          schema: {type: integer, minimum: 1, maximum: 16777216, default: 1048576}
+      responses:
+        "200":
+          description: The page and its successor cursor
+          headers:
+            Antfly-Changefeed-Cursor:
+              required: true
+              schema: {$ref: "#/components/schemas/ChangefeedCursor"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChangefeedPage"}
+        "409": {$ref: "#/components/responses/ChangefeedRecovery"}
+        "429": {$ref: "#/components/responses/ChangefeedBackpressure"}
+        default: {$ref: "#/components/responses/ChangefeedError"}
+  /db/v1/changefeeds/{feed_id}/ack:
+    parameters:
+      - $ref: "#/components/parameters/ChangefeedId"
+    post:
+      tags: [changefeeds]
+      operationId: acknowledgeChangefeed
+      summary: Acknowledge a successfully applied page
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ChangefeedCheckpoint"}
+      responses:
+        "200":
+          description: The durable acknowledged cursor
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChangefeedCheckpoint"}
+        "409": {$ref: "#/components/responses/ChangefeedRecovery"}
+        default: {$ref: "#/components/responses/ChangefeedError"}
+  /db/v1/changefeeds/{feed_id}/renew:
+    parameters:
+      - $ref: "#/components/parameters/ChangefeedId"
+    post:
+      tags: [changefeeds]
+      operationId: renewChangefeed
+      summary: Extend the retention lease for a streaming feed
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ChangefeedLease"}
+      responses:
+        "200":
+          description: Effective expiry in Unix seconds
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChangefeedLease"}
+        "409": {$ref: "#/components/responses/ChangefeedRecovery"}
+        default: {$ref: "#/components/responses/ChangefeedError"}
+  /db/v1/tables/{tableName}/sources/managed:
+    parameters:
+      - in: path
+        name: tableName
+        required: true
+        schema: {type: string}
+    get:
+      tags: [changefeeds]
+      operationId: getManagedSources
+      summary: Read managed-source configuration, progress, and destination capabilities
+      responses:
+        "200":
+          description: Current managed sources and their destination contract
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ManagedSourceStatus"}
+        default: {$ref: "#/components/responses/ChangefeedError"}
+    post:
+      tags: [changefeeds]
+      operationId: replaceManagedSources
+      summary: Replace managed-source configuration using the current table ID and source hash
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ManagedSourceReplacement"}
+      responses:
+        "200":
+          description: The resulting configuration revision
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ManagedSourceConfigured"}
+        default: {$ref: "#/components/responses/ChangefeedError"}
+components:
+  parameters:
+    ChangefeedId:
+      in: path
+      name: feed_id
+      required: true
+      schema: {type: string, pattern: "^[a-fA-F0-9]{32}$"}
+  responses:
+    ChangefeedError:
+      description: The request was rejected or the runtime could not serve it
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ChangefeedError"}
+    ChangefeedRecovery:
+      description: Retry a conflicting request, or resynchronize after expiry, invalidation, or an oversized event
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ChangefeedError"}
+    ChangefeedBackpressure:
+      description: Acknowledge outstanding pages or retry with a larger page budget
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ChangefeedError"}
+  schemas:
+    ChangefeedCursor:
+      type: string
+      pattern: "^[a-fA-F0-9]{64}$"
+    ChangefeedError:
+      type: object
+      required: [error]
+      properties:
+        error: {type: string}
+    ChangefeedCreate:
+      type: object
+      required: [tables]
+      properties:
+        tables:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: {type: string}
+        selectors:
+          type: array
+          items: {$ref: "#/components/schemas/ChangefeedSelector"}
+        start: {type: string, enum: [now, snapshot_then_changes], default: now}
+        events:
+          type: array
+          maxItems: 1
+          items: {type: string, enum: [document_committed, artifact_published, publication_activated]}
+        include: {type: string, enum: [keys_and_versions, rows], default: keys_and_versions}
+        lease_seconds: {type: integer, minimum: 1, maximum: 604800, default: 3600}
+    ChangefeedSelector:
+      type: object
+      required: [table]
+      properties:
+        table: {type: string}
+        fields:
+          type: array
+          maxItems: 64
+          items: {type: string}
+        predicates:
+          type: array
+          maxItems: 16
+          items: {$ref: "#/components/schemas/ChangefeedPredicate"}
+    ChangefeedPredicate:
+      type: object
+      required: [field, value]
+      properties:
+        field: {type: string}
+        value:
+          description: A JSON scalar or null. Missing and null are distinct.
+    ChangefeedCreated:
+      type: object
+      required: [id, cursor, expires_at]
+      properties:
+        id: {type: string, pattern: "^[a-fA-F0-9]{32}$"}
+        cursor: {$ref: "#/components/schemas/ChangefeedCursor"}
+        expires_at: {type: integer, format: int64}
+    ChangefeedCheckpoint:
+      type: object
+      required: [cursor]
+      properties:
+        cursor: {$ref: "#/components/schemas/ChangefeedCursor"}
+    ChangefeedLease:
+      type: object
+      required: [expires_at]
+      properties:
+        expires_at: {type: integer, format: int64, minimum: 1}
+    ChangefeedProgress:
+      type: object
+      required: [phase, acknowledged_cursor, unacknowledged_deliveries, cursor_window, cursor_byte_limit, expires_at]
+      properties:
+        phase: {type: string, enum: [enrolling, bootstrap, streaming, reset_required, closing, deleted]}
+        acknowledged_cursor: {$ref: "#/components/schemas/ChangefeedCursor"}
+        unacknowledged_deliveries: {type: integer, minimum: 0}
+        oldest_unacknowledged_at: {type: integer, format: int64, nullable: true}
+        cursor_window: {type: integer, minimum: 1}
+        cursor_byte_limit: {type: integer, format: int64}
+        expires_at: {type: integer, format: int64}
+        bootstrap_expires_at: {type: integer, format: int64, nullable: true}
+    ChangefeedPage:
+      type: object
+      required: [version, events]
+      properties:
+        version: {type: integer, enum: [1]}
+        events:
+          type: array
+          items: {$ref: "#/components/schemas/ChangefeedEvent"}
+        transaction:
+          type: object
+          nullable: true
+          required: [transaction_id, complete]
+          properties:
+            transaction_id: {type: string}
+            complete: {type: boolean}
+        snapshot:
+          type: object
+          required: [complete]
+          properties:
+            complete: {type: boolean}
+    ChangefeedEvent:
+      type: object
+      required: [event_id, table_id]
+      properties:
+        event_id: {type: string}
+        table_id: {type: string}
+        transaction_id: {type: string}
+        version: {type: string}
+        operation: {type: string, enum: [insert, enter, update, leave, delete]}
+        kind: {type: string, enum: [document_snapshot, document_committed, artifact_published, publication_activated]}
+        key: {$ref: "#/components/schemas/ChangefeedKey"}
+        before: {type: object, nullable: true, additionalProperties: true}
+        after: {type: object, nullable: true, additionalProperties: true}
+      additionalProperties: true
+    ChangefeedKey:
+      type: object
+      required: [encoding, value]
+      properties:
+        encoding: {type: string, enum: [utf8, base64url]}
+        value: {type: string}
+    ManagedSourceReplacement:
+      type: object
+      required: [table_id, expected_sources_hash, replication_sources]
+      properties:
+        table_id: {type: integer, format: uint64}
+        expected_sources_hash: {type: string, pattern: "^[a-fA-F0-9]{64}$"}
+        replication_sources:
+          type: array
+          items: {$ref: "#/components/schemas/ReplicationSource"}
+    ManagedSourceConfigured:
+      type: object
+      required: [table_id, sources_hash, state]
+      properties:
+        table_id: {type: integer, format: uint64}
+        sources_hash: {type: string}
+        state: {type: string, enum: [configured]}
+    ManagedSourceStatus:
+      type: object
+      required: [table_id, sources_hash, replication_sources, progress, destination_contract, cdc_supported, cdc_unsupported_reason]
+      properties:
+        table_id: {type: integer, format: uint64}
+        sources_hash: {type: string}
+        replication_sources:
+          type: array
+          description: Source definitions with credential material redacted.
+          items: {type: object, additionalProperties: true}
+        progress:
+          type: array
+          items: {$ref: "#/components/schemas/ManagedSourceProgress"}
+        destination_contract:
+          $ref: "#/components/schemas/ManagedSourceDestinationContract"
+        index_publication:
+          type: object
+          nullable: true
+          properties:
+            published_generation: {type: integer, format: uint64, nullable: true}
+            published_snapshot: {type: string, nullable: true}
+            building_generation: {type: integer, format: uint64, nullable: true}
+            failed_generation: {type: integer, format: uint64, nullable: true}
+        cdc_supported: {type: boolean}
+        cdc_unsupported_reason: {type: string}
+    ManagedSourceProgress:
+      type: object
+      required: [table_id, source_ordinal, source_kind, phase]
+      properties:
+        table_id: {type: integer, format: uint64}
+        source_ordinal: {type: integer, minimum: 0}
+        source_kind: {type: string}
+        external_table: {type: string}
+        cutover_mode: {type: string}
+        slot_name: {type: string}
+        publication_name: {type: string}
+        phase: {type: string}
+        checkpoint: {type: string, description: Opaque destination progress token.}
+        snapshot_offset: {type: integer, format: uint64}
+        prepared_checkpoint: {type: string}
+        stream_checkpoint: {type: string}
+        accepted_stream_checkpoint: {type: string, nullable: true}
+        failure_class: {type: string}
+        last_error: {type: string}
+        lag_records: {type: integer, format: uint64}
+        lag_millis: {type: integer, format: uint64}
+        consecutive_failures: {type: integer, format: uint64}
+        last_source_commit_at_ms: {type: integer, format: uint64}
+        last_success_at_ms: {type: integer, format: uint64}
+        last_change_applied_at_ms: {type: integer, format: uint64}
+      additionalProperties: true
+    ManagedSourceDestinationContract:
+      type: object
+      required: [version, input, accepted_by, committed_by, transaction_scope, committed_history, outbound]
+      properties:
+        version: {type: integer, enum: [1]}
+        adapter: {type: string, nullable: true, enum: [native, writable_iceberg]}
+        input: {type: string, enum: [row_transactions, committed_snapshots, unavailable]}
+        accepted_by: {type: string, enum: [native_transaction, iceberg_ingress, none]}
+        committed_by: {type: string, enum: [native_transaction, iceberg_catalog_snapshot, external_snapshot, none]}
+        transaction_scope: {type: string, enum: [native_transaction, iceberg_table, none]}
+        committed_history: {type: string, enum: [native_rows_when_enrolled, iceberg_committed_wal, unavailable]}
+        outbound:
+          type: object
+          required: [document_committed, snapshot_then_changes, artifact_published, publication_activated]
+          properties:
+            document_committed: {type: boolean}
+            snapshot_then_changes: {type: boolean}
+            artifact_published: {type: boolean}
+            publication_activated: {type: boolean}

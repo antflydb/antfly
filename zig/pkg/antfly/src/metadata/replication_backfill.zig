@@ -167,6 +167,8 @@ fn classifyReplicationError(err: anyerror) []const u8 {
         error.InvalidQueryRequest,
         error.UnsupportedReplicationStreaming,
         error.UnsupportedReplicationTruncate,
+        error.ReplicationPublicationBindingChanged,
+        error.ReplicationCaptureLimitExceeded,
         error.UnsupportedReplicationMessage,
         error.InvalidReplicationTransaction,
         error.InvalidReplicationCheckpoint,

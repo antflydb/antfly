@@ -881,7 +881,26 @@ pub const CatalogRetainedStream = struct {
                 .source = self.source,
                 .byte_limit = @import("history_page_operations.zig").pages.max_source_bytes,
             };
+            defer transaction.deinit();
             _ = upload.drive(host.service, host.registry, &transaction, allocator, host.id, self.session, .{ .require_shared = host.config.require_shared }, self.context) catch |err| {
+                if (err == error.HistoryTooLarge or err == error.PgoutputMessageTooLarge) {
+                    const bytes = try host.service.read(allocator, host.id, self.context);
+                    defer allocator.free(bytes);
+                    var parsed = try control.parse(allocator, bytes);
+                    defer parsed.deinit();
+                    const state = parsed.value;
+                    try cleanup_registry.authorizeCleanup(state, self.context);
+                    const definition = state.definition orelse return error.ChangefeedResynchronizationRequired;
+                    try host.service.mutate(allocator, .{
+                        .id = state.id,
+                        .authority = state.authority,
+                        .owner = definition.owner,
+                        .authorization = definition.authorization,
+                        .expected_revision = state.revision,
+                        .expected_epoch = state.epoch,
+                        .mutation = .{ .reset = .quota },
+                    }, self.context);
+                }
                 std.log.debug("logical slot spool publication failed err={s}", .{@errorName(err)});
                 return err;
             };

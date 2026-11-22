@@ -69,7 +69,7 @@ const LocalSchemaProgressProvider = struct {
 };
 const default_public_port: u16 = 8080;
 const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
-const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "If-Match" };
+const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "If-Match", "Idempotency-Key" };
 const cors_default_exposed_headers = [_][]const u8{
     "X-Request-ID",
     "Retry-After",
@@ -80,6 +80,7 @@ const cors_default_exposed_headers = [_][]const u8{
     "X-RateLimit-Remaining",
     "X-RateLimit-Reset",
     "X-Antfly-Next-Cursor",
+    "Antfly-Changefeed-Cursor",
 };
 const cors_default_max_age: u32 = 3600;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
@@ -10808,7 +10809,7 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
         try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings(
-            "X-Request-ID, Retry-After, ETag, X-Antfly-Raft-Mutation-Outcome, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Antfly-Next-Cursor",
+            "X-Request-ID, Retry-After, ETag, X-Antfly-Raft-Mutation-Outcome, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Antfly-Next-Cursor, Antfly-Changefeed-Cursor",
             response.headers.get("Access-Control-Expose-Headers").?,
         );
     }
@@ -10818,12 +10819,12 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
             .OPTIONS,
             "https://any.example",
             "POST",
-            "content-type, AUTHORIZATION",
+            "content-type, AUTHORIZATION, idempotency-key",
         );
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 204), response.status.code);
         try std.testing.expectEqualStrings("GET, POST, PUT, DELETE, OPTIONS, PATCH", response.headers.get("Access-Control-Allow-Methods").?);
-        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin, If-Match", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin, If-Match, Idempotency-Key", response.headers.get("Access-Control-Allow-Headers").?);
         try std.testing.expectEqualStrings("3600", response.headers.get("Access-Control-Max-Age").?);
     }
     {

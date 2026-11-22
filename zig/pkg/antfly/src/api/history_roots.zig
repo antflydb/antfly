@@ -781,7 +781,8 @@ pub fn flushAcknowledged(client: *MetadataClient, policy: anytype, a: A, confirm
             .definition = state.definition.?.identity(),
         };
         if (item.reclaimed_through >= target) {
-            if (target == item.start) return false;
+            const native_http = state.slot == null;
+            if (target == item.start or (native_http and (item.native_collected_through orelse item.start) >= target)) return false;
             try policy.validateRoot(state, root.namespace, root.fence, root.table_name, request);
             // Collection operates on the owner's shared ACK floor. Retrying a
             // lost reply can collect another bounded page, without changing a
@@ -796,7 +797,20 @@ pub fn flushAcknowledged(client: *MetadataClient, policy: anytype, a: A, confirm
             if (!result.confirmed()) return error.MetadataMutationOutcomeUnknown;
             if (result.outcome.? == .rejected) return result.outcome.?.rejected.asError();
             if (result.outcome.? != .applied) return error.ChangefeedResynchronizationRequired;
-            return result.outcome.?.applied.reclaimed_frames == command.command.reclaim.max_frames;
+            const more = result.outcome.?.applied.reclaimed_frames == command.command.reclaim.max_frames;
+            if (native_http and !more) {
+                const definition = state.definition.?;
+                try client.mutateChangefeedState(a, .{
+                    .id = state.id,
+                    .authority = state.authority,
+                    .owner = definition.owner,
+                    .authorization = definition.authorization,
+                    .expected_revision = state.revision,
+                    .expected_epoch = state.epoch,
+                    .mutation = .{ .native_collected = .{ .namespace = root.namespace, .consumer_epoch = item.consumer_epoch, .through = target } },
+                }, request);
+            }
+            return more;
         }
         if (item.pending_control != null) {
             try driveRoot(client, policy, a, state, root.namespace, request);
