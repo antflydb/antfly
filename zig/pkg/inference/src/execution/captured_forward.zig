@@ -660,7 +660,7 @@ const TestProvider = struct {
         var foreign = provider;
         foreign.context = @ptrFromInt(1);
         try std.testing.expectError(error.ForeignModelProgramProvider, cache.run(a, foreign, frontend, &declared, a, null));
-        if (client != null) {
+        if (comptime @import("build_options").enable_pjrt) if (client != null) {
             var second_program = frontend;
             second_program.fingerprint = 1;
             const outputs = try cache.run(a, provider, second_program, &declared, a, null);
@@ -679,7 +679,7 @@ const TestProvider = struct {
             try std.testing.expectEqual(@as(u64, 3), cache.entries.stats.builds);
             try std.testing.expectEqual(@as(usize, 2), cache.parameters.?.uploads);
             try std.testing.expectError(error.ModelProgramPrecisionMismatch, cache.run(a, bf16_provider, frontend, &declared, a, null));
-        }
+        };
         const entry = cache.entries.entries.items[0];
         const first = try entry.acquireFrame();
         defer entry.returnFrame(first);
