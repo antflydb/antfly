@@ -24228,10 +24228,11 @@ pub const Node = struct {
         const body_size = hostedJsonSize(result);
         const response_units = hostedOcrResponseUnits(body_size, if (capacity == 0) queue.retained_reply_bytes else wire_quota.live, inline_source_bytes, capacity) catch
             return ctx.status(502).json(.{ .@"error" = "READER_OUTPUT_TOO_LARGE" });
-        const target_units = @max(response_units.peak, reserved_units.* +| (response_units.response -| hosted_ocr_initial_response_units));
-        if (target_units != reserved_units.*) {
-            if (try self.growSlotUnits(ctx, reserved_units.*, target_units)) |response| return response;
-            reserved_units.* = target_units;
+        // Dispatch has torn down. Grow only for the live serialization
+        // peak, which already includes the HTTP body we will transfer.
+        if (response_units.peak > reserved_units.*) {
+            if (try self.growSlotUnits(ctx, reserved_units.*, response_units.peak)) |response| return response;
+            reserved_units.* = response_units.peak;
         }
         try ctx.setHeader("content-type", "application/json");
         const units = self.inference_admission.capacityUnits(response_units.response);
@@ -24402,11 +24403,11 @@ pub const Node = struct {
                     });
             }
         }
-        var admission = readRequestAdmission(self, (body.images orelse @as([]const api.ImageURL, &.{})).len, inline_source_bytes, max_tokens);
-        // Reserve space for ordinary responses before launching upstream work.
-        if (hosted_reader != null) admission.units +|= hosted_ocr_initial_response_units;
-        if (try self.acquireSlotUnits(ctx, admission.units)) |resp| return resp;
-        var reserved_units = admission.units;
+        const admission = readRequestAdmission(self, (body.images orelse @as([]const api.ImageURL, &.{})).len, inline_source_bytes, max_tokens);
+        // Keep the response allowance separate from the image decode budget.
+        const initial_units = if (hosted_reader != null) admission.units +| hosted_ocr_initial_response_units else admission.units;
+        if (try self.acquireSlotUnits(ctx, initial_units)) |resp| return resp;
+        var reserved_units = initial_units;
         var transferred_units: usize = 0;
         defer {
             const remaining = self.inference_admission.capacityUnits(reserved_units) - transferred_units;
@@ -50341,6 +50342,147 @@ test "hosted image reader routes the inference API alias to chat completions" {
     try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightUnits());
     response.releaseBody();
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "hosted image reader reuses its serialization reservation under saturation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const page_count = 9;
+    const Fixture = struct {
+        fn serve(server: *httpx.TestServer) void {
+            for (0..page_count) |_| server.handleOne() catch return;
+        }
+    };
+
+    // Escaped text makes the final body exceed one unit while keeping each
+    // upstream response under the per-page wire limit.
+    const prefix = "{\"choices\":[{\"message\":{\"content\":\"";
+    const suffix = "\"},\"finish_reason\":\"stop\"}]}";
+    const escaped_bytes = 2 * 960 * 1024;
+    const upstream_body = try a.alloc(u8, prefix.len + escaped_bytes + suffix.len);
+    defer a.free(upstream_body);
+    @memcpy(upstream_body[0..prefix.len], prefix);
+    @memset(upstream_body[prefix.len..][0..escaped_bytes], '\\');
+    @memcpy(upstream_body[prefix.len + escaped_bytes ..], suffix);
+    try std.testing.expect(upstream_body.len < hosted_ocr_response_bytes);
+
+    var upstream = try httpx.TestServer.start(a, io, &.{.{
+        .method = .POST,
+        .path = "/v1/chat/completions",
+        .respond = .{ .body = upstream_body },
+    }});
+    defer upstream.deinit();
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&upstream});
+
+    const base_url = try std.fmt.allocPrint(a, "{s}/v1", .{upstream.baseUrl()});
+    defer a.free(base_url);
+    const request_units = page_count + hosted_ocr_initial_response_units;
+    const competing_units = 1;
+    var node = try Node.init(a, .{
+        .max_work_units = request_units + competing_units,
+        .image_readers = &.{.{ .name = "ocr", .config = .{
+            .provider = .openai,
+            .model = "lighton-ocr",
+            .base_url = base_url,
+            .prompt = "",
+            .max_tokens = 16,
+        } }},
+    });
+    defer node.deinit();
+    try node.reserveAdmissionUnits(competing_units);
+    defer node.releaseSlotUnits(competing_units);
+
+    const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC";
+    const images: [page_count]api.ImageURL = @splat(.{ .url = image });
+    const body = try std.json.Stringify.valueAlloc(a, .{ .model = "readers/ocr", .images = images }, .{});
+    defer a.free(body);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, page_count), upstream.routeHitCount(0));
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const body_units = admissionUnitsFor(response.body.?.len, read_admission_bytes_per_unit);
+    try std.testing.expectEqual(@as(usize, 2), body_units);
+    try std.testing.expectEqual(competing_units + body_units, node.inference_admission.inFlightUnits());
+    response.releaseBody();
+    try std.testing.expectEqual(@as(usize, competing_units), node.inference_admission.inFlightUnits());
+}
+
+test "hosted image reader releases admission after upstream parsing exhausts the quota" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fixture = struct {
+        fn serve(server: *httpx.TestServer) void {
+            for (0..2) |_| server.handleOne() catch return;
+        }
+    };
+
+    // Keep the HTTP body below the wire limit while forcing the JSON
+    // parser to allocate more than the deployment's single work unit.
+    const prefix = "{\"choices\":[{\"message\":{\"content\":\"receipt\"},\"finish_reason\":\"stop\"}],\"usage\":{\"padding\":[";
+    const suffix = "0]}}";
+    const padding = 1600 * 1024;
+    const upstream_body = try a.alloc(u8, prefix.len + padding + suffix.len);
+    defer a.free(upstream_body);
+    @memcpy(upstream_body[0..prefix.len], prefix);
+    for (0..padding / 2) |i| {
+        upstream_body[prefix.len + i * 2] = '0';
+        upstream_body[prefix.len + i * 2 + 1] = ',';
+    }
+    @memcpy(upstream_body[prefix.len + padding ..], suffix);
+    try std.testing.expect(upstream_body.len < hosted_ocr_response_bytes);
+
+    var upstream = try httpx.TestServer.start(a, io, &.{.{
+        .method = .POST,
+        .path = "/v1/chat/completions",
+        .respond = .{ .body = upstream_body },
+    }});
+    defer upstream.deinit();
+    upstream.max_request_bytes = 128 * 1024;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&upstream});
+
+    const base_url = try std.fmt.allocPrint(a, "{s}/v1", .{upstream.baseUrl()});
+    defer a.free(base_url);
+    var node = try Node.init(a, .{
+        .max_work_units = 1,
+        .image_readers = &.{.{ .name = "ocr", .config = .{
+            .provider = .openai,
+            .model = "lighton-ocr",
+            .base_url = base_url,
+            .prompt = "",
+            .max_tokens = 16,
+            .hosted_parallelism = 1,
+        } }},
+    });
+    defer node.deinit();
+
+    const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC";
+    const body = "{\"model\":\"readers/ocr\",\"images\":[{\"url\":\"" ++ image ++ "\"},{\"url\":\"" ++ image ++ "\"}]}";
+
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 502), response.status.code);
+    const payload = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer payload.deinit();
+    try std.testing.expectEqualStrings("READER_WORKING_LIMIT_EXCEEDED", payload.value.object.get("error").?.string);
+    try std.testing.expectEqual(@as(usize, 1), upstream.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try node.reserveAdmissionUnits(1);
+    node.releaseSlotUnits(1);
 }
 
 test "audio read rejects mixed inputs and unsupported options before model admission" {
