@@ -7344,7 +7344,8 @@ pub const AntflyApiHandler = struct {
         defer parsed.deinit();
         const request = parsed.value;
         if (mode == .statement) {
-            const observe_retry = (request.session_id != null or request.connection_id != null) and (request.parameters orelse &.{}).len == 0 and
+            const no_parameters = if (request.parameters) |parameters| parameters.len == 0 else true;
+            const observe_retry = (request.session_id != null or request.connection_id != null) and no_parameters and
                 @import("../pgwire/session_commands.zig").isCommit(request.statement orelse "");
             if (observe_retry and ctx.header("X-Antfly-SQL-Fence") != null and
                 ctx.header("X-Antfly-SQL-Probe") == null and ctx.header("X-Antfly-SQL-Settlement") == null)

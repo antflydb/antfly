@@ -12108,7 +12108,7 @@ test "commit requirements inherited defaults strengthen without becoming explici
     for (final_view.tables) |table| try std.testing.expectEqual(if (std.mem.eql(u8, table.table_name, "docs")) db_mod.types.CommitRequires.direct_enrichments else .none, table.commit_requires.?);
 }
 
-test "observation retirement advances beyond malformed index rows within the scan budget" {
+test "distributed txn observation retirement advances beyond malformed index rows within the scan budget" {
     const alloc = std.testing.allocator;
     var backend = mem_backend.Backend.init(alloc, .{});
     defer backend.close();
