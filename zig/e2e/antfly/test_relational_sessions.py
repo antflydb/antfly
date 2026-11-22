@@ -15,8 +15,10 @@
 
 """Constrained sessions across real three-metadata/three-data-node owners."""
 
+import os
 import time
 
+import pytest
 import requests
 
 import test_backup_restore as backups
@@ -151,6 +153,82 @@ def _row(cluster, session, table, key, expected):
     assert wait_until(visible, timeout_s=60, interval_s=0.25), (
         f"unexpected row {table}/{key}, expected id={expected}\n{cluster.debug_logs()}"
     )
+
+
+@pytest.mark.e2e_resource("antfly_process")
+def test_hosted_changefeed_retains_cascade_transaction(monkeypatch):
+    from test_cdc import _changefeed_call
+
+    class AuthenticatedCluster(backups.ThreeByThreeBackupCluster):
+        def _data_command(self, index):
+            return [*super()._data_command(index), "--auth", "true"]
+
+    monkeypatch.setenv(
+        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD", backups.AUTH_BOOTSTRAP_PASSWORD
+    )
+    monkeypatch.setenv(
+        "ANTFLY_TRUSTED_PRINCIPAL_SECRET", "cascade-test-principal-secret"
+    )
+    monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", "cascade-test")
+    binary = backups.resolve_binary_path(
+        os.environ.get("ANTFLY_BIN", str(backups.DEFAULT_ANTFLY_BIN))
+    )
+    cluster = AuthenticatedCluster(binary)
+    try:
+        base = cluster.data_api_urls[0]
+        with requests.Session() as session:
+            session.auth = ("admin", backups.AUTH_BOOTSTRAP_PASSWORD)
+            tables = {"parent": _schema(), "child": _schema("parent")}
+            ids = set()
+            for table, schema in tables.items():
+                created = backups._create_cluster_table_when_admitted(
+                    cluster, session, table, {"num_shards": 3, "schema": schema}
+                )
+                _ready(cluster, session, table)
+                ids.add(str(created["table_id"]))
+            seed = _begin(session, base)
+            _write(session, seed, "parent", "parent", 1)
+            _write(session, seed, "child", "child", 1)
+            _commit(cluster, session, seed)
+
+            feed = _changefeed_call(
+                session,
+                "POST",
+                f"{base}/changefeeds",
+                json={"tables": list(tables), "include": "rows"},
+                headers={"Idempotency-Key": "cascade-feed"},
+            ).json()
+            path = f"{base}/changefeeds/{feed['id']}"
+            transaction = _begin(session, base)
+            _write(session, transaction, "parent", "parent", 2)
+            _commit(cluster, session, transaction)
+
+            cursor = feed["cursor"]
+            events = []
+
+            def read_cascade():
+                nonlocal cursor
+                response = _changefeed_call(
+                    session, "GET", f"{path}/events", params={"after": cursor}
+                )
+                page = response.json()
+                cursor = response.headers["Antfly-Changefeed-Cursor"]
+                events.extend(page["events"])
+                boundary = page.get("transaction")
+                return boundary if boundary and boundary["complete"] else None
+
+            boundary = wait_until(read_cascade, timeout_s=45)
+            assert boundary, cluster.debug_logs()
+            assert len(events) == 2
+            assert {event["table_id"] for event in events} == ids
+            for event in events:
+                assert event["transaction_id"] == boundary["transaction_id"]
+                assert event["operation"] == "update"
+                assert event["before"]["id"] == 1
+                assert event["after"]["id"] == 2
+            _changefeed_call(session, "DELETE", path)
+    finally:
+        cluster.stop()
 
 
 def test_constrained_sessions_defer_reject_and_rollback_across_owners(
