@@ -219,6 +219,9 @@ pub const Admission = struct {
         }
         return null;
     }
+    pub fn isCoordinator(self: Admission, participant: Participant) bool {
+        return same(self.coordinator_namespace, participant.namespace) and same(self.coordinator_fence, participant.owner_fence);
+    }
     pub fn coordinatorMember(self: Admission) !Participant {
         try self.validate();
         return self.findFenced(self.coordinator_namespace, self.coordinator_fence) orelse error.InvalidParticipant;
@@ -299,10 +302,36 @@ pub fn preparedInputDigest(namespace: Namespace, encoded_input: []const u8) Dige
     sha.update(encoded_input);
     return sha.finalResult();
 }
-pub const AdmissionEnvelope = struct { admission: Admission, digest: Digest };
+pub const AdmissionEnvelope = struct {
+    admission: Admission,
+    digest: Digest,
+    local_owner_fence: ?Digest = null,
+
+    pub fn localMember(self: AdmissionEnvelope, namespace: Namespace) !Participant {
+        if (self.admission.version < physical_participant_version) return self.admission.member(namespace);
+        const fence = self.local_owner_fence orelse return error.InvalidTxnRecord;
+        return self.admission.findFenced(namespace, fence) orelse error.InvalidParticipant;
+    }
+};
+
 pub fn encodeAdmission(a: A, admission: Admission) ![]u8 {
+    return encodeAdmissionEnvelope(a, admission, null);
+}
+
+/// Persist the owner selected by qualified BEGIN alongside the common plan.
+pub fn encodeLocalAdmission(a: A, admission: Admission, owner: RoutedOwner) ![]u8 {
+    if (admission.version != physical_participant_version) return error.InvalidTxnRecord;
+    _ = try admission.memberForOwner(owner);
+    return encodeAdmissionEnvelope(a, admission, owner.digest());
+}
+
+fn encodeAdmissionEnvelope(a: A, admission: Admission, local_owner_fence: ?Digest) ![]u8 {
     try admission.validate();
-    const bytes = try std.json.Stringify.valueAlloc(a, AdmissionEnvelope{ .admission = admission, .digest = admission.digest() }, .{});
+    const digest = admission.digest();
+    const bytes = if (local_owner_fence) |fence|
+        try std.json.Stringify.valueAlloc(a, .{ .admission = admission, .digest = digest, .local_owner_fence = fence }, .{})
+    else
+        try std.json.Stringify.valueAlloc(a, .{ .admission = admission, .digest = digest }, .{});
     errdefer a.free(bytes);
     if (bytes.len > max_bytes) return error.HistoryTooLarge;
     return bytes;
@@ -316,6 +345,12 @@ pub fn parseAdmission(a: A, bytes: []const u8) !std.json.Parsed(AdmissionEnvelop
     errdefer parsed.deinit();
     try parsed.value.admission.validate();
     if (!same(parsed.value.digest, parsed.value.admission.digest())) return error.InvalidTxnRecord;
+    if (parsed.value.local_owner_fence) |fence| {
+        if (parsed.value.admission.version != physical_participant_version) return error.InvalidTxnRecord;
+        for (parsed.value.admission.participants) |participant| {
+            if (same(fence, participant.owner_fence)) break;
+        } else return error.InvalidTxnRecord;
+    }
     return parsed;
 }
 pub const Manifest = struct {
@@ -831,6 +866,13 @@ test "physical completion retains two participants that share a document namespa
     try std.testing.expectEqual(right, (try recovered.coordinatorMember()).routed_owner.?);
     try std.testing.expectEqual(left, (try recovered.memberForOwner(left)).routed_owner.?);
     try std.testing.expectError(error.InvalidParticipant, recovered.member(left.namespace));
+    try std.testing.expectError(error.InvalidTxnRecord, retained.value.localMember(left.namespace));
+    const local_encoded = try encodeLocalAdmission(a, admission, left);
+    defer a.free(local_encoded);
+    var local = try parseAdmission(a, local_encoded);
+    defer local.deinit();
+    try std.testing.expectEqual(retained.value.digest, local.value.digest);
+    try std.testing.expectEqual(left, (try local.value.localMember(right.namespace)).routed_owner.?);
 
     const manifest = try recovered.manifest(100);
     var position: Digest = @splat(0);

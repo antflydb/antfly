@@ -616,8 +616,13 @@ pub const TxnManager = struct {
         if (admission.version < 3 and try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
         const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
         defer self.alloc.free(namespace);
-        if (namespace.len != 24 or coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return TxnError.DecisionConflict;
-        _ = try admission.member(namespace[0..24].*);
+        if (namespace.len != 24) return TxnError.DecisionConflict;
+        const local = if (admission.version == completion.physical_participant_version) local: {
+            const owner = extra.completion_owner orelse return error.InvalidHistoryAdmission;
+            if (!std.mem.eql(u8, namespace, &owner.namespace)) return error.InvalidParticipant;
+            break :local try admission.memberForOwner(owner);
+        } else try admission.member(namespace[0..24].*);
+        if (coordinator != admission.isCoordinator(local)) return TxnError.DecisionConflict;
         const key = makeSidecarKey(completion_admission_prefix, admission.transaction_id);
         for (extra.writes) |write| if (std.mem.eql(u8, write.key, &key)) return error.InvalidTxnRecord;
         for (extra.deletes) |deleted| if (std.mem.eql(u8, deleted, &key)) return error.InvalidTxnRecord;
@@ -630,6 +635,8 @@ pub const TxnManager = struct {
             var owned = saved;
             defer owned.deinit();
             if (existing_record == null or !std.mem.eql(u8, &owned.value.digest, &admission.digest())) return TxnError.DecisionConflict;
+            const saved_local = try owned.value.localMember(namespace[0..24].*);
+            if (!std.mem.eql(u8, &saved_local.owner_fence, &local.owner_fence)) return TxnError.DecisionConflict;
         } else if (existing_record != null) return TxnError.DecisionConflict;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -641,11 +648,16 @@ pub const TxnManager = struct {
         for (admission.participants) |participant| {
             const member = try unique.getOrPut(scratch, participant.locator);
             if (member.found_existing) return error.InvalidParticipant;
-            if (coordinator and !std.mem.eql(u8, &participant.namespace, &admission.coordinator_namespace)) try members.append(scratch, participant.locator);
+            if (coordinator and !admission.isCoordinator(participant)) try members.append(scratch, participant.locator);
         }
         // Preserve the original encoding as well as its logical identity. A
         // serializer upgrade must not reprice credits or break pending retry.
-        const encoded = if (existing_record != null) try self.getAlloc(scratch, &key) else try completion.encodeAdmission(scratch, admission);
+        const encoded = if (existing_record != null)
+            try self.getAlloc(scratch, &key)
+        else if (admission.version == completion.physical_participant_version)
+            try completion.encodeLocalAdmission(scratch, admission, local.routed_owner.?)
+        else
+            try completion.encodeAdmission(scratch, admission);
         var writes: std.ArrayList(docstore.KVPair) = .empty;
         try writes.appendSlice(scratch, extra.writes);
         try writes.append(scratch, .{ .key = &key, .value = encoded });
@@ -668,8 +680,9 @@ pub const TxnManager = struct {
         if (!record.coordinator_known) return error.InvalidTxnRecord;
         const namespace = try self.getAlloc(a, &internal_keys.identity_namespace_key);
         defer a.free(namespace);
-        if (namespace.len != 24 or record.coordinator != std.mem.eql(u8, namespace, &parsed.value.admission.coordinator_namespace)) return TxnError.DecisionConflict;
-        _ = try parsed.value.admission.member(namespace[0..24].*);
+        if (namespace.len != 24) return TxnError.DecisionConflict;
+        const participant = try parsed.value.localMember(namespace[0..24].*);
+        if (record.coordinator != parsed.value.admission.isCoordinator(participant)) return TxnError.DecisionConflict;
         return parsed;
     }
 
@@ -937,12 +950,13 @@ pub const TxnManager = struct {
         const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
         defer self.alloc.free(namespace);
         if (namespace.len != 24) return error.InvalidTxnRecord;
-        const member = try plan.member(namespace[0..24].*);
+        const member = try frozen.value.localMember(namespace[0..24].*);
         const supplied = input_digest orelse return error.SourceTransactionIdentityConflict;
         if (!std.mem.eql(u8, &supplied, &member.input_digest.?)) return error.SourceTransactionIdentityConflict;
         const binding = owner orelse return error.InvalidHistoryAdmission;
         if (!std.mem.eql(u8, &binding.namespace, namespace)) return error.HistoryResynchronizationRequired;
         try plan.requireRoutedOwner(binding);
+        if (!std.mem.eql(u8, &member.owner_fence, &binding.digest())) return error.InvalidParticipant;
         var probe = try self.store.beginProbe();
         defer probe.abort();
         try @import("committed_history.zig").requireCompletionReservation(&probe, namespace[0..24].*, plan);
@@ -997,13 +1011,14 @@ pub const TxnManager = struct {
             defer self.alloc.free(namespace);
             if (namespace.len != 24) return error.InvalidTxnRecord;
             if (frozen.value.admission.version < 3 and try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
-            const participant = try frozen.value.admission.member(namespace[0..24].*);
+            const participant = try frozen.value.localMember(namespace[0..24].*);
             if (frozen.value.admission.version >= 2) {
                 const supplied = extra_batch.completion_input_digest orelse return error.SourceTransactionIdentityConflict;
                 if (!std.mem.eql(u8, &supplied, &participant.input_digest.?)) return error.SourceTransactionIdentityConflict;
                 const binding = extra_batch.completion_owner orelse return error.InvalidHistoryAdmission;
                 if (!std.mem.eql(u8, &binding.namespace, namespace)) return error.HistoryResynchronizationRequired;
                 try frozen.value.admission.requireRoutedOwner(binding);
+                if (!std.mem.eql(u8, &participant.owner_fence, &binding.digest())) return error.InvalidParticipant;
             } else if (extra_batch.completion_input_digest != null or extra_batch.completion_owner != null) return error.ChangefeedCapabilityUnsupported;
             for (intents) |intent| if (@import("source_checkpoint.zig").isKey(intent.key) and (record.source_purpose == null or participant.roles & completion.Roles.checkpoint == 0)) return error.InvalidParticipant;
             if (participant.roles & completion.Roles.effects == 0) {

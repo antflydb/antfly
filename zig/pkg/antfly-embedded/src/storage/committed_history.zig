@@ -1015,7 +1015,7 @@ pub const Capture = struct {
             defer parsed.deinit();
             const admission = parsed.value.admission;
             if (!std.mem.eql(u8, &admission.transaction_id, &id)) return error.InvalidTxnRecord;
-            _ = try admission.member(self.namespace);
+            _ = try parsed.value.localMember(self.namespace);
             if (entry.value_ptr.previous != 0 and !std.mem.eql(u8, &entry.value_ptr.digest, &parsed.value.digest)) return error.InvalidTxnRecord;
             entry.value_ptr.next = try admission.reservationBytes(raw.len);
             entry.value_ptr.digest = parsed.value.digest;
@@ -1194,7 +1194,7 @@ pub const Capture = struct {
             if (!std.mem.eql(u8, &completion.bytesDigest(record), &request.record_digest)) return error.InvalidTxnRecord;
             try @import("transactions.zig").requireCompletionResolvedRecord(record, request.commit_version);
             const manifest = try plan.value.admission.manifest(request.commit_version);
-            const member = try plan.value.admission.member(state.namespace);
+            const member = try plan.value.localMember(state.namespace);
             const receipt_key = completion.resolutionKey(request.transaction_id);
             if (try optional(txn, &receipt_key) != null) return error.InvalidTxnRecord;
             const position = produced_position orelse try self.sourcePosition(txn);

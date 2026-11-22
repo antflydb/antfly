@@ -26466,12 +26466,14 @@ pub const DB = struct {
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
         const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
-        _ = try plan.member(namespace);
         if (plan.version >= 2) {
             const binding = owner orelse return error.InvalidHistoryAdmission;
             try plan.requireRoutedOwner(binding);
             if (!std.mem.eql(u8, &binding.namespace, &namespace) or binding.root_generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
-        } else if (owner != null) return error.ChangefeedCapabilityUnsupported;
+        } else {
+            if (owner != null) return error.ChangefeedCapabilityUnsupported;
+            _ = try plan.member(namespace);
+        }
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
@@ -26495,8 +26497,9 @@ pub const DB = struct {
         }
         var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(identity, &value_buf);
-        const extra: transactions_mod.MutationExtraBatch = .{ .ordinary_producer = ordinary_producer, .legacy_producer = legacy_producer, .writes = &.{marker}, .source_purpose = purpose, .source_scope = scope };
-        if (std.mem.eql(u8, &namespace, &plan.coordinator_namespace))
+        const extra: transactions_mod.MutationExtraBatch = .{ .ordinary_producer = ordinary_producer, .legacy_producer = legacy_producer, .writes = &.{marker}, .completion_owner = owner, .source_purpose = purpose, .source_scope = scope };
+        const is_coordinator = if (owner) |binding| std.mem.eql(u8, &binding.digest(), &plan.coordinator_fence) else std.mem.eql(u8, &namespace, &plan.coordinator_namespace);
+        if (is_coordinator)
             try manager.initTransactionWithCompletionAdmission(plan, timestamp_ns, created_at_ns, retain_terminal, extra)
         else
             try manager.initParticipantWithCompletionAdmission(plan, timestamp_ns, created_at_ns, retain_terminal, extra);
