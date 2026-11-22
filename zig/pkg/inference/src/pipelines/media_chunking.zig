@@ -226,8 +226,7 @@ pub const Runner = struct {
             descriptor.coordinates.page_box = self.page_box;
             descriptor.coordinates.page_rotation = self.page_rotation;
         }
-        if (self.executor.preflight) |preflight| {
-            const measured = measured_ready orelse try preflight(self.executor.context, payload);
+        if (measured_ready orelse try self.measurePayload(payload)) |measured| {
             selected_pictures = measured.selected_pictures;
             descriptor.coordinates.selected_pictures = measured.selected_pictures;
             descriptor.coordinates.picture_basis = measured.picture_basis;
@@ -1040,13 +1039,17 @@ pub const Runner = struct {
     fn videoTimestampPolicy(self: *const Runner, shape: planning.Descriptor) video.sampling.TimestampPolicy {
         return .{ .start_ns = shape.coordinates.start_ns.?, .end_ns = shape.coordinates.end_ns, .step_ns = @intCast(self.request.policy.step_ns), .max_frames = @min(self.request.policy.max_frames, self.executor.model.max_frames), .overflow = .truncate, .hold = self.request.policy.video_hold != 0 };
     }
-    fn planDurableWebmWindow(self: *const Runner, input: @import("embedding_gemma2_video.zig").WebmInput, policy: video.sampling.TimestampPolicy, ordinal: u64) !struct { input: @import("embedding_gemma2_video.zig").WebmInput, replay_required: bool } {
+    fn planDurableWebmWindow(self: *const Runner, input: @import("embedding_gemma2_video.zig").WebmInput, policy: video.sampling.TimestampPolicy, ordinal: u64) !struct { input: ?@import("embedding_gemma2_video.zig").WebmInput, replay_required: bool } {
         const limit = self.request.limits.max_coded_window_bytes;
         const selective = if (self.request.outputs) |config| for (config.targets) |target| {
-            if (target.skip_windows.len != 0) break true;
+            if (!target.execute or target.skip_windows.len != 0) break true;
         } else false else false;
         var planned = @import("embedding_gemma2_video.zig").planWebmWindow(input, policy, if (selective) std.math.maxInt(usize) else limit, self.control) catch |err| switch (err) {
             error.ResourceLimitExceeded => return error.ChunkReplayUnavailable,
+            error.EmptyVideoWindow => {
+                if (!selective or try self.videoReplayNeeded(ordinal, 1)) return err;
+                return .{ .input = null, .replay_required = false };
+            },
             else => return err,
         };
         // Published ordinals can be replayed by a fresh process. Warm
@@ -1099,9 +1102,16 @@ pub const Runner = struct {
         }
         slot.initialized = true;
     }
+    fn measurePayload(self: *const Runner, payload: Payload) !?Preflight {
+        if (payload == .video and !payload.video.replay_required and payload.video.webm == null) {
+            return .{ .input_tokens = 0, .picture_count = 0 };
+        }
+        if (self.executor.preflight) |measure| return try measure(self.executor.context, payload);
+        return null;
+    }
+
     fn cacheVideoPreflight(self: *Runner, slot: *VideoSlot) !void {
-        if (slot.measured == null) if (self.executor.preflight) |preflight| {
-            const measured = try preflight(self.executor.context, slot.payload);
+        if (slot.measured == null) if (try self.measurePayload(slot.payload)) |measured| {
             errdefer if (measured.selected_pictures) |pictures| self.allocator.free(pictures);
             if (measured.input_tokens > try self.executor.model.capacity()) return error.ChunkUnitTooLarge;
             slot.measured = measured;
@@ -1197,7 +1207,7 @@ pub const Runner = struct {
                 if (slot.failure) |err| return err;
                 if (!slot.initialized) self.prepareVideoSlot(source, slot) catch |err| {
                     if (count == 0) return err;
-                    if (err == error.ChunkReplayUnavailable) {
+                    if (err == error.ChunkReplayUnavailable or err == error.EmptyVideoWindow) {
                         slot.failure = err;
                     } else if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return err;
                     break;
@@ -1297,7 +1307,10 @@ pub const Runner = struct {
         try self.control.check();
         try cursor.seekVideo(self.summary.start_ordinal -| self.ordinal);
         self.ordinal += cursor.ordinal;
-        const selective = if (self.request.outputs) |config| (try config.boundary()).skip_windows.len != 0 else false;
+        const selective = if (self.request.outputs) |config| masked: {
+            const boundary = try config.boundary();
+            break :masked !boundary.execute or boundary.skip_windows.len != 0;
+        } else false;
         if (self.request.execute and !selective and self.executor.embed_video_batch != null) return self.videoBatches(source, &cursor);
         var slots = [_]VideoSlot{ .{}, .{} };
         defer for (&slots) |*slot| slot.deinit();
@@ -1483,6 +1496,31 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     try masked.webmWindowsSnapshot(&reader, &snapshot);
     try std.testing.expectEqual(@as(usize, 1), masked.summary.emitted);
     try std.testing.expect(masked.summary.page_terminal == null);
+    pictures[1].pts = 2 * second;
+    var gap_timeline = try index.presentationTimeline(a, .{});
+    defer gap_timeline.deinit();
+    const gap_snapshot = @import("media_index_cache.zig").Cache.WebmSnapshot{ .index = index, .timeline = gap_timeline, .origin = 0, .duration = 3 * second };
+    masked_request.policy.video_hold = 0;
+    masked_request.limits.max_coded_window_bytes = 6;
+    masked_request.max_chunks = 0;
+    const Gap = struct {
+        fn accept(raw: *anyopaque, item: Item) !void {
+            const seen: *usize = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(seen.*, item.descriptor.ordinal);
+            if (item.descriptor.ordinal == 1) {
+                try std.testing.expectEqual(@as(?u32, 0), item.descriptor.coordinates.picture_count);
+                try std.testing.expectEqual(@as(usize, 0), item.descriptor.input_tokens);
+                try std.testing.expect(item.embedding == null);
+            } else try std.testing.expect(item.embedding != null);
+            seen.* += 1;
+        }
+    };
+    var gap_seen: usize = 0;
+    var gap = try Runner.init(a, masked_request, result.executor(), .{}, .{ .context = &gap_seen, .accept = Gap.accept });
+    try gap.webmWindowsSnapshot(&reader, &gap_snapshot);
+    try std.testing.expectEqual(@as(usize, 3), gap_seen);
+    try std.testing.expect(gap.summary.page_terminal == null);
+    pictures[1].pts = second;
     var token: [85]u8 = undefined;
     request.continuation = page.summary.identity.cursor(page.summary.next_ordinal, &token);
     var resumed = try Runner.init(a, request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });

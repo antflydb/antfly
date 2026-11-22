@@ -51424,7 +51424,13 @@ const MediaOutputExecution = struct {
                 continue;
             }
             if (payload == .video and resolved.classifier_profile != null and resolved.classifier_profile.?.input == .pixels) {
-                const pictures = descriptor.coordinates.selected_pictures orelse return error.InvalidChunkCoordinates;
+                const pictures = descriptor.coordinates.selected_pictures orelse {
+                    if (payload.video.replay_required or descriptor.coordinates.picture_count != 0 or target.wants(descriptor.ordinal, 0)) return error.InvalidChunkCoordinates;
+                    var value = base;
+                    value.status = .skipped;
+                    try results.append(a, value);
+                    continue;
+                };
                 const batched = self.runFrameBatch(a, target, resolved, index, pictures, descriptor.ordinal) catch |err| failed: {
                     if (chunks.abort(err) or (!allow_partial and target.required)) return err;
                     // Preserve independent frame receipts when a batch fails.

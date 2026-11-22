@@ -8226,9 +8226,9 @@ fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichm
             cursor_bytes = retained_checkpoint;
             cursor = next;
         }
-        // A terminal page retains its verified rows in the checkpoint, but
-        // cannot authorize another model request or a complete inventory.
-        if (page.terminal) |terminal| return terminal.failure();
+        // Stop this attempt at the blocked ordinal. A later attempt can
+        // replay the acknowledged rows and recheck the provider's limits.
+        if (!replaying) if (page.terminal) |terminal| return terminal.failure();
         // Do not freeze retryable result receipts into an accepted immutable
         // parent. The saved page keeps healthy model work while only gaps retry.
         if (pending_index) return error.IncompleteChunkCoverage;
@@ -47266,6 +47266,7 @@ test "model aware media pass resumes acknowledged pages after interruption and s
     const Fake = struct {
         calls: usize = 0,
         interrupted: bool = true,
+        terminal_first: bool = true,
         first_calls: usize = 0,
         stale: bool = false,
         revision: [64]u8 = @splat('4'),
@@ -47302,7 +47303,7 @@ test "model aware media pass resumes acknowledged pages after interruption and s
             errdefer a.free(plan);
             const fingerprint = try a.dupe(u8, "2222222222222222222222222222222222222222222222222222222222222222");
             errdefer a.free(fingerprint);
-            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal == 1 };
+            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal == 1, .terminal = if (!probe and ordinal == 0 and self.terminal_first) .coded_window_budget_exceeded else null };
         }
     };
     var fake = Fake{};
@@ -47318,6 +47319,9 @@ test "model aware media pass resumes acknowledged pages after interruption and s
     var cfg = try chunking_types_mod.parseConfigFromSlice(alloc, request.chunker_json);
     defer cfg.deinit(alloc);
     cfg.max_chunks = 1;
+    try std.testing.expectError(error.ChunkCodedWindowBudgetExceeded, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    fake.terminal_first = false;
     try std.testing.expectError(error.ChunkRequestFailed, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
     try std.testing.expectEqual(@as(usize, 1), fake.first_calls);
     fake.interrupted = false;

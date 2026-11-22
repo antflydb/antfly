@@ -146,7 +146,7 @@ const MediaGenerationSnapshot = struct {
     fn matches(self: *const @This(), a: Allocator, document: std.json.Value, recipe: []const u8, version: u32, legacy: bool) !bool {
         const boundary = self.boundary orelse return false;
         const state = document.object.get("_enrichment") orelse return false;
-        if (state != .object or serverlessMediaPending(state)) return false;
+        if (state != .object or serverlessMediaPending(state) or document_projection.hasChunkEmbeddingsTerminal(state)) return false;
         const old_recipe = state.object.get("chunk_embeddings_recipe") orelse return false;
         const old_version = state.object.get("chunk_embeddings_version") orelse return false;
         if (old_recipe != .string or !std.mem.eql(u8, old_recipe.string, recipe) or old_version != .integer or old_version.integer < version) return false;
@@ -1428,7 +1428,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     if (current_outputs) {
         if (document.object.get("_enrichment")) |state| if (state == .object) {
             const old_recipe = state.object.get("chunk_embeddings_recipe");
-            if (state.object.get("chunk_embeddings_version")) |version| if (version == .integer and version.integer >= pipeline_version and !serverlessMediaPending(state) and old_recipe != null and old_recipe.? == .string and std.mem.eql(u8, old_recipe.?.string, &recipe_fingerprint)) return .{};
+            if (state.object.get("chunk_embeddings_version")) |version| if (version == .integer and version.integer >= pipeline_version and !serverlessMediaPending(state) and !document_projection.hasChunkEmbeddingsTerminal(state) and old_recipe != null and old_recipe.? == .string and std.mem.eql(u8, old_recipe.?.string, &recipe_fingerprint)) return .{};
         };
     }
     var config = base_config;
@@ -1568,15 +1568,15 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             a.free(cursor.source_version);
             position = null;
         }
-        if (page.terminal) |terminal| {
-            page_terminal = terminal;
-            break;
-        }
         const plan = try a.dupe(u8, page.plan_id);
         errdefer a.free(plan);
         const fingerprint = try a.dupe(u8, page.source_fingerprint);
         errdefer a.free(fingerprint);
         position = .{ .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, page.source_version), .ordinal = page.covered_through_ordinal };
+        if (page.terminal) |terminal| {
+            page_terminal = terminal;
+            break;
+        }
         if (self.media_page_limit != 0 and (pages >= page_limit or (self.media_checkpoint_interval_ms != 0 and @import("antfly_platform").time.monotonicNs() >= checkpoint_deadline))) {
             pending_outputs = true;
             break;
@@ -1646,9 +1646,10 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         _ = state.object.swapRemove("chunk_embeddings_cursor");
         _ = state.object.swapRemove("chunk_embeddings_pages");
     }
-    if (pending_outputs) {
+    if (pending_outputs or page_terminal != null) {
         _ = state.object.swapRemove("chunk_embeddings_version");
         _ = state.object.swapRemove("chunk_embeddings_recipe");
+        _ = state.object.swapRemove("chunk_embeddings_recipe_format");
     } else {
         try state.object.put(scratch, "chunk_embeddings_version", .{ .integer = pipeline_version });
         try state.object.put(scratch, "chunk_embeddings_recipe", .{ .string = &recipe_fingerprint });
@@ -3654,6 +3655,7 @@ test "model aware media serverless chunks use the shared paged provider and reta
         calls: usize = 0,
         first_calls: usize = 0,
         fail_second: bool = false,
+        terminal_first: bool = false,
         fn page(ptr: *anyopaque, alloc: Allocator, _: []const u8, input: chunking.inference.RemoteInput, cfg: chunking.types.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!chunking.inference.ChunkPage {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try @import("std").testing.expect(input == .source);
@@ -3689,7 +3691,7 @@ test "model aware media serverless chunks use the shared paged provider and reta
             errdefer alloc.free(plan);
             const source = try alloc.dupe(u8, "2222222222222222222222222222222222222222222222222222222222222222");
             errdefer alloc.free(source);
-            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = source, .source_version = try alloc.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal == 1 };
+            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = source, .source_version = try alloc.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal == 1, .terminal = if (ordinal == 0 and self.terminal_first) .coded_window_budget_exceeded else null };
         }
     };
     var fake = Fake{};
@@ -3729,12 +3731,20 @@ test "model aware media serverless chunks use the shared paged provider and reta
     worker.media_page_limit = 1;
     worker.model_chunker.?.max_chunks = 1;
     fake.first_calls = 0;
+    fake.terminal_first = true;
     const first_page = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"version_kind\":\"s3_version_id\",\"length\":100}}", 2, .require_model);
     defer a.free(first_page.body.?);
     var prefix = try document_projection.parseAlloc(a, first_page.body.?);
     defer prefix.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), prefix.chunk_embeddings.?.len);
     try std.testing.expect(prefix.chunk_embeddings_version == null);
+    var terminal_body = try std.json.parseFromSlice(std.json.Value, a, first_page.body.?, .{});
+    defer terminal_body.deinit();
+    const terminal_state = terminal_body.value.object.get("_enrichment").?;
+    try std.testing.expect(document_projection.hasChunkEmbeddingsTerminal(terminal_state));
+    try std.testing.expect(!terminal_state.object.contains("chunk_embeddings_version"));
+    try std.testing.expect(!terminal_state.object.get("chunk_embeddings_pending").?.bool);
+    fake.terminal_first = false;
     fake.fail_second = true;
     try std.testing.expectError(error.ChunkRequestFailed, buildDerivedBodyAlloc(&worker, .chunk_embeddings, first_page.body.?, 2, .require_model));
     fake.fail_second = false;
