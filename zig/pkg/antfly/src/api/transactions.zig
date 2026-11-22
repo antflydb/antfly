@@ -28,6 +28,7 @@ const platform_time = @import("antfly_platform").time;
 const session_record = @import("../metadata/transaction_session_record.zig");
 const session_prefix = session_record.session_prefix;
 const session_lease_prefix = "\x00\x00__api_txn_session_leases__:";
+const sql_legacy_pin_fence_key = "\x00\x00__api_sql_legacy_pin_fence__";
 const sql_abort_expiry_prefix = "\x00\x00__api_sql_abort_expiry__:";
 const session_expiry_prefix = "\x00\x00__api_txn_session_expiry__:";
 const session_recovery_prefix = "\x00\x00__api_txn_session_recovery__:";
@@ -1539,6 +1540,41 @@ pub const DurableSessionStore = struct {
         return std.mem.eql(u8, value, "settled-v1");
     }
 
+    fn legacySqlPinsFenced(txn: anytype) !bool {
+        const version = txn.get(sql_legacy_pin_fence_key) catch |err| if (err == error.NotFound) return false else return err;
+        if (!std.mem.eql(u8, version, "sealed-v1")) return error.InvalidTransactionSessionRecord;
+        return true;
+    }
+
+    /// Seal the exclusive issuer and owner namespace on its storage write cut.
+    /// The caller must establish that it has no separately routed issuers.
+    pub fn sealStandaloneLegacySqlPins(self: *DurableSessionStore) !void {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        if ((self.registration_issuer orelse 0) != 0) return error.CompletionWrongOwner;
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                if (try self.sealStandaloneLegacySqlPinsTxn(&txn)) try txn.commit() else txn.abort();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                if (try self.sealStandaloneLegacySqlPinsTxn(&txn)) try txn.commit() else txn.abort();
+            },
+        }
+    }
+
+    fn sealStandaloneLegacySqlPinsTxn(self: *DurableSessionStore, txn: anytype) !bool {
+        if (try legacySqlPinsFenced(txn)) return false;
+        const producer = try self.registrationOutbox().producer(txn, self.alloc, @splat(0));
+        if (producer.active != 0 or self.reserved_registrations != 0) return error.CompletionIssuerNotDrained;
+        try txn.put(sql_legacy_pin_fence_key, "sealed-v1");
+        return true;
+    }
+
     fn sqlAbortProofExists(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId) !bool {
         const key = try makeSessionCompletionKey(self.alloc, id);
         defer self.alloc.free(key);
@@ -1547,6 +1583,7 @@ pub const DurableSessionStore = struct {
     }
 
     fn putSqlAbortProof(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId) !void {
+        if (try legacySqlPinsFenced(txn)) return;
         const key = try makeSessionCompletionKey(self.alloc, id);
         defer self.alloc.free(key);
         try txn.put(key, "settled-v1");
@@ -1620,6 +1657,12 @@ pub const DurableSessionStore = struct {
                 if (try self.registrationOutbox().available(txn, self.alloc) <= held) return error.SessionLimitExceeded;
                 const floor = (try self.registrationOutbox().producer(txn, self.alloc, value.seed)).retired_through;
                 const reference = try self.registrationOutbox().create(txn, self.alloc, value.seed, value.outcome, value.prepared);
+                if (!value.prepared and value.outcome.transaction_id != null and value.outcome.ddl_receipt_json == null and try legacySqlPinsFenced(txn)) {
+                    const hex = value.outcome.transaction_id.?;
+                    const id = distributed_txn.parseTxnIdHex(hex) catch return error.InvalidArgument;
+                    _ = try self.completionReferenceTxn(txn, id, reference, false, floor, .atomic_pin);
+                    try self.registrationOutbox().put(txn, self.alloc, reference, .{ .outcome = value.outcome, .phase = .registered });
+                }
                 if (value.local_transaction_id) |id| {
                     // Fold the local handoff into the intent allocation batch:
                     // no remote RPC or intermediate WAL commits are necessary.
@@ -1766,7 +1809,7 @@ pub const DurableSessionStore = struct {
     fn mutateCompletionReference(self: *DurableSessionStore, id: db_mod.types.TxnId, reference: [16]u8, acknowledge: bool, retired_through: ?u64) !bool {
         return self.changeCompletionReference(id, reference, acknowledge, retired_through, .pin);
     }
-    pub const CompletionMode = enum { pin, prepare, quiesce, abandon, forget };
+    pub const CompletionMode = enum { pin, atomic_pin, prepare, quiesce, abandon, forget };
     pub fn changeCompletionReference(self: *DurableSessionStore, id: [16]u8, reference: [16]u8, acknowledge: bool, retired_through: ?u64, mode: CompletionMode) !bool {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
@@ -1829,6 +1872,7 @@ pub const DurableSessionStore = struct {
             return false;
         }
         if (!retiring and existing != null) return true;
+        if (!retiring and mode == .pin and try legacySqlPinsFenced(txn)) return error.CompletionUnavailable;
         const directory = try completionDirectoryKey(self.alloc, id);
         defer self.alloc.free(directory);
         const bytes = txn.get(directory) catch |err| switch (err) {
@@ -1851,7 +1895,7 @@ pub const DurableSessionStore = struct {
                 defer session.deinit(self.alloc);
                 break :live sessionCompletionSettled(session) or (mode != .prepare and !session.commit_execution_started);
             } else receipt: {
-                if (mode == .prepare) return error.SqlTransactionOutcomeUnknown;
+                if (mode == .prepare or mode == .atomic_pin) return error.SqlTransactionOutcomeUnknown;
                 if (!try self.sqlAbortProofExists(txn, id)) {
                     const result = try readSqlAbortStatus(txn, self.alloc, id, .all);
                     if (result != .found or result.found.disposition != .aborted) return error.SqlTransactionOutcomeUnknown;
@@ -8893,6 +8937,48 @@ test "distributed txn public mutation guards reject a reused id" {
     _ = try registry.beginForPrincipalWithSettingsAndId(a, .{}, 1, "bob", &.{}, null, id);
     try std.testing.expectError(error.SessionLeaseLost, registry.readMutationInfo(guard));
     try std.testing.expectError(error.SessionLeaseLost, registry.getTerminalCommitForMutation(a, guard));
+}
+
+test "distributed txn standalone SQL pin fence drains and persists across issuer restart" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "standalone-sql-pin-fence" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(a, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(a);
+    const id = (try registry.begin(a, .{}, 0)).txn_id;
+    const encoded = std.fmt.bytesToHex(id, .lower);
+    const seed: [8]u8 = @splat(3);
+    const legacy = try durable.createRegistration(seed, .{ .transaction_id = &encoded });
+    try std.testing.expectError(error.CompletionIssuerNotDrained, durable.sealStandaloneLegacySqlPins());
+    try durable.removeRegistration(legacy);
+    try durable.reserveRegistrations(1);
+    try std.testing.expectError(error.CompletionIssuerNotDrained, durable.sealStandaloneLegacySqlPins());
+    durable.releaseRegistrations(1);
+    try durable.sealStandaloneLegacySqlPins();
+
+    var reopened = DurableSessionStore.initRuntime(a, &store);
+    const missing: db_mod.types.TxnId = @splat(7);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try reopened.putSqlAbortProof(&write, missing);
+        try write.commit();
+    }
+    try std.testing.expect(!try reopened.completionSettled(missing));
+    try std.testing.expectError(error.CompletionUnavailable, reopened.pinCompletion(id, @splat(4)));
+    const missing_hex = std.fmt.bytesToHex(missing, .lower);
+    try std.testing.expectError(error.SqlTransactionOutcomeUnknown, reopened.createRegistration(seed, .{ .transaction_id = &missing_hex }));
+    const atomic = try reopened.createRegistration(seed, .{ .transaction_id = &encoded });
+    try std.testing.expectEqual(@as(u64, 2), @import("completion_retirement.zig").sequence(atomic));
+    try reopened.sealStandaloneLegacySqlPins();
+    var registration = (try reopened.loadRegistration(a, atomic)).?;
+    defer registration.deinit();
+    try std.testing.expect(registration.value.phase == .registered);
+    try std.testing.expect(try reopened.completionReferenceSettled(id, atomic));
+    try reopened.pinCompletion(id, atomic);
 }
 
 test "distributed txn migrates legacy detached SQL aborts out of live quota" {
