@@ -2682,7 +2682,10 @@ fn needsDenseRepairWritePreflight(req: antfly.db.types.BatchRequest) bool {
     // parent ACK cannot acquire an ordinary writer on its own fenced owner.
     // Keep every mixed/effect-bearing batch on the regular pressure gate;
     // DB.batch independently validates topology command shape at apply.
-    if (req.relational_topology == null) return true;
+    // Authenticated merge copy commands carry the destination's exact
+    // transition identity and are checked again by ordered apply. Public
+    // writer acquisition cannot succeed while the receiver fence is held.
+    if (req.relational_topology == null) return req.merge_replication == null;
     return req.row_policy_principal_proof.len != 0 or req.row_policy_database.len != 0 or
         req.row_policy_admitted_at_seconds != 0 or req.schema_version != null or
         req.relational_schema_version != null or req.relational_integrity_generation_set != null or
@@ -52777,6 +52780,18 @@ fn implementationTests() type {
                 .catalog_digest = @splat(1),
             };
             try std.testing.expect(needsDenseRepairWritePreflight(.{}));
+            const merge_copy: antfly.db.types.MergeReplicationContext = .{
+                .transition_id = 2,
+                .donor_group_id = 8,
+                .receiver_group_id = 7,
+                .identity_namespace = fence.namespace,
+                .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+            };
+            try std.testing.expect(!needsDenseRepairWritePreflight(.{ .merge_replication = merge_copy }));
+            try std.testing.expect(needsDenseRepairWritePreflight(.{
+                .relational_topology = .{ .action = .begin, .fence = fence },
+                .merge_replication = merge_copy,
+            }));
             inline for (.{ .begin, .stage_child_generation, .activate_child_generation, .acknowledge_child_generation, .cancel_child_generation_source, .install_child_schema }) |action| {
                 try std.testing.expect(!needsDenseRepairWritePreflight(.{ .relational_topology = .{ .action = action, .fence = fence } }));
             }
