@@ -2523,6 +2523,14 @@ pub const Owner = struct {
         return self.refreshImpl(true);
     }
 
+    fn rememberRedoRecoveryCursor(self: *Owner, candidate: native.RedoRecoveryCursor) void {
+        if (self.redo_recovery_cursor) |saved| {
+            if (saved.inode == candidate.inode and
+                saved.checkpoint.commit_sequence > candidate.checkpoint.commit_sequence) return;
+        }
+        self.redo_recovery_cursor = candidate;
+    }
+
     fn refreshImpl(self: *Owner, fast_only: bool) !?*h.Handle {
         wal_trace.recordOp(.serving_runtime_refresh);
         if (comptime h.builtin.is_test) _ = self.test_refresh_count.fetchAdd(1, .release);
@@ -2536,7 +2544,7 @@ pub const Owner = struct {
                 maintenance_references_clear and !needsOutcomeReconciliation(current) and
                 file.adoptionEpoch() == current.lite_refresh_adoption_epoch;
             if (can_reuse and current.lane_pins.load(.acquire) == 0) {
-                if (file.redoRecoveryCursor()) |cursor| self.redo_recovery_cursor = cursor;
+                if (file.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
                 if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |inode| {
                     self.reader_coordinator.observeCurrent(inode, file.headerFingerprint());
                     if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
@@ -2551,8 +2559,11 @@ pub const Owner = struct {
             });
             defer recovered_probe.close();
             const probe = &recovered_probe;
-            self.redo_recovery_cursor = probe.redoRecoveryCursor();
             const probe_inode = (try probe.file.stat(probe.runtime())).inode;
+            if (self.redo_recovery_cursor) |saved| {
+                if (saved.inode != probe_inode) self.redo_recovery_cursor = null;
+            }
+            if (probe.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
             // Establish the fenced tip before opening any new read pins.
             // Existing readers of an unknown peer publication remain poisoned.
             self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());

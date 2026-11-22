@@ -165,6 +165,16 @@ pub const FrontierSlots = struct {
     };
 
     pub fn readLatest(self: FrontierSlots, file: File, io: Io) !?Published {
+        return self.read(file, io, null);
+    }
+
+    /// Find the frontier named by a live publication. The other slot can
+    /// already contain the next group's frontier before that group is visible.
+    pub fn readSequence(self: FrontierSlots, file: File, io: Io, sequence: u64) !?Published {
+        return self.read(file, io, sequence);
+    }
+
+    fn read(self: FrontierSlots, file: File, io: Io, sequence: ?u64) !?Published {
         var latest: ?Published = null;
         var read_error: ?error{InputOutput} = null;
         for (self.offsets, 0..) |offset, page| {
@@ -179,6 +189,7 @@ pub const FrontierSlots = struct {
             for (0..len / Frontier.encoded_len) |copy| {
                 const record = raw[copy * Frontier.encoded_len ..][0..Frontier.encoded_len];
                 const frontier = Frontier.decode(record) orelse continue;
+                if (sequence) |want| if (frontier.sequence != want) continue;
                 if (latest) |prior| {
                     if (frontier.sequence < prior.frontier.sequence) continue;
                     if (frontier.sequence == prior.frontier.sequence) {

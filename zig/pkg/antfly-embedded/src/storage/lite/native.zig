@@ -8675,11 +8675,15 @@ pub const NativeFile = struct {
             // A live publication bounds recovery. Use the matching disk
             // tuple to bind a borrowed cursor to that WAL generation.
             if (persisted_frontier == null and recovery_base != null and live_watermark and
-                !segment_mismatch and replay_ceiling != null)
+                !segment_mismatch and replay_ceiling != null and replay_ceiling == promised_durable)
             {
-                if (try redoFrontierSlots(self.header).readLatest(self.file, io)) |seal| {
+                const matching = redoFrontierSlots(self.header).readSequence(self.file, io, replay_ceiling.?) catch |err| switch (err) {
+                    error.InputOutput => null,
+                    else => return err,
+                };
+                if (matching) |seal| {
                     const tip = seal.frontier;
-                    if (tip.sequence == replay_ceiling.? and tip.sequence > folded_through and
+                    if (tip.sequence > folded_through and
                         tip.end_offset == published_offset and tip.end_offset <= self.header.redo_log_capacity)
                         persisted_frontier = tip;
                 }
@@ -41051,8 +41055,16 @@ test "lite redo serving reopen resumes from a verified cursor" {
     try expectRedoDocument(&next, "one", "first");
     try expectRedoDocument(&next, "two", "second");
 
+    const slots = NativeFile.redoFrontierSlots(writer.header);
+    const live = (try slots.readLatest(writer.file, io)).?;
+    var prepared = live.frontier;
+    prepared.sequence += 1;
+    prepared.end_offset += redo_log.header_len;
+    _ = try slots.writeNext(writer.file, io, live, prepared);
+
     var same = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true, .redo_recovery_base = next.redoRecoveryCursor() });
     defer same.close();
+    try std.testing.expectEqual(live.frontier.sequence, same.committedSequence());
     try std.testing.expectEqual(next.redo.?.writer.tail, test_redo_recovery_start);
     try expectRedoDocument(&same, "two", "second");
 }

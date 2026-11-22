@@ -4305,7 +4305,11 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
-        if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertaintyForRead();
+        if (self.file.checkpoint_publication_uncertain) {
+            waitForStoreSyncAssumeLocked(self);
+            if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            try self.file.reconcilePublicationUncertaintyForRead();
+        }
         return self.file.getCatalogRecordAlloc(a, key);
     }
 
@@ -7628,28 +7632,20 @@ pub const Txn = struct {
             store.read_mutex.lockUncancelable(io);
         }
         defer store.read_mutex.unlock(io);
-        // A prior publish may have left durability unknown. Try to resolve
-        // it in-process (re-reads the on-disk slot the failed publish
-        // targeted; see `NativeFile.reconcilePublicationUncertainty`)
-        // before refusing the read outright -- that call's own
-        // `notifyPublication` keeps `read_outcome_unknown` in sync via the
-        // same `observeReadCheckpoint` callback an ordinary successful
-        // publish already notifies. Only a secret-store uncertainty (no
-        // in-process reconciliation exists for that yet) or a disk that is
-        // still failing falls through to the original refusal.
-        //
-        // `reconcilePublicationUncertainty` must run with `read_mutex`
-        // released: its own success path calls `notifyPublication`, which
-        // invokes this same `Store`'s `observeReadCheckpoint` observer --
-        // and that locks `read_mutex` too. Held across the call, that is an
-        // immediate self-deadlock on this non-reentrant mutex (caught by a
-        // hung regression run; see this file's test of the same name).
         if (store.read_outcome_unknown) {
-            if (store.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             store.read_mutex.unlock(io);
-            const reconciled = store.file.reconcilePublicationUncertaintyForRead();
+            const reconciled = repair: {
+                if (!serialized_admission) lockStore(store);
+                defer if (!serialized_admission) store.mutex.unlock();
+                // Repair can publish and notify read-generation observers.
+                // Serialize it with writers while read_mutex is released.
+                waitForStoreSyncAssumeLocked(store);
+                if (store.secret_store_uncertain) break :repair error.OutcomeReconciliationRequired;
+                break :repair store.file.reconcilePublicationUncertaintyForRead();
+            };
             store.read_mutex.lockUncancelable(io);
             try reconciled;
+            if (store.read_outcome_unknown) return error.OutcomeReconciliationRequired;
         }
         const checkpoint = store.read_generation.?.checkpoint;
         // Nested reads borrow the current writer's publication lease. Taking
@@ -9877,6 +9873,16 @@ fn lockStoreExclusive(store: *Store) void {
     _ = store.exclusive_waiting.fetchAdd(1, .monotonic);
     defer _ = store.exclusive_waiting.fetchSub(1, .monotonic);
     store.mutex.lock();
+    waitForStoreSync(store);
+}
+
+fn waitForStoreSyncAssumeLocked(store: *Store) void {
+    _ = store.exclusive_waiting.fetchAdd(1, .monotonic);
+    defer _ = store.exclusive_waiting.fetchSub(1, .monotonic);
+    waitForStoreSync(store);
+}
+
+fn waitForStoreSync(store: *Store) void {
     while (store.commit_in_sync != 0) {
         const observed_epoch = store.exclusive_wait_epoch.load(.acquire);
         const io = store.file.runtime();
@@ -10698,6 +10704,60 @@ test "lite exclusive waiter parks until the released overlay probe finishes" {
     try std.testing.expect(parked);
     try std.testing.expect(!completed_early);
     try std.testing.expect(completed.load(.acquire));
+}
+
+test "lite redo read repair waits for an in-flight publication" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "native-docstore-read-repair-wait.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .use_redo_log = true });
+    defer store.close();
+    {
+        var read = try store.beginRead();
+        read.abort();
+    }
+
+    const Reader = struct {
+        fn run(owner: *Store, result: *?anyerror) void {
+            var read = owner.beginRead() catch |err| {
+                result.* = err;
+                return;
+            };
+            read.abort();
+        }
+    };
+    var result: ?anyerror = null;
+    var gate: Store.SyncExclusiveGate = .{ .store = &store };
+    store.mutex.lock();
+    store.read_mutex.lockUncancelable(io);
+    store.read_outcome_unknown = true;
+    store.read_mutex.unlock(io);
+    Store.releaseStoreMutexForOverlayProbe(&gate);
+    const thread = std.Thread.spawn(.{}, Reader.run, .{ &store, &result }) catch |err| {
+        Store.reacquireStoreMutexAfterSync(&gate);
+        store.mutex.unlock();
+        return err;
+    };
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s;
+    var parked = false;
+    while (std.Io.Clock.awake.now(io).nanoseconds < deadline) {
+        store.mutex.lock();
+        parked = store.exclusive_parked != 0;
+        store.mutex.unlock();
+        if (parked) break;
+        antfly_platform.time.yieldNow();
+    }
+    Store.reacquireStoreMutexAfterSync(&gate);
+    store.read_mutex.lockUncancelable(io);
+    store.read_outcome_unknown = false;
+    store.read_mutex.unlock(io);
+    store.mutex.unlock();
+    thread.join();
+    try std.testing.expect(parked);
+    if (result) |err| return err;
 }
 
 test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
