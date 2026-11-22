@@ -251,10 +251,7 @@ pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principa
 }
 
 fn removeDirectoryEntry(txn: anytype, alloc: std.mem.Allocator, id: [32]u8, cutoff: ?u64) !void {
-    const raw = txn.get(directory_key) catch |err| switch (err) {
-        error.NotFound => return alloc.alloc(Entry, 0),
-        else => return err,
-    };
+    const raw = try txn.get(directory_key);
     var directory = try std.json.parseFromSlice(Directory, alloc, raw, .{ .allocate = .alloc_always });
     defer directory.deinit();
     if (directory.value.entries.len > max_connections) return error.InvalidSqlConnection;
