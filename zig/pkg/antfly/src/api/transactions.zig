@@ -1730,7 +1730,15 @@ pub const DurableSessionStore = struct {
                     if (!std.mem.eql(u8, key[issuer_end..observation_ack_prefix_len], ":ack:")) break :candidate;
                     _ = std.fmt.hexToBytes(reference[0..8], key[completion_retirement_root.len..issuer_end]) catch break :candidate;
                     _ = std.fmt.hexToBytes(reference[8..], key[observation_ack_prefix_len..]) catch break :candidate;
-                    if (!Outbox.isObservation(reference)) break :candidate;
+                    if (!Outbox.isObservation(reference)) {
+                        // Ordinary sequences sort before tagged observations
+                        // for this producer. Resume directly at the tag.
+                        var position: ObservationAckPosition = .{ .len = observation_ack_prefix_len + 1, .exclusive = false };
+                        @memcpy(position.bytes[0..observation_ack_prefix_len], key[0..observation_ack_prefix_len]);
+                        position.bytes[observation_ack_prefix_len] = '8';
+                        scan.next = position;
+                        return false;
+                    }
                     scan.acks[scan.count] = .{ .key = key[0..][0 .. observation_ack_prefix_len + 16].*, .reference = reference };
                     scan.count += 1;
                 }
@@ -12397,7 +12405,8 @@ test "distributed txn shared acknowledgement sweep reclaims retired observation 
         try write.commit();
     }
     // The old issuer has no local facade. The sweep does not need its outbox.
-    _ = try durable.reclaimLegacyObservationAcks(true);
+    try std.testing.expect(try durable.reclaimLegacyObservationAcks(true));
+    try std.testing.expect(!try durable.reclaimLegacyObservationAcks(true));
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectError(error.NotFound, read.get(old_key));
