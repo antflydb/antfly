@@ -4750,6 +4750,12 @@ pub const Node = struct {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
         try config.request_limits.validate();
+        for (config.generated_extractors) |extractor| {
+            const tokens = std.math.cast(i32, extractor.config.generator.max_tokens) orelse return error.InvalidHostedExtractorTokenBudget;
+            if (tokens <= 0) return error.InvalidHostedExtractorTokenBudget;
+            if (config.request_limits.max_output_tokens_per_item) |limit|
+                if (tokens > limit) return error.InvalidHostedExtractorTokenBudget;
+        }
         if (config.pjrt_extraction_batch_size == 0 or config.pjrt_extraction_batch_size > 8) return error.InvalidPjrtBatch;
         if (config.pjrt_media_bucket_rows > 256) return error.InvalidPjrtBucket;
         try config.cooperative_execution.validate();
@@ -26256,7 +26262,9 @@ pub const Node = struct {
                         self.metrics.incRequest("extract");
                         defer self.metrics.decActive();
                         const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, hostedInferenceControl(execution_control), entry.config) catch |err| switch (err) {
-                            error.InvalidConstrainedOutput, error.ExtractorUpstreamFailed, error.InvalidExtractorUsage => return ctx.status(502).json(.{ .@"error" = @errorName(err) }),
+                            error.InvalidConstrainedOutput, error.ExtractorUpstreamFailed, error.InvalidExtractorUsage, error.ExtractorUpstreamOutputTooLarge => return ctx.status(502).json(.{ .@"error" = @errorName(err) }),
+                            error.ExtractorResponseTooLarge => return ctx.status(500).json(.{ .@"error" = "EXTRACTION_RESPONSE_TOO_LARGE" }),
+                            error.HostedExtractionWorkingLimitExceeded => return ctx.status(500).json(.{ .@"error" = "EXTRACTION_WORKING_LIMIT_EXCEEDED" }),
                             else => return extractionDirectFailureResponse(ctx, err),
                         };
                         defer ctx.allocator.free(output);
@@ -26763,6 +26771,7 @@ pub const Node = struct {
                 try self.control.check();
                 return switch (err) {
                     error.OutOfMemory, error.Timeout, error.Cancelled, error.Canceled => err,
+                    error.ResponseTooLarge => error.ExtractorUpstreamOutputTooLarge,
                     else => error.ExtractorUpstreamFailed,
                 };
             };
@@ -26770,7 +26779,7 @@ pub const Node = struct {
             if (!response.ok()) return error.ExtractorUpstreamFailed;
             const response_bytes = response.body orelse return error.InvalidConstrainedOutput;
             self.hosted_reply_bytes +|= response_bytes.len;
-            if (self.hosted_reply_bytes > hosted_extraction_result_bytes) return error.GeneratedExtractionLimitExceeded;
+            if (self.hosted_reply_bytes > hosted_extraction_result_bytes) return error.ExtractorUpstreamOutputTooLarge;
             const Wire = struct {
                 choices: []const struct { finish_reason: []const u8, message: struct {
                     content: ?[]const u8 = null,
@@ -26886,7 +26895,7 @@ pub const Node = struct {
     fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config) ![]u8 {
         var quota: httpx.QuotaAllocator = .{ .backing = allocator, .limit = hosted_extraction_working_bytes };
         return self.generatedExtractionBounded(allocator, envelope, control, registered, if (registered != null) &quota else null) catch |err| {
-            if (err == error.OutOfMemory and quota.exceeded) return error.GeneratedExtractionLimitExceeded;
+            if (err == error.OutOfMemory and quota.exceeded) return error.HostedExtractionWorkingLimitExceeded;
             return err;
         };
     }
@@ -26965,6 +26974,7 @@ pub const Node = struct {
         const text_control: @import("antfly_extracting").text_processing.Checkpoint = .{ .ptr = &backend, .check_fn = StructuredGeneration.textCheck };
         const planned = extractor.planWithLimit(a, config, texts, text_control, if (registered != null) hosted_extraction_max_windows else null) catch |err| {
             if (registered == null) return err;
+            if (err == error.OutOfMemory and quota.?.exceeded) return error.GeneratedExtractionLimitExceeded;
             return switch (err) {
                 error.BoundaryTextLimitExceeded,
                 error.InvalidLongDocumentLimits,
@@ -26982,7 +26992,7 @@ pub const Node = struct {
         const response = try extractor.responseValueWithUsage(a, if (registered != null) envelope.object.get("model").?.string else config.generator.model, inputs.array.items, values, if (backend.hosted_usage_complete) generated else null);
         if (registered == null) return std.json.Stringify.valueAlloc(allocator, response, .{});
         const rendered = try std.json.Stringify.valueAlloc(a, response, .{});
-        if (rendered.len > hosted_extraction_result_bytes) return error.GeneratedExtractionLimitExceeded;
+        if (rendered.len > hosted_extraction_result_bytes) return error.ExtractorResponseTooLarge;
         return allocator.dupe(u8, rendered);
     }
 
@@ -49489,15 +49499,15 @@ test "named hosted extractor validates upstream output and advertises its capabi
             try std.testing.expectEqualStrings("json_schema", object.get("response_format").?.object.get("type").?.string);
         }
         fn serve(upstream: *httpx.TestServer) void {
-            for (0..8) |_| upstream.handleOne() catch return;
+            for (0..9) |_| upstream.handleOne() catch return;
         }
     };
     const valid = "{\"items\":[{\"item\":0,\"value\":{\"entities\":[{\"label\":\"invoice_number\",\"text\":\"12345\",\"present\":true}],\"relations\":[]}}]}";
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var routes: [8]httpx.testing_mod.Route = undefined;
-    for (&routes, [8][]const u8{ "stop", "stop", "length", "stop", "stop", "stop", "stop", "stop" }, [8][]const u8{ valid, "malformed", valid, valid, valid, valid, valid, valid }, 0..) |*route, finish, content, index| {
+    var routes: [9]httpx.testing_mod.Route = undefined;
+    for (routes[0..8], [8][]const u8{ "stop", "stop", "length", "stop", "stop", "stop", "stop", "stop" }, [8][]const u8{ valid, "malformed", valid, valid, valid, valid, valid, valid }, 0..) |*route, finish, content, index| {
         const message = .{
             .content = if (index == 5) try std.mem.replaceOwned(u8, scratch, content, "\"item\":0", "\"item\":1") else content,
             .refusal = if (index == 6) @as(?[]const u8, "declined") else null,
@@ -49511,6 +49521,15 @@ test "named hosted extractor validates upstream output and advertises its capabi
             .respond = .{ .body = try std.json.Stringify.valueAlloc(scratch, .{ .choices = .{.{ .finish_reason = finish, .message = message }}, .usage = if (index == 5) null else @as(?struct { prompt_tokens: u64, completion_tokens: u64 }, .{ .prompt_tokens = if (index == 3) std.math.maxInt(u64) else 10, .completion_tokens = 10 }) }, .{ .emit_null_optional_fields = false }) },
         };
     }
+    const oversized_reply = try scratch.alloc(u8, 1024 * 1024 + 1);
+    @memset(oversized_reply, ' ');
+    routes[8] = .{
+        .method = .POST,
+        .path = "/v1/chat/completions",
+        .max_uses = 1,
+        .assert_request = Fixture.inspect,
+        .respond = .{ .body = oversized_reply },
+    };
     var upstream = try httpx.TestServer.start(a, io, &routes);
     defer upstream.deinit();
     upstream.max_request_bytes = 64 * 1024;
@@ -49522,6 +49541,13 @@ test "named hosted extractor validates upstream output and advertises its capabi
         \\{{"method":"generated","generator":{{"provider":"openai","model":"local-extractor","api_url":"{s}/v1","max_tokens":256}},"schema":{{"entities":["invoice_number"]}},"probabilities":"verdict_only","batch":{{"max_items_per_call":1}}}}
     , .{upstream.baseUrl()});
     const entry = try NamedGeneratedExtractor.parse(scratch, "invoice", try std.json.parseFromSliceLeaky(std.json.Value, scratch, config, .{}));
+    try std.testing.expectError(error.InvalidHostedExtractorTokenBudget, Node.init(a, .{
+        .generated_extractors = &.{entry},
+        .request_limits = .{ .max_output_tokens_per_item = 128 },
+    }));
+    var oversized = entry;
+    oversized.config.generator.max_tokens = @as(i64, std.math.maxInt(i32)) + 1;
+    try std.testing.expectError(error.InvalidHostedExtractorTokenBudget, Node.init(a, .{ .generated_extractors = &.{oversized} }));
     var node = try Node.init(a, .{
         .generated_extractors = &.{entry},
         .max_work_units = 32,
@@ -49537,7 +49563,7 @@ test "named hosted extractor validates upstream output and advertises its capabi
     const reader_info = listings.value.object.get("readers").?.object.get("readers/ocr").?.object;
     try std.testing.expectEqualStrings("image", reader_info.get("inputs").?.array.items[0].string);
 
-    for ([_]u16{ 503, 200, 502, 502, 502, 400, 200, 502, 502 }, 0..) |status, index| {
+    for ([_]u16{ 503, 200, 502, 502, 502, 400, 200, 502, 502, 502 }, 0..) |status, index| {
         const capacity = node.inference_admission.capacity;
         if (index == 0) try node.reserveAdmissionUnits(capacity);
         defer if (index == 0) node.releaseSlotUnits(capacity);
@@ -49554,6 +49580,11 @@ test "named hosted extractor validates upstream output and advertises its capabi
         var response = try node.extractJSON(&ctx);
         defer response.deinit();
         try std.testing.expectEqual(status, response.status.code);
+        if (index == 9) {
+            var rejected = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer rejected.deinit();
+            try std.testing.expectEqualStrings("ExtractorUpstreamOutputTooLarge", rejected.value.object.get("error").?.string);
+        }
         if (status == 200) {
             var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
             defer parsed.deinit();

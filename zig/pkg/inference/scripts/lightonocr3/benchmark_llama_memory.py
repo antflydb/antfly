@@ -22,6 +22,8 @@ import base64
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
+from html.parser import HTMLParser
+from itertools import groupby
 import json
 import os
 from pathlib import Path
@@ -195,6 +197,64 @@ def request_case(url, case, alias, prompt=""):
     }
 
 
+class HtmlTables(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self.rows = None
+        self.row = None
+        self.cell = None
+        self.spanned = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self.rows, self.row, self.cell = [], None, None
+            self.spanned = False
+        elif self.rows is not None and tag == "tr":
+            self.row, self.cell = [], None
+        elif self.row is not None and tag in ("th", "td"):
+            self.cell = []
+            self.spanned |= any(
+                key in ("colspan", "rowspan") and value != "1" for key, value in attrs
+            )
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ("th", "td") and self.cell is not None:
+            self.row.append(normalize("".join(self.cell)))
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            self.rows.append(self.row)
+            self.row, self.cell = None, None
+        elif tag == "table" and self.rows is not None:
+            if not self.spanned:
+                self.tables.append(self.rows)
+            self.rows, self.row, self.cell = None, None, None
+
+
+def parsed_tables(text):
+    parser = HtmlTables()
+    parser.feed(text)
+    parser.close()
+    for is_table, block in groupby(text.splitlines(), key=lambda line: "|" in line):
+        if not is_table:
+            continue
+        rows = [
+            [normalize(cell) for cell in line.strip().strip("|").split("|")]
+            for line in block
+        ]
+        if (
+            len(rows) >= 2
+            and len(rows[0]) == len(rows[1])
+            and all(re.fullmatch(r":?-{3,}:?", cell) for cell in rows[1])
+        ):
+            parser.tables.append([rows[0], *rows[2:]])
+    return parser.tables
+
+
 def score_case(row, case):
     if "text" not in row:
         return
@@ -212,14 +272,13 @@ def score_case(row, case):
     if table_rows:
         content = re.sub(r"(?m)^\s*\|?[ :|\-]+\|?\s*$", "", content).replace("|", " ")
     plain = plain_text(content)
-    normalized = " " + normalize(plain) + " "
-    missing_rows = [
-        entry for entry in table_rows if " " + normalize(entry) + " " not in normalized
-    ]
+    tables = parsed_tables(transcript) if table_rows else []
+    expected_cells = [[normalize(cell) for cell in row] for row in table_rows]
+    table_matches = not table_rows or expected_cells in tables
     row.update(
         exact=normalize(expected) == normalize(transcript),
         cer=cer(expected, plain),
-        missing_table_rows=missing_rows,
+        table_matches=table_matches,
         missing=[term for term in case["required"] if term not in transcript],
         has_table_markup="<table" in text.lower()
         or bool(re.search(r"(?m)^\s*\|.+\|\s*$", text)),
@@ -234,7 +293,7 @@ def quality_passes(row):
         row.get("finish") == "stop"
         and row.get("cer", float("inf")) <= 0.05
         and not row.get("missing")
-        and not row.get("missing_table_rows")
+        and row.get("table_matches", True)
     )
 
 
@@ -247,6 +306,35 @@ def grounding_quality_passes(row, case):
 
 
 def run_profile(args, cases, grounding_case, size, profile, parallel):
+    try:
+        return measure_profile(args, cases, grounding_case, size, profile, parallel)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {
+            "qualified": False,
+            "model": size,
+            "profile": asdict(profile),
+            "parallel": parallel,
+            "completed_pages": 0,
+            "quality_pages": 0,
+            "requests": 0,
+            "artifact_bytes": None,
+            "peak_rss_bytes": None,
+            "peak_physical_footprint_bytes": None,
+            "sampled_peak_bytes_by_phase": {},
+            "warm_idle": None,
+            "seconds": None,
+            "pages_per_second": None,
+            "p50_seconds": None,
+            "mean_cer": None,
+            "backend_buffer_report": [],
+            "grounding": None,
+            "startup_error_log": None,
+            "error": str(error),
+            "results": [],
+        }
+
+
+def measure_profile(args, cases, grounding_case, size, profile, parallel):
     model = args.models_dir / f"LightOnOCR-3-{size}-{profile.precision}.gguf"
     projector = args.models_dir / f"mmproj-LightOnOCR-3-{size}-{profile.vision}.gguf"
     if not model.is_file() or not projector.is_file():
@@ -436,6 +524,16 @@ def main():
     if not cases:
         parser.error("The corpus must contain at least one case")
     for case in cases:
+        table_rows = case.get("expected_table_rows", [])
+        if not isinstance(table_rows, list) or any(
+            not isinstance(row, list)
+            or not row
+            or not all(isinstance(cell, str) for cell in row)
+            for row in table_rows
+        ):
+            parser.error(
+                "expected_table_rows must contain cell lists; regenerate older dense fixtures"
+            )
         image = (args.cases.parent / case["image"]).read_bytes()
         case["uri"] = "data:image/png;base64," + base64.b64encode(image).decode()
     grounding_case = None

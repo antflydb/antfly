@@ -19,7 +19,9 @@ Only model computation is synthetic, so these tests need no GPU or downloads.
 Every wait is bounded; cleanup owns the complete fixture process group.
 """
 
+import base64
 import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import signal
@@ -28,6 +30,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -36,7 +39,7 @@ FIXTURE = os.path.abspath(sys.argv.pop(1))
 
 
 class CancellationE2E(unittest.TestCase):
-    def start(self, mode):
+    def start(self, mode, extra_env=None):
         temp = tempfile.TemporaryDirectory(prefix="inference-cancellation-")
         self.addCleanup(temp.cleanup)
         model = Path(temp.name).resolve() / "fixture-model"
@@ -84,6 +87,7 @@ class CancellationE2E(unittest.TestCase):
         env.update(
             FIXTURE_MODEL_DIR=str(model), FIXTURE_PORT=str(self.port), FIXTURE_MODE=mode
         )
+        env.update(extra_env or {})
         # addCleanup closes the log after terminating the process group.
         self.log = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
         self.addCleanup(self.log.close)
@@ -278,6 +282,72 @@ class CancellationE2E(unittest.TestCase):
             self.assertEqual(self.embed(), expected)
         else:
             self.assertEqual(self.request("POST", path, {}), (200, expected))
+
+    def test_hosted_ocr_terminal_page_cancels_blocked_sibling(self):
+        files = Path(__file__).resolve().parent.parent
+        corpus = files / "scripts/lightonocr3/corpus"
+        paths = [
+            files / "src/models/testdata/lightonocr3/invoice.png",
+            corpus / "receipt.png",
+            corpus / "shipping.png",
+        ]
+        uris = [
+            "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode()
+            for path in paths
+        ]
+        blocked = threading.Event()
+        release = threading.Event()
+        unexpected = threading.Event()
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                uri = request["messages"][0]["content"][0]["image_url"]["url"]
+                if uri == uris[1]:
+                    blocked.set()
+                    release.wait(15)
+                    return
+                if uri == uris[0] and blocked.wait(5):
+                    self.send_error(503)
+                    return
+                unexpected.set()
+                self.send_error(500)
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(upstream.shutdown)
+        self.addCleanup(release.set)
+        self.start(
+            "hosted_ocr",
+            {"FIXTURE_OCR_ENDPOINT": f"http://127.0.0.1:{upstream.server_port}/v1"},
+        )
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=8)
+        self.addCleanup(connection.close)
+        connection.request(
+            "POST",
+            "/ai/v1/read",
+            json.dumps(
+                {
+                    "model": "readers/fixture",
+                    "images": [{"url": uri} for uri in uris],
+                }
+            ),
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 502)
+        self.assertEqual(json.loads(response.read())["error"], "READER_UPSTREAM_FAILED")
+        self.assertTrue(blocked.is_set())
+        self.assertFalse(release.is_set())
+        self.assertFalse(unexpected.is_set())
 
     def test_rerank_disconnect_stops_at_batch_boundary_without_worker_restart(self):
         self.exercise_bounded_call("bounded_rerank", "/ai/v1/rerank")

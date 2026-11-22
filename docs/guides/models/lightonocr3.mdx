@@ -227,9 +227,10 @@ whole-process peaks, completed pages per second, latency, and OCR checks.
 Process startup is cold within each run. The system file cache is shared across
 runs. The synthetic pages cover small print and tables, with a separate
 grounding probe. They do not establish broad OCR accuracy. The harness retains
-reports for incomplete profiles and exits with a nonzero status when a page or
+reports for incomplete profiles, including setup failures, and exits with a nonzero status when a page or
 layout probe fails qualification. A qualifying page needs at most 5% character
-error and all required text and table rows. The receipt layout probe requires
+error and all required text. The dense fixture also requires matching rows and
+cells in an HTML or Markdown table. The receipt layout probe requires
 at least three distinct, valid boxes.
 
 

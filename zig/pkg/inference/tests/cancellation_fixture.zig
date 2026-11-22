@@ -170,11 +170,22 @@ pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
     const model_dir = init.environ_map.get("FIXTURE_MODEL_DIR") orelse return error.MissingModelDir;
     const port = try std.fmt.parseInt(u16, init.environ_map.get("FIXTURE_PORT") orelse return error.MissingPort, 10);
+    const hosted_readers: []const inference.server.NamedImageReader = if (init.environ_map.get("FIXTURE_OCR_ENDPOINT")) |endpoint|
+        &[1]inference.server.NamedImageReader{.{ .name = "fixture", .config = .{
+            .provider = .openai,
+            .base_url = endpoint,
+            .model = "fixture-ocr",
+            .prompt = "",
+            .hosted_parallelism = 2,
+        } }}
+    else
+        &[_]inference.server.NamedImageReader{};
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = std.fs.path.dirname(model_dir) orelse return error.MissingModelsRoot,
         .allow_unknown_models = true,
         .process_termination_available = true,
         .max_concurrent_requests = 1,
+        .image_readers = hosted_readers,
     });
     defer node.deinit();
     try node.attachIo(init.io);
@@ -210,7 +221,8 @@ pub fn main(init: std.process.Init) !void {
             },
         },
         .session_manager = &node.session_manager,
-        .model_manager = &node.model_manager,
+        .host = node.model_manager.loadedRuntimeHost(),
+        .executor_io = init.io,
         .prompt_prefix_cache = inference.runtime.kv.prompt_cache.PromptPrefixCache.init(alloc),
         .native_generation_graph_cache = inference.graph.cache.GraphCache.init(alloc),
         .pinned = true,

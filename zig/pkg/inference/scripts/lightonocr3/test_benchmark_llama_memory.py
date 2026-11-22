@@ -15,9 +15,18 @@
 
 """Quality gates for the llama.cpp OCR memory benchmark."""
 
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from benchmark_llama_memory import grounding_quality_passes, quality_passes, score_case
+from benchmark_llama_memory import (
+    Profile,
+    grounding_quality_passes,
+    quality_passes,
+    run_profile,
+    score_case,
+)
 
 
 class QualificationTest(unittest.TestCase):
@@ -33,12 +42,12 @@ class QualificationTest(unittest.TestCase):
 
     def test_changing_one_table_row_fails_even_at_low_cer(self):
         rows = [
-            "Item Reference Quantity",
-            "Replacement part SKU-1201 2",
-            "Replacement part SKU-1202 3",
+            ["Item", "Reference", "Quantity"],
+            ["Replacement part", "SKU-1201", "2"],
+            ["Replacement part", "SKU-1202", "3"],
         ]
         case = {
-            "expected": "\n".join(rows),
+            "expected": "\n".join(" ".join(row) for row in rows),
             "required": ["SKU-1201", "SKU-1202"],
             "expected_table_rows": rows,
         }
@@ -46,11 +55,41 @@ class QualificationTest(unittest.TestCase):
         row = {"finish": "stop", "text": table}
         score_case(row, case)
         self.assertTrue(quality_passes(row))
+        row["text"] = case["expected"]
+        score_case(row, case)
+        self.assertEqual(row["cer"], 0)
+        self.assertFalse(quality_passes(row))
+        row["text"] = table.replace(
+            "<td>2</td></tr><tr><td>Replacement part</td>",
+            "</tr><tr><td>2</td><td>Replacement part</td>",
+        )
+        score_case(row, case)
+        self.assertEqual(row["cer"], 0)
+        self.assertFalse(quality_passes(row))
+        row["text"] = (
+            "| Item | Reference | Quantity |\n| --- | --- | --- |\n| Replacement part | SKU-1201 | 2 |\n| Replacement part | SKU-1202 | 3 |"
+        )
+        score_case(row, case)
+        self.assertTrue(quality_passes(row))
         row["text"] = table.replace(">3<", ">8<")
         score_case(row, case)
         self.assertLess(row["cer"], 0.05)
         self.assertEqual(row["missing"], [])
         self.assertFalse(quality_passes(row))
+
+    def test_setup_failure_records_a_result_row(self):
+        profile = Profile("bf16")
+        args = SimpleNamespace(models_dir=Path("."))
+        for failure in (FileNotFoundError("weights"), OSError("address in use")):
+            with (
+                self.subTest(failure=failure),
+                patch("benchmark_llama_memory.measure_profile", side_effect=failure),
+            ):
+                row = run_profile(args, [], None, "0.8B", profile, 4)
+            self.assertFalse(row["qualified"])
+            self.assertEqual(row["error"], str(failure))
+            self.assertEqual(row["results"], [])
+            self.assertEqual(row["parallel"], 4)
 
     def test_layout_requires_distinct_boxes_at_fixture_coverage(self):
         case = {
