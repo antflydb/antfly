@@ -77,18 +77,128 @@ pub const Next = struct {
     images: []const Images,
 };
 
+const LookupKey = @import("lake_sql_cursor.zig").LookupKey;
+
+const IndexedGroup = struct {
+    committed: ingestion.CommittedWalGroup,
+    first_keys: []const ?LookupKey,
+
+    fn init(a: A, group: ingestion.CommittedWalGroup, context: Context) !IndexedGroup {
+        const batch = group.group.batch;
+        const first = try a.alloc(?LookupKey, batch.changes.len);
+        var seen: std.StringHashMap(void) = .init(a);
+        defer seen.deinit();
+        for (batch.changes, first) |change, *entry| {
+            try context.ensureActive();
+            const identity = try ingestion.rowId(a, batch.key_fields, change.row);
+            if ((try seen.getOrPut(identity)).found_existing) {
+                a.free(identity);
+                entry.* = null;
+            } else {
+                entry.* = .{ .identity = identity, .row = change.row };
+            }
+        }
+        return .{ .committed = group, .first_keys = first };
+    }
+};
+
+/// Cache immutable committed WAL and its first-occurrence index. Re-read the
+/// authoritative catalog on every request to qualify the interval and lineage.
+pub const GroupCache = struct {
+    const Owner = struct {
+        identity: control.Digest,
+        refs: std.atomic.Value(usize) = .init(1),
+        arena: std.heap.ArenaAllocator,
+        group: IndexedGroup,
+        used: u64 = 0,
+
+        fn release(self: *Owner) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            self.arena.deinit();
+            std.heap.smp_allocator.destroy(self);
+        }
+    };
+
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: [4]?*Owner = @splat(null),
+    tick: u64 = 0,
+
+    pub fn deinit(self: *GroupCache) void {
+        for (&self.entries) |*entry| if (entry.*) |owner| {
+            owner.release();
+            entry.* = null;
+        };
+    }
+
+    fn lookupLocked(self: *GroupCache, identity: control.Digest) ?*Owner {
+        for (self.entries) |entry| if (entry) |owner| {
+            if (!std.mem.eql(u8, &owner.identity, &identity)) continue;
+            self.tick +%= 1;
+            owner.used = self.tick;
+            _ = owner.refs.fetchAdd(1, .monotonic);
+            return owner;
+        };
+        return null;
+    }
+
+    fn acquire(self: *GroupCache, identity: control.Digest, binding: local.serverless_external_source_catalog_binding.Binding, options: Options, catalog_context: local.serverless_external_source_mod.lake_catalog.types.Context, metadata: CatalogTable, snapshot: i64, context: Context) !*Owner {
+        const sync = @import("antfly_platform").sync;
+        sync.lockYielding(&self.mutex);
+        const cached = self.lookupLocked(identity);
+        self.mutex.unlock();
+        if (cached) |owner| return owner;
+
+        const heap = std.heap.smp_allocator;
+        const owner = try heap.create(Owner);
+        errdefer heap.destroy(owner);
+        var arena = std.heap.ArenaAllocator.init(heap);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const committed = try ingestion.readCommittedWalGroup(a, binding, options, catalog_context, metadata, snapshot);
+        owner.* = .{ .identity = identity, .group = try IndexedGroup.init(a, committed, context), .arena = arena };
+        if (arena.queryCapacity() > 32 * 1024 * 1024) return owner;
+
+        sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.lookupLocked(identity)) |winner| {
+            owner.release();
+            return winner;
+        }
+        var target: ?usize = null;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (self.entries, 0..) |entry, index| {
+            const existing = entry orelse {
+                target = index;
+                break;
+            };
+            if (existing.refs.load(.acquire) != 1 or existing.used > oldest) continue;
+            oldest = existing.used;
+            target = index;
+        }
+        if (target) |index| {
+            if (self.entries[index]) |retired| retired.release();
+            self.entries[index] = owner;
+            self.tick +%= 1;
+            owner.used = self.tick;
+            _ = owner.refs.fetchAdd(1, .monotonic);
+        }
+        return owner;
+    }
+};
+
 /// Resolve one logical commit from a durable position. The schema resolver
 /// supplies the relation view for each physical snapshot selected by the
 /// catalog. The returned position is suitable for acknowledgment after the
 /// whole transaction is delivered.
 const CommittedGroup = struct {
     position: ingestion.CommittedWalPosition,
-    committed: ingestion.CommittedWalGroup,
+    indexed: IndexedGroup,
+    cached: ?*GroupCache.Owner,
     before_table: ?Table,
     after_table: Table,
 };
 
-fn loadNext(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: Options, metadata: CatalogTable, after: ingestion.CommittedWalPosition, schemas: anytype, context: Context) !?CommittedGroup {
+fn loadNext(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: Options, metadata: CatalogTable, after: ingestion.CommittedWalPosition, schemas: anytype, context: Context, cache: ?*GroupCache, table_binding: control.Digest) !?CommittedGroup {
     const interval = (try ingestion.nextCommittedWalInterval(a, metadata, after)) orelse return null;
     const normalized = try context.platformDeadline();
     const catalog_context: local.serverless_external_source_mod.lake_catalog.types.Context = .{
@@ -96,22 +206,33 @@ fn loadNext(a: A, binding: local.serverless_external_source_catalog_binding.Bind
         .deadline_ns = normalized.deadline_ns,
         .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn),
     };
-    const committed = try ingestion.readCommittedWalGroup(a, binding, options, catalog_context, metadata, interval.snapshot);
+    const cached = if (cache) |owner| try owner.acquire(
+        control.hash(.{ .domain = "antfly:committed-iceberg-group:v1", .binding = table_binding, .uuid = after.table_uuid, .interval = interval }),
+        binding,
+        options,
+        catalog_context,
+        metadata,
+        interval.snapshot,
+        context,
+    ) else null;
+    errdefer if (cached) |owner| owner.release();
+    const indexed = if (cached) |owner| owner.group else try IndexedGroup.init(a, try ingestion.readCommittedWalGroup(a, binding, options, catalog_context, metadata, interval.snapshot), context);
     const before_table = if (interval.parent) |parent| try schemas.tableAt(a, parent, metadata, context) else null;
     const after_table = try schemas.tableAt(a, interval.snapshot, metadata, context);
     return .{
         .position = .{ .table_uuid = try a.dupe(u8, after.table_uuid), .snapshot = interval.snapshot, .through = interval.through },
-        .committed = committed,
+        .indexed = indexed,
+        .cached = cached,
         .before_table = before_table,
         .after_table = after_table,
     };
 }
 
 pub fn readNext(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: Options, metadata: CatalogTable, after: ingestion.CommittedWalPosition, schemas: anytype, context: Context) !?Next {
-    const next = (try loadNext(a, binding, options, metadata, after, schemas, context)) orelse return null;
+    const next = (try loadNext(a, binding, options, metadata, after, schemas, context, null, @splat(0))) orelse return null;
     return .{
         .position = next.position,
-        .images = try read(a, next.committed, metadata, next.before_table, next.after_table, context, options),
+        .images = try read(a, next.indexed.committed, metadata, next.before_table, next.after_table, context, options),
     };
 }
 
@@ -317,6 +438,7 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
         schemas: Schemas,
         policy: *Policy,
         provider_context_override: ?[]const u8 = null,
+        group_cache: ?*GroupCache = null,
         const Self = @This();
 
         pub fn authorize(self: *Self, state: control.State, request: Context) !void {
@@ -418,7 +540,7 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
         /// has seen a visible event. Only keys in this bounded window open
         /// snapshot cursors. Earlier ordinals are used for deduplication only.
         fn boundedPage(self: *Self, a: A, state: control.State, selector: control.Table, next: CommittedGroup, start: control.Position, bound: ?control.Position, limits: delivery.Limits, request: Context) !Page {
-            const batch = next.committed.group.batch;
+            const batch = next.indexed.committed.group.batch;
             const from = start.event / 2;
             const stop = if (bound) |target|
                 if (target.sequence == start.sequence) target.event / 2 else batch.changes.len
@@ -434,28 +556,19 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
             const table_id = try std.fmt.allocPrint(scratch, "{d}", .{selector.table_id});
             const mode: projection.Projection = if (state.definition.?.projection == .rows) .rows else .keys_and_versions;
             const overhead = try wire_json.size(native.Envelope{ .events = &.{}, .transaction = .{ .transaction_id = transaction_id, .complete = false } });
-            var seen: std.StringHashMap(void) = .init(scratch);
-            for (batch.changes[0..from]) |change| {
-                try request.ensureActive();
-                try seen.put(try ingestion.rowId(scratch, batch.key_fields, change.row), {});
-            }
-
             const cursor = @import("lake_sql_cursor.zig");
             const indexes = try scratch.alloc(?usize, stop - from);
-            @memset(indexes, null);
             var keys: std.ArrayList(cursor.LookupKey) = .empty;
-            for (batch.changes[from..stop], indexes) |change, *index| {
+            for (next.indexed.first_keys[from..stop], indexes) |entry, *index| {
                 try request.ensureActive();
-                const identity = try ingestion.rowId(scratch, batch.key_fields, change.row);
-                if ((try seen.getOrPut(identity)).found_existing) continue;
-                index.* = keys.items.len;
-                try keys.append(scratch, .{ .identity = identity, .row = change.row });
+                index.* = if (entry != null) keys.items.len else null;
+                if (entry) |key| try keys.append(scratch, key);
             }
-            const prior_images = if (next.committed.interval.parent) |parent|
+            const prior_images = if (next.indexed.committed.interval.parent) |parent|
                 try cursor.lookupSnapshotRows(scratch, next.before_table.?, parent, self.metadata, batch.key_fields, keys.items, request, self.options)
             else
                 null;
-            const committed_images = try cursor.lookupSnapshotRows(scratch, next.after_table, next.committed.interval.snapshot, self.metadata, batch.key_fields, keys.items, request, self.options);
+            const committed_images = try cursor.lookupSnapshotRows(scratch, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, keys.items, request, self.options);
 
             var events: std.ArrayList(wire_json.Raw) = .empty;
             var occupied = overhead;
@@ -470,14 +583,14 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 const row_alloc = row_arena.allocator();
                 const before = if (prior_images) |images|
                     images[index]
-                else if (next.committed.interval.parent) |parent|
+                else if (next.indexed.committed.interval.parent) |parent|
                     try lookup(row_alloc, next.before_table.?, parent, self.metadata, batch.key_fields, key.row, request, self.options)
                 else
                     null;
                 const after = if (committed_images) |images|
                     images[index]
                 else
-                    try lookup(row_alloc, next.after_table, next.committed.interval.snapshot, self.metadata, batch.key_fields, key.row, request, self.options);
+                    try lookup(row_alloc, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, key.row, request, self.options);
                 const authorized = try self.policy.imagesFor(row_alloc, selector.table_id, identity, before, after, request);
                 const effect = (try projection.project(row_alloc, selector, mode, authorized.before, authorized.after)) orelse continue;
                 const event: native.Event = .{
@@ -554,16 +667,17 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 if (receipt.advances.len != 1 or !std.mem.eql(u8, &receipt.advances[0].namespace, &self.namespace) or receipt.advances[0].snapshot != null) return error.ChangefeedResynchronizationRequired;
                 break :blk receipt.advances[0].position;
             } else null;
-            const next = (try loadNext(a, self.binding, self.options, self.metadata, position, self.schemas, request)) orelse {
+            const next = (try loadNext(a, self.binding, self.options, self.metadata, position, self.schemas, request, self.group_cache, selector.binding)) orelse {
                 if (original != null or start.event != 0) return error.ChangefeedResynchronizationRequired;
                 return heartbeat(a, feed, before, saved);
             };
+            defer if (next.cached) |cached| cached.release();
             try limits.validate();
             const encoded = if (decoded.version >= 3)
                 try self.boundedPage(a, state, selector, next, start, target, limits, request)
             else legacy: {
                 const mode: projection.Projection = if (definition.projection == .rows) .rows else .keys_and_versions;
-                const images = try read(a, next.committed, self.metadata, next.before_table, next.after_table, request, self.options);
+                const images = try read(a, next.indexed.committed, self.metadata, next.before_table, next.after_table, request, self.options);
                 const effects = try project(a, selector, mode, images, self.policy, request);
                 const end = if (target) |bound| if (bound.sequence == start.sequence) bound.event else std.math.cast(u32, effects.len) orelse return error.ChangefeedBackpressure else null;
                 break :legacy try encodePage(a, feed, table_id, next.position, effects, start.event, end, limits);

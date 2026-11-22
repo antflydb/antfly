@@ -15981,8 +15981,9 @@ pub const RaftApplyStore = struct {
         const authority = if (try stagingGet(txn, authority_key)) |raw| try changefeed_control.parseAuthority(a, raw) else null;
         if (authority) |current| if (!std.mem.eql(u8, &current.incarnation, &write.authority)) return;
         const sequence = if (authority) |current| std.math.add(u64, current.sequence, 1) catch return error.ChangefeedCorrupt else 1;
-        if (write.mutation == .retire_absent_slot_root) {
-            const table_id = std.mem.readInt(u64, write.mutation.retire_absent_slot_root[0..8], .big);
+        if (write.mutation == .retire_absent_slot_root or write.mutation == .retire_absent_public_root) {
+            const namespace = if (write.mutation == .retire_absent_slot_root) write.mutation.retire_absent_slot_root else write.mutation.retire_absent_public_root;
+            const table_id = std.mem.readInt(u64, namespace[0..8], .big);
             if (try stagingGet(txn, try tableKeyForGroup(&buffer, group_id, table_id)) != null) return;
         }
         const next = write.apply(a, before, sequence) catch |err| switch (err) {

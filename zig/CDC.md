@@ -416,6 +416,10 @@ ingress. Configure the same artifact store on metadata and serving nodes.
 Each writable Iceberg table owns one PostgreSQL source cut and checkpoint. A retry uses the
 same source epoch, transaction identity, and checkpoint. Unsupported mutation
 messages, including inbound TRUNCATE, stop progress before the checkpoint.
+Use Iceberg equality columns covered by PostgreSQL replica identity. Use
+`REPLICA IDENTITY FULL` when the destination key includes other columns or the
+table can emit unchanged TOAST values that Iceberg must reconstruct. Configure
+replica identity before capturing the baseline.
 
 An Iceberg bootstrap records its staged checkpoint under the source ordinal
 and cutover authority before uploading pages. When a replacement cutover
@@ -442,6 +446,8 @@ plan after interruptions and acknowledges PostgreSQL through the committed
 frontier. Managed native streams use the compatibility writer until their
 source is handed over to scoped admission. An interruption between a
 compatibility write and its source checkpoint can replay that write.
+Use idempotent transforms on a compatibility stream. A non-idempotent transform
+requires the fenced native admission path before relying on crash recovery.
 Writable Iceberg reports its ingress and catalog commit capability. External
 read-only Iceberg attachments report committed snapshots as their change
 authority. Index publication is a separate milestone across these contracts.

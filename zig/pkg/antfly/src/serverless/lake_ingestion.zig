@@ -121,16 +121,26 @@ pub fn postgresBatch(a: A, source: []const u8, epoch: []const u8, previous: ?[]c
     var changes: std.ArrayList(Batch.Change) = .empty;
     for (transaction) |change| {
         if (!std.mem.eql(u8, checkpoint, change.checkpoint)) return error.InvalidReplicationCheckpoint;
-        const row = change.row orelse return error.InvalidReplicationSourceRow;
+        var row = change.row orelse return error.InvalidReplicationSourceRow;
         switch (change.op) {
             .delete => try changes.append(a, .{ .op = .delete, .row = try keyImage(a, keys, row) }),
             .insert, .update => {
-                if (!change.row_complete) return error.ReplicationProjectionIncomplete;
+                if (!change.row_complete) {
+                    const before = change.before orelse return error.ReplicationProjectionIncomplete;
+                    if (change.op != .update or !change.before_complete or before != .object or row != .object)
+                        return error.ReplicationProjectionIncomplete;
+                    var complete = try before.object.clone(a);
+                    var fields = row.object.iterator();
+                    while (fields.next()) |field| try complete.put(a, field.key_ptr.*, field.value_ptr.*);
+                    row = .{ .object = complete };
+                }
                 if (change.op == .update) {
                     // A missing before image cannot prove that a separately
                     // configured Iceberg equality key stayed the same.
                     const before = change.before orelse return error.ReplicationProjectionIncomplete;
-                    try changes.append(a, .{ .op = .delete, .row = try keyImage(a, keys, before) });
+                    const old_key = try keyImage(a, keys, before);
+                    if (!std.mem.eql(u8, try rowId(a, keys, old_key), try rowId(a, keys, row)))
+                        try changes.append(a, .{ .op = .delete, .row = old_key });
                 }
                 try changes.append(a, .{ .op = .upsert, .row = row });
             },

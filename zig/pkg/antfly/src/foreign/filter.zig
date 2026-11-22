@@ -60,11 +60,21 @@ pub fn translateAlloc(
     };
 }
 
+/// Publication DDL cannot bind parameters. Render the same expression using
+/// PostgreSQL escape-string literals so server settings cannot change quoting.
+pub fn postgresPublicationPredicateAlloc(a: Allocator, json: []const u8, columns: []const source.Column) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    var generator: SqlGenerator = .{ .alloc = a, .dialect = sql.postgresDialect(), .known_columns = columns, .literal_values = true };
+    return generator.valueToSqlAlloc(parsed.value);
+}
+
 const SqlGenerator = struct {
     alloc: Allocator,
     dialect: sql.Dialect,
     known_columns: []const source.Column,
     args: std.ArrayListUnmanaged(sql.ParameterValue) = .empty,
+    literal_values: bool = false,
 
     fn valueToSqlAlloc(self: *SqlGenerator, value: std.json.Value) TranslationError![]u8 {
         if (value != .object) return error.InvalidQueryRequest;
@@ -305,6 +315,29 @@ const SqlGenerator = struct {
     }
 
     fn appendPlaceholderValueAlloc(self: *SqlGenerator, value: sql.ParameterValue) ![]u8 {
+        if (self.literal_values) {
+            var owned = value;
+            defer owned.deinit(self.alloc);
+            if (value == .null) return self.alloc.dupe(u8, "NULL");
+            var buffer: [64]u8 = undefined;
+            const value_text = switch (value) {
+                .null => unreachable,
+                .string => |string| string,
+                .bool => |flag| if (flag) "true" else "false",
+                .integer => |integer| try std.fmt.bufPrint(&buffer, "{d}", .{integer}),
+                .float => |float| try std.fmt.bufPrint(&buffer, "{e}", .{float}),
+            };
+            if (std.mem.indexOfScalar(u8, value_text, 0) != null) return error.InvalidQueryRequest;
+            var escaped: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer escaped.deinit(self.alloc);
+            try escaped.appendSlice(self.alloc, "E'");
+            for (value_text) |byte| {
+                if (byte == '\\' or byte == '\'') try escaped.append(self.alloc, byte);
+                try escaped.append(self.alloc, byte);
+            }
+            try escaped.append(self.alloc, '\'');
+            return escaped.toOwnedSlice(self.alloc);
+        }
         try self.args.append(self.alloc, value);
         return try sql.placeholderAlloc(self.alloc, self.dialect.placeholder_style, self.args.items.len);
     }

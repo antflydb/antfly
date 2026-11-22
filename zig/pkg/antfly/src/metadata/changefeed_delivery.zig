@@ -120,6 +120,18 @@ pub fn pull(svc: anytype, adapter: anytype, a: A, id: control.Id, before: contro
         try adapter.prepare(scratch, state, before, limits, request);
     try validatePage(page, limits);
     _ = try active(adapter, state, request);
+    if (original == null and page.events == 0 and page.advances.len == 0 and
+        std.mem.eql(u8, page.provider_context, try state.contextAt(before)))
+    {
+        var observed = try load(svc, a, id, request);
+        defer observed.deinit();
+        _ = try active(adapter, observed.value, request);
+        if (observed.value.epoch != state.epoch or !equal(observed.value.authority, state.authority) or
+            !equal(observed.value.definition.?.identity(), state.definition.?.identity()))
+            return error.ChangefeedResynchronizationRequired;
+        if (try following(observed.value, before) != null) return error.ChangefeedConflict;
+        return .{ .arena = arena, .cursor = before, .sequence = state.latest_delivery, .body = page.body, .replayed = false };
+    }
     var receipt: control.Delivery = if (original) |recorded| recorded else .{
         .sequence = std.math.add(u64, state.latest_delivery, 1) catch return error.ChangefeedBackpressure,
         .before = before,
@@ -225,6 +237,7 @@ const TestAdapter = struct {
     replays: usize = 0,
     authorizations: usize = 0,
     tamper: bool = false,
+    idle: bool = false,
     provider_context: []const u8 = "",
     revoke_on_prepare: bool = false,
     now: u64 = 200,
@@ -242,6 +255,13 @@ const TestAdapter = struct {
     pub fn prepare(self: *@This(), a: A, state: control.State, _: control.Digest, _: Limits, _: TestRequest) !Prepared {
         self.prepares += 1;
         if (self.revoke_on_prepare) self.denied = true;
+        if (self.idle) return .{
+            .body = "{\"events\":[]}",
+            .events = 0,
+            .advances = &.{},
+            .provider_context = self.provider_context,
+            .proof = @splat(1),
+        };
         return self.page(a, state.roots[0].namespace, state.roots[0].delivered.sequence + 1);
     }
     pub fn replay(self: *@This(), a: A, _: control.State, receipt: control.Delivery, _: Limits, _: TestRequest) !Prepared {
@@ -262,6 +282,27 @@ fn testService(a: A) !TestService {
     state = try (control.Mutation{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 0 } }).apply(scratch, state, .{ .incarnation = @splat(9), .sequence = 3 });
     state = try (control.Mutation{ .seal = .{ .cut = @splat(5) } }).apply(scratch, state, .{ .incarnation = @splat(9), .sequence = 4 });
     return .{ .a = a, .bytes = try control.encode(a, state), .stamp = .{ .incarnation = @splat(9), .sequence = 4 } };
+}
+
+test "idle feed delivery keeps the original cursor and consumes no metadata proposals" {
+    const a = std.testing.allocator;
+    var svc = try testService(a);
+    defer a.free(svc.bytes);
+    var adapter: TestAdapter = .{ .idle = true };
+    var initial = try control.parse(a, svc.bytes);
+    defer initial.deinit();
+    for (0..3) |_| {
+        var heartbeat = try pull(&svc, &adapter, a, initial.value.id, initial.value.latest_cursor, .{}, TestRequest{});
+        defer heartbeat.deinit();
+        try std.testing.expectEqual(initial.value.latest_cursor, heartbeat.cursor);
+        try std.testing.expectEqual(initial.value.latest_delivery, heartbeat.sequence);
+    }
+    try std.testing.expectEqual(@as(u64, 0), svc.proposals);
+    adapter.idle = false;
+    var delivered = try pull(&svc, &adapter, a, initial.value.id, initial.value.latest_cursor, .{}, TestRequest{});
+    defer delivered.deinit();
+    try std.testing.expectEqual(@as(u64, 1), delivered.sequence);
+    try std.testing.expectEqual(@as(u64, 1), svc.proposals);
 }
 
 test "feed delivery recovers lost metadata reply by replaying exact issued payload before ACK" {

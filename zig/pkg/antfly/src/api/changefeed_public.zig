@@ -150,6 +150,7 @@ const IcebergScheduler = struct {
             .options = options,
             .metadata = loaded.table,
             .schemas = .{ .table = table },
+            .group_cache = &self.policy.api.lake_changefeed_groups,
             .policy = self.policy,
         };
         if (self.native_factory != null) return mixedProviderPage(a, state, before, original, .iceberg, &provider, limits, request);
@@ -1746,7 +1747,11 @@ pub fn close(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
             .allocator = a,
             .closing = true,
         };
-        if (!try retireOne(&client, &policy, a, state, internal)) return;
+        if (!(retireOne(&client, &policy, a, state, internal) catch |err| {
+            if (err != error.ChangefeedResynchronizationRequired or
+                !try retireAbsentRoot(&client, api.source, a, state, internal)) return err;
+            continue;
+        })) return;
     }
     return error.MetadataMutationOutcomeUnknown;
 }
@@ -1815,21 +1820,10 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
     }
     var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .closing = true };
     if (retireOne(&client, &policy, a, state, request) catch |err| {
-        if (err != error.ChangefeedResynchronizationRequired or state.slot == null) return err;
+        if (err != error.ChangefeedResynchronizationRequired) return err;
         const owner = catalog_owner orelse return err;
-        var snapshot = (try owner.source.linearizableSnapshot(request)) orelse return err;
-        defer owner.source.freeAdminSnapshot(&snapshot);
-        for (state.roots) |root| {
-            if (root.released) continue;
-            const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
-            for (snapshot.tables) |table| {
-                if (table.table_id == table_id) break;
-            } else {
-                try change(&client, a, state, .{ .retire_absent_slot_root = root.namespace }, request);
-                return;
-            }
-        }
-        return err;
+        if (!try retireAbsentRoot(&client, owner.source, a, state, request)) return err;
+        return;
     }) return;
     if (spool_registry) |storage| if (state.slot) |slot| {
         if (slot.spool.records.len != 0) {
@@ -1838,6 +1832,25 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
             _ = try cleanup.cleanup(&metadata, registry, a, id, .{}, request);
         }
     };
+}
+
+fn retireAbsentRoot(client: *config.Client, source: http.StatusSource, a: A, state: control.State, request: Context) !bool {
+    var snapshot = (try source.linearizableSnapshot(request)) orelse return false;
+    defer source.freeAdminSnapshot(&snapshot);
+    for (state.roots) |root| {
+        if (root.released) continue;
+        const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
+        for (snapshot.tables) |table| {
+            if (table.table_id == table_id) break;
+        } else {
+            try change(client, a, state, if (state.slot != null)
+                .{ .retire_absent_slot_root = root.namespace }
+            else
+                .{ .retire_absent_public_root = root.namespace }, request);
+            return true;
+        }
+    }
+    return false;
 }
 
 fn requireMaintenancePrincipal(request: Context) !void {
@@ -1898,7 +1911,7 @@ pub fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.S
         try policy.authorizeRoot(state, item.namespace, request);
         if (item.split_grant_sequence) |grant| {
             const source = policy.source;
-            var discovered = try source.capturePhysical(a, definition, request);
+            var discovered = try source.captureRetiringRoot(a, definition, item.namespace, request);
             defer discovered.deinit();
             const table_id = std.mem.readInt(u64, item.namespace[0..8], .big);
             const route = try discovered.findPhysical(table_id, handoff.successor.group_id, handoff.successor.range_id);
@@ -1960,7 +1973,7 @@ pub fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.S
     };
     try policy.authorizeRoot(state, item.namespace, request);
     const source = policy.source;
-    var discovered = try source.capturePhysical(a, definition, request);
+    var discovered = try source.captureRetiringRoot(a, definition, item.namespace, request);
     defer discovered.deinit();
     const root = try discovered.findInstalled(item);
     if (item.pending_control) |pending| {

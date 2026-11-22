@@ -3232,6 +3232,9 @@ fn compileReplicationProjection(
     if (change.op == .update) {
         if (route.where_json != null and !change.before_complete) return error.ReplicationProjectionIncomplete;
         if (change.beforeImage()) |before| {
+            if (change.before_kind == .key and key_template.len == 0 and
+                row.object.contains("_id") and !before.object.contains("_id"))
+                return error.ReplicationProjectionIncomplete;
             const old_key = try renderDocumentKeyAlloc(alloc, before, key_template);
             defer alloc.free(old_key);
             const moved = !std.mem.eql(u8, old_key, key);

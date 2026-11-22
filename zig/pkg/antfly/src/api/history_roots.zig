@@ -434,6 +434,17 @@ pub const Source = struct {
         return self.captureRoutes(a, definition, context, .physical);
     }
 
+    pub fn captureRetiringRoot(self: Source, a: A, definition: control.Definition, namespace: control.Namespace, context: Context) !Captured {
+        const table_id = std.mem.readInt(u64, namespace[0..8], .big);
+        for (definition.tables, 0..) |table, index| {
+            if (table.table_id != table_id) continue;
+            var single = definition;
+            single.tables = definition.tables[index..][0..1];
+            return self.capturePhysical(a, single, context);
+        }
+        return error.ChangefeedResynchronizationRequired;
+    }
+
     /// Give a fresh feed one durable logical cursor per physical range.
     pub fn captureAdmission(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
         return self.captureRoutes(a, definition, context, .admission);
@@ -639,7 +650,10 @@ pub const Source = struct {
     pub fn validate(self: Source, a: A, state: control.State, namespace: control.Namespace, frozen: metadata.CatalogRouteFence, table_name: []const u8, context: Context) !void {
         try state.validate();
         const item = state.roots[try state.rootIndex(namespace)];
-        var current = try self.capturePhysical(a, state.definition.?, context);
+        var current = if (state.phase == .closing or state.phase == .reset_required)
+            try self.captureRetiringRoot(a, state.definition.?, namespace, context)
+        else
+            try self.capturePhysical(a, state.definition.?, context);
         defer current.deinit();
         const root = try current.findInstalled(item);
         if (!std.mem.eql(u8, root.table_name, table_name) or !std.meta.eql(root.fence.route, frozen.route) or root.fence.table_id != frozen.table_id or root.fence.metadata_group_id != frozen.metadata_group_id or !std.meta.eql(root.fence.metadata_incarnation, frozen.metadata_incarnation) or root.fence.topology_epoch != frozen.topology_epoch) return error.ChangefeedResynchronizationRequired;

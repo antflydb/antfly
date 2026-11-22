@@ -31,6 +31,7 @@ pub const shared_namespace_plan_protocol_version: u16 = 127;
 pub const slot_recreation_protocol_version: u16 = 133;
 pub const retired_slot_root_protocol_version: u16 = 134;
 pub const native_collection_protocol_version: u16 = 135;
+pub const absent_public_root_protocol_version: u16 = 136;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -741,11 +742,13 @@ pub const Mutation = union(enum) {
     close,
     release_root: struct { namespace: Namespace, ownership_epoch: u64, proof: Digest },
     retire_absent_slot_root: Namespace,
+    retire_absent_public_root: Namespace,
     finish_close,
     restart: struct { definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
     pub fn requiredProtocol(self: Mutation) u16 {
         switch (self) {
             .retire_absent_slot_root => return retired_slot_root_protocol_version,
+            .retire_absent_public_root => return absent_public_root_protocol_version,
             .native_collected => return native_collection_protocol_version,
             .recreate_slot => return slot_recreation_protocol_version,
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
@@ -774,7 +777,7 @@ pub const Mutation = union(enum) {
 
     pub fn validate(self: Mutation) !void {
         switch (self) {
-            .retire_absent_slot_root => |namespace| if (!nz(namespace)) return error.InvalidChangefeed,
+            .retire_absent_slot_root, .retire_absent_public_root => |namespace| if (!nz(namespace)) return error.InvalidChangefeed,
             .recreate_slot => |value| {
                 try value.definition.validate();
                 try slotDefinition(value.definition);
@@ -1516,10 +1519,10 @@ pub const Mutation = union(enum) {
                 roots[index].released = true;
                 next.roots = roots;
             },
-            .retire_absent_slot_root => |namespace| {
+            .retire_absent_slot_root, .retire_absent_public_root => |namespace| {
                 // The metadata apply store must certify the table ID is absent
                 // in the same transaction as this state transition.
-                if ((state.phase != .closing and state.phase != .reset_required) or state.slot == null) return error.ChangefeedConflict;
+                if ((state.phase != .closing and state.phase != .reset_required) or ((state.slot != null) != (self == .retire_absent_slot_root))) return error.ChangefeedConflict;
                 const index = try state.rootIndex(namespace);
                 if (state.roots[index].released) return state;
                 const roots = try a.dupe(Root, state.roots);
