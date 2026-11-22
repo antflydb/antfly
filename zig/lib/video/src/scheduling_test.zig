@@ -438,3 +438,47 @@ test "video dependency immutable seek cache reuses verified anchors without reta
     src.identity = "different-source";
     try std.testing.expectError(error.InvalidVideoReaderSelection, video.decode_plan.create(a, &reader, &.{19}, .{ .seek_cache = &cache }));
 }
+
+test "video metadata-only IDR qualification charges NAL headers without pinning payloads" {
+    var src = source();
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    const before = src.total_bytes;
+    var plan = try video.decode_plan.create(a, &reader, &.{19}, .{ .headers_only = true, .max_probe_bytes = 128 });
+    defer plan.deinit();
+    const restart = plan.runs[0].first;
+    try std.testing.expect(restart > 0 and reader.packets[restart].size > 128);
+    try std.testing.expect(plan.probe_bytes > 0 and plan.probe_bytes <= 128);
+    try std.testing.expectEqual(src.total_bytes - before, plan.probe_bytes);
+    try std.testing.expect(plan.anchorBytes(restart) == null);
+}
+
+test "video bounded merges keep each selected GOP disjoint" {
+    var src = source();
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    var cache = video.decode_plan.SeekCache.forPage(a, &reader, &.{ 0, 4 });
+    cache.complete = true;
+    var plan = try video.decode_plan.create(a, &reader, &.{ 5, 12, 3 }, .{ .portable_config = true, .seek_cache = &cache, .max_run_packets = 10, .max_decode_packets = 13 });
+    defer plan.deinit();
+    try std.testing.expectEqualSlices(video.decode_plan.Run, &.{ .{ .first = 0, .last = 3 }, .{ .first = 4, .last = 12 } }, plan.runs);
+    try std.testing.expectEqual(@as(usize, 0), plan.skipped_packets);
+}
+
+test "video resumed pages share content-verified restart candidates" {
+    var src = source();
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    var candidates: std.ArrayList(video.decode_plan.SeekCache.Candidate) = .empty;
+    defer candidates.deinit(a);
+    // Some containers advertise every sample as a sync candidate.
+    for (0..reader.packets.len) |i| try candidates.append(a, .{ .packet = i });
+    for (0..2) |page| {
+        var cache = video.decode_plan.SeekCache.forPage(a, &reader, &.{});
+        cache.candidates = candidates.items;
+        const before = src.reads;
+        var plan = try video.decode_plan.create(a, &reader, &.{19}, .{ .seek_cache = &cache, .headers_only = true, .portable_config = true, .max_search_steps = if (page == 0) 100 else 1 });
+        defer plan.deinit();
+        if (page == 0) try std.testing.expect(src.reads > before) else try std.testing.expectEqual(before, src.reads);
+    }
+}

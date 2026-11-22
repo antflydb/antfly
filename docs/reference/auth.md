@@ -125,8 +125,17 @@ user manager (`/auth/v1`) with one of:
 - `Authorization: ApiKey <base64(key_id:key_secret)>`
 - `Authorization: Bearer <base64(key_id:key_secret)>`
 
-An API key can only narrow its owner's permissions, and that narrowing is
-re-applied on every use.
+Use scoped API keys for service traffic and benchmarks. Basic authentication
+verifies the password with bcrypt on every request. API keys use a fast salted
+hash of a generated high-entropy secret. Each use reapplies the owner's
+current permissions and row filters together with any restrictions on the key.
+
+On protected table queries and batch writes, send `X-Antfly-Server-Timing: 1`
+to receive `Server-Timing: auth;dur=<milliseconds>` after successful credential
+verification. This duration includes resolving the identity and its policies.
+Query results report execution separately in `responses[].took` (whole
+milliseconds). Record the credential type with client latency measurements.
+See the [scoped key and timing example](/docs/guides/access-control).
 
 ### Trusted Principal Tokens
 

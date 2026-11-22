@@ -42832,8 +42832,9 @@ components:
         skip_windows:
           type: array
           maxItems: 4096
-          description: Execution-only repair mask for already accepted sub-windows; does not affect the
-            model recipe or boundary plan. Skipped windows return receipts with status skipped.
+          description: Execution-only repair mask for accepted receipts. A sub_index of 4294967295
+            skips all outputs at that ordinal. Other entries skip individual sub-windows. Masks leave
+            recipe and boundary identities unchanged.
           items:
             type: object
             required:

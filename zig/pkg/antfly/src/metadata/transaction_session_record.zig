@@ -17,13 +17,14 @@
 const std = @import("std");
 pub const count_key = "\x00session-count-v1";
 pub const session_prefix = "\x00\x00__api_txn_sessions__:";
+pub const prepared_session_header = "{\"session_format\":3,";
 pub const bound_session_header = "{\"session_format\":2,";
 fn frameVersion(changes: []const Change) u8 {
     for (changes) |change| if (change.value_is_splice) return 4;
     for (changes) |change| if (change.expected_is_digest) return 3;
     for (changes) |change| {
         if (!std.mem.startsWith(u8, change.key, session_prefix)) continue;
-        if (change.value) |value| if (std.mem.startsWith(u8, value, bound_session_header)) return 2;
+        if (change.value) |value| if (std.mem.startsWith(u8, value, bound_session_header) or std.mem.startsWith(u8, value, prepared_session_header)) return 2;
     }
     return 1;
 }

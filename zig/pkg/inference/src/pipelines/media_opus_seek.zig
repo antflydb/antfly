@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Exact Opus state advances on demand. Recent checkpoints bound forward
-//! page replay without decoding the unrequested tail of a recording.
+//! Buffered Opus retains exact decoder checkpoints. Range-backed WebM
+//! uses deterministic Matroska preroll, independent of cache warmth.
 const std = @import("std");
 const audio = @import("inference_audio");
 const opus = audio.opus;
@@ -22,6 +22,8 @@ const memory = @import("../runtime/tier/memory.zig");
 const admitted = @import("../backends/admitted_allocator.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 pub const Admission = struct { context: *anyopaque, acquire: *const fn (*anyopaque, usize) anyerror!memory.AdmissionLease };
+// A declaration beyond this envelope would defeat bounded remote seeking.
+pub const max_webm_preroll_ns = 2 * std.time.ns_per_s;
 pub const max_checkpoints = 64;
 threadlocal var active_lane: u1 = 0;
 pub const Lane = struct {
@@ -49,13 +51,19 @@ pub const Index = struct {
         return .{ .owner = owner };
     }
     pub fn create(admission: ?Admission) !*Owner {
+        return createBounded(admission, null);
+    }
+
+    pub fn createBounded(admission: ?Admission, limit: ?usize) !*Owner {
         const backing = @import("antfly_platform").allocator.concurrentFallback();
         var lease: ?memory.AdmissionLease = if (admission) |quota| try quota.acquire(quota.context, @sizeOf(Owner)) else null;
         errdefer if (lease) |*owned| owned.release();
         const owner = try backing.create(Owner);
         errdefer backing.destroy(owner);
         owner.* = .{ .allocation = .{ .backing = backing, .admission_context = if (admission) |quota| quota.context else null, .admit = if (admission) |quota| quota.acquire else null }, .lease = lease, .admission = admission, .arena = undefined };
-        owner.arena = .init(if (admission != null) owner.allocation.allocator() else backing);
+        const retained = if (admission != null) owner.allocation.allocator() else backing;
+        if (limit) |bytes| owner.bound = .{ .backing = retained, .limit = bytes };
+        owner.arena = .init(if (owner.bound) |*bound| bound.allocator() else retained);
         errdefer {
             owner.arena.deinit();
             owner.allocation.deinit();
@@ -75,9 +83,22 @@ pub const Index = struct {
     }
     pub const Builder = struct {
         owner: *Owner,
+        range_backed: bool = false,
         pub fn build(self: Builder, _: std.mem.Allocator, demuxed: opus.Demuxed, max_packets: usize) !Index {
             self.owner.demuxed = demuxed;
-            try finish(self.owner, max_packets);
+            if (self.range_backed) {
+                if (demuxed.packets.len == 0 or demuxed.packets.len > max_packets) return error.UnsupportedAudioFormat;
+                _ = try opus.initialFrameState(demuxed.header.channels);
+                const starts = try self.owner.arena.allocator().alloc(usize, demuxed.packets.len);
+                var start: usize = 0;
+                for (starts, demuxed.packet_sample_counts) |*offset, count| {
+                    offset.* = start;
+                    start = try std.math.add(usize, start, count);
+                }
+                self.owner.range_starts = starts;
+                self.owner.capacity = 0;
+                refreshBytes(self.owner);
+            } else try finish(self.owner, max_packets);
             _ = self.owner.refs.fetchAdd(1, .monotonic);
             // Packet ownership is already in this owner's admitted arena.
             // A second payload copy or a later admission step is unnecessary.
@@ -101,7 +122,10 @@ pub const Index = struct {
         try audio.work_control.check();
     }
     pub fn visitWindow(self: Index, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink) !void {
-        try self.owner.visit(a, first, last, sink, .{ .check_fn = check });
+        try self.visitWindowPackets(a, first, last, sink, null);
+    }
+    pub fn visitWindowPackets(self: Index, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink, packets: ?@import("antfly_media").webm_audio.PacketSource) !void {
+        try self.owner.visit(a, first, last, sink, .{ .check_fn = check }, packets);
     }
     pub fn visitWindowControlled(self: Index, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink, control: Control) !void {
         try self.owner.visit(a, first, last, sink, control);
@@ -112,11 +136,13 @@ pub const Owner = struct {
     mutex: std.atomic.Mutex = .unlocked,
     allocation: admitted.AdmittedAllocator,
     arena: std.heap.ArenaAllocator,
+    bound: ?@import("../runtime/bounded_allocator.zig").BoundedAllocator = null,
     lease: ?memory.AdmissionLease,
     checkpoint_lease: ?memory.AdmissionLease = null,
     admission: ?Admission,
     capacity: usize = max_checkpoints,
     demuxed: opus.Demuxed = undefined,
+    range_starts: ?[]const usize = null,
     checkpoints: [max_checkpoints]?*Checkpoint = @splat(null),
     frontiers: [4]?*Checkpoint = @splat(null),
     clock: u64 = 0,
@@ -162,40 +188,76 @@ pub const Owner = struct {
         };
         point.* = value;
     }
-    fn visit(self: *Owner, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink, control: Control) !void {
-        if (last < first or last > self.demuxed.playable_frames) return error.InvalidAudioWindow;
-        if (first == last) return;
+    fn checkpoint(self: *Owner, raw_first: usize, lane: usize, control: Control) !?Checkpoint {
         try control.lockWithPoll(&self.mutex, 100 * std.time.ns_per_us);
         defer self.mutex.unlock();
-        const raw_first = first + self.demuxed.header.pre_skip;
-        const raw_last = last + self.demuxed.header.pre_skip;
         var selected: ?*Checkpoint = null;
         for (self.checkpoints) |maybe| if (maybe) |point| {
             if (point.first <= raw_first and (selected == null or point.first > selected.?.first)) selected = point;
         };
-        const lane: usize = active_lane;
         for (self.frontiers[lane * 2 ..][0..2]) |maybe| if (maybe) |point| {
             if (point.first <= raw_first and (selected == null or point.first > selected.?.first)) selected = point;
         };
-        var state = if (selected) |point| point.state else try opus.initialFrameState(self.demuxed.header.channels);
-        var position: usize = if (selected) |point| point.first else 0;
-        var packet_index: usize = if (selected) |point| point.packet else 0;
-        var saved_at = position;
         if (selected) |point| {
             self.clock += 1;
             point.used = self.clock;
+            return point.*;
         }
+        return null;
+    }
+
+    fn publish(self: *Owner, value: Checkpoint, slot: ?usize, control: Control) !void {
+        try control.lockWithPoll(&self.mutex, 100 * std.time.ns_per_us);
+        defer self.mutex.unlock();
+        if (slot) |index| return self.frontier(index, value);
+        return self.remember(value);
+    }
+
+    fn prerollPacket(starts: []const usize, raw_first: usize, seek_pre_roll_ns: u64) usize {
+        // Matroska Opus requires at least 80 ms. Round up to avoid
+        // dropping a fractional sample from the declared preroll.
+        const preroll = (@as(u128, @max(80 * std.time.ns_per_ms, seek_pre_roll_ns)) * 48_000 + std.time.ns_per_s - 1) / std.time.ns_per_s;
+        const target = raw_first -| @as(usize, @intCast(@min(preroll, raw_first)));
+        var low: usize = 0;
+        var high = starts.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (starts[middle] <= target) low = middle + 1 else high = middle;
+        }
+        return low -| 1;
+    }
+
+    fn visit(self: *Owner, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink, control: Control, packets: ?@import("antfly_media").webm_audio.PacketSource) !void {
+        if (last < first or last > self.demuxed.playable_frames) return error.InvalidAudioWindow;
+        if (first == last) return;
+        const raw_first = first + self.demuxed.header.pre_skip;
+        const raw_last = last + self.demuxed.header.pre_skip;
+        const lane: usize = active_lane;
+        const selected = if (packets == null) try self.checkpoint(raw_first, lane, control) else null;
+        var state = if (selected) |point| point.state else try opus.initialFrameState(self.demuxed.header.channels);
+        var position: usize = if (selected) |point| point.first else 0;
+        var packet_index: usize = if (selected) |point| point.packet else 0;
+        if (packets) |input| {
+            const starts = self.range_starts orelse return error.InvalidAudioWindow;
+            packet_index = prerollPacket(starts, raw_first, input.seek_pre_roll_ns);
+            position = starts[packet_index];
+        } else if (self.range_starts != null) return error.InvalidAudioWindow;
+        var saved_at = position;
         var filled: usize = 0;
         while (position < raw_last and packet_index < self.demuxed.packets.len) : (packet_index += 1) {
             try control.check();
-            if (position - saved_at >= interval) {
-                try self.remember(.{ .packet = packet_index, .first = position, .state = state });
+            if (packets == null and position - saved_at >= interval) {
+                try self.publish(.{ .packet = packet_index, .first = position, .state = state }, null, control);
                 saved_at = position;
             }
             const expected = self.demuxed.packet_sample_counts[packet_index];
-            if (position <= raw_first and position + expected > raw_first) try self.frontier(lane * 2, .{ .packet = packet_index, .first = position, .state = state });
-            if (position < raw_last and position + expected >= raw_last) try self.frontier(lane * 2 + 1, .{ .packet = packet_index, .first = position, .state = state });
-            const decoded = try opus.decodeWindowPacket(a, &state, self.demuxed.packets[packet_index], self.demuxed.packet_tocs[packet_index], self.demuxed.header.channels);
+            if (packets == null) {
+                if (position <= raw_first and position + expected > raw_first) try self.publish(.{ .packet = packet_index, .first = position, .state = state }, lane * 2, control);
+                if (position < raw_last and position + expected >= raw_last) try self.publish(.{ .packet = packet_index, .first = position, .state = state }, lane * 2 + 1, control);
+            }
+            var lease = if (packets) |input| try input.read(packet_index) else null;
+            defer if (lease) |*owned| owned.deinit();
+            const decoded = try opus.decodeWindowPacket(a, &state, if (lease) |owned| owned.bytes else self.demuxed.packets[packet_index], self.demuxed.packet_tocs[packet_index], self.demuxed.header.channels);
             defer a.free(decoded);
             _ = self.decoded_packets.fetchAdd(1, .monotonic);
             const frames = decoded.len / self.demuxed.header.channels;
@@ -211,7 +273,7 @@ pub const Owner = struct {
             position += frames;
         }
         if (filled != last - first) return error.IncompleteAudioStream;
-        try self.remember(.{ .packet = packet_index, .first = position, .state = state });
+        if (packets == null) try self.publish(.{ .packet = packet_index, .first = position, .state = state }, null, control);
     }
 };
 
@@ -258,14 +320,17 @@ test "model aware media progressive Opus indexes decode requested prefixes and r
     defer reference.deinit();
     const Sink = struct {
         a: std.mem.Allocator,
+        owner: *Owner,
         samples: std.ArrayList(f32) = .empty,
         fn write(raw: *anyopaque, samples: []const f32, _: u32, _: u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.owner.mutex.tryLock());
+            self.owner.mutex.unlock();
             try self.samples.appendSlice(self.a, samples);
         }
         fn discard(_: *anyopaque, _: []const f32, _: u32, _: u8) !void {}
     };
-    var capture = Sink{ .a = a };
+    var capture = Sink{ .a = a, .owner = owner };
     defer capture.samples.deinit(a);
     try index.visitWindow(a, 0, 4800, .{ .context = &capture, .write = Sink.write });
     try std.testing.expectEqualSlices(f32, reference.samples[0 .. 4800 * @as(usize, original.header.channels)], capture.samples.items);

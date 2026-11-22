@@ -1,0 +1,160 @@
+{
+  "runtime_source": "0b94bdff5020f82511f393662df041db84c18ea3",
+  "benchmark_sha256": "564f89ddcf9de8fa066658f854dbbb498ce8ef4f7b7f05985969ba94a606edca",
+  "gpu": "NVIDIA GB10 (SM121)",
+  "inputs_and_reference_receipt": "e4b-qat-gb10-projector-20261121.json",
+  "base_profile": "gemma4_e4b_qat_l4_qualified.env",
+  "base_profile_sha256": "a27eec3038607e700c03c0796f49b39bbe0cec59e112d9bfd3c2b0d4865cc916",
+  "environment_override": {
+    "ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL_TERMS": "3"
+  },
+  "context_tokens": 8192,
+  "kv_dtype": "f16",
+  "timing": "Shared GB10, one prime per case, three warm repetitions with fixed output budgets. End to end from encoded input through synchronized token readback.",
+  "oracle": "FP32 Transformers using the same dequantized GGUF tensors. Each decision uses the native continuation through first EOS or budget. Previously computed rows are reused only when the entire checked native prefix matches.",
+  "gates": {
+    "min_cosine": 0.9999,
+    "max_relative_l2": 0.02,
+    "identical_argmax": true
+  },
+  "two_term_video_cosine": 0.99989453,
+  "decisions_checked": 585,
+  "decisions_matched": 581,
+  "cases": [
+    {
+      "id": "text_short_256",
+      "prompt_tokens": 32,
+      "output_budget": 256,
+      "cosine": 0.99992948,
+      "relative_l2": 0.012211417,
+      "first_token": 70895,
+      "decisions_checked": 256,
+      "mismatch_steps": [
+        206
+      ],
+      "median_ms": 7596.062,
+      "samples_ms": [
+        7946.975,
+        5292.602,
+        7596.062
+      ]
+    },
+    {
+      "id": "page_summary_128",
+      "prompt_tokens": 419,
+      "output_budget": 128,
+      "cosine": 0.999969177,
+      "relative_l2": 0.007864553,
+      "first_token": 818,
+      "decisions_checked": 128,
+      "mismatch_steps": [
+        102
+      ],
+      "median_ms": 3920.867,
+      "samples_ms": [
+        2095.09,
+        3920.867,
+        4633.063
+      ]
+    },
+    {
+      "id": "long2k_summary_64",
+      "prompt_tokens": 1775,
+      "output_budget": 64,
+      "cosine": 0.999958492,
+      "relative_l2": 0.013387432,
+      "first_token": 818,
+      "decisions_checked": 55,
+      "mismatch_steps": [],
+      "median_ms": 1272.888,
+      "samples_ms": [
+        1602.44,
+        1272.82,
+        1272.888
+      ]
+    },
+    {
+      "id": "image_64",
+      "prompt_tokens": 284,
+      "output_budget": 64,
+      "cosine": 0.999965723,
+      "relative_l2": 0.011500117,
+      "first_token": 2094,
+      "decisions_checked": 64,
+      "mismatch_steps": [],
+      "median_ms": 2716.807,
+      "samples_ms": [
+        2139.693,
+        2786.525,
+        2716.807
+      ]
+    },
+    {
+      "id": "audio_1s_64",
+      "prompt_tokens": 42,
+      "output_budget": 64,
+      "cosine": 0.999928909,
+      "relative_l2": 0.011924014,
+      "first_token": 11947,
+      "decisions_checked": 4,
+      "mismatch_steps": [],
+      "median_ms": 1062.416,
+      "samples_ms": [
+        1885.82,
+        1062.161,
+        1062.416
+      ]
+    },
+    {
+      "id": "audio_12s_64",
+      "prompt_tokens": 317,
+      "output_budget": 64,
+      "cosine": 0.999946672,
+      "relative_l2": 0.010579595,
+      "first_token": 818,
+      "decisions_checked": 7,
+      "mismatch_steps": [],
+      "median_ms": 2317.205,
+      "samples_ms": [
+        1120.933,
+        2317.205,
+        2483.68
+      ]
+    },
+    {
+      "id": "audio_30s_64",
+      "prompt_tokens": 767,
+      "output_budget": 64,
+      "cosine": 0.999952598,
+      "relative_l2": 0.009767978,
+      "first_token": 818,
+      "decisions_checked": 7,
+      "mismatch_steps": [],
+      "median_ms": 1757.306,
+      "samples_ms": [
+        2686.433,
+        1757.306,
+        1591.564
+      ]
+    },
+    {
+      "id": "video_6s_64",
+      "prompt_tokens": 465,
+      "output_budget": 64,
+      "cosine": 0.99990328,
+      "relative_l2": 0.014256043,
+      "first_token": 2094,
+      "decisions_checked": 64,
+      "mismatch_steps": [
+        55,
+        61
+      ],
+      "median_ms": 2785.378,
+      "samples_ms": [
+        1611.026,
+        2785.378,
+        2825.668
+      ]
+    }
+  ]
+}

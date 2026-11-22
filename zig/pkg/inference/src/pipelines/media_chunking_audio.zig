@@ -32,6 +32,39 @@ pub const Fork = struct {
         self.destroy(self.context);
     }
 };
+pub const FrameCheckpointSession = struct {
+    snapshot: ?@import("media_audio_plan.zig").Snapshot = null,
+    identity: [32]u8 = undefined,
+    generation: usize = 0,
+    decoded: std.ArrayList(@import("media_audio_plan.zig").Point) = .empty,
+    continuation: ?@import("media_audio_plan.zig").Point = null,
+    limit: usize = 0,
+    stride: usize = 1,
+    seen: usize = 0,
+
+    pub fn reset(self: *FrameCheckpointSession) void {
+        self.decoded.clearRetainingCapacity();
+        self.stride = 1;
+        self.seen = 0;
+    }
+
+    pub fn observe(self: *FrameCheckpointSession, a: std.mem.Allocator, point: @import("media_audio_plan.zig").Point) void {
+        const seen = self.seen;
+        self.seen += 1;
+        if (self.limit < 2 or seen % self.stride != 0) return;
+        if (self.decoded.items.len == self.limit) {
+            for (0..(self.decoded.items.len + 1) / 2) |i| self.decoded.items[i] = self.decoded.items[2 * i];
+            self.decoded.items.len = (self.decoded.items.len + 1) / 2;
+            self.stride *= 2;
+            if (seen % self.stride != 0) return;
+        }
+        if (self.decoded.items.len == self.decoded.capacity) {
+            self.decoded.ensureTotalCapacityPrecise(a, @min(self.limit, @max(16, self.decoded.capacity * 2))) catch return;
+        }
+        self.decoded.appendAssumeCapacity(point);
+    }
+};
+
 pub const Provider = struct {
     context: *anyopaque,
     samples: usize,
@@ -40,6 +73,12 @@ pub const Provider = struct {
     fork: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!Fork = null,
     final_samples: ?*const fn (*anyopaque) ?usize = null,
     probe: ?*const fn (*anyopaque, usize, usize) anyerror!?usize = null,
+    /// Retains PCM for [first, last) while probing through lookahead.
+    /// An empty retained interval only discovers the end of the stream.
+    probe_window: ?*const fn (*anyopaque, std.mem.Allocator, usize, usize, usize) anyerror!?Lease = null,
+    acknowledge_frame_start: ?*const fn (*anyopaque, usize) void = null,
+    restore_frames: ?*const fn (*anyopaque, std.mem.Allocator, @import("media_audio_plan.zig").Store.Context, *FrameCheckpointSession) void = null,
+    save_frames: ?*const fn (*anyopaque, std.mem.Allocator, @import("media_audio_plan.zig").Store.Context, *FrameCheckpointSession) void = null,
     sample_rate: u32,
     read: *const fn (*anyopaque, std.mem.Allocator, usize, usize) anyerror!Lease,
 };

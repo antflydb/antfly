@@ -46,7 +46,7 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
     }, .{});
     defer alloc.free(encoded);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly:document-facts:semantics:v5:");
+    hash.update("antfly:document-facts:semantics:v6:");
     var len: [8]u8 = undefined;
     std.mem.writeInt(u64, &len, encoded.len, .little);
     hash.update(&len);
@@ -221,7 +221,7 @@ pub const Context = struct {
             defer self.alloc.free(normalized);
             break :text normalized.len > 0;
         } else false;
-        const has_chunk_source = projection.chunk_embeddings_pending or projection.model_media_source_present or (if (projection.chunk_preview) |chunks| chunks.len > 0 else has_text);
+        const has_chunk_source = projection.chunk_embeddings_pending or projection.chunk_embeddings_terminal or projection.model_media_source_present or (if (projection.chunk_preview) |chunks| chunks.len > 0 else has_text);
         return .{
             .body_has_dependencies = projection.has_media_checkpoint,
             .present = @as(u3, @intFromBool(has_chunk_preview)) |
@@ -755,6 +755,8 @@ test "model aware media serverless pending facts retain empty vector failures an
     const policy = catalog.NamespacePolicy{ .chunk_embeddings_enabled = true, .chunk_embeddings_pipeline_version = 2 };
     const retry = try flagsForDocumentAlloc(a, .{ .doc_id = @constCast("doc"), .last_lsn = 0, .last_timestamp_ns = 0, .body = @constCast("{\"text\":\"\",\"chunk_preview\":[],\"_enrichment\":{\"chunk_embeddings_pending\":true}}") }, policy, "{}");
     try std.testing.expect(retry.pending & 4 != 0);
+    const blocked = try flagsForDocumentAlloc(a, .{ .doc_id = @constCast("doc"), .last_lsn = 0, .last_timestamp_ns = 0, .body = @constCast("{\"chunk_preview\":[],\"_enrichment\":{\"chunk_embeddings_version\":2,\"chunk_embeddings_terminal_error\":\"ChunkCodedWindowBudgetExceeded\"}}") }, policy, "{}");
+    try std.testing.expect(blocked.pending & 4 != 0);
     const initial = try flagsForDocumentAlloc(a, .{ .doc_id = @constCast("doc"), .last_lsn = 0, .last_timestamp_ns = 0, .body = @constCast("{\"text\":\"\",\"clip\":{\"uri\":\"s3://bucket/clip\"}}") }, policy, "{\"dense\":{\"field\":\"clip\",\"embedder\":{\"provider\":\"antfly\"}}}");
     try std.testing.expect(initial.pending & 4 != 0);
 }

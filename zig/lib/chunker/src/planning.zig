@@ -128,6 +128,10 @@ pub const Control = struct {
         if (self.check_fn) |f| try f(self.context);
     }
 };
+// Container dispatch can sniff the payload after a metadata-only plan probe.
+// Scope the revision to all audio and video plans so both routes agree.
+pub const media_playback_recipe = "media-playback-v3";
+
 pub const Identity = struct {
     source: [32]u8,
     plan: [32]u8,
@@ -173,6 +177,14 @@ pub const Identity = struct {
         }
         return .{ .source = fingerprint, .plan = plan.finalResult() };
     }
+    pub fn withPlaybackRecipe(self: Identity, recipe: []const u8) Identity {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-chunk-playback-recipe-v1");
+        hash.update(&self.plan);
+        field(&hash, recipe);
+        return .{ .source = self.source, .plan = hash.finalResult() };
+    }
+
     fn field(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
         number(hash, bytes.len);
         hash.update(bytes);
@@ -283,6 +295,19 @@ pub const Temporal = struct {
     picture_tokens: usize,
     offset_ns: i64 = 0,
     ordinal: u64 = 0,
+    /// Position a fresh video cursor at a continuation, clamping to the actual
+    /// number of windows so the caller can distinguish EOF from a stale token.
+    pub fn seekVideo(self: *Temporal, ordinal: u64) !void {
+        if (self.kind != .video or self.ordinal != 0 or self.offset_ns != 0) return error.InvalidChunkPolicy;
+        if (ordinal == 0) return;
+        const first = (try self.next()) orelse return;
+        if (self.offset_ns == self.end_ns) return;
+        const stride: u64 = @intCast(self.offset_ns);
+        const tail: u64 = @intCast(self.end_ns - first.coordinates.end_ns.?);
+        const count = 1 + try std.math.divCeil(u64, tail, stride);
+        self.ordinal = @min(count, ordinal);
+        self.offset_ns = if (self.ordinal == count) self.end_ns else @intCast(self.ordinal * stride);
+    }
     pub fn next(self: *Temporal) !?Descriptor {
         try self.policy.validate();
         const budget = try self.model.capacity();
@@ -369,6 +394,23 @@ test "time windows retain cadence rather than sparsifying long clips and cover t
     var audio = Temporal{ .kind = .audio, .end_ns = 31 * std.time.ns_per_s, .model = planner.model, .policy = .{}, .picture_tokens = 0 };
     try std.testing.expectEqual(@as(i64, 30 * std.time.ns_per_s), (try audio.next()).?.coordinates.end_ns.?);
 }
+test "video continuation seek matches iteration through overlapping and terminal windows" {
+    const second = std.time.ns_per_s;
+    for ([_]i64{ 0, 1, 8, 9, 16, 17, 31 }) |seconds| {
+        const initial = Temporal{ .kind = .video, .end_ns = seconds * second, .model = .{ .planning_identity = "test", .context_tokens = 8192 }, .policy = .{ .window_ns = 8 * second, .overlap_ns = 3 * second }, .picture_tokens = 140 };
+        var linear = initial;
+        for (0..12) |page| {
+            var resumed = initial;
+            try resumed.seekVideo(page);
+            try std.testing.expectEqual(linear.ordinal, resumed.ordinal);
+            try std.testing.expectEqual(try linear.next(), try resumed.next());
+        }
+        var beyond = initial;
+        try beyond.seekVideo(std.math.maxInt(u64));
+        try std.testing.expectEqual(linear.ordinal, beyond.ordinal);
+    }
+}
+
 test "continuation binds source model and semantic policy while tiling covers original regions" {
     const model = Model{ .planning_identity = "tokenizer+geometry-v1", .context_tokens = 8192 };
     const original = try Identity.init("source", "video/mp4", "version1", model, .{});

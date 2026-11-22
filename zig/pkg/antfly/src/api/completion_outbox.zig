@@ -27,17 +27,37 @@ pub const Record = struct {
     prepared: bool = false,
     execution_admitted: bool = false,
     joined: bool = false,
+    observation: ?bool = null,
 };
 pub const RecoveryPage = struct { references: [][16]u8, after: u64 };
+// The sequence tag selects a separately persisted producer. The tag alone
+// conveys no settlement proof: load validates the producer and issued sequence.
+const observation_bit: u64 = 1 << 63;
+
+pub fn isObservation(reference: [16]u8) bool {
+    return reference[8] & 0x80 != 0;
+}
+
 // Node-local stores retain their original namespace (issuer zero). Shared
 // transaction stores must bind a separate facade to each immutable issuer.
 pub const Namespace = struct {
     issuer: u64 = 0,
+    observation: bool = false,
+
+    pub fn ownerFloor(self: Namespace, floor: u64) u64 {
+        return if (self.observation) floor | observation_bit else floor;
+    }
+
+    fn localSequence(reference: [16]u8) u64 {
+        return @import("completion_retirement.zig").sequence(reference) & (observation_bit - 1);
+    }
     fn stateKey(self: Namespace, buf: []u8) ![]const u8 {
+        if (self.observation) return std.fmt.bufPrint(buf, "\x00\x00__sql_observation_producer__:{x:0>16}", .{self.issuer});
         if (self.issuer == 0) return state_key;
         return std.fmt.bufPrint(buf, "{s}:{x:0>16}", .{ state_key, self.issuer });
     }
     fn entryPrefix(self: Namespace, buf: []u8) ![]const u8 {
+        if (self.observation) return std.fmt.bufPrint(buf, "\x00\x00__sql_observation_outbox__:{x:0>16}:", .{self.issuer});
         if (self.issuer == 0) return prefix;
         return std.fmt.bufPrint(buf, "\x00\x00__sql_completion_issuer__:{x:0>16}:", .{self.issuer});
     }
@@ -50,6 +70,7 @@ pub const Namespace = struct {
         errdefer references.deinit(alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
+        cursor.setKeysOnly();
         var buf: [128]u8 = undefined;
         const lower = try std.fmt.bufPrint(&buf, "{s}{x:0>16}", .{ entry_prefix, after +| 1 });
         var row = try cursor.seekAtOrAfter(lower);
@@ -72,7 +93,7 @@ pub const Namespace = struct {
     pub fn key(self: Namespace, buf: []u8, reference: [16]u8) ![]const u8 {
         var prefix_buf: [128]u8 = undefined;
         const entry_prefix = try self.entryPrefix(&prefix_buf);
-        return std.fmt.bufPrint(buf, "{s}{x:0>16}", .{ entry_prefix, @import("completion_retirement.zig").sequence(reference) });
+        return std.fmt.bufPrint(buf, "{s}{x:0>16}", .{ entry_prefix, localSequence(reference) });
     }
     pub fn producer(self: Namespace, txn: anytype, alloc: std.mem.Allocator, seed: [8]u8) !Producer {
         var state_buf: [128]u8 = undefined;
@@ -95,17 +116,17 @@ pub const Namespace = struct {
     pub fn available(self: Namespace, txn: anytype, alloc: std.mem.Allocator) !usize {
         var state = try self.producer(txn, alloc, @splat(0));
         try self.advanceFloor(txn, &state);
-        if (state.next == std.math.maxInt(u64)) return 0;
+        if (state.next >= observation_bit) return 0;
         const occupied = state.next - state.retired_through - 1;
-        return @intCast(@min(max_window - @min(max_window, occupied), std.math.maxInt(u64) - state.next));
+        return @intCast(@min(max_window - @min(max_window, occupied), observation_bit - state.next));
     }
     pub fn create(self: Namespace, txn: anytype, alloc: std.mem.Allocator, seed: [8]u8, outcome: wire.Outcome, prepared: bool) ![16]u8 {
         var state = try self.producer(txn, alloc, seed);
         try self.advanceFloor(txn, &state);
-        if (state.next == std.math.maxInt(u64) or state.next - state.retired_through > max_window) return error.SessionLimitExceeded;
+        if (state.next >= observation_bit or state.next - state.retired_through > max_window) return error.SessionLimitExceeded;
         var reference: [16]u8 = undefined;
         reference[0..8].* = state.id;
-        std.mem.writeInt(u64, reference[8..16], state.next, .big);
+        std.mem.writeInt(u64, reference[8..16], self.ownerFloor(state.next), .big);
         state.next += 1;
         state.active += 1;
         try self.putProducer(txn, alloc, state);
@@ -114,7 +135,7 @@ pub const Namespace = struct {
     }
     pub fn put(self: Namespace, txn: anytype, alloc: std.mem.Allocator, reference: [16]u8, record: Record) !void {
         var buf: [128]u8 = undefined;
-        const value = try std.json.Stringify.valueAlloc(alloc, record, .{});
+        const value = try std.json.Stringify.valueAlloc(alloc, record, .{ .emit_null_optional_fields = false });
         defer alloc.free(value);
         try txn.put(try self.key(&buf, reference), value);
     }
@@ -122,18 +143,22 @@ pub const Namespace = struct {
         const state = try self.producer(txn, alloc, @splat(0));
         // Missing entries are idempotently acknowledged only by the producer that
         // actually allocated them. A replacement/foreign store is not retirement.
-        const seq = @import("completion_retirement.zig").sequence(reference);
-        if (!std.mem.eql(u8, &state.id, reference[0..8]) or seq == 0 or seq >= state.next) return error.CompletionWrongOwner;
+        const seq = localSequence(reference);
+        if (self.observation != isObservation(reference) or !std.mem.eql(u8, &state.id, reference[0..8]) or seq == 0 or seq >= state.next) return error.CompletionWrongOwner;
         var buf: [128]u8 = undefined;
         const value = txn.get(try self.key(&buf, reference)) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
-        return try std.json.parseFromSlice(Record, alloc, value, .{ .allocate = .alloc_always });
+        const parsed = std.json.parseFromSlice(Record, alloc, value, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidTransactionSessionRecord,
+        };
+        return parsed;
     }
     pub fn remove(self: Namespace, txn: anytype, alloc: std.mem.Allocator, reference: [16]u8) !void {
         var state = try self.producer(txn, alloc, @splat(0));
-        if (!std.mem.eql(u8, &state.id, reference[0..8])) return error.InvalidArgument;
+        if (self.observation != isObservation(reference) or !std.mem.eql(u8, &state.id, reference[0..8])) return error.InvalidArgument;
         var buf: [128]u8 = undefined;
         const target = try self.key(&buf, reference);
         _ = txn.get(target) catch |err| switch (err) {

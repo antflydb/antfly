@@ -139,6 +139,12 @@ pub fn normalizeReader(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
     return @import("hevc_inspection.zig").resolveReader(a, reader);
 }
 
+/// Normalize before publishing the reader so later HEVC seeks can reuse the
+/// verified random-access flags without repeating per-sample range requests.
+pub fn normalizeOwnedReader(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
+    return @import("hevc_inspection.zig").resolve(a, reader, true);
+}
+
 /// Put the active SPS first for consumers of the resolved record. Preserve all
 /// other identities for switches that keep the same geometry and color policy.
 pub fn prioritizeSps(a: std.mem.Allocator, config: []const u8, active: u4, control: media.source.Control) !?[]u8 {
