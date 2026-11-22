@@ -448,11 +448,11 @@ pub const ChunkCursor = struct {
         default_chunk_rows: usize = 0,
         selected_kv: bool = false,
         checkpoint_resume: bool = false,
-        backend: ops.BackendKind,
+        backend: ops.BackendKind = .native,
         pure_greedy: bool,
         resident_greedy_allowed: bool,
-        first_token_enabled: bool,
-        coalesce_token_limit: usize,
+        first_token_enabled: bool = false,
+        coalesce_token_limit: usize = 0,
     };
     pub const PlanDecision = union(enum) {
         none,
@@ -460,6 +460,20 @@ pub const ChunkCursor = struct {
         bypassed_prompt_cache: Plan,
         bypassed_geometry: Plan,
     };
+
+    pub fn selectNative(
+        backend: *const ComputeBackend,
+        config: gpt_arch.Config,
+        request: Options,
+        selection: Selection,
+    ) !ChunkCursor {
+        var physical = selection;
+        physical.backend = backend.kind();
+        physical.default_chunk_rows = nativeChunkRows(backend, config, request.prompt_tokens, 0) orelse 0;
+        physical.first_token_enabled = firstTokenEnabled();
+        physical.coalesce_token_limit = firstTokenCoalesceLimit();
+        return select(request, physical);
+    }
 
     /// Resolve the physical plan once before any chunk/KV mutation. Scheduler
     /// and task configuration become primitive request facts at this boundary.

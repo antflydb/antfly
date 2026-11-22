@@ -4971,7 +4971,7 @@ pub const NativeGenerationPipeline = struct {
 
         if (decode_state.isPaged() and seq_len > 1) {
             const query_len = prompt_ids.len;
-            var cursor = try decoder_prefill.ChunkCursor.select(.{
+            var cursor = try decoder_prefill.ChunkCursor.selectNative(&self.cb, self.gpt_config, .{
                 .query_tokens = query_len,
                 .prefilled_tokens = prefilled_tokens,
                 .prompt_tokens = seq_len,
@@ -4983,14 +4983,10 @@ pub const NativeGenerationPipeline = struct {
                 .leased_plan = if (self.scheduler_lease) |lease| if (lease.prefill_chunk_plan.isAdmitted()) lease.prefill_chunk_plan else null else null,
                 .configured_chunk_rows = config.prefill_chunk_size,
                 .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
-                .default_chunk_rows = decoder_prefill.nativeChunkRows(&self.cb, self.gpt_config, seq_len, 0) orelse 0,
                 .selected_kv = config.kv_cache_mode == .select_v1,
                 .checkpoint_resume = self.checkpoint_resume != null,
-                .backend = self.cb.kind(),
                 .pure_greedy = isPureGreedyConfig(config) and config.grammar == null,
                 .resident_greedy_allowed = allow_resident_greedy_token,
-                .first_token_enabled = enableCudaPrefillFirstToken(),
-                .coalesce_token_limit = cudaPrefillFirstTokenCoalesceTokenLimit(),
             });
             const admitted_plan = cursor.options.admitted_plan;
             switch (cursor.plan_decision) {
