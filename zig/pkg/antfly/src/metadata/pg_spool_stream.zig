@@ -162,9 +162,12 @@ pub const Owner = struct {
         return now;
     }
     pub fn poll(self: *Owner, svc: anytype, registry: anytype, policy: anytype, a: A, after: u64, maximum: u32, request: anytype) !Page {
+        var phase: enum { metadata, authorize, artifact_store, manifest, message, recheck_metadata, reauthorize } = .metadata;
+        errdefer if (zig017_return_error) |err| std.log.debug("retained replication poll failed phase={s} err={s}", .{ @tagName(phase), @errorName(err) });
         const retained_span = span: {
             var before = try load(svc, a, self.id, request);
             defer before.deinit();
+            phase = .authorize;
             _ = try self.check(policy, before.value, request);
             if (after != self.frontier or maximum == 0 or maximum > spool.max_message_bytes) return error.PgSpoolCursorInvalid;
             const slot = before.value.slot.?;
@@ -184,17 +187,22 @@ pub const Owner = struct {
         const entry = retained_span.entry;
         const record = retained_span.record;
         if (record.phase != .live or record.spec.messages < 3 or std.mem.allEqual(u8, &record.spec.wire, 0)) return error.ChangefeedCapabilityUnsupported;
+        phase = .artifact_store;
         const store = try registry.artifactStore(record.scope, request);
         if (store.namespace_identity == null or !same(store.namespace_identity.?, record.scope.namespace)) return error.PgSpoolStorageUnsupported;
         var cancellation: Cancellation(@TypeOf(request)) = .{ .request = request };
         var reader_store = try artifacts.Adapter.init(store, .{ .domain = record.scope.domain, .attempt = record.scope.attempt }, .read, cancellation.token());
         if (self.config.require_shared) try reader_store.requireShared();
+        phase = .manifest;
         const reader = try spool.Reader.open(a, &reader_store, record.manifest, .{ .feed = record.spec.feed, .epoch = record.spec.epoch, .definition = record.spec.definition, .projection = record.spec.projection, .storage = record.spec.storage });
         if (!record.spec.matchesPlan(reader.seal.plan) or !same(reader.seal.serialization, record.content) or reader.seal.root.messages != record.spec.messages) return error.PgSpoolCorrupt;
+        phase = .message;
         const bytes = (try reader.message(a, &reader_store, after - entry.start_lsn, maximum)) orelse return error.PgSpoolCorrupt;
         errdefer a.free(bytes);
+        phase = .recheck_metadata;
         var current = try load(svc, a, self.id, request);
         defer current.deinit();
+        phase = .reauthorize;
         _ = try self.check(policy, current.value, request);
         const retained = current.value.slot.?.spool.find(record.id) orelse return error.ChangefeedConflict;
         if (retained.phase != .live or !same(retained.manifest, record.manifest) or !same(retained.content, record.content)) return error.ChangefeedConflict;

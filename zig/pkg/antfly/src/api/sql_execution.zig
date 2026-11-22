@@ -2688,8 +2688,10 @@ pub const Adapter = struct {
                 try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
             } else try deletes.append(alloc, mutation.key);
         }
-        var response = @import("public_table_http.zig").handleNativeTableBatch(scratch, table.physical_name, .{ .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null }, self.server.tableApi(self.context)) catch
+        var response = @import("public_table_http.zig").handleNativeTableBatch(scratch, table.physical_name, .{ .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null }, self.server.tableApi(self.context)) catch |err| {
+            std.log.debug("native SQL write failed without a receipt err={s}", .{@errorName(err)});
             return error.SqlMutationOutcomeUnknown;
+        };
         defer response.deinit(scratch);
         self.outcome_transaction_id = mutationTransactionId(response.body);
         if (response.status == 200 or response.status == 201) return .committed;
@@ -2698,6 +2700,8 @@ pub const Adapter = struct {
         // is never converted into a retryable, definitely-aborted SQL result.
         const failure = classifyMutationFailure(response.status, response.body);
         self.outcome_transaction_id = failure.transaction_id;
+        if (failure.err == error.SqlMutationOutcomeUnknown)
+            std.log.debug("native SQL write outcome unknown status={d} has_transaction_id={}", .{ response.status, failure.transaction_id != null });
         return failure.err;
     }
 
