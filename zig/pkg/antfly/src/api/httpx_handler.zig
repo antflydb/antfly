@@ -15796,7 +15796,9 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     _ = try server.txn_sessions.beginForPrincipalWithSettingsAndId(alloc, .{}, node, principal, &.{}, null, corrupt_id);
     const corrupt_hex = std.fmt.bytesToHex(corrupt_id, .lower);
     const corrupt_reference = try durable.createLocalObservedRegistration(@splat(3), .{ .transaction_id = &corrupt_hex }, corrupt_id);
-    _ = (try server.txn_sessions.recordTerminalAbort(alloc, corrupt_id)).?;
+    const corrupt_guard = try server.txn_sessions.mutation(alloc, corrupt_id, node);
+    const corrupt_info = (try server.txn_sessions.readInfo(corrupt_id)).?;
+    try std.testing.expect(try server.txn_sessions.retireBeforeExecution(alloc, corrupt_guard, corrupt_info.version, false));
     const directory = try std.fmt.allocPrint(alloc, "\x00\x00__api_completion_consumers__:{s}", .{&corrupt_hex});
     defer alloc.free(directory);
     {
