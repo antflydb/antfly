@@ -1898,3 +1898,54 @@ extern "C" __global__ void termite_deberta_attention_stream_f32(
 ) {
 {{relative_stream_f32}}
 }
+
+// native-program:entry termite_head_major_attention_f32
+extern "C" __global__ void termite_head_major_attention_f32(ANTFLY_CUDA_HEAD_MAJOR_ATTENTION_PARAMS) {
+    extern __shared__ float probabilities[];
+    __shared__ float denominator;
+    const unsigned int row = blockIdx.x;
+    const unsigned int head_batch = row / query_rows;
+    const unsigned int query = row % query_rows;
+    const unsigned int lane = threadIdx.x % 32u;
+    const unsigned int warp = threadIdx.x / 32u;
+    const size_t key_base = (size_t)head_batch * key_rows * head_dim;
+    const size_t bias_base = (size_t)(head_batch / heads) * bias_batch_stride
+        + (size_t)(head_batch % heads) * bias_head_stride + (size_t)query * bias_query_stride;
+    for (unsigned int key = warp; key < key_rows; key += 4u) {
+        float dot = 0.0f;
+        for (unsigned int d = lane; d < head_dim; d += 32u) {
+            const size_t key_index = key_contract_last
+                ? (size_t)key * head_dim + d
+                : (size_t)d * key_rows + key;
+            dot += q[(size_t)row * head_dim + d] * k[key_base + key_index];
+        }
+        dot = antfly_warp_reduce_sum_f32(dot);
+        if (lane == 0u) {
+            float score = __fmul_rn(dot, score_scale);
+            if (bias != nullptr) score += bias[bias_base + (size_t)key * bias_key_stride];
+            probabilities[key] = score;
+        }
+    }
+    __syncthreads();
+    // Match the primitive softmax's ordered denominator reduction.
+    if (threadIdx.x == 0u) {
+        float max_score = -3.402823466e+38f;
+        for (unsigned int key = 0; key < key_rows; ++key) max_score = fmaxf(max_score, probabilities[key]);
+        float sum = 0.0f;
+        for (unsigned int key = 0; key < key_rows; ++key) {
+            const float weight = expf(probabilities[key] - max_score);
+            probabilities[key] = weight;
+            sum += weight;
+        }
+        denominator = sum;
+    }
+    __syncthreads();
+    for (unsigned int key = threadIdx.x; key < key_rows; key += blockDim.x) probabilities[key] /= denominator;
+    __syncthreads();
+    for (unsigned int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float value = 0.0f;
+        for (unsigned int key = 0; key < key_rows; ++key)
+            value += probabilities[key] * v[key_base + (size_t)key * head_dim + d];
+        output[(size_t)row * head_dim + d] = value;
+    }
+}

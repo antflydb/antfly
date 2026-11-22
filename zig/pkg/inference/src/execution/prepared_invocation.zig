@@ -109,6 +109,8 @@ pub const PreparedInvocation = struct {
     /// Backend-owned inline scalar metadata (for example preparation events).
     /// Contains no borrowed pointer and needs no per-invocation allocation.
     backend_cookie: usize = 0,
+    validate_stage_controls: ?*const fn (*PreparedInvocation, []const @import("../backends/session.zig").StageInput) anyerror!void = null,
+    stage_controls_validated: bool = false,
     dispatch: *const fn (*PreparedInvocation, Inputs, Placement, std.mem.Allocator, ?Control, ?storage.Capability) anyerror!Result,
     reclaim_idle: ?*const fn (*PreparedInvocation, ?Control) anyerror!bool = null,
     reclaim_idle_with_cleanup: ?*const fn (*PreparedInvocation, ?Control, @import("cleanup_context.zig").Context) anyerror!bool = null,

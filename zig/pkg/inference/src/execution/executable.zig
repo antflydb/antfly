@@ -141,14 +141,40 @@ pub fn prepareWithOptions(allocator: std.mem.Allocator, program: *const ModelPro
     }
     prepared.mutable_parameters = program.mutable_parameters;
     if (comptime !@import("build_options").enable_wasm) {
-        if (prepared.runtime.physical_pool) |pool| for (program.bindings) |binding| {
-            if (binding.kind == .state_input or binding.kind == .state_output) {
-                pool.cuda_frame_dispatch = false;
-                pool.metal_frame_dispatch = false;
+        if (prepared.runtime.physical_pool) |pool| {
+            var state_inputs: usize = 0;
+            var state_outputs: usize = 0;
+            var independent_cuda_state = true;
+            for (program.bindings) |binding| {
+                switch (binding.kind) {
+                    .state_input => state_inputs += 1,
+                    .state_output => state_outputs += 1,
+                    else => continue,
+                }
+                if (!qualifiedCudaStateSlot(pool, binding.node_id, binding.kind == .state_output))
+                    independent_cuda_state = false;
             }
-        };
+            if (state_inputs != 0 or state_outputs != 0) {
+                // State output banks must outlive the frame and may never
+                // borrow an ingress or turn a mutable input into a weight.
+                pool.cuda_frame_dispatch = pool.cuda_frame_dispatch and independent_cuda_state and state_inputs != 0 and state_outputs != 0;
+                pool.metal_frame_dispatch = false;
+                pool.metal_projection_region_candidate = false;
+            }
+        }
     }
     return prepared;
+}
+
+fn qualifiedCudaStateSlot(pool: *const @import("physical_buffers.zig").Pool, node: @import("ml").graph.NodeId, output: bool) bool {
+    const slot = pool.plan.slotForNode(node) orelse return false;
+    const shape = slot.desc.shape;
+    const count = shape.numElements() orelse return false;
+    if (slot.backend != .cuda or shape.dtype != .f32 or count <= 0 or slot.source_slot != null) return false;
+    if (!output) return slot.kind == .runtime_input and !slot.roles.graph_output;
+    if (slot.kind != .allocation or !slot.roles.graph_output or slot.reusable) return false;
+    const allocation = pool.plan.allocationById(slot.allocation) orelse return false;
+    return allocation.kind == .tensor and !allocation.reusable;
 }
 
 /// Borrow canonical IR and its cached analysis from an existing semantic owner.
@@ -478,7 +504,7 @@ test "prepared physical workspace is declared once reused and owned by its frame
     const a = std.testing.allocator;
     const ScratchKernel = struct {
         fn requirement(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) !ops.kernel_descriptor.WorkspaceRequirement {
-            return .{ .byte_size = descriptor.elements() * @sizeOf(f32) };
+            return .{ .byte_size = descriptor.elements() * @sizeOf(f32), .alignment = 8 };
         }
         fn run(raw: *anyopaque, request: ops.kernel_descriptor.Invocation) !bool {
             const compute: *Native = @ptrCast(@alignCast(raw));
@@ -521,6 +547,7 @@ test "prepared physical workspace is declared once reused and owned by its frame
     const allocation = executable.runtime.buffer_plan.?.allocations[scratch_id];
     try std.testing.expectEqual(@import("../graph/buffer_plan.zig").AllocationKind.workspace, allocation.kind);
     try std.testing.expectEqual(@as(u64, 32), allocation.byte_size);
+    try std.testing.expectEqual(@as(u32, 8), allocation.alignment);
     try std.testing.expect(allocation.first_use == 0 and allocation.last_use >= program.graph.nodeCount());
     const input = try cb.fromFloat32Shape(&.{ -4, -3, -2, -1, 0, 1, 2, 3 }, &.{ 2, 4 });
     defer cb.free(input);
@@ -1303,6 +1330,112 @@ test "prepared grouped projections retain resident assigned outputs across reuse
             for (expected, retained) |wanted, value| try std.testing.expectApproxEqAbs(wanted, value, 1e-6);
         }
     }
+}
+
+test "strict CUDA mixed ingress validates the current typed stage upload" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Context = @import("../backends/compute_context.zig").SharedBackendContext;
+    const ctx = Context.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.release();
+    const cb = ctx.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const s = ml.graph.Shape.init(.f32, &.{ 1, 2, 2 });
+    const ix = ml.graph.Shape.init(.i64, &.{1});
+    const table = try b.parameter("table", s);
+    const indices = try b.parameter("indices", ix);
+    const view = try b.reshape(table, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    const output = try b.gather(view, indices, ml.graph.Shape.init(.f32, &.{ 1, 2 }));
+    try graph.markOutput(output);
+    var program = try ModelProgram.init(a, &graph, &.{
+        .{ .name = "table", .node_id = table, .kind = .input },
+        .{ .name = "indices", .node_id = indices, .kind = .input },
+        .{ .name = "output", .node_id = output, .kind = .output },
+    });
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .compiled_required);
+    defer executable.deinit();
+    const facts = [_]@import("kernel_route.zig").InputBinding{
+        .{ .node_id = program.id_map[table], .value = .{ .imported_device = .{ .logical = s, .implementation = .{ .context = cb.ptr, .table = cb.vtable } } } },
+        .{ .node_id = program.id_map[indices], .value = .{ .imported_device = .{ .logical = ix, .implementation = .{ .context = cb.ptr, .table = cb.vtable } } } },
+    };
+    const routes = (try executable.runtime.physical_pool.?.prepareRoutes(&facts)) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    try std.testing.expect(routes.pool.completeOwnedPayload() != null);
+    const device_table = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 2, 2 });
+    defer cb.free(device_table);
+    try std.testing.expectEqual(@as(usize, 1), routes.pool.completeOwnedPayload().?.aliases);
+    for ([_]i64{ 1, -2, 2 }) |index| {
+        const ct = (try cb.fromReadOnlyBytes(std.mem.asBytes(&index), .i64, &.{1})).?;
+        defer cb.free(ct);
+        const options = interpreter.ExecuteOptions{ .prepared_routes = routes, .runtime_inputs = &.{ .{ .node_id = program.id_map[table], .value = device_table }, .{ .node_id = program.id_map[indices], .value = ct } }, .activation_readbacks = .forbidden, .collect_partition_stats = true };
+        if (index == 2) {
+            try std.testing.expectError(error.IndexOutOfBounds, executable.run(a, options));
+            continue;
+        }
+        var result = try executable.run(a, options);
+        defer result.deinit(&executable.runtime);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.index_metadata_host_access_bytes);
+        const values = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, if (index == 1) &.{ 3, 4 } else &.{ 1, 2 }, values);
+    }
+}
+
+test "CUDA strict gather captures with an exact immutable integer literal" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Context = @import("../backends/compute_context.zig").SharedBackendContext;
+    const context = Context.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer context.release();
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const table_shape = ml.graph.Shape.init(.f32, &.{ 4, 2 });
+    const table = try b.parameter("table", table_shape);
+    const index = try b.tensorConstBytes(std.mem.asBytes(&[_]i64{ 2, -1, 0 }), ml.graph.Shape.init(.i64, &.{3}));
+    const gathered = try b.gather(table, index, ml.graph.Shape.init(.f32, &.{ 3, 2 }));
+    var output = gathered;
+    for (0..8) |_| output = try b.add(output, gathered);
+    try graph.markOutput(output);
+    var program = try ModelProgram.init(a, &graph, &.{
+        .{ .name = "table", .node_id = table, .kind = .state_input },
+        .{ .name = "output", .node_id = output, .kind = .state_output },
+    });
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .compiled_required);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool.?;
+    const fact = @import("kernel_route.zig").InputBinding{ .node_id = program.id_map[table], .value = .{ .imported_host = .{ .logical = table_shape, .target = .cuda, .owned_ingress = true } } };
+    const routes = (try pool.prepareRoutes(&.{fact})) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    try std.testing.expect(routes.pool.completeOwnedPayload() != null);
+    var host = try @import("../backends/tensor.zig").Tensor.initFloat32(a, "table", &.{ 4, 2 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer host.deinit();
+    const inputs = [_]@import("host_ingress.zig").Input{.{ .node_id = program.id_map[table], .value = &host }};
+    var replays: u64 = 0;
+    for (0..4) |iteration| {
+        host.asFloat32Mut()[0] = @floatFromInt(iteration);
+        var result = try executable.run(a, .{ .prepared_routes = routes, .host_inputs = &inputs, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+        defer result.deinit(&executable.runtime);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.index_metadata_host_access_bytes);
+        replays += result.stats.physical_graph_replays;
+        const values = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 45, 54, 63, 72, host.asFloat32()[0] * 9, 18 }, values);
+    }
+    try std.testing.expect(replays > 0);
 }
 
 test "prepared CUDA gather uses assigned control scratch and validates current exact indices" {
@@ -2231,8 +2364,8 @@ test "prepared immutable literal selections lend only their own pinned bank cred
     defer first_claim.release();
     var second_claim = try store.claimImmutableFor(cap.identity, second);
     defer second_claim.release();
-    try std.testing.expectEqual(store.literals[0].data.len * 4, first_claim.totals.credit.host_scratch_bytes);
-    try std.testing.expectEqual(store.literals[1].data.len * 4, second_claim.totals.credit.host_scratch_bytes);
+    try std.testing.expectEqual(store.literals[0].data.len, first_claim.totals.credit.host_scratch_bytes);
+    try std.testing.expectEqual(store.literals[1].data.len, second_claim.totals.credit.host_scratch_bytes);
     var all_claim = try store.claimImmutable(cap.identity);
     defer all_claim.release();
     try std.testing.expectEqual(@as(usize, 48), all_claim.totals.credit.host_scratch_bytes);
@@ -2688,6 +2821,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
     pool.native_frame_dispatch = false;
     pool.cuda_frame_dispatch = false;
     pool.metal_frame_dispatch = false;
+    pool.metal_projection_region_candidate = false;
     pool.coverage_backend = .{ .ptr = executable.runtime.default_backend.ptr, .vtable = executable.runtime.default_backend.vtable };
     if (comptime @import("build_options").enable_metal) {
         if (executable.runtime.default_backend.kind() == .metal and @import("device_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
@@ -2705,31 +2839,49 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 }
             }
             if (targets != 1) return;
-            // Nonblocking compatibility decline if this cold executable was built
-            // beneath an external owner. Never wait while an unknown outer lane is
-            // held, and never reinterpret its legacy scope as managed authority.
-            var metadata = @import("backend_operation.zig").enter(executable.runtime.default_backend.*, graph, null, .metadata) catch |err| switch (err) {
-                error.QueueFull => return,
-                else => return err,
-            };
+            const Executor = @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor;
+            const projection_head = if (ops.kernel_descriptor.projectionHead(graph)) |head|
+                head.linears[0].operation.linear.rows > 1 or head.form == .independent
+            else
+                false;
+            const operation = @import("backend_operation.zig");
+            var metadata: operation.Scope = .{};
             defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-            if (metadata.token() == null) return;
+            if (!projection_head) {
+                // Primitive attestation reads the executor's live cached
+                // plans. A projection only checks immutable owner identity
+                // here. Its actual region is attested under metadata during
+                // variant preparation, after any weight construction ends.
+                operation.enterInto(executable.runtime.default_backend, graph, null, .metadata, &metadata) catch |err| switch (err) {
+                    error.QueueFull => return,
+                    else => return err,
+                };
+                if (metadata.token() == null) return;
+            }
+            var active_partitions: usize = 0;
             for (plan.base.partitions, 0..) |part, index| {
                 var active = false;
+                var active_compute = false;
                 for (part.node_ids) |id| {
                     if (id >= analysis.reachable.len) return;
                     if (!analysis.reachable[id]) continue;
                     if (plan.base.node_assignment[id] != index or graph.node(id).op == .fused_from_float32) return;
                     active = true;
+                    active_compute = active_compute or graph.node(id).op != .parameter;
                 }
                 if (!active) continue;
                 if (part.backend != .metal or plan.device_assignment[index] != 0) return;
+                if (projection_head and !active_compute) continue;
+                active_partitions += 1;
                 const actual = part.executor orelse return;
                 var owned = false;
                 for (compiled) |cached| if (cached.partition_idx == index and actual.ptr == cached.executor.ptr and actual.vtable == cached.executor.vtable) {
                     owned = true;
                 };
-                if (!owned or !try @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
+                if (!owned) return;
+                if (projection_head) {
+                    if (active_partitions != 1 or !Executor.ownsPartition(actual, graph, executable.runtime.default_backend)) return;
+                } else if (!try Executor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
             }
             for (analysis.reachable, 0..) |active, id| {
                 if (!active) continue;
@@ -2741,7 +2893,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 };
                 if (count != 1) return;
             }
-            pool.metal_frame_dispatch = true;
+            pool.metal_projection_region_candidate = projection_head and active_partitions == 1;
+            pool.metal_frame_dispatch = !projection_head;
             return;
         }
     }

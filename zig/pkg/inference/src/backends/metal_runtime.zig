@@ -5113,6 +5113,14 @@ pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytyp
     return finishHostOutput(output, &shape, rc);
 }
 
+fn rmsNormDeviceRows(input: MetalTensor, weight: MetalTensor, width: usize) ?usize {
+    if (!input.isDevice() or !weight.isDevice() or input.dtype != .f32 or weight.dtype != .f32) return null;
+    if (width == 0 or input.ndim() == 0 or input.elemCount() == 0 or weight.elemCount() != width) return null;
+    const dim = std.math.cast(i32, width) orelse return null;
+    if (input.dim(input.ndim() - 1) != dim) return null;
+    return input.elemCount() / width;
+}
+
 pub fn decoderRuntimeApplyRmsNormWeightDevice(
     self: anytype,
     input: MetalTensor,
@@ -5122,11 +5130,7 @@ pub fn decoderRuntimeApplyRmsNormWeightDevice(
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (!input.isDevice() or !weight.isDevice()) return null;
-    if (hidden_size == 0 or input.ndim() != 2 or weight.ndim() != 1) return null;
-    const rows: usize = @intCast(input.dim(0));
-    if (rows == 0 or @as(usize, @intCast(input.dim(1))) != hidden_size) return null;
-    if (@as(usize, @intCast(weight.dim(0))) != hidden_size) return null;
+    const rows = rmsNormDeviceRows(input, weight, hidden_size) orelse return null;
 
     var output = try MetalTensor.deviceAllocate(runtime, rows * hidden_size * @sizeOf(f32), .private, input.shape());
     errdefer output.deinit();
@@ -5263,12 +5267,8 @@ pub fn decoderRuntimeApplyRmsNormWeightDeviceInto(
 ) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
-    if (!input.isDevice() or !weight.isDevice() or !output.isDevice()) return false;
-    if (hidden_size == 0 or input.ndim() != 2 or weight.ndim() != 1 or output.ndim() != 2) return false;
-    const rows: usize = @intCast(input.dim(0));
-    if (rows == 0 or @as(usize, @intCast(input.dim(1))) != hidden_size) return false;
-    if (@as(usize, @intCast(weight.dim(0))) != hidden_size) return false;
-    if (@as(usize, @intCast(output.dim(0))) != rows or @as(usize, @intCast(output.dim(1))) != hidden_size) return false;
+    const rows = rmsNormDeviceRows(input, weight, hidden_size) orelse return false;
+    if (!output.isDevice() or output.dtype != .f32 or !std.mem.eql(i32, output.shape(), input.shape())) return false;
 
     const rc = termite_metal_decode_runtime_apply_rms_norm_weight_device(
         runtime,
@@ -45354,6 +45354,28 @@ test "metal native owned shared F32 layernorm preserves copies cancellation and 
         try std.testing.expect(provider.raw_layer_norm_slot_biases[slot] == null);
     }
     try std.testing.expectEqual(baseline.norm_bytes, runtimeMemorySnapshot(runtime).norm_bytes);
+}
+
+test "device RMSNorm keeps batched tensor rank on Metal" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const input_values = [_]f32{ 1, 2, 3, 4, 2, 4, 6, 8 };
+    const gain = [_]f32{ 0.5, 1, 1.5, 2 };
+    var input = try testDeviceTensorFromSlice(runtime, &input_values, &.{ 1, 2, 4 });
+    defer input.deinit();
+    var weight = try testDeviceTensorFromSlice(runtime, &gain, &.{ 1, 1, 4 });
+    defer weight.deinit();
+    var output = (try decoderRuntimeApplyRmsNormWeightDevice(&provider, input, weight, 4, 1e-6)) orelse return error.UnexpectedNull;
+    defer output.deinit();
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 4 }, output.shape());
+    const actual = try output.toHostSlice();
+    for (actual, input_values, 0..) |value, x, index| {
+        const denominator: f32 = if (index < 4) @sqrt(@as(f32, 7.500001)) else @sqrt(@as(f32, 30.000001));
+        try std.testing.expectApproxEqAbs(x * gain[index % 4] / denominator, value, 1e-6);
+    }
 }
 
 test "metal native embeddinggemma2 row RMS policy is model scoped and matches independent F64" {

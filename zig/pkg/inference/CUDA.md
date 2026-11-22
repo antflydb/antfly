@@ -432,6 +432,14 @@ its native context policy. Preload configuration accepts `cuda_precision`:
 with `UnqualifiedGlinerCudaPrecision` until release evidence is available.
 Precision is part of both resident and in-flight model identity.
 
+The public Decide-1B CUDA route uses the pinned all-F32 checkpoint and the
+existing span service envelope of one request item, up to 64 prepared sequences,
+and up to 1,024 encoder tokens per sequence. The 7,999-token marker-classifier
+measurements and the split Q8_0 benchmark use separate qualification profiles.
+The pinned Multi-Decide checkpoint has separate CUDA rows for bounded,
+single-window extraction and typed decisions. Those rows preserve the
+individual prompt bounds from the captured reference cases.
+
 Diagnostic constructors may measure reduced-precision candidates. For
 Decide-1B only encoder matrix weights are reduced; embeddings, norms,
 classifier weights, and logits remain FP32, and attention uses masked FP16

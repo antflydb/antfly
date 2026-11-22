@@ -511,6 +511,32 @@ unsigned int log_softmax
     unsigned int lhs_contract_last, \
     unsigned int rhs_contract_last
 
+#define ANTFLY_CUDA_HEAD_MAJOR_ATTENTION_PARAMS \
+    float* output, \
+    const float* q, \
+    const float* k, \
+    const float* v, \
+    const float* bias, \
+    unsigned int query_rows, \
+    unsigned int key_rows, \
+    unsigned int heads, \
+    unsigned int head_dim, \
+    float score_scale, \
+    unsigned int key_contract_last, \
+    unsigned int bias_batch_stride, \
+    unsigned int bias_head_stride, \
+    unsigned int bias_query_stride, \
+    unsigned int bias_key_stride
+
+#define ANTFLY_CUDA_SHORT_ROW_MATMUL_PARAMS \
+    float* output, \
+    const float* lhs, \
+    const float* rhs, \
+    unsigned int m, \
+    unsigned int n, \
+    unsigned int k, \
+    unsigned int epilogue
+
 #define ANTFLY_CUDA_PRIMITIVE_GATHER_PARAMS \
     float* output, \
     const float* input, \

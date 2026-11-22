@@ -37,6 +37,7 @@ pub const NativePolicy = struct {
 };
 
 pub fn createNative(allocator: std.mem.Allocator, weights: *native.WeightStore, budget: ?*memory.RunBudget, io: ?std.Io, policy: NativePolicy) !ops.ComputeBackend {
+    if (comptime !@import("build_options").enable_native) return error.NativeNotEnabled;
     // The default path keeps its exact allocator. Optional instrumentation
     // starts before constructing the temporary compute and retains only State
     // metadata through the enclosing synchronous dispatch observation.
