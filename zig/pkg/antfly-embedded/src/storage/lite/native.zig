@@ -8225,7 +8225,11 @@ pub const NativeFile = struct {
         if (builtin.is_test) if (self.test_fail_redo_frontier_sync) |err| return err;
         try self.syncRedoData();
         redo.frontier_cache = publication;
-        self.noteSyncedRedoFrontier(self.regionForInode() catch null, publication.frontier);
+        if (self.regionForInode() catch null) |region| {
+            self.noteSyncedRedoFrontier(region, publication.frontier);
+        } else {
+            try slots.noteSyncedWithoutRegion(self.file, io, publication.frontier);
+        }
     }
 
     fn syncRedoData(self: *NativeFile) !void {
@@ -8529,7 +8533,13 @@ pub const NativeFile = struct {
             const protected = self.header.protected_redo and !self.no_sync;
             var use_persisted_frontier = protected and (owns_recovery_fence or sidecar_fence != null);
             const live_writer = protected and if (scan_region) |r| r.foreignLiveWriter(0) else false;
-            if (protected and self.read_only and !holds_authority and sidecar_fence == null and replay_ceiling != null and !live_writer) {
+            const synced_without_region: ?redo_log.Frontier = if (protected and self.read_only and extent_fence != null and !live_writer and !use_persisted_frontier) proof: {
+                const synced = (try redoFrontierSlots(self.header).readSyncedWithoutRegion(self.file, io)) orelse break :proof null;
+                if (synced.sequence <= (replay_ceiling orelse 0)) break :proof null;
+                break :proof synced;
+            } else null;
+            if (synced_without_region != null) use_persisted_frontier = true;
+            if (protected and self.read_only and !holds_authority and sidecar_fence == null and replay_ceiling != null and !live_writer and synced_without_region == null) {
                 switch (self.holdSidecarReadFence(io)) {
                     .held => |fence| {
                         sidecar_fence = fence;
@@ -8539,7 +8549,7 @@ pub const NativeFile = struct {
                     .own, .busy => {},
                 }
             }
-            if (replay_ceiling == null and !holds_authority and sidecar_fence == null) {
+            if (replay_ceiling == null and !holds_authority and sidecar_fence == null and synced_without_region == null) {
                 switch (self.holdSidecarReadFence(io)) {
                     .held => |fence| {
                         sidecar_fence = fence;
@@ -8584,8 +8594,11 @@ pub const NativeFile = struct {
             if (protected and (replay_ceiling == null or use_persisted_frontier)) {
                 observed_checkpoint = folded_through;
                 published_fold_start = 0;
-                const durable = (try redoFrontierSlots(self.header).readLatest(self.file, io)) orelse return error.NativeRedoLogCorrupt;
-                const frontier = durable.frontier;
+                const frontier = synced_without_region orelse frontier: {
+                    const durable = (try redoFrontierSlots(self.header).readLatest(self.file, io)) orelse return error.NativeRedoLogCorrupt;
+                    break :frontier durable.frontier;
+                };
+                if (synced_without_region != null and checkpoint.commit_sequence > frontier.sequence) return error.FileBusy;
                 replay_ceiling = @max(frontier.sequence, checkpoint.commit_sequence);
                 if ((promised_durable orelse 0) > replay_ceiling.?) return error.NativeRedoLogCorrupt;
                 promised_durable = frontier.sequence;
@@ -8593,7 +8606,7 @@ pub const NativeFile = struct {
                     persisted_frontier = frontier;
                     if (recovered_under_writer_fence) writer_frontier = frontier;
                     if (recovered_under_writer_fence or (self.read_only and (use_persisted_frontier or !live_watermark))) {
-                        const already_synced = if (scan_region) |r|
+                        const already_synced = if (synced_without_region != null and !full_recovery_sync) true else if (scan_region) |r|
                             r.hasSyncedFrontier(frontier.sequence, frontier.generation, frontier.end_offset, full_recovery_sync)
                         else
                             false;
@@ -10024,15 +10037,23 @@ pub const NativeFile = struct {
     /// actually see the records this call just applied.
     fn refreshFencedRedoFromDisk(self: *NativeFile, io: std.Io) !bool {
         const redo = self.redo orelse return false;
-        const fence = switch (self.holdSidecarReadFence(io)) {
+        const slots = redoFrontierSlots(self.header);
+        const fence: ?std.Io.File = switch (self.holdSidecarReadFence(io)) {
             .held => |held| held,
-            .absent, .own, .busy => return false,
+            .busy, .own => null,
+            .absent => return false,
         };
-        defer fence.close(io);
-        const persisted = (try redoFrontierSlots(self.header).readLatest(self.file, io)) orelse return error.NativeRedoLogCorrupt;
-        // Checkpoint-only groups can advance without writing a WAL frontier.
-        const slots = loadCheckpointSlots(self.file, io, self.header.page_size, try self.file.length(io));
-        if (@max(persisted.frontier.sequence, slots[0].commit_sequence, slots[1].commit_sequence) <= redo.durable_sequence) return false;
+        defer if (fence) |held| held.close(io);
+        if (fence == null) {
+            if (!self.header.segmented_redo) return false;
+            const synced = (try slots.readSyncedWithoutRegion(self.file, io)) orelse return false;
+            if (synced.sequence <= redo.durable_sequence) return false;
+        } else {
+            const persisted = (try slots.readLatest(self.file, io)) orelse return error.NativeRedoLogCorrupt;
+            // Checkpoint-only groups can advance without writing a WAL frontier.
+            const checkpoints = loadCheckpointSlots(self.file, io, self.header.page_size, try self.file.length(io));
+            if (@max(persisted.frontier.sequence, checkpoints[0].commit_sequence, checkpoints[1].commit_sequence) <= redo.durable_sequence) return false;
+        }
         const header = self.header;
         errdefer {
             self.header = header;
@@ -12088,7 +12109,23 @@ pub const NativeFile = struct {
     /// this call ever runs once.
     fn publishRedoLogState(self: *NativeFile) void {
         const redo = if (self.redo) |*r| r else return;
-        const region = (self.regionForInode() catch return) orelse return;
+        const region = (self.regionForInode() catch null) orelse {
+            // The confirmed checkpoint covers the complete visible cut,
+            // even when this publication did not append a WAL record.
+            if (self.header.protected_redo and self.holdsWriterAuthority() and
+                !self.no_sync and self.durable_header == null and
+                redo.checkpoint_sequence == redo.syncedSequence() and
+                self.activeCheckpoint().redo_folded_through == redo.checkpoint_sequence and
+                self.activeCheckpoint().commit_sequence == redo.checkpoint_sequence)
+            {
+                redoFrontierSlots(self.header).noteSyncedWithoutRegion(self.file, self.runtimeIo(), .{
+                    .sequence = redo.checkpoint_sequence,
+                    .generation = 0,
+                    .end_offset = 0,
+                }) catch {};
+            }
+            return;
+        };
         if (self.inode_lock_ref.load(.acquire)) |entry| _ = entry.self_published_durable_sequence.fetchMax(redo.durable_sequence, .acq_rel);
         region.publishReadyLogState(.{
             .checkpoint_sequence = redo.checkpoint_sequence,
@@ -39658,7 +39695,10 @@ test "lite redo log vacuum preserves the write path: commits after vacuum match 
     // `putDocument` call path, not necessarily the single-fsync-per-group
     // figure group commit achieves through `docstore.Store`), it must be
     // identical on both sides, not merely "non-zero" on the vacuumed one.
-    try std.testing.expectEqual(baseline_writes, subject_writes);
+    // The old generation can keep its region mapped across the rename.
+    // Until a new region is available, each group has one visibility write.
+    const fallback_writes: u64 = if ((try subject.regionForInode()) == null) updates else 0;
+    try std.testing.expectEqual(baseline_writes + fallback_writes, subject_writes);
     try std.testing.expectEqual(baseline_syncs, subject_syncs);
     try std.testing.expect(subject_syncs > 0);
 
@@ -40531,7 +40571,6 @@ test "lite redo readers recover a newer disk frontier behind a live mapped publi
     try writer.beginTransaction();
     try writer.putDocument("beta", "two");
     try writer.commitTransaction();
-    try writer.releaseWriterOwnership();
 
     try std.testing.expectEqual(published, region.readLogStateChecked().?);
     try std.testing.expect(region.isLogStateLive(published));

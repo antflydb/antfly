@@ -195,6 +195,20 @@ pub const FrontierSlots = struct {
 
     /// Each logical slot has one copy on each frontier page. Updating it
     /// leaves the other logical slot intact on both pages.
+    // A visibility hint for writers that cannot publish to the shared
+    // lock region. It is written after the frontier barrier and can be
+    // lost on crash. Recovery still uses the mirrored frontier itself.
+    pub fn noteSyncedWithoutRegion(self: FrontierSlots, file: File, io: Io, frontier: Frontier) !void {
+        const raw = frontier.encode();
+        try file.writePositionalAll(io, &raw, self.offsets[0] + 2 * Frontier.encoded_len);
+    }
+
+    pub fn readSyncedWithoutRegion(self: FrontierSlots, file: File, io: Io) !?Frontier {
+        var raw: [Frontier.encoded_len]u8 = undefined;
+        if (try file.readPositionalAll(io, &raw, self.offsets[0] + 2 * Frontier.encoded_len) != raw.len) return null;
+        return Frontier.decode(&raw);
+    }
+
     pub fn writeSlot(self: FrontierSlots, file: File, io: Io, publication: Published) !void {
         const raw = publication.frontier.encode();
         try file.writePositionalAll(io, &raw, self.offsets[publication.slot]);
