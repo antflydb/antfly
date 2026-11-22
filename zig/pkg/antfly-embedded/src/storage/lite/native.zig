@@ -7015,7 +7015,10 @@ pub const NativeFile = struct {
     /// spoken for by the plain-reader-open/`acquireReaderFence`/
     /// `captureFullReadSnapshot` triad). Claimed lazily on first refresh,
     /// released in `close()`.
-    cross_process_redo_reader_slot: ?u32 = null,
+    cross_process_redo_reader_slot: ?struct {
+        region: *shared_lock_region.Region,
+        index: u32,
+    } = null,
     reader_window_depth: usize = 0,
     reader_window_lock: ?inode_lock.Handle = null,
     /// The reuse frontier `acquireEpochReuseLock` last read directly from
@@ -7935,59 +7938,22 @@ pub const NativeFile = struct {
     /// calls this on `prepared`, after `inode_lock.open` on its tmp path).
     fn attachFreshRedoState(self: *NativeFile, io: std.Io, offset: u64, capacity: u64, durable_sequence: u64, checkpoint_sequence: u64) !void {
         std.debug.assert(self.redo == null);
+        self.redo = try self.prepareFreshRedoState(io, offset, capacity, durable_sequence, checkpoint_sequence);
         self.manifest_commits_enabled = false;
+        if (!self.read_only) self.publishRedoLogState();
+    }
+
+    fn prepareFreshRedoState(self: *const NativeFile, io: std.Io, offset: u64, capacity: u64, durable_sequence: u64, checkpoint_sequence: u64) !RedoCommitState {
         const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
         const shared = try inode_lock.ensureRedoOverlay(entry, io, {}, struct {
-            // Nothing to replay: the shared overlay this populates stays
-            // empty until the first commit appends to it.
             fn populate(_: void, _: *redo_overlay.SharedRedoOverlay, _: Allocator) anyerror!void {}
         }.populate);
-        // `durable_sequence = checkpoint_sequence`: the same convention
-        // `recoverRedoLog` uses when its own replay finds nothing past the
-        // checkpoint (`outcome.last_sequence orelse checkpoint.commit_sequence`,
-        // this file's own doc comment a few lines up) -- an empty log
-        // attached to an already-durable checkpoint means that checkpoint's
-        // sequence *is* the highest durable one so far, not zero. For
-        // `enableRedoLog`'s brand-new-file caller this is a no-op either
-        // way (the bootstrap checkpoint's own sequence is already the
-        // zero/initial value); for `prepareVacuum`'s caller it is load-
-        // bearing -- the vacuum's own checkpoint just became durable via a
-        // real sync, not a log append, and `durableSequence()`/every
-        // caller that compares an acknowledged write's sequence against it
-        // (`Store.Ticket`'s own durability wait, cross-process readers via
-        // `publishRedoLogState` below) must see that immediately, not
-        // revert to "nothing is durable yet" the moment a vacuum lands.
-        //
-        // perf/lwa-fold-boundary: `durable_sequence` (the tip) and
-        // `checkpoint_sequence` (the fold boundary) are no longer always
-        // the same number, so they are now two separate parameters rather
-        // than one reused for both. `enableRedoLog`'s own caller still
-        // passes the same value for each (nothing has diverged yet for a
-        // brand-new file), and a genuinely vacuum-compacted `prepared`
-        // also still passes the same value for each (`prepareVacuum`'s
-        // own compaction folds everything, so its new checkpoint's
-        // `redo_folded_through == commit_sequence` by construction) --
-        // but `replaceWithPreparedGeneration`'s own caller, reached from
-        // this same shared tail, can legitimately pass two different
-        // ones: if `prepared`'s inode already carries a shared overlay
-        // with content durably logged past its own last real fold (not
-        // true for an ordinary vacuum-built `prepared`, which is never
-        // itself redo-attached before this call -- but true whenever a
-        // caller hands this a `prepared` that was written to directly
-        // under redo, as the inode's shared overlay persists past the
-        // `self.redo = null` reset above, independent of whether this
-        // function's own freshly-attached state's fold boundary covers
-        // it), the tip must still name every such durably-logged
-        // version (so `committedSequence()`/`readMark`-based reads keep
-        // resolving them through that still-live overlay), while the
-        // fold boundary must stay at the real value or a later
-        // `checkpointRedoLog` on `self` would wrongly treat that
-        // unfolded content as already covered (`redo_folded_through`'s
-        // own doc comment).
-        self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .shared = shared, .checkpoint_sequence = checkpoint_sequence, .durable_sequence = durable_sequence };
-        // An empty, durable log: publish its boundary now, so a cold reader
-        // never waits on this writer's first commit to learn it.
-        if (!self.read_only) self.publishRedoLogState();
+        return .{
+            .writer = redo_log.Writer.init(self.file, io, offset, capacity),
+            .shared = shared,
+            .checkpoint_sequence = checkpoint_sequence,
+            .durable_sequence = durable_sequence,
+        };
     }
 
     /// Decodes one redo record's logical mutations and page images into the
@@ -10248,12 +10214,15 @@ pub const NativeFile = struct {
     pub fn refreshCrossProcessRedoOverlay(self: *NativeFile) !void {
         const region = try self.regionForInode();
         const io = self.runtimeIo();
+        if (self.cross_process_redo_reader_slot) |pin| {
+            if (region != pin.region) self.releaseCrossProcessRedoReaderSlot();
+        }
         if (self.read_only and self.header.protected_redo and
             (region == null or !region.?.hasReadyLogWriter()) and try self.refreshFencedRedoFromDisk(io))
         {
-            if (region) |mapped| if (self.cross_process_redo_reader_slot) |slot| {
-                mapped.pinReader(slot, @max(self.redo.?.durable_sequence, 1));
-            };
+            if (self.cross_process_redo_reader_slot) |pin| {
+                pin.region.pinReader(pin.index, @max(self.redo.?.durable_sequence, 1));
+            }
             return;
         }
         const mapped = region orelse return;
@@ -10262,10 +10231,10 @@ pub const NativeFile = struct {
         var extent_fence: ?inode_lock.Handle = null;
         defer if (extent_fence) |fence| fence.release(io);
 
-        const slot = self.cross_process_redo_reader_slot orelse blk: {
+        const slot = if (self.cross_process_redo_reader_slot) |pin| pin.index else blk: {
             const pid: u32 = @bitCast(std.c.getpid());
             const claimed = try mapped.claimReaderSlot(pid);
-            self.cross_process_redo_reader_slot = claimed;
+            self.cross_process_redo_reader_slot = .{ .region = mapped, .index = claimed };
             break :blk claimed;
         };
         // Pin at what we already have *before* reading anything new.
@@ -10607,13 +10576,26 @@ pub const NativeFile = struct {
             if (std.meta.eql(previous, state)) return;
         }
         self.lifetime_writer_observed = state;
-        if (state.holder != 0 or state.head != state.tail) return;
+        if (state.holder != 0 or state.head != state.tail) {
+            region.repairWriterAdmission();
+            const repaired = region.writerAdmissionState();
+            self.lifetime_writer_observed = repaired;
+            if (repaired.holder != 0 or repaired.head != repaired.tail) return;
+        }
         if (!region.tryAcquireWriterFair(antfly_platform.process.currentId() orelse 0)) {
             self.lifetime_writer_observed = null;
             return;
         }
         self.lifetime_writer_claimed = true;
         noteOwnSidecarWriterClaim(self.runtimeIo(), registration, region.writerClaim());
+    }
+
+    fn releaseCrossProcessRedoReaderSlot(self: *NativeFile) void {
+        if (self.cross_process_redo_reader_slot) |pin| {
+            pin.region.unpinReader(pin.index);
+            pin.region.releaseReaderSlot(pin.index);
+            self.cross_process_redo_reader_slot = null;
+        }
     }
 
     fn releaseLifetimeWriterRegion(self: *NativeFile) void {
@@ -10691,17 +10673,7 @@ pub const NativeFile = struct {
             inode_lock.unpinReader(entry, io, .{ .data = self.reader_pin_sequence, .metadata = self.reader_pin_sequence });
             self.reader_pin_entry = null;
         }
-        // Same ordering requirement as `reader_pin_entry` just above:
-        // releasing this slot needs `regionForInode()`, which needs
-        // `self.inode_lock_ref` still live, so it must run before the
-        // `inode_lock.unref` below.
-        if (self.cross_process_redo_reader_slot) |slot| {
-            if (self.regionForInode() catch null) |region| {
-                region.unpinReader(slot);
-                region.releaseReaderSlot(slot);
-            }
-            self.cross_process_redo_reader_slot = null;
-        }
+        self.releaseCrossProcessRedoReaderSlot();
         if (self.inode_lock_ref.load(.acquire)) |entry| {
             inode_lock.unref(entry, io);
             self.inode_lock_ref.store(null, .release);
@@ -23551,19 +23523,38 @@ pub const NativeFile = struct {
     /// closed normally after this returns.
     pub fn replaceWithPreparedGeneration(self: *NativeFile, prepared: *NativeFile) !GenerationPublicationOutcome {
         if (self.read_only or prepared.read_only) return error.ReadOnly;
-        if (std.mem.eql(u8, self.path, prepared.path)) return error.InvalidNativeSnapshotPath;
+        if (std.mem.eql(u8, self.path, prepared.path) or self.sameDataFile(prepared)) return error.InvalidNativeSnapshotPath;
 
         const io = self.runtimeIo();
-        const prepared_entry = prepared.inode_lock_ref.load(.acquire);
-        var binding: ?[]u8 = if (prepared_entry) |entry|
-            try inode_lock.prepareRebind(entry, io, prepared.file, self.path)
-        else
-            null;
+        const prepared_entry = prepared.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
+        var binding: ?[]u8 = try inode_lock.prepareRebind(prepared_entry, io, prepared.file, self.path);
         defer if (binding) |owned| std.heap.page_allocator.free(owned);
         try prepared.preparePrivatePublication(self.path);
-        try renameFilePath(io, prepared.path, self.path);
+        var adopted_redo: ?RedoCommitState = null;
+        if (prepared.header.redo_log_capacity != 0) {
+            const tip = prepared.activeCheckpoint();
+            adopted_redo = try prepared.prepareFreshRedoState(io, prepared.header.redoOffset(), prepared.header.redo_log_capacity, tip.commit_sequence, tip.redo_folded_through);
+            if (prepared.redo) |redo| {
+                adopted_redo.?.writer.tail = redo.writer.tail;
+                adopted_redo.?.writer.salt = redo.writer.salt;
+                adopted_redo.?.writer.last_sequence = redo.writer.last_sequence;
+            }
+        }
+        {
+            // A same-process opener of the published inode must wait until
+            // the registry entry names the destination before borrowing it.
+            prepared_entry.mutex.lockUncancelable(io);
+            defer prepared_entry.mutex.unlock(io);
+            const named = try storage_file_identity.nativePathIdentity(prepared.path);
+            if (!std.meta.eql(named, prepared_entry.identity)) return error.FileBusy;
+            try renameFilePath(io, prepared.path, self.path);
+            inode_lock.installRebindLocked(prepared_entry, binding.?);
+            binding = null;
+        }
         self.releaseLifetimeWriterRegion();
         prepared.releaseLifetimeWriterRegion();
+        self.releaseCrossProcessRedoReaderSlot();
+        prepared.releaseCrossProcessRedoReaderSlot();
 
         std.mem.swap(std.Io.File, &self.file, &prepared.file);
         // `self.file` now holds the fd `prepared` had open on its own
@@ -23587,10 +23578,6 @@ pub const NativeFile = struct {
         // ever change which entry a *future* acquire resolves to, never
         // which one an in-flight one releases against.
         const self_entry = self.inode_lock_ref.load(.acquire);
-        if (binding) |owned| {
-            inode_lock.installRebind(prepared_entry.?, io, owned);
-            binding = null;
-        }
         self.inode_lock_ref.store(prepared_entry, .release);
         prepared.inode_lock_ref.store(self_entry, .release);
         const retired_header = self.header;
@@ -23615,88 +23602,9 @@ pub const NativeFile = struct {
         // have published to this entry since (the swap runs under the
         // writer-lease admission gate's own exclusivity).
         if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.resetCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
-        // §9.3a/§9.4/§9 (vacuum redo-log retention): the live `self.redo`,
-        // if this file had one, still points its `writer` at the *old*
-        // file's fd and byte offsets, which the swap above just moved into
-        // `prepared.file` (about to be closed by this call's caller) and
-        // which no longer correspond to anything in the compacted file
-        // either way -- always drop it; uncheckpointed overlay content is
-        // not lost by this, because every committed mutation already
-        // reached the compacted file through `copyVacuumCatalogRecords`/
-        // `copyVacuumDocumentRecords`'s overlay-aware `LiveRecordCursor`/
-        // `OverlayScanState` scans.
         if (self.redo) |*redo| redo.deinit(self.allocator);
-        self.redo = null;
-        // The adopted header carries a reserved log region whenever
-        // `prepareVacuum` found one on the source file (`reserve_redo_log`)
-        // -- attach `self.redo` to it now, fresh, rather than reverting to
-        // manifest-commit durability, or every redo-log store would
-        // permanently lose the whole point of the redo-log write path the
-        // moment maintenance first vacuumed it. Deliberately *not* done
-        // any earlier (inside `prepareVacuum`, on `prepared` itself):
-        // `prepared` was still under construction there --
-        // `Store.performVacuum`'s own `preparePublicationSequence` and
-        // catch-up-round machinery still had real, undiverted ledger/
-        // free-map writes left to make against it before this generation
-        // was ever adopted, and attaching redo state that early made every
-        // one of those internal writes divert into an overlay instead of
-        // writing real pages (confirmed live: `next_page_id`/`checkpoint.
-        // page_count` kept advancing as if they had, so the adopted header
-        // ended up claiming pages the file was never actually extended to
-        // hold -- `recoverActiveCheckpoint`'s `candidates == 0` on the very
-        // first read after an *online* vacuum). By this point every such
-        // write this generation will ever make is already done, the swap
-        // has settled, and `self.file`/`self.inode_lock_ref` are their
-        // final, adopted values -- exactly `enableRedoLog`'s own
-        // "nothing to replay yet" case (every live mutation already
-        // reached the compacted tree through the ordinary copy pass, never
-        // through this brand-new, still-empty log region), just reached
-        // from a swapped-in generation instead of a freshly bootstrapped
-        // file.
-        if (self.header.redo_log_capacity != 0) {
-            // perf/lwa-fold-boundary: for a genuinely vacuum-compacted
-            // `prepared` (the only case this function's own doc comment
-            // above promises), `redo_folded_through == commit_sequence`
-            // already -- `prepareVacuum`'s compaction folds everything --
-            // so these two arguments name the same value. They can
-            // legitimately differ if `prepared`'s inode already carries a
-            // shared overlay with content logged past its own last real
-            // fold (see `attachFreshRedoState`'s own doc comment on this
-            // split): the tip (`commit_sequence`) still names every such
-            // version, so reads keep resolving them through that
-            // surviving overlay, while the fold boundary
-            // (`redo_folded_through`) stays truthful for `self`'s own
-            // later folds.
-            try self.attachFreshRedoState(io, self.header.redoOffset(), self.header.redo_log_capacity, self.activeCheckpoint().commit_sequence, self.activeCheckpoint().redo_folded_through);
-            // `attachFreshRedoState`'s own `Writer.init` call above always
-            // resumes at `tail = 0`, correct only for the "nothing to
-            // replay yet" case its doc comment promises (a vacuum's
-            // `prepared`, never itself redo-attached). A caller that hands
-            // this a `prepared` written to directly under redo (the
-            // backup/restore-import path, not vacuum -- the exact case
-            // the comment above this block already acknowledges can leave
-            // `commit_sequence`/`redo_folded_through` genuinely different)
-            // has real, valid records already sitting in the log region
-            // between `redo_folded_through` and `commit_sequence`.
-            // `prepared.redo` -- left completely untouched above, since
-            // only `self.redo` is reset -- still holds `prepared`'s own
-            // writer at its true on-disk tail/last_sequence. Resuming at
-            // `tail = 0` instead would make this generation's very next
-            // diverted commit physically overwrite the start of that
-            // still-valid region, corrupting a reopen's replay
-            // (`recoverRedoLog`'s `NativeRedoLogCorrupt`) even though
-            // nothing had actually gone wrong on disk. `prepared.redo.
-            // writer.file` already names the post-rename fd -- the same
-            // value this function's own swap moved into `self.file` --
-            // so only the position fields need to carry over.
-            if (prepared.redo) |prepared_redo| {
-                self.redo.?.writer.tail = prepared_redo.writer.tail;
-                self.redo.?.writer.salt = prepared_redo.writer.salt;
-                self.redo.?.writer.last_sequence = prepared_redo.writer.last_sequence;
-            }
-        } else {
-            self.manifest_commits_enabled = true;
-        }
+        self.redo = adopted_redo;
+        self.manifest_commits_enabled = adopted_redo == null;
         // Cross-process readers (§9.3b) cache this inode's log state from
         // the shared lock region's own published watermarks; push this
         // generation's fresh ones (a brand-new, still-empty log: tail 0,
@@ -28757,6 +28665,28 @@ test "lite native vacuum atomically replaces file and keeps writer handle usable
     const after = (try reopened.getDocumentAlloc(allocator, "doc:after-vacuum")).?;
     defer allocator.free(after);
     try std.testing.expectEqualStrings("writer still attached", after);
+}
+
+test "lite redo prepared generation preflight failure keeps the live name and writer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const live_path = try testPath(allocator, tmp, "live-generation.aflite");
+    defer allocator.free(live_path);
+    const staged_path = try testPath(allocator, tmp, "staged-generation.aflite");
+    defer allocator.free(staged_path);
+    var live = try NativeFile.createWithRedoLog(allocator, io, live_path, .{}, 64 * 1024);
+    defer live.close();
+    var staged = try NativeFile.createWithRedoLog(allocator, io, staged_path, .{}, 64 * 1024);
+    defer staged.close();
+    const live_identity = live.dataIdentity().?;
+    const staged_entry = staged.inode_lock_ref.swap(null, .acq_rel).?;
+    defer staged.inode_lock_ref.store(staged_entry, .release);
+    try std.testing.expectError(error.InvalidTransactionState, live.replaceWithPreparedGeneration(&staged));
+    try std.testing.expectEqual(live_identity, try storage_file_identity.nativePathIdentity(live_path));
+    try std.testing.expectEqual(staged_entry.identity, try storage_file_identity.nativePathIdentity(staged_path));
+    try live.putDocument("key", "still writable");
 }
 
 test "lite native vacuum keeps adopted replacement usable after post rename failure" {
@@ -41153,6 +41083,33 @@ test "lite redo sidecar registration is removed with canceled stat I/O" {
     const acquired = lease.sidecar_registration orelse return error.MissingSidecarRegistration;
     unregisterOwnSidecarLock(io, original);
     try std.testing.expectEqual(acquired.epoch, ownSidecarEpoch(io, acquired.identity).?);
+}
+
+test "lite redo lifetime successor repairs a dead mapped writer after recovery" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-dead-lifetime-region.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        try writer.putDocument("key", "durable");
+    }
+
+    var observer = try shared_lock_region.Region.open(a, io, path);
+    defer observer.close();
+    {
+        var dead = try shared_lock_region.Region.open(a, io, path);
+        defer dead.close();
+        try std.testing.expect(dead.tryAcquireWriterFair(antfly_platform.process.currentId() orelse 0));
+    }
+    try std.testing.expect(observer.writerHolderDead());
+    var successor = try NativeFile.openWithIo(a, io, path, .{});
+    defer successor.close();
+    try std.testing.expect(successor.lifetime_writer_claimed);
+    try std.testing.expectEqual(successor.durableSequence(), observer.readyLogState().?.durable_sequence);
 }
 
 test "lite redo lifetime writer keeps its mapping while a fair claimant holds the region" {

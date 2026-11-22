@@ -128,7 +128,7 @@ const DebugAcquisition = struct {
 /// unconditionally without disturbing its own control flow.
 fn debugDumpOutstanding(entry: *Entry, why: []const u8) void {
     if (!debug_tracking) return;
-    std.debug.print("inode_lock: {s} entry={*} inode={d} shared={d} blocking_shared={d} exclusive={d} refs={d} outstanding={d}\n", .{ why, entry, entry.identity.inode, entry.shared_count, entry.blocking_shared_count, entry.exclusive_count, entry.refs, entry.debug_outstanding.items.len });
+    std.debug.print("inode_lock: {s} entry={*} inode={d} shared={d} blocking_shared={d} exclusive={d} refs={d} outstanding={d}\n", .{ why, entry, entry.identity.inode, entry.shared_count, entry.blocking_shared_count, entry.exclusive_count, entry.refs.load(.monotonic), entry.debug_outstanding.items.len });
     for (entry.debug_outstanding.items, 0..) |acq, i| {
         std.debug.print("  [{d}] mode={s} site={s}\n", .{ i, @tagName(acq.mode), acq.site });
     }
@@ -211,6 +211,11 @@ pub const shared_fail_fast_retry_ns: i128 = 40 * std.time.ns_per_ms;
 const file_identity = @import("../lsm_backend/storage_io.zig");
 pub const FileIdentity = file_identity.NativeFileIdentity;
 
+const RegionBinding = struct {
+    region: shared_lock_region.Region,
+    next: ?*RegionBinding = null,
+};
+
 pub const Entry = struct {
     identity: FileIdentity,
     /// Reopened lazily to get this entry's own dedicated fd (see
@@ -247,7 +252,7 @@ pub const Entry = struct {
     /// comment for why unifying these is what makes the generation-swap
     /// case safe. The entry is destroyed, and its fd closed, once this
     /// drops to zero.
-    refs: usize = 0,
+    refs: std.atomic.Value(usize) = .init(0),
     /// Guards every field below, including across the (bounded,
     /// nonblocking) kernel calls `acquireOn`/`releaseOn` make. A
     /// `.shared` acquire's *blocking* kernel wait deliberately holds this
@@ -313,7 +318,8 @@ pub const Entry = struct {
     /// `ensureRegion` call after a rebind reopens lazily against the new
     /// path, exactly like `ensureFd`'s existing lazy-reopen pattern after
     /// `entry.fd` goes back to `null`.
-    region: ?shared_lock_region.Region = null,
+    region: ?*RegionBinding = null,
+    retired_regions: ?*RegionBinding = null,
     /// §9.6a: the redo-log's in-process versioned overlay, shared the
     /// same way `region` is -- one instance per inode, referenced by
     /// every `NativeFile` (writer or `ReadGeneration` reader) open on
@@ -663,10 +669,13 @@ pub fn ensureRegion(entry: *Entry, io: Io) !*shared_lock_region.Region {
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
     if (entry.region == null) {
-        if (!std.meta.eql(entry.identity, try file_identity.nativePathIdentity(entry.path))) return error.FileBusy;
-        entry.region = try shared_lock_region.Region.open(std.heap.page_allocator, io, entry.path);
+        const page = std.heap.page_allocator;
+        const binding = try page.create(RegionBinding);
+        errdefer page.destroy(binding);
+        binding.* = .{ .region = try shared_lock_region.Region.openForIdentity(page, io, entry.path, entry.identity) };
+        entry.region = binding;
     }
-    return &entry.region.?;
+    return &entry.region.?.region;
 }
 
 /// True when `err` (from `shared_lock_region.Region.open`/`openSized`)
@@ -777,18 +786,25 @@ pub fn openForFile(io: Io, path: []const u8, file: Io.File) !*Entry {
 fn openIdentity(io: Io, path: []const u8, identity: FileIdentity) !*Entry {
     const page = std.heap.page_allocator;
     registry_mutex.lockUncancelable(io);
-    defer registry_mutex.unlock(io);
     if (registry.get(identity)) |entry| {
-        entry.mutex.lockUncancelable(io);
-        entry.refs += 1;
-        entry.mutex.unlock(io);
+        _ = entry.refs.fetchAdd(1, .monotonic);
+        registry_mutex.unlock(io);
         return entry;
     }
+    registry_mutex.unlock(io);
+
     const canonical_path = try canonicalPathAlloc(page, io, path);
     errdefer page.free(canonical_path);
+    registry_mutex.lockUncancelable(io);
+    defer registry_mutex.unlock(io);
+    if (registry.get(identity)) |entry| {
+        _ = entry.refs.fetchAdd(1, .monotonic);
+        page.free(canonical_path);
+        return entry;
+    }
     const entry = try page.create(Entry);
     errdefer page.destroy(entry);
-    entry.* = .{ .identity = identity, .path = canonical_path, .refs = 1 };
+    entry.* = .{ .identity = identity, .path = canonical_path, .refs = .init(1) };
     try registry.put(page, identity, entry);
     return entry;
 }
@@ -920,7 +936,7 @@ fn trySharedOnce(entry: *Entry, io: Io, blocks_exclusive: bool, site: []const u8
     if (entry.state == .shared or (entry.state == .exclusive and entry.exclusive_count == 0)) {
         entry.shared_count += 1;
         if (blocks_exclusive) entry.blocking_shared_count += 1;
-        entry.refs += 1;
+        _ = entry.refs.fetchAdd(1, .monotonic);
         debugRecordAcquire(entry, .shared, site);
         return .{ .entry = entry, .mode = .shared, .blocks_exclusive = blocks_exclusive };
     }
@@ -930,7 +946,7 @@ fn trySharedOnce(entry: *Entry, io: Io, blocks_exclusive: bool, site: []const u8
     entry.state = .shared;
     entry.shared_count += 1;
     if (blocks_exclusive) entry.blocking_shared_count += 1;
-    entry.refs += 1;
+    _ = entry.refs.fetchAdd(1, .monotonic);
     entry.last_transition_ns = Io.Clock.awake.now(io).nanoseconds;
     debugRecordAcquire(entry, .shared, site);
     return .{ .entry = entry, .mode = .shared, .blocks_exclusive = blocks_exclusive };
@@ -959,7 +975,7 @@ fn tryExclusiveOnce(entry: *Entry, io: Io, site: []const u8) !?Handle {
     if (entry.blocking_shared_count != 0) return null;
     if (entry.state == .exclusive) {
         entry.exclusive_count += 1;
-        entry.refs += 1;
+        _ = entry.refs.fetchAdd(1, .monotonic);
         debugRecordAcquire(entry, .exclusive, site);
         return .{ .entry = entry, .mode = .exclusive };
     }
@@ -975,7 +991,7 @@ fn tryExclusiveOnce(entry: *Entry, io: Io, site: []const u8) !?Handle {
     if (!try fd.tryLock(io, .exclusive)) return null;
     entry.state = .exclusive;
     entry.exclusive_count += 1;
-    entry.refs += 1;
+    _ = entry.refs.fetchAdd(1, .monotonic);
     entry.last_transition_ns = Io.Clock.awake.now(io).nanoseconds;
     debugRecordAcquire(entry, .exclusive, site);
     return .{ .entry = entry, .mode = .exclusive };
@@ -1023,57 +1039,31 @@ fn releaseOn(entry: *Entry, io: Io, mode: Mode, blocks_exclusive: bool) void {
 fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
     const page = std.heap.page_allocator;
     registry_mutex.lockUncancelable(io);
-    var destroy = false;
-    var fd: ?Io.File = null;
-    var region: ?shared_lock_region.Region = null;
-    var overlay: ?redo_overlay.SharedRedoOverlay = null;
-    {
-        entry.mutex.lockUncancelable(io);
-        defer entry.mutex.unlock(io);
-        entry.refs -= 1;
-        destroy = entry.refs == 0;
-        if (destroy) {
-            if (debug_tracking and (entry.shared_count != 0 or entry.exclusive_count != 0)) debugDumpOutstanding(entry, "teardown with nonzero counts");
-            std.debug.assert(entry.shared_count == 0 and entry.exclusive_count == 0);
-            fd = entry.fd;
-            entry.fd = null;
-            entry.state = .none;
-            region = entry.region;
-            entry.region = null;
-            overlay = entry.redo_overlay;
-            entry.redo_overlay = null;
-        }
-    }
+    const destroy = entry.refs.fetchSub(1, .acq_rel) == 1;
     if (destroy) _ = registry.remove(entry.identity);
     registry_mutex.unlock(io);
-    if (destroy) {
-        if (fd) |held| held.close(io);
-        if (region) |*r| r.close();
-        if (overlay) |*o| o.deinit(page);
-        page.free(entry.path);
-        entry.reader_pins.deinit(page);
-        entry.debug_outstanding.deinit(page);
-        page.destroy(entry);
+    if (!destroy) return;
+
+    if (debug_tracking and (entry.shared_count != 0 or entry.exclusive_count != 0)) debugDumpOutstanding(entry, "teardown with nonzero counts");
+    std.debug.assert(entry.shared_count == 0 and entry.exclusive_count == 0);
+    if (entry.fd) |held| held.close(io);
+    retireRegionLocked(entry);
+    var regions = entry.retired_regions;
+    while (regions) |binding| {
+        regions = binding.next;
+        binding.region.close();
+        page.destroy(binding);
     }
+    if (entry.redo_overlay) |*overlay| overlay.deinit(page);
+    page.free(entry.path);
+    entry.reader_pins.deinit(page);
+    entry.debug_outstanding.deinit(page);
+    page.destroy(entry);
 }
 
-/// Updates the path `entry` reopens its dedicated fd with if it is ever
-/// closed and needed again (`ensureFd`), to `new_path`. The entry's
-/// identity is its inode, not a path, and inodes survive a rename -- but a
-/// *remembered path* does not, so a caller that renames the file this
-/// entry's inode refers to (an atomic generation swap,
-/// `replaceWithPreparedGeneration`) must call this with the new path, or a
-/// later lazy reopen (only when `entry.fd` happens to have gone back to
-/// `null`, e.g. after a fairness release) would try the old, now-
-/// nonexistent name.
-///
-/// Also closes and clears `entry.region` if one is open: that mapping was
-/// opened against the old path's own `<old_path>.aflite-lock` sidecar, and
-/// nothing renames that sidecar alongside the data file's own rename, so a
-/// region left open across this call would silently keep serving stale
-/// (pre-swap) writer/reader state for what is now a different generation
-/// at this path. The next `ensureRegion` call lazily reopens a fresh region
-/// against `new_path`, exactly mirroring `ensureFd`'s own lazy-reopen shape.
+/// Resolve the destination while publication can still fail without
+/// changing the live name. The data descriptor keeps its identity through
+/// rename, while new region lookups must use the destination sidecar.
 pub fn prepareRebind(entry: *Entry, io: Io, file: Io.File, new_path: []const u8) ![]u8 {
     if (!std.meta.eql(entry.identity, try file_identity.nativeFileIdentity(file.handle))) return error.FileBusy;
     // Rename replaces the destination basename, including a symlink.
@@ -1081,15 +1071,24 @@ pub fn prepareRebind(entry: *Entry, io: Io, file: Io.File, new_path: []const u8)
 }
 
 pub fn installRebind(entry: *Entry, io: Io, owned: []u8) void {
-    const page = std.heap.page_allocator;
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
-    page.free(entry.path);
+    installRebindLocked(entry, owned);
+}
+
+pub fn installRebindLocked(entry: *Entry, owned: []u8) void {
+    std.heap.page_allocator.free(entry.path);
     entry.path = owned;
-    if (entry.region) |*r| {
-        r.close();
-        entry.region = null;
-    }
+    retireRegionLocked(entry);
+}
+
+fn retireRegionLocked(entry: *Entry) void {
+    const binding = entry.region orelse return;
+    // Every borrower holds an Entry reference. Preserve the address and
+    // mapping until those references drain, including fences releasing slots.
+    binding.next = entry.retired_regions;
+    entry.retired_regions = binding;
+    entry.region = null;
 }
 
 /// Caller holds `entry.mutex`. Fully idle (no in-process holder remains):
@@ -1216,7 +1215,7 @@ test "ensureRegion's region closes when the entry is torn down" {
     region.releaseWriter();
 }
 
-test "rebind closes an already-open region instead of carrying it across the path change" {
+test "rebind preserves a borrowed region and opens a new region for the destination" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1243,15 +1242,10 @@ test "rebind closes an already-open region instead of carrying it across the pat
     const entry = try open(io, old_path);
     defer unref(entry, io);
 
-    // Open a region against the old path and use it, mirroring what a
-    // real reader-fence/writer-lock caller would have done before a
-    // generation swap renamed this entry's underlying file.
-    {
-        const region = try ensureRegion(entry, io);
-        const own_pid: u32 = @bitCast(std.c.getpid());
-        region.acquireWriter(own_pid);
-        region.releaseWriter();
-    }
+    const region_before_rebind = try ensureRegion(entry, io);
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    region_before_rebind.acquireWriter(own_pid);
+    region_before_rebind.releaseWriter();
     // Only the old path's sidecar exists so far -- `ensureRegion` has
     // never been asked about `new_path`.
     try Io.Dir.cwd().access(io, old_region_sidecar, .{});
@@ -1273,8 +1267,10 @@ test "rebind closes an already-open region instead of carrying it across the pat
     try std.testing.expect(entry.region == null);
 
     const region_after_rebind = try ensureRegion(entry, io);
+    try std.testing.expect(region_before_rebind != region_after_rebind);
+    try std.testing.expect(region_before_rebind.tryAcquireWriterFair(own_pid));
+    region_before_rebind.releaseWriter();
     try Io.Dir.cwd().access(io, new_region_sidecar, .{});
-    const own_pid: u32 = @bitCast(std.c.getpid());
     region_after_rebind.acquireWriter(own_pid);
     region_after_rebind.releaseWriter();
 }

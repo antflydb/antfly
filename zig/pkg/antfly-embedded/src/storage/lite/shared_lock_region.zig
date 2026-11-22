@@ -596,10 +596,12 @@ const FdEntry = struct {
     identity: file_identity.NativeFileIdentity,
     fd: std.posix.fd_t,
     refs: usize = 0,
+    registered_generation: u64 = 0,
     // An open after a path race may duplicate this process's fd for the
     // inode. POSIX releases its record locks if either descriptor closes.
     spare_descriptors: ?*FdEntry = null,
     unresolved_path: ?[]u8 = null,
+    probing_identity: bool = false,
     /// Liveness slot indices *this process* has already claimed through
     /// some `Region` handle sharing this entry. `fcntl` locks are
     /// process-scoped, not per-claim: a second same-process attempt to
@@ -622,16 +624,18 @@ const FdEntry = struct {
 // raw `std.Thread.Mutex`/`std.atomic.Mutex`, so holding it is always
 // accounted for by whatever cooperative scheduler this process's `Io`
 // implementation runs (including, correctly, one that happens to be
-// single-threaded). Every critical section it guards is brief and
-// bounded (an in-memory scan plus at most one *nonblocking*
-// `fcntl(F_SETLK)` call, never `F_SETLKW`), so `lockUncancelable` is
-// appropriate here the same way it is in `inode_lock.zig`'s own `open`.
+// single-threaded). Reserve and register descriptors under this mutex;
+// path and descriptor identity lookups run outside it.
 var fd_registry_mutex: Io.Mutex = .init;
 var fd_registry: std.AutoHashMapUnmanaged(file_identity.NativeFileIdentity, *FdEntry) = .empty;
-// Only an existing file with unreadable identity may alias a live entry.
+var fd_registry_generation: std.atomic.Value(u64) = .init(0);
+// Charge uncertain opens to the device observed before open. This key
+// manages admission only: the descriptor may have crossed a path race,
+// so only its own identity can prove which registered locks it aliases.
 const max_unidentified_descriptors = 8;
-var unidentified_descriptors: ?*FdEntry = null;
-var unidentified_count: usize = 0;
+const DescriptorReserve = [max_unidentified_descriptors]?*FdEntry;
+var unidentified_by_device: std.AutoHashMapUnmanaged(u64, DescriptorReserve) = .empty;
+var pending_opens: usize = 0;
 var test_fail_process_fd_identity = false;
 var test_fail_specific_process_fd: ?std.posix.fd_t = null;
 
@@ -694,56 +698,87 @@ fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
     // before `statFile`: Linux's statx wrapper treats ENAMETOOLONG as a
     // caller bug and panics in safe builds.
     if (std.fs.path.basename(region_path).len > max_name_bytes or region_path.len >= std.fs.max_path_bytes) return RegionError.RegionUnavailable;
-    fd_registry_mutex.lockUncancelable(io);
-    defer fd_registry_mutex.unlock(io);
+    const sampled_generation = fd_registry_generation.load(.acquire);
     const path_identity: ?file_identity.NativeFileIdentity = file_identity.nativePathIdentity(region_path) catch |err| switch (err) {
         error.FileNotFound => null,
-        else => return RegionError.RegionUnavailable,
+        else => return error.RegionUnavailable,
     };
+    const device = if (path_identity) |identity|
+        identity.device
+    else
+        (file_identity.nativePathIdentity(std.fs.path.dirname(region_path) orelse ".") catch return error.RegionUnavailable).device;
+    fd_registry_mutex.lockUncancelable(io);
+    // A registration newer than the start of stat could be a reused
+    // inode. Older registrations still hold their original descriptor.
     if (path_identity) |identity| {
         if (fd_registry.get(identity)) |entry| {
-            entry.refs += 1;
-            return entry;
-        }
-    }
-    resolveUnidentifiedDescriptors();
-    var unresolved = unidentified_descriptors;
-    while (unresolved) |pending| : (unresolved = pending.spare_descriptors) {
-        if (std.mem.eql(u8, pending.unresolved_path.?, region_path)) return RegionError.RegionUnavailable;
-    }
-
-    const page = std.heap.page_allocator;
-    // Reserve cleanup storage before opening an fd that could alias
-    // an existing descriptor with process-scoped record locks.
-    fd_registry.ensureUnusedCapacity(page, 1) catch return RegionError.RegionUnavailable;
-    const pending = page.create(FdEntry) catch return RegionError.RegionUnavailable;
-    const owned_path = page.dupe(u8, region_path) catch {
-        page.destroy(pending);
-        return RegionError.RegionUnavailable;
-    };
-    const opened: struct { fd: std.posix.fd_t, created: bool } = opened: {
-        if (path_identity == null) {
-            if (std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true, .EXCL = true }, 0o600)) |fd| {
-                break :opened .{ .fd = fd, .created = true };
-            } else |err| if (err != error.PathAlreadyExists) {
-                page.free(owned_path);
-                page.destroy(pending);
-                return RegionError.RegionUnavailable;
+            if (entry.registered_generation <= sampled_generation) {
+                entry.refs += 1;
+                fd_registry_mutex.unlock(io);
+                return entry;
             }
         }
-        if (unidentified_count == max_unidentified_descriptors) {
-            page.free(owned_path);
-            page.destroy(pending);
+    }
+    const has_reserve = unidentified_by_device.contains(device);
+    fd_registry_mutex.unlock(io);
+    if (has_reserve) resolveUnidentifiedDescriptors(io, device);
+
+    const pending = try reserveDescriptor(io, device, region_path);
+    const opened = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = path_identity == null }, 0o600);
+    const actual = if (opened) |fd| processFdIdentity(fd) catch null else |_| null;
+    fd_registry_mutex.lockUncancelable(io);
+    defer fd_registry_mutex.unlock(io);
+    pending_opens -= 1;
+    if (opened) |fd| {
+        pending.fd = fd;
+        if (actual == null and fd_registry.count() != 0) {
+            pending.probing_identity = false;
             return RegionError.RegionUnavailable;
         }
-        const fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch {
-            page.free(owned_path);
-            page.destroy(pending);
-            return RegionError.RegionUnavailable;
-        };
-        break :opened .{ .fd = fd, .created = false };
-    };
-    return registerOpenedProcessFd(pending, opened.fd, owned_path, opened.created);
+    } else |_| {}
+    unreserveDescriptor(device, pending);
+    if (actual) |known| return registerIdentifiedDescriptor(pending, known);
+    if (opened) |fd| _ = std.posix.system.close(fd) else |_| {}
+    std.heap.page_allocator.destroy(pending);
+    return RegionError.RegionUnavailable;
+}
+
+fn reserveDescriptor(io: Io, device: u64, path: []const u8) RegionError!*FdEntry {
+    const page = std.heap.page_allocator;
+    fd_registry_mutex.lockUncancelable(io);
+    defer fd_registry_mutex.unlock(io);
+    fd_registry.ensureUnusedCapacity(page, @intCast(pending_opens + 1)) catch return error.RegionUnavailable;
+    const pending = page.create(FdEntry) catch return error.RegionUnavailable;
+    errdefer page.destroy(pending);
+    const owned_path = page.dupe(u8, path) catch return error.RegionUnavailable;
+    errdefer page.free(owned_path);
+    const bucket = unidentified_by_device.getOrPut(page, device) catch return error.RegionUnavailable;
+    if (!bucket.found_existing) bucket.value_ptr.* = @splat(null);
+    var free: ?*?*FdEntry = null;
+    for (bucket.value_ptr) |*slot| {
+        if (slot.*) |entry| {
+            if (entry.fd != -1 and std.mem.eql(u8, entry.unresolved_path.?, path)) return error.RegionUnavailable;
+        } else free = slot;
+    }
+    const slot = free orelse return error.RegionUnavailable;
+    pending.* = .{ .identity = undefined, .fd = -1, .unresolved_path = owned_path, .probing_identity = true };
+    slot.* = pending;
+    pending_opens += 1;
+    return pending;
+}
+
+fn unreserveDescriptor(device: u64, pending: *FdEntry) void {
+    const bucket = unidentified_by_device.getPtr(device).?;
+    var remains = false;
+    for (bucket) |*slot| {
+        if (slot.* == pending) {
+            slot.* = null;
+        } else if (slot.* != null) remains = true;
+    }
+    if (!remains) _ = unidentified_by_device.remove(device);
+    std.heap.page_allocator.free(pending.unresolved_path.?);
+    pending.unresolved_path = null;
+    pending.probing_identity = false;
 }
 
 fn processFdIdentity(fd: std.posix.fd_t) !file_identity.NativeFileIdentity {
@@ -758,54 +793,46 @@ fn retainSpareDescriptor(entry: *FdEntry, spare: *FdEntry) void {
     entry.spare_descriptors = spare;
 }
 
-fn resolveUnidentifiedDescriptors() void {
-    var link = &unidentified_descriptors;
-    while (link.*) |pending| {
-        const identity = identity: {
-            if (fd_registry.count() == 0) break :identity null;
-            break :identity processFdIdentity(pending.fd) catch {
-                link = &pending.spare_descriptors;
-                continue;
-            };
-        };
-        link.* = pending.spare_descriptors;
-        pending.spare_descriptors = null;
-        unidentified_count -= 1;
-        std.heap.page_allocator.free(pending.unresolved_path.?);
-        pending.unresolved_path = null;
+fn resolveUnidentifiedDescriptors(io: Io, device: u64) void {
+    for (0..max_unidentified_descriptors) |i| {
+        fd_registry_mutex.lockUncancelable(io);
+        const pending = if (unidentified_by_device.getPtr(device)) |bucket| bucket[i] else null;
+        if (pending == null or pending.?.probing_identity) {
+            fd_registry_mutex.unlock(io);
+            continue;
+        }
+        const entry = pending.?;
+        entry.probing_identity = true;
+        fd_registry_mutex.unlock(io);
+
+        const identity = processFdIdentity(entry.fd) catch null;
+
+        fd_registry_mutex.lockUncancelable(io);
+        defer fd_registry_mutex.unlock(io);
+        if (identity == null and fd_registry.count() != 0) {
+            entry.probing_identity = false;
+            continue;
+        }
+        unreserveDescriptor(device, entry);
         if (identity) |known| {
-            if (fd_registry.get(known)) |entry| {
-                retainSpareDescriptor(entry, pending);
+            if (fd_registry.get(known)) |registered| {
+                retainSpareDescriptor(registered, entry);
                 continue;
             }
         }
-        closeSpareDescriptors(pending);
+        closeSpareDescriptors(entry);
     }
 }
 
-// Caller holds fd_registry_mutex and has reserved one free registry slot.
-fn registerOpenedProcessFd(pending: *FdEntry, raw_fd: std.posix.fd_t, path: []u8, created: bool) RegionError!*FdEntry {
-    pending.* = .{ .identity = undefined, .fd = raw_fd, .refs = 1 };
-    const identity = processFdIdentity(raw_fd) catch {
-        if (created or fd_registry.count() == 0) {
-            std.heap.page_allocator.free(path);
-            closeSpareDescriptors(pending);
-        } else {
-            std.debug.assert(unidentified_count < max_unidentified_descriptors);
-            pending.unresolved_path = path;
-            pending.spare_descriptors = unidentified_descriptors;
-            unidentified_descriptors = pending;
-            unidentified_count += 1;
-        }
-        return RegionError.RegionUnavailable;
-    };
-    std.heap.page_allocator.free(path);
+fn registerIdentifiedDescriptor(pending: *FdEntry, identity: file_identity.NativeFileIdentity) *FdEntry {
     pending.identity = identity;
     if (fd_registry.get(identity)) |entry| {
         retainSpareDescriptor(entry, pending);
         entry.refs += 1;
         return entry;
     }
+    pending.refs = 1;
+    pending.registered_generation = fd_registry_generation.fetchAdd(1, .acq_rel) +% 1;
     fd_registry.putAssumeCapacity(identity, pending);
     return pending;
 }
@@ -816,6 +843,26 @@ fn closeSpareDescriptors(head: ?*FdEntry) void {
         next = descriptor.spare_descriptors;
         _ = std.posix.system.close(descriptor.fd);
         std.heap.page_allocator.destroy(descriptor);
+    }
+}
+
+fn discardInactiveDescriptors() void {
+    var buckets = unidentified_by_device.valueIterator();
+    while (buckets.next()) |bucket| {
+        for (bucket) |*slot| {
+            const entry = slot.* orelse continue;
+            if (entry.probing_identity) continue;
+            std.heap.page_allocator.free(entry.unresolved_path.?);
+            closeSpareDescriptors(entry);
+            slot.* = null;
+        }
+    }
+    // In-flight opens and probes keep their reservations until they finish.
+    var devices = unidentified_by_device.iterator();
+    while (devices.next()) |device| {
+        for (device.value_ptr) |slot| {
+            if (slot != null) break;
+        } else unidentified_by_device.removeByPtr(device.key_ptr);
     }
 }
 
@@ -832,7 +879,7 @@ fn releaseProcessFd(io: Io, entry: *FdEntry) void {
         _ = std.posix.system.close(entry.fd);
         _ = fd_registry.remove(entry.identity);
         closeSpareDescriptors(entry.spare_descriptors);
-        resolveUnidentifiedDescriptors();
+        if (fd_registry.count() == 0) discardInactiveDescriptors();
         entry.claimed_slots.deinit(std.heap.page_allocator);
         std.heap.page_allocator.destroy(entry);
     }
@@ -1394,17 +1441,25 @@ pub const Region = struct {
     /// rebuilding out from under a still-running writer or reader would
     /// silently break its exclusion/pin guarantees.
     pub fn openSized(allocator: std.mem.Allocator, io: Io, db_path: []const u8, max_readers: u32) !Region {
-        return openSizedUntil(allocator, io, db_path, max_readers, null);
+        return openSizedUntil(allocator, io, db_path, max_readers, null, null);
     }
 
     /// `open`, with the one-time setup lock bounded by `deadline` instead of
     /// its own 30 s budget: a writer admission must not outwait its own
     /// busy timeout setting up the region it queues on.
     pub fn openUntil(allocator: std.mem.Allocator, io: Io, db_path: []const u8, deadline: Io.Timestamp) !Region {
-        return openSizedUntil(allocator, io, db_path, default_max_readers, deadline);
+        return openSizedUntil(allocator, io, db_path, default_max_readers, deadline, null);
     }
 
-    fn openSizedUntil(allocator: std.mem.Allocator, io: Io, db_path: []const u8, max_readers: u32, deadline: ?Io.Timestamp) !Region {
+    pub fn openForIdentity(allocator: std.mem.Allocator, io: Io, db_path: []const u8, identity: file_identity.NativeFileIdentity) !Region {
+        var region = try openSizedUntil(allocator, io, db_path, default_max_readers, null, identity);
+        // Cached mappings can outlive the handle and runtime that opened
+        // them. Their coordination calls use a process-lifetime runtime.
+        region.io = Io.Threaded.global_single_threaded.io();
+        return region;
+    }
+
+    fn openSizedUntil(allocator: std.mem.Allocator, io: Io, db_path: []const u8, max_readers: u32, deadline: ?Io.Timestamp, expected: ?file_identity.NativeFileIdentity) !Region {
         // Canonicalize before deriving the sidecar name from it: two
         // different relative or symlinked spellings of the same data
         // file -- even from two entirely separate processes, each
@@ -1422,6 +1477,10 @@ pub const Region = struct {
             error.FileNotFound => null,
             else => return error.RegionUnavailable,
         };
+
+        if (expected) |identity| {
+            if (!std.meta.eql(db_identity, @as(?file_identity.NativeFileIdentity, identity))) return error.FileBusy;
+        }
 
         // This process's one shared fd for this inode (see
         // `acquireProcessFd`'s own doc comment for why it must be shared,
@@ -2234,13 +2293,29 @@ pub const Region = struct {
     /// (the two are kept separate so a caller mid-wait on a ticket
     /// doesn't have its own turn skipped by a recovering bystander).
     pub fn recoverDeadWriter(self: *Region, recovery: DeadWriterRecovery) !void {
-        if (!self.writerHolderDead()) return error.WriterHolderStillAlive;
+        const holder = self.deadWriterClaim() orelse return error.WriterHolderStillAlive;
         try recovery.run(recovery.ctx);
+        self.clearDeadWriterClaim(holder);
+    }
+
+    /// The caller already holds the writer lease and recovered the WAL.
+    pub fn repairWriterAdmission(self: *Region) void {
+        if (self.deadWriterClaim()) |holder| self.clearDeadWriterClaim(holder);
+        self.skipResolvedHeads();
+    }
+
+    fn deadWriterClaim(self: *const Region) ?u128 {
+        const word = self.writerClaim();
+        if (word == 0 or !self.isReferenceDead(holderLivenessSlot(word), holderClaimGeneration(word))) return null;
+        return word;
+    }
+
+    fn clearDeadWriterClaim(self: *Region, holder: u128) void {
         const hdr = self.header();
-        hdr.writer_holder.store(0, .release);
-        if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) {
-            countedWriterFutexWakeShared(&hdr.writer_ticket_head.raw);
-        }
+        if (hdr.writer_holder.cmpxchgStrong(holder, 0, .acq_rel, .acquire) != null) return;
+        _ = hdr.writer_release_epoch.fetchAdd(1, .release);
+        countedWriterFutexWakeShared(&hdr.writer_release_epoch.raw);
+        countedWriterFutexWakeShared(&hdr.writer_ticket_head.raw);
     }
 
     /// §8.3: the fixed reader-slot array immediately following the
@@ -3568,12 +3643,14 @@ test "shared lock region: identity failures are isolated to the unresolved path"
     test_fail_process_fd_identity = true;
     defer test_fail_process_fd_identity = false;
     try std.testing.expectError(error.RegionUnavailable, acquireProcessFd(io, retry_path));
-    const pending = unidentified_descriptors orelse return error.MissingSpareDescriptor;
+    const device = (try file_identity.nativePathIdentity(retry_path)).device;
+    const pending_slot = max_unidentified_descriptors - 1;
+    const pending = unidentified_by_device.get(device).?[pending_slot] orelse return error.MissingSpareDescriptor;
     for (0..3) |_| {
         try std.testing.expectError(error.RegionUnavailable, acquireProcessFd(io, retry_path));
-        try std.testing.expect(unidentified_descriptors == pending);
+        try std.testing.expect(unidentified_by_device.get(device).?[pending_slot] == pending);
     }
-    try std.testing.expectEqual(@as(usize, 1), unidentified_count);
+    try std.testing.expectEqual(@as(usize, 1), unidentified_by_device.count());
 
     const cached = try acquireProcessFd(io, first_path);
     releaseProcessFd(io, cached);
@@ -3582,12 +3659,53 @@ test "shared lock region: identity failures are isolated to the unresolved path"
     defer test_fail_specific_process_fd = null;
     const unrelated = try acquireProcessFd(io, blocked_path);
     defer releaseProcessFd(io, unrelated);
-    try std.testing.expect(unidentified_descriptors == pending);
+    try std.testing.expect(unidentified_by_device.get(device).?[pending_slot] == pending);
     test_fail_specific_process_fd = null;
     const recovered = try acquireProcessFd(io, retry_path);
     defer releaseProcessFd(io, recovered);
-    try std.testing.expect(unidentified_descriptors == null);
+    try std.testing.expect(!unidentified_by_device.contains(device));
     try std.testing.expect(first != recovered);
+}
+
+test "shared lock region checks the expected data identity before creating a sidecar" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const path = try std.fs.path.join(allocator, &.{ buf[0..dir_len], "bound.data" });
+    defer allocator.free(path);
+    const sidecar = try std.fmt.allocPrint(allocator, "{s}.aflite-lock", .{path});
+    defer allocator.free(sidecar);
+    const data = try Io.Dir.cwd().createFile(io, path, .{});
+    defer data.close(io);
+    var wrong = try file_identity.nativeFileIdentity(data.handle);
+    wrong.device ^= 1;
+    try std.testing.expectError(error.FileBusy, Region.openForIdentity(allocator, io, path, wrong));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, sidecar, .{}));
+}
+
+test "shared lock region: descriptor reserves are independent per device" {
+    const io = std.testing.io;
+    var reservations: [max_unidentified_descriptors]*FdEntry = undefined;
+    for (&reservations) |*reservation| reservation.* = try reserveDescriptor(io, 1, "device-one");
+    defer {
+        fd_registry_mutex.lockUncancelable(io);
+        defer fd_registry_mutex.unlock(io);
+        for (reservations) |reservation| {
+            pending_opens -= 1;
+            unreserveDescriptor(1, reservation);
+            std.heap.page_allocator.destroy(reservation);
+        }
+    }
+    try std.testing.expectError(error.RegionUnavailable, reserveDescriptor(io, 1, "device-one-extra"));
+    const other = try reserveDescriptor(io, 2, "device-two");
+    fd_registry_mutex.lockUncancelable(io);
+    defer fd_registry_mutex.unlock(io);
+    pending_opens -= 1;
+    unreserveDescriptor(2, other);
+    std.heap.page_allocator.destroy(other);
 }
 
 test "shared lock region: post-open identity collision retains the registered descriptor" {
@@ -3606,17 +3724,12 @@ test "shared lock region: post-open identity collision retains the registered de
         fd_registry_mutex.lockUncancelable(io);
         defer fd_registry_mutex.unlock(io);
         try fd_registry.ensureUnusedCapacity(std.heap.page_allocator, 1);
-        const owned = try std.heap.page_allocator.dupe(u8, path);
-        const pending = std.heap.page_allocator.create(FdEntry) catch |err| {
-            std.heap.page_allocator.free(owned);
-            return err;
-        };
-        const duplicate = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch |err| {
-            std.heap.page_allocator.free(owned);
-            std.heap.page_allocator.destroy(pending);
-            return err;
-        };
-        break :attach try registerOpenedProcessFd(pending, duplicate, owned, false);
+        const pending = try std.heap.page_allocator.create(FdEntry);
+        errdefer std.heap.page_allocator.destroy(pending);
+        const duplicate = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        errdefer _ = std.posix.system.close(duplicate);
+        pending.* = .{ .identity = undefined, .fd = duplicate };
+        break :attach registerIdentifiedDescriptor(pending, try processFdIdentity(duplicate));
     };
     {
         defer releaseProcessFd(io, attached);
