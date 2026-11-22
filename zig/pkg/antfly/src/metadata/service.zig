@@ -3824,6 +3824,8 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         },
         else => {},
     }
+    if (command == .upsert_replication_source_status and command.upsert_replication_source_status.accepted_stream_checkpoint != null)
+        return metadata_topology_protocol.iceberg_acceptance_status_version;
     if (command == .publish_native_replication_bootstrap or command == .seal_native_root_producer_cohort) return @import("source_control.zig").native_bootstrap_protocol_version;
     if (command == .apply_source_control) return @import("source_control.zig").requiredProtocolEncoded(command.apply_source_control);
     if (command == .apply_changefeed_control) return @import("changefeed_control.zig").requiredProtocolEncoded(command.apply_changefeed_control);
@@ -7509,7 +7511,14 @@ pub const MetadataService = struct {
     }
 
     pub fn upsertReplicationSourceStatus(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
+        var command: metadata_storage.TransitionCommand = .{ .upsert_replication_source_status = record };
+        if (record.accepted_stream_checkpoint != null) {
+            ensureCoordinatedDecoderWithContext(self, command, .{}) catch |err| switch (err) {
+                error.TableTopologyProtocolUpgradeRequired => command.upsert_replication_source_status.accepted_stream_checkpoint = null,
+                else => return err,
+            };
+        }
+        try self.proposeTransitionCommand(command);
     }
 
     /// Atomically claims exact-cutover authority against both the current
@@ -10740,7 +10749,14 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn upsertReplicationSourceStatus(self: *MetadataHttpService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
+        var command: metadata_storage.TransitionCommand = .{ .upsert_replication_source_status = record };
+        if (record.accepted_stream_checkpoint != null) {
+            ensureCoordinatedDecoderWithContext(self, command, .{}) catch |err| switch (err) {
+                error.TableTopologyProtocolUpgradeRequired => command.upsert_replication_source_status.accepted_stream_checkpoint = null,
+                else => return err,
+            };
+        }
+        try self.proposeTransitionCommand(command);
     }
 
     const NativeSnapshotPageGuard = struct {
@@ -10841,11 +10857,7 @@ pub const MetadataHttpService = struct {
         try self.waitForTransitionAppliedWithContext(receipt, context);
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const captured = (try store.observeNativeSnapshotCapture(self.alloc, self.metadata_group_id, record, record.snapshot_offset, false)) orelse return error.SourceAdmissionBackpressure;
-        defer {
-            self.alloc.free(captured.page.checkpoint);
-            self.alloc.free(captured.page.recovery_job);
-            self.alloc.free(captured.rows);
-        }
+        defer captured.deinit(self.alloc);
         if (!metadata_table_manager.ReplicationSourceStatusRecord.SnapshotPage.eql(captured.page, record.pending_snapshot_page) or
             !std.mem.eql(u8, captured.rows, rows))
             return error.SourcePayloadConflict;
@@ -10860,11 +10872,7 @@ pub const MetadataHttpService = struct {
         try NativeSnapshotPageGuard.check(&guard, context);
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const captured = (try store.observeNativeSnapshotCapture(a, self.metadata_group_id, record, record.snapshot_offset, true)) orelse return false;
-        defer {
-            a.free(captured.page.checkpoint);
-            a.free(captured.page.recovery_job);
-            a.free(captured.rows);
-        }
+        defer captured.deinit(a);
         const control = @import("source_control.zig");
         if (!captured.sealed or !captured.page.managed_dispatch or captured.page.recovery_job.len != 0) return error.SourceControlCorrupt;
         const definition = try control.definitionDigest(a, table.replication_sources_json, record.source_ordinal);
@@ -11011,11 +11019,7 @@ pub const MetadataHttpService = struct {
                 if (!page.managed_dispatch) return;
                 const store = self.projectedStore() orelse return error.MissingMetadataStore;
                 if (try store.observeNativeSnapshotCapture(a, self.metadata_group_id, record, record.snapshot_offset, true)) |capture| {
-                    defer {
-                        a.free(capture.page.checkpoint);
-                        a.free(capture.page.recovery_job);
-                        a.free(capture.rows);
-                    }
+                    defer capture.deinit(a);
                     if (!std.meta.eql(capture.page.payload_digest, page.payload_digest))
                         return error.SourcePayloadConflict;
                     progressed.phase = control.native_bootstrap_retry_phase;

@@ -383,6 +383,20 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
 
+        row_feed = requests.post(
+            server.api_url + "/changefeeds",
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            headers={"Idempotency-Key": "external-iceberg-row-bootstrap"},
+            json={
+                "tables": ["ice_events"],
+                "start": "snapshot_then_changes",
+                "include": "rows",
+            },
+            timeout=30,
+        )
+        assert row_feed.status_code == 501, row_feed.text + server.debug_logs()
+        assert row_feed.json()["error"] == "changefeed_capability_unsupported"
+
         for cold in (False, True):
             if cold:
                 server.restart()

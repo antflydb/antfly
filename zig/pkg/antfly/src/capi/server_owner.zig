@@ -2699,10 +2699,10 @@ pub fn metadataApplyStoreProjection(
             const record = (handle.store.getReplicationSourceStatus(alloc, request.group_id, request.arg0, ordinal) catch |err|
                 break :blk storageOwnerStatusFromError(err)) orelse break :blk metadataProjectionJson(alloc, out_json, @as(?u8, null));
             defer metadata_table_manager.freeReplicationSourceStatus(alloc, record);
-            var page = (handle.store.observeNativeSnapshotCapture(alloc, request.group_id, record, std.mem.readInt(u64, key[0..8], .little), key[8] != 0) catch |err|
+            const page = (handle.store.observeNativeSnapshotCapture(alloc, request.group_id, record, std.mem.readInt(u64, key[0..8], .little), key[8] != 0) catch |err|
                 break :blk storageOwnerStatusFromError(err)) orelse break :blk metadataProjectionJson(alloc, out_json, @as(?u8, null));
-            defer page.deinit();
-            break :blk metadataProjectionJson(alloc, out_json, page.value);
+            defer page.deinit(alloc);
+            break :blk metadataProjectionJson(alloc, out_json, page);
         },
         .native_snapshot_rows => blk: {
             const ordinal = std.math.cast(u32, request.arg1) orelse break :blk .invalid_argument;

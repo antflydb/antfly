@@ -1370,6 +1370,8 @@ pub const ReplicationSourceStatusRecord = struct {
     snapshot_offset: u64 = 0,
     prepared_checkpoint: []const u8 = "",
     stream_checkpoint: []const u8 = "",
+    /// Durable destination acceptance, projected from the scoped actor or recorded after Iceberg WAL admission.
+    accepted_stream_checkpoint: ?[]const u8 = null,
     last_error: []const u8 = "",
     failure_class: []const u8 = "",
     lag_records: u64 = 0,
@@ -1426,6 +1428,12 @@ pub const CapturedNativeSnapshotPage = struct {
     page: ReplicationSourceStatusRecord.SnapshotPage,
     rows: []const u8,
     sealed: bool = false,
+
+    pub fn deinit(self: CapturedNativeSnapshotPage, a: std.mem.Allocator) void {
+        a.free(self.page.checkpoint);
+        a.free(self.page.recovery_job);
+        a.free(self.rows);
+    }
 };
 
 pub const ShuffleJoinLeaseRecord = struct {
@@ -2580,6 +2588,8 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
     errdefer alloc.free(prepared_checkpoint);
     const stream_checkpoint = try alloc.dupe(u8, record.stream_checkpoint);
     errdefer alloc.free(stream_checkpoint);
+    const accepted_stream_checkpoint = if (record.accepted_stream_checkpoint) |checkpoint_value| try alloc.dupe(u8, checkpoint_value) else null;
+    errdefer if (accepted_stream_checkpoint) |checkpoint_value| alloc.free(checkpoint_value);
     const last_error = try alloc.dupe(u8, record.last_error);
     errdefer alloc.free(last_error);
     const failure_class = try alloc.dupe(u8, record.failure_class);
@@ -2615,6 +2625,7 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .snapshot_offset = record.snapshot_offset,
         .prepared_checkpoint = prepared_checkpoint,
         .stream_checkpoint = stream_checkpoint,
+        .accepted_stream_checkpoint = accepted_stream_checkpoint,
         .last_error = last_error,
         .failure_class = failure_class,
         .lag_records = record.lag_records,
@@ -2653,6 +2664,7 @@ pub fn freeReplicationSourceStatus(alloc: std.mem.Allocator, record: Replication
     alloc.free(record.checkpoint);
     alloc.free(record.prepared_checkpoint);
     alloc.free(record.stream_checkpoint);
+    if (record.accepted_stream_checkpoint) |checkpoint| alloc.free(checkpoint);
     alloc.free(record.last_error);
     alloc.free(record.failure_class);
     alloc.free(record.retired_slot_name);

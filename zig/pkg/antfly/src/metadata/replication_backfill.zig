@@ -2062,8 +2062,14 @@ pub const StreamingReplicationRunner = struct {
         var progress_checkpoint = std.ArrayListUnmanaged(u8).empty;
         defer progress_checkpoint.deinit(self.alloc);
         if (resume_checkpoint) |checkpoint| try progress_checkpoint.appendSlice(self.alloc, checkpoint);
+        var accepted_checkpoint: std.ArrayListUnmanaged(u8) = .empty;
+        defer accepted_checkpoint.deinit(self.alloc);
+        if (existing_status) |status| {
+            if (status.accepted_stream_checkpoint) |checkpoint|
+                try accepted_checkpoint.appendSlice(self.alloc, checkpoint);
+        }
 
-        return self.runTableSourceInner(status_sink, table, source_ordinal, snapshot_offset, cutover_mode, resume_checkpoint, existing_status, &progress_checkpoint) catch |err| {
+        return self.runTableSourceInner(status_sink, table, source_ordinal, snapshot_offset, cutover_mode, resume_checkpoint, existing_status, &progress_checkpoint, &accepted_checkpoint) catch |err| {
             self.checkpointWork() catch return err;
             try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer) catch return err;
@@ -2102,6 +2108,7 @@ pub const StreamingReplicationRunner = struct {
                 .snapshot_offset = @intCast(snapshot_offset),
                 .prepared_checkpoint = prepared_checkpoint,
                 .stream_checkpoint = progress_checkpoint.items,
+                .accepted_stream_checkpoint = if (accepted_checkpoint.items.len > 0) accepted_checkpoint.items else null,
                 .last_error = @errorName(err),
                 .failure_class = classifyReplicationError(err),
                 .lag_records = 0,
@@ -2228,7 +2235,7 @@ pub const StreamingReplicationRunner = struct {
         }, requests, snapshot, context);
     }
 
-    fn applyExternal(self: *StreamingReplicationRunner, owner: ExternalStreamDestination, table: metadata_table_manager.TableRecord, source_ordinal: u32, status: ?metadata_table_manager.ReplicationSourceStatusRecord, previous: []const u8, checkpoint: []const u8, changes: []const foreign_mod.ReplicationChange) !void {
+    fn applyExternal(self: *StreamingReplicationRunner, owner: ExternalStreamDestination, table: metadata_table_manager.TableRecord, source_ordinal: u32, status: ?metadata_table_manager.ReplicationSourceStatusRecord, previous: []const u8, checkpoint: []const u8, changes: []const foreign_mod.ReplicationChange, accepted_checkpoint: *std.ArrayListUnmanaged(u8)) !void {
         const cutover = status orelse return error.UnsupportedReplicationRoute;
         if (cutover.cutover_authority_id == 0 or cutover.table_id != table.table_id or cutover.source_ordinal != source_ordinal) return error.UnsupportedReplicationRoute;
         const outcome = try owner.apply(owner.ptr, self.alloc, .{
@@ -2239,6 +2246,7 @@ pub const StreamingReplicationRunner = struct {
             .changes = changes,
             .deadline_ns = try self.workDeadlineNs(),
         });
+        try replaceProgressSlice(self.alloc, accepted_checkpoint, checkpoint);
         if (outcome != .committed) return error.SourceOutcomeUnresolved;
     }
 
@@ -2252,6 +2260,7 @@ pub const StreamingReplicationRunner = struct {
         resume_checkpoint: ?[]const u8,
         existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord,
         progress_checkpoint: *std.ArrayListUnmanaged(u8),
+        accepted_checkpoint: *std.ArrayListUnmanaged(u8),
     ) !StreamSummary {
         try self.checkpointWork();
         try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
@@ -2358,7 +2367,7 @@ pub const StreamingReplicationRunner = struct {
         if (result.changes.len == 0) {
             try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             if (result.checkpoint.len > 0 and !std.mem.eql(u8, result.checkpoint, progress_checkpoint.items)) {
-                if (destination) |owner| try self.applyExternal(owner, table, source_ordinal, existing_status, progress_checkpoint.items, result.checkpoint, &.{});
+                if (destination) |owner| try self.applyExternal(owner, table, source_ordinal, existing_status, progress_checkpoint.items, result.checkpoint, &.{}, accepted_checkpoint);
                 progress_checkpoint.clearRetainingCapacity();
                 try progress_checkpoint.appendSlice(self.alloc, result.checkpoint);
             }
@@ -2375,6 +2384,7 @@ pub const StreamingReplicationRunner = struct {
                 .snapshot_offset = @intCast(snapshot_offset),
                 .prepared_checkpoint = prepared_checkpoint,
                 .stream_checkpoint = progress_checkpoint.items,
+                .accepted_stream_checkpoint = if (accepted_checkpoint.items.len > 0) accepted_checkpoint.items else null,
                 .last_error = "",
                 .failure_class = "",
                 .lag_records = result.lag_records,
@@ -2433,7 +2443,7 @@ pub const StreamingReplicationRunner = struct {
             // Advance the provider frontier after complete durable effects;
             // index visibility is an independent publication obligation.
             const apply_summary = if (destination) |owner| blk: {
-                try self.applyExternal(owner, table, source_ordinal, existing_status, progress_checkpoint.items, change.checkpoint, transaction);
+                try self.applyExternal(owner, table, source_ordinal, existing_status, progress_checkpoint.items, change.checkpoint, transaction, accepted_checkpoint);
                 var applied: ReplicationApplySummary = .{};
                 for (transaction) |member| switch (member.op) {
                     .insert, .update => applied.writes_applied += 1,
@@ -2488,6 +2498,7 @@ pub const StreamingReplicationRunner = struct {
                 .snapshot_offset = @intCast(snapshot_offset),
                 .prepared_checkpoint = prepared_checkpoint,
                 .stream_checkpoint = progress_checkpoint.items,
+                .accepted_stream_checkpoint = if (accepted_checkpoint.items.len > 0) accepted_checkpoint.items else null,
                 .last_error = "",
                 .failure_class = "",
                 .lag_records = if (change.lag_records > 0) change.lag_records else result.lag_records,
@@ -8123,8 +8134,12 @@ test "metadata replication stream resumes complete durable transactions while de
     try std.testing.expectError(error.SourceOutcomeUnresolved, runner.runTableSourceFromCheckpoint(&sink, external_table, 0, 0, "", "initial", status));
     const pending = sink.records.items[sink.records.items.len - 1];
     try std.testing.expectEqualStrings("first-commit", pending.checkpoint);
+    try std.testing.expectEqualStrings("first-commit", pending.stream_checkpoint);
+    try std.testing.expectEqualStrings("second-commit", pending.accepted_stream_checkpoint.?);
     _ = try runner.runTableSourceFromCheckpoint(&sink, external_table, 0, 0, "", pending.checkpoint, pending);
-    try std.testing.expectEqualStrings("second-commit", sink.records.items[sink.records.items.len - 1].checkpoint);
+    const committed = sink.records.items[sink.records.items.len - 1];
+    try std.testing.expectEqualStrings("second-commit", committed.stream_checkpoint);
+    try std.testing.expectEqualStrings("second-commit", committed.accepted_stream_checkpoint.?);
     try std.testing.expectEqual(@as(usize, 3), state.external_calls);
     try std.testing.expectEqual(@as(usize, 3), state.calls);
     var bootstrap_runner: SnapshotBackfillRunner = .{

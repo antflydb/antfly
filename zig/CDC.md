@@ -164,18 +164,17 @@ uv run --project e2e/antfly python e2e/antfly/bench_changefeed.py zig-out/bin/an
 
 A macOS arm64 debug run with one metadata node, one data node, and one table
 root gave the following results. At each nonzero fan-out, one consumer stayed
-offline until both servers restarted. These results used serial pulls. The
-current benchmark runs active consumers concurrently and also reports their
-aggregate delivered events per second. Lag includes the pull and durable
-acknowledgement. The replica allocation column measures whole replica
-directory growth during the workload. The no-feed baseline provides a
-comparison for the retention cost.
+offline until both servers restarted. The other consumers pulled and
+acknowledged each batch concurrently using independent connections. Lag
+includes the pull and durable acknowledgement. Replica growth measures the
+whole replica directory. The no-feed baseline provides a comparison for the
+retention cost.
 
-| Consumers | Write rows/s | Write and deliver rows/s | Median batch ACK lag | Replica growth | Restart | Offline catch-up |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 38.3 | 38.3 | — | 104 KiB | — | — |
-| 2 | 38.7 | 2.11 | 3.58 s | 312 KiB | 1.40 s | 14.39 s |
-| 4 | 38.9 | 0.73 | 7.20 s | 352 KiB | 1.64 s | 14.34 s |
+| Consumers | Write rows/s | Write and deliver rows/s | Active consumer events/s | Median batch ACK lag | Replica growth | Restart | Offline catch-up |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 38.6 | 38.6 | 0 | — | 100 KiB | — | — |
+| 2 | 38.5 | 1.91 | 1.91 | 3.97 s | 304 KiB | 1.68 s | 16.16 s |
+| 4 | 38.9 | 1.73 | 5.18 | 4.00 s | 292 KiB | 1.48 s | 16.55 s |
 
 ## Metadata substrate
 
@@ -312,9 +311,22 @@ Hosted native sources that set `require_exact_cutover = true` capture the
 exported snapshot in durable pages before applying it. Scoped snapshot
 transactions advance the durable snapshot offset one committed page at a
 time. The stream begins at the provider checkpoint after the final page.
-Public progress retains the original snapshot cut in `prepared_checkpoint`
-and reports the committed provider cut in `stream_checkpoint`. A new routed
+Public progress retains the original snapshot cut in `prepared_checkpoint`.
+The managed-source status reports durable acceptance in
+`accepted_stream_checkpoint` and destination commit in `stream_checkpoint`.
+Writable Iceberg publishes acceptance after its WAL admits the transaction.
+The committed checkpoint advances after the catalog commit. Treat checkpoints
+as opaque provider values. A new routed
 source can use this path after a destination closes legacy CDC intake.
+
+Use `GET /db/v1/tables/{table}/sources/managed` to read the destination
+contract, source configuration hash, and per-source progress. For a managed
+configuration change, `POST` to the same route with the table ID,
+`expected_sources_hash`, and the replacement `replication_sources` array.
+On a table already using scoped CDC, append new definitions after the
+existing definitions. The catalog preserves the existing ordinals and
+checkpoints. Use the reseed operation to rotate an existing source's
+PostgreSQL resources.
 
 Capture is bounded to 4,096 pages and 256 MiB of retained page data per
 export. An oversized capture reports backpressure and leaves the streaming

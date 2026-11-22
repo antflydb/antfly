@@ -185,7 +185,8 @@ pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
 pub const compact_session_compare_version: u16 = 128;
 pub const spliced_session_record_version: u16 = 129;
 /// Version 130 certifies the initial scoped native PostgreSQL checkpoint.
-pub const current_version: u16 = @import("source_control.zig").scoped_snapshot_protocol_version;
+pub const iceberg_acceptance_status_version: u16 = 132;
+pub const current_version: u16 = iceberg_acceptance_status_version;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

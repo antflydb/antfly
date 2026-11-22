@@ -16181,7 +16181,8 @@ pub const RaftApplyStore = struct {
         try txn.put(key, output);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         if (next.native_bootstrap_checkpoint != null and
-            (next.committed.sequence != state.committed.sequence or next.closing != state.closing or next.retired != state.retired))
+            (next.accepted.sequence != state.accepted.sequence or next.committed.sequence != state.committed.sequence or
+                next.closing != state.closing or next.retired != state.retired))
         {
             self.notifyProjectionListeners(.{
                 .kind = .replication_source_status,
@@ -16662,11 +16663,16 @@ pub const RaftApplyStore = struct {
         const scope = state.scope orelse return status;
         const checkpoint = state.native_bootstrap_checkpoint orelse return status;
         const provider = source_control.nativeSourceProviderBinding(status) catch return status;
-        if (state.retired or state.closing or state.committed.sequence == 0 or
-            source_control.isNativeSnapshotScopedCheckpoint(state.committed.checkpoint) or
-            scope.destination != .native or scope.table_id != status.table_id or scope.source_ordinal != status.source_ordinal or
+        if (state.retired or state.closing or scope.destination != .native or scope.table_id != status.table_id or scope.source_ordinal != status.source_ordinal or
             !std.meta.eql(scope.source_id, id) or !std.meta.eql(scope.definition, definition) or !std.meta.eql(scope.provider, provider) or
             !std.mem.eql(u8, checkpoint, status.prepared_checkpoint)) return status;
+
+        if (state.accepted.sequence != 0 and !source_control.isNativeSnapshotScopedCheckpoint(state.accepted.checkpoint)) {
+            const accepted = try alloc.dupe(u8, state.accepted.checkpoint);
+            if (status.accepted_stream_checkpoint) |prior| alloc.free(prior);
+            status.accepted_stream_checkpoint = accepted;
+        }
+        if (state.committed.sequence == 0 or source_control.isNativeSnapshotScopedCheckpoint(state.committed.checkpoint)) return status;
 
         const phase = try alloc.dupe(u8, "streaming");
         errdefer alloc.free(phase);
@@ -23151,14 +23157,14 @@ pub const RaftApplyStore = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const before = try std.json.parseFromSlice(std.json.Value, a, current.replication_sources_json, .{ .duplicate_field_behavior = .@"error" });
-        const after = try std.json.parseFromSlice(std.json.Value, a, replacement.replication_sources_json, .{ .duplicate_field_behavior = .@"error" });
+        const before = try std.json.parseFromSlice(std.json.Value, a, current.replication_sources_json, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+        const after = try std.json.parseFromSlice(std.json.Value, a, replacement.replication_sources_json, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
         if (before.value != .array or after.value != .array or before.value.array.items.len != after.value.array.items.len) return null;
         var ordinal: ?u32 = null;
         for (before.value.array.items, after.value.array.items, 0..) |*prior, *next, index| {
             const idx = std.math.cast(u32, index) orelse return null;
-            const definition = try source_control.definitionDigest(a, current.replication_sources_json, idx);
-            if (std.meta.eql(definition, try source_control.definitionDigest(a, replacement.replication_sources_json, idx))) continue;
+            const definition = try source_control.definitionValueDigest(a, prior.*);
+            if (std.meta.eql(definition, try source_control.definitionValueDigest(a, next.*))) continue;
             if (ordinal != null or prior.* != .object or next.* != .object) return null;
             for ([_][]const u8{ "slot_name", "publication_name" }) |field| {
                 const candidate = next.object.get(field) orelse return null;
@@ -23219,7 +23225,28 @@ pub const RaftApplyStore = struct {
         return ordinal;
     }
 
-    fn publishScopedReseedStatusTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord, ordinal: u32) !void {
+    fn scopedSourceAppendAllowed(a: std.mem.Allocator, current: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
+        if (!std.mem.eql(u8, current.name, replacement.name) or
+            !std.mem.eql(u8, current.schema_json, replacement.schema_json) or
+            current.storage.engine != replacement.storage.engine) return false;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const before = try std.json.parseFromSlice(std.json.Value, scratch, if (current.replication_sources_json.len == 0) "[]" else current.replication_sources_json, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+        const after = try std.json.parseFromSlice(std.json.Value, scratch, replacement.replication_sources_json, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+        if (before.value != .array or after.value != .array or after.value.array.items.len <= before.value.array.items.len) return false;
+        var definitions: std.AutoHashMapUnmanaged(source_control.Digest, void) = .empty;
+        for (after.value.array.items, 0..) |item, index| {
+            const definition = try source_control.definitionValueDigest(scratch, item);
+            if (index < before.value.array.items.len and
+                !std.meta.eql(definition, try source_control.definitionValueDigest(scratch, before.value.array.items[index]))) return false;
+            const entry = try definitions.getOrPut(scratch, definition);
+            if (entry.found_existing) return false;
+        }
+        return true;
+    }
+
+    fn rebindNativeBootstrapStatusesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord, reseed_ordinal: ?u32) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -23231,7 +23258,7 @@ pub const RaftApplyStore = struct {
             var status = try decodeReplicationSourceStatusRecord(a, entry.value);
             if (!std.meta.eql(status.native_bootstrap_catalog_digest, old_digest)) continue;
             status.native_bootstrap_catalog_digest = new_digest;
-            if (status.source_ordinal == ordinal) {
+            if (reseed_ordinal == status.source_ordinal) {
                 status.phase = source_control.native_bootstrap_reseed_phase;
                 status.checkpoint = "snapshot_offset:0";
                 status.snapshot_offset = 0;
@@ -23357,9 +23384,10 @@ pub const RaftApplyStore = struct {
             const existing = try decodeTableRecord(self.alloc, encoded);
             retained = existing;
             const renamed = !std.mem.eql(u8, existing.name, record.name);
-            if (renamed and try hasNativeRootCohortSealTxn(txn, group_id, existing.name)) return;
+            const root_sealed = try hasNativeRootCohortSealTxn(txn, group_id, existing.name);
+            if (renamed and root_sealed) return;
             if ((renamed or !std.mem.eql(u8, existing.replication_sources_json, record.replication_sources_json)) and
-                !try self.sourceDefinitionAllowedTxn(txn, group_id, record, false)) return;
+                (root_sealed or !try self.sourceDefinitionAllowedTxn(txn, group_id, record, false))) return;
 
             if (nativeBootstrapDefinitionChanged(existing, record) and
                 try tableHasNativeBootstrapWorkTxn(self.alloc, txn, group_id, record.table_id)) return;
@@ -25121,13 +25149,23 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn readNativeSnapshotCapture(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, record: metadata.ReplicationSourceStatusRecord, offset: u64) !?std.json.Parsed(metadata.CapturedNativeSnapshotPage) {
-        return self.observeNativeSnapshotCapture(a, group_id, record, offset, true);
-    }
-
-    pub fn observeNativeSnapshotCapture(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, record: metadata.ReplicationSourceStatusRecord, offset: u64, require_sealed: bool) !?std.json.Parsed(metadata.CapturedNativeSnapshotPage) {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        return observeNativeSnapshotCaptureTxn(a, &txn, group_id, record, offset, require_sealed);
+        return observeNativeSnapshotCaptureTxn(a, &txn, group_id, record, offset, true);
+    }
+
+    pub fn observeNativeSnapshotCapture(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, record: metadata.ReplicationSourceStatusRecord, offset: u64, require_sealed: bool) !?metadata.CapturedNativeSnapshotPage {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var parsed = (try observeNativeSnapshotCaptureTxn(a, &txn, group_id, record, offset, require_sealed)) orelse return null;
+        defer parsed.deinit();
+        var owned = parsed.value;
+        owned.page.checkpoint = try a.dupe(u8, parsed.value.page.checkpoint);
+        errdefer a.free(owned.page.checkpoint);
+        owned.page.recovery_job = try a.dupe(u8, parsed.value.page.recovery_job);
+        errdefer a.free(owned.page.recovery_job);
+        owned.rows = try a.dupe(u8, parsed.value.rows);
+        return owned;
     }
 
     fn observeNativeSnapshotCaptureTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.ReplicationSourceStatusRecord, offset: u64, require_sealed: bool) !?std.json.Parsed(metadata.CapturedNativeSnapshotPage) {
@@ -25345,16 +25383,30 @@ pub const RaftApplyStore = struct {
         }
         const renamed = !std.mem.eql(u8, current.name, replacement.name);
         var reseed_ordinal: ?u32 = null;
-        if (renamed and try hasNativeRootCohortSealTxn(txn, group_id, current.name)) {
+        var append_scoped_source = false;
+        const root_sealed = try hasNativeRootCohortSealTxn(txn, group_id, current.name);
+        if (renamed and root_sealed) {
             try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
             return;
         }
         if ((renamed or !std.mem.eql(u8, current.replication_sources_json, replacement.replication_sources_json)) and
-            !try self.sourceDefinitionAllowedTxn(txn, group_id, replacement, false))
+            (root_sealed or !try self.sourceDefinitionAllowedTxn(txn, group_id, replacement, false)))
         {
-            if (!renamed and try self.sourceDefinitionAllowedTxn(txn, group_id, replacement, true))
-                reseed_ordinal = try self.scopedReseedOrdinalTxn(txn, group_id, current, replacement);
-            if (reseed_ordinal == null) {
+            const activation = self.standbyRelationActivationTxn(txn, group_id) catch |err| switch (err) {
+                error.TableTopologyProtocolUpgradeRequired => {
+                    try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
+                    return;
+                },
+                else => return err,
+            };
+            if (!renamed and activation.version >= source_control.scoped_snapshot_protocol_version and
+                try self.sourceDefinitionAllowedTxn(txn, group_id, replacement, true))
+            {
+                append_scoped_source = try scopedSourceAppendAllowed(self.alloc, current, replacement);
+                if (!append_scoped_source)
+                    reseed_ordinal = try self.scopedReseedOrdinalTxn(txn, group_id, current, replacement);
+            }
+            if (reseed_ordinal == null and !append_scoped_source) {
                 try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
                 return;
             }
@@ -25487,8 +25539,8 @@ pub const RaftApplyStore = struct {
         if ((try self.loadTableTransitionFenceTxn(txn, group_id, expected.table_id)).active()) return;
         if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
         try self.putTableRecordTxn(txn, group_id, key, replacement);
-        if (reseed_ordinal) |ordinal|
-            try self.publishScopedReseedStatusTxn(txn, group_id, current, replacement, ordinal);
+        if (append_scoped_source or reseed_ordinal != null)
+            try self.rebindNativeBootstrapStatusesTxn(txn, group_id, current, replacement, reseed_ordinal);
     }
 
     fn relationalDefinitionsRetained(self: *RaftApplyStore, previous: metadata.TableRecord, next: metadata.TableRecord) !bool {
@@ -33427,7 +33479,8 @@ fn appendReplicationSourceStatusRecord(
     try appendRequiredString(alloc, out, record.retired_publication_name);
     const extension: u8 = (if (record.pending_snapshot_page != null) @as(u8, 1) else if (record.snapshot_cleanup_job.len != 0) @as(u8, 2) else @as(u8, 0)) |
         (if (record.snapshot_page_attempt != 0) @as(u8, 4) else 0) |
-        (if (!std.mem.allEqual(u8, &record.native_bootstrap_catalog_digest, 0)) @as(u8, 8) else 0);
+        (if (!std.mem.allEqual(u8, &record.native_bootstrap_catalog_digest, 0)) @as(u8, 8) else 0) |
+        (if (record.accepted_stream_checkpoint != null) @as(u8, 16) else 0);
     if (extension != 0) try out.append(alloc, extension);
     if (record.pending_snapshot_page) |page| {
         try appendInt(alloc, out, u64, page.end_offset);
@@ -33440,6 +33493,7 @@ fn appendReplicationSourceStatusRecord(
     }
     if (record.snapshot_page_attempt != 0) try appendInt(alloc, out, u32, record.snapshot_page_attempt);
     if (extension & 8 != 0) try out.appendSlice(alloc, &record.native_bootstrap_catalog_digest);
+    if (record.accepted_stream_checkpoint) |checkpoint| try appendRequiredString(alloc, out, checkpoint);
 }
 
 fn appendRangeRecord(
@@ -34392,7 +34446,7 @@ fn readReplicationSourceStatusRecord(
     );
     errdefer alloc.free(retired_publication_name);
     const extension = if (pos.* < encoded.len) try readInt(encoded, pos, u8) else 0;
-    if (extension > 14 or extension & 3 == 3) return error.InvalidMetadataTransitionEncoding;
+    if (extension & ~@as(u8, 31) != 0 or extension & 3 == 3) return error.InvalidMetadataTransitionEncoding;
     const snapshot_cleanup_job = if (extension & 3 == 2) try readRequiredString(alloc, encoded, pos) else try alloc.dupe(u8, "");
     errdefer alloc.free(snapshot_cleanup_job);
     const pending_snapshot_page: ?metadata.ReplicationSourceStatusRecord.SnapshotPage = if (extension & 3 == 1) blk: {
@@ -34426,6 +34480,7 @@ fn readReplicationSourceStatusRecord(
         pos.* = end;
         break :blk digest;
     } else @splat(0);
+    const accepted_stream_checkpoint = if (extension & 16 != 0) try readRequiredString(alloc, encoded, pos) else null;
     return .{
         .table_id = table_id,
         .source_ordinal = source_ordinal,
@@ -34455,6 +34510,7 @@ fn readReplicationSourceStatusRecord(
         .retired_slot_name = retired_slot_name,
         .retired_publication_name = retired_publication_name,
         .pending_snapshot_page = pending_snapshot_page,
+        .accepted_stream_checkpoint = accepted_stream_checkpoint,
         .native_bootstrap_catalog_digest = native_bootstrap_catalog_digest,
         .snapshot_page_attempt = snapshot_page_attempt,
         .snapshot_cleanup_job = snapshot_cleanup_job,
@@ -39390,6 +39446,8 @@ test "metadata replication source status transition command round-trips" {
             .phase = "snapshot",
             .checkpoint = "lsn:0/16B6A50",
             .prepared_checkpoint = "lsn:0/16B6A50",
+            .stream_checkpoint = "lsn:0/16B6A60",
+            .accepted_stream_checkpoint = "lsn:0/16B6A70",
             .last_error = "",
             .failure_class = "terminal",
             .lag_records = 12,
@@ -39420,6 +39478,8 @@ test "metadata replication source status transition command round-trips" {
     try std.testing.expectEqualStrings("exported_snapshot", decoded.?.upsert_replication_source_status.cutover_mode);
     try std.testing.expectEqualStrings("snapshot", decoded.?.upsert_replication_source_status.phase);
     try std.testing.expectEqualStrings("lsn:0/16B6A50", decoded.?.upsert_replication_source_status.prepared_checkpoint);
+    try std.testing.expectEqualStrings("lsn:0/16B6A60", decoded.?.upsert_replication_source_status.stream_checkpoint);
+    try std.testing.expectEqualStrings("lsn:0/16B6A70", decoded.?.upsert_replication_source_status.accepted_stream_checkpoint.?);
     try std.testing.expectEqualStrings("terminal", decoded.?.upsert_replication_source_status.failure_class);
     try std.testing.expectEqual(@as(u64, 34), decoded.?.upsert_replication_source_status.lag_millis);
     try std.testing.expectEqual(@as(u64, 4), decoded.?.upsert_replication_source_status.consecutive_failures);
@@ -48464,6 +48524,18 @@ test "metadata source control artifact debt survives reopening and keeps table r
             try restored.expectWork(0);
         }
     }
+}
+
+test "metadata source control scoped append retains existing ordinals and rejects duplicates" {
+    const a = std.testing.allocator;
+    const current: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .replication_sources_json = "[{\"id\":1,\"value\":1e1}]" };
+    var replacement = current;
+    replacement.replication_sources_json = "[{\"value\":1e1,\"id\":1},{\"id\":2}]";
+    try std.testing.expect(try RaftApplyStore.scopedSourceAppendAllowed(a, current, replacement));
+    replacement.replication_sources_json = "[{\"id\":2},{\"id\":1,\"value\":1e1}]";
+    try std.testing.expect(!try RaftApplyStore.scopedSourceAppendAllowed(a, current, replacement));
+    replacement.replication_sources_json = "[{\"id\":1,\"value\":1e1},{\"value\":1e1,\"id\":1}]";
+    try std.testing.expect(!try RaftApplyStore.scopedSourceAppendAllowed(a, current, replacement));
 }
 
 test "metadata source control scoped lifecycle pins idle bindings through reopen and snapshot" {

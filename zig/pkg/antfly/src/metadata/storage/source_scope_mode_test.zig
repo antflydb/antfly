@@ -59,7 +59,7 @@ pub fn run(a: A) !void {
     const group = groups.main_metadata_group_id;
     const incarnation = "11111111111111111111111111111111".*;
     try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
-    const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}", .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]" };
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}", .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\",\"require_exact_cutover\":true}]" };
     try store.applyStandaloneCommand(group, .{ .upsert_table = table });
     const cutover: metadata.ReplicationSourceStatusRecord = .{
         .table_id = table.table_id,
@@ -283,6 +283,17 @@ pub fn run(a: A) !void {
         const saved = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
         defer metadata.freeReplicationSourceStatus(a, saved);
         try std.testing.expectEqual(@as(u64, 0), saved.snapshot_offset);
+    }
+    {
+        const owned_capture = (try store.observeNativeSnapshotCapture(a, group, snapshot_status, 0, true)) orelse return error.TestUnexpectedResult;
+        defer owned_capture.deinit(a);
+        store.deinit();
+        opened = false;
+        store = try Store.init(a, .{ .root_dir = path });
+        opened = true;
+        try std.testing.expect(owned_capture.sealed);
+        try std.testing.expectEqualStrings(captured_rows, owned_capture.rows);
+        try std.testing.expectEqualStrings("snapshot_keyset:[1]", owned_capture.page.checkpoint);
     }
     {
         const original_actor = try store.getSourceControl(a, group, source.table_id, source.source_id);
@@ -538,6 +549,8 @@ pub fn run(a: A) !void {
         const uncommitted = try store.listReplicationSourceStatuses(a, group);
         defer store.freeReplicationSourceStatuses(a, uncommitted);
         try std.testing.expectEqualStrings(control.native_bootstrap_prepared_phase, uncommitted[0].phase);
+        try std.testing.expectEqualStrings("lsn:0/1234", uncommitted[0].accepted_stream_checkpoint.?);
+        try std.testing.expectEqualStrings("", uncommitted[0].stream_checkpoint);
         state.outstanding = &.{};
         state.committed = .{
             .sequence = 2,
@@ -556,6 +569,7 @@ pub fn run(a: A) !void {
         try std.testing.expectEqualStrings("streaming", statuses[0].phase);
         try std.testing.expectEqualStrings("lsn:0/2345", statuses[0].checkpoint);
         try std.testing.expectEqualStrings("lsn:0/2345", statuses[0].stream_checkpoint);
+        try std.testing.expectEqualStrings("lsn:0/2345", statuses[0].accepted_stream_checkpoint.?);
         try std.testing.expectEqualStrings("lsn:0/1234", statuses[0].prepared_checkpoint);
         const raw = (try store.getReplicationSourceStatus(a, group, source.table_id, 0)) orelse return error.TestUnexpectedResult;
         defer metadata.freeReplicationSourceStatus(a, raw);
@@ -567,6 +581,30 @@ pub fn run(a: A) !void {
     }
     try actor.expectWork(1);
     try std.testing.expect(!try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
+    {
+        const append_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-scope-mode-append", .{tmp.sub_path});
+        defer a.free(append_path);
+        var append_store = try Store.init(a, .{ .root_dir = append_path });
+        defer append_store.deinit();
+        const before_append = try store.snapshotBuilder().buildSnapshot(a, group);
+        defer a.free(before_append);
+        try std.testing.expect(try append_store.snapshotBuilder().installSnapshot(a, group, 99, before_append));
+        const existing = (try append_store.getTable(a, group, table.table_id)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeTable(a, existing);
+        var appended = existing;
+        appended.replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\",\"require_exact_cutover\":true},{\"type\":\"postgres\",\"postgres_table\":\"other\",\"require_exact_cutover\":true}]";
+        try append_store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = existing, .replacement = appended } });
+        const saved_table = (try append_store.getTable(a, group, table.table_id)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeTable(a, saved_table);
+        try std.testing.expectEqualStrings(appended.replication_sources_json, saved_table.replication_sources_json);
+        const saved_status = (try append_store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, saved_status);
+        try std.testing.expectEqualStrings(control.native_bootstrap_prepared_phase, saved_status.phase);
+        try std.testing.expectEqualStrings("lsn:0/1234", saved_status.prepared_checkpoint);
+        try std.testing.expectEqual(publication_status.cutover_authority_id, saved_status.cutover_authority_id);
+        try std.testing.expectEqual(control.nativeBootstrapCatalogDigest(appended), saved_status.native_bootstrap_catalog_digest);
+        try std.testing.expect(try append_store.legacyReplicationSourceIntakeAllowed(a, group, table.table_id, 1, try control.definitionDigest(a, appended.replication_sources_json, 1)));
+    }
     try actor.apply(.{ .close = {} });
     try actor.expectWork(1);
     const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);

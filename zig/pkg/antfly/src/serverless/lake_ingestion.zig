@@ -293,7 +293,10 @@ pub const StreamOwner = struct {
             try writeBootstrapStage(a, bound.binding, options, context, batch);
             return .accepted;
         }
-        const outcome = try applyBatch(a, bound.binding, options, context, batch);
+        const outcome = applyBatch(a, bound.binding, options, context, batch) catch |err| switch (err) {
+            error.LakeCommitOutcomeUnknown => (try observeBatch(a, bound.binding, options, context, batch)) orelse return err,
+            else => return err,
+        };
         if (outcome.committed and batch.bootstrap) retireBootstrapStage(a, bound.binding, options, context, batch);
         return if (outcome.committed) .committed else .accepted;
     }
@@ -1469,10 +1472,15 @@ test "external lake filesystem WAL retries a rejected intent after metadata pres
     try std.testing.expectEqualStrings(parent.metadata_location, retired.metadata_location);
     try std.testing.expect(!std.mem.eql(u8, parent.version.?, retired.version.?));
     try std.testing.expectError(error.LakeCommitConflict, managed.commit(a, commit));
-    // First pass resolves the saved rejection, second pass plans at the new
-    // catalog version, and a third pass proves publication is complete.
-    try std.testing.expect(try drain(a, binding, options, .{}));
-    try std.testing.expect(try drain(a, binding, options, .{}));
+    // The first pass reports the original WAL admission while it resolves
+    // the rejected intent. The retry commits that same admission.
+    const admitted = try applyBatch(a, binding, options, .{}, batch);
+    try std.testing.expectEqual(lsn, admitted.accepted_sequence);
+    try std.testing.expect(!admitted.committed);
+    try std.testing.expectEqual(@as(u64, 0), try coverage(a, try managed.load(a)));
+    const committed = try applyBatch(a, binding, options, .{}, batch);
+    try std.testing.expectEqual(lsn, committed.accepted_sequence);
+    try std.testing.expect(committed.committed);
     try std.testing.expect(!try drain(a, binding, options, .{}));
     const published = try managed.load(a);
     try std.testing.expectEqual(lsn, try coverage(a, published));
@@ -1662,6 +1670,20 @@ test "external lake filesystem WAL group commit folds pending transactions into 
     try protectRetainedWalSnapshots(a, compacted, 3, &rewrite_protected);
     try std.testing.expectEqual(@as(usize, 2), rewrite_protected.items.len);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{rewrite_id}), rewrite_protected.items[1]);
+    // An acknowledged feed at the current logical cut must stay empty
+    // when the catalog advances through a physical rewrite only.
+    var rewrite_only = try catalog.metadata.parse(a, last.metadata_json);
+    const rewrite_after_commit = try std.json.Stringify.valueAlloc(a, .{
+        .@"snapshot-id" = rewrite_id,
+        .@"parent-snapshot-id" = last_id,
+        .summary = .{ .operation = "replace", .@"antfly.compaction" = "rewrite", .@"antfly.wal.coverage" = "5" },
+    }, .{});
+    try rewrite_only.object.getPtr("snapshots").?.array.append(try catalog.metadata.parse(a, rewrite_after_commit));
+    try rewrite_only.object.put(a, "current-snapshot-id", .{ .integer = rewrite_id });
+    var rewrite_only_table = last;
+    rewrite_only_table.metadata_json = try std.json.Stringify.valueAlloc(a, rewrite_only, .{});
+    try std.testing.expect(try changes.readNext(a, binding, options, rewrite_only_table, resumed_position, schemas, .{}) == null);
+
     var rolled_back = try catalog.metadata.parse(a, last.metadata_json);
     try rolled_back.object.put(a, "current-snapshot-id", .{ .integer = first_id });
     var rollback_table = last;

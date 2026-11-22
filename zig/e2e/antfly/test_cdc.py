@@ -2011,6 +2011,84 @@ def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_coll
         interval_s=0.25,
     )
 
+    managed_path = f"/tables/{table_name}/sources/managed"
+    managed = stateful_api._check(stateful_api._request("GET", managed_path))
+    appended = {
+        "type": "postgres",
+        "dsn": _pg_dsn(),
+        "postgres_table": pg_cdc_source["table_name"],
+        "key_template": "attached-{{id}}",
+        "require_exact_cutover": True,
+    }
+    stateful_api._check(
+        stateful_api._request(
+            "POST",
+            managed_path,
+            {
+                "table_id": table_id,
+                "expected_sources_hash": managed["sources_hash"],
+                "replication_sources": [
+                    *create_payload["replication_sources"],
+                    appended,
+                ],
+            },
+        )
+    )
+
+    def attached_status():
+        statuses = {
+            status["source_ordinal"]: status
+            for status in _metadata_replication_status_records(stateful_api)
+            if int(status.get("table_id", 0)) == table_id
+            and status.get("phase") == "streaming"
+        }
+        if 0 in statuses and 1 in statuses:
+            return statuses
+        return None
+
+    attached = wait_until(attached_status, timeout_s=60.0, interval_s=0.25)
+    assert attached is not None, (
+        "managed source append did not preserve and bootstrap both sources\n"
+        f"{_metadata_replication_statuses(stateful_api)}\n"
+        f"{_server_logs(stateful_api)}"
+    )
+    assert (
+        attached[0]["cutover_authority_id"] == physical_status["cutover_authority_id"]
+    )
+    assert attached[0]["prepared_checkpoint"] == bootstrap_checkpoint
+    pg_cdc_source["cleanup_slot_names"].append(attached[1]["slot_name"])
+    pg_cdc_source["cleanup_publication_names"].append(attached[1]["publication_name"])
+    assert _lookup_doc_if(
+        stateful_api,
+        table_name,
+        "attached-user-3",
+        lambda doc: doc.get("name") == "Carol",
+    )
+    managed_after = stateful_api._check(stateful_api._request("GET", managed_path))
+    second_progress = next(
+        progress
+        for progress in managed_after["progress"]
+        if progress["source_ordinal"] == 1
+    )
+    assert second_progress["accepted_stream_checkpoint"]
+    assert (
+        second_progress["accepted_stream_checkpoint"]
+        == second_progress["stream_checkpoint"]
+    )
+
+    _run_psql(f"""
+        insert into {pg_cdc_source["table_name"]} (id, name, tier)
+        values ('user-4', 'Dina', 'gold');
+        """)
+    for key in ("user-4", "attached-user-4", "routed-user-4"):
+        assert wait_until(
+            lambda: _lookup_doc_if(
+                stateful_api, table_name, key, lambda doc: doc.get("name") == "Dina"
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        ), f"source did not resume streaming to {key}"
+
 
 def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
     stateful_api, pg_cdc_source
@@ -2809,6 +2887,22 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         check_row_count()
         if publication_failure:
             saved_catalog = call("GET", table + "/lake/catalog")["metadata"]
+
+            def accepted_and_committed():
+                checkpoint = resumed["antfly.cdc.checkpoint"]
+                return next(
+                    (
+                        row
+                        for row in call("GET", table + "/sources/managed")["progress"]
+                        if row["stream_checkpoint"] == checkpoint
+                        and row.get("accepted_stream_checkpoint") == checkpoint
+                    ),
+                    None,
+                )
+
+            assert wait_until(accepted_and_committed, timeout_s=30.0, interval_s=0.5), (
+                server.debug_logs()
+            )
 
             def failed_publication():
                 state = publication_progress()

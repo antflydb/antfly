@@ -967,10 +967,14 @@ fn hashJson(a: A, hash: *std.crypto.hash.sha2.Sha256, value: std.json.Value) any
 pub fn definitionDigest(a: A, sources_json: []const u8, ordinal: u32) !Digest {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, sources_json, .{ .parse_numbers = false });
     defer parsed.deinit();
-    if (parsed.value != .array or ordinal >= parsed.value.array.items.len or parsed.value.array.items[ordinal] != .object) return error.InvalidSourceControl;
+    if (parsed.value != .array or ordinal >= parsed.value.array.items.len) return error.InvalidSourceControl;
+    return definitionValueDigest(a, parsed.value.array.items[ordinal]);
+}
+pub fn definitionValueDigest(a: A, value: std.json.Value) !Digest {
+    if (value != .object) return error.InvalidSourceControl;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly:source-definition:v1");
-    try hashJson(a, &hash, parsed.value.array.items[ordinal]);
+    try hashJson(a, &hash, value);
     return hash.finalResult();
 }
 pub fn hasWork(state: State) bool {
