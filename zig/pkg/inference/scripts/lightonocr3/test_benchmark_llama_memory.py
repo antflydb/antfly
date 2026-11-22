@@ -36,6 +36,7 @@ from benchmark_llama_memory import (
     run_pass,
     run_profile,
     shutdown_pass,
+    wait_ready,
     score_case,
 )
 
@@ -162,6 +163,39 @@ class QualificationTest(unittest.TestCase):
             response.read.side_effect = IncompleteRead(b"{", 10)
             with self.assertRaisesRegex(OSError, "HTTP protocol error for /slots"):
                 read_json("http://localhost/slots")
+
+    def test_readiness_retries_truncated_response_and_waits_for_current_alias(self):
+        proc = Mock()
+        proc.poll.return_value = None
+        responses = [
+            OSError("truncated health"),
+            {},
+            {"data": [{"id": "stale"}]},
+            {},
+            {"data": [{"id": "current"}]},
+        ]
+        with (
+            patch("benchmark_llama_memory.read_json", side_effect=responses) as read,
+            patch("benchmark_llama_memory.time.sleep"),
+        ):
+            wait_ready(proc, "http://localhost", "current")
+        self.assertEqual(read.call_count, 5)
+
+    def test_readiness_timeout_includes_last_transport_error(self):
+        proc = Mock()
+        proc.poll.return_value = None
+        with (
+            patch(
+                "benchmark_llama_memory.read_json",
+                side_effect=OSError("truncated health"),
+            ),
+            patch(
+                "benchmark_llama_memory.time.monotonic", side_effect=[0, 1, 120, 120]
+            ),
+            patch("benchmark_llama_memory.time.sleep"),
+            self.assertRaisesRegex(RuntimeError, "truncated health"),
+        ):
+            wait_ready(proc, "http://localhost", "current")
 
     def test_slots_schema_validates_width_and_active_task_ids(self):
         slots = [{"id": 0, "is_processing": False}]

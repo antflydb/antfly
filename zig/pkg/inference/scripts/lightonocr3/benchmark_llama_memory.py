@@ -38,7 +38,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from benchmark_corpus import cer, normalize, plain_text
@@ -179,16 +179,32 @@ def shutdown_pass(proc, record_memory):
 
 def wait_ready(proc, url, alias):
     deadline = time.monotonic() + 120
-    while time.monotonic() < deadline and proc.poll() is None:
+    detail = "no readiness response"
+    while proc.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            read_json(url + "/health", timeout=1)
-            models = read_json(url + "/v1/models", timeout=1)
-            if any(model.get("id") == alias for model in models.get("data", [])):
+            read_json(url + "/health", timeout=min(1, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            models = read_json(url + "/v1/models", timeout=min(1, remaining))
+            entries = models.get("data") if isinstance(models, dict) else None
+            if not isinstance(entries, list) or not all(
+                isinstance(item, dict) for item in entries
+            ):
+                raise ValueError("invalid /v1/models response")
+            if (
+                any(model.get("id") == alias for model in entries)
+                and proc.poll() is None
+            ):
                 return
-        except (URLError, TimeoutError):
-            pass
-        time.sleep(0.2)
-    raise RuntimeError("llama-server failed to become ready")
+            detail = f"/v1/models did not advertise {alias}"
+        except (OSError, ValueError) as error:
+            detail = str(error)
+        time.sleep(max(0, min(0.2, deadline - time.monotonic())))
+    raise RuntimeError(f"llama-server failed to become ready: {detail}")
 
 
 def request_case(url, case, alias, prompt="", *, on_submit=None):
