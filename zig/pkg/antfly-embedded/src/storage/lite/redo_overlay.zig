@@ -49,6 +49,9 @@ pub const VersionedOverlayEntry = struct {
     /// (`external_value_root_page != 0`).
     value: []u8 = &.{},
     is_delete: bool = false,
+    /// The appending instance's `RedoCommitState.origin`; 0 when replayed
+    /// from the log (another process's commit).
+    origin: u32 = 0,
     external_value_root_page: u64 = 0,
     external_value_len: usize = 0,
     /// The version this one superseded, or null if this is the oldest
@@ -616,6 +619,13 @@ pub const SharedRedoOverlay = struct {
         return @max(self.scope_latest.get(scope) orelse 0, self.scope_untracked);
     }
 
+    /// Every version at or below this may have been reclaimed.
+    pub fn reclaimedThrough(self: *SharedRedoOverlay, io: std.Io) u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.reclaimed_through;
+    }
+
     pub fn replayedSequence(self: *const SharedRedoOverlay, root: u8) u64 {
         return self.replayed_sequence[root].load(.acquire);
     }
@@ -623,6 +633,22 @@ pub const SharedRedoOverlay = struct {
     pub fn appendVersion(
         self: *SharedRedoOverlay,
         _: Allocator,
+        io: std.Io,
+        root: u8,
+        key: []const u8,
+        sequence: u64,
+        value: []u8,
+        is_delete: bool,
+        external_value_root_page: u64,
+        external_value_len: usize,
+    ) !void {
+        return self.appendVersionFrom(0, io, root, key, sequence, value, is_delete, external_value_root_page, external_value_len);
+    }
+
+    /// `appendVersion` for a version `origin`'s own commit made.
+    pub fn appendVersionFrom(
+        self: *SharedRedoOverlay,
+        origin: u32,
         io: std.Io,
         root: u8,
         key: []const u8,
@@ -651,6 +677,7 @@ pub const SharedRedoOverlay = struct {
             .sequence = sequence,
             .value = value,
             .is_delete = is_delete,
+            .origin = origin,
             .external_value_root_page = external_value_root_page,
             .external_value_len = external_value_len,
         };
@@ -949,6 +976,34 @@ pub const SharedRedoOverlay = struct {
                 .external_value_root_page = head.external_value_root_page,
                 .external_value_len = head.external_value_len,
             });
+        }
+        return try list.toOwnedSlice(allocator);
+    }
+
+    /// The keys under `root` with a version newer than
+    /// `min_sequence_exclusive` that `own_origin` did not append: what other
+    /// writers changed since an instance last caught up. Complete only
+    /// while `reclaimedThrough() <= min_sequence_exclusive` (a reclaim drops
+    /// versions at or below its floor). Keys only, each owned by the caller.
+    pub fn changedKeysAfterAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, min_sequence_exclusive: u64, own_origin: u32) ![][]u8 {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var list = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (list.items) |key| allocator.free(key);
+            list.deinit(allocator);
+        }
+        var it = self.maps[root].iterator();
+        while (it.next()) |kv| {
+            var node: ?*VersionedOverlayEntry = kv.value_ptr.*;
+            const changed = while (node) |n| : (node = n.older) {
+                if (n.sequence <= min_sequence_exclusive) break false;
+                if (n.origin == 0 or n.origin != own_origin) break true;
+            } else false;
+            if (!changed) continue;
+            try list.ensureUnusedCapacity(allocator, 1);
+            list.appendAssumeCapacity(try allocator.dupe(u8, kv.key_ptr.*));
         }
         return try list.toOwnedSlice(allocator);
     }

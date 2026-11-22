@@ -3478,6 +3478,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             fn finish(self: *InlineTextPublication) void {
+                _ = self.entry.persistent.inline_in_flight.fetchSub(1, .acq_rel);
                 // Segments neither installed nor aborted (an install that
                 // could not retake the guard) are released here.
                 for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
@@ -3632,6 +3633,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const result = try alloc.create(InlineTextPublication);
+            // Under the apply guard, which `refreshFromTip` also takes.
+            _ = entry.persistent.inline_in_flight.fetchAdd(1, .acq_rel);
             result.* = .{
                 .alloc = alloc,
                 .index_manager = index_manager,

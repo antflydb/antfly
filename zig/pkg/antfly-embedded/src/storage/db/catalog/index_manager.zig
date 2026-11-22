@@ -17273,6 +17273,44 @@ pub const IndexManager = struct {
         return null;
     }
 
+    /// What a scope another process committed under needs from this
+    /// process's loaded indexes.
+    pub const ScopeRefresh = enum {
+        /// A loaded full-text index owned it and now reads its tip.
+        refreshed,
+        /// No index here can refresh it in place: reopen the runtime.
+        reopen,
+        /// No full-text index here owns it (another database's, or an
+        /// index kind that does not refresh in place).
+        not_loaded,
+    };
+
+    /// Refreshes the loaded index whose native-catalog scope is `scope`
+    /// from the file, under that index's apply guard. Only versioned
+    /// full-text indexes refresh in place so far.
+    pub fn refreshIndexScopeFromTip(self: *IndexManager, scope: []const u8) !ScopeRefresh {
+        const name = name: {
+            self.catalog_mutex.lockShared();
+            defer self.catalog_mutex.unlockShared();
+            for (self.text_indexes.items) |*entry| {
+                const owned = entry.persistent.nativeCatalogScope() orelse continue;
+                if (!std.mem.eql(u8, owned, scope)) continue;
+                if (!entry.persistent.versioned) return .reopen;
+                break :name try self.alloc.dupe(u8, entry.config.name);
+            }
+            return .not_loaded;
+        };
+        defer self.alloc.free(name);
+        var guard = try self.lockManagedIndexApply(.{ .name = name, .kind = .full_text });
+        defer guard.unlock();
+        const entry = self.textIndexEntry(name) orelse return .reopen;
+        entry.persistent.refreshFromTip() catch |err| switch (err) {
+            error.UnsupportedRefresh => return .reopen,
+            else => return err,
+        };
+        return .refreshed;
+    }
+
     pub fn textIndexEntry(self: *IndexManager, name: ?[]const u8) ?*TextIndex {
         if (name) |index_name| {
             return self.textIndexEntryByName(index_name);

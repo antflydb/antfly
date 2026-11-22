@@ -1171,6 +1171,11 @@ pub const PersistentIndex = struct {
     /// A native catalog index from an older format: its owner resets and
     /// rebuilds it from the primary rows.
     needs_version_rebuild: bool = false,
+    /// Inline publications prepared and not yet installed or aborted. Their
+    /// commits may already be durable, so a refresh from the tip could load
+    /// a level-0 record their install would then add again (or after
+    /// another process merged it away): `refreshFromTip` refuses meanwhile.
+    inline_in_flight: std.atomic.Value(u32) = .init(0),
     /// Where each version of a loaded segment sits, for installing newly dead
     /// versions in memory (`installDeadVersions`).
     version_locations: VersionLocations = .{},
@@ -2185,6 +2190,120 @@ pub const PersistentIndex = struct {
         if (self.retired_segment_file_deleter) |deleter| {
             for (active_ids) |seg_id| RetiredSegmentFileDeleter.delete(deleter, seg_id);
         }
+    }
+
+    /// Brings this process's view up to the index as committed, after
+    /// another process committed under its scope: reloads the
+    /// native-catalog mirror, publishes the segments and level-0 records
+    /// now active (dropping those another process merged away) and derives
+    /// every segment's deletions from the dead set. Memory only; the
+    /// version rule already decided everything at those commits' tips.
+    pub fn refreshFromTip(self: *PersistentIndex) !void {
+        if (!self.versioned) return error.UnsupportedRefresh;
+        if (self.inline_in_flight.load(.acquire) != 0) return error.UnsupportedRefresh;
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        self.lockStorage();
+        defer self.unlockStorage();
+        try backend.reloadMirror();
+
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        var tip = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer tip.deinit(self.alloc);
+        const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);
+        defer self.alloc.free(active_ids);
+        for (active_ids) |seg_id| try tip.put(self.alloc, seg_id, {});
+        {
+            var cursor = txn.openCursor(.l0) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (cursor) |*c| {
+                defer c.close();
+                var entry = try c.first();
+                while (entry) |item| : (entry = try c.next()) {
+                    if (item.key.len != 8) return error.InvalidLevel0Segment;
+                    try tip.put(self.alloc, l0SegmentId(std.mem.readInt(u64, item.key[0..8], .big)), {});
+                }
+            }
+        }
+
+        var removed = std.ArrayListUnmanaged(u64).empty;
+        defer removed.deinit(self.alloc);
+        var present = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer present.deinit(self.alloc);
+        {
+            const snap = self.writer.acquireSnapshot();
+            defer snap.release();
+            for (snap.segments) |segment| {
+                try present.put(self.alloc, segment.id, {});
+                if (!tip.contains(segment.id)) try removed.append(self.alloc, segment.id);
+            }
+        }
+        var dead = try DeadVersions.load(self.alloc, &txn);
+        defer dead.deinit();
+        // Segments new here are published with their deletions; ones
+        // already loaded get theirs replaced after, as an inline install
+        // marks its deletes after adding its copies.
+        var added = std.ArrayListUnmanaged(index_mod.ReplacementSegmentData).empty;
+        var added_deleted = std.ArrayListUnmanaged(?roaring.RoaringBitmap).empty;
+        defer {
+            for (added.items) |*replacement| replacement.data.deinit(self.alloc);
+            added.deinit(self.alloc);
+            for (added_deleted.items) |*bitmap| if (bitmap.*) |*b| b.deinit();
+            added_deleted.deinit(self.alloc);
+        }
+        var tip_it = tip.keyIterator();
+        while (tip_it.next()) |seg_id| {
+            if (present.contains(seg_id.*)) continue;
+            try added.ensureUnusedCapacity(self.alloc, 1);
+            try added_deleted.ensureUnusedCapacity(self.alloc, 1);
+            const bytes = self.readSegmentBytesAlloc(&txn, self.alloc, seg_id.*) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            var data = index_mod.SegmentData.fromOwnedHeap(bytes);
+            const deleted = deleted: {
+                errdefer data.deinit(self.alloc);
+                var reader = try segment_mod.SegmentReader.init(self.alloc, bytes);
+                defer reader.deinit();
+                break :deleted try derivedDeletionBitmap(self.alloc, &reader, &dead);
+            };
+            added.appendAssumeCapacity(.{ .id = seg_id.*, .data = data });
+            added_deleted.appendAssumeCapacity(deleted);
+        }
+        for (added.items, added_deleted.items) |*replacement, *bitmap| {
+            if (bitmap.*) |*b| replacement.deleted = b;
+        }
+        if (removed.items.len != 0 or added.items.len != 0) {
+            var prepared = try self.writer.prepareSegmentsManyData(removed.items, added.items);
+            defer prepared.abort();
+            prepared.publish();
+            // Published: the writer owns the data now.
+            added.clearRetainingCapacity();
+        }
+
+        const snap = self.writer.acquireSnapshot();
+        defer snap.release();
+        for (snap.segments) |*segment| {
+            if (!present.contains(segment.id)) continue;
+            if (try derivedDeletionBitmap(self.alloc, &segment.reader, &dead)) |bitmap| {
+                self.writer.setDeletionBitmap(segment.id, bitmap);
+            } else if (segment.shared.deleted_count.load(.acquire) != 0) {
+                self.writer.setDeletionBitmap(segment.id, roaring.RoaringBitmap.init(self.alloc));
+            }
+        }
+        const next_seg_id_bytes = txn.get(.meta, meta_next_seg_id) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (next_seg_id_bytes) |bytes| if (bytes.len >= @sizeOf(u64)) {
+            self.writer.next_segment_id = @max(self.writer.next_segment_id, std.mem.readInt(u64, bytes[0..@sizeOf(u64)], .little));
+        };
+        self.version_locations.clear(self.alloc);
     }
 
     pub fn sync(self: *PersistentIndex, force: bool) !void {
@@ -9046,4 +9165,59 @@ test "empty lite persistent reopen preserves checkpoint" {
     defer reopened.close();
     try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
     try std.testing.expectEqual(@as(u32, 0), reopened.snapshot().liveDocCount());
+}
+
+// Another process's publications, rewrites and merges reach this process's
+// snapshot through `refreshFromTip`, without reopening the index.
+test "persistent index refreshes another writer's segments, rewrites and merges from the tip" {
+    const alloc = std.testing.allocator;
+    var test_sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer test_sink.deinit(alloc);
+    var writer_buf: [256]u8 = undefined;
+    const writer_path = persistTmpPath(&writer_buf);
+    defer cleanupPersistDir(writer_path);
+    var reader_buf: [256]u8 = undefined;
+    const reader_path = persistTmpPath(&reader_buf);
+    defer cleanupPersistDir(reader_path);
+    var writer = try openVersionedTestIndex(alloc, &test_sink, writer_path);
+    defer writer.close();
+    var reader = try openVersionedTestIndex(alloc, &test_sink, reader_path);
+    defer reader.close();
+
+    const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(first);
+    try writer.indexSegment(first);
+    try reader.refreshFromTip();
+    {
+        const snap = reader.writer.acquireSnapshot();
+        defer snap.release();
+        try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
+        try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
+    }
+
+    const second = try buildSimpleSegment(alloc, "doc:a", "beta");
+    defer alloc.free(second);
+    try writer.indexSegment(second);
+    const current = (try test_sink.docVersion("doc:a")).?;
+    try reader.refreshFromTip();
+    var ids = std.ArrayListUnmanaged(u64).empty;
+    defer ids.deinit(alloc);
+    {
+        const snap = reader.writer.acquireSnapshot();
+        defer snap.release();
+        try std.testing.expectEqual(@as(usize, 2), snap.segments.len);
+        // The rewrite made the first copy dead.
+        try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
+        for (snap.segments) |segment| try ids.append(alloc, segment.id);
+    }
+
+    const merged = try alloc.alloc([]u8, 1);
+    merged[0] = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:a", .term = "beta", .version = current }});
+    try std.testing.expect(try writer.replaceSegmentsIfActiveManyOwnedWithDeletes(ids.items, merged, null));
+    try reader.refreshFromTip();
+    const snap = reader.writer.acquireSnapshot();
+    defer snap.release();
+    try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
+    try std.testing.expect(std.mem.indexOfScalar(u64, ids.items, snap.segments[0].id) == null);
+    try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
 }

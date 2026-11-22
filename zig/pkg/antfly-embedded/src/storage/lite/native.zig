@@ -4354,6 +4354,16 @@ pub const CatalogMutation = struct {
 /// Payloads larger than one record are streamed immediately; only their extent
 /// references are retained. A spill rebuilds each touched index once, without
 /// publishing a checkpoint or ending the transaction.
+/// The roots a redo overlay keys versions by (`SharedRedoOverlay.maps`).
+pub const OverlayRoot = TransactionWrites.Root;
+
+fn nextOverlayOrigin() u32 {
+    while (true) {
+        const origin = next_overlay_origin.fetchAdd(1, .monotonic);
+        if (origin != 0) return origin;
+    }
+}
+
 const TransactionWrites = struct {
     const Root = enum { metadata, index, documents };
     const max_keys = 1024;
@@ -4704,8 +4714,15 @@ const RedoTailSource = enum { own, published, unknown };
 /// still the current one.
 const PendingLogReset = struct { old_tail: u64, fold_sequence: u64 };
 
+var next_overlay_origin = std.atomic.Value(u32).init(1);
+
 const RedoCommitState = struct {
     writer: redo_log.Writer,
+    /// Tags the overlay versions this instance's own commits append, so a
+    /// runtime can tell them from every other writer's
+    /// (`SharedRedoOverlay.changedKeysAfterAlloc`). Never 0, which marks a
+    /// replayed version.
+    origin: u32 = 0,
     /// This transaction's accumulated logical mutations, encoded via
     /// `redo_overlay.SharedRedoOverlay.decodeLogicalMutationsPayload`'s own
     /// shape. Cleared after every append (durable or not).
@@ -4953,7 +4970,7 @@ const RedoCommitState = struct {
         const owned_key = try allocator.dupe(u8, m.key);
         errdefer allocator.free(owned_key);
         try self.overlay_undo.ensureUnusedCapacity(allocator, 1);
-        try self.shared.appendVersion(std.heap.page_allocator, io, root, m.key, sequence, value, m.is_delete, m.external_value_root_page, m.external_value_len);
+        try self.shared.appendVersionFrom(self.origin, io, root, m.key, sequence, value, m.is_delete, m.external_value_root_page, m.external_value_len);
         self.overlay_undo.appendAssumeCapacity(.{ .logical = .{ .root = root, .key = owned_key } });
     }
 
@@ -7926,7 +7943,7 @@ pub const NativeFile = struct {
         // `checkpointRedoLog` on `self` would wrongly treat that
         // unfolded content as already covered (`redo_folded_through`'s
         // own doc comment).
-        self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .shared = shared, .checkpoint_sequence = checkpoint_sequence, .durable_sequence = durable_sequence };
+        self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .origin = nextOverlayOrigin(), .shared = shared, .checkpoint_sequence = checkpoint_sequence, .durable_sequence = durable_sequence };
         // An empty, durable log: publish its boundary now, so a cold reader
         // never waits on this writer's first commit to learn it.
         if (!self.read_only) self.publishRedoLogState();
@@ -8620,6 +8637,7 @@ pub const NativeFile = struct {
         const resumed_sequence = @max(outcome.last_sequence orelse recovered_checkpoint_sequence, recovered_checkpoint_sequence);
         self.redo = RedoCommitState{
             .writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, resumed_sequence),
+            .origin = nextOverlayOrigin(),
             .shared = shared,
             .durable_sequence = resumed_sequence,
             .checkpoint_sequence = folded_through,

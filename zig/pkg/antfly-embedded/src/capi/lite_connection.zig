@@ -2390,6 +2390,8 @@ pub const Owner = struct {
     /// `test_background_turn_count == 0`, a delta here is wholly
     /// attributable to the calling writes themselves.
     test_refresh_count: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
+    /// Refreshes `refreshInPlace` served without reopening the runtime.
+    test_in_place_refresh_count: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
     /// Per-owner, test-local running total of `native.NativeFile.
     /// test_sync_calls` across every generation this owner has ever had as
     /// `current`. `refresh`'s slow path replaces `current` (and therefore
@@ -2601,6 +2603,30 @@ pub const Owner = struct {
                 }
                 current.lite_refresh_adoption_epoch = file.adoptionEpoch();
                 current.lite_runtime_sequence = @max(current.lite_runtime_sequence, probe.committedSequence());
+                return current;
+            }
+            // Other processes' redo-only commits that changed document rows
+            // and full-text index records: catch this runtime up in place.
+            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and
+                !needsOutcomeReconciliation(current) and file.redo != null and fast2_metadata_unchanged and
+                try refreshInPlace(current, file, &probe))
+            {
+                if (comptime h.builtin.is_test) _ = self.test_in_place_refresh_count.fetchAdd(1, .release);
+                try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
+                if (self.maintenance_snapshot) |snapshot| try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                if (self.options.profile == .native and self.options.open_mode == .writer and !file.free_pages_verified) {
+                    _ = try self.copyIdleSnapshotLedger(file);
+                    _ = try file.inheritAllocatorCertificate();
+                }
+                for (self.connections.items) |connection| {
+                    for (connection.table_handles.items) |id| {
+                        const child, const slot = api.handleRegistry().enter(id) orelse continue;
+                        defer api.HandleRegistry.leave(slot);
+                        h.invalidateQueryProducer(child);
+                    }
+                }
+                current.lite_refresh_adoption_epoch = file.adoptionEpoch();
+                current.lite_runtime_sequence = @max(current.lite_runtime_sequence, file.committedSequence());
                 return current;
             }
             if (self.maintenance_snapshot) |snapshot| {
@@ -2855,6 +2881,125 @@ pub const Owner = struct {
         var tables = root.embedded_tables.valueIterator();
         while (tables.next()) |table| if (!try databaseIndexInputsUnchanged(&table.*.db, before, after)) return false;
         return true;
+    }
+
+    /// lite-index-write-path.md "Cross-process refresh": catches `root` up
+    /// with commits other processes made since it last did, when those are
+    /// redo-only and changed only what a runtime reads through the file
+    /// (document rows, the replay journal, per-write metadata) or versioned
+    /// full-text index records, which each owning index reloads from the
+    /// tip. False, with nothing but the shared overlay advanced, when
+    /// anything else changed (schema, catalogs, index definitions, other
+    /// index kinds, a fold): the caller reopens.
+    fn refreshInPlace(root: *h.Handle, file: *native.NativeFile, probe: *native.NativeFile) !bool {
+        const redo = if (file.redo) |*r| r else return false;
+        const since = root.lite_runtime_sequence;
+        const folded_before = redo.checkpoint_sequence;
+        try file.refreshCrossProcessRedoOverlay();
+        // A fold adopts records without decoding them into the overlay.
+        if (redo.checkpoint_sequence != folded_before) return false;
+        if (file.committedSequence() < probe.committedSequence()) return false;
+        const io = file.runtime();
+        const shared = redo.shared;
+        // A reclaim past `since` may have dropped versions this must see.
+        if (shared.reclaimedThrough(io) > since) return false;
+        const origin = redo.origin;
+        const Root = native.OverlayRoot;
+        {
+            const changed = try shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.metadata), since, origin);
+            defer freeKeys(changed);
+            for (changed) |key| if (!routineMetadataKey(key)) return false;
+        }
+        {
+            const changed = try shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.documents), since, origin);
+            defer freeKeys(changed);
+            for (changed) |key| if (!routineDocumentKey(key)) return false;
+        }
+        var scopes = std.StringArrayHashMapUnmanaged(void).empty;
+        defer scopes.deinit(alloc);
+        const changed = try shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.index), since, origin);
+        defer freeKeys(changed);
+        for (changed) |key| {
+            const scope = nativeCatalogScopeOf(key) orelse return false;
+            try scopes.put(alloc, scope, {});
+        }
+        for (scopes.keys()) |scope| {
+            var refreshed = switch (try root.db.core.index_manager.refreshIndexScopeFromTip(scope)) {
+                .refreshed => true,
+                .reopen => return false,
+                .not_loaded => false,
+            };
+            var tables = root.embedded_tables.valueIterator();
+            while (!refreshed) {
+                const table = tables.next() orelse break;
+                refreshed = switch (try table.*.db.core.index_manager.refreshIndexScopeFromTip(scope)) {
+                    .refreshed => true,
+                    .reopen => return false,
+                    .not_loaded => false,
+                };
+            }
+            if (!refreshed) return false;
+        }
+        return true;
+    }
+
+    fn freeKeys(owned: [][]u8) void {
+        for (owned) |key| alloc.free(key);
+        alloc.free(owned);
+    }
+
+    /// `"\x00ncat/<scope>\x00..."`, the native catalog sink's records.
+    fn nativeCatalogScopeOf(key: []const u8) ?[]const u8 {
+        const prefix = "\x00ncat/";
+        if (!std.mem.startsWith(u8, key, prefix)) return null;
+        const rest = key[prefix.len..];
+        return rest[0 .. std.mem.indexOfScalar(u8, rest, 0) orelse return null];
+    }
+
+    /// Metadata-root keys writers touch per commit, none of which a runtime
+    /// caches: artifact leases and writer bookkeeping.
+    fn routineMetadataKey(key: []const u8) bool {
+        return std.mem.startsWith(u8, key, native.NativeFile.artifact_lease_key_prefix) or
+            std.mem.eql(u8, key, "\x00AFREDO/reservation-v1") or
+            std.mem.eql(u8, key, "\x00AFCERT/allocator-v1");
+    }
+
+    /// Document-root keys an ordinary write changes, under a table's
+    /// `"\x02db/<namespace>\x00"` prefix or the root database's none:
+    /// rows, identities, the replay journal (except table storage
+    /// settings) and per-write metadata. Anything else, schema and catalogs
+    /// included, is not routine.
+    fn routineDocumentKey(physical: []const u8) bool {
+        var key = physical;
+        if (std.mem.startsWith(u8, key, "\x02db/")) {
+            const end = std.mem.indexOfScalarPos(u8, key, 4, 0) orelse return false;
+            key = key[end + 1 ..];
+        }
+        if (key.len == 0) return false;
+        return switch (key[0]) {
+            0x01, 0x03 => true,
+            0x02 => !(key.len >= 3 and key[1] == 0xff and key[2] == 0x40),
+            0x00 => {
+                const metadata = "\x00\x00__metadata__:";
+                if (std.mem.startsWith(u8, key, metadata)) {
+                    const name = key[metadata.len..];
+                    inline for (.{
+                        "progress:v2:",
+                        "document_revision_v2:",
+                        "source_value_identity_v1:",
+                        "document_projection_v1:",
+                        "document_version_watermark_v1",
+                        "range_generation:",
+                        "range_writer:",
+                        "index_span_",
+                    }) |routine| if (std.mem.startsWith(u8, name, routine)) return true;
+                    return false;
+                }
+                return std.mem.startsWith(u8, key, "\x00\x00__columnar__:dirty:") or
+                    std.mem.startsWith(u8, key, "\x00\x00__columnar__:mutation");
+            },
+            else => false,
+        };
     }
 
     fn databaseIndexInputsUnchanged(database: *h.db_mod.DB, before: *native.NativeFile, after: *native.NativeFile) !bool {
@@ -8609,6 +8754,102 @@ test "capi native separate writer processes keep full-text deletes at full_index
             }
         }
     }
+}
+
+// lite-index-write-path.md "Cross-process refresh": another process's
+// full_index writes reach an open handle's full-text index without reopening
+// its runtime, and the handle keeps writing and finding its own afterwards.
+test "capi native separate writer processes refresh full-text in place" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("xproc-fts-in-place");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(h.handleLockIo(), tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, true);
+    const owner = wrapper.lite_connection.?.owner;
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    var deleted = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(id, .fromSlice("full_text_index_v0"), &deleted));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
+        "{\"name\":\"matched_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+    )));
+    const Search = struct {
+        fn found(handle: anytype, token: []const u8, key: []const u8) !bool {
+            var query_buffer: [256]u8 = undefined;
+            const query = try std.fmt.bufPrint(&query_buffer, "{{\"full_text_search\":{{\"match\":{{\"field\":\"text\",\"text\":\"{s}\"}}}},\"limit\":16}}", .{token});
+            var response: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&response);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_search_json(handle, .fromSlice(query), &response));
+            return std.mem.indexOf(u8, response.ptr.?[0..response.len], key) != null;
+        }
+        fn write(handle: anytype, key: []const u8, token: []const u8) !void {
+            var request_buffer: [256]u8 = undefined;
+            const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"{s}\":{{\"text\":\"{s}\"}}}},\"sync_level\":\"full_index\"}}", .{ key, token });
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(handle, .fromSlice(request), &out));
+        }
+    };
+    try Search.write(id, "doc-0", "parentfirst");
+    try std.testing.expect(try Search.found(id, "parentfirst", "\"doc-0\""));
+
+    const writes = 8;
+    const Child = struct {
+        fn run(child_path: []const u8, result_fd: std.c.fd_t) noreturn {
+            const child = open(child_path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, false) catch xprocParkForever();
+            const child_id = api.publishHandle(child) catch xprocParkForever();
+            var request_buffer: [256]u8 = undefined;
+            for (0..writes) |sequence| {
+                const request = std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"doc-{d}\":{{\"text\":\"childwrote{d}\"}}}},\"sync_level\":\"full_index\"}}", .{ sequence % 2, sequence }) catch xprocParkForever();
+                var out: h.capi.Buffer = .{};
+                const code = api.antfly_db_batch_json(child_id, .fromSlice(request), &out);
+                api.antfly_buffer_free_zero(&out);
+                if (code != .ok) {
+                    const report: [1]u8 = .{1};
+                    _ = std.c.write(result_fd, &report, report.len);
+                    xprocParkForever();
+                }
+            }
+            api.antfly_db_close(child_id);
+            const report: [1]u8 = .{0};
+            _ = std.c.write(result_fd, &report, report.len);
+            xprocParkForever();
+        }
+    };
+    const in_place_before = owner.test_in_place_refresh_count.load(.acquire);
+    const runtime_before = owner.current.?;
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&fds));
+    const pid = std.c.fork();
+    if (pid == 0) {
+        _ = std.posix.system.close(fds[0]);
+        Child.run(path, fds[1]);
+    }
+    try std.testing.expect(pid > 0);
+    _ = std.posix.system.close(fds[1]);
+    defer {
+        _ = std.c.kill(pid, std.c.SIG.KILL);
+        _ = std.c.waitpid(pid, null, 0);
+        _ = std.posix.system.close(fds[0]);
+    }
+    var report: [1]u8 = undefined;
+    try xprocReadBounded(fds[0], &report, 600_000);
+    try std.testing.expectEqual(@as(u8, 0), report[0]);
+
+    // The child's last writes are current; everything it overwrote is gone.
+    try std.testing.expect(try Search.found(id, "childwrote6", "\"doc-0\""));
+    try std.testing.expect(try Search.found(id, "childwrote7", "\"doc-1\""));
+    try std.testing.expect(!try Search.found(id, "childwrote4", "\"doc-0\""));
+    try std.testing.expect(!try Search.found(id, "parentfirst", "\"doc-0\""));
+    try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > in_place_before);
+    try std.testing.expect(owner.current.? == runtime_before);
+    // This runtime still writes, and its write supersedes the child's.
+    try Search.write(id, "doc-0", "parentagain");
+    try std.testing.expect(try Search.found(id, "parentagain", "\"doc-0\""));
+    try std.testing.expect(!try Search.found(id, "childwrote6", "\"doc-0\""));
 }
 
 // perf/lwa-xproc-writers item 4: a cold-opened writer whose opportunistic

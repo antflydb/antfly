@@ -125,11 +125,32 @@ timeout. The flusher also:
 
 ### Cross-process refresh
 
-Each index scope's latest commit sequence is published in the shared lock
-region (`redo.shared.scopeLatestSequence`). Before serving, a process compares
-it with what it loaded; if it moved, it reads only the level-0 records and
-base changes committed since, plus the dead set, and updates its snapshot.
-The runtime is not reopened for another process's index commit.
+Before serving, a process catches its shared redo overlay up with the log
+and asks what other writers changed since its runtime last caught up
+(`lite_connection.zig` `refreshInPlace`). Every overlay version carries the
+appending instance's origin (`RedoCommitState.origin`; 0 for a version
+replayed from another process's record), so the runtime's own commits are
+excluded (`SharedRedoOverlay.changedKeysAfterAlloc`). It refreshes in place
+when every other change is one it reads through the file anyway or can
+reload:
+
+- metadata root: artifact leases and writer bookkeeping only;
+- documents root: rows, identities, the replay journal and per-write
+  metadata (apply progress, document revisions, range counters), under any
+  table's `\x02db/<namespace>\x00` prefix. Schema, catalogs, table settings
+  and SQL markers are not routine;
+- index root: native-catalog records (`\x00ncat/<scope>\x00...`) of loaded
+  versioned full-text indexes, each reloaded by `PersistentIndex.refreshFromTip`:
+  the mirror is reloaded, segments and level-0 records another process
+  published or merged away are added or dropped in one snapshot
+  publication, and every segment's deletions are derived from the dead set.
+
+Anything else reopens the runtime, as do a fold or reclaim past the
+runtime's sequence (records may not be in the overlay), outcome
+uncertainty, live borrows, and an index with inline publications in flight
+(their install could re-add a level-0 record the refresh already loaded or
+that another process merged away). Other index kinds join as they move to
+level-0 records.
 
 ## Crash and consistency invariants
 
@@ -163,7 +184,8 @@ The runtime is not reopened for another process's index commit.
    flusher; per-transaction hot-key writes removed. Full-text level-0
    records are folded by ordinary merges, which check each input at the
    tip (`l0/` present) rather than in this process's mirror.
-4. Incremental cross-process refresh.
+4. Incremental cross-process refresh. Done for document rows and full-text
+   indexes; other index kinds still reopen.
 5. Delete-marker cleanup and the remaining per-type folds.
 
 Each stage keeps the crash sweeps, the multi-process capi tests and the

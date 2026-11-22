@@ -395,6 +395,21 @@ pub const Backend = struct {
         const scope = try allocator.dupe(u8, options.scope);
         errdefer allocator.free(scope);
 
+        var tree = try loadTree(allocator, options.sink, scope);
+        errdefer tree.release(allocator);
+
+        const rc = try allocator.create(RcState);
+        rc.* = .{ .refs = 1, .state = .{ .tree = tree } };
+        return .{
+            .scope = scope,
+            .allocator = allocator,
+            .sink = options.sink,
+            .open_options = options.backend,
+            .state = rc,
+        };
+    }
+
+    fn loadTree(allocator: Allocator, sink: Sink, scope: []const u8) !ordered.Tree {
         var tree: ordered.Tree = .empty;
         errdefer tree.release(allocator);
 
@@ -402,7 +417,7 @@ pub const Backend = struct {
         // and value each separately allocated); `tree.put` dupes its own
         // copies, so every entry's bytes must be freed here once copied in,
         // on every path (including an error partway through the loop).
-        const loaded = try options.sink.loadAllAlloc(options.sink.ptr, allocator, scope);
+        const loaded = try sink.loadAllAlloc(sink.ptr, allocator, scope);
         defer allocator.free(loaded);
         var freed: usize = 0;
         defer for (loaded[freed..]) |entry| {
@@ -410,7 +425,7 @@ pub const Backend = struct {
             allocator.free(entry.key);
             allocator.free(entry.value);
         };
-        const tip_reads = options.sink.loadOneAlloc != null;
+        const tip_reads = sink.loadOneAlloc != null;
         for (loaded) |entry| {
             if (!(tip_reads and isTipNamespace(entry.namespace)) and !isStagedOnly(entry.namespace)) {
                 const next = try tree.put(allocator, entry.namespace, entry.key, entry.value);
@@ -422,16 +437,24 @@ pub const Backend = struct {
             allocator.free(entry.value);
             freed += 1;
         }
+        return tree;
+    }
 
-        const rc = try allocator.create(RcState);
+    /// Replaces the mirror with the scope as the sink now reads it, for a
+    /// process that learned another one committed under this scope. Open
+    /// transactions keep the state they retained. Clears an invalidated
+    /// mirror: it is current again.
+    pub fn reloadMirror(self: *Backend) !void {
+        var tree = try loadTree(self.allocator, self.sink, self.scope);
+        errdefer tree.release(self.allocator);
+        const rc = try self.allocator.create(RcState);
         rc.* = .{ .refs = 1, .state = .{ .tree = tree } };
-        return .{
-            .scope = scope,
-            .allocator = allocator,
-            .sink = options.sink,
-            .open_options = options.backend,
-            .state = rc,
-        };
+        lockBackend(self);
+        const old = self.state;
+        self.state = rc;
+        releaseState(self.allocator, old);
+        self.mutex.unlock();
+        self.mirror_invalid.store(false, .release);
     }
 
     pub fn close(self: *Backend) void {
