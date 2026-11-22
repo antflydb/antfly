@@ -2381,7 +2381,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
         if (comptime kind == .resolution or kind == .publication or kind == .admission or kind == .decision) if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
-        var lease = try self.acquireWithControls(group, table_name, .from(opts));
+        // The route and applied-index fences qualify this retained read even
+        // when topology prevents the owner from publishing catalog changes.
+        var owner_controls: ReadControls = .from(opts);
+        owner_controls.historical_raft_apply = true;
+        var lease = try self.acquireWithControls(group, table_name, owner_controls);
         defer lease.deinit();
         if (lease.entry.identity.table_id != identity.table_id or lease.entry.identity.shard_id != identity.shard_id or lease.entry.identity.range_id != identity.range_id) return error.HistoryResynchronizationRequired;
         try self.validateRoutedRead(alloc, fence, group, table_name);
