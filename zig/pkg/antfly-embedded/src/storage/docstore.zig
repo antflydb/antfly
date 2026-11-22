@@ -217,8 +217,9 @@ fn scanReplayJournalCredits(txn: anytype) !ReplayCreditScan {
     var scan: ReplayCreditScan = .{};
     for (replay_credit_lanes, 0..) |kind, i| {
         const head = replayCreditLaneHead(&scan.heads, i);
-        var cursor = try txn.openCursor();
+        var cursor = try txn.openPhysicalCursorAdapter();
         defer cursor.close();
+        cursor.setLengthOnly();
         const lower = internal_keys.replayRangeLower(kind, 0);
         const upper = internal_keys.replayRangeUpper(kind);
         cursor.setUpperBound(&upper);
@@ -228,7 +229,7 @@ fn scanReplayJournalCredits(txn: anytype) !ReplayCreditScan {
             if (current.key.len < 2 or current.key[0] != internal_keys.replay_namespace or current.key[1] != kind) break;
             const seq = internal_keys.parseReplayEntrySequence(current.key, kind) orelse continue;
             if (std.mem.readInt(u64, head, .little) == 0) std.mem.writeInt(u64, head, seq + 1, .little);
-            scan.ledger = scan.ledger.charged(replay_journal_format.entryCharge(current.key.len, current.value.len), 1);
+            scan.ledger = scan.ledger.charged(replay_journal_format.entryCharge(current.key.len, cursor.valueLen(current)), 1);
         }
     }
     const next = try replayCreditNextSequence(txn);
@@ -3891,6 +3892,7 @@ pub const DocStore = struct {
             var cursor = try txn.openPhysicalCursorAdapter();
             defer cursor.close();
             cursor.boundPersistedRunBlockResidency();
+            cursor.setLengthOnly();
             // Keep hinted lanes ahead of the all-record lane.
             for (1..replay_credit_lanes.len + 1) |turn| {
                 const lane = turn % replay_credit_lanes.len;
@@ -3908,7 +3910,7 @@ pub const DocStore = struct {
                     if (sequence > up_to_sequence) break;
                     try plan.deletes.append(alloc, kv.key[0..internal_keys.replay_key_len].*);
                     plan.stats.keys_deleted += 1;
-                    plan.stats.bytes_deleted += kv.key.len + kv.value.len;
+                    plan.stats.bytes_deleted += kv.key.len + cursor.valueLen(kv);
                     plan.stats.retired_through = @max(plan.stats.retired_through, sequence);
                     if (plan.first_deleted[lane] == null) plan.first_deleted[lane] = sequence;
                     plan.deleted_through[lane] = sequence + 1;

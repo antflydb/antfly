@@ -1037,6 +1037,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             namespace_name: ?[]const u8,
             key: []const u8,
             value: []const u8,
+            logical_value_len: ?usize = null,
             tombstone: bool,
         };
         const cursor_storage_alignment = @max(
@@ -1088,6 +1089,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         backend_locked: bool = false,
         record_scan_value_stats: bool = true,
         keys_only: bool = false,
+        last_value_len: usize = 0,
         bounded_run_block_residency: bool = false,
         resident_run_source: ?usize = null,
 
@@ -1281,6 +1283,14 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             self.boundPersistedRunBlockResidency();
         }
 
+        pub fn setLengthOnly(self: *@This()) void {
+            self.setKeysOnly();
+        }
+
+        pub fn lastValueLen(self: *const @This()) usize {
+            return self.last_value_len;
+        }
+
         pub fn close(self: *@This()) void {
             defer if (self.cursor_reservation) |*lease| lease.release();
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
@@ -1435,6 +1445,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 if (!entry.tombstone) {
                     self.current_visible_source = winner_source;
                     self.recordVisibleValueStat(winner_source);
+                    self.last_value_len = entry.logical_value_len orelse entry.value.len;
                     return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
                 }
                 self.current_visible_source = null;
@@ -2046,12 +2057,14 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             } else if (self.mutable.findIndex(self.namespace, key)) |idx| {
                 const entry = self.mutable.entryAt(idx);
                 if (entry.tombstone) return null;
+                self.last_value_len = entry.value.len;
                 return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
             }
             for (self.immutable_memtables) |state| {
                 if (state.findIndex(self.namespace, key)) |idx| {
                     const entry = state.entryAt(idx);
                     if (entry.tombstone) return null;
+                    self.last_value_len = entry.value.len;
                     return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
                 }
             }
@@ -2060,6 +2073,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 const entry = self.source_entries[source_index] orelse continue;
                 if (!std.mem.eql(u8, entry.key, key)) continue;
                 if (entry.tombstone) return null;
+                self.last_value_len = entry.value.len;
                 return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
             }
             return null;
@@ -2147,6 +2161,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .namespace_name = copied_namespace,
                 .key = copied_key,
                 .value = copied_value,
+                .logical_value_len = entry.value.len,
                 .tombstone = entry.tombstone,
             };
         }
@@ -2211,6 +2226,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const idx = self.mutable.findIndex(self.namespace, key) orelse return .absent;
             const entry = self.mutable.entryAt(idx);
             if (entry.tombstone) return .tombstone;
+            self.last_value_len = entry.value.len;
             const value_len = if (self.keys_only) @as(usize, 0) else entry.value.len;
             const bytes = try self.backend.allocator.alloc(u8, entry.key.len + value_len);
             errdefer self.backend.allocator.free(bytes);

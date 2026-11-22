@@ -195,6 +195,8 @@ pub const Cursor = struct {
         seek_at_or_before: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         set_upper_bound: ?*const fn (*anyopaque, ?[]const u8) void = null,
         set_keys_only: ?*const fn (*anyopaque) void = null,
+        set_length_only: ?*const fn (*anyopaque) void = null,
+        last_value_len: ?*const fn (*anyopaque) usize = null,
         bound_persisted_run_block_residency: ?*const fn (*anyopaque) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
@@ -241,6 +243,16 @@ pub const Cursor = struct {
     /// Call before the first move. Unsupported adapters retain normal reads.
     pub fn setKeysOnly(self: *Cursor) void {
         if (self.vtable.set_keys_only) |set| set(self.ptr);
+    }
+
+    /// Use lengths without loading external values when the backend can
+    /// supply them. Other backends keep returning ordinary entries.
+    pub fn setLengthOnly(self: *Cursor) void {
+        if (self.vtable.set_length_only) |set| set(self.ptr);
+    }
+
+    pub fn valueLen(self: *Cursor, entry: Entry) usize {
+        return if (self.vtable.last_value_len) |len| len(self.ptr) else entry.value.len;
     }
 
     /// Count borrowed keys on this snapshot without retaining or copying values.
@@ -1878,6 +1890,14 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             unbox(ptr).handle.setKeysOnly();
         }
 
+        fn setLengthOnly(ptr: *anyopaque) void {
+            unbox(ptr).handle.setLengthOnly();
+        }
+
+        fn lastValueLen(ptr: *anyopaque) usize {
+            return unbox(ptr).handle.lastValueLen();
+        }
+
         pub fn setUpperBound(ptr: *anyopaque, upper: ?[]const u8) void {
             unbox(ptr).handle.setUpperBound(upper);
         }
@@ -1896,6 +1916,8 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             .seek_at_or_before = vt.seekAtOrBefore,
             .set_upper_bound = if (@hasDecl(Handle, "setUpperBound")) vt.setUpperBound else null,
             .set_keys_only = if (@hasDecl(Handle, "setKeysOnly")) vt.setKeysOnly else null,
+            .set_length_only = if (@hasDecl(Handle, "setLengthOnly") and @hasDecl(Handle, "lastValueLen")) vt.setLengthOnly else null,
+            .last_value_len = if (@hasDecl(Handle, "setLengthOnly") and @hasDecl(Handle, "lastValueLen")) vt.lastValueLen else null,
             .bound_persisted_run_block_residency = if (@hasDecl(Handle, "boundPersistedRunBlockResidency")) vt.boundPersistedRunBlockResidency else null,
         },
     };
