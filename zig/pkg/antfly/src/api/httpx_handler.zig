@@ -18122,7 +18122,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
             self.owner_attempts += 1;
             if (!self.default_conflict) {
                 var empty: EmptyOwner = .{};
-                var effects = try owner.prepare(a, &empty, tables[0].integrity_commands);
+                var effects = try owner.prepare(a, &empty, tables[0].integrity_commands, null);
                 defer effects.deinit();
             }
             self.primary_apply_attempts += 1;
