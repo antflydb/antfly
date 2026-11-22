@@ -7662,7 +7662,7 @@ pub const NativeFile = struct {
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         // See the matching comment in `createWithIo`.
         if (result.manifest_commits_enabled) try result.manifest_builder.reserveCapacity(allocator);
-        if (result.writer_lock_file) |file| result.sidecar_registration = registerOwnSidecarLock(result.runtimeIo(), file);
+        if (result.writer_lock_file) |sidecar| result.sidecar_registration = registerOwnSidecarLock(result.runtimeIo(), sidecar);
         return result;
     }
 
@@ -10567,7 +10567,7 @@ pub const NativeFile = struct {
         // heap allocation and preserve gaps") start measuring right after
         // this call returns, before issuing any writes.
         result.manifest_builder = manifest_builder_reservation;
-        if (result.writer_lock_file) |file| result.sidecar_registration = registerOwnSidecarLock(result.runtimeIo(), file);
+        if (result.writer_lock_file) |sidecar| result.sidecar_registration = registerOwnSidecarLock(result.runtimeIo(), sidecar);
         return result;
     }
 
