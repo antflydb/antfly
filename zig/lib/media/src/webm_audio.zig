@@ -537,6 +537,7 @@ pub const Packet = struct {
 pub const PacketSource = struct {
     source: *Source,
     packets: []const Packet,
+    seek_pre_roll_ns: u64 = 0,
 
     pub fn read(self: PacketSource, index: usize) !@import("source.zig").Lease {
         if (index >= self.packets.len) return error.UnsupportedAudioFormat;
@@ -585,7 +586,7 @@ const RangeBlock = struct {
         if (self.lease == null or self.position - self.lease_start >= self.lease.?.bytes.len) {
             self.close();
             self.lease_start = self.position;
-            self.lease = try self.source.read(self.start + self.position, @min(if (self.position == 0) @as(usize, 12) else 64, self.length - self.position));
+            self.lease = try self.source.readMetadata(self.start + self.position, @min(if (self.position == 0) @as(usize, 12) else 64, self.length - self.position));
         }
         const value = self.lease.?.bytes[self.position - self.lease_start];
         self.position += 1;
@@ -615,7 +616,7 @@ fn scanSegment(a: std.mem.Allocator, scan: *Webm.Scan, segment: Webm.Element) !D
         const size = elem.end - elem.payload;
         if (elem.id == info_id or (elem.id == tracks_id and state.track == null)) {
             if (size > scan.limits.max_metadata_bytes) return error.ResourceLimitExceeded;
-            var lease = try scan.input.read(elem.payload, @intCast(size));
+            var lease = try scan.input.readMetadata(elem.payload, @intCast(size));
             defer lease.deinit();
             if (elem.id == info_id) {
                 try parseInfo(lease.bytes, &state);
@@ -649,7 +650,7 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
         switch (child.id) {
             timecode_id => {
                 if (child.end - child.payload > 8) return error.UnsupportedAudioFormat;
-                var lease = try scan.input.read(child.payload, @intCast(child.end - child.payload));
+                var lease = try scan.input.readMetadata(child.payload, @intCast(child.end - child.payload));
                 defer lease.deinit();
                 ticks = try readUint(lease.bytes);
             },
@@ -670,7 +671,7 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
                 }
                 if (packets.items.len != before) if (discard) |field| {
                     if (field.end - field.payload > 8) return error.UnsupportedAudioFormat;
-                    var lease = try scan.input.read(field.payload, @intCast(field.end - field.payload));
+                    var lease = try scan.input.readMetadata(field.payload, @intCast(field.end - field.payload));
                     defer lease.deinit();
                     padding.* = try readSignedInt(lease.bytes);
                 };

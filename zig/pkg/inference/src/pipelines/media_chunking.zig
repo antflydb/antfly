@@ -290,6 +290,7 @@ pub const Runner = struct {
             try self.prepareVideoAudio();
             output_payload.video.audio_failure = self.audio_failure;
             if (self.audio_provider) |provider| {
+                if (provider.sample_rate == 0) return error.UnsupportedAudioFormat;
                 const start: u128 = @intCast(descriptor.coordinates.start_ns orelse return error.InvalidChunkCoordinates);
                 const end: u128 = @intCast(descriptor.coordinates.end_ns orelse return error.InvalidChunkCoordinates);
                 const first = std.math.cast(usize, @divFloor(start * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)) orelse return error.InvalidChunkCoordinates;
@@ -918,7 +919,7 @@ pub const Runner = struct {
         const source = &planning_source;
         const transport = try media.transport_stream.isTransportSource(source);
         const webm = if (transport) false else detect: {
-            var prefix = try source.read(0, @intCast(@min(4, source.length())));
+            var prefix = try source.readMetadata(0, @intCast(@min(4, source.length())));
             defer prefix.deinit();
             break :detect std.mem.eql(u8, prefix.bytes, "\x1a\x45\xdf\xa3");
         };

@@ -59,6 +59,7 @@ pub const Range = struct {
     context: *anyopaque,
     /// May return a short read. Returning zero before the declared end is EOF.
     read_at: *const fn (*anyopaque, u64, []u8, Control) anyerror!usize,
+    metadata_read_at: ?*const fn (*anyopaque, u64, []u8, Control) anyerror!usize = null,
     length: u64,
 };
 pub const Storage = union(enum) { borrowed: []const u8, range: Range };
@@ -137,12 +138,15 @@ pub const Source = struct {
         return self.readControlled(offset, size, .{});
     }
     pub fn readReclaiming(self: *Source, offset: u64, size: usize, reclaimer: ?admission.Reclaimer) !Lease {
-        return self.readWithControl(offset, size, .{}, reclaimer);
+        return self.readWithControl(offset, size, .{}, reclaimer, false);
     }
     pub fn readControlled(self: *Source, offset: u64, size: usize, caller: Control) !Lease {
-        return self.readWithControl(offset, size, caller, null);
+        return self.readWithControl(offset, size, caller, null, false);
     }
-    fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer) !Lease {
+    pub fn readMetadata(self: *Source, offset: u64, size: usize) !Lease {
+        return self.readWithControl(offset, size, .{}, null, true);
+    }
+    fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, metadata: bool) !Lease {
         const owner = self.physical orelse self;
         const io = std.Io.Threaded.global_single_threaded.io();
         const controls = ReadControl{ .source = owner.control, .worker = self.control };
@@ -177,6 +181,7 @@ pub const Source = struct {
         var reservation = try self.admitBytes(size, reclaimer);
         errdefer reservation.deinit();
         const range = self.storage.range;
+        const read_at = if (metadata) range.metadata_read_at orelse range.read_at else range.read_at;
         if (range.borrow_at) |borrow| {
             if (serial) try owner.provider_gate.lock(control);
             defer if (serial) owner.provider_gate.unlock();
@@ -204,7 +209,7 @@ pub const Source = struct {
             try control.check();
             if (first_call_used) try self.chargeCall(owner);
             first_call_used = true;
-            const n = try range.read_at(range.context, offset + done, owned[done..], control);
+            const n = try read_at(range.context, offset + done, owned[done..], control);
             if (n == 0) return error.UnexpectedEndOfSource;
             if (n > size - done) return error.InvalidSourceRead;
             done += n;

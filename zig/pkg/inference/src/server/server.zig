@@ -15844,7 +15844,7 @@ pub const Node = struct {
             const binding = identity_hash.finalResult();
             const source_identity = std.fmt.bytesToHex(binding, .lower);
             cache.upstream.immutable_binding = binding;
-            var source = media.source.Source{ .allocator = transport_allocator, .identity = &source_identity, .storage = .{ .range = cache.range() }, .limits = .{ .max_total_bytes = std.math.maxInt(u64) } };
+            var source = media.source.Source{ .allocator = transport_allocator, .identity = &source_identity, .storage = .{ .range = cache.range() }, .limits = .{ .max_total_bytes = std.math.maxInt(u64), .max_reads = std.math.maxInt(usize) } };
             var resolved = request;
             resolved.input = .{ .binary = .{ .mime_type = reference.mime_type, .data = &.{} } };
             resolved.native_source = &source;

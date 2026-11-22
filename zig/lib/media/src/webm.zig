@@ -115,7 +115,7 @@ pub const Scan = struct {
         if (offset >= parent_end or parent_end > self.input.length()) return error.MalformedMedia;
         if (self.elements >= self.limits.max_elements) return error.ResourceLimitExceeded;
         self.elements += 1;
-        var lease = try self.input.read(offset, @intCast(@min(12, parent_end - offset)));
+        var lease = try self.input.readMetadata(offset, @intCast(@min(12, parent_end - offset)));
         defer lease.deinit();
         const id = try ebml.readElementId(lease.bytes, 0);
         const size = try ebml.readVint(lease.bytes, id.len);
@@ -126,7 +126,7 @@ pub const Scan = struct {
     }
     fn uint(self: *Scan, element: Element) !u64 {
         if (element.unknown or element.end - element.payload > 8) return error.MalformedMedia;
-        var lease = try self.input.read(element.payload, @intCast(element.end - element.payload));
+        var lease = try self.input.readMetadata(element.payload, @intCast(element.end - element.payload));
         defer lease.deinit();
         return ebml.readUint(lease.bytes);
     }
@@ -567,7 +567,7 @@ fn parseColour(bytes: []const u8, limits: Limits, control: source.Control, eleme
 }
 fn appendBlock(allocator: std.mem.Allocator, scan: *Scan, packets: *std.ArrayList(Packet), track: Track, element: Element, time: u64, scale: u64, duration: ?u64, group_sync: bool, cluster_offset: u64) !void {
     if (element.unknown or element.end - element.payload < 4) return error.MalformedMedia;
-    var lease = try scan.input.read(element.payload, @intCast(@min(12, element.end - element.payload)));
+    var lease = try scan.input.readMetadata(element.payload, @intCast(@min(12, element.end - element.payload)));
     defer lease.deinit();
     const number = try ebml.readVint(lease.bytes, 0);
     if (number.is_unknown) return error.MalformedMedia;

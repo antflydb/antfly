@@ -116,7 +116,7 @@ pub const ReadAhead = struct {
     reads: usize = 0,
     hits: usize = 0,
     pub fn range(self: *ReadAhead) source.Range {
-        return .{ .context = self, .read_at = readAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
+        return .{ .context = self, .read_at = readAt, .metadata_read_at = readMetadataAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
     }
     pub fn deinit(self: *ReadAhead) void {
         if (self.buffer) |bytes| self.allocator.free(bytes);
@@ -126,6 +126,14 @@ pub const ReadAhead = struct {
     }
     pub fn readAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
+        return self.readWindow(offset, out, control, self.window_bytes);
+    }
+    fn readMetadataAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
+        const self: *ReadAhead = @ptrCast(@alignCast(context));
+        // Coalesce adjacent EBML headers without pulling whole video blocks.
+        return self.readWindow(offset, out, control, @min(self.window_bytes, @max(256, out.len)));
+    }
+    fn readWindow(self: *ReadAhead, offset: u64, out: []u8, control: source.Control, fill_bytes: usize) !usize {
         try control.check();
         if (offset > self.upstream.length or out.len > self.upstream.length - offset) return error.UnexpectedEndOfSource;
         if (out.len == 0) return 0;
@@ -146,7 +154,7 @@ pub const ReadAhead = struct {
         errdefer self.valid = 0;
         self.start = offset;
         // Large callers receive a short read, keeping the cache allocation fixed.
-        const wanted: usize = @intCast(@min(self.buffer.?.len, self.upstream.length - offset, self.max_bytes -| self.charged_bytes));
+        const wanted: usize = @intCast(@min(fill_bytes, self.upstream.length - offset, self.max_bytes -| self.charged_bytes));
         if (wanted == 0) return error.RemoteReadBudgetExceeded;
         while (self.valid < wanted) {
             try control.check();

@@ -666,6 +666,7 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
         channels: u8,
         retained_owner: ?OpusIndex = null,
         packets: ?[]container.Packet = null,
+        seek_pre_roll_ns: u64 = 0,
         pub fn init(a: std.mem.Allocator, bytes: []const u8, max_packets: usize) !Self {
             const Builder = struct {
                 fn build(_: @This(), alloc: std.mem.Allocator, demuxed: opus.Demuxed, max: usize) !OpusIndex {
@@ -710,6 +711,7 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
                 .allocator = a,
             }, max_packets, builder, true);
             index.packets = packets;
+            index.seek_pre_roll_ns = directory.track.seek_pre_roll_ns;
             return index;
         }
 
@@ -821,7 +823,7 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
             errdefer a.free(spans);
             const packets = if (self.packets) |packets| try a.dupe(container.Packet, packets) else null;
             errdefer if (packets) |owned| a.free(owned);
-            return .{ .allocator = a, .packets = packets, .codec = switch (self.codec) {
+            return .{ .allocator = a, .packets = packets, .seek_pre_roll_ns = self.seek_pre_roll_ns, .codec = switch (self.codec) {
                 .opus => |index| .{ .opus = try index.copy(a) },
                 .vorbis => |index| .{ .vorbis = try index.copy(a) },
             }, .spans = spans, .samples = self.samples, .sample_rate = self.sample_rate, .channels = self.channels };
@@ -836,7 +838,7 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
         }
 
         pub fn visitWindowSource(self: *const Self, a: std.mem.Allocator, first: usize, last: usize, sink: @import("pcm_sink.zig").Sink, source: ?*@import("antfly_media").source.Source) !void {
-            const packets: ?container.PacketSource = if (self.packets) |directory| .{ .source = source orelse return error.UnsupportedAudioFormat, .packets = directory } else null;
+            const packets: ?container.PacketSource = if (self.packets) |directory| .{ .source = source orelse return error.UnsupportedAudioFormat, .packets = directory, .seek_pre_roll_ns = self.seek_pre_roll_ns } else null;
             if (last < first or last > self.samples) return error.UnsupportedAudioFormat;
             var lo: usize = 0;
             var hi = self.spans.len;

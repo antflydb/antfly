@@ -308,16 +308,16 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
         try options.decoder.control.check();
         try reader.input.control.check();
         if (packet.size > options.decoder.max_packet_bytes) return error.ResourceLimitExceeded;
-        var lease = try reader.readPacket(packet_id);
-        defer lease.deinit();
         if (reader.track.codec == .vp8) {
+            var lease = try reader.input.readMetadata(packet.offset, @min(10, packet.size));
+            defer lease.deinit();
             const bytes = lease.bytes;
             if (bytes.len < 3) return error.InvalidVideoData;
             const tag = @as(u32, bytes[0]) | (@as(u32, bytes[1]) << 8) | (@as(u32, bytes[2]) << 16);
             const key = tag & 1 == 0;
             if ((tag >> 1) & 7 > 3) return error.UnsupportedVideoProfile;
             const start: usize = if (key) 10 else 3;
-            if (bytes.len < start or tag >> 5 > bytes.len - start) return error.InvalidVideoData;
+            if (bytes.len < start or tag >> 5 > packet.size - start) return error.InvalidVideoData;
             if (key) {
                 if (!std.mem.eql(u8, bytes[3..6], &.{ 0x9d, 0x01, 0x2a })) return error.InvalidVideoData;
                 const width = std.mem.readInt(u16, bytes[6..8], .little);
@@ -331,6 +331,8 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
             if (g.width == 0 or g.height == 0 or @as(u64, g.width) * g.height > options.decoder.max_pixels) return error.ResourceLimitExceeded;
             if (tag & 16 != 0 and !packet.invisible) try appendHeader(collector, packet, packet_id, g);
         } else if (av1) |session| {
+            var lease = try reader.readPacket(packet_id);
+            defer lease.deinit();
             const sequence_before = sequence;
             var publish = Av1Publish{ .collector = collector, .packet = packet, .packet_id = packet_id };
             try session.walk(lease.bytes, &publish, Av1Publish.accept);
@@ -339,10 +341,23 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
                 try collector.restart(.{ .packet = packet_id, .logical = logical_before, .sequence = if (session.packet_restart_needs_sequence) sequence_before else null });
             }
         } else {
-            const parts = try @import("codecs/vp9_header.zig").split(lease.bytes);
+            const vp9 = @import("codecs/vp9_header.zig");
+            // Geometry inspection only consumes the uncompressed prefix.
+            // Use the suffix independently to validate superframe extents.
+            var prefix = try reader.input.readMetadata(packet.offset, @min(32, packet.size));
+            defer prefix.deinit();
+            const tail_size = @min(vp9.Extents.max_tail_bytes, packet.size);
+            var tail = try reader.input.readMetadata(packet.offset + (packet.size - tail_size), tail_size);
+            defer tail.deinit();
+            const parts = try vp9.splitExtents(tail.bytes, packet.size);
             if (parts.len != 1) collector.apple_packet_layout = false;
-            for (parts.packets[0..parts.len], 0..) |part, part_id| {
-                const picture = try @import("codecs/vp9_header.zig").inspect(part, &references, options.decoder.max_pixels);
+            var offset = packet.offset;
+            for (parts.sizes[0..parts.len], 0..) |part_size, part_id| {
+                var header = if (part_id != 0) try reader.input.readMetadata(offset, @min(32, part_size)) else null;
+                defer if (header) |*lease| lease.deinit();
+                const bytes = if (header) |lease| lease.bytes else prefix.bytes[0..@min(prefix.bytes.len, part_size)];
+                const picture = try vp9.inspect(bytes, &references, options.decoder.max_pixels);
+                offset += part_size;
                 if (part_id == 0 and picture.key) try collector.restart(.{ .packet = packet_id, .logical = logical_before });
                 if (picture.visible and !packet.invisible) try appendHeader(collector, packet, packet_id, picture.geometry);
             }

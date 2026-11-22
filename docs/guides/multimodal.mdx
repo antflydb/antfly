@@ -236,6 +236,11 @@ its boundary model. Antfly cuts the source into windows, embeds each window,
 and can transcribe the same windows in the same pass. [Resumable Media
 Enrichment](/docs/guides/media-pass) has the configuration. See the [inference guide](/docs/guides/inference) for CUDA video codecs, hardware requirements, and clip limits.
 
+Audio windows read from a remote WebM Opus source use the container's seek
+preroll, with a minimum of 80 ms. This preserves sample positions and makes
+each window repeatable across retries. The PCM after a seek can differ from
+uninterrupted decoding, even at the same sample positions.
+
 ### Rerank with Images
 
 A reranker `template` accepts the same `media` and `remoteMedia` helpers as an

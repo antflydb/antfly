@@ -233,9 +233,12 @@ pub const Track = struct {
             self.seek_reader = .{ .index = &hit.data.audio, .source = source, .control = control };
             return self;
         };
-        var prefix: [4]u8 = undefined;
         if (source.length() < 4) return error.UnsupportedAudioFormat;
-        try readInto(source, 0, &prefix);
+        const prefix = sniff: {
+            var lease = try source.readMetadata(0, 4);
+            defer lease.deinit();
+            break :sniff lease.bytes[0..4].*;
+        };
         if (!std.mem.eql(u8, &prefix, "\x1a\x45\xdf\xa3")) {
             self.mp4 = Mp4.init(a, source, @min(64 * 1024 * 1024, max_bytes), max_packets) catch |err| switch (err) {
                 error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => null,

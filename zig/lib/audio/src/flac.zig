@@ -255,7 +255,7 @@ pub fn parseStreamInfoBlock(payload: []const u8) !StreamInfo {
     const channels = @as(u8, @intCast(((packed_info >> 41) & 0x7) + 1));
     const bits_per_sample = @as(u8, @intCast(((packed_info >> 36) & 0x1f) + 1));
     const total_samples = packed_info & 0x0f_ffff_ffff;
-    if (channels == 0 or channels > 8) return error.UnsupportedAudioFormat;
+    if (sample_rate == 0 or channels == 0 or channels > 8) return error.UnsupportedAudioFormat;
     if (bits_per_sample < 4 or bits_per_sample > 32) return error.UnsupportedAudioFormat;
 
     return .{
@@ -779,6 +779,12 @@ const BitReader = struct {
 fn signExtend(raw: u64, bit_count: usize) i64 {
     const shift = 64 - bit_count;
     return @as(i64, @bitCast(raw << @intCast(shift))) >> @intCast(shift);
+}
+
+test "FLAC STREAMINFO rejects a missing sample rate" {
+    var info: [34]u8 = @splat(0);
+    std.mem.writeInt(u64, info[10..18], (@as(u64, 15) << 36) | 1, .big);
+    try std.testing.expectError(error.UnsupportedAudioFormat, parseStreamInfoBlock(&info));
 }
 
 test "parse checked-in flac streaminfo" {

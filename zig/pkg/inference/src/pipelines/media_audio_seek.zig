@@ -98,7 +98,7 @@ pub const Index = union(enum) {
         const owner = try Progressive.createBounded(admission, index_limit);
         var initial = Progressive{ .owner = owner };
         errdefer initial.deinit();
-        var index = Webm.initDirectory(owner.arena.allocator(), scratch, directory, max_frames, Progressive.Builder{ .owner = owner }) catch |err| return if (err == error.OutOfMemory and (bounded.denied or owner.bound.?.denied)) error.AudioTooLarge else err;
+        var index = Webm.initDirectory(owner.arena.allocator(), scratch, directory, max_frames, Progressive.Builder{ .owner = owner, .range_backed = true }) catch |err| return if (err == error.OutOfMemory and (bounded.denied or owner.bound.?.denied)) error.AudioTooLarge else err;
         if (index.codec == .vorbis) index.retained_owner = initial else initial.deinit();
         Progressive.refreshBytes(owner);
         return .{ .webm = index };
@@ -566,7 +566,10 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
                 @memcpy(out, self.bytes[logical..][0..out.len]);
                 return out.len;
             }
-            if (start >= self.boundary + void_header.len) return error.UnexpectedPayloadRead;
+            if (start >= self.boundary + void_header.len) {
+                @memset(out, 0);
+                return out.len;
+            }
             const count = @min(out.len, self.boundary + void_header.len - start);
             const from_file = @min(count, self.boundary -| start);
             @memcpy(out[0..from_file], self.bytes[@min(start, self.boundary)..][0..from_file]);
@@ -576,12 +579,17 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
         }
     };
     var context = Source{ .bytes = webm, .boundary = boundary };
-    var source = media.source.Source{ .allocator = a, .identity = "ranged-opus", .storage = .{ .range = .{ .context = &context, .read_at = Source.read, .length = webm.len + void_header.len + 1024 * 1024 } }, .limits = .{ .max_total_bytes = webm.len } };
+    const upstream = media.source.Range{ .context = &context, .read_at = Source.read, .length = webm.len + void_header.len + 1024 * 1024 };
+    var transport = media.remote.ReadAhead{ .allocator = a, .upstream = upstream, .max_bytes = webm.len * 2 };
+    defer transport.deinit();
+    var source = media.source.Source{ .allocator = a, .identity = "ranged-opus", .storage = .{ .range = transport.range() } };
 
     var track = try @import("media_chunking_audio_source.zig").Track.init(a, &source, .{}, 64 * 1024, 1024);
     defer track.deinit();
     try std.testing.expect(track.bytes == null);
     try std.testing.expect(source.total_bytes < webm.len / 2);
+    try std.testing.expect(transport.transferred_bytes < webm.len);
+    try std.testing.expect(transport.reads <= packets.len + 4);
     var baseline = try Index.init(a, webm, 1024);
     defer baseline.deinit();
     try std.testing.expectEqual(baseline.samples(), track.provider().samples);
@@ -591,8 +599,9 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
     defer expected.deinit(a);
     var copied = try track.seek.?.copy(a);
     defer copied.deinit();
-    var second = source;
-    second.total_bytes = 0;
+    var cold_transport = media.remote.ReadAhead{ .allocator = a, .upstream = upstream, .max_bytes = webm.len };
+    defer cold_transport.deinit();
+    var second = media.source.Source{ .allocator = a, .identity = source.identity, .storage = .{ .range = cold_transport.range() } };
     var reader = Reader{ .index = &copied, .source = &second };
     const provider = reader.provider();
     var actual = try provider.read(provider.context, a, 0, 2048);
@@ -600,6 +609,20 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
     try std.testing.expectEqualSlices(f32, expected.pcm.samples, actual.pcm.samples);
     try std.testing.expect(second.total_bytes > 0 and second.total_bytes < webm.len / 2);
     try std.testing.expectEqual(@as(usize, 0), second.retained_bytes);
+    var late_transport = media.remote.ReadAhead{ .allocator = a, .upstream = upstream, .max_bytes = webm.len / 2 };
+    defer late_transport.deinit();
+    var late_source = media.source.Source{ .allocator = a, .identity = source.identity, .storage = .{ .range = late_transport.range() } };
+    var late_reader = Reader{ .index = &copied, .source = &late_source };
+    const late_provider = late_reader.provider();
+    const before = copied.webm.codec.opus.owner.decoded_packets.load(.monotonic);
+    const end = late_provider.samples;
+    const start = end - 480;
+    var late = try late_provider.read(late_provider.context, a, start, end);
+    defer late.deinit(a);
+    try std.testing.expect(copied.webm.codec.opus.owner.decoded_packets.load(.monotonic) - before < 10);
+    var repeated = try late_provider.read(late_provider.context, a, start, end);
+    defer repeated.deinit(a);
+    try std.testing.expectEqualSlices(f32, late.pcm.samples, repeated.pcm.samples);
 }
 
 test "model aware media range WebM audio preserves FLAC clocks with absent stream totals" {
