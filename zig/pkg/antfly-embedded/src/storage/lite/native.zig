@@ -8543,24 +8543,20 @@ pub const NativeFile = struct {
             }
             var use_persisted_frontier = protected and (disk_fenced or owns_recovery_fence or sidecar_fence != null);
             const live_writer = protected and if (scan_region) |r| r.foreignLiveWriter(0) else false;
-            var synced_without_region: ?redo_log.Frontier = if (protected and self.read_only and extent_fence != null and !live_writer and !use_persisted_frontier) proof: {
-                const synced = (try redoFrontierSlots(self.header).readSyncedWithoutRegion(self.file, io)) orelse break :proof null;
-                if (synced.sequence <= (replay_ceiling orelse 0)) break :proof null;
-                break :proof synced;
-            } else null;
+            var synced_without_region: ?redo_log.Frontier = null;
             if (protected and self.read_only and !holds_authority and !use_persisted_frontier and !live_writer) {
                 switch (self.holdSidecarReadFence(io)) {
                     .held => |fence| {
                         sidecar_fence = fence;
                         use_persisted_frontier = true;
-                        synced_without_region = null;
                     },
-                    .absent => {
-                        use_persisted_frontier = true;
-                        synced_without_region = null;
-                    },
-                    .own, .busy => if (synced_without_region != null) {
-                        use_persisted_frontier = true;
+                    .absent => use_persisted_frontier = true,
+                    .own, .busy => if (extent_fence != null) {
+                        const synced = try self.readRegionlessRedoVisibility(io);
+                        if (synced) |cut| if (cut.sequence > (replay_ceiling orelse 0)) {
+                            synced_without_region = cut;
+                            use_persisted_frontier = true;
+                        };
                     },
                 }
             }
@@ -10075,6 +10071,13 @@ pub const NativeFile = struct {
     /// writer (`publishCheckpoint`'s redo branch) -- so overlay-aware
     /// reads (`redoOverlayEntry`'s own `checkpoint.commit_sequence` bound)
     /// actually see the records this call just applied.
+    fn readRegionlessRedoVisibility(self: *NativeFile, io: std.Io) !?redo_log.Frontier {
+        return redoFrontierSlots(self.header).readSyncedWithoutRegion(self.file, io) catch |err| switch (err) {
+            error.InputOutput => null,
+            else => return err,
+        };
+    }
+
     fn refreshFencedRedoFromDisk(self: *NativeFile, io: std.Io) !bool {
         const redo = self.redo orelse return false;
         const slots = redoFrontierSlots(self.header);
@@ -10086,7 +10089,7 @@ pub const NativeFile = struct {
         defer if (fence) |held| held.close(io);
         if (fence == null) {
             if (!self.header.segmented_redo) return false;
-            const synced = (try slots.readSyncedWithoutRegion(self.file, io)) orelse return false;
+            const synced = (try self.readRegionlessRedoVisibility(io)) orelse return false;
             if (synced.sequence <= redo.durable_sequence) return false;
         } else {
             const persisted = (try slots.readLatest(self.file, io)) orelse return error.NativeRedoLogCorrupt;
