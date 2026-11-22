@@ -2369,6 +2369,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.legacyReplicationSourceIntakeAllowed(a, group_id, input.table_id, input.ordinal, input.definition) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .native_source_recovery_scope => |input| {
+                    const value = handle.store.nativeSourceRecoveryScope(a, group_id, input.table_id, input.ordinal, input.definition) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .capture_source_scope => |input| {
                     if (input.metadata_group_id != group_id) break :blk storageOwnerStatusFromError(error.InvalidSourceControl);
                     var value = handle.store.captureSourceScope(a, input) catch |err| break :blk storageOwnerStatusFromError(err);

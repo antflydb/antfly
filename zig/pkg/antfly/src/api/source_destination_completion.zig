@@ -46,3 +46,98 @@ pub const Completion = struct {
         };
     }
 };
+
+/// Advance at most one durable recovery phase before returning to the CDC
+/// scheduler. This pass only uses a manifest reserved by the source actor.
+pub fn recover(
+    svc: anytype,
+    admission: @import("source_destination_admission.zig").Admission,
+    a: std.mem.Allocator,
+    binding: source.Scope,
+    catalog_digest: source.Digest,
+    context: Context,
+) !void {
+    const raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
+    defer a.free(raw);
+    var state = try source.parse(a, raw);
+    defer state.deinit();
+    const current = state.value;
+    if (!current.scope_fencing or !current.manifest_retention or current.retired or
+        !std.meta.eql(current.scope, @as(?source.Scope, binding))) return error.SourceBindingConflict;
+    const record = current.artifact_control.?.current orelse return;
+
+    if (current.pending) |pending| {
+        if (record.phase == .garbage) return;
+        var grant = try @import("source_destination_admission.zig").Grant.init(a, binding, pending, record);
+        defer grant.deinit();
+        const manifest = grant.manifest.value;
+        const fence = try retainedRoute(admission.coordinator.recovery, a, manifest, context);
+        if (record.phase == .reserved) {
+            if (current.closing) return;
+            const transfer = try manifest.transfer(fence, admission.artifacts);
+            const stamp = (try transfer.recoverSeal(a, record, context)) orelse return;
+            return mutate(svc, a, binding, catalog_digest, current, .{ .seal_artifact = .{ .reservation_digest = record.reservation, .stamp = stamp } }, context);
+        }
+        const acceptance = if (current.closing)
+            (try admission.resolveDelivery(a, current, fence, context)) orelse return
+        else
+            try admission.admitDelivery(a, current, fence, context);
+        defer a.free(acceptance.receipt);
+        return mutate(svc, a, binding, catalog_digest, current, .{ .accept = .{
+            .reservation_digest = acceptance.reservation_digest,
+            .receipt = acceptance.receipt,
+        } }, context);
+    }
+
+    var receipt = try receipts.decode(a, current, current.accepted.reference);
+    defer receipt.deinit();
+    if (receipt == .reclaimed) return;
+    const manifest = receipt.retained.manifest.value;
+    const fence = try retainedRoute(admission.coordinator.recovery, a, manifest, context);
+    if (current.committed.sequence != current.accepted.sequence) {
+        const worker: Completion = .{ .recovery = admission.coordinator.recovery };
+        if (try worker.run(a, current, current.accepted.reference, fence, context) != .complete) return;
+        const reference = try std.fmt.allocPrint(a, "{x}:{d}", .{ &manifest.admission_digest, manifest.commit_version });
+        defer a.free(reference);
+        return mutate(svc, a, binding, catalog_digest, current, .{ .commit = .{
+            .sequence = current.accepted.sequence,
+            .receipt_digest = current.accepted.receipt_digest,
+            .reference = reference,
+        } }, context);
+    }
+    if (record.phase == .accepted) {
+        return mutate(svc, a, binding, catalog_digest, current, .{ .retire_artifact = .{
+            .reservation_digest = record.reservation,
+            .proof = source.digest(current.committed.reference),
+            .reason = .committed,
+        } }, context);
+    }
+    if (record.phase == .garbage) {
+        const transfer = try manifest.transfer(fence, admission.artifacts);
+        const proof = (try transfer.reclaim(a, record, context)) orelse return;
+        try mutate(svc, a, binding, catalog_digest, current, .{ .reclaim_artifact = .{ .reservation_digest = record.reservation, .proof = proof } }, context);
+    }
+}
+
+fn retainedRoute(recovery_worker: recovery.Recovery, a: std.mem.Allocator, manifest: @import("source_destination_plan.zig").Manifest, context: Context) !metadata.CatalogRouteFence {
+    const catalog = @import("table_catalog.zig");
+    var budget = recovery_worker.catalog.budget(null);
+    budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+    budget.cancellation = context.cancellation;
+    var session = try catalog.RoutingSession.initWithBudget(a, recovery_worker.catalog, budget);
+    defer session.deinit();
+    const locator = try @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroup(a, manifest.checkpoint_authority.table_name, manifest.owner.group_id);
+    defer a.free(locator);
+    return recovery.routeRetainedOwner(&session, manifest.owner, locator, budget, context);
+}
+
+fn mutate(svc: anytype, a: std.mem.Allocator, scope: source.Scope, catalog_digest: source.Digest, state: source.State, mutation: source.Mutation, context: Context) !void {
+    try source.mutateOnService(svc, a, .{
+        .table_id = scope.table_id,
+        .source_id = scope.source_id,
+        .expected_revision = state.revision,
+        .expected_binding = scope.identity(),
+        .expected_catalog_digest = catalog_digest,
+        .mutation = mutation,
+    }, context);
+}

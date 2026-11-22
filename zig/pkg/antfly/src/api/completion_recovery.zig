@@ -540,6 +540,11 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqualDeep(scope_ref, prepared.plan.source_scope.?);
     const encoded_prepared = try prepared.plan.encodeFrozen(a);
     defer a.free(encoded_prepared);
+    var reprepared = (try coordinator.prepare(a, admission.transaction_id, 10, &source_inputs, .{})).?;
+    defer reprepared.deinit();
+    const rebuilt_bytes = try reprepared.plan.encodeFrozen(a);
+    defer a.free(rebuilt_bytes);
+    try std.testing.expectEqualSlices(u8, encoded_prepared, rebuilt_bytes);
     var restored_prepared = try plan_mod.Plan.restoreFrozen(a, encoded_prepared, try plan_mod.frozenDigest(encoded_prepared));
     defer restored_prepared.deinit();
     try std.testing.expectEqualDeep(scope_ref, restored_prepared.source_scope.?);
@@ -778,6 +783,49 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(@as(u64, 0), actor_state.committed.sequence);
     try std.testing.expectEqual(resolutions_before_bound + 1, fake.resolves);
     try std.testing.expectEqual(publications_before_bound + 2, fake.publishes);
+
+    const ActorMetadata = struct {
+        alloc: A,
+        state: source_control.State,
+        metadata_group_id: u64 = 1,
+        lose_reply: bool = true,
+
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, _: u16) !void {}
+        pub fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        pub fn getSourceControl(self: *@This(), allocator: A, _: u64, _: u64, _: source_control.Digest) ![]u8 {
+            return source_control.encode(allocator, self.state);
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !u64 {
+            // Copy the mutation-owned reference into the same durable lifetime
+            // as the other actor state before simulating a lost reply.
+            var parsed = try source_control.parseWrite(self.alloc, command.apply_source_control);
+            try std.testing.expectEqual(self.state.revision, parsed.value.expected_revision);
+            const next = try parsed.value.mutation.apply(self.alloc, self.state);
+            const encoded = try source_control.encode(self.alloc, next);
+            const saved = try source_control.parse(self.alloc, encoded);
+            parsed.deinit();
+            self.state = saved.value;
+            return self.state.revision;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Context) !void {
+            if (!self.lose_reply) return;
+            self.lose_reply = false;
+            return error.TestLostMetadataReply;
+        }
+    };
+    var journal: ActorMetadata = .{ .alloc = actor_alloc, .state = actor_state };
+    const source_completion = @import("source_destination_completion.zig");
+    const actor_admission: @import("source_destination_admission.zig").Admission = .{ .coordinator = coordinator, .artifacts = undefined, .checkpoints = undefined };
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.recover(&journal, actor_admission, a, actor_scope, @splat(32), .{}));
+    try std.testing.expectEqual(@as(u64, 1), journal.state.committed.sequence);
+    try std.testing.expectEqual(.accepted, journal.state.artifact_control.?.current.?.phase);
+    try source_completion.recover(&journal, actor_admission, a, actor_scope, @splat(32), .{});
+    try std.testing.expectEqual(.garbage, journal.state.artifact_control.?.current.?.phase);
+    try std.testing.expectEqual(publications_before_bound + 2, fake.publishes);
+
     fake.state.status = .aborted;
     fake.state.commit_version = 0;
     try std.testing.expectError(error.DecisionConflict, coordinator.commitSourcePrepared(a, &prepared, 20, .{}));

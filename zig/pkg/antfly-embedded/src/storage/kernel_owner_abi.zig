@@ -47,7 +47,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 122 adds read-only original-terminal outcome observations.
 // Version 125 includes immutable direct preparation and retained history.
 // Version 127 includes retained metadata session snapshot ranges and counts.
-pub const abi_version: u32 = 127;
+// Version 128 adds source recovery scope lookup to the metadata owner.
+pub const abi_version: u32 = 128;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

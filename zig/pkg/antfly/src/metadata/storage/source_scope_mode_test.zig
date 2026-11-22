@@ -96,6 +96,14 @@ pub fn run(a: A) !void {
     defer closing.deinit();
     try std.testing.expect(closing.value.scope_fencing and closing.value.closing);
     try installed.expectWork(1);
+    try std.testing.expectError(error.TableTransitionActive, target.captureTableDropProjection(a, group, "docs"));
+    const fence = try target.getTableTransitionFence(group, source.table_id);
+    try target.applyStandaloneCommand(group, .{ .apply_table_topology = .{ .drop = .{
+        .table_id = source.table_id,
+        .expected_name = "docs",
+        .expected_transition_generation = fence.generation,
+        .range_contract = .{ .membership = fence.membership(source.table_id) },
+    } } });
     try target.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = source.table_id, .expected_transition_generation = 0 } });
     const retained_table = (try target.getTable(a, group, source.table_id)) orelse return error.TestUnexpectedTableRemoval;
     defer metadata.freeTable(a, retained_table);

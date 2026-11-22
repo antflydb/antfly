@@ -1428,6 +1428,8 @@ pub const MetadataHttpClient = struct {
                 error.ResolverCurationConflict
             else if (std.mem.eql(u8, response.body, "ConstraintRetirementRequired"))
                 error.ConstraintRetirementRequired
+            else if (std.mem.eql(u8, response.body, "TableTransitionActive"))
+                error.TableTransitionActive
             else if ((input == .store_root_enroll or input == .store_root_enrollment_status) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
                 error.StoreRootEnrollmentChanged
             else

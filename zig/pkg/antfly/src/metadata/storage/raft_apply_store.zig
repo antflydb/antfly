@@ -15990,6 +15990,12 @@ pub const RaftApplyStore = struct {
         defer txn.abort();
         return @import("../source_legacy_intake.zig").allowed(a, &txn, group_id, table_id, ordinal, definition);
     }
+    pub fn nativeSourceRecoveryScope(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !?source_control.Scope {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return @import("../source_legacy_intake.zig").find(a, &txn, group_id, table_id, ordinal, definition, .recovery);
+    }
+
     /// The service establishes ReadIndex before calling. Every captured field,
     /// including the actual applied index and activated decoder, shares one read.
     pub fn captureSourceScope(self: *RaftApplyStore, a: std.mem.Allocator, query: @import("../source_scope_capture.zig").Query) !@import("../source_scope_capture.zig").Snapshot {
@@ -17096,6 +17102,7 @@ pub const RaftApplyStore = struct {
         const table = try decodeTableRecord(alloc, encoded_table);
         errdefer metadata_table_manager.freeTable(alloc, table);
         if (!std.mem.eql(u8, table.name, table_name)) return error.InvalidDerivedCatalogIndex;
+        if (try tableHasSourceWorkTxn(&txn, group_id, table_id)) return error.TableTransitionActive;
         if (try self.relationalDropBlockedTxn(&txn, group_id, table))
             return error.ConstraintRetirementRequired;
 
@@ -22836,15 +22843,19 @@ pub const RaftApplyStore = struct {
         }
     }
 
+    fn tableHasSourceWorkTxn(txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
+        var buffer: [256]u8 = undefined;
+        const key = try source_control.workKey(&buffer, group_id, table_id);
+        const work = (try stagingGet(txn, key)) orelse return false;
+        if (work.len != @sizeOf(u64)) return error.InvalidSourceControl;
+        return std.mem.readInt(u64, work[0..8], .little) != 0;
+    }
+
     /// Admission and mutation share the caller's transaction. In particular,
     /// rejection must precede logical unbinding: Raft commits rejected commands
     /// as no-ops, while standalone aborts and exposes the precise policy error.
     fn removeTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, expected_generation: u64) !void {
-        var source_work_buffer: [256]u8 = undefined;
-        if (try stagingGet(txn, try source_control.workKey(&source_work_buffer, group_id, table_id))) |work| {
-            if (work.len != 8) return error.InvalidSourceControl;
-            if (std.mem.readInt(u64, work[0..8], .little) != 0) return error.TableTransitionActive;
-        }
+        if (try tableHasSourceWorkTxn(txn, group_id, table_id)) return error.TableTransitionActive;
         if (try self.fkGenerationTableLockedTxn(txn, group_id, table_id)) return error.TableTransitionActive;
         const fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
         if (fence.active()) return error.TableTransitionActive;
@@ -24187,6 +24198,7 @@ pub const RaftApplyStore = struct {
                 }
             },
             .drop => |drop| {
+                if (try tableHasSourceWorkTxn(txn, group_id, drop.table_id)) return;
                 if (try self.fkGenerationTableLockedTxn(txn, group_id, drop.table_id)) return;
                 const fence = try self.loadTableTransitionFenceTxn(txn, group_id, drop.table_id);
                 if (fence.active() or fence.generation != drop.expected_transition_generation) return;

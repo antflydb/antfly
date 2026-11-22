@@ -2267,6 +2267,14 @@ pub const StreamingReplicationCoordinator = struct {
                     .allowed => {},
                     .destination_actor => {
                         summary.sources_skipped_destination_actor += 1;
+                        if (comptime @hasDecl(Service, "recoverNativeReplicationSource")) {
+                            const permit_deadline = (try self.runner.workDeadlineNs()) orelse quantum_deadline_ns;
+                            service.recoverNativeReplicationSource(self.alloc, table, @intCast(ordinal), @min(permit_deadline, quantum_deadline_ns)) catch |err| {
+                                if (replicationErrorEndsRound(err)) return err;
+                                summary.sources_failed += 1;
+                                std.log.warn("metadata native source recovery deferred table={s} source={d} err={s}", .{ table.name, ordinal, @errorName(err) });
+                            };
+                        }
                         continue;
                     },
                     .unproven => {
@@ -8398,8 +8406,16 @@ test "metadata replication stream coordinator waits for snapshot completion and 
         legacy_allowed: bool = true,
         close_at: ReplicationLifecyclePhase = .stream_polled,
         upserts: usize = 0,
+        recoveries: usize = 0,
         pub fn legacyReplicationSourceIntakeAllowed(self: *@This(), _: u64, _: u32, _: [32]u8) !bool {
             return self.legacy_allowed;
+        }
+        pub fn recoverNativeReplicationSource(self: *@This(), _: Allocator, table: metadata_table_manager.TableRecord, ordinal: u32, deadline_ns: ?u64) !void {
+            try std.testing.expect(!self.legacy_allowed);
+            try std.testing.expectEqual(self.table.table_id, table.table_id);
+            try std.testing.expectEqual(@as(u32, 0), ordinal);
+            try std.testing.expect(deadline_ns != null);
+            self.recoveries += 1;
         }
         fn handover(ptr: *anyopaque, event: ReplicationLifecycleEvent) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -8585,6 +8601,14 @@ test "metadata replication stream coordinator waits for snapshot completion and 
     const idle_upserts_before = service.upserts;
     const idle_commits_before = NullSource.commits;
     try std.testing.expectError(error.SourcePendingWork, coordinator.runner.runTableSourceFromCheckpoint(&service, service.table, 0, 2, "exported_snapshot", "lsn:5", service.statuses.items[0]));
+    try std.testing.expectEqual(idle_upserts_before, service.upserts);
+    try std.testing.expectEqual(idle_commits_before, NullSource.commits);
+
+    const polls_before_recovery = stream_ctx.poll_calls;
+    const recovery_round = try coordinator.runRound(&service);
+    try std.testing.expectEqual(@as(usize, 1), recovery_round.sources_skipped_destination_actor);
+    try std.testing.expectEqual(@as(usize, 1), service.recoveries);
+    try std.testing.expectEqual(polls_before_recovery, stream_ctx.poll_calls);
     try std.testing.expectEqual(idle_upserts_before, service.upserts);
     try std.testing.expectEqual(idle_commits_before, NullSource.commits);
 }

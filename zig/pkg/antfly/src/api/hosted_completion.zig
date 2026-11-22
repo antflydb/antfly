@@ -43,16 +43,30 @@ pub const Hosted = struct {
     pub fn coordinator(self: *Hosted) @import("completion_admission.zig").Coordinator {
         return .{ .owners = .{ .ptr = self, .read_fn = owner }, .recovery = .{
             .catalog = self.catalog,
-            .decisions = .{ .ptr = self, .read_fn = Reader(decision_ops, decision_ops.Reply, "fetchGroupHistoryDecision").read },
-            .resolutions = .{ .ptr = self, .read_fn = Reader(resolution_ops, resolution_ops.wire.Reply, "fetchGroupHistoryResolution").read },
-            .publications = .{ .ptr = self, .read_fn = Reader(publication_ops, publication_ops.Reply, "fetchGroupHistoryPublication").read },
+            .decisions = .{ .ptr = self, .read_fn = Routed(decision_ops.Request, decision_ops.Reply, "fetchGroupHistoryDecision").read },
+            .resolutions = .{ .ptr = self, .read_fn = Routed(resolution_ops.Request, resolution_ops.wire.Reply, "fetchGroupHistoryResolution").read },
+            .publications = .{ .ptr = self, .read_fn = Routed(publication_ops.Request, publication_ops.Reply, "fetchGroupHistoryPublication").read },
             .participants = .{ .writer = .{ .ptr = self, .write_fn = write } },
         } };
     }
+    pub fn sourceAdmission(self: *Hosted) @import("source_destination_admission.zig").Admission {
+        const checkpoint = @import("source_checkpoint_operations.zig").wire;
+        const artifact = @import("source_plan_operations.zig").wire;
+        return .{
+            .coordinator = self.coordinator(),
+            .checkpoints = .{ .ptr = self, .read_fn = Routed(checkpoint.Request, checkpoint.Reply, "fetchGroupSourceCheckpointObservation").read },
+            .artifacts = .{
+                .controls = .{ .ptr = self, .execute_fn = Routed(artifact.ControlRequest, artifact.ControlReply, "fetchGroupSourcePlanControl").read },
+                .observations = .{ .ptr = self, .read_fn = Routed(artifact.ObserveRequest, artifact.control.Observation, "fetchGroupSourcePlanObservation").read },
+                .chunks = .{ .ptr = self, .read_fn = Routed(artifact.ChunkRequest, artifact.control.Read, "fetchGroupSourcePlanChunk").read },
+            },
+        };
+    }
+
     fn owner(ptr: *anyopaque, a: A, fence: metadata.CatalogRouteFence, table: []const u8, input: owner_ops.Request, context: Context) !owner_ops.Reply {
         const self: *Hosted = @ptrCast(@alignCast(ptr));
-        if (!self.provision_policy) return Reader(owner_ops, owner_ops.Reply, "fetchGroupHistoryOwner").read(ptr, a, fence, table, input, context);
-        const provisioner: @import("history_policy_provisioning.zig").Provisioner = .{ .controls = self.controlPort(), .owners = .{ .ptr = self, .read_fn = Reader(owner_ops, owner_ops.Reply, "fetchGroupHistoryOwner").read }, .guard = self.policy_guard, .cache = self.policy_cache };
+        if (!self.provision_policy) return Routed(owner_ops.Request, owner_ops.Reply, "fetchGroupHistoryOwner").read(ptr, a, fence, table, input, context);
+        const provisioner: @import("history_policy_provisioning.zig").Provisioner = .{ .controls = self.controlPort(), .owners = .{ .ptr = self, .read_fn = Routed(owner_ops.Request, owner_ops.Reply, "fetchGroupHistoryOwner").read }, .guard = self.policy_guard, .cache = self.policy_cache };
         return provisioner.ensure(a, fence, table, input, context);
     }
     pub fn controlPort(self: *Hosted) @import("history_control_operations.zig").Port {
@@ -90,9 +104,9 @@ pub const Hosted = struct {
         if (uri.len == 0 or router.groupLeaderNodeId(group) != leader or !eligible(router, group, leader)) return error.GroupLeaderUnavailable;
         return uri;
     }
-    fn Reader(comptime Ops: type, comptime Reply: type, comptime method: []const u8) type {
+    fn Routed(comptime Request: type, comptime Reply: type, comptime method: []const u8) type {
         return struct {
-            fn read(ptr: *anyopaque, a: A, fence: metadata.CatalogRouteFence, table: []const u8, input: Ops.Request, context: Context) !Reply {
+            fn read(ptr: *anyopaque, a: A, fence: metadata.CatalogRouteFence, table: []const u8, input: Request, context: Context) !Reply {
                 const self: *Hosted = @ptrCast(@alignCast(ptr));
                 const uri = try self.endpoint(a, fence.route.group_id, context);
                 defer a.free(uri);

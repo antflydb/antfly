@@ -367,6 +367,11 @@ and historical row images needed by retained groups.
 
 A native destination can separately expose retained committed history through
 the public changefeed API and eligible relational tables through pgoutput.
+The hosted metadata worker can recover a durable native source reservation
+from its original frozen plan and complete publication before advancing its
+committed checkpoint. Managed native streams still use the compatibility
+writer until their source is handed over to scoped admission. An interruption
+between a compatibility write and its source checkpoint can replay that write.
 Writable Iceberg reports its ingress and catalog commit capability. External
 read-only Iceberg attachments report committed snapshots as their change
 authority. Index publication is a separate milestone across these contracts.

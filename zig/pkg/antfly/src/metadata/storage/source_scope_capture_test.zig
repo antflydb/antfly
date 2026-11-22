@@ -71,7 +71,7 @@ pub fn run(a: A) !void {
     try driver.mutate(.{ .bind_checkpoint = authority });
     try driver.mutate(.{ .enable_scope_fencing = {} });
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.captureSourceScope(a, query));
-    const activation = try std.json.Stringify.valueAlloc(a, topology.Activation{ .version = control.closing_protocol_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(5) }, .{});
+    const activation = try std.json.Stringify.valueAlloc(a, topology.Activation{ .version = control.manifest_protocol_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(5) }, .{});
     defer a.free(activation);
     try driver.apply(.{ .activate_topology_protocol = activation });
     var active = try store.captureSourceScope(a, query);
@@ -92,9 +92,13 @@ pub fn run(a: A) !void {
     try std.testing.expectError(error.SourceBindingConflict, store.captureSourceScope(a, changed));
     var attempt: [16]u8 = @splat(6);
     std.mem.writeInt(u64, attempt[0..8], 1, .big);
-    const pending: control.Reservation = .{ .sequence = 1, .batch_id = "original", .checkpoint = "one", .accepted_at_ns = 10, .payload_digest = @splat(7), .plan_digest = @splat(8), .transaction_id = @splat(9), .destination = .native, .delivery_manifest = "original", .artifact = .{ .namespace = @splat(10), .binding = source.identity(), .domain = control.artifact_control.domainFor(source.identity()), .attempt = attempt, .bytes = 128, .checksum = @splat(11), .plan_digest = @splat(12) } };
+    const pending: control.Reservation = .{ .sequence = 1, .batch_id = "original", .checkpoint = "one", .accepted_at_ns = 10, .payload_digest = @splat(7), .plan_digest = @splat(8), .transaction_id = @splat(9), .destination = .native, .delivery_manifest = "original", .retain_manifest = true, .artifact = .{ .namespace = @splat(10), .binding = source.identity(), .domain = control.artifact_control.domainFor(source.identity()), .attempt = attempt, .bytes = 128, .checksum = @splat(11), .plan_digest = @splat(12) } };
+    try std.testing.expectEqual(null, try store.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition));
     try driver.mutate(.{ .reserve = pending });
+    try std.testing.expectEqualDeep(@as(?control.Scope, source), try store.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition));
+    try std.testing.expectEqual(null, try store.nativeSourceRecoveryScope(a, group, source.table_id, 0, @splat(99)));
     try driver.mutate(.{ .close = {} });
+    try std.testing.expectEqualDeep(@as(?control.Scope, source), try store.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition));
     var closing = try store.captureSourceScope(a, query);
     defer closing.deinit(a);
     try std.testing.expectEqual(driver.index, closing.cut.index);

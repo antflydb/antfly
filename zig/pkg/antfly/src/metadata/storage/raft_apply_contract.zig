@@ -334,6 +334,7 @@ pub const CatalogProjectionRequest = union(enum) {
     changefeed_maintenance: struct { now: u64, after: ?feed.Id },
     source_control: struct { table_id: u64, source_id: [32]u8 },
     legacy_source_intake: struct { table_id: u64, ordinal: u32, definition: [32]u8 },
+    native_source_recovery_scope: struct { table_id: u64, ordinal: u32, definition: [32]u8 },
     capture_source_scope: @import("../source_scope_capture.zig").Query,
     pg_publication: struct { database: feed.Digest, name: []const u8 },
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,

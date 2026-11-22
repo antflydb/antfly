@@ -5275,6 +5275,7 @@ test "compiled metadata owner projects changefeed and source control reads" {
     defer source_state.deinit();
     try std.testing.expectEqual(@as(u64, 0), source_state.value.revision);
     try std.testing.expect(try store.legacyReplicationSourceIntakeAllowed(a, group, 7, 0, @splat(1)));
+    try std.testing.expectEqual(null, try store.nativeSourceRecoveryScope(a, group, 7, 0, @splat(1)));
     try std.testing.expectError(error.ReadUnavailable, store.captureSourceScope(a, .{
         .metadata_group_id = group,
         .metadata_incarnation = @splat('1'),

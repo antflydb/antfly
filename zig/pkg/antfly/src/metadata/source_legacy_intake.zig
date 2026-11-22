@@ -21,6 +21,12 @@ const control = @import("source_control.zig");
 pub const max_records = 256;
 pub const max_bytes = 4 * 1024 * 1024;
 pub fn allowed(a: std.mem.Allocator, txn: anytype, group: u64, table: u64, ordinal: u32, definition: control.Digest) !bool {
+    return (try find(a, txn, group, table, ordinal, definition, .legacy_gate)) == null;
+}
+
+pub const Lookup = enum { legacy_gate, recovery };
+
+pub fn find(a: std.mem.Allocator, txn: anytype, group: u64, table: u64, ordinal: u32, definition: control.Digest, mode: Lookup) !?control.Scope {
     if (group == 0 or table == 0 or std.mem.allEqual(u8, &definition, 0)) return error.InvalidSourceControl;
     var buffer: [256]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&buffer, "\x00\x00__metadata__:source_control:{d}:state:{d}:", .{ group, table });
@@ -29,6 +35,7 @@ pub fn allowed(a: std.mem.Allocator, txn: anytype, group: u64, table: u64, ordin
     var row = try cursor.seekAtOrAfter(prefix);
     var records: usize = 0;
     var bytes: usize = 0;
+    var found: ?control.Scope = null;
     while (row) |entry| : (row = try cursor.next()) {
         if (!std.mem.startsWith(u8, entry.key, prefix)) break;
         if (records == max_records or entry.value.len > max_bytes - bytes) return error.SourceAdmissionBackpressure;
@@ -39,8 +46,18 @@ pub fn allowed(a: std.mem.Allocator, txn: anytype, group: u64, table: u64, ordin
         if (state.value.scope) |scope| {
             var expected_buffer: [256]u8 = undefined;
             if (scope.table_id != table or !std.mem.eql(u8, entry.key, try control.keyForGroup(&expected_buffer, group, table, scope.source_id))) return error.InvalidSourceControl;
-            if (scope.source_ordinal == ordinal or std.mem.eql(u8, &scope.definition, &definition)) return false;
+            const same_definition = std.mem.eql(u8, &scope.definition, &definition);
+            switch (mode) {
+                .legacy_gate => if (scope.source_ordinal == ordinal or same_definition) return scope,
+                .recovery => {
+                    if (scope.source_ordinal != ordinal or !same_definition or
+                        scope.destination != .native or state.value.retired or !state.value.scope_fencing or !state.value.manifest_retention or
+                        (state.value.pending == null and state.value.artifact_control.?.current == null)) continue;
+                    if (found != null) return error.SourceBindingConflict;
+                    found = scope;
+                },
+            }
         }
     }
-    return true;
+    return found;
 }

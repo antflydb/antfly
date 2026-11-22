@@ -717,6 +717,10 @@ pub const RaftApplyStore = struct {
         return self.catalogProjection(bool, a, group_id, .{ .legacy_source_intake = .{ .table_id = table_id, .ordinal = ordinal, .definition = definition } });
     }
 
+    pub fn nativeSourceRecoveryScope(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source.Digest) !?source.Scope {
+        return self.catalogProjection(?source.Scope, a, group_id, .{ .native_source_recovery_scope = .{ .table_id = table_id, .ordinal = ordinal, .definition = definition } });
+    }
+
     pub fn captureSourceScope(self: *RaftApplyStore, a: std.mem.Allocator, query: source_scope.Query) !source_scope.Snapshot {
         return self.catalogProjection(source_scope.Snapshot, a, query.metadata_group_id, .{ .capture_source_scope = query });
     }

@@ -10806,6 +10806,27 @@ pub const MetadataHttpService = struct {
         return store.legacyReplicationSourceIntakeAllowed(self.alloc, self.metadata_group_id, table_id, ordinal, definition);
     }
 
+    pub fn recoverNativeReplicationSource(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, ordinal: u32, deadline_ns: ?u64) !void {
+        try ensureCdcWorkPermit(self);
+        const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
+        try self.ensureLinearizableReadWithContext(context);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const control = @import("source_control.zig");
+        const definition = try control.definitionDigest(a, table.replication_sources_json, ordinal);
+        const scope = (try store.nativeSourceRecoveryScope(a, self.metadata_group_id, table.table_id, ordinal, definition)) orelse return;
+        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        var router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+        var hosted: @import("../api/hosted_completion.zig").Hosted = .{
+            .catalog = catalog,
+            .router = router.router(),
+            .executor = self.raft.host.http_host.request_executor,
+            .secret = self.internal_service_secret,
+            .issuer = self.internal_service_issuer,
+        };
+        try ensureCdcWorkPermit(self);
+        try @import("../api/source_destination_completion.zig").recover(self, hosted.sourceAdmission(), a, scope, control.digest(table.replication_sources_json), context);
+    }
+
     pub fn replicationSourceAuthorityCurrent(
         self: *MetadataHttpService,
         expected_replication_sources_json: []const u8,

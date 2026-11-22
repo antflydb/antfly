@@ -140,7 +140,11 @@ pub const Coordinator = struct {
             break;
         };
         const coordinator = captured.items[coordinator_index];
-        var plan = try plan_mod.Plan.freezeDerived(a, transaction_id, coordinator.input.owner, frozen_inputs, @import("antfly_platform").time.realtimeNs());
+        const checkpoint = coordinator.input.prepare.transaction.?.prepare.source_checkpoint;
+        // A source reservation must be able to verify the same plan bytes
+        // across worker restarts before its immutable upload is sealed.
+        const created_at_ns = if (checkpoint) |command| command.accepted_at_ns else @import("antfly_platform").time.realtimeNs();
+        var plan = try plan_mod.Plan.freezeDerived(a, transaction_id, coordinator.input.owner, frozen_inputs, created_at_ns);
         errdefer plan.deinit();
         const reservation = try plan.admission.reservationBytes(plan.admission_bytes.len);
         for (captured.items) |item| if (reservation > item.retention_limit_bytes) return error.HistoryTooLarge;

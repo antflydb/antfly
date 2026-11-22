@@ -213,7 +213,7 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ttl", .{tmp.sub_path});
         defer alloc.free(path);
-        var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 500, .shard_id = 501 }, .primary_backend = .{ .lsm = .{} } });
+        var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 500, .shard_id = 501 }, .online_source_authority = .native, .primary_backend = .{ .lsm = .{} } });
         defer db.close();
         const template =
             \\{"version":1,"storage_mode":"relational","default_type":"row","ttl":{"duration":"1ns","field":"expires"},"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"ACTION"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true},"expires":{"type":"datetime"},"note":{"type":"keyword","nullable":true}},"additionalProperties":false}}}}
