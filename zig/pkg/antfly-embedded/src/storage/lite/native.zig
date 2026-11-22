@@ -8237,7 +8237,7 @@ pub const NativeFile = struct {
         // Also participate in inode fencing so a writer that cannot
         // map the region can exclude raw reads of a retired extent.
         const extent_fence = if (self.header.segmented_redo and self.read_only)
-            try self.acquireInodeLock(.shared, true, true, "coldRedoExtent")
+            try self.acquireInodeLock(.shared, false, true, "coldRedoExtent")
         else
             null;
         defer if (extent_fence) |fence| fence.release(io);
@@ -10021,7 +10021,7 @@ pub const NativeFile = struct {
         const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
 
         const extent_fence = if (self.header.segmented_redo and self.read_only)
-            try self.acquireInodeLock(.shared, true, true, "refreshRedoExtent")
+            try self.acquireInodeLock(.shared, false, true, "refreshRedoExtent")
         else
             null;
         defer if (extent_fence) |fence| fence.release(io);
