@@ -4970,7 +4970,7 @@ pub const SessionRegistry = struct {
                     }
                     page.more = rows.len == 64;
                 } else |err| {
-                    if (err != error.Unsupported) return err;
+                    if (err != error.Unsupported and err != error.InvalidTransactionSessionRecord) return err;
                     var cursor = try txn.openCursor();
                     defer cursor.close();
                     try page.scan(&txn, &cursor, alloc, start);
@@ -5058,7 +5058,7 @@ pub const SessionRegistry = struct {
                 defer scope.close();
                 const bytes = scope.probePrefix(key, connection_prefix_len) catch |err| switch (err) {
                     error.NotFound => return false,
-                    error.Unsupported, error.EndOfStream => break :bounded null,
+                    error.Unsupported, error.EndOfStream, error.InvalidTransactionSessionRecord => break :bounded null,
                     else => return err,
                 };
                 break :bounded isTerminalPrefix(bytes);
