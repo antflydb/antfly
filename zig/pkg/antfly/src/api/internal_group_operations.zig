@@ -1143,7 +1143,10 @@ pub const Operations = struct {
                 const deadline: Deadline = .{ .context = request };
                 const json = ops.topologyRead(alloc, input.group_id, input.table_name, scoped.value, .{ .ptr = &deadline, .is_cancelled_fn = Deadline.canceled }) catch |err| {
                     try request.ensureActive();
-                    const mapped = mapCommonReadError(err) orelse mapLookupError(err);
+                    const mapped = switch (err) {
+                        error.IntegrityTopologyBusy, error.TransactionTopologyBusy => error.StorageReadTemporarilyUnavailable,
+                        else => mapCommonReadError(err) orelse mapLookupError(err),
+                    };
                     if (mapped == error.Internal) {
                         const now = platform_time.monotonicNs();
                         const next = next_unknown_topology_read_log_ns.load(.monotonic);

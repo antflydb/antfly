@@ -1281,10 +1281,10 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn leaseTransitionOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !TransitionLease {
         const path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer self.alloc.free(path);
-        // A transition's catalog descriptor pins the physical source or
-        // provisional destination. Its lifecycle reads can use the resident
-        // owner while ordinary catalog reconciliation is still fenced.
-        return .{ .lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .resident, .{ .allow_deferred_catalog = true }) };
+        // Use the exact transition descriptor and the applied schema on
+        // cold reopen. A fenced transition cannot publish a schema or amend
+        // ordinary catalog bindings to serve a lifecycle read.
+        return .{ .lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .resident, .{ .historical_raft_apply = true }) };
     }
 
     pub fn reconcileDataRaftProjection(
