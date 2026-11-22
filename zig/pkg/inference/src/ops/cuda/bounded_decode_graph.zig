@@ -386,16 +386,21 @@ pub const Module = struct {
                 self.head_quota = quota_mod.Quota.fromRawAdmission(try policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = layout.head_bytes }, policy.check_live_memory));
             self.head = try buffer.DeviceBuffer.alloc(ctx, layout.head_bytes);
         }
+        self.installStorageGeometry(layout, rows, hidden, vocab, host_positions);
+    }
+
+    fn installStorageGeometry(self: *Module, layout: StorageLayout, rows: usize, hidden: usize, vocab: usize, positions_: []const u32) void {
         self.rows = rows;
         self.hidden = hidden;
         self.vocab = vocab;
         self.bank_offset = layout.bank_offset;
         self.positions_offset = layout.positions_offset;
         self.progress_offset = layout.progress_offset;
-        @memcpy(self.base_positions[0..host_positions.len], host_positions);
-        @memcpy(self.next_positions[0..host_positions.len], host_positions);
+        @memcpy(self.base_positions[0..positions_.len], positions_);
+        @memcpy(self.next_positions[0..positions_.len], positions_);
         self.phase = .warm;
     }
+
     pub fn arenaLayout(self: *const Module) !plan_mod.Layout {
         const plan = self.plan orelse return error.InvalidState;
         const layout = try plan.layout(0);
@@ -437,15 +442,7 @@ pub const Module = struct {
         cold.key = &.{};
         self.plan = cold.plan;
         cold.plan = null;
-        self.rows = descriptor.rows;
-        self.hidden = descriptor.hidden;
-        self.vocab = descriptor.vocab;
-        self.bank_offset = layout.bank_offset;
-        self.positions_offset = layout.positions_offset;
-        self.progress_offset = layout.progress_offset;
-        @memcpy(self.base_positions[0..descriptor.positions.len], descriptor.positions);
-        @memcpy(self.next_positions[0..descriptor.positions.len], descriptor.positions);
-        self.phase = .warm;
+        self.installStorageGeometry(layout, descriptor.rows, descriptor.hidden, descriptor.vocab, descriptor.positions);
     }
     pub fn reserveArenaPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
         if (self.arena.ptr != 0) return;
