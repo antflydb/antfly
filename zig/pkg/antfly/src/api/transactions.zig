@@ -12128,7 +12128,7 @@ test "distributed txn observation retirement advances beyond malformed index row
     defer alloc.free(invalid);
     {
         var write = try store.beginWrite();
-        defer write.abort();
+        errdefer write.abort();
         try write.put(invalid, "invalid");
         try write.put(valid, &reference);
         try write.commit();
