@@ -190,6 +190,20 @@ def counters(section: dict | None) -> dict[str, float]:
     return found
 
 
+TOKEN_IDS_LINE = re.compile(r"^token_ids:((?: \d+)*)\s*$", re.MULTILINE)
+
+
+def generated_token_ids(proc: subprocess.CompletedProcess, timing: dict) -> list[int]:
+    """`generate --print-token-ids` prints the ids on a `token_ids:` line
+    (stderr); the timing JSON field is used when a build fills it."""
+    if timing.get("token_ids"):
+        return [int(t) for t in timing["token_ids"]]
+    match = TOKEN_IDS_LINE.search(proc.stderr) or TOKEN_IDS_LINE.search(proc.stdout)
+    if match is None:
+        raise SystemExit("generate printed no token_ids line")
+    return [int(t) for t in match.group(1).split()]
+
+
 def agreement(reference: list[int], tokens: list[int]) -> tuple[int, float]:
     """Tokens before the first divergence, and the matching fraction."""
     prefix = 0
@@ -248,13 +262,16 @@ def bench(args: argparse.Namespace) -> None:
                         "--max-tokens",
                         str(args.max_tokens),
                     ]
-                    cmd += ["--ignore-eos", "--json-timing", str(timing)] + (
-                        args.generate_args or []
-                    )
-                    run(cmd)
+                    cmd += [
+                        "--ignore-eos",
+                        "--print-token-ids",
+                        "--json-timing",
+                        str(timing),
+                    ] + (args.generate_args or [])
+                    proc = run(cmd)
                     data = json.loads(timing.read_text())
                     if r == 0:
-                        outputs.append([int(t) for t in data.get("token_ids") or []])
+                        outputs.append(generated_token_ids(proc, data))
                     if r > 0 or args.repeat == 1:
                         speeds.append(float(data.get("decode_tok_per_s") or 0))
                         prefill.append(
