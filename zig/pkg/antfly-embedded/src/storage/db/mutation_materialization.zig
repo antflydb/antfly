@@ -1490,6 +1490,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             error_code: []const u8,
             error_message: []const u8,
             error_stage: []const u8,
+            execution_json: []const u8,
             artifact_writes: anytype,
         ) !void {
             var previous_state = DocumentExtractionPreviousState{};
@@ -1511,6 +1512,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 error_code,
                 error_message,
                 error_stage,
+                execution_json,
             );
             defer alloc.free(manifest);
             try appendPreparedArtifactCopy(alloc, artifact_writes, manifest_key, manifest);
@@ -7063,6 +7065,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
+            if (producer_cfg.type == .reader or producer_cfg.type == .generator) {
+                if (try enrichment_types.withGenerationBudgetAlloc(alloc, producer_cfg.config_json, request.execution_json)) |updated| {
+                    alloc.free(producer_cfg.config_json);
+                    producer_cfg.config_json = updated;
+                }
+            }
             if (producer_cfg.type != .copy) {
                 if (deferred_asset_producer_items) |items| {
                     const request_clone = try enrichment_types.cloneGeneratedRequest(alloc, request);
@@ -7547,6 +7555,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var config = try document_extraction_mod.parseConfig(alloc, config_json);
             defer config.deinit(alloc);
             enrichment_runtime_mod.applyDocumentExtractionRuntimePolicy(&config);
+            try document_extraction_mod.applyExecutionPolicy(alloc, &config, request.execution_json);
             try document_extraction_mod.applySourceMetadataFromJson(alloc, &config, doc_value);
 
             const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
@@ -7575,12 +7584,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 0;
             const to_generation = from_generation + 1;
+            const must_force = force_reprocess and (request.reprocess_generation == 0 or from_generation < request.reprocess_generation);
 
             const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
             defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
             // As in async replay, checksum opt-in requires verified bytes;
             // metadata-only legacy fingerprints cannot prove that provenance.
-            if (!force_reprocess) {
+            if (!must_force) {
                 if (metadata_fingerprint) |fingerprint| {
                     if (try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
                 }
@@ -7633,7 +7643,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else
                     raw_err;
                 if (err != error.DocumentExtractionWorkingSetTooLarge and !document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
-                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
+                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", request.execution_json, artifact_writes);
                 return;
             };
             const downloaded = switch (fetched) {
@@ -7643,7 +7653,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return error.RemoteDocumentFetchFailed;
                     const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
                     defer alloc.free(message);
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", artifact_writes);
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", request.execution_json, artifact_writes);
                     return;
                 },
             };
@@ -7659,7 +7669,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var content_digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(downloaded_mut.data, &content_digest, .{});
                 document_extraction_mod.verifyChecksumDigest(config, &content_digest) catch |raw_err| {
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", artifact_writes);
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", request.execution_json, artifact_writes);
                     return;
                 };
             }
@@ -7671,7 +7681,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
             const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
-            if (metadata_fingerprint == null and !force_reprocess and
+            if (metadata_fingerprint == null and !must_force and
                 try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
 
             // Downloaded bytes, inspection state, and decoded extraction results are
@@ -7708,10 +7718,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const exact_error_name = if (err != raw_err) @errorName(err) else boundaryFailureErrorName(&extraction_failure, err);
                 const decode_failure = document_extraction_mod.failureStageFromErrorName(exact_error_name, "").len != 0;
                 if (err == error.OutOfMemory or err == error.ResourceTemporarilyUnavailable or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded or err == error.Timeout or (!decode_failure and enrichment_runtime_mod.isRetryableEnrichmentError(err))) return err;
-                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
+                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), request.execution_json, artifact_writes);
                 return;
             };
             defer extraction.deinit(document_extraction_alloc);
+            extraction.execution_json = request.execution_json;
             if (S.ownerField(db, "enrichment_runtime").*) |runtime| {
                 enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
                     if (document_execution) |execution| &execution.runtime else runtime,
@@ -7733,7 +7744,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else
                         raw_err;
                     if (err != error.DocumentExtractionWorkingSetTooLarge) return err;
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "generated document text exceeded its working-set limit", "document_generated_text", artifact_writes);
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "generated document text exceeded its working-set limit", "document_generated_text", request.execution_json, artifact_writes);
                     return;
                 };
             } else if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or config.transcription_enabled) {
@@ -8746,6 +8757,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             error_code: []const u8,
             error_message: []const u8,
             error_stage: []const u8,
+            execution_json: []const u8,
         ) ![]u8 {
             var out = std.ArrayListUnmanaged(u8).empty;
             errdefer out.deinit(alloc);
@@ -8760,6 +8772,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", "");
             try appendJsonFieldString(alloc, &out, &first, "content_type", "");
             try appendJsonFieldString(alloc, &out, &first, "route_type", "error");
+            if (execution_json.len > 0) {
+                try appendJsonFieldName(alloc, &out, &first, "execution");
+                try out.appendSlice(alloc, execution_json);
+            }
             try appendJsonFieldUsize(alloc, &out, &first, "unit_count", unit_keys.len);
             try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
             try appendJsonFieldName(alloc, &out, &first, "child_ranges");
@@ -8843,6 +8859,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
             try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
             try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+            if (extraction.execution_json.len > 0) {
+                try appendJsonFieldName(alloc, &out, &first, "execution");
+                try out.appendSlice(alloc, extraction.execution_json);
+            }
             if (extraction.unsupported_reason.len > 0) {
                 try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
             }
