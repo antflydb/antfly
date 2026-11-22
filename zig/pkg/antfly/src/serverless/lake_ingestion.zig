@@ -685,20 +685,17 @@ fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context:
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
     const expected = try bootstrapIdentity(a, source, epoch, checkpoint, keys);
     const record = try store.next(a, 0);
-    const bytes = if (record) |accepted| accepted.payload else blk: {
+    const batch = if (record) |accepted| try std.json.parseFromSliceLeaky(Batch, a, accepted.payload, .{}) else blk: {
         var client = opened.client;
         const key = try bootstrapStageKey(a, base, expected);
-        if (try readBootstrapPages(a, &opened, context, key, expected)) |assembled| {
-            break :blk try std.json.Stringify.valueAlloc(a, assembled, .{});
-        }
+        if (try readBootstrapPages(a, &opened, context, key, expected)) |assembled| break :blk assembled;
         var staged = client.getObject(opened.bucket, key, .{ .max_response_bytes = catalog.types.max_commit_bytes, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
             error.NotFound, error.ObjectNotFound, error.FileNotFound => return false,
             else => return err,
         };
         defer staged.deinit(client.allocator);
-        break :blk try a.dupe(u8, staged.body);
+        break :blk try std.json.parseFromSliceLeaky(Batch, a, staged.body, .{ .allocate = .alloc_always });
     };
-    const batch = try std.json.parseFromSliceLeaky(Batch, a, bytes, .{});
     if (!batch.bootstrap or batch.expected_checkpoint != null or
         !std.mem.eql(u8, batch.batch_id, expected.batch_id) or !std.mem.eql(u8, batch.source, source) or
         !std.mem.eql(u8, batch.epoch, epoch) or !std.mem.eql(u8, batch.checkpoint, checkpoint) or
@@ -723,13 +720,15 @@ pub const BatchOutcome = struct {
 /// receipt and catalog intent. Callers may checkpoint only a committed result.
 pub fn applyBatch(a: A, binding: Binding, unresolved_options: Options, context: Context, batch: Batch) !BatchOutcome {
     const options = try unresolved_options.resolveOwner(a, context);
-    const sequence = try acceptResolvedBatch(a, binding, options, context, batch);
-    const observed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
+    const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
+    defer a.free(payload);
+    const sequence = try acceptResolvedPayload(a, binding, options, context, batch, payload);
+    const observed = (try observeResolvedPayload(a, binding, options, context, batch, payload)) orelse return error.LakeWalCoverageGap;
     if (observed.accepted_sequence != sequence) return error.LakeWalCoverageGap;
     if (observed.committed) return observed;
 
     _ = try drain(a, binding, options, context);
-    const refreshed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
+    const refreshed = (try observeResolvedPayload(a, binding, options, context, batch, payload)) orelse return error.LakeWalCoverageGap;
     if (refreshed.accepted_sequence != sequence) return error.LakeWalCoverageGap;
     return refreshed;
 }
@@ -740,6 +739,10 @@ pub fn observeBatch(a: A, binding: Binding, unresolved_options: Options, context
     const options = try unresolved_options.resolveOwner(a, context);
     const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
     defer a.free(payload);
+    return observeResolvedPayload(a, binding, options, context, batch, payload);
+}
+
+fn observeResolvedPayload(a: A, binding: Binding, options: Options, context: Context, batch: Batch, payload: []const u8) !?BatchOutcome {
     var opened = try openQueue(a, binding, options);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
@@ -774,6 +777,10 @@ fn observedSequence(a: A, store: wal.Store, batch: Batch, payload: []const u8) !
 fn acceptResolvedBatch(a: A, binding: Binding, options: Options, context: Context, batch: Batch) !u64 {
     const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
     defer a.free(payload);
+    return acceptResolvedPayload(a, binding, options, context, batch, payload);
+}
+
+fn acceptResolvedPayload(a: A, binding: Binding, options: Options, context: Context, batch: Batch, payload: []const u8) !u64 {
     var opened = try openQueue(a, binding, options);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);

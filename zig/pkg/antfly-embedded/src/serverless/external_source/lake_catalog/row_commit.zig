@@ -84,13 +84,16 @@ fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
     var seen: std.StringHashMap(usize) = .init(a);
     var data = array(a);
     var keys = array(a);
+    const identities = try a.alloc([]const u8, batch.changes.len);
+    defer a.free(identities);
     // Keep only the last complete mutation for each key within the transaction.
     // Array slots preserve deterministic encoding across retries.
     for (batch.changes, 0..) |change, index| {
-        try context.ensureActive();
+        // The source authority check may read durable metadata. Bound CPU work
+        // between checks without re-reading that metadata for every row.
+        if (index % 128 == 0) try context.ensureActive();
         if (change.row != .object) return error.InvalidLakeRow;
         var key = object(a);
-        var tuple = array(a);
         for (batch.key_fields, 0..) |name, key_index| {
             var v = change.row.object.get(name) orelse return error.InvalidLakeRow;
             const kind = try m.str(try m.get(fields.array.items[key_index], "type"));
@@ -107,18 +110,16 @@ fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
             }
             if (v == .null) return error.InvalidLakeRow;
             try put(a, &key, name, v);
-            try append(&tuple, v);
         }
         if (change.op == .delete and change.row.object.count() != batch.key_fields.len) return error.InvalidLakeRow;
         const encoded_key = try stable_key.identity(a, batch.key_fields, change.row, &.{});
+        identities[index] = encoded_key;
         try seen.put(encoded_key, index);
         try append(&keys, key);
     }
     var unique_keys = array(a);
-    for (batch.changes, keys.array.items, 0..) |change, key, index| {
-        var tuple = array(a);
-        for (batch.key_fields) |name| try append(&tuple, key.object.get(name).?);
-        const encoded_key = try stable_key.identity(a, batch.key_fields, change.row, &.{});
+    for (batch.changes, keys.array.items, identities, 0..) |change, key, encoded_key, index| {
+        if (index % 128 == 0) try context.ensureActive();
         if (seen.get(encoded_key).? != index) continue;
         try append(&unique_keys, key);
         if (change.op == .upsert) try append(&data, change.row);
@@ -130,6 +131,7 @@ fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
     for (batch.changes) |change| if (change.op == .upsert) try append(&all_data, change.row);
     try validateParquetRows(a, s, all_data.array.items, context);
     try validateParquetRows(a, key_schema, keys.array.items, context);
+    try context.ensureActive();
     return .{ .data = data.array.items, .keys = unique_keys.array.items, .key_schema = key_schema, .ids = ids };
 }
 fn validateParquetRows(a: A, schema_value: V, rows: []const V, context: types.Context) !void {

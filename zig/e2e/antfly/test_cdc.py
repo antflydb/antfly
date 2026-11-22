@@ -3839,7 +3839,9 @@ def test_public_changefeed_resets_stalled_lease_under_native_history_pressure():
             name = "feed_history_pressure"
             table = f"{api}/tables/{name}"
             feeds = f"{api}/changefeeds"
-            _changefeed_call(client, "POST", table, json={"num_shards": 1})
+            _changefeed_call(
+                client, "POST", table, json={"num_shards": 1, "indexes": {}}
+            )
             stalled = _changefeed_call(
                 client,
                 "POST",
@@ -3851,16 +3853,21 @@ def test_public_changefeed_resets_stalled_lease_under_native_history_pressure():
             payload = "x" * (9 * 1024**2)
 
             def write(index):
-                return client.post(
-                    f"{table}/batch",
-                    json={"inserts": {f"row-{index}": {"payload": payload}}},
-                    timeout=60,
+                try:
+                    response = client.post(
+                        f"{table}/batch",
+                        json={"inserts": {f"row-{index}": {"payload": payload}}},
+                        timeout=60,
+                    )
+                except requests.RequestException as error:
+                    pytest.fail(f"Write {index} failed: {error}\n{server.debug_logs()}")
+                assert response.ok, (
+                    f"Write {index}: {response.text}\n{server.debug_logs()}"
                 )
 
             # Cross the soft 192 MiB watermark while staying below 256 MiB.
             for index in range(22):
-                response = write(index)
-                assert response.ok, response.text
+                write(index)
 
             def reset():
                 reply = client.get(path, timeout=15)
@@ -3877,8 +3884,7 @@ def test_public_changefeed_resets_stalled_lease_under_native_history_pressure():
             assert expired.json()["error"] == "changefeed_resynchronization_required"
             # Later writes exceed the old pinned budget after background cleanup.
             for index in range(22, 31):
-                response = write(index)
-                assert response.ok, response.text
+                write(index)
     finally:
         server.stop()
 
