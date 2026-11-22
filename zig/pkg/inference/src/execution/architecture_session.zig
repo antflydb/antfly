@@ -15507,7 +15507,7 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
             var requirements: [2]@import("prepared_storage_admission.zig").Requirement = undefined;
             for (requirements[0..copies]) |*entry| entry.* = .{ .backend = .cuda, .class = .activation, .bytes = bytes };
             const metadata = try std.math.mul(usize, copies, @sizeOf(ops.physical_storage.Lease) + 2 * @sizeOf(cuda_compute_mod.CudaTensor) + 3 * @sizeOf(i64));
-            return prepare(requestSession(session, limits), primary, requirements[0..copies], .{ .consumer_metadata_bytes = metadata }, control);
+            return @This().prepare(@This().requestSession(session, limits), primary, requirements[0..copies], .{ .consumer_metadata_bytes = metadata }, control);
         }
 
         pub fn prepare(session: Session, primary: *runtime.tier.memory.AdmissionLease, requirements: []const @import("prepared_storage_admission.zig").Requirement, options: @import("prepared_storage_admission.zig").Prepared.AdditionalOptions, control: InferenceExecutionControl) !?@This() {
