@@ -1123,6 +1123,7 @@ pub const Detail = enum(c_int) {
     transaction_prepare_aborted_unavailable,
     pre_dispatch_decision_admission_unavailable,
     model_chunk_empty_video_window,
+    model_chunk_malformed_video_packet,
 };
 
 pub const Status = extern struct {
@@ -1382,6 +1383,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.ChunkDependencyBudgetExceeded => status(.invalid_argument, .model_chunk_dependency_budget),
         error.ChunkCodedWindowBudgetExceeded => status(.invalid_argument, .model_chunk_coded_window_budget),
         error.EmptyVideoWindow => status(.invalid_argument, .model_chunk_empty_video_window),
+        error.MalformedVideoPacket => status(.invalid_argument, .model_chunk_malformed_video_packet),
         error.ChunkEventBudgetExceeded => status(.invalid_argument, .model_chunk_event_budget),
         error.RemoteReadBudgetExceeded => status(.invalid_argument, .model_chunk_remote_bytes_budget),
         error.RemoteRequestBudgetExceeded => status(.invalid_argument, .model_chunk_remote_requests_budget),
@@ -2357,6 +2359,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .model_chunk_dependency_budget => "ChunkDependencyBudgetExceeded",
         .model_chunk_coded_window_budget => "ChunkCodedWindowBudgetExceeded",
         .model_chunk_empty_video_window => "EmptyVideoWindow",
+        .model_chunk_malformed_video_packet => "MalformedVideoPacket",
         .model_chunk_event_budget => "ChunkEventBudgetExceeded",
         .model_chunk_remote_bytes_budget => "RemoteReadBudgetExceeded",
         .model_chunk_remote_requests_budget => "RemoteRequestBudgetExceeded",

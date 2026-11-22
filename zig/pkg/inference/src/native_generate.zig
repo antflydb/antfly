@@ -512,13 +512,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
     const prompt_projector = if (opts.audio_count != 0) try model.ensureProjectorStore() else null;
-    const prompt_media_admission = try generation.nativeGenerationMediaAdmissionForBackend(
+    var transport_inspection = @import("pipelines/gemma4_video.zig").transportInspection(allocator);
+    defer transport_inspection.deinit();
+    const prompt_media_admission = try generation.nativeGenerationMediaAdmissionWithInspection(
         allocator,
         opts.model_dir,
         &messages,
         gpt_config,
         if (model.session.backend() == .cuda) .cuda else .generic,
         if (prompt_projector) |store| &store.gguf.parsed else null,
+        .{},
+        &transport_inspection,
     );
     const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(&messages, gpt_config);
     const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
@@ -981,6 +985,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .cb = cb,
         .session = model.session,
         .media_run_budget = &run_budget,
+        .transport_inspection = &transport_inspection,
         .media_prepaid = .{ .process_bytes = media_budget_credit.bytes, .budget_bytes = media_budget_credit.bytes },
         .explicit_scratch_limit = if (opts.scratch_budget_mb != 0) budget_limits.scratch_limit_bytes else 0,
         .gpt_config = gpt_config,

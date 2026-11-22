@@ -1498,6 +1498,19 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             }
         }
     };
+    var cached_token_counts: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    if (cached_rows.len != 0) if (baseline_vectors) |vectors| if (vectors == .array) {
+        for (vectors.array.items) |row| {
+            const ordinal = media_checkpoint.vectorOrdinal(row) catch continue;
+            const old = row.object.get("_chunk").?.object;
+            const old_plan = old.get("plan_id") orelse continue;
+            if (old_plan != .string or !std.mem.eql(u8, old_plan.string, cached_document_outputs.?.object.get("plan_id").?.string)) continue;
+            const tokens = old.get("descriptor").?.object.get("input_tokens") orelse continue;
+            if (tokens != .integer) continue;
+            const count = std.math.cast(usize, tokens.integer) orelse continue;
+            try cached_token_counts.put(scratch, ordinal, count);
+        }
+    };
     const group_start = if (position) |cursor| cursor.ordinal else 0;
     var covered: u64 = group_start;
     var group_generation: ?[32]u8 = if (fast_checkpoint) |saved| saved.generation else null;
@@ -1528,7 +1541,10 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
                     if (std.mem.eql(u8, identity.name, target.name)) break identity.recipe_id;
                 } else "";
                 for (@min(first, cached_rows.len)..@min(first +| config.max_chunks, cached_rows.len)) |ordinal| {
-                    for (cached_rows[ordinal].outputs) |value| {
+                    const row = cached_rows[ordinal];
+                    if (skips.items.len < 4096 and !needsServerlessOutput(target.*, row.outputs, current_identities))
+                        try skips.append(scratch, .{ .ordinal = ordinal, .sub_index = media_outputs.Target.Window.all_sub_windows });
+                    for (row.outputs) |value| {
                         if (skips.items.len < 4096 and std.mem.eql(u8, value.name, target.name) and std.mem.eql(u8, value.recipe_id, current_recipe) and value.reusable()) try skips.append(scratch, .{ .ordinal = ordinal, .sub_index = value.sub_index });
                     }
                 }
@@ -1559,7 +1575,16 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
                 pending_outputs = true;
             };
             if (independent.len != 0) try output_rows.append(scratch, .{ .chunk_id = chunk.id, .outputs = independent });
-            try appendServerlessEmbeddingRows(scratch, wanted, metadata, independent, chunk.text orelse "", &embeddings, &previews);
+            var publication = metadata.*;
+            if (publication.descriptor.input_tokens == 0) if (cached_token_counts.get(chunk.id)) |count| {
+                for (independent) |value| {
+                    if (value.kind == .embedding and value.status == .complete and std.mem.eql(u8, value.name, "embedding") and media_checkpoint.healthyIndex(cached_rows, chunk.id, value.recipe_id)) {
+                        publication.descriptor.input_tokens = count;
+                        break;
+                    }
+                }
+            };
+            try appendServerlessEmbeddingRows(scratch, wanted, &publication, independent, chunk.text orelse "", &embeddings, &previews);
         }
         pages += 1;
         covered = page.covered_through_ordinal;

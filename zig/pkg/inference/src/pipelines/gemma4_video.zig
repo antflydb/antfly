@@ -45,15 +45,24 @@ fn clockAllowance(clock: media.timeline.SampleClock) !usize {
 
 /// Size the reservation from container clocks without acquiring a decoder or
 /// projector. Final context validation tokenizes the actual projected spans.
-pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8, control: Control) !usize {
+pub fn transportInspection(a: std.mem.Allocator) embedding_video.InspectionScope {
+    return .{ .allocator = a, .limit = inspection_bytes };
+}
+
+pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8, control: Control, inspection: ?*embedding_video.InspectionScope) !usize {
     try control.check();
     const adapter = control.imageWorkControl();
     const media_control = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
     if (bytes.len > video.packet_sampling.reference_max_input_bytes) return error.VideoInputTooLarge;
     if (media.transport_stream.isTransportStream(bytes)) {
-        // TS has no independent clock table. Reserve the bounded frame
-        // allowance and let the execution index measure the exact timeline.
-        return token_allowance;
+        if (inspection) |scope| {
+            const times = try embedding_video.inspectedPresentationUs(a, bytes, null, control, .{ .sampling = sampling, .inspection_scope = scope });
+            defer a.free(times);
+            if (times.len == 0) return error.EmptyVideo;
+            const minutes = @divFloor(times[times.len - 1], 60 * std.time.us_per_s);
+            return times.len * (projector_mod.video_tokens_per_frame + @max(2, std.fmt.count("{d}", .{minutes})) + 7);
+        }
+        return clockAllowance(try media.transport_stream.probeSampleClock(a, bytes, .{ .max_bytes = video.packet_sampling.reference_max_input_bytes, .max_packets = video.mp4_coded.limits.max_samples }, media_control));
     }
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = inspection_bytes } };
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-prompt-clock", .control = media_control, .admission_pool = &pool, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
@@ -83,6 +92,7 @@ pub const Admission = struct {
     run_budget: ?*memory.RunBudget = null,
     session: ?Session = null,
     explicit_scratch_limit: usize = 0,
+    transport_inspection: ?*embedding_video.InspectionScope = null,
 
     fn acquire(self: Admission, additional_shared: bool, reserved: Reservation) !Permit {
         var permit: Permit = .{ .reservation = reserved };
@@ -367,12 +377,13 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes - inspection_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
     var inspection = embedding_video.InspectionScope{ .allocator = a, .limit = inspection_bytes };
     defer inspection.deinit();
-    const configuration = embedding_video.Configuration{ .sampling = sampling, .pool = &pool, .inspection_scope = &inspection };
+    const scope = if (media.transport_stream.isTransportStream(bytes)) admission.transport_inspection orelse &inspection else &inspection;
+    const configuration = embedding_video.Configuration{ .sampling = sampling, .pool = &pool, .inspection_scope = scope };
     const adapter = control.imageWorkControl();
     const source_control = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
     const timestamps = embedding_video.inspectedPresentationUs(a, bytes, null, control, configuration) catch |err| return inputError(err);
     defer a.free(timestamps);
-    const inspected = inspection.find(bytes, null, configuration).?;
+    const inspected = scope.find(bytes, null, configuration).?;
     if (!inspected.clip().webm and inspected.clip().reader.track.codec == .hevc) {
         if (@import("builtin").os.tag != .macos) return error.HevcDecoderUnavailable;
         const required = try video.apple_hevc.surfaceBytesControlled(inspected.clip().reader.track, source_control);

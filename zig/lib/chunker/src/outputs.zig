@@ -45,7 +45,14 @@ pub const Target = struct {
         return if (self.kind == .diarize) self.model else self.speakerConfig().model orelse diarization.default_model;
     }
 
-    pub const Window = struct { ordinal: u64, sub_index: u32 };
+    pub const Window = struct {
+        ordinal: u64,
+        sub_index: u32,
+
+        // A real receipt index cannot reach this value. Legacy providers
+        // ignore the marker and can still honor accompanying sub-window masks.
+        pub const all_sub_windows = std.math.maxInt(u32);
+    };
     pub fn speakerRecipeIdentity(self: Target, a: std.mem.Allocator, identity: []const u8, revision: []const u8, speaker_revision: []const u8) ![64]u8 {
         const base = try self.recipeIdentity(a, identity, revision);
         const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = diarization.algorithm, .base = base, .speaker_revision = speaker_revision, .config = self.speakerConfig() }, .{});
@@ -94,13 +101,21 @@ pub const Target = struct {
     };
 
     pub fn wantsWithMask(self: Target, mask: ?Mask, ordinal: u64, sub_index: u32) bool {
-        if (mask) |compiled| return self.execute and !compiled.contains(.{ .ordinal = ordinal, .sub_index = sub_index });
+        if (mask) |compiled| return !self.skipsOrdinalWithMask(compiled, ordinal) and !compiled.contains(.{ .ordinal = ordinal, .sub_index = sub_index });
         return self.wants(ordinal, sub_index);
+    }
+
+    pub fn skipsOrdinalWithMask(self: Target, mask: ?Mask, ordinal: u64) bool {
+        if (!self.execute) return true;
+        const marker = Window{ .ordinal = ordinal, .sub_index = Window.all_sub_windows };
+        if (mask) |compiled| return compiled.contains(marker);
+        for (self.skip_windows) |window| if (std.meta.eql(window, marker)) return true;
+        return false;
     }
 
     pub fn wants(self: Target, ordinal: u64, sub_index: u32) bool {
         if (!self.execute) return false;
-        for (self.skip_windows) |window| if (window.ordinal == ordinal and window.sub_index == sub_index) return false;
+        for (self.skip_windows) |window| if (window.ordinal == ordinal and (window.sub_index == sub_index or window.sub_index == Window.all_sub_windows)) return false;
         return true;
     }
 

@@ -161,6 +161,7 @@ pub const Runner = struct {
     page_rotation: ?i32 = null,
     audio_provider: ?@import("media_chunking_audio.zig").Provider = null,
     audio_failure: ?anyerror = null,
+    video_audio: ?*VideoAudio = null,
     pub fn init(a: std.mem.Allocator, request: Request, executor: Executor, control: Control, sink: Sink) !Runner {
         try control.check();
         if (request.outputs) |config| {
@@ -882,6 +883,42 @@ pub const Runner = struct {
         return self.movieSource(&source, bytes);
     }
 
+    const VideoAudio = struct {
+        source: *media.source.Source,
+        track: ?@import("media_chunking_audio_source.zig").Track = null,
+    };
+
+    fn pageNeedsAudio(self: *const Runner, initial: planning.Temporal) !bool {
+        const config = self.request.outputs orelse return true;
+        if (self.request.audio_output_targets == 0) return true;
+        var cursor = initial;
+        try cursor.seekVideo(self.summary.start_ordinal -| self.ordinal);
+        var count: usize = 0;
+        while (self.request.max_chunks == 0 or count < self.request.max_chunks) : (count += 1) {
+            const shape = (try cursor.next()) orelse break;
+            try self.control.check();
+            const ordinal = try std.math.add(u64, self.ordinal, shape.ordinal);
+            for (config.targets, 0..) |target, index| {
+                if (!target.execute or self.request.audio_output_targets & (@as(u16, 1) << @as(u4, @intCast(index))) == 0) continue;
+                const mask = if (self.request.output_masks) |masks| masks[index] else null;
+                if (!target.skipsOrdinalWithMask(mask, ordinal)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn prepareVideoAudio(self: *Runner, cursor: planning.Temporal) !void {
+        const owner = self.video_audio orelse return;
+        if (!try self.pageNeedsAudio(cursor)) return;
+        owner.track = @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission) catch |err| {
+            if (abort(err) and err != error.AudioTooLarge) return err;
+            self.audio_failure = err;
+            return;
+        };
+        self.audio_provider = owner.track.?.provider();
+        try self.prepareSpeakers(self.audio_provider.?);
+    }
+
     fn movieSource(self: *Runner, physical: *media.source.Source, bytes: []const u8) !void {
         var planning_source = physical.view(physical.allocator, physical.admission_pool, physical.control);
         const source = &planning_source;
@@ -891,18 +928,14 @@ pub const Runner = struct {
             defer prefix.deinit();
             break :detect std.mem.eql(u8, prefix.bytes, "\x1a\x45\xdf\xa3");
         };
-        var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission) catch |err| blk: {
-            if (abort(err) and err != error.AudioTooLarge) return err;
-            self.audio_failure = err;
-            break :blk null;
-        } else null;
-        defer if (audio_track) |*track_owner| track_owner.deinit();
+        var audio_owner = VideoAudio{ .source = source };
+        self.video_audio = if (self.request.needs_audio) &audio_owner else null;
+        defer if (audio_owner.track) |*track| track.deinit();
         defer self.finishSpeakers();
-        if (audio_track) |*track_owner| {
-            self.audio_provider = track_owner.provider();
-            try self.prepareSpeakers(self.audio_provider.?);
+        defer {
+            self.video_audio = null;
+            self.audio_provider = null;
         }
-        defer self.audio_provider = null;
         const count = self.request.limits.max_index_packets;
         const Cache = @import("media_index_cache.zig").Cache;
         const container: Cache.Container = if (transport) .transport else if (webm) .webm else .mp4;
@@ -1365,6 +1398,7 @@ pub const Runner = struct {
         if (owner) |state| state.continuation.session = self.executor.video_session;
         const source = VideoSource{ .bytes = bytes, .reader = reader, .origin = origin, .timescale = timescale, .owner = owner, .webm = webm };
         var cursor = try self.videoCursor(duration);
+        try self.prepareVideoAudio(cursor);
         const base = self.ordinal;
         self.emitVideoWindows(source, &cursor) catch |err| {
             const terminal = videoTerminal(err) orelse return err;
@@ -1636,6 +1670,11 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     const extent = AudioExtent{ .samples = 2, .sample_rate = 1, .start_ns = 0 };
     try std.testing.expect(!try audio_runner.audioReplayNeeded(1, extent));
     try std.testing.expect(try audio_runner.audioReplayNeeded(2, extent));
+    audio_targets[1].skip_windows = &.{.{ .ordinal = 0, .sub_index = output_types.Target.Window.all_sub_windows }};
+    var page_audio = audio_runner;
+    page_audio.request.max_chunks = 64;
+    try std.testing.expect(!try page_audio.pageNeedsAudio(try page_audio.videoCursor(second)));
+    try std.testing.expect(try page_audio.pageNeedsAudio(try page_audio.videoCursor(2 * second)));
     pictures[1].pts = second;
     var token: [85]u8 = undefined;
     request.continuation = page.summary.identity.cursor(page.summary.next_ordinal, &token);

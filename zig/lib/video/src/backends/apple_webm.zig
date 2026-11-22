@@ -45,6 +45,7 @@ pub const Sink = struct {
     context: *anyopaque,
     /// Called after native initialization succeeds, before submitting any packet.
     before_decode: ?*const fn (*anyopaque) void = null,
+    submitted_packets: ?*usize = null,
     accept: *const fn (*anyopaque, usize, *const apple.Surface, pictures.Picture) anyerror!void,
 };
 pub const Configuration = struct { bytes: [12]u8 = @splat(0), len: usize, format: apple.Format };
@@ -378,6 +379,7 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
             payload = combined.?;
         };
         // SourceFrameRefCon identifies packets; logical IDs come from the index.
+        if (sink.submitted_packets) |submitted| submitted.* += 1;
         try session.submit(payload, packet_id, packet.pts, packet.duration_ns, 1_000_000_000);
         try capture.flush(sink);
     }

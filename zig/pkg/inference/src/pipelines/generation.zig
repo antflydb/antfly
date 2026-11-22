@@ -302,6 +302,19 @@ pub fn nativeGenerationMediaAdmissionControlled(
     projector_file: ?*const @import("../gguf/format.zig").File,
     control: InferenceExecutionControl,
 ) !NativeGenerationMediaAdmission {
+    return nativeGenerationMediaAdmissionWithInspection(allocator, model_dir, messages, config, backend, projector_file, control, null);
+}
+
+pub fn nativeGenerationMediaAdmissionWithInspection(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    messages: []const Message,
+    config: gpt_mod.Config,
+    backend: qwen3vl_projector.AdmissionBackend,
+    projector_file: ?*const @import("../gguf/format.zig").File,
+    control: InferenceExecutionControl,
+    inspection: ?*@import("embedding_gemma2_video.zig").InspectionScope,
+) !NativeGenerationMediaAdmission {
     try control.check();
     if (config.family == .qwen3_vl or config.hasQwen35VisionArchitectureContract()) {
         const images = try collectImagesInPromptOrder(allocator, messages);
@@ -339,7 +352,7 @@ pub fn nativeGenerationMediaAdmissionControlled(
     for (messages) |message| if (message.video_bytes) |bytes| {
         // Malformed inputs retain the decoder's detailed diagnostic. The
         // scheduling estimate is permitted to be conservative in that case.
-        admission.token_allowance +|= gemma4_video.promptAllowance(allocator, bytes, control) catch |err| switch (err) {
+        admission.token_allowance +|= gemma4_video.promptAllowance(allocator, bytes, control, inspection) catch |err| switch (err) {
             error.OutOfMemory, error.VideoInputTooLarge, error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded => return err,
             else => gemma4_video.token_allowance,
         };
@@ -2701,6 +2714,8 @@ pub const NativeGenerationPipeline = struct {
     /// Borrowed invocation budget; portable video scratch is additional to the
     /// generation estimate and must also respect offline CLI memory limits.
     media_run_budget: ?*runtime.tier.memory.RunBudget = null,
+    transport_inspection: ?*@import("embedding_gemma2_video.zig").InspectionScope = null,
+    executor_prompt_limit: ?usize = null,
     /// Borrowed process credit for media preparation, held until generate returns.
     media_prepaid: @import("preprocessing_memory.zig").Credit = .{},
     /// An operator's scratch cap. Zero leaves the automatic cap free to grow.
@@ -3508,7 +3523,7 @@ pub const NativeGenerationPipeline = struct {
                         null;
                     defer if (request_projector) |store| store.close();
                     const projector = self.projector_store orelse request_projector.?;
-                    var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, .{ .session = self.session, .run_budget = self.media_run_budget, .explicit_scratch_limit = self.explicit_scratch_limit }, allocator, projector, bytes) else null;
+                    var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, .{ .session = self.session, .run_budget = self.media_run_budget, .explicit_scratch_limit = self.explicit_scratch_limit, .transport_inspection = self.transport_inspection }, allocator, projector, bytes) else null;
                     defer if (projected_video) |*video| video.deinit();
                     var projected_images = if (self.usesPjrtSession() and images.len != 0) gemma4_projector.PromptImageInput{ .backend = &self.cb, .allocator = allocator, .projector = projector, .images = images, .data = .{ .host = try @import("../execution/media_projection.zig").companionImages(self.session.?, allocator, images, self.execution_control) } } else try gemma4_projector.PromptImageInput.begin(&self.cb, allocator, projector, images);
                     defer projected_images.deinit();
@@ -3698,6 +3713,10 @@ pub const NativeGenerationPipeline = struct {
             requested_max_tokens,
             speculative_bonus_tokens,
         );
+
+        if (self.executor_prompt_limit) |limit| {
+            if (prompt_token_count > limit) return error.InferenceInputTokensExceeded;
+        }
 
         // Build token sequence. Add slack only when speculative decoding is
         // active; the bonus token can write one position past max_tokens.

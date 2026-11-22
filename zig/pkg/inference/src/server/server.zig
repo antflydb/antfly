@@ -6351,6 +6351,7 @@ pub const Node = struct {
         enable_thinking: ?bool,
         has_grammar: bool,
         control: InferenceExecutionControl,
+        inspection: ?*@import("../pipelines/embedding_gemma2_video.zig").InspectionScope,
     ) !NativePromptTokenCount {
         var prompt = if (model.chat_tmpl) |ct|
             try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = enable_thinking })
@@ -6364,7 +6365,7 @@ pub const Node = struct {
         }
 
         const audio_projector = if (generation.messagesHaveAudio(messages)) try model.ensureProjectorStore() else null;
-        const media_admission = try generation.nativeGenerationMediaAdmissionControlled(
+        const media_admission = try generation.nativeGenerationMediaAdmissionWithInspection(
             allocator,
             model_dir,
             messages,
@@ -6372,6 +6373,7 @@ pub const Node = struct {
             if (model.session.backend() == .cuda) .cuda else .generic,
             if (audio_projector) |store| &store.gguf.parsed else null,
             control,
+            inspection,
         );
         const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
@@ -6485,7 +6487,7 @@ pub const Node = struct {
         defer preparation.deinit();
         var binding = try bindPreparationModelResidency(&preparation, model);
         defer if (binding) |*held| held.deinit();
-        return countPromptTokens(preparation.allocator(), model_dir, model, cfg, messages, max_tokens, false, false, control) catch |err|
+        return countPromptTokens(preparation.allocator(), model_dir, model, cfg, messages, max_tokens, false, false, control, null) catch |err|
             if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
     }
 
@@ -6686,13 +6688,15 @@ pub const Node = struct {
         };
         const budget_limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, self.defaultGenerationLimits(budget_backend_class), self.config.generation_budget_overrides.limits());
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const prompt_estimate = countPromptTokens(preparation_allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null, execution_control) catch |err|
+        var transport_inspection = @import("../pipelines/gemma4_video.zig").transportInspection(preparation_allocator);
+        defer transport_inspection.deinit();
+        const prompt_estimate = countPromptTokens(preparation_allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null, execution_control, &transport_inspection) catch |err|
             return if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
         const prompt_tokens = prompt_estimate.token_count;
         try validateGenerateExecutorInvocation(executor_contract, .{
             .item_count = 1,
             .text_bytes_per_item = preflight.text_bytes,
-            .input_tokens_per_item = prompt_tokens,
+            .input_tokens_per_item = if (preflight.video_count != 0) 0 else prompt_tokens,
             .output_tokens_per_item = @intCast(max_tokens),
             .encoded_media_bytes = encoded_media_bytes,
             .decoded_pixels = decoded_pixels,
@@ -6917,6 +6921,8 @@ pub const Node = struct {
             .cb = cb,
             .session = model.session,
             .media_run_budget = &run_budget,
+            .transport_inspection = &transport_inspection,
+            .executor_prompt_limit = executor_contract.batch.max_input_tokens_per_item,
             .media_prepaid = .{ .process_bytes = prompt_estimate.media_admission.host_scratch_bytes, .budget_bytes = media_budget_credit.bytes },
             .explicit_scratch_limit = self.config.generation_budget_overrides.scratch_limit_bytes,
             .gpt_config = gpt_config,
@@ -51402,7 +51408,7 @@ const MediaOutputExecution = struct {
             try self.control.check();
             const resolved = &self.resolved[index];
             const base = outputs.Result{ .name = target.name, .kind = target.kind, .required = target.required, .model = target.model, .model_identity = if (resolved.path.len != 0) &resolved.identity else "", .model_revision = if (resolved.path.len != 0) &resolved.revision else "", .recipe_id = &resolved.recipe_id, .speaker_model_revision = if (resolved.speaker_path != null) &resolved.speaker_revision else null, .status = .complete, .start_ns = descriptor.coordinates.start_ns, .end_ns = descriptor.coordinates.end_ns };
-            if (!target.execute) {
+            if (target.skipsOrdinalWithMask(self.mask(index), descriptor.ordinal)) {
                 var value = base;
                 value.status = .skipped;
                 try results.append(a, value);
@@ -57306,7 +57312,7 @@ test "reader direct prompt preparation includes metadata and pinned model in rej
         const content = try a.alloc(u8, 16 * 1024);
         defer a.free(content);
         @memset(content, 'x');
-        try std.testing.expectError(error.OutOfMemory, Node.countPromptTokens(preparation.allocator(), "unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1, false, false, .{}));
+        try std.testing.expectError(error.OutOfMemory, Node.countPromptTokens(preparation.allocator(), "unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1, false, false, .{}, null));
         try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admission_error.?);
     }
 }

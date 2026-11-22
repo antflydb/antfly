@@ -257,6 +257,7 @@ pub const ChunkPage = struct {
         coded_window_budget_exceeded,
         empty_video_window,
         dependency_window_budget_exceeded,
+        malformed_video_packet,
 
         pub fn fromCode(code: []const u8) ?Terminal {
             inline for (std.meta.tags(Terminal)) |reason| {
@@ -270,6 +271,7 @@ pub const ChunkPage = struct {
                 error.ChunkCodedWindowBudgetExceeded => .coded_window_budget_exceeded,
                 error.ChunkDependencyBudgetExceeded => .dependency_window_budget_exceeded,
                 error.EmptyVideoWindow => .empty_video_window,
+                error.MalformedVideoPacket => .malformed_video_packet,
                 else => null,
             };
         }
@@ -279,6 +281,7 @@ pub const ChunkPage = struct {
                 .coded_window_budget_exceeded => error.ChunkCodedWindowBudgetExceeded,
                 .empty_video_window => error.EmptyVideoWindow,
                 .dependency_window_budget_exceeded => error.ChunkDependencyBudgetExceeded,
+                .malformed_video_packet => error.MalformedVideoPacket,
             };
         }
     };
