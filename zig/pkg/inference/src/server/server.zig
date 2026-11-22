@@ -38341,13 +38341,23 @@ test "audio read registerAiRoutesOn excludes Traditional ML predictor routes" {
     try std.testing.expect(!server.hasRoute(.get, ai_api_prefix ++ "/predictors"));
 }
 
-test "root operational routes stay outside inference API prefix" {
+test "inference listener publishes both API namespaces and root operational routes" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
-    try node.registerRootOperationalRoutes(&server);
+    try node.registerHttpRoutes(&server);
+
+    inline for (.{ ai_api_prefix, public_api_prefix }) |prefix| {
+        inline for (.{ "/chat/completions", "/chunk", "/decisions", "/dictate", "/embed", "/embeddings", "/extract", "/generate", "/read", "/rerank", "/transcription/sessions" }) |suffix| {
+            try std.testing.expect(server.hasRoute(.post, prefix ++ suffix));
+        }
+    }
+    try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/predict"));
 
     try std.testing.expect(server.hasRoute(.get, "/healthz"));
     try std.testing.expect(server.hasRoute(.get, "/readyz"));
