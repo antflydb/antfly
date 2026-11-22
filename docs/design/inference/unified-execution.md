@@ -696,12 +696,14 @@ preparation API do not by themselves complete these remaining requirements:
   imports the activation into its assigned bank or verifies the exact resident
   input. The packed multirow variant attests the live pack and uses its planned
   split workspace. The retained weight pack keeps independent cache admission.
+  Attested primitive frames skip compatibility output banks and promotion caches.
   Mixed scopes and entries without an attested region keep conservative admission.
 - CUDA prepared projections describe eligible BF16-rounded output separately
   from F32 publication, activation conversion and vendor workspace. Cold
   preparation loads the original widening program; dispatch retains the
-  original GEMM and widening order. This ordinary-only route preserves the
-  existing capture restriction and declines separate mutable mirror planes.
+  original GEMM and widening order. Capture uses assigned activation staging,
+  rounded output and vendor workspace. A rounded projection with a separate
+  activation mirror uses ordinary execution.
   A witnessed RMSNorm BF16 auxiliary can supply activation rows without another
   conversion. Allocator alignment is explicit metadata; SDK binding rechecks
   the actual primary and auxiliary leases against the current frame. External
