@@ -115,6 +115,7 @@ pub const ReadAhead = struct {
     charged_bytes: u64 = 0,
     reads: usize = 0,
     hits: usize = 0,
+    dense_sparse: bool = false,
     pub fn range(self: *ReadAhead) source.Range {
         return .{ .context = self, .read_at = readAt, .sparse_read_at = readSparseAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
     }
@@ -126,12 +127,26 @@ pub const ReadAhead = struct {
     }
     pub fn readAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
+        self.dense_sparse = false;
         return self.readWindow(offset, out, control, self.window_bytes);
     }
     fn readSparseAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
-        // Coalesce adjacent EBML headers without pulling whole video blocks.
-        return self.readWindow(offset, out, control, @min(self.window_bytes, @max(256, out.len)));
+        const requests_left = self.max_reads -| self.reads;
+        const bytes_left = self.max_bytes -| self.charged_bytes;
+        const stride = if (offset >= self.start) offset - self.start else 0;
+        const source_left = self.upstream.length -| offset;
+        // Sparse reads trade transfer for requests. When the observed stride
+        // cannot reach the end on the remaining requests, spend the available
+        // bytes more evenly on contiguous ranges. Backward seeks stay sparse.
+        if (offset < self.start) self.dense_sparse = false;
+        if (stride != 0 and source_left / stride >= requests_left) self.dense_sparse = true;
+        const dense = if (self.dense_sparse and requests_left != 0)
+            bytes_left / requests_left + @intFromBool(bytes_left % requests_left != 0)
+        else
+            0;
+        const fill = @min(self.window_bytes, @max(256, out.len, dense));
+        return self.readWindow(offset, out, control, @intCast(fill));
     }
     fn readWindow(self: *ReadAhead, offset: u64, out: []u8, control: source.Control, fill_bytes: usize) !usize {
         try control.check();
@@ -288,6 +303,27 @@ test "range budgets bound fetched bytes independently of large object length" {
     try std.testing.expectError(error.RemoteReadBudgetExceeded, ReadAhead.readAt(&cache, 2000, &out, .{}));
     cache.max_bytes = 100;
     try std.testing.expectError(error.RemoteRequestBudgetExceeded, ReadAhead.readAt(&cache, 2000, &out, .{}));
+}
+
+test "sparse forward scans coalesce before exhausting requests" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            for (out, 0..) |*byte, index| byte.* = @truncate(offset + index);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var cache = ReadAhead{ .allocator = std.testing.allocator, .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 8192 }, .window_bytes = 4096, .max_bytes = 8192, .max_reads = 4 };
+    defer cache.deinit();
+    var input = source.Source{ .allocator = std.testing.allocator, .identity = "sparse", .storage = .{ .range = cache.range() } };
+    var offset: u64 = 0;
+    while (offset + 4 <= input.length()) : (offset += 300) {
+        var lease = try input.readSparse(offset, 4);
+        defer lease.deinit();
+        try std.testing.expectEqual(@as(u8, @truncate(offset)), lease.bytes[0]);
+    }
+    try std.testing.expectEqual(@as(usize, 4), cache.reads);
+    try std.testing.expect(cache.transferred_bytes <= 8192);
 }
 
 test "immutable snapshot bindings separate object version kind and length through read ahead" {

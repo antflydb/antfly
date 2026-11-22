@@ -331,11 +331,9 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
             if (g.width == 0 or g.height == 0 or @as(u64, g.width) * g.height > options.decoder.max_pixels) return error.ResourceLimitExceeded;
             if (tag & 16 != 0 and !packet.invisible) try appendHeader(collector, packet, packet_id, g);
         } else if (av1) |session| {
-            var lease = try reader.readPacket(packet_id);
-            defer lease.deinit();
             const sequence_before = sequence;
             var publish = Av1Publish{ .collector = collector, .packet = packet, .packet_id = packet_id };
-            try session.walk(lease.bytes, &publish, Av1Publish.accept);
+            try session.walkRange(reader.input, packet.offset, packet.size, &publish, Av1Publish.accept);
             if (session.packet_sequence) |span| sequence = .{ .packet = packet_id, .offset = span.offset, .size = span.size };
             if (session.packet_restart_key) {
                 try collector.restart(.{ .packet = packet_id, .logical = logical_before, .sequence = if (session.packet_restart_needs_sequence) sequence_before else null });
@@ -793,6 +791,54 @@ test "WebM header indexes match fully reconstructed logical timelines" {
     }
 }
 
+test "WebM AV1 range header walking skips padded packet payload" {
+    const a = std.testing.allocator;
+    const fixture = @embedFile("../testdata/vpx-av1/av1.webm");
+    var original = media.source.Source{ .allocator = a, .storage = .{ .borrowed = fixture }, .identity = "av1" };
+    var reader = try media.webm.Reader.init(a, &original, .{});
+    defer reader.deinit();
+    var first = try reader.readPacket(0);
+    defer first.deinit();
+    const Av1 = @import("codecs/av1_headers.zig");
+    const Capture = struct {
+        count: usize = 0,
+        fn accept(raw: *anyopaque, _: @import("codecs/vp9_header.zig").Geometry) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    const Padded = struct {
+        packet: []const u8,
+        const header = [_]u8{ 0x7a, 0x80, 0x80, 0x40 };
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: media.source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (out, 0..) |*byte, delta| {
+                const pos = offset + delta;
+                byte.* = if (pos < self.packet.len) self.packet[@intCast(pos)] else if (pos - self.packet.len < header.len) header[@intCast(pos - self.packet.len)] else 0;
+            }
+            return out.len;
+        }
+    };
+    var padded = Padded{ .packet = first.bytes };
+    const length = first.bytes.len + Padded.header.len + 1024 * 1024;
+    var ahead = media.remote.ReadAhead{ .allocator = a, .upstream = .{ .context = &padded, .read_at = Padded.read, .length = length }, .max_bytes = 32 * 1024 };
+    defer ahead.deinit();
+    var source = media.source.Source{ .allocator = a, .storage = .{ .range = ahead.range() }, .identity = "padded-av1" };
+    const buffered = try Av1.Session.create(a, .{ .max_pixels = 16_384 * 16_384 });
+    defer buffered.deinit();
+    const ranged = try Av1.Session.create(a, .{ .max_pixels = 16_384 * 16_384 });
+    defer ranged.deinit();
+    try buffered.configuration(reader.track.codec_private);
+    try ranged.configuration(reader.track.codec_private);
+    var expected = Capture{};
+    var actual = Capture{};
+    try buffered.walk(first.bytes, &expected, Capture.accept);
+    try ranged.walkRange(&source, 0, length, &actual, Capture.accept);
+    try std.testing.expectEqual(expected.count, actual.count);
+    try std.testing.expect(ahead.transferred_bytes < 32 * 1024);
+    try std.testing.expectEqual(buffered.packet_sequence, ranged.packet_sequence);
+}
+
 test "WebM header metadata admission outlives indexing and allocation failures reclaim it" {
     const Campaign = struct {
         fn run(a: std.mem.Allocator) !void {
@@ -803,7 +849,7 @@ test "WebM header metadata admission outlives indexing and allocation failures r
             defer reader.deinit();
             var headers = try index(a, &reader, .{ .decoder = .{ .admission_pool = &pool } });
             defer headers.deinit();
-            try std.testing.expectEqual(@as(u64, headers.pictures.len * @sizeOf(Picture) + headers.restarts.len * @sizeOf(Restart)), pool.snapshot().host_bytes);
+            try std.testing.expectEqual(@as(u64, headers.pictures.len * @sizeOf(Picture) + headers.restarts.len * @sizeOf(Restart) + std.mem.sliceAsBytes(headers.packet_byte_prefix).len), pool.snapshot().host_bytes);
         }
     };
     // Refuse backing remaps so every campaign enumerates the same allocations.
@@ -1395,12 +1441,12 @@ test "WebM continuation retains VP8 VP9 AV1 references and preserves replay outp
         }
         try std.testing.expect(retained.reused_windows > 0);
         try std.testing.expect(retained.packets_decoded < replay_packets);
-        // A backward request replays separately and leaves forward state intact.
+        // The budgeted clip rewinds its single reference bank on a backward request.
         const next_packet = retained.packet;
         var backwards = Capture{};
         try retained.walk(indexed, .{}, &.{0}, &backwards, Capture.accept);
         try std.testing.expectEqual(@as(usize, 1), backwards.count);
-        try std.testing.expectEqual(next_packet, retained.packet);
+        try std.testing.expect(retained.packet < next_packet);
         // A consumer failure must not leave a partially advanced owner reusable.
         if (count < indexed.pictures.len) {
             var failed = Capture{ .fail = true };

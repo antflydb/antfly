@@ -22,6 +22,8 @@ const memory = @import("../runtime/tier/memory.zig");
 const admitted = @import("../backends/admitted_allocator.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 pub const Admission = struct { context: *anyopaque, acquire: *const fn (*anyopaque, usize) anyerror!memory.AdmissionLease };
+// A declaration beyond this envelope would defeat bounded remote seeking.
+pub const max_webm_preroll_ns = 2 * std.time.ns_per_s;
 pub const max_checkpoints = 64;
 threadlocal var active_lane: u1 = 0;
 pub const Lane = struct {

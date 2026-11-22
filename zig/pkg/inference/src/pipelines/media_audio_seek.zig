@@ -88,8 +88,10 @@ pub const Index = union(enum) {
             .max_packet_bytes = read_limit,
         }) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
         defer directory.deinit();
-        if (directory.track.codec == .flac) return .{ .webm_flac = try WebmFlac.init(a, scratch, directory, source, max_frames, admission, max_bytes - bounded.live) };
-        const Progressive = @import("media_opus_seek.zig").Index;
+        if (directory.track.codec == .flac) return .{ .webm_flac = try WebmFlac.init(a, scratch, directory, source, max_bytes - bounded.live) };
+        const OpusSeek = @import("media_opus_seek.zig");
+        if (directory.track.codec == .opus and directory.track.seek_pre_roll_ns > OpusSeek.max_webm_preroll_ns) return error.UnsupportedStreamingAudioProfile;
+        const Progressive = OpusSeek.Index;
         const Webm = audio.webm.WindowIndexFor(Progressive);
         const temporary = Webm.directoryScratchBytes(directory);
         if (temporary >= max_bytes - bounded.live) return error.AudioTooLarge;
@@ -136,69 +138,61 @@ pub const Index = union(enum) {
             .opus => 48000,
             .vorbis => |index| index.demuxed.headers.identification.sample_rate,
             .webm => |index| index.sample_rate,
-            .webm_flac => |index| index.flac.rate(),
+            .webm_flac => |index| index.info.sample_rate,
         };
     }
 };
-/// A native FLAC byte stream assembled logically from CodecPrivate and
-/// packet extents. Only the current request is bound to the underlying source.
+/// Each FLAC Block starts on a native frame boundary. Retain its sample
+/// coordinate so a cold seek can decode independent frames in that block.
 const WebmFlac = struct {
-    const Flac = @import("media_flac_seek.zig").Index;
-    const Extent = struct { logical: u64, physical: u64, size: usize };
+    const Extent = struct { packet: media.webm_audio.Packet, first: usize };
     allocator: std.mem.Allocator,
-    private: []u8,
+    info: audio.flac.StreamInfo,
     extents: []Extent,
-    length: u64,
     leading: usize,
     sample_count: usize,
-    flac: Flac,
 
-    fn init(a: std.mem.Allocator, scratch: std.mem.Allocator, directory: media.webm_audio.Directory, input: *media.source.Source, max_frames: usize, admission: ?Index.Admission, remaining: usize) !WebmFlac {
-        if (directory.track.codec_private.len +| directory.packets.len *| @sizeOf(Extent) > remaining) return error.AudioTooLarge;
-        const private = try a.dupe(u8, directory.track.codec_private);
-        errdefer a.free(private);
+    fn init(a: std.mem.Allocator, scratch: std.mem.Allocator, directory: media.webm_audio.Directory, input: *media.source.Source, remaining: usize) !WebmFlac {
+        if (directory.packets.len *| @sizeOf(Extent) > remaining) return error.AudioTooLarge;
+        const parsed = try audio.flac.parseStream(directory.track.codec_private);
+        if (parsed.data_offset != directory.track.codec_private.len) return error.UnsupportedAudioFormat;
+        var info = parsed.stream_info;
         const extents = try a.alloc(Extent, directory.packets.len);
         errdefer a.free(extents);
-        var length: u64 = private.len;
-        for (extents, directory.packets) |*extent, packet| {
-            extent.* = .{ .logical = length, .physical = packet.offset, .size = packet.size };
-            length = try std.math.add(u64, length, packet.size);
+        var origin: u64 = 0;
+        for (extents, directory.packets, 0..) |*extent, packet, index| {
+            try input.checkControl();
+            const sample = try audio.flac.frameStart(info, packet.prefix[0..@min(packet.prefix.len, packet.size)]);
+            if (index == 0) origin = sample;
+            const start = std.math.cast(usize, std.math.sub(u64, sample, origin) catch return error.UnsupportedAudioFormat) orelse return error.ResourceLimitExceeded;
+            if (index != 0 and start <= extents[index - 1].first) return error.UnsupportedAudioFormat;
+            extent.* = .{ .packet = packet, .first = start };
         }
-        var map = Mapping{ .input = input, .private = private, .extents = extents };
-        var source = map.source(a, length);
-        var parsed = try audio.flac.parseStream(private);
-        if (parsed.data_offset != private.len) return error.UnsupportedAudioFormat;
-        if (parsed.stream_info.total_samples == 0) {
-            const packets = media.webm_audio.PacketSource{ .source = input, .packets = directory.packets };
-            // FLAC frame numbers provide the duration even when STREAMINFO
-            // omits it. Only the last block can contain an unknown tail.
-            const first_packet = directory.packets[0];
-            var prefix = try input.read(first_packet.offset, @min(16, first_packet.size));
-            defer prefix.deinit();
-            const first = try audio.flac.frameStart(parsed.stream_info, prefix.bytes);
-            var tail = try packets.read(directory.packets.len - 1);
-            defer tail.deinit();
-            var end = try audio.flac.frameStart(parsed.stream_info, tail.bytes);
+        if (info.total_samples == 0) {
+            // The final Block can contain several independent native frames.
+            // Decode only that Block to measure its exact trailing extent.
+            const tail = extents[extents.len - 1];
+            var lease = try input.readSparse(tail.packet.offset, tail.packet.size);
+            defer lease.deinit();
             var at: usize = 0;
-            while (at < tail.bytes.len) {
+            var end: u64 = tail.first;
+            while (at < lease.bytes.len) {
                 try input.control.check();
-                var frame = try audio.flac.decodeFrameAlloc(scratch, parsed.stream_info, tail.bytes[at..]);
+                var frame = try audio.flac.decodeFrameAlloc(scratch, info, lease.bytes[at..]);
                 defer frame.deinit();
                 at += frame.consumed;
                 end = try std.math.add(u64, end, frame.frame_samples);
             }
-            if (end <= first) return error.UnsupportedAudioFormat;
-            parsed.stream_info.total_samples = end - first;
+            info.total_samples = end;
         }
-        var flac = try Flac.initParsed(parsed, std.math.cast(usize, source.length()) orelse return error.ResourceLimitExceeded, max_frames, admission);
-        errdefer flac.deinit();
-        const rate = flac.rate();
+        if (info.total_samples <= extents[extents.len - 1].first) return error.UnsupportedAudioFormat;
+        const rate = info.sample_rate;
         const offset = frames(directory.packets[0].time_ns, rate) -| frames(directory.track.codec_delay_ns, rate);
         const leading = if (offset > @max(1, rate / 1000)) offset else 0;
         if (leading > @as(usize, rate) * 3600) return error.UnsupportedAudioFormat;
-        const count = try std.math.add(usize, flac.samples(), leading);
+        const count = try std.math.add(usize, std.math.cast(usize, info.total_samples) orelse return error.ResourceLimitExceeded, leading);
         const trim = if (directory.discard_padding_ns > 0) frames(@intCast(directory.discard_padding_ns), rate) else 0;
-        return .{ .allocator = a, .private = private, .extents = extents, .length = length, .leading = leading, .sample_count = if (trim < count) count - trim else count, .flac = flac };
+        return .{ .allocator = a, .info = info, .extents = extents, .leading = leading, .sample_count = if (trim < count) count - trim else count };
     }
 
     fn frames(ns: u64, rate: u32) usize {
@@ -206,17 +200,14 @@ const WebmFlac = struct {
     }
 
     fn copy(self: WebmFlac, a: std.mem.Allocator) !WebmFlac {
-        const private = try a.dupe(u8, self.private);
-        errdefer a.free(private);
-        const extents = try a.dupe(Extent, self.extents);
-        errdefer a.free(extents);
-        return .{ .allocator = a, .private = private, .extents = extents, .length = self.length, .leading = self.leading, .sample_count = self.sample_count, .flac = try self.flac.copy(a) };
+        var result = self;
+        result.allocator = a;
+        result.extents = try a.dupe(Extent, self.extents);
+        return result;
     }
 
     fn deinit(self: *WebmFlac) void {
-        self.flac.deinit();
         self.allocator.free(self.extents);
-        self.allocator.free(self.private);
     }
 
     fn samples(self: WebmFlac) usize {
@@ -224,57 +215,51 @@ const WebmFlac = struct {
     }
 
     fn estimatedBytes(self: WebmFlac) usize {
-        return self.private.len +| std.mem.sliceAsBytes(self.extents).len +| self.flac.estimatedBytes();
+        return std.mem.sliceAsBytes(self.extents).len;
     }
 
     fn read(self: WebmFlac, a: std.mem.Allocator, first: usize, last: usize, out: []f32, input: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl) !void {
         const silence = @min(last, self.leading) -| first;
         @memset(out[0..silence], 0);
         if (silence == out.len) return;
-        var map = Mapping{ .input = input, .private = self.private, .extents = self.extents };
-        var source = map.source(a, self.length);
-        try self.flac.read(a, first -| self.leading, last - self.leading, out[silence..], &source, &.{}, control);
-    }
-
-    const Mapping = struct {
-        input: *media.source.Source,
-        private: []const u8,
-        extents: []const Extent,
-
-        fn source(self: *Mapping, a: std.mem.Allocator, length: u64) media.source.Source {
-            return .{
-                .allocator = a,
-                .identity = self.input.identity,
-                .storage = .{ .range = .{ .context = self, .length = length, .read_at = readAt } },
-                .limits = .{ .max_total_bytes = std.math.maxInt(u64), .max_reads = std.math.maxInt(usize) },
-            };
+        const begin = first -| self.leading;
+        const end = last - self.leading;
+        var low: usize = 0;
+        var high = self.extents.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.extents[middle].first <= begin) low = middle + 1 else high = middle;
         }
-
-        fn readAt(raw: *anyopaque, offset: u64, out: []u8, control: media.source.Control) !usize {
-            const self: *Mapping = @ptrCast(@alignCast(raw));
-            if (offset < self.private.len) {
-                const available = self.private[@intCast(offset)..];
-                const count = @min(out.len, available.len);
-                @memcpy(out[0..count], available[0..count]);
-                return count;
-            }
-            var low: usize = 0;
-            var high = self.extents.len;
-            while (low < high) {
-                const mid = low + (high - low) / 2;
-                if (self.extents[mid].logical + self.extents[mid].size <= offset) low = mid + 1 else high = mid;
-            }
-            if (low == self.extents.len) return 0;
-            const extent = self.extents[low];
-            const begin: usize = @intCast(offset - extent.logical);
-            const size = @min(out.len, extent.size - begin, self.input.limits.max_read_bytes, self.input.limits.max_retained_bytes);
-            if (size == 0) return error.ResourceLimitExceeded;
-            var lease = try self.input.readSparseControlled(extent.physical + begin, size, control);
+        var copied = silence;
+        var index = low -| 1;
+        const work = control.imageWorkControl();
+        while (index < self.extents.len and self.extents[index].first < end) : (index += 1) {
+            const extent = self.extents[index];
+            const stop = if (index + 1 < self.extents.len) self.extents[index + 1].first else @as(usize, @intCast(self.info.total_samples));
+            var lease = try input.readSparseControlled(extent.packet.offset, extent.packet.size, .{ .context = work.context, .check_fn = work.check_fn });
             defer lease.deinit();
-            @memcpy(out[0..size], lease.bytes);
-            return size;
+            var at: usize = 0;
+            var position = extent.first;
+            while (at < lease.bytes.len) {
+                try control.check();
+                var frame = try audio.flac.decodeFrameAlloc(a, self.info, lease.bytes[at..]);
+                defer frame.deinit();
+                const next = try std.math.add(usize, position, frame.frame_samples);
+                if (next > stop) return error.UnsupportedAudioFormat;
+                const from = @min(frame.frame_samples, begin -| position);
+                const to = @min(frame.frame_samples, end -| position);
+                for (from..to) |sample| {
+                    if (copied == out.len) return error.UnsupportedAudioFormat;
+                    out[copied] = mono(frame.samples[sample * frame.channels ..][0..frame.channels]);
+                    copied += 1;
+                }
+                position = next;
+                at += frame.consumed;
+            }
+            if (position != stop) return error.UnsupportedAudioFormat;
         }
-    };
+        if (copied != out.len) return error.IncompleteAudioStream;
+    }
 };
 
 pub const Reader = struct {
@@ -623,6 +608,11 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
     var repeated = try late_provider.read(late_provider.context, a, start, end);
     defer repeated.deinit(a);
     try std.testing.expectEqualSlices(f32, late.pcm.samples, repeated.pcm.samples);
+
+    const over_limit = try audio.webm.buildOpusTestFileWithPrerollAlloc(a, ogg.packets[0].bytes, packets, 3 * std.time.ns_per_s);
+    defer a.free(over_limit);
+    var declared = media.source.Source{ .allocator = a, .identity = "opus-declared-preroll", .storage = .{ .borrowed = over_limit } };
+    try std.testing.expectError(error.UnsupportedStreamingAudioProfile, Index.initWebmSource(a, &declared, 1024, 64 * 1024, null));
 }
 
 test "model aware media range WebM audio preserves FLAC clocks with absent stream totals" {
@@ -641,9 +631,13 @@ test "model aware media range WebM audio preserves FLAC clocks with absent strea
         try std.testing.expectEqual(expected.samples.len, index.samples());
         var reader = Reader{ .index = &index, .source = &source };
         const provider = reader.provider();
-        var actual = try provider.read(provider.context, a, 512, 2048);
+        const end = provider.samples;
+        const first = end - 512;
+        const before = source.total_bytes;
+        var actual = try provider.read(provider.context, a, first, end);
         defer actual.deinit(a);
-        try std.testing.expectEqualSlices(f32, expected.samples[512..2048], actual.pcm.samples);
+        try std.testing.expectEqualSlices(f32, expected.samples[first..end], actual.pcm.samples);
+        try std.testing.expect(source.total_bytes - before < encoded.len / 2);
         try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
     }
 }

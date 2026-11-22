@@ -696,7 +696,7 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
             const times = try scratch.alloc(u64, packets.len);
             defer scratch.free(times);
             for (packets, units, times) |*packet, *unit, *time| {
-                unit.* = packet.prefix[0..@min(packet.prefix.len, packet.size)];
+                unit.* = packet.prefix[0..@min(2, packet.size)];
                 time.* = packet.time_ns;
             }
             var index = try initDemuxed(a, scratch, .{
@@ -999,6 +999,10 @@ fn expectStreaming(a: std.mem.Allocator, bytes: []const u8, expected: DecodedInt
 /// can exercise the public `decode`/`decodeInterleaved` entry points against
 /// a real WebM byte stream without duplicating the EBML muxer here.
 pub fn buildOpusTestFileAlloc(allocator: std.mem.Allocator, opus_head: []const u8, packets: []const []const u8) ![]u8 {
+    return buildOpusTestFileWithPrerollAlloc(allocator, opus_head, packets, null);
+}
+
+pub fn buildOpusTestFileWithPrerollAlloc(allocator: std.mem.Allocator, opus_head: []const u8, packets: []const []const u8, preroll: ?u64) ![]u8 {
     var blocks = std.ArrayList([]u8).empty;
     defer {
         for (blocks.items) |b| allocator.free(b);
@@ -1008,7 +1012,7 @@ pub fn buildOpusTestFileAlloc(allocator: std.mem.Allocator, opus_head: []const u
         try blocks.append(allocator, try buildSimpleBlockNoLacing(allocator, 1, packet));
     }
 
-    const entry = try buildAudioTrackEntry(allocator, 1, "A_OPUS", opus_head, 2, null);
+    const entry = try buildAudioTrackEntryWithPreroll(allocator, 1, "A_OPUS", opus_head, 2, null, preroll);
     defer allocator.free(entry);
     const tracks = try buildTracks(allocator, &.{entry});
     defer allocator.free(tracks);
@@ -1056,6 +1060,10 @@ fn buildAudioTrackEntry(
     channels: u8,
     codec_delay_ns: ?u32,
 ) ![]u8 {
+    return buildAudioTrackEntryWithPreroll(allocator, track_number, codec_id, codec_private, channels, codec_delay_ns, null);
+}
+
+fn buildAudioTrackEntryWithPreroll(allocator: std.mem.Allocator, track_number: u8, codec_id: []const u8, codec_private: []const u8, channels: u8, codec_delay_ns: ?u32, preroll: ?u64) ![]u8 {
     var audio = std.ArrayList(u8).empty;
     defer audio.deinit(allocator);
     var freq_bytes: [8]u8 = undefined;
@@ -1073,6 +1081,11 @@ fn buildAudioTrackEntry(
         var delay_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &delay_bytes, delay, .big);
         try appendLeafElement(&entry, allocator, &.{ 0x56, 0xAA }, &delay_bytes); // CodecDelay
+    }
+    if (preroll) |ns| {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, ns, .big);
+        try appendLeafElement(&entry, allocator, &.{ 0x56, 0xBB }, &bytes);
     }
     try appendLeafElement(&entry, allocator, &.{0xE1}, audio.items); // Audio
 
@@ -1980,13 +1993,26 @@ pub fn buildFlacTestFileAlloc(a: std.mem.Allocator, bytes: []const u8, unknown_t
     defer a.free(private);
     const info = std.mem.readInt(u64, private[18..26], .big);
     if (unknown_total) std.mem.writeInt(u64, private[18..26], info & ~@as(u64, 0x0f_ffff_ffff), .big);
-    const block = try buildSimpleBlockNoLacing(a, 1, bytes[end..]);
-    defer a.free(block);
+    const info_block = try flac.parseStreamInfo(bytes);
+    var blocks: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (blocks.items) |block| a.free(block);
+        blocks.deinit(a);
+    }
+    var offset = end;
+    while (offset < bytes.len) {
+        var frame = try flac.decodeFrameAlloc(a, info_block, bytes[offset..]);
+        defer frame.deinit();
+        const block = try buildSimpleBlockNoLacing(a, 1, bytes[offset..][0..frame.consumed]);
+        errdefer a.free(block);
+        try blocks.append(a, block);
+        offset += frame.consumed;
+    }
     const entry = try buildAudioTrackEntry(a, 1, "A_FLAC", private, 2, null);
     defer a.free(entry);
     const tracks = try buildTracks(a, &.{entry});
     defer a.free(tracks);
-    const cluster = try buildCluster(a, 0, &.{block});
+    const cluster = try buildCluster(a, 0, blocks.items);
     defer a.free(cluster);
     const file = try buildWebmFile(a, tracks, &.{cluster});
     return file;

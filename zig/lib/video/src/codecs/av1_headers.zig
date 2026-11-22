@@ -33,6 +33,15 @@ const Obu = struct {
     payload: []const u8,
 
     fn read(bytes: []const u8, position: *usize) !Obu {
+        const header = try readHeader(bytes, position, bytes.len);
+        var obu = header.obu;
+        obu.payload = bytes[position.*..][0..header.size];
+        position.* += header.size;
+        return obu;
+    }
+
+    fn readHeader(bytes: []const u8, position: *usize, packet_size: usize) !struct { obu: Obu, size: usize } {
+        if (position.* >= bytes.len) return error.InvalidVideoData;
         const tag = bytes[position.*];
         position.* += 1;
         if (tag & 0x81 != 0) return error.InvalidVideoData;
@@ -45,11 +54,29 @@ const Obu = struct {
             obu.temporal = @intCast(extension >> 5);
             obu.spatial = @intCast((extension >> 3) & 3);
         }
-        const size = if (tag & 2 != 0) try leb(bytes, position) else bytes.len - position.*;
-        if (size > bytes.len - position.*) return error.InvalidVideoData;
-        obu.payload = bytes[position.*..][0..size];
-        position.* += size;
-        return obu;
+        const size = if (tag & 2 != 0) try leb(bytes, position) else packet_size - position.*;
+        if (size > packet_size - position.*) return error.InvalidVideoData;
+        return .{ .obu = obu, .size = size };
+    }
+};
+
+const Packet = union(enum) {
+    bytes: []const u8,
+    range: struct { input: *media.source.Source, offset: u64, size: usize },
+
+    fn size(self: Packet) usize {
+        return switch (self) {
+            .bytes => |bytes| bytes.len,
+            .range => |range| range.size,
+        };
+    }
+
+    fn read(self: Packet, offset: usize, length: usize) !media.source.Lease {
+        if (offset > self.size() or length > self.size() - offset) return error.InvalidVideoData;
+        return switch (self) {
+            .bytes => |bytes| .{ .bytes = bytes[offset..][0..length], .source = null },
+            .range => |range| if (length == 0) .{ .bytes = &.{}, .source = null } else try range.input.readSparse(range.offset + offset, length),
+        };
     }
 };
 
@@ -133,6 +160,14 @@ pub const Session = struct {
     /// Outputs complete displayed pictures only, in coded OBU order. Reference
     /// updates happen for hidden pictures too. Owners are invalidated on failure.
     pub fn walk(self: *Session, bytes: []const u8, context: *anyopaque, accept: *const fn (*anyopaque, Geometry) anyerror!void) !void {
+        return self.walkPacket(.{ .bytes = bytes }, context, accept);
+    }
+
+    pub fn walkRange(self: *Session, input: *media.source.Source, offset: u64, size: usize, context: *anyopaque, accept: *const fn (*anyopaque, Geometry) anyerror!void) !void {
+        return self.walkPacket(.{ .range = .{ .input = input, .offset = offset, .size = size } }, context, accept);
+    }
+
+    fn walkPacket(self: *Session, packet: Packet, context: *anyopaque, accept: *const fn (*anyopaque, Geometry) anyerror!void) !void {
         if (self.failed) return error.InvalidDecoderSession;
         const scope = runtime.Scope.enter(&self.owner);
         defer scope.deinit();
@@ -142,14 +177,18 @@ pub const Session = struct {
         self.packet_restart_needs_sequence = false;
         var first_frame = !self.pending;
         var position: usize = 0;
-        while (position < bytes.len) {
+        while (position < packet.size()) {
             const obu_start = position;
             try self.options.control.check();
-            const obu = try Obu.read(bytes, &position);
-            const kind = obu.kind;
-            const temporal = obu.temporal;
-            const spatial = obu.spatial;
-            const payload = obu.payload;
+            var header = try packet.read(position, @min(10, packet.size() - position));
+            defer header.deinit();
+            var header_size: usize = 0;
+            const descriptor = try Obu.readHeader(header.bytes, &header_size, packet.size() - position);
+            const payload_offset = position + header_size;
+            position = payload_offset + descriptor.size;
+            const kind = descriptor.obu.kind;
+            const temporal = descriptor.obu.temporal;
+            const spatial = descriptor.obu.spatial;
             // NVDEC receives every submitted frame header, including hidden
             // references and layers outside the selected operating point.
             if (kind == 3 or kind == 6) {
@@ -160,13 +199,25 @@ pub const Session = struct {
                 const idc = self.context.operating_point_idc;
                 if (idc & (@as(u32, 1) << temporal) == 0 or idc & (@as(u32, 1) << (@as(u5, spatial) + 8)) == 0) continue;
             }
+            const prefix_size = switch (kind) {
+                // Frame and tile OBUs include entropy payload after the
+                // uncompressed header. Tile extents are read independently.
+                6 => if (packet == .range) @min(4096, descriptor.size) else descriptor.size,
+                4 => @min(4, descriptor.size),
+                1, 3, 7 => descriptor.size,
+                else => 0,
+            };
+            if (packet == .range and prefix_size > 64 * 1024) return error.ResourceLimitExceeded;
+            var prefix = try packet.read(payload_offset, prefix_size);
+            defer prefix.deinit();
+            const payload = prefix.bytes;
             switch (kind) {
                 1 => {
                     try self.sequenceHeader(payload);
                     self.packet_sequence = .{ .offset = obu_start, .size = position - obu_start };
                 },
                 2 => {
-                    if (payload.len != 0 or self.pending) return error.InvalidVideoData;
+                    if (descriptor.size != 0 or self.pending) return error.InvalidVideoData;
                 },
                 3, 6 => {
                     if (!self.have_sequence or self.pending or payload.len == 0) return error.InvalidVideoData;
@@ -201,14 +252,14 @@ pub const Session = struct {
                         if (kind == 6) {
                             // Frame OBU appends a tile-group header directly to
                             // the uncompressed header's bitstream, then aligns.
-                            try self.tiles(&bits, context, accept);
+                            try self.tiles(&bits, packet, payload, payload_offset, descriptor.size, context, accept);
                         }
                     }
                 },
                 4 => {
                     if (!self.pending or payload.len == 0) return error.InvalidVideoData;
                     var bits = initBits(payload);
-                    try self.tiles(&bits, context, accept);
+                    try self.tiles(&bits, packet, payload, payload_offset, descriptor.size, context, accept);
                 },
                 7 => {
                     if (!self.pending or payload.len == 0) return error.InvalidVideoData;
@@ -267,7 +318,7 @@ pub const Session = struct {
             self.context.refs[i].p.showable = frame.showable_frame;
         };
     }
-    fn tiles(self: *Session, bits: *grammar.GetBits, context: *anyopaque, accept: *const fn (*anyopaque, Geometry) anyerror!void) !void {
+    fn tiles(self: *Session, bits: *grammar.GetBits, packet: Packet, prefix: []const u8, offset: usize, size: usize, context: *anyopaque, accept: *const fn (*anyopaque, Geometry) anyerror!void) !void {
         const frame = self.current;
         const count = @as(usize, frame.tiling.cols) * frame.tiling.rows;
         if (count == 0 or count > 4096) return error.InvalidVideoData;
@@ -277,20 +328,23 @@ pub const Session = struct {
         const end: usize = if (explicit) grammar.antfly_av1_dav1d_get_bits(bits, n_bits) else count - 1;
         if (bits.@"error" != 0 or start != self.next_tile or start > end or end >= count) return error.InvalidVideoData;
         grammar.dav1d_bytealign_get_bits(bits);
-        var position: usize = 0;
-        const remaining = @intFromPtr(bits.ptr_end) - @intFromPtr(bits.ptr);
-        const bytes = bits.ptr[0..remaining];
+        const first = @intFromPtr(bits.ptr) - @intFromPtr(prefix.ptr);
+        if (first > size) return error.InvalidVideoData;
+        var position = first;
         for (start..end) |_| {
             const size_bytes = frame.tiling.n_bytes;
-            if (size_bytes < 1 or size_bytes > 4 or size_bytes > bytes.len - position) return error.InvalidVideoData;
-            var size: usize = 0;
-            for (0..size_bytes) |i| size |= @as(usize, bytes[position + i]) << @intCast(i * 8);
+            if (size_bytes < 1 or size_bytes > 4 or size_bytes > size - position) return error.InvalidVideoData;
+            var lease = if (position <= prefix.len and size_bytes <= prefix.len - position) null else try packet.read(offset + position, size_bytes);
+            defer if (lease) |*owned| owned.deinit();
+            const bytes = if (lease) |owned| owned.bytes else prefix[position..][0..size_bytes];
+            var tile_size: usize = 0;
+            for (bytes, 0..) |byte, i| tile_size |= @as(usize, byte) << @intCast(i * 8);
             position += size_bytes;
-            size = std.math.add(usize, size, 1) catch return error.ResourceLimitExceeded;
-            if (size > bytes.len - position) return error.InvalidVideoData;
-            position += size;
+            tile_size = std.math.add(usize, tile_size, 1) catch return error.ResourceLimitExceeded;
+            if (tile_size > size - position) return error.InvalidVideoData;
+            position += tile_size;
         }
-        if (position == bytes.len) return error.InvalidVideoData;
+        if (position == size) return error.InvalidVideoData;
         self.next_tile = end + 1;
         if (self.next_tile == count) {
             self.refresh(frame, frame.refresh_frame_flags);
