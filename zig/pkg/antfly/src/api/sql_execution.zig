@@ -2790,7 +2790,8 @@ fn classifyMutationFailure(status: u16, body: []const u8) MutationFailure {
             return .{ .err = error.SqlStatementReadUnavailable };
     }
     if (status == 503) if (parsed.value.code) |code| {
-        if (std.mem.eql(u8, code, "transaction_precommit_read_unavailable") and parsed.value.transaction_id == null and parsed.value.status == null)
+        if ((std.mem.eql(u8, code, "transaction_precommit_read_unavailable") or
+            std.mem.eql(u8, code, "transaction_precommit_aborted")) and parsed.value.transaction_id == null and parsed.value.status == null)
             return .{ .err = error.SqlStatementReadUnavailable };
         if (std.mem.eql(u8, code, "constraint_activation_pending")) return .{ .err = error.SqlWriteCapacityUnavailable, .transaction_id = id };
     };
@@ -4318,6 +4319,7 @@ test "SQL unknown mutation keeps native reconciliation receipt without allocatio
     try std.testing.expectEqual(error.SqlStatementReadUnavailable, classifyMutationFailure(409, "{\"code\":\"integrity_topology_busy\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(409, "{\"code\":\"integrity_topology_busy\",\"status\":\"unknown\"}").err);
     try std.testing.expectEqual(error.SqlStatementReadUnavailable, classifyMutationFailure(503, "{\"code\":\"transaction_precommit_read_unavailable\"}").err);
+    try std.testing.expectEqual(error.SqlStatementReadUnavailable, classifyMutationFailure(503, "{\"code\":\"transaction_precommit_aborted\"}").err);
     inline for (.{
         "{\"code\":\"transaction_precommit_read_unavailable\",\"status\":\"committed_pending\"}",
         "{\"code\":\"transaction_precommit_read_unavailable\",\"transaction_id\":\"0123456789abcdef0123456789abcdef\"}",

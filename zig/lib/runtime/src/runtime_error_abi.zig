@@ -1185,6 +1185,7 @@ pub const Detail = enum(c_int) {
     pg_spool_corrupt,
     invalid_pg_spool,
     query_canceled,
+    transaction_prepare_aborted_unavailable,
 };
 
 pub const Status = extern struct {
@@ -2284,6 +2285,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.PgSpoolCorrupt => status(.corrupt, .pg_spool_corrupt),
         error.InvalidPgSpool => status(.invalid_argument, .invalid_pg_spool),
         error.QueryCanceled => status(.cancelled, .query_canceled),
+        error.TransactionPrepareAbortedUnavailable => status(.retryable, .transaction_prepare_aborted_unavailable),
 
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
@@ -3398,6 +3400,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .pg_spool_corrupt => "PgSpoolCorrupt",
         .invalid_pg_spool => "InvalidPgSpool",
         .query_canceled => "QueryCanceled",
+        .transaction_prepare_aborted_unavailable => "TransactionPrepareAbortedUnavailable",
     };
 }
 

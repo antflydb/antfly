@@ -686,6 +686,8 @@ pub const CatalogRetainedStream = struct {
             error.StorageReadTemporarilyUnavailable,
             error.CatalogRoutingUnavailable,
             error.CatalogRoutingSnapshotTimeout,
+            error.MetadataSnapshotHeadMismatch,
+            error.TopologyChanged,
             error.ConnectionRefused,
             error.ConnectionResetByPeer,
             error.NetworkUnreachable,
