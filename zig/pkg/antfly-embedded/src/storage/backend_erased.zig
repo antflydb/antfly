@@ -292,6 +292,7 @@ pub const ReadScope = struct {
     const VTable = struct {
         get_ranges_many: ?*const fn (*anyopaque, []const RangeRequest) anyerror!void = null,
         get_ranges: ?*const fn (*anyopaque, []const u8, []const ValueRange, [][]const u8) anyerror!void = null,
+        probe_prefix: ?*const fn (*anyopaque, []const u8, usize) anyerror![]const u8 = null,
         get_range: ?*const fn (*anyopaque, []const u8, u64, usize) anyerror![]const u8 = null,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
@@ -335,6 +336,12 @@ pub const ReadScope = struct {
     pub fn supportsRange(self: *const @This()) bool {
         return self.vtable.get_range != null;
     }
+    /// Read a bounded prefix without requiring a full-value compatibility read.
+    pub fn probePrefix(self: *@This(), key: []const u8, length: usize) ![]const u8 {
+        if (self.vtable.probe_prefix) |probe| return BoundaryAbi.call("probe_prefix", self.boundary_dispatch, probe, .{ self.ptr, key, length });
+        return self.getRange(key, 0, length);
+    }
+
     pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
         const read_range = self.vtable.get_range orelse return error.Unsupported;
         return BoundaryAbi.call("get_range", self.boundary_dispatch, read_range, .{ self.ptr, key, offset, length });
@@ -484,6 +491,11 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRanges(key, ranges, output);
         }
+        fn probePrefix(ptr: *anyopaque, key: []const u8, length: usize) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.probePrefix(key, length);
+        }
+
         fn getRange(ptr: *anyopaque, key: []const u8, offset: u64, length: usize) anyerror![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRange(key, offset, length);
@@ -577,7 +589,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .probe_prefix = if (@hasDecl(@TypeOf(handle), "probePrefix")) State.probePrefix else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies

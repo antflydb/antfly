@@ -166,9 +166,16 @@ pub const FrontierSlots = struct {
 
     pub fn readLatest(self: FrontierSlots, file: File, io: Io) !?Published {
         var latest: ?Published = null;
+        var read_error: ?error{InputOutput} = null;
         for (self.offsets, 0..) |offset, page| {
             var raw: [2 * Frontier.encoded_len]u8 = undefined;
-            const len = try file.readPositionalAll(io, &raw, offset);
+            const len = file.readPositionalAll(io, &raw, offset) catch |err| switch (err) {
+                error.InputOutput => {
+                    read_error = error.InputOutput;
+                    continue;
+                },
+                else => return err,
+            };
             for (0..len / Frontier.encoded_len) |copy| {
                 const record = raw[copy * Frontier.encoded_len ..][0..Frontier.encoded_len];
                 const frontier = Frontier.decode(record) orelse continue;
@@ -182,6 +189,7 @@ pub const FrontierSlots = struct {
                 latest = .{ .slot = @intCast(page ^ copy), .frontier = frontier };
             }
         }
+        if (latest == null) if (read_error) |err| return err;
         return latest;
     }
 
@@ -206,6 +214,32 @@ pub const FrontierSlots = struct {
         return next;
     }
 };
+
+test "redo frontier reads either mirror after a positional I/O error" {
+    const io = std.testing.io;
+    var region = try makeTempRegion(io, 8192);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+    const slots: FrontierSlots = .{ .offsets = .{ 0, 4096 } };
+    const frontier: Frontier = .{ .generation = 7, .sequence = 8, .end_offset = 9 };
+    const expected = try slots.writeNext(region.file, io, null, frontier);
+    const Fault = struct {
+        real: Io,
+        offset: u64,
+
+        fn read(userdata: ?*anyopaque, file: File, data: []const []u8, offset: u64) File.ReadPositionalError!usize {
+            const self: *const @This() = @ptrCast(@alignCast(userdata.?));
+            if (offset == self.offset) return error.InputOutput;
+            return self.real.vtable.fileReadPositional(self.real.userdata, file, data, offset);
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.fileReadPositional = Fault.read;
+    for (slots.offsets) |offset| {
+        var fault: Fault = .{ .real = io, .offset = offset };
+        const failing_io: Io = .{ .userdata = &fault, .vtable = &vtable };
+        try std.testing.expectEqual(expected, (try slots.readLatest(region.file, failing_io)).?);
+    }
+}
 
 test "redo frontier slots retain the preceding publication after a torn slot write" {
     const io = std.testing.io;
@@ -375,11 +409,15 @@ fn readHeaderAt(file: File, io: Io, offset: u64, available: u64) !ReadHeader {
     var buf: [header_len]u8 = @splat(0);
     const want: usize = @intCast(@min(available, header_len));
     const got = try file.readPositionalAll(io, buf[0..want], offset);
+    return decodeReadHeader(&buf, got);
+}
+
+fn decodeReadHeader(buf: *const [header_len]u8, got: usize) ReadHeader {
     if (got < legacy_header_len) return .short;
     if (isAllZero(buf[0..legacy_header_len])) return .zero;
     if (std.mem.readInt(u32, buf[0..4], .little) == trailer_magic) {
         if (got < header_len) return .short;
-        return if (Trailer.decode(&buf)) |trailer| .{ .trailer = trailer } else .garbage;
+        return if (Trailer.decode(buf)) |trailer| .{ .trailer = trailer } else .garbage;
     }
     var header = RecordHeader.decodeLegacy(buf[0..legacy_header_len]);
     const len = header.knownLength() orelse return .garbage;
@@ -802,6 +840,65 @@ pub fn replayBounded(
     on_record: ?Callback,
     ctx: ?*anyopaque,
 ) anyerror!ReplayOutcome {
+    var window: ReplayReadWindow = .{};
+    return replayBoundedWithWindow(allocator, file, io, base_offset, capacity, start_after_sequence, max_sequence, unlogged_through, on_record, ctx, &window);
+}
+
+/// Verify a sealed prefix with sequential reads, keeping the scratch size
+/// independent of the extent size. Each record is still checked.
+pub fn replayBufferedPrefix(
+    allocator: Allocator,
+    file: File,
+    io: Io,
+    base_offset: u64,
+    capacity: u64,
+    start_after_sequence: ?u64,
+    max_sequence: ?u64,
+    unlogged_through: ?u64,
+    on_record: ?Callback,
+    ctx: ?*anyopaque,
+) anyerror!ReplayOutcome {
+    const scratch = try allocator.alloc(u8, @intCast(@min(capacity, 64 * 1024)));
+    defer allocator.free(scratch);
+    var window: ReplayReadWindow = .{ .scratch = scratch };
+    return replayBoundedWithWindow(allocator, file, io, base_offset, capacity, start_after_sequence, max_sequence, unlogged_through, on_record, ctx, &window);
+}
+
+const ReplayReadWindow = struct {
+    scratch: []u8 = &.{},
+    start: u64 = 0,
+    len: usize = 0,
+
+    fn read(window: *ReplayReadWindow, file: File, io: Io, out: []u8, offset: u64, limit: u64) !usize {
+        if (out.len == 0) return 0;
+        if (out.len > window.scratch.len) return file.readPositionalAll(io, out, offset);
+        if (offset < window.start or offset - window.start > window.len or
+            out.len > window.len - (offset - window.start))
+        {
+            window.start = offset;
+            const want: usize = @intCast(@min(limit - offset, window.scratch.len));
+            window.len = try file.readPositionalAll(io, window.scratch[0..want], offset);
+        }
+        const index: usize = @intCast(offset - window.start);
+        const count = @min(out.len, window.len - index);
+        @memcpy(out[0..count], window.scratch[index..][0..count]);
+        return count;
+    }
+};
+
+fn replayBoundedWithWindow(
+    allocator: Allocator,
+    file: File,
+    io: Io,
+    base_offset: u64,
+    capacity: u64,
+    start_after_sequence: ?u64,
+    max_sequence: ?u64,
+    unlogged_through: ?u64,
+    on_record: ?Callback,
+    ctx: ?*anyopaque,
+    window: *ReplayReadWindow,
+) anyerror!ReplayOutcome {
     var pos: u64 = 0;
     var count: u64 = 0;
     var last_sequence = start_after_sequence;
@@ -826,7 +923,10 @@ pub fn replayBounded(
 
     while (true) {
         const remaining = capacity - pos;
-        const header, const record_header_len = switch (try readHeaderAt(file, io, base_offset + pos, remaining)) {
+        var raw_header: [header_len]u8 = undefined;
+        const want: usize = @intCast(@min(remaining, header_len));
+        const got = if (want < legacy_header_len) 0 else try window.read(file, io, raw_header[0..want], base_offset + pos, base_offset + capacity);
+        const header, const record_header_len = switch (decodeReadHeader(&raw_header, got)) {
             // Too little room left for any header: the region's end.
             .short => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = if (remaining < legacy_header_len) .end_of_region else .torn_tail },
             // The append writes the payload and trailer before its
@@ -896,7 +996,7 @@ pub fn replayBounded(
         payload_buf.clearRetainingCapacity();
         try payload_buf.resize(allocator, payload_len);
         if (payload_len != 0) {
-            const payload_got = try file.readPositionalAll(io, payload_buf.items, base_offset + pos + record_header_len);
+            const payload_got = try window.read(file, io, payload_buf.items, base_offset + pos + record_header_len, base_offset + capacity);
             if (payload_got < payload_len) {
                 return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .torn_tail };
             }

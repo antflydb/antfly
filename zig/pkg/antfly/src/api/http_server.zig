@@ -14450,8 +14450,9 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn authorizedTransactionMutation(self: *ApiHttpServer, id: db_mod.types.TxnId, identity: ?AuthenticatedIdentity) !?transactions_api.Mutation {
-        var details = (try self.authorizedTransactionSessionDetails(id, identity, false)) orelse return null;
+        var details = (try self.txn_sessions.getAuthorizationDetailsForPrincipal(self.alloc, id, transactionPrincipal(identity))) orelse return null;
         defer details.deinit(self.alloc);
+        if (!directTransactionRouteEligible(details, false) or !try self.transactionSessionDetailsAuthorized(identity, details)) return null;
         var guard = try self.txn_sessions.mutation(self.alloc, id, self.localSessionNodeId());
         guard.bindPublicSession(details.status.begin_timestamp, transactionPrincipal(identity));
         return guard;
@@ -14507,8 +14508,9 @@ pub const ApiHttpServer = struct {
         var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
         errdefer authorized.deinit(self.alloc);
         for (candidates) |id| {
-            var details = (try self.authorizedTransactionSessionDetails(id, authenticated_identity, true)) orelse continue;
+            var details = (try self.txn_sessions.getListingDetailsForPrincipal(self.alloc, id, transactionPrincipal(authenticated_identity))) orelse continue;
             defer details.deinit(self.alloc);
+            if (!try self.transactionSessionDetailsAuthorized(authenticated_identity, details)) continue;
             try authorized.append(self.alloc, details.status);
         }
         return try authorized.toOwnedSlice(self.alloc);

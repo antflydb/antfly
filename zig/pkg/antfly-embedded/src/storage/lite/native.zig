@@ -8423,6 +8423,7 @@ pub const NativeFile = struct {
         const needs_barrier = !self.no_sync and (!self.read_only or !holds_authority);
         cold_scan: while (true) {
             var torn_protected_watermark = false;
+            var segment_mismatch = false;
             // A fold that published between the catch-up above and this pin may
             // already have zero-filled the log from `folded_through`, and the
             // pin only defers folds after it. Catch up again under the pin until
@@ -8441,8 +8442,7 @@ pub const NativeFile = struct {
                 if (torn_protected_watermark) promised_durable = null;
                 if (published.checkpoint_sequence <= folded_through) {
                     if (checkpoint.redo_rotation) |rotation| {
-                        if (checked != null and published.durable_sequence > folded_through and published.segment != rotation.active)
-                            return error.FileBusy;
+                        segment_mismatch = checked != null and published.durable_sequence > folded_through and published.segment != rotation.active;
                     }
                     break;
                 }
@@ -8473,6 +8473,22 @@ pub const NativeFile = struct {
             // writer could take it, append, fail its sync (its rollback
             // leaves the bytes) and release it in between. Hold it shared for
             // the rest of this open instead, so no writer can.
+            // A coherent mmap watermark can survive a crash at an older
+            // sequence than the data file. The sidecar fence lets a cold
+            // opener use the persisted frontier without racing appends.
+            const protected = self.header.protected_redo and !self.no_sync;
+            var use_persisted_frontier = protected and self.read_only and sidecar_fence != null;
+            const live_writer = if (scan_region) |r| r.foreignLiveWriter(0) else false;
+            if (protected and self.read_only and !holds_authority and sidecar_fence == null and replay_ceiling != null and !live_writer) {
+                switch (self.holdSidecarReadFence(io)) {
+                    .held => |fence| {
+                        sidecar_fence = fence;
+                        use_persisted_frontier = true;
+                    },
+                    .absent => use_persisted_frontier = true,
+                    .own, .busy => {},
+                }
+            }
             if (replay_ceiling == null and !holds_authority and sidecar_fence == null) {
                 switch (self.holdSidecarReadFence(io)) {
                     .held => |fence| sidecar_fence = fence,
@@ -8486,7 +8502,8 @@ pub const NativeFile = struct {
                     },
                 }
             }
-            if (torn_protected_watermark) {
+            if (segment_mismatch and !use_persisted_frontier and replay_ceiling != null) return error.FileBusy;
+            if (torn_protected_watermark or use_persisted_frontier) {
                 // A writer can die after changing the active extent and
                 // before the first field of its new watermark is stored.
                 // With the writer fenced, load the selector from disk.
@@ -8496,10 +8513,13 @@ pub const NativeFile = struct {
                 if (scan_slot) |slot| scan_region.?.pinReader(slot, @max(folded_through, 1));
             }
             var persisted_frontier: ?redo_log.Frontier = null;
-            if (replay_ceiling == null and self.header.protected_redo and !self.no_sync) {
+            if (protected and (replay_ceiling == null or use_persisted_frontier)) {
+                observed_checkpoint = folded_through;
+                published_fold_start = 0;
                 const durable = (try redoFrontierSlots(self.header).readLatest(self.file, io)) orelse return error.NativeRedoLogCorrupt;
                 const frontier = durable.frontier;
                 replay_ceiling = @max(frontier.sequence, checkpoint.commit_sequence);
+                if ((promised_durable orelse 0) > replay_ceiling.?) return error.NativeRedoLogCorrupt;
                 promised_durable = frontier.sequence;
                 if (frontier.sequence > folded_through) {
                     persisted_frontier = frontier;
@@ -10768,7 +10788,11 @@ pub const NativeFile = struct {
         };
         var scan_ctx: Scan = .{ .have_through = @max(redo.shared.appliedThrough(), redo.shared.decodedThrough()) };
         const base = self.header.redoOffset();
-        var scan = try redo_log.replayBounded(self.allocator, self.file, io, base + start_offset, scan_end - start_offset, floor, if (persisted) |seal| @max(seal.frontier.sequence, floor) else null, covered, Scan.onRecord, &scan_ctx);
+        const replay_prefix: *const @TypeOf(redo_log.replayBounded) = if (persisted != null and scan_end != capacity and start_offset == 0)
+            redo_log.replayBufferedPrefix
+        else
+            redo_log.replayBounded;
+        var scan = try replay_prefix(self.allocator, self.file, io, base + start_offset, scan_end - start_offset, floor, if (persisted) |seal| @max(seal.frontier.sequence, floor) else null, covered, Scan.onRecord, &scan_ctx);
         scan.valid_bytes += start_offset;
         const published = if (region) |r| r.readLogStateChecked() else null;
         if (persisted) |seal| {
@@ -18515,6 +18539,8 @@ pub const NativeFile = struct {
 
         if (!replace and !dest_exists and pathExists(io, dest_path)) return error.PathAlreadyExists;
 
+        if (self.redo_frontier_uncertain or self.checkpoint_publication_uncertain) return error.OutcomeUnknown;
+        if (!self.read_only and self.durable_header != null) try self.sync();
         const checkpoint = self.activeCheckpoint();
         const snapshot_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
         const source_size = (try self.file.stat(io)).size;
@@ -18647,7 +18673,7 @@ pub const NativeFile = struct {
         return .{
             .source_size = source_size,
             .snapshot_size = snapshot_size,
-            .checkpoint_sequence = checkpoint.commit_sequence,
+            .checkpoint_sequence = if (redo_cut) |cut| cut.sequence else checkpoint.commit_sequence,
             .page_count = checkpoint.page_count,
             .tail_bytes = source_size - snapshot_size,
         };
@@ -40055,6 +40081,35 @@ test "lite redo durable frontier rejects an erased acknowledged header after col
     try std.testing.expectError(error.NativeRedoLogCorrupt, NativeFile.openWithIo(a, io, path, .{ .read_only = true }));
 }
 
+test "lite redo cold reader uses the durable frontier ahead of a coherent watermark" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-stale-watermark.aflite");
+    defer a.free(path);
+
+    const old_watermark = block: {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        try writer.beginTransaction();
+        try writer.putDocument("before", "one");
+        try writer.commitTransaction();
+        const old = (try writer.regionForInode()).?.readLogStateChecked().?;
+        try writer.beginTransaction();
+        try writer.putDocument("after", "two");
+        try writer.commitTransaction();
+        break :block old;
+    };
+    var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+    defer region.close();
+    region.publishLogState(old_watermark);
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reader.close();
+    try expectRedoDocument(&reader, "before", "one");
+    try expectRedoDocument(&reader, "after", "two");
+}
+
 test "lite redo durable frontier recovers acknowledged redo after losing one frontier page" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -40377,6 +40432,31 @@ test "lite redo authority token is scoped to a sidecar" {
     try writer.beginTransaction();
     try std.testing.expectEqual(epoch, writer.redo.?.sidecar_epoch.?);
     writer.abortTransaction();
+}
+
+test "lite redo stable snapshot seals pending writes and reports the exported sequence" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "snapshot-pending.aflite");
+    defer a.free(path);
+    const backup = try testPath(a, tmp, "snapshot-sealed.aflite");
+    defer a.free(backup);
+
+    var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("pending", "value");
+    try writer.commitTransactionWithDurability(false, null);
+    const sequence = writer.activeCheckpoint().commit_sequence;
+    try std.testing.expect(writer.durableSequence() < sequence);
+    const report = try writer.copyStableSnapshotToPath(backup, false);
+    var reader = try NativeFile.openWithIo(a, io, backup, .{ .read_only = true });
+    defer reader.close();
+    try std.testing.expectEqual(sequence, report.checkpoint_sequence);
+    try std.testing.expectEqual(report.checkpoint_sequence, reader.durableSequence());
+    try expectRedoDocument(&reader, "pending", "value");
 }
 
 test "lite redo handoff replaces an unsealed deferred record despite a retained reader" {

@@ -1686,7 +1686,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn selectSpanRun(self: *@This(), source_index: usize, run_index: usize) void {
             const span = &self.run_spans[source_index];
             if (span.current == run_index) return;
-            self.clearSourceBlock(source_index);
+            self.resetRunSourceResidency(source_index);
             self.clearSourceRunLease(source_index);
             if (self.source_table_index_handles[source_index]) |*handle| handle.release();
             self.source_table_index_handles[source_index] = null;
@@ -2278,9 +2278,9 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn isPersistedRunSource(self: *const @This(), source_index: usize) bool {
             const offset = self.runSourceOffset();
             if (source_index < offset) return false;
-            const run_index = source_index - offset;
-            if (run_index >= self.runs.len) return false;
-            const run = self.runs[run_index];
+            const run_index = self.run_spans[source_index].current;
+            if (run_index >= self.sequence.count()) return false;
+            const run = self.sequence.at(run_index);
             return run.state == null and run.path != null;
         }
 
