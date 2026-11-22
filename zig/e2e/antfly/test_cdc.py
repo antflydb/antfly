@@ -3590,3 +3590,69 @@ def test_public_changefeed_renew_retains_root_beyond_original_deadline():
             _changefeed_call(client, "DELETE", feed)
     finally:
         server.stop()
+
+
+@pytest.mark.parametrize("start", ["now", "snapshot_then_changes"])
+def test_public_changefeed_expired_cut_requires_resynchronization(start):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            name = "expiry_test"
+            base = server.api_url
+            _changefeed_call(
+                client, "POST", f"{base}/tables/{name}", json={"num_shards": 1}
+            )
+
+            def subscribe(key, position, lease_seconds):
+                return _changefeed_call(
+                    client,
+                    "POST",
+                    f"{base}/changefeeds",
+                    headers={"Idempotency-Key": key},
+                    json={
+                        "tables": [name],
+                        "include": "rows",
+                        "start": position,
+                        "lease_seconds": lease_seconds,
+                    },
+                ).json()
+
+            active = subscribe("active", "now", 120)
+            lagging = subscribe("lagging", start, 15)
+            time.sleep(max(0, lagging["expires_at"] + 1 - time.time()))
+            server.restart()
+            expired = client.get(
+                f"{base}/changefeeds/{lagging['id']}/events",
+                params={"after": lagging["cursor"]},
+                timeout=15,
+            )
+            assert expired.status_code == 409, expired.text
+            assert expired.json()["error"] == "changefeed_resynchronization_required"
+
+            _changefeed_call(
+                client,
+                "POST",
+                f"{base}/tables/{name}/batch",
+                json={"inserts": {"still-live": {"value": "committed-after-expiry"}}},
+            )
+            path = f"{base}/changefeeds/{active['id']}"
+            cursor = active["cursor"]
+
+            def active_page():
+                nonlocal cursor
+                page = _changefeed_call(
+                    client, "GET", f"{path}/events", params={"after": cursor}
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                return page.json()["events"]
+
+            events = wait_until(active_page, timeout_s=20, interval_s=0.2)
+            assert events and [event["key"]["value"] for event in events] == [
+                "still-live"
+            ]
+            _changefeed_call(client, "POST", f"{path}/ack", json={"cursor": cursor})
+            _changefeed_call(client, "DELETE", path)
+    finally:
+        server.stop()
