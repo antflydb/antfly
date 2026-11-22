@@ -4708,7 +4708,7 @@ const PendingLogReset = struct { old_tail: u64, fold_sequence: u64 };
 const RedoCommitState = struct {
     frontier_cache: ?redo_log.FrontierSlots.Published = null,
     sidecar_epoch: ?u64 = null,
-    sidecar_inode: ?std.Io.File.INode = null,
+    sidecar_identity: ?SidecarIdentity = null,
     validate_full_prefix: bool = false,
     writer: redo_log.Writer,
     /// This transaction's accumulated logical mutations, encoded via
@@ -6953,6 +6953,7 @@ pub const NativeFile = struct {
     file: std.Io.File,
     writer_lock_file: ?std.Io.File = null,
     sidecar_registration: ?SidecarRegistration = null,
+    lifetime_writer_region: ?shared_lock_region.Region = null,
     /// The embedded connection layer holds the path lease around complete calls.
     externally_locked: bool = false,
     reader_coordinator: ?*ReaderCoordinator = null,
@@ -7662,7 +7663,8 @@ pub const NativeFile = struct {
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         // See the matching comment in `createWithIo`.
         if (result.manifest_commits_enabled) try result.manifest_builder.reserveCapacity(allocator);
-        if (result.writer_lock_file) |sidecar| result.sidecar_registration = registerOwnSidecarLock(result.runtimeIo(), sidecar);
+        result.registerLifetimeWriter();
+        if (result.writer_lock_file != null and result.redoRecoveryCursor() != null) result.publishRedoLogState();
         return result;
     }
 
@@ -8214,7 +8216,7 @@ pub const NativeFile = struct {
         // Lifetime writer authority excludes another process. The inode
         // publication guards against reuse after another local handle commits.
         const cached = if (!retry and (self.writer_lock_file != null or
-            (redo.sidecar_epoch != null and redo.sidecar_epoch == ownSidecarEpoch(io, redo.sidecar_inode))))
+            (redo.sidecar_epoch != null and redo.sidecar_epoch == ownSidecarEpoch(io, redo.sidecar_identity))))
         cached: {
             const publication = redo.frontier_cache orelse break :cached null;
             const entry = self.inode_lock_ref.load(.acquire) orelse break :cached null;
@@ -8244,6 +8246,7 @@ pub const NativeFile = struct {
         if (self.regionForInode() catch null) |region| {
             self.noteSyncedRedoFrontier(region, publication.frontier);
         } else {
+            self.releaseLifetimeWriterRegion();
             try slots.noteSyncedWithoutRegion(self.file, io, publication.frontier);
         }
     }
@@ -10567,8 +10570,38 @@ pub const NativeFile = struct {
         // heap allocation and preserve gaps") start measuring right after
         // this call returns, before issuing any writes.
         result.manifest_builder = manifest_builder_reservation;
-        if (result.writer_lock_file) |sidecar| result.sidecar_registration = registerOwnSidecarLock(result.runtimeIo(), sidecar);
+        result.registerLifetimeWriter();
         return result;
+    }
+
+    fn registerLifetimeWriter(self: *NativeFile) void {
+        const sidecar = self.writer_lock_file orelse return;
+        const io = self.runtimeIo();
+        const registration = registerOwnSidecarLock(io, sidecar) orelse return;
+        self.sidecar_registration = registration;
+    }
+
+    fn claimLifetimeWriterRegion(self: *NativeFile, io: std.Io) void {
+        if (self.writer_lock_file == null or self.lifetime_writer_region != null or !self.header.protected_redo or self.no_sync) return;
+        const registration = self.sidecar_registration orelse return;
+
+        // The flock is already held. Never wait for a region holder
+        // that may itself be waiting for this flock.
+        var region = shared_lock_region.Region.open(std.heap.page_allocator, io, self.path) catch return;
+        if (!region.tryAcquireWriterFair(antfly_platform.process.currentId() orelse 0)) {
+            region.close();
+            return;
+        }
+        noteOwnSidecarWriterClaim(io, registration, region.writerClaim());
+        self.lifetime_writer_region = region;
+    }
+
+    fn releaseLifetimeWriterRegion(self: *NativeFile) void {
+        const region = if (self.lifetime_writer_region) |*held| held else return;
+        noteOwnSidecarWriterClaim(self.runtimeIo(), self.sidecar_registration, null);
+        region.releaseWriter();
+        region.close();
+        self.lifetime_writer_region = null;
     }
 
     /// Seal pending commits before handing lifetime ownership back to the
@@ -10585,6 +10618,7 @@ pub const NativeFile = struct {
         self.sidecar_registration = null;
         if (self.writer_lock_file) |file| file.close(self.runtime());
         self.writer_lock_file = null;
+        self.releaseLifetimeWriterRegion();
         if (self.redo) |*redo| redo.frontier_cache = null;
         self.externally_locked = true;
     }
@@ -10617,6 +10651,7 @@ pub const NativeFile = struct {
         if (self.writer_lock_file) |lock_file| {
             lock_file.close(io);
         }
+        self.releaseLifetimeWriterRegion();
         // Defensive: every acquirer above already pairs its own
         // acquire/release (reader_window_lock is asserted empty just
         // above; acquireReaderFence/captureFullReadSnapshot pair through
@@ -10831,10 +10866,12 @@ pub const NativeFile = struct {
     fn borrowRepairLease(self: *NativeFile, io: std.Io) !std.Io.File {
         const path = try writerLockPathAlloc(self.allocator, io, self.path);
         defer self.allocator.free(path);
-        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return error.OutcomeReconciliationRequired;
+        const sidecar = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return error.OutcomeReconciliationRequired;
+        defer sidecar.close(io);
+        const identity = sidecarIdentity(sidecar) orelse return error.OutcomeReconciliationRequired;
         own_sidecar_locks.mutex.lockUncancelable(io);
         defer own_sidecar_locks.mutex.unlock(io);
-        const lease = own_sidecar_locks.held.get(stat.inode) orelse return error.OutcomeReconciliationRequired;
+        const lease = own_sidecar_locks.held.get(identity) orelse return error.OutcomeReconciliationRequired;
         // The registered owner closes its descriptor only after removing
         // the registration. The duplicate keeps its flock if it closes.
         const descriptor = std.c.fcntl(lease.file.handle, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
@@ -11327,15 +11364,15 @@ pub const NativeFile = struct {
     fn refreshExternalRedoAuthority(self: *NativeFile, redo: *RedoCommitState) void {
         if (!self.externally_locked or self.writer_lock_file != null) return;
         const io = self.runtimeIo();
-        var epoch = ownSidecarEpoch(io, redo.sidecar_inode);
+        var epoch = ownSidecarEpoch(io, redo.sidecar_identity);
         if (epoch == null) lookup: {
             const path = writerLockPathAlloc(self.allocator, io, self.path) catch break :lookup;
             defer self.allocator.free(path);
             const lock = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch break :lookup;
             defer lock.close(io);
-            const stat = lock.stat(io) catch break :lookup;
-            redo.sidecar_inode = stat.inode;
-            epoch = ownSidecarEpoch(io, stat.inode);
+            const identity = sidecarIdentity(lock) orelse break :lookup;
+            redo.sidecar_identity = identity;
+            epoch = ownSidecarEpoch(io, identity);
         }
         if (epoch == null and !self.header.protected_redo) return;
         if (epoch != null and redo.sidecar_epoch == epoch) return;
@@ -12316,6 +12353,7 @@ pub const NativeFile = struct {
             self.test_fail_redo_visibility = null;
             return err;
         };
+        self.releaseLifetimeWriterRegion();
         try redoFrontierSlots(self.header).noteSyncedWithoutRegion(self.file, self.runtimeIo(), .{
             .sequence = checkpoint.commit_sequence,
             .generation = 0,
@@ -12326,6 +12364,7 @@ pub const NativeFile = struct {
     fn publishRedoLogState(self: *NativeFile) void {
         const redo = if (self.redo) |*r| r else return;
         const region = (self.regionForInode() catch null) orelse return;
+        self.claimLifetimeWriterRegion(self.runtimeIo());
         if (self.inode_lock_ref.load(.acquire)) |entry| _ = entry.self_published_durable_sequence.fetchMax(redo.durable_sequence, .acq_rel);
         region.publishReadyLogStateForClaim(.{
             .checkpoint_sequence = redo.checkpoint_sequence,
@@ -12334,7 +12373,7 @@ pub const NativeFile = struct {
             .fold_start_offset = redo.fold_start_offset,
             .segment = if (self.activeCheckpoint().redo_rotation) |rotation| rotation.active else 0,
             .reset_generation = redo.log_reset_generation,
-        }, ownSidecarWriterClaim(self.runtimeIo(), redo.sidecar_inode));
+        }, ownSidecarWriterClaim(self.runtimeIo(), if (self.sidecar_registration) |token| token.identity else redo.sidecar_identity));
     }
 
     /// Read-generation locks join the same-owner frontier only while
@@ -24661,63 +24700,68 @@ fn sidecarWriterHeld(allocator: Allocator, io: std.Io, path: []const u8) bool {
     return !free;
 }
 
-const SidecarRegistration = struct { inode: std.Io.File.INode, epoch: u64 };
+const storage_file_identity = @import("../lsm_backend/storage_io.zig");
+const SidecarIdentity = storage_file_identity.NativeFileIdentity;
+const SidecarRegistration = struct { identity: SidecarIdentity, epoch: u64 };
 
-/// Sidecar writer locks this process holds, by the lock file's inode.
+fn sidecarIdentity(file: std.Io.File) ?SidecarIdentity {
+    return storage_file_identity.nativeFileIdentity(file.handle) catch null;
+}
+
+/// Sidecar writer locks this process holds, by the lock file's device and inode.
 const own_sidecar_locks = struct {
     const Lease = struct { epoch: u64, file: std.Io.File, writer_claim: ?u128 = null };
     var mutex: std.Io.Mutex = .init;
     var next_epoch: u64 = 0;
-    var held: std.AutoHashMapUnmanaged(std.Io.File.INode, Lease) = .empty;
+    var held: std.AutoHashMapUnmanaged(SidecarIdentity, Lease) = .empty;
 };
 
 /// Capture identity while admitting the writer. Cleanup uses the token
 /// without filesystem I/O, even when the caller's I/O is canceled.
 fn registerOwnSidecarLock(io: std.Io, file: std.Io.File) ?SidecarRegistration {
-    const stat = file.stat(io) catch return null;
+    const identity = sidecarIdentity(file) orelse return null;
     own_sidecar_locks.mutex.lockUncancelable(io);
     defer own_sidecar_locks.mutex.unlock(io);
-    const slot = own_sidecar_locks.held.getOrPut(std.heap.page_allocator, stat.inode) catch return null;
+    const slot = own_sidecar_locks.held.getOrPut(std.heap.page_allocator, identity) catch return null;
     if (slot.found_existing) return null;
     own_sidecar_locks.next_epoch +%= 1;
     const epoch = own_sidecar_locks.next_epoch;
     slot.value_ptr.* = .{ .epoch = epoch, .file = file };
-    return .{ .inode = stat.inode, .epoch = epoch };
+    return .{ .identity = identity, .epoch = epoch };
 }
 
 fn unregisterOwnSidecarLock(io: std.Io, registration: ?SidecarRegistration) void {
     const token = registration orelse return;
     own_sidecar_locks.mutex.lockUncancelable(io);
     defer own_sidecar_locks.mutex.unlock(io);
-    const lease = own_sidecar_locks.held.get(token.inode) orelse return;
-    if (lease.epoch == token.epoch) _ = own_sidecar_locks.held.remove(token.inode);
+    const lease = own_sidecar_locks.held.get(token.identity) orelse return;
+    if (lease.epoch == token.epoch) _ = own_sidecar_locks.held.remove(token.identity);
 }
 
-fn noteOwnSidecarWriterClaim(io: std.Io, registration: ?SidecarRegistration, claim: u128) void {
+fn noteOwnSidecarWriterClaim(io: std.Io, registration: ?SidecarRegistration, claim: ?u128) void {
     const token = registration orelse return;
     own_sidecar_locks.mutex.lockUncancelable(io);
     defer own_sidecar_locks.mutex.unlock(io);
-    const lease = own_sidecar_locks.held.getPtr(token.inode) orelse return;
+    const lease = own_sidecar_locks.held.getPtr(token.identity) orelse return;
     if (lease.epoch == token.epoch) lease.writer_claim = claim;
 }
 
-fn ownSidecarWriterClaim(io: std.Io, maybe_inode: ?std.Io.File.INode) ?u128 {
-    const inode = maybe_inode orelse return null;
+fn ownSidecarWriterClaim(io: std.Io, maybe_identity: ?SidecarIdentity) ?u128 {
+    const identity = maybe_identity orelse return null;
     own_sidecar_locks.mutex.lockUncancelable(io);
     defer own_sidecar_locks.mutex.unlock(io);
-    return if (own_sidecar_locks.held.get(inode)) |lease| lease.writer_claim else null;
+    return if (own_sidecar_locks.held.get(identity)) |lease| lease.writer_claim else null;
 }
 
-fn ownSidecarEpoch(io: std.Io, maybe_inode: ?std.Io.File.INode) ?u64 {
-    const inode = maybe_inode orelse return null;
+fn ownSidecarEpoch(io: std.Io, maybe_identity: ?SidecarIdentity) ?u64 {
+    const identity = maybe_identity orelse return null;
     own_sidecar_locks.mutex.lockUncancelable(io);
     defer own_sidecar_locks.mutex.unlock(io);
-    return if (own_sidecar_locks.held.get(inode)) |lease| lease.epoch else null;
+    return if (own_sidecar_locks.held.get(identity)) |lease| lease.epoch else null;
 }
 
 fn ownSidecarLockHeld(io: std.Io, file: std.Io.File) bool {
-    const stat = file.stat(io) catch return false;
-    return ownSidecarEpoch(io, stat.inode) != null;
+    return ownSidecarEpoch(io, sidecarIdentity(file)) != null;
 }
 
 fn writerLockPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -40844,7 +40888,7 @@ test "lite redo idle recovery prefers the mirrored frontier to an older regionle
     try expectRedoDocument(&reader, "two", "mapped");
 }
 
-test "lite redo readers recover a newer disk frontier behind a live mapped publisher" {
+test "lite redo readers recover a newer disk frontier after mapped publication stops" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -40870,7 +40914,7 @@ test "lite redo readers recover a newer disk frontier behind a live mapped publi
     try writer.commitTransaction();
 
     try std.testing.expectEqual(published, region.readLogStateChecked().?);
-    try std.testing.expect(region.isLogStateLive(published));
+    try std.testing.expect(!region.hasReadyLogWriter());
     try std.testing.expect((try reader.unchangedProtectedRedoTip(io)) == null);
     const known_tail = reader.redo.?.writer.tail;
     try reader.refreshCrossProcessRedoOverlay();
@@ -41035,6 +41079,20 @@ test "lite redo checkpoint reconciliation rejects a superseding lease publicatio
     try std.testing.expectEqual(proof, (try NativeFile.redoFrontierSlots(first.header).readSyncedWithoutRegion(first.file, io)).?);
 }
 
+test "lite redo sidecar registry separates equal inodes on different devices" {
+    const io = std.testing.io;
+    const first: SidecarIdentity = .{ .device = 1, .inode = 73 };
+    const second: SidecarIdentity = .{ .device = 2, .inode = 73 };
+    {
+        own_sidecar_locks.mutex.lockUncancelable(io);
+        defer own_sidecar_locks.mutex.unlock(io);
+        try own_sidecar_locks.held.put(std.heap.page_allocator, first, .{ .epoch = 17, .file = undefined });
+    }
+    defer unregisterOwnSidecarLock(io, .{ .identity = first, .epoch = 17 });
+    try std.testing.expectEqual(@as(?u64, 17), ownSidecarEpoch(io, first));
+    try std.testing.expectEqual(@as(?u64, null), ownSidecarEpoch(io, second));
+}
+
 test "lite redo sidecar registration is removed with canceled stat I/O" {
     const Fault = struct {
         var cancel_stat = false;
@@ -41059,17 +41117,22 @@ test "lite redo sidecar registration is removed with canceled stat I/O" {
     Fault.cancel_stat = true;
     defer Fault.cancel_stat = false;
     try writer.releaseWriterOwnership();
-    try std.testing.expect(ownSidecarEpoch(io, original.inode) == null);
+    try std.testing.expect(ownSidecarEpoch(io, original.identity) == null);
 
     Fault.cancel_stat = false;
     var lease = try lockWriterPathWithIo(a, io, path);
     defer lease.close();
     const acquired = lease.sidecar_registration orelse return error.MissingSidecarRegistration;
     unregisterOwnSidecarLock(io, original);
-    try std.testing.expectEqual(acquired.epoch, ownSidecarEpoch(io, acquired.inode).?);
+    try std.testing.expectEqual(acquired.epoch, ownSidecarEpoch(io, acquired.identity).?);
 }
 
 test "lite redo serving reopen resumes from a verified cursor" {
+    try exerciseServingRedoCursor(false);
+    try exerciseServingRedoCursor(true);
+}
+
+fn exerciseServingRedoCursor(fair: bool) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -41089,9 +41152,12 @@ test "lite redo serving reopen resumes from a verified cursor" {
         break :captured base.redoRecoveryCursor() orelse return error.MissingRedoRecoveryCursor;
     };
 
-    try writer.releaseWriterOwnership();
-    var lease = try tryFairWriterLockWithIo(a, io, path);
-    defer lease.close();
+    var lease: ?PathWriterLock = null;
+    if (fair) {
+        try writer.releaseWriterOwnership();
+        lease = try tryFairWriterLockWithIo(a, io, path);
+    }
+    defer if (lease) |*held| held.close();
     try writer.beginTransaction();
     try writer.putDocument("two", "second");
     try writer.commitTransaction();

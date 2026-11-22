@@ -2543,6 +2543,7 @@ pub const Owner = struct {
             const can_reuse = !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and
                 maintenance_references_clear and !needsOutcomeReconciliation(current) and
                 file.adoptionEpoch() == current.lite_refresh_adoption_epoch;
+            if (fast_only and !can_reuse) return null;
             if (can_reuse and current.lane_pins.load(.acquire) == 0) {
                 if (file.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
                 if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |inode| {

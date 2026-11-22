@@ -3541,12 +3541,12 @@ fn closeFd(fd: std.posix.fd_t) void {
     _ = std.posix.system.close(fd);
 }
 
-const NativeFileIdentity = struct {
+pub const NativeFileIdentity = struct {
     device: u64,
     inode: u64,
 };
 
-fn nativeFileIdentity(fd: std.posix.fd_t) !NativeFileIdentity {
+pub fn nativeFileIdentity(fd: std.posix.fd_t) !NativeFileIdentity {
     if (comptime builtin.os.tag == .linux) {
         const linux = std.os.linux;
         while (true) {
