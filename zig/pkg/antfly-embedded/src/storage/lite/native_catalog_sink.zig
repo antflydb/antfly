@@ -123,6 +123,25 @@ fn applyMutations(allocator: Allocator, file: *native.NativeFile, scope: []const
     try file.putIndexCatalogBatch(batch.items);
 }
 
+/// Runs `resolver` against `scope` at this point of `file`'s open
+/// transaction and applies its decisions (a primary write's inline
+/// publication, decided in its group apply rather than in its own thread).
+pub fn applyResolver(allocator: Allocator, file: *native.NativeFile, scope: []const u8, resolver: *native_catalog_backend.Resolver) !void {
+    var reader: TipReader = .{ .file = file, .scope = scope };
+    try resolver.run(.{ .ptr = &reader, .getFn = TipReader.get });
+    if (resolver.outputs.items.len == 0) return;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const batch = try a.alloc(native.CatalogMutation, resolver.outputs.items.len);
+    for (resolver.outputs.items, batch) |out, *m| m.* = .{
+        .key = try durableKeyAlloc(a, scope, out.namespace, out.key),
+        .value = out.value,
+        .is_delete = out.is_delete,
+    };
+    try file.putIndexCatalogBatch(batch);
+}
+
 /// `native_catalog_backend.TipReader` over the open transaction.
 const TipReader = struct {
     file: *native.NativeFile,

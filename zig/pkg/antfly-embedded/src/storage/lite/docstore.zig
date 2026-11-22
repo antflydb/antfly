@@ -7345,6 +7345,10 @@ pub const Txn = struct {
     // `PrimaryCommitContext.apply`). Encoded keys are owned by
     // `index_catalog_arena`, created lazily on first use.
     index_catalog_pending: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
+    /// Resolvers staged with `putIndexCatalogBatch`, run in the group apply
+    /// before `index_catalog_pending`, at the tip (`native_catalog_backend.Resolver`).
+    /// Scopes live in `index_catalog_arena`.
+    index_catalog_resolvers: std.ArrayListUnmanaged(ScopedResolver) = .empty,
     index_catalog_arena: ?std.heap.ArenaAllocator = null,
     read_only: bool = true,
     writer_reserved: bool = false,
@@ -7587,8 +7591,15 @@ pub const Txn = struct {
         return self.commit();
     }
 
+    pub const ScopedResolver = struct {
+        scope: []const u8,
+        resolver: *@import("../native_catalog_backend.zig").Resolver,
+    };
+
     const PrimaryCommitContext = struct {
         mutations: []const native.DocumentMutation,
+        allocator: Allocator = undefined,
+        index_resolvers: []const ScopedResolver = &.{},
         // WS4 phase 2: index-catalog-root mutations (segment/range/active-
         // set records, projection seal, progress) applied in this SAME
         // `apply` invocation -- i.e. the same native transaction/commit --
@@ -7598,6 +7609,7 @@ pub const Txn = struct {
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             try file.putDocumentBatch(context.mutations);
+            for (context.index_resolvers) |scoped| try @import("native_catalog_sink.zig").applyResolver(context.allocator, file, scoped.scope, scoped.resolver);
             if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
         }
     };
@@ -7695,7 +7707,7 @@ pub const Txn = struct {
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0) {
+        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_resolvers.items.len == 0) {
             self.abort();
             return .{};
         }
@@ -7724,7 +7736,7 @@ pub const Txn = struct {
         // `StagedCommit.wait()`/`abort()`, both of which run after the
         // group's `apply` callback has already consumed it, mirroring how
         // `mutations` above borrows `self.pending`'s own buffers.
-        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items };
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .allocator = allocator, .index_resolvers = self.index_catalog_resolvers.items };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -8534,6 +8546,10 @@ pub const Txn = struct {
         const a = self.index_catalog_arena.?.allocator();
         try self.index_catalog_pending.ensureUnusedCapacity(a, mutations.len);
         for (mutations) |m| {
+            if (@import("../native_catalog_backend.zig").isResolution(m.namespace)) {
+                try self.index_catalog_resolvers.append(a, .{ .scope = try a.dupe(u8, scope), .resolver = try @import("../native_catalog_backend.zig").resolverOf(m) });
+                continue;
+            }
             const key = try @import("native_catalog_sink.zig").durableKeyAlloc(a, scope, m.namespace, m.key);
             self.index_catalog_pending.appendAssumeCapacity(.{
                 .key = key,
@@ -8567,6 +8583,7 @@ pub const Txn = struct {
         if (self.index_catalog_arena) |*arena| arena.deinit();
         self.index_catalog_arena = null;
         self.index_catalog_pending = .empty;
+        self.index_catalog_resolvers = .empty;
     }
 
     fn pendingNode(node: *PendingTree.Node) *PendingNode {

@@ -92,6 +92,12 @@ pub const DerivedBatch = struct {
     /// records, each `overwritten_doc_keys` entry's record sequence (empty:
     /// every key at `sequence`).
     delete_sequences: []const u64 = &.{},
+    /// Request-local, omitted from the codec: when a batch folds several
+    /// records, each `deleted_keys` entry's record sequence.
+    deleted_sequences: []const u64 = &.{},
+    /// Request-local, omitted from the codec: the record sequence of keys
+    /// without their own entry (0: `sequence`).
+    key_sequence: u64 = 0,
 };
 
 pub const DerivedLogRecord = struct {
@@ -350,6 +356,7 @@ pub noinline fn deinitDerivedBatch(alloc: Allocator, batch: *DerivedBatch) void 
     if (batch.graph_deletes.len > 0) alloc.free(batch.graph_deletes);
 
     if (batch.delete_sequences.len > 0) alloc.free(batch.delete_sequences);
+    if (batch.deleted_sequences.len > 0) alloc.free(batch.deleted_sequences);
 
     batch.* = undefined;
 }

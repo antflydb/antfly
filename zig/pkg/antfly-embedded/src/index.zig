@@ -631,6 +631,12 @@ fn publishReplacementMissingLiveCounts(
     }
 }
 
+/// Level-0 segment ids (`persistent.zig` `l0SegmentId`) carry the high bit
+/// and never advance the writer's segment id counter.
+pub fn isLevel0SegmentId(seg_id: u64) bool {
+    return seg_id & (@as(u64, 1) << 63) != 0;
+}
+
 pub const SegmentEntry = struct {
     id: u64,
     data: SegmentData,
@@ -4155,7 +4161,9 @@ pub const IndexWriter = struct {
         fork.current.release();
         fork.current = snapshot_ref;
         fork.next_epoch = snapshot_ref.epoch + 1;
-        for (snapshot_ref.segments) |segment| fork.next_segment_id = @max(fork.next_segment_id, segment.id + 1);
+        for (snapshot_ref.segments) |segment| {
+            if (!isLevel0SegmentId(segment.id)) fork.next_segment_id = @max(fork.next_segment_id, segment.id + 1);
+        }
         return fork;
     }
 
@@ -4744,7 +4752,7 @@ pub const IndexWriter = struct {
             .shared = shared,
         };
 
-        if (seg_id >= self.next_segment_id) self.next_segment_id = seg_id + 1;
+        if (!isLevel0SegmentId(seg_id) and seg_id >= self.next_segment_id) self.next_segment_id = seg_id + 1;
 
         var global_field_lens = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
         errdefer global_field_lens.deinit(self.alloc);
@@ -4964,7 +4972,7 @@ pub const IndexWriter = struct {
         cells_created = 0;
         var next_segment_id = self.next_segment_id;
         for (replacements) |replacement| {
-            if (replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
+            if (!isLevel0SegmentId(replacement.id) and replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
         }
         return .{
             .writer = self,

@@ -1276,8 +1276,8 @@ pub const WriterLane = struct {
     /// calling `refresh` at all.
     fn mightNeedRefreshAdmission(connection: *Connection, root: *h.Handle, intent: api.StorageIntent) bool {
         if (connection.options.profile != .native or connection.options.open_mode != .writer) return false;
-        if (Connection.usesCapacityAdmission(root)) return true;
         if (intent != .mutation) return false;
+        if (Connection.usesCapacityAdmission(root)) return true;
         return connection.needsReuseAdmission(root) catch true;
     }
 
@@ -4826,10 +4826,9 @@ pub const Connection = struct {
             self.gate.mutex.unlock(io);
             return null;
         };
-        // Pending SQL recovery writes on entry; capacity admission may prove.
-        if (root.sql_commit_recovery_needed or root.sql_ddl_recovery_needed or
-            (self.options.profile == .native and self.options.open_mode == .writer and usesCapacityAdmission(root)))
-        {
+        // Pending SQL recovery writes on entry. Capacity admission proves
+        // writes only: a read never allocates, so it keeps the reader slot.
+        if (root.sql_commit_recovery_needed or root.sql_ddl_recovery_needed) {
             lane.endRead();
             self.gate.mutex.unlock(io);
             return null;
@@ -5053,8 +5052,9 @@ pub const Connection = struct {
             error.MaintenanceTurnBusy => try self.refreshAfterMaintenanceTurn(lease, skip_lane_wait),
             else => return err,
         };
-        if (self.options.profile == .native and self.options.open_mode == .writer and
-            (usesCapacityAdmission(root) or (intent == .mutation and try self.needsReuseAdmission(root))))
+        // Capacity and reuse proofs admit writes; a read never waits on one.
+        if (self.options.profile == .native and self.options.open_mode == .writer and intent == .mutation and
+            (usesCapacityAdmission(root) or try self.needsReuseAdmission(root)))
         {
             const io = h.handleLockIo();
             // Verification can be published just before its reader is closed.
