@@ -115,6 +115,47 @@ fn generation(txn: anytype, marker_key: []const u8, epoch: u64) !?u64 {
     return std.mem.readInt(u64, marker[8..16], .little);
 }
 
+pub const RangeRead = enum { ordinary, bounded_probe };
+
+pub fn readRange(scope: anytype, a: std.mem.Allocator, group: u64, physical: []const u8, logical: []const u8, offset: u64, length: usize, mode: RangeRead) ![]const u8 {
+    return scope.getRange(physical, offset, length) catch |err| switch (err) {
+        error.Unsupported => {
+            if (try cachedRange(scope, a, group, logical, offset, length)) |cached| return cached;
+            if (mode == .bounded_probe) return error.EndOfStream;
+            const full = try scope.get(physical);
+            if (offset > full.len or length > full.len - offset) return error.EndOfStream;
+            return full[@intCast(offset)..][0..length];
+        },
+        else => return err,
+    };
+}
+
+test "replicated session bounded probe skips a full read on a cache miss" {
+    const Fake = struct {
+        physical: []const u8,
+        full_reads: usize = 0,
+
+        fn getRange(_: *@This(), _: []const u8, _: u64, _: usize) anyerror![]const u8 {
+            return error.Unsupported;
+        }
+
+        fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (!std.mem.eql(u8, key, self.physical)) return error.NotFound;
+            self.full_reads += 1;
+            return "header plus payload";
+        }
+    };
+    const a = std.testing.allocator;
+    const logical = session_prefix ++ "00112233445566778899aabbccddeeff";
+    const physical = try keyAlloc(a, 7, logical);
+    defer a.free(physical);
+    var scope = Fake{ .physical = physical };
+    try std.testing.expectError(error.EndOfStream, readRange(&scope, a, 7, physical, logical, 0, 6, .bounded_probe));
+    try std.testing.expectEqual(@as(usize, 0), scope.full_reads);
+    try std.testing.expectEqualStrings("header", try readRange(&scope, a, 7, physical, logical, 0, 6, .ordinary));
+    try std.testing.expectEqual(@as(usize, 1), scope.full_reads);
+}
+
 pub fn cachedRange(scope: anytype, a: std.mem.Allocator, group: u64, key: []const u8, offset: u64, length: usize) !?[]const u8 {
     if (!std.mem.startsWith(u8, key, session_prefix) or offset > cached_prefix_bytes or length > cached_prefix_bytes - offset) return null;
     const gen = (try cachedPrefixGeneration(scope, a, group)) orelse return null;

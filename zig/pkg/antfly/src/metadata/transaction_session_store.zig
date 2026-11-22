@@ -148,6 +148,14 @@ const Read = struct {
                 else => err,
             };
         }
+        pub fn probePrefix(self: *@This(), key: []const u8, length: usize) ![]const u8 {
+            const physical = try self.physicalKey(key);
+            defer self.alloc.free(physical);
+            return self.physical.probePrefix(physical, length) catch |err| switch (err) {
+                error.Unsupported => (try record.cachedRange(&self.physical, self.alloc, self.group, key, 0, length)) orelse error.Unsupported,
+                else => err,
+            };
+        }
         pub fn close(self: *@This()) void {
             self.physical.close();
         }
