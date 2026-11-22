@@ -135,6 +135,7 @@ pub const Adapter = struct {
     commit_fn: *const fn (*anyopaque, sql.Scope, transactions.Mutation) anyerror!sql.CommitResult,
     supports_range_guards: bool = false,
     observed_execution_started: bool = false,
+    begin_prepared_completion_only: bool = false,
     failed_commit_completion: @FieldType(operation.RequestContext, "sql_completion") = null,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
@@ -174,7 +175,7 @@ pub const Adapter = struct {
             .expected_revision = self.connection_revision orelse return error.SqlConnectionChanged,
             .txn_id = txn_id,
         } });
-        const info = self.registry.beginForPrincipalWithSettingsAndId(self.alloc, .{ .sql = .{
+        const info = self.registry.beginForPrincipalWithSettingsAndId(self.alloc, .{ .prepared_completion_only = self.begin_prepared_completion_only, .sql = .{
             .database = scope.database,
             .namespace = scope.namespace,
             .isolation = options.isolation,

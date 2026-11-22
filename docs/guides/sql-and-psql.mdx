@@ -268,6 +268,12 @@ HTTP is a request per statement. It rides the same port, auth, and TLS terminati
 
 Either way, the wire protocol is not a promise of full PostgreSQL compatibility. Tools that depend on `pg_catalog`, advisory locks, extensions, or transactional DDL need the Antfly-specific path (the Kysely dialect replaces catalog introspection and migration locking for this reason). An ambiguous commit returns SQLSTATE `40003` with a transaction receipt and `retryable: false`; reconcile it by transaction ID instead of replaying the write.
 
+## Prepared completion for HTTP transactions
+
+On upgraded owners, clients that use the SQL completion protocol can opt in at `BEGIN` by sending `X-Antfly-SQL-Transaction-Protocol: prepared-v1` alongside their SQL fence on a durable HTTP connection. Keep using the SQL fence on `COMMIT`. The owner persists the mode with the transaction and requires completion registration before any ambiguous commit work. Expired abort receipts for these transactions leave no legacy settlement marker.
+
+Enable this only on routes whose transaction owners and failover targets understand `prepared-v1`. Older owners cannot open a tagged transaction. Existing transactions and their legacy markers retain their original behavior.
+
 ## Standalone SQL completion upgrades
 
 An administrator can seal legacy SQL transaction pin creation on an exclusive standalone store. Upgrade the server and any process with direct write access to the store before sealing. Drain existing SQL completion registrations first. The seal is durable, survives restarts, and requires keeping the store on a version that understands it.

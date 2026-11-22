@@ -461,6 +461,7 @@ pub const CommitConflictKind = enum {
 };
 
 pub const BeginRequest = struct {
+    prepared_completion_only: bool = false,
     sync_level: db_mod.types.SyncLevel = .propose,
     sql: ?SqlMetadata = null,
 };
@@ -1022,6 +1023,7 @@ pub const Savepoint = struct {
 };
 
 pub const Session = struct {
+    prepared_completion_only: bool = false,
     graph_receipt: bool = false,
     graph_abort_tables: []SessionTableDetail = &.{},
     graph_admission_growth: usize = 0,
@@ -1151,6 +1153,7 @@ pub const Session = struct {
             .owner_node_id = self.owner_node_id,
             .principal = if (self.principal) |principal| try alloc.dupe(u8, principal) else null,
             .connection_id = self.connection_id,
+            .prepared_completion_only = self.prepared_completion_only,
             .begin_timestamp = self.begin_timestamp,
             .last_touched_timestamp = self.last_touched_timestamp,
             .sync_level = self.sync_level,
@@ -1657,6 +1660,15 @@ pub const DurableSessionStore = struct {
         return count;
     }
 
+    fn sqlAbortReceiptAcceptsLatePin(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId) !bool {
+        const key = try makeSqlAbortReceiptKey(self.alloc, id);
+        defer self.alloc.free(key);
+        const raw = txn.get(key) catch |err| if (err == error.NotFound) return false else return err;
+        var receipt = try decodeSqlAbortReceipt(self.alloc, id, raw);
+        defer receipt.deinit(self.alloc);
+        return !receipt.prepared_completion_only;
+    }
+
     fn sqlAbortProofExists(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId) !bool {
         const key = try makeSessionCompletionKey(self.alloc, id);
         defer self.alloc.free(key);
@@ -1977,12 +1989,12 @@ pub const DurableSessionStore = struct {
             const settled = if (try self.loadSessionTxn(txn, id)) |loaded| live: {
                 var session = loaded;
                 defer session.deinit(self.alloc);
+                if (session.prepared_completion_only and mode != .prepare) return error.CompletionUnavailable;
                 break :live sessionCompletionSettled(session) or (mode != .prepare and !session.commit_execution_started);
             } else receipt: {
                 if (mode == .prepare or mode == .atomic_pin) return error.SqlTransactionOutcomeUnknown;
                 if (!try self.sqlAbortProofExists(txn, id)) {
-                    const result = try readSqlAbortStatus(txn, self.alloc, id, .all);
-                    if (result != .found or result.found.disposition != .aborted) return error.SqlTransactionOutcomeUnknown;
+                    if (!try self.sqlAbortReceiptAcceptsLatePin(txn, id)) return error.SqlTransactionOutcomeUnknown;
                 }
                 break :receipt true;
             };
@@ -2114,6 +2126,7 @@ pub const DurableSessionStore = struct {
                 .owner_node_id = session.owner_node_id,
                 .principal = session.principal,
                 .connection_id = session.connection_id,
+                .prepared_completion_only = session.prepared_completion_only,
                 .begin_timestamp = session.begin_timestamp,
                 .last_touched_timestamp = session.last_touched_timestamp,
                 .sync_level = session.sync_level,
@@ -2121,7 +2134,7 @@ pub const DurableSessionStore = struct {
                 .terminal_abort = true,
             };
             touchSession(&receipt);
-            if (!separate_receipt) {
+            if (!separate_receipt and !session.prepared_completion_only) {
                 const encoded = try encodeSessionRecord(self.alloc, receipt);
                 defer self.alloc.free(encoded);
                 try self.putSessionAndExpiryTxn(txn, key, encoded, receipt, .{ .expected = expected, .guard = guard });
@@ -2142,7 +2155,7 @@ pub const DurableSessionStore = struct {
         defer self.alloc.free(receipt_key);
         const expiry_key = try makeExpiryKey(self.alloc, sql_abort_expiry_prefix, receipt.last_touched_timestamp, receipt.txn_id);
         defer self.alloc.free(expiry_key);
-        try self.putSqlAbortProof(txn, receipt.txn_id);
+        if (!receipt.prepared_completion_only) try self.putSqlAbortProof(txn, receipt.txn_id);
         try txn.put(receipt_key, encoded);
         try txn.put(expiry_key, &.{});
     }
@@ -2353,7 +2366,7 @@ pub const DurableSessionStore = struct {
         var receipt = try decodeSqlAbortReceipt(self.alloc, id, raw);
         defer receipt.deinit(self.alloc);
         if (receipt.last_touched_timestamp >= cutoff) return false;
-        if (!try self.sqlAbortProofExists(txn, id)) try self.putSqlAbortProof(txn, id);
+        if (!receipt.prepared_completion_only and !try self.sqlAbortProofExists(txn, id)) try self.putSqlAbortProof(txn, id);
         const expiry_key = try makeExpiryKey(self.alloc, sql_abort_expiry_prefix, receipt.last_touched_timestamp, id);
         defer self.alloc.free(expiry_key);
         try txn.delete(expiry_key);
@@ -2388,7 +2401,7 @@ pub const DurableSessionStore = struct {
         // Deletion and its terminal witness share one storage commit.
         if (previous.commit_execution_started and !sessionCompletionSettled(previous)) return error.SqlTransactionOutcomeUnknown;
         try self.preserveCompletionTxn(txn, previous, true);
-        if (isLegacySqlAbortReceipt(previous)) try self.putSqlAbortProof(txn, txn_id);
+        if (!previous.prepared_completion_only and isLegacySqlAbortReceipt(previous)) try self.putSqlAbortProof(txn, txn_id);
         const expiry_key = try makeSessionExpiryKey(self.alloc, previous.last_touched_timestamp, txn_id);
         defer self.alloc.free(expiry_key);
         txn.delete(expiry_key) catch |err| switch (err) {
@@ -3179,6 +3192,7 @@ pub const SessionRegistry = struct {
             .owner_node_id = owner_node_id,
             .principal = if (principal) |value| try alloc.dupe(u8, value) else null,
             .connection_id = connection_id,
+            .prepared_completion_only = req.prepared_completion_only,
             .begin_timestamp = now,
             .last_touched_timestamp = now,
             .sync_level = req.sync_level,
@@ -3376,6 +3390,7 @@ pub const SessionRegistry = struct {
     }
 
     pub const SqlState = struct {
+        prepared_completion_only: bool = false,
         version: DurableSessionStore.Version,
         metadata: SqlMetadata,
         setting_active: SettingEntries = .empty,
@@ -3388,7 +3403,7 @@ pub const SessionRegistry = struct {
 
         fn fromSession(alloc: std.mem.Allocator, session: *const Session) !?SqlState {
             const metadata = session.sql orelse return null;
-            var result: SqlState = .{ .version = DurableSessionStore.Version.of(session.*), .metadata = try metadata.clone(alloc), .connection_id = session.connection_id, .owner_node_id = session.owner_node_id, .execution_started = session.commit_execution_started, .terminal = if (session.terminal_commit) |terminal| terminal.status else null, .terminal_abort = session.terminal_abort, .savepoints = session.savepoints.count() };
+            var result: SqlState = .{ .prepared_completion_only = session.prepared_completion_only, .version = DurableSessionStore.Version.of(session.*), .metadata = try metadata.clone(alloc), .connection_id = session.connection_id, .owner_node_id = session.owner_node_id, .execution_started = session.commit_execution_started, .terminal = if (session.terminal_commit) |terminal| terminal.status else null, .terminal_abort = session.terminal_abort, .savepoints = session.savepoints.count() };
             errdefer result.deinit(alloc);
             result.setting_active = try cloneSettingEntries(alloc, session.setting_active.items);
             return result;
@@ -7484,6 +7499,14 @@ fn checkSqlReader(session: *const Session, principal: []const u8, owner: u64) !v
 // rewrite semantics. An older writer drops the field and selects legacy decode.
 const reader_field = "\"reader_v1\":\"";
 const reader_payload_len = 41;
+const prepared_session_header = session_record.prepared_session_header;
+
+fn sessionRecordHeader(bytes: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, bytes, prepared_session_header)) return prepared_session_header;
+    if (std.mem.startsWith(u8, bytes, session_record.bound_session_header)) return session_record.bound_session_header;
+    return "{";
+}
+
 const reader_prefix_len = session_record.bound_session_header.len + reader_field.len + 2 * reader_payload_len + 2;
 
 comptime {
@@ -7530,7 +7553,7 @@ fn sqlPrefixPayload(session: *const Session) ![payload_len]u8 {
 }
 
 fn parseSqlPrefix(bytes: []const u8, name: []const u8) !?[payload_len]u8 {
-    const header = if (std.mem.startsWith(u8, bytes, session_record.bound_session_header)) @as([]const u8, session_record.bound_session_header) else "{";
+    const header = sessionRecordHeader(bytes);
     if (!std.mem.startsWith(u8, bytes, header) or !std.mem.startsWith(u8, bytes[header.len..], name)) return null;
     const field = bytes[header.len + name.len ..];
     if (field.len < encoded_len + 2 or !std.mem.startsWith(u8, field[encoded_len..], "\",")) return error.InvalidTransactionSessionRecord;
@@ -7543,7 +7566,7 @@ fn parseSqlPrefix(bytes: []const u8, name: []const u8) !?[payload_len]u8 {
 fn checkReaderPrefix(bytes: []const u8, principal: []const u8, owner: u64) !bool {
     if (try parseConnectionPrefix(bytes)) |payload| return checkReaderIdentity(payload[0..41], principal, owner);
     if (try parseSqlPrefix(bytes, sql_field)) |payload| return checkReaderIdentity(payload[0..41], principal, owner);
-    const header: []const u8 = if (std.mem.startsWith(u8, bytes, session_record.bound_session_header)) session_record.bound_session_header else "{";
+    const header: []const u8 = sessionRecordHeader(bytes);
     if (!std.mem.startsWith(u8, bytes, header) or !std.mem.startsWith(u8, bytes[header.len..], reader_field)) return false;
     const encoded = bytes[header.len + reader_field.len ..];
     if (encoded.len < 2 * reader_payload_len + 2 or !std.mem.startsWith(u8, encoded[2 * reader_payload_len ..], "\",")) return error.InvalidTransactionSessionRecord;
@@ -7678,7 +7701,7 @@ fn sessionPrincipalCandidate(scope: *backend_erased.ReadScope, alloc: std.mem.Al
 
 fn sessionPrincipalMatchesPrefix(raw: []const u8, principal: ?[]const u8, digest: *const [32]u8) !?bool {
     if (raw.len < graph_status_read_len) return null;
-    const header: []const u8 = if (std.mem.startsWith(u8, raw, session_record.bound_session_header)) session_record.bound_session_header else "{";
+    const header: []const u8 = sessionRecordHeader(raw);
     const fields = raw[header.len..];
     if (std.mem.startsWith(u8, fields, graph_status_field)) {
         var bits: [graph_status_bytes]u8 = undefined;
@@ -7811,7 +7834,7 @@ fn recoveryPrefixMayNeedWork(scope: *backend_erased.ReadScope, key: []const u8, 
 }
 
 fn graphStatusFromPrefix(raw: []const u8, id: db_mod.types.TxnId, filter: SessionRegistry.StatusPrincipalFilter) !?GraphStatusLookup {
-    const header: []const u8 = if (std.mem.startsWith(u8, raw, session_record.bound_session_header)) session_record.bound_session_header else "{";
+    const header: []const u8 = sessionRecordHeader(raw);
     if (raw.len < graph_status_read_len or !std.mem.startsWith(u8, raw[header.len..], graph_status_field)) return null;
     const start = header.len + graph_status_field.len;
     var bits: [graph_status_bytes]u8 = undefined;
@@ -7867,7 +7890,7 @@ fn encodeSessionRecordWithListingLimit(alloc: std.mem.Allocator, session: Sessio
         while (saves.next()) |save| if (save.snapshot.bound_catalog_incarnation != null) break :blk true;
         break :blk false;
     };
-    try out.appendSlice(alloc, if (bound) session_record.bound_session_header else "{");
+    try out.appendSlice(alloc, if (session.prepared_completion_only) prepared_session_header else if (bound) session_record.bound_session_header else "{");
     if (session.graph_receipt) {
         try encodeGraphStatus(&out, alloc, &session);
     } else if (session.connection_id != null or session.sql != null) {
@@ -8072,7 +8095,7 @@ fn decodeOwnedSealedRecovery(alloc: std.mem.Allocator, id: db_mod.types.TxnId, b
     };
     defer decoded.deinit();
     const header = decoded.value;
-    if (header.session_format != 2) return error.InvalidTransactionSessionRecord;
+    if (header.session_format != 2 and header.session_format != 3) return error.InvalidTransactionSessionRecord;
     if ((header.owner_node_id orelse sessionOwnerNodeId(id)) != owner) return null;
     const plan = header.execution_plan orelse return null;
     if (!header.commit_execution_started) return error.InvalidTransactionSessionRecord;
@@ -8082,6 +8105,7 @@ fn decodeOwnedSealedRecovery(alloc: std.mem.Allocator, id: db_mod.types.TxnId, b
     var session: Session = .{
         .owner_alloc = alloc,
         .txn_id = id,
+        .prepared_completion_only = header.session_format == 3,
         .owner_node_id = owner,
         .begin_timestamp = header.begin_timestamp,
         .last_touched_timestamp = header.begin_timestamp,
@@ -8218,12 +8242,16 @@ fn decodeSessionForListing(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw
 }
 
 fn decodeSessionObject(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, obj: std.json.ObjectMap) !Session {
+    var prepared_completion_only = false;
     if (obj.get("session_format")) |version| {
-        if (version != .number_string or !std.mem.eql(u8, version.number_string, "2")) return error.InvalidTransactionSessionRecord;
+        if (version != .number_string) return error.InvalidTransactionSessionRecord;
+        prepared_completion_only = std.mem.eql(u8, version.number_string, "3");
+        if (!prepared_completion_only and !std.mem.eql(u8, version.number_string, "2")) return error.InvalidTransactionSessionRecord;
     }
     var session: Session = .{
         .owner_alloc = alloc,
         .txn_id = txn_id,
+        .prepared_completion_only = prepared_completion_only,
         .owner_node_id = if (obj.get("owner_node_id")) |value|
             switch (value) {
                 .integer => |v| try nonNegativeRecordInteger(v),

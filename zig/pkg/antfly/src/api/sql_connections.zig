@@ -635,9 +635,10 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
         const id: [32]u8 = @splat(digit);
         const txn_id = transactions.newSessionTxnId(7);
         saved_id.* = txn_id;
+        registry.durable_scope = if (request_persisted) .cluster_shared else .node_local;
         _ = try mutate(&store, .{ .create = .{ .id = id, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 1);
         _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 1, .txn_id = txn_id } }, "alice", 7, 2);
-        _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
+        _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .prepared_completion_only = request_persisted, .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
         _ = try mutate(&store, .{ .bind = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2);
         const guard = try registry.mutation(alloc, txn_id, 7);
         if (request_persisted) {
@@ -645,6 +646,11 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
             defer session.deinit(alloc);
             session.commit_body_digest = @splat(4);
             try store.saveForTest(session, null);
+        }
+        const reference: [16]u8 = @splat(digit);
+        if (request_persisted) {
+            try std.testing.expectError(error.CompletionUnavailable, store.pinCompletion(txn_id, reference));
+            _ = try store.changeCompletionReference(txn_id, reference, false, null, .prepare);
         }
         if (request_persisted) _ = try mutate(&store, .{ .uncertain = .{ .id = id, .guard = guard } }, "alice", 7, 2);
         try reconcileExpired(&store, &registry, alloc, 999);
@@ -658,16 +664,21 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
         try std.testing.expectEqual(@as(u64, 0), disposition.lease_expires_at);
         try std.testing.expect((try registry.getStatusForPrincipal(alloc, txn_id, "bob")) == null);
         try std.testing.expect((try store.load(txn_id)) == null);
-        const reference: [16]u8 = @splat(digit);
-        try store.pinCompletion(txn_id, reference);
+        if (!request_persisted) try store.pinCompletion(txn_id, reference);
         try std.testing.expect(try store.completionReferenceSettled(txn_id, reference));
     }
     try std.testing.expectEqual(@as(usize, 2), try registry.cleanupExpiredSqlAbortReceipts(alloc, std.math.maxInt(u64)));
     for (transaction_ids, [_]u8{ 'c', 'd' }) |id, digit| {
         try std.testing.expect((try registry.getStatusForPrincipal(alloc, id, "alice")) == null);
         const delayed_reference: [16]u8 = @splat(digit);
-        try store.pinCompletion(id, delayed_reference);
-        try std.testing.expect(try store.completionReferenceSettled(id, delayed_reference));
+        if (digit == 'c') {
+            try store.pinCompletion(id, delayed_reference);
+            try std.testing.expect(try store.completionReferenceSettled(id, delayed_reference));
+        } else {
+            try std.testing.expectError(error.SqlTransactionOutcomeUnknown, store.pinCompletion(id, delayed_reference));
+            try std.testing.expect(!try store.completionSettled(id));
+            try std.testing.expect(try store.completionReferenceSettled(id, @splat('b')));
+        }
     }
 }
 

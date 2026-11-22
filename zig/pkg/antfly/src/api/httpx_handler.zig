@@ -1908,7 +1908,7 @@ pub const AntflyApiHandler = struct {
         var headers: std.ArrayList(http_common.RequestHeader) = .empty;
         defer headers.deinit(ctx.allocator);
         const limits = @import("antfly_public_limits").Execution;
-        for ([_][]const u8{ http_server_mod.trusted_principal_header, "X-Antfly-SQL-Fence", "X-Antfly-SQL-Resource-Hop", "x-antfly-sql-connection-id", limits.timeout_header, limits.scan_rows_header, limits.memory_header, limits.spill_header }) |name| {
+        for ([_][]const u8{ http_server_mod.trusted_principal_header, "X-Antfly-SQL-Fence", "X-Antfly-SQL-Resource-Hop", "X-Antfly-SQL-Transaction-Protocol", "x-antfly-sql-connection-id", limits.timeout_header, limits.scan_rows_header, limits.memory_header, limits.spill_header }) |name| {
             if (ctx.header(name)) |value| try headers.append(ctx.allocator, .{ .name = name, .value = value });
         }
         const completion = try requestCompletion(ctx);
@@ -2265,6 +2265,7 @@ pub const AntflyApiHandler = struct {
             ) catch {};
         }
         return .{
+            .sql_prepared_completion_only = if (ctx.header("X-Antfly-SQL-Transaction-Protocol")) |version| std.mem.eql(u8, version, "prepared-v1") else false,
             .sql_completion = if (ctx.getData("antfly-sql-completion-admission")) |raw| if (@as(*RequestCompletion, @ptrCast(@alignCast(raw))).server != null) .{ .ptr = raw, .prepare_transaction = RequestCompletion.prepareTransaction, .prepare_metadata = RequestCompletion.prepareMetadata, .reject_metadata = RequestCompletion.rejectMetadata } else null else null,
             .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null) .{
                 .ptr = ctx,
