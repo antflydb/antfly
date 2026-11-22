@@ -1416,14 +1416,8 @@ pub const Region = struct {
         defer allocator.free(canonical_db_path);
         const region_path = try std.fmt.allocPrint(allocator, "{s}.aflite-lock", .{canonical_db_path});
         defer allocator.free(region_path);
-        // Best-effort: most callers reach this only once a real data file
-        // exists at `db_path` (`inode_lock.ensureRegion`, every migrated
-        // writer/reader path), and for those this is the data file's real
-        // inode, checked against the header below. A handful of this
-        // module's own tests exercise the sidecar alone, with no backing
-        // data file ever created at `db_path` -- for those this is simply
-        // 0, and the comparison below treats 0 on either side as "not
-        // tied to a real file," never a mismatch.
+        // Standalone sidecars can be opened without a backing file. Once
+        // a data file exists, the header must match its device and inode.
         const db_identity: ?file_identity.NativeFileIdentity = file_identity.nativePathIdentity(canonical_db_path) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return error.RegionUnavailable,
@@ -1491,7 +1485,7 @@ pub const Region = struct {
         if (need_init and !fresh_file) {
             // A file that already existed and is at least header-sized,
             // but fails validation (or belongs to a different data file,
-            // per the inode check above): prove no live process is
+            // per the identity check above): prove no live process is
             // relying on it before even considering a rebuild.
             try ensureNoLivePeer(io, fd_entry, &existing_raw, size);
         }
