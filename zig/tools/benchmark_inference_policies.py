@@ -64,7 +64,10 @@ def validate_endpoint(endpoint):
 
 def request(endpoint, route, body, timeout):
     validate_endpoint(endpoint)
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Antfly-Inference-Timeout-Ms": str(max(1, min(3600000, int(timeout * 1000)))),
+    }
     token = os.environ.get("ANTFLY_INFERENCE_TOKEN")
     if token:
         headers["Authorization"] = "Bearer " + token

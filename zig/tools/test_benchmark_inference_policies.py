@@ -186,6 +186,9 @@ class PolicyBenchmarkTests(unittest.TestCase):
                 self.reply(200, {"data": [{"model": model, "backend": "native"}]})
 
             def do_POST(self):
+                if self.headers.get("X-Antfly-Inference-Timeout-Ms") != "600000":
+                    self.reply(400, {"error": "MISSING_INFERENCE_DEADLINE"})
+                    return
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 calls.append((self.path, body))
                 if self.path == "/ai/v1/embeddings" and body.get("input") == [
