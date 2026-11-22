@@ -24,7 +24,7 @@ here (see [Alternatives](#alternatives-considered)).
 | `export --quantize-plan` | Implemented, tested; fails closed |
 | Fused-kernel groups and fusion targets | Implemented from dispatch code; device speed not yet measured |
 | Embedding cosine sensitivity (Antfly runtime and PyTorch) | Implemented; measured on bge-base-en-v1.5 |
-| Token-KL sensitivity for decoders (PyTorch) | Implemented; measured on Qwen3-0.6B |
+| Token-KL sensitivity for decoders (PyTorch) | Implemented; measured on Qwen3-0.6B (2x lower KL than `q5_k` at its size, untied) |
 | Device benchmark (Metal, CUDA) | Script implemented; runs pending |
 | Bundle exports (GLiNER, ClipClap, Florence-2) | Not supported; flags are rejected |
 
@@ -138,8 +138,9 @@ candidates are the combinations the chosen `--fusion-target` fuses
 (`mixed_plan.fusionRule`), with bytes and losses summed over members.
 `portable` (the default) keeps only combinations fused on both runtimes, so
 one file is fast on either; `metal` and `cuda` use one runtime's rules;
-`--untied` ignores groups. `--quantize-plan` prints a warning for every group a
-plan leaves unfused on Metal or CUDA.
+`--untie qkv` or `--untie gate_up` ignores one kind and `--untied` all.
+`--quantize-plan` prints a warning for every group a plan leaves unfused on
+Metal or CUDA.
 
 The cost of leaving a fused kernel has not been measured for these exact
 fallbacks. For a different fallback off the fused frame (non-greedy sampling
@@ -203,9 +204,32 @@ Plans from the data-free `weight_sse` loss at 5.5 bits per weight:
 | uniform q6_k | 6.56 | 0.0145 | 0.915 | 28 QKV unfused on both; 28 gate/up unfused on CUDA |
 | uniform q8_0 | 8.50 | 0.0014 | 0.986 | 0 |
 
-The weight-error proxy does not find better plans for decoders, and tying for
-portability costs quality when the plan is chosen badly. Plans from measured
-token KL: TODO(results), filled in from `torch_lm_sensitivity.py measure`.
+The weight-error proxy does not find better plans for decoders. Plans from
+measured token KL (`torch_lm_sensitivity.py measure` on 256 calibration
+tokens), on the same 512 evaluation tokens:
+
+| Plan (token KL) | bits/weight | token KL | top-1 agreement | vs uniform q5_k |
+|---|---:|---:|---:|---:|
+| `portable` | 5.00 | 0.1226 | 0.762 | |
+| `metal` | 5.00 | 0.1101 | 0.789 | |
+| gate/up tied, Q/K/V free | 5.00 | 0.0901 | 0.791 | equal KL, 9% fewer bytes |
+| untied | 5.00 | 0.0915 | 0.803 | equal KL, 9% fewer bytes |
+| `portable` | 5.50 | 0.0854 | 0.801 | 5% lower KL |
+| `metal` | 5.50 | 0.0727 | 0.852 | 19% lower KL |
+| gate/up tied, Q/K/V free | 5.50 | 0.0448 | 0.850 | 2.0x lower KL |
+| untied | 5.50 | 0.0426 | 0.850 | 2.1x lower KL |
+
+Measured token KL finds plans with half of `q5_k`'s KL at the same size, but
+today's fusions keep most of that gain out of reach: the `portable` plan keeps
+only 5% of it. The constraint that costs is Q/K/V, not gate/up. The untied
+plan stores V as `q6_k` in 27 of 28 layers with Q and K mostly at `q5_k`,
+while the only mixed QKV combination fused today (`q5_k`/`q4_k`/`q4_k`, Metal)
+raises Q instead. Tying gate/up and leaving Q/K/V free (the "gate/up tied" row,
+`--fusion-target metal --untie qkv`) loses almost nothing against untied.
+Summed single-tensor losses predicted the held-out KL of these plans within
+15%. The sample is small (one 0.6B model, 512 tokens); the device runs below
+should repeat it on Gemma 4. Details:
+`zig/pkg/inference/scripts/quant_plan/results/qwen3-0.6b.json`.
 
 ## Qualification plan
 
@@ -216,7 +240,7 @@ speed and whether it keeps its quality on the real runtime:
    uniformly, then `torch_lm_sensitivity.py measure --device cuda|mps` on
    calibration windows.
 2. Plan at matched budgets (for example 4.5, 5.0 and 5.5 bits) for `portable`,
-   `metal`, `cuda` and `--untied`.
+   `metal`, `cuda`, `--untied`, and `metal`/`cuda` with `--untie qkv`.
 3. Quality: `torch_lm_sensitivity.py evaluate` on disjoint windows.
 4. Speed: `bench_variants.py prepare` then `run --backend metal` and
    `run --backend cuda` with `--repeat 3`. It reports decode tok/s, prefill
@@ -230,18 +254,27 @@ Acceptance, per model and backend:
   format, and decode tok/s within 5% of it.
 - An untied plan that splits gate/up shows the Metal fused-block fallback in
   the counters; the size of that slowdown is recorded.
+- A plan with tied gate/up and free Q/K/V (`quantize-plan --untie qkv`;
+  `bench_variants.py` targets `metal-qkv-free` and `cuda-qkv-free`) is timed
+  against the `portable` plan: the difference is what a per-projection-format
+  fused QKV kernel could recover.
 - Greedy agreement with `uniform-q8_0` does not fall below the uniform format
   of the same size.
 
 ## Alternatives considered
 
-- Fused kernels that take mixed formats inside one dispatch (for example gate
-  in q6_k and up in q4_k). Tying the group costs little quality and avoids
-  multiplying routes that need tuning and conformance evidence. If measurements
-  show a tied group needs a combination no runtime fuses, add that format to
-  the existing fused route through the quant kernel compiler
-  (`zig/pkg/inference/QUANT_KERNEL_COMPILER.md`), for example a uniform
-  q5_k/q6_k QKV route.
+- Fused kernels that take mixed formats inside one dispatch. For gate/up this
+  is not worth it: tying the pair costs almost nothing (Qwen3-0.6B above). For
+  Q/K/V it is the one kernel the measurements support: a fused QKV projection
+  whose three outputs each use their own format (each output already has its
+  own rows, so this is a per-output decoder choice rather than a mixed block),
+  on Metal and CUDA, built through the quant kernel compiler
+  (`zig/pkg/inference/QUANT_KERNEL_COMPILER.md`). With it, plus CUDA gate/up
+  pair routes for `q5_k` and `q6_k` (Metal already fuses them), portable plans
+  would reach the "gate/up tied, Q/K/V free" row. Build it only if the device
+  runs show the unfused QKV fallback costs measurable decode speed; if three
+  separate matmuls are nearly as fast, untied Q/K/V plans already get the
+  quality.
 - Trellis-coded weights (QTIP, as used by LookAtMyQuant). Better below 3 bits,
   but a new format with a runtime Hadamard transform, an offline Viterbi
   encoder and new kernels on every backend; revisit only for sub-3-bit
@@ -259,8 +292,8 @@ Acceptance, per model and backend:
 
 - Token-KL and output-space plans for Gemma 4 E2B/E4B, Whisper (WER) and GLiNER
   (span F1); plans for bundle exports.
-- A fused uniform q5_k/q6_k QKV route if device runs show tied plans are capped
-  there.
+- A fused QKV route with per-projection formats, and CUDA `q5_k`/`q6_k` gate/up
+  pair routes, if device runs show the unfused fallbacks cost decode speed.
 - Row-group allocation for token tables (frequency-ranked rows), which matters
   for EmbeddingGemma's and Gemma's 262k-token vocabularies.
 - Runtime selection of mixed variants through `antfly_inference_variants.json`.

@@ -492,6 +492,9 @@ pub const SelectOptions = struct {
     formats: ?[]const []const u8 = null,
     /// Fusion rules for groups that declare a `kind`.
     fusion_target: FusionTarget = .portable,
+    /// Groups of these kinds are ignored, e.g. to plan Q/K/V freely for a
+    /// runtime that fuses them with per-projection formats.
+    untie: std.EnumSet(FusionKind) = .empty,
 };
 
 /// One format per input tensor, aligned with the `items` passed to `select`.
@@ -558,6 +561,9 @@ pub fn select(
 
     const active_groups = if (options.untied) &[_]Group{} else groups;
     for (active_groups) |group| {
+        if (group.kind) |kind| {
+            if (options.untie.contains(kind)) continue;
+        }
         if (group.members.len < 2) return error.InvalidGroup;
         const members = try a.alloc(usize, group.members.len);
         for (group.members, members) |name, *slot| {
@@ -790,6 +796,9 @@ pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--untied")) {
             options.untied = true;
+        } else if (std.mem.eql(u8, arg, "--untie") and i + 1 < args.len) {
+            options.untie.insert(std.meta.stringToEnum(FusionKind, args[i + 1]) orelse return usage());
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--fusion-target") and i + 1 < args.len) {
             options.fusion_target = std.meta.stringToEnum(FusionTarget, args[i + 1]) orelse return usage();
             i += 1;
@@ -840,14 +849,15 @@ pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
 
 fn usage() error{InvalidArguments} {
     std.debug.print(
-        \\usage: antfly inference quantize-plan --sensitivity <file.json> (--bits-per-weight <x> | --budget-bytes <n>) [--formats <csv>] [--fusion-target portable|metal|cuda | --untied] [--output <plan.json>]
+        \\usage: antfly inference quantize-plan --sensitivity <file.json> (--bits-per-weight <x> | --budget-bytes <n>) [--formats <csv>] [--fusion-target portable|metal|cuda] [--untie gate_up|qkv]... [--untied] [--output <plan.json>]
         \\
         \\Chooses one format per tensor from a sensitivity file so the summed loss is
         \\smallest within the budget. The budget covers only the tensors the file lists.
         \\Tensors in a group (fused kernels such as FFN gate/up and attention Q/K/V)
         \\get a format combination the target runtime fuses: portable (default) keeps
         \\only combinations fused on both Metal and CUDA, metal or cuda one runtime's.
-        \\--untied ignores groups for backends without those fusions. --formats limits
+        \\--untie <kind> ignores one kind of group; --untied ignores all groups, for
+        \\backends without those fusions. --formats limits
         \\the candidates, e.g. to the formats a target backend has fast routes for.
         \\Apply the plan with: antfly inference export <model-dir> --target gguf --format <base> --quantize-plan <plan.json>
         \\
@@ -1183,6 +1193,13 @@ test "fusion rules differ by target and portable is their intersection" {
     defer portable.deinit();
     try std.testing.expectEqualStrings("q4_k", portable.formats[0]);
     try std.testing.expectEqualStrings("q4_k", portable.formats[1]);
+    // Untying gate_up frees the pair; untying qkv leaves it tied.
+    var untie_gate_up = try select(allocator, &items, &groups, 300, .{ .untie = .initOne(.gate_up) });
+    defer untie_gate_up.deinit();
+    try std.testing.expectEqualStrings("q6_k", untie_gate_up.formats[0]);
+    var untie_qkv = try select(allocator, &items, &groups, 300, .{ .untie = .initOne(.qkv) });
+    defer untie_qkv.deinit();
+    try std.testing.expectEqualStrings("q4_k", untie_qkv.formats[0]);
 }
 
 test "parse rejects unknown schemas and duplicate names" {

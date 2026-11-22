@@ -28,7 +28,7 @@ a slowdown can be traced to the fused kernel it lost.
 
     bench_variants.py prepare --antfly antfly-inference --model MODEL \\
         --sensitivity kl.json --base-format q4_k --budgets 5.0,5.5 \\
-        --targets portable,metal,cuda,untied --uniform q4_0,q4_k,q5_k,q8_0 \\
+        --targets portable,metal,cuda,untied,metal-qkv-free,cuda-qkv-free --uniform q4_0,q4_k,q5_k,q8_0 \\
         --out bench/
     bench_variants.py run --antfly antfly-inference --out bench/ \\
         --backend metal --reference uniform-q8_0 --max-tokens 128 --repeat 3 \\
@@ -97,6 +97,17 @@ def copy_sidecars(model: Path, out_dir: Path) -> None:
             shutil.copy2(entry, target)
 
 
+def target_flags(target: str) -> list[str]:
+    """`untied`, a fusion target (`portable`, `metal`, `cuda`), or a fusion
+    target with free Q/K/V (`metal-qkv-free`): the plan a QKV kernel with
+    per-projection formats would allow."""
+    if target == "untied":
+        return ["--untied"]
+    if target.endswith("-qkv-free"):
+        return ["--fusion-target", target.removesuffix("-qkv-free"), "--untie", "qkv"]
+    return ["--fusion-target", target]
+
+
 def prepare(args: argparse.Namespace) -> None:
     out = Path(args.out)
     (out / "plans").mkdir(parents=True, exist_ok=True)
@@ -160,9 +171,7 @@ def prepare(args: argparse.Namespace) -> None:
                     "--output",
                     str(plan),
                 ]
-                cmd += (
-                    ["--untied"] if target == "untied" else ["--fusion-target", target]
-                )
+                cmd += target_flags(target)
                 if args.formats:
                     cmd += ["--formats", args.formats]
                 run(cmd)
@@ -381,8 +390,8 @@ def main() -> None:
     )
     p.add_argument(
         "--targets",
-        default="portable,metal,cuda,untied",
-        help="csv of fusion targets (or untied)",
+        default="portable,metal,cuda,untied,metal-qkv-free,cuda-qkv-free",
+        help="csv of fusion targets, untied, or <target>-qkv-free (Q/K/V planned freely)",
     )
     p.add_argument("--formats", help="csv passed to quantize-plan --formats")
     r = sub.add_parser("run")

@@ -265,7 +265,7 @@ antfly inference export <model-dir> --target gguf --format q4_k \
 # 2. Allocate: one format per tensor, least summed loss within the budget.
 antfly inference quantize-plan --sensitivity sensitivity.json \
   --bits-per-weight 5.0 --output plan.json        # or --budget-bytes <n>
-  # [--fusion-target portable|metal|cuda | --untied] [--formats q4_k,q6_k,q8_0]
+  # [--fusion-target portable|metal|cuda] [--untie qkv] [--untied] [--formats q4_k,q6_k,q8_0]
 
 # 3. Export with the plan.
 antfly inference export <model-dir> --target gguf --format q4_k \
@@ -300,7 +300,8 @@ down and PLE. Two fusions constrain formats across tensors:
 `--quantize-sensitivity` writes these as `groups` (found by GGUF name,
 including `ffn_gate_exps`/`ffn_up_exps`), and `quantize-plan` gives each group
 one combination its `--fusion-target` fuses: `portable` (default, fused on both
-runtimes), `metal` or `cuda`. `--untied` ignores groups. `--quantize-plan`
+runtimes), `metal` or `cuda`. `--untie qkv` (or `gate_up`) ignores one kind
+of group and `--untied` ignores all. `--quantize-plan`
 prints a warning for every group a plan leaves unfused on Metal or CUDA. The
 rules and their dispatch-code sources are in `mixed_plan.fusionRule`; the
 design, measurements and qualification plan are in

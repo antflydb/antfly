@@ -1,0 +1,156 @@
+{
+  "model": "Qwen/Qwen3-0.6B (safetensors, bf16 source)",
+  "base_format": "q4_k",
+  "candidates": [
+    "q4_k",
+    "q5_k",
+    "q6_k",
+    "q8_0"
+  ],
+  "planned_tensors": 197,
+  "fused_groups": 56,
+  "corpus": "paragraphs from docs/ packed into 128-token windows; calibration windows 0-1 (256 tokens), evaluation windows 4-7 (512 tokens)",
+  "measurement": "torch_lm_sensitivity.py measure: one tensor in one format, all others dense; mean next-token KL(dense || quantized)",
+  "evaluation_token_kl_plans": {
+    "tokens": 512,
+    "results": [
+      {
+        "variant": "uniform q4_k",
+        "planned_bytes": 335241216,
+        "bits_per_weight": 4.5,
+        "token_kl": 0.31345248785544566,
+        "top1_agreement": 0.6830708661417323
+      },
+      {
+        "variant": "uniform q5_k",
+        "planned_bytes": 409739264,
+        "bits_per_weight": 5.5,
+        "token_kl": 0.08998360971766194,
+        "top1_agreement": 0.8307086614173228
+      },
+      {
+        "variant": "uniform q6_k",
+        "planned_bytes": 488893440,
+        "bits_per_weight": 6.5625,
+        "token_kl": 0.014532977201807218,
+        "top1_agreement": 0.9153543307086615
+      },
+      {
+        "variant": "uniform q8_0",
+        "planned_bytes": 633233408,
+        "bits_per_weight": 8.5,
+        "token_kl": 0.0013624260744710607,
+        "top1_agreement": 0.9862204724409449
+      },
+      {
+        "variant": "plan kl-portable-5.0.json",
+        "planned_bytes": 372375552,
+        "bits_per_weight": 4.9985,
+        "token_kl": 0.12261052769938792,
+        "top1_agreement": 0.7618110236220472
+      },
+      {
+        "variant": "plan kl-metal-5.0.json",
+        "planned_bytes": 372391936,
+        "bits_per_weight": 4.9987,
+        "token_kl": 0.11013396330705778,
+        "top1_agreement": 0.7893700787401575
+      },
+      {
+        "variant": "plan kl-untied-5.0.json",
+        "planned_bytes": 372400128,
+        "bits_per_weight": 4.9988,
+        "token_kl": 0.09153859446367879,
+        "top1_agreement": 0.8031496062992126
+      },
+      {
+        "variant": "plan kl-portable-5.5.json",
+        "planned_bytes": 409673728,
+        "bits_per_weight": 5.4991,
+        "token_kl": 0.08542661967239981,
+        "top1_agreement": 0.8011811023622047
+      },
+      {
+        "variant": "plan kl-metal-5.5.json",
+        "planned_bytes": 409714688,
+        "bits_per_weight": 5.4997,
+        "token_kl": 0.07274875490684209,
+        "top1_agreement": 0.8523622047244095
+      },
+      {
+        "variant": "plan kl-untied-5.5.json",
+        "planned_bytes": 409739264,
+        "bits_per_weight": 5.5,
+        "token_kl": 0.04264914707874688,
+        "top1_agreement": 0.8503937007874016
+      }
+    ]
+  },
+  "evaluation_weight_sse_plans": {
+    "tokens": 512,
+    "results": [
+      {
+        "variant": "uniform q4_k",
+        "planned_bytes": 335241216,
+        "bits_per_weight": 4.5,
+        "token_kl": 0.31345248785544566,
+        "top1_agreement": 0.6830708661417323
+      },
+      {
+        "variant": "uniform q5_k",
+        "planned_bytes": 409739264,
+        "bits_per_weight": 5.5,
+        "token_kl": 0.08998360971766194,
+        "top1_agreement": 0.8307086614173228
+      },
+      {
+        "variant": "uniform q6_k",
+        "planned_bytes": 488893440,
+        "bits_per_weight": 6.5625,
+        "token_kl": 0.014532977201807218,
+        "top1_agreement": 0.9153543307086615
+      },
+      {
+        "variant": "uniform q8_0",
+        "planned_bytes": 633233408,
+        "bits_per_weight": 8.5,
+        "token_kl": 0.0013624260744710607,
+        "top1_agreement": 0.9862204724409449
+      },
+      {
+        "variant": "plan portable-5.5.json",
+        "planned_bytes": 409739264,
+        "bits_per_weight": 5.5,
+        "token_kl": 0.11983921020988404,
+        "top1_agreement": 0.7598425196850394
+      },
+      {
+        "variant": "plan metal-5.5.json",
+        "planned_bytes": 409640960,
+        "bits_per_weight": 5.4987,
+        "token_kl": 0.0990592062942625,
+        "top1_agreement": 0.8090551181102362
+      },
+      {
+        "variant": "plan untied-5.5.json",
+        "planned_bytes": 409632768,
+        "bits_per_weight": 5.4986,
+        "token_kl": 0.09029068533829816,
+        "top1_agreement": 0.8267716535433071
+      }
+    ]
+  },
+  "proposed_kernels_note": "kl-proposed plans: gate/up tied with Metal's rule (one shared q4_0/q4_k/q5_k/q6_k/q8_0), Q/K/V unconstrained; simulates a QKV kernel with per-projection formats plus CUDA q5_k/q6_k gate/up routes",
+  "proposed_kernels": {
+    "5.0": {
+      "bits_per_weight": 5.0,
+      "token_kl": 0.0901,
+      "top1_agreement": 0.791
+    },
+    "5.5": {
+      "bits_per_weight": 5.4997,
+      "token_kl": 0.0448,
+      "top1_agreement": 0.85
+    }
+  }
+}
