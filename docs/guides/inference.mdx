@@ -82,6 +82,27 @@ Pull the referenced models into `models_dir` before starting the process. CLI fl
 override the file; see the [inference runtime reference](../reference/inference-runtime.md)
 for every setting, preload rules, and migrating older flat configs.
 
+## Inference-Only Executable
+
+From the `zig/` directory, build and start `antfly-inference`:
+
+```sh
+zig build inference-artifact -Doptimize=ReleaseFast
+zig-out/bin/antfly-inference run --config inference.json
+```
+
+The executable serves the same routes as `antfly inference run`. Use `/ai/v1`
+for embeddings, generation, reranking, reading, and other inference operations.
+Both `/ai/v1` and `/ml/v1` expose OpenAI-compatible `/embeddings` and
+`/chat/completions` routes. Use `/ml/v1` for traditional ML predictors and
+metrics, and `/healthz` and `/readyz` for operational probes.
+
+Models installed in the runtime can serve these operations. The listener also
+accepts configured OpenAI-compatible image readers for `/ai/v1/read`, including
+[llama.cpp-backed LightOnOCR](/docs/guides/models/lightonocr3#run-quantized-models-with-llamacpp).
+The database API gateway provides additional named provider and connection
+routing.
+
 ## Pulling Models
 
 Models come from Hugging Face by their full `owner/name` reference. Pull rejects all bare names and friendly aliases. The `hf:` prefix is accepted. Append `@revision` to request a branch, tag, or commit; omit it to use `main`. Each pull resolves one immutable snapshot for all files. See [Model Downloads](/docs/guides/model-downloads) for format selection and revision examples.

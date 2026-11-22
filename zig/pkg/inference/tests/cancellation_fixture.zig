@@ -33,7 +33,6 @@ const Fixture = struct {
     bounded_embed: bool,
     block_next: std.atomic.Value(bool) = .init(false),
     release_block: std.atomic.Value(bool) = .init(false),
-    execution_gate: std.atomic.Mutex = .unlocked,
     active: std.atomic.Value(usize) = .init(0),
     cancelled: std.atomic.Value(usize) = .init(0),
     entered: std.atomic.Value(usize) = .init(0),
@@ -170,11 +169,23 @@ pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
     const model_dir = init.environ_map.get("FIXTURE_MODEL_DIR") orelse return error.MissingModelDir;
     const port = try std.fmt.parseInt(u16, init.environ_map.get("FIXTURE_PORT") orelse return error.MissingPort, 10);
+    const hosted_readers: []const inference.server.NamedImageReader = if (init.environ_map.get("FIXTURE_OCR_ENDPOINT")) |endpoint|
+        &[1]inference.server.NamedImageReader{.{ .name = "fixture", .config = .{
+            .provider = .openai,
+            .base_url = endpoint,
+            .model = "fixture-ocr",
+            .prompt = "",
+            .hosted_parallelism = 2,
+        } }}
+    else
+        &[_]inference.server.NamedImageReader{};
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = std.fs.path.dirname(model_dir) orelse return error.MissingModelsRoot,
         .allow_unknown_models = true,
         .process_termination_available = true,
         .max_concurrent_requests = 1,
+        .max_work_units = 64,
+        .image_readers = hosted_readers,
     });
     defer node.deinit();
     try node.attachIo(init.io);
@@ -201,7 +212,6 @@ pub fn main(init: std.process.Init) !void {
         .session = .{
             .ptr = &fixture,
             .vtable = &Fixture.vtable,
-            .execution_gate = &fixture.execution_gate,
             .run_admission = .{
                 .controller = node.model_manager.resource_domain.?.admission,
                 .backend_class = .cpu,
@@ -210,11 +220,13 @@ pub fn main(init: std.process.Init) !void {
             },
         },
         .session_manager = &node.session_manager,
-        .model_manager = &node.model_manager,
+        .host = node.model_manager.loadedRuntimeHost(),
+        .executor_io = init.io,
         .prompt_prefix_cache = inference.runtime.kv.prompt_cache.PromptPrefixCache.init(alloc),
         .native_generation_graph_cache = inference.graph.cache.GraphCache.init(alloc),
         .pinned = true,
     };
+    try model.session.installOwnedExecutionGate(alloc);
     try node.model_manager.loaded.put(alloc, try alloc.dupe(u8, model_dir), model);
 
     var server = httpx.Server.initWithConfig(alloc, init.io, node.httpServerConfig("127.0.0.1", port));
