@@ -656,8 +656,8 @@ pub const DirectoryBuilder = struct {
 
     pub fn deinit(self: *DirectoryBuilder) void {
         if (self.track) |track| self.allocator.free(track.codec_private);
-        self.packets.deinit(self.allocator);
-        self.padding.deinit(self.allocator);
+        self.packets.clearAndFree(self.allocator);
+        self.padding.clearAndFree(self.allocator);
         self.track = null;
     }
 };
@@ -871,4 +871,11 @@ test "WebM joint video and audio index reuses the block prefix" {
     defer baseline.deinit();
     try std.testing.expectEqualSlices(Packet, baseline.packets, observed.packets);
     try std.testing.expectEqualSlices(BlockPadding, baseline.padding, observed.padding);
+
+    var denied = DirectoryBuilder{ .allocator = a, .limits = .{ .max_packets = 0 } };
+    defer denied.deinit();
+    var video_only = try Webm.Reader.initObserved(a, &standalone, .{}, denied.observer());
+    defer video_only.deinit();
+    try std.testing.expectEqualSlices(Webm.Packet, video.packets, video_only.packets);
+    try std.testing.expectError(error.ResourceLimitExceeded, denied.borrowDirectory());
 }
