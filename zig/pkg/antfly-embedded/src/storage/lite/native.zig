@@ -8234,6 +8234,13 @@ pub const NativeFile = struct {
     }
 
     fn recoverRedoLog(self: *NativeFile, allocator: Allocator, io: std.Io, test_hook: if (builtin.is_test) ?*const fn (?*anyopaque) void else void, test_ctx: if (builtin.is_test) ?*anyopaque else void) !void {
+        // Also participate in inode fencing so a writer that cannot
+        // map the region can exclude raw reads of a retired extent.
+        const extent_fence = if (self.header.segmented_redo and self.read_only)
+            try self.acquireInodeLock(.shared, true, true, "coldRedoExtent")
+        else
+            null;
+        defer if (extent_fence) |fence| fence.release(io);
         var checkpoint = self.activeCheckpoint();
         // perf/lwa-fold-boundary: the real, durable fold boundary this
         // on-disk slot's own roots reflect -- NOT `checkpoint.commit_sequence`,
@@ -10012,6 +10019,12 @@ pub const NativeFile = struct {
         const region = (try self.regionForInode()) orelse return;
         const io = self.runtimeIo();
         const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
+
+        const extent_fence = if (self.header.segmented_redo and self.read_only)
+            try self.acquireInodeLock(.shared, true, true, "refreshRedoExtent")
+        else
+            null;
+        defer if (extent_fence) |fence| fence.release(io);
 
         const slot = self.cross_process_redo_reader_slot orelse blk: {
             const pid: u32 = @bitCast(std.c.getpid());
