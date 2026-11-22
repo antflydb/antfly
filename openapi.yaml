@@ -7553,11 +7553,17 @@ paths:
 
         artifact name replaces the existing mapping.
 
-        Omitting the write-only producer_json/producer fields on an existing
+        Omitting all producer fields (producer, producer_json and transcriber)
 
-        same-kind artifact retains its admitted producer. This permits execution
+        on an existing same-kind artifact retains its admitted producer. Supplying
 
-        policy updates without reading credentials or reconstructing its recipe.
+        any one of these fields explicitly replaces the producer; mutually
+
+        exclusive spellings cannot be combined. Execution-policy updates persist
+
+        separately from publication authority, without reading credentials,
+
+        reconstructing the recipe, or invalidating completed output.
 
         Changing execution alone preserves completed artifacts; changing producer
 
@@ -43677,9 +43683,9 @@ components:
       type: object
       additionalProperties: false
       description: Non-semantic execution policy for one producer or index maintenance operation. Updates
-        affect future invocations without invalidating accepted artifacts. To retry incomplete extraction
-        or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings
-        still apply.
+        persist separately from the frozen publication catalog and affect future invocations without invalidating
+        accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use
+        the bounded reprocess APIs. Node/provider ceilings still apply.
       properties:
         max_output_tokens_per_item:
           type: integer

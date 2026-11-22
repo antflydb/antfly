@@ -40790,7 +40790,7 @@ fn requireLocalAssetSourceWithAllocator(runtime: *EnrichmentRuntime, alloc: Allo
     const entry = runtime.index_manager.getEnrichment(.asset, name) orelse return error.InvalidEnrichmentConfig;
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", name);
     defer alloc.free(key);
-    try local.require(alloc, txn, key, local.recipe(entry), parent, output);
+    try local.requireCompatible(alloc, txn, key, local.recipe(entry), local.legacyRecipe(entry), parent, output);
 }
 
 fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: LocalSourceFence) !void {
@@ -42792,6 +42792,20 @@ fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void 
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
     }
     try Step.run(runtime, dense, request, &cache, &sources, &window);
+    try expect.expectEqual(@as(usize, 1), harness.provider_calls);
+    // Updating operational policy must preserve the exact authority and the
+    // accepted causal proof, not just a high-level config hash.
+    var policy_cfg = (try db.getEnrichment(alloc, .embedding, "model")).?;
+    defer policy_cfg.deinit(alloc);
+    policy_cfg.execution = .{ .batch_items = 2 };
+    _ = try db.upsertEnrichment(policy_cfg);
+    var updated_pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer updated_pin.release();
+    try expect.expect(updated_pin.plan().matchesArtifactInventory(catalog.catalogs));
+    var updated_request = updated_pin.plan().generated_templates[0];
+    updated_request.doc_key = "doc";
+    updated_request.reprocess_generation = reprocess_generation;
+    try Step.run(runtime, dense, updated_request, &cache, &sources, &window);
     try expect.expectEqual(@as(usize, 1), harness.provider_calls);
     const first = blk: {
         var read = try db.core.store.beginReadTxn();

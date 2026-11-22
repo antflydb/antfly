@@ -6865,7 +6865,7 @@ pub const IndexManager = struct {
         }
         const catalog_indexes = try serializeCatalog(alloc, self);
         errdefer alloc.free(catalog_indexes);
-        const catalog_enrichments = try enrichment_catalog.serializeCatalog(alloc, self.enrichments.items);
+        const catalog_enrichments = try self.publicationEnrichments(alloc);
         errdefer alloc.free(catalog_enrichments);
         const catalog_resolvers = try self.serializeResolverDefinitions(alloc);
         errdefer alloc.free(catalog_resolvers);
@@ -12990,6 +12990,8 @@ pub const IndexManager = struct {
             const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
             defer self.alloc.free(enrichment_data);
             try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+            try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, &txn);
+            try @import("enrichment_execution.zig").stage(self.alloc, &txn, enrichment_data);
             try txn.put(enrichment_catalog_key, enrichment_data);
         }
         if (self.resolvers.items.len != resolver_checkpoint) {
@@ -25094,6 +25096,10 @@ pub const IndexManager = struct {
             producer_positions.getPtr(self.enrichments.items[position].name).?.* = position;
             producer_positions.getPtr(self.enrichments.items[previous].name).?.* = previous;
         }
+        const effective_execution = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
+        defer self.alloc.free(effective_execution);
+        try @import("enrichment_execution.zig").stage(self.alloc, txn, effective_execution);
+        try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, txn);
         inline for (.{ index_catalog_key, enrichment_catalog_key, resolver_catalog_key }, .{ expected.indexes, expected.enrichments, expected.resolvers }) |key, value| {
             if (value.len != 0) try txn.put(key, value) else txn.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -25112,7 +25118,7 @@ pub const IndexManager = struct {
         while (repairs.next()) |slot| if (slot.blocked()) return false;
         const indexes = try serializeCatalog(self.alloc, self);
         defer self.alloc.free(indexes);
-        const enrichments = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
+        const enrichments = try self.publicationEnrichments(self.alloc);
         defer self.alloc.free(enrichments);
         const resolvers = try self.serializeResolverDefinitions(self.alloc);
         defer self.alloc.free(resolvers);
@@ -25477,6 +25483,8 @@ pub const IndexManager = struct {
         const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, retained_producers);
         defer self.alloc.free(enrichment_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+        try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, &txn);
+        try @import("enrichment_execution.zig").stage(self.alloc, &txn, enrichment_data);
         try txn.put(enrichment_catalog_key, enrichment_data);
         // Allocate the complete post-commit catalog before crossing durability.
         var next_active: std.ArrayListUnmanaged(ResolverConfig) = .empty;
@@ -25573,6 +25581,14 @@ pub const IndexManager = struct {
         for (configs) |cfg| {
             try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, cfg));
         }
+        try @import("enrichment_execution.zig").apply(self.alloc, &txn, self.enrichments.items);
+    }
+
+    fn publicationEnrichments(self: *IndexManager, alloc: Allocator) ![]u8 {
+        if (self.primary_store) |store| {
+            if (store.get(alloc, enrichment_catalog_key)) |raw| return raw else |err| if (err != error.NotFound) return err;
+        }
+        return enrichment_catalog.serializeCatalog(alloc, self.enrichments.items);
     }
 
     fn persistEnrichmentCatalog(self: *IndexManager, store: anytype) !void {
@@ -25582,6 +25598,15 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, &txn);
+        try @import("enrichment_execution.zig").stage(self.alloc, &txn, data);
+        if (txn.get(enrichment_catalog_key)) |previous| {
+            if (std.meta.eql(try @import("../artifact_semantics.zig").digest(self.alloc, "", previous, ""), try @import("../artifact_semantics.zig").digest(self.alloc, "", data, ""))) {
+                try txn.commit();
+                _ = self.write_plan_generation.fetchAdd(1, .release);
+                return;
+            }
+        } else |err| if (err != error.NotFound) return err;
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
         // Removed source definitions lose readiness in the same durable DDL
         // transaction. Re-adding identical configuration must backfill again.
@@ -25664,6 +25689,8 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, &txn);
+        try @import("enrichment_execution.zig").stage(self.alloc, &txn, enrichment_data);
         try txn.put(enrichment_catalog_key, enrichment_data);
         const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
@@ -36143,9 +36170,13 @@ pub fn onlineBaseEmbeddingProducer(cfg: enrichment_catalog.EnrichmentConfig) boo
 }
 
 pub fn enrichmentDefinitionsEqual(alloc: Allocator, left: enrichment_catalog.EnrichmentConfig, right: enrichment_catalog.EnrichmentConfig) !bool {
-    const a = try std.json.Stringify.valueAlloc(alloc, left, .{});
+    var semantic_left = left;
+    semantic_left.execution_json = "";
+    var semantic_right = right;
+    semantic_right.execution_json = "";
+    const a = try std.json.Stringify.valueAlloc(alloc, semantic_left, .{});
     defer alloc.free(a);
-    const b = try std.json.Stringify.valueAlloc(alloc, right, .{});
+    const b = try std.json.Stringify.valueAlloc(alloc, semantic_right, .{});
     defer alloc.free(b);
     return std.mem.eql(u8, a, b);
 }

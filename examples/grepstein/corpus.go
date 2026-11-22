@@ -802,11 +802,12 @@ func corpusLoadCmd(args []string) error {
 	if err = json.Unmarshal(status, &identity); err != nil {
 		return err
 	}
-	if identity.Description != description {
-		return fmt.Errorf("table configuration differs from this corpus (page window or provider/index settings); use matching flags or a new table")
-	}
 	if identity.TableID == "" {
 		return fmt.Errorf("server must expose table_id to safely resume loading")
+	}
+	description, err = resolveCorpusDescription(*state, acceptedStates, *endpoint, *table, identity.TableID, identity.Description, indexes, sourceConfig.PagesPerRecord)
+	if err != nil {
+		return err
 	}
 	input, err := os.Open(filepath.Join(*state, "published.ndjson"))
 	if err != nil {
@@ -1107,7 +1108,7 @@ func corpusDescription(indexes map[string]any, pagesPerRecord int) string {
 	}
 	encoded, _ := json.Marshal([]any{semantic, pagesPerRecord})
 	sum := sha256.Sum256(encoded)
-	return "grepstein-corpus-v1:" + hex.EncodeToString(sum[:])
+	return "grepstein-corpus-v2:" + hex.EncodeToString(sum[:])
 }
 
 func recordSkippedSource(path, id string, cause error) error {

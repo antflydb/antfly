@@ -2363,9 +2363,12 @@ export interface paths {
          * Register or replace an artifact enrichment
          * @description Registers a table-level generated artifact definition. Reusing the same
          *     artifact name replaces the existing mapping.
-         *     Omitting the write-only producer_json/producer fields on an existing
-         *     same-kind artifact retains its admitted producer. This permits execution
-         *     policy updates without reading credentials or reconstructing its recipe.
+         *     Omitting all producer fields (producer, producer_json and transcriber)
+         *     on an existing same-kind artifact retains its admitted producer. Supplying
+         *     any one of these fields explicitly replaces the producer; mutually
+         *     exclusive spellings cannot be combined. Execution-policy updates persist
+         *     separately from publication authority, without reading credentials,
+         *     reconstructing the recipe, or invalidating completed output.
          *     Changing execution alone preserves completed artifacts; changing producer
          *     semantics may invalidate them. Use explicit reprocessing for incomplete
          *     or all existing work. Chunk or asset enrichments
@@ -18380,7 +18383,7 @@ export interface components {
              */
             limit?: number;
         };
-        /** @description Non-semantic execution policy for one producer or index maintenance operation. Updates affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply. */
+        /** @description Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply. */
         ExecutionPolicy: {
             /**
              * Format: uint32

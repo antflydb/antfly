@@ -2063,3 +2063,29 @@ requires verified content identity and unchanged routing predicates. Chunking,
 embeddings, summaries and graph projections can consume existing text but must
 rebuild their own changed artifacts. Native-text thresholds may select additional
 pages for OCR; DPI, sampling, model and prompt changes remain semantic.
+
+### Operational persistence and upgrade
+
+Policy-only producer updates persist in the versioned
+`__metadata__:enrichment_execution` overlay, scoped to the complete semantic
+producer definition. They leave the frozen publication catalog, its exact byte
+digest, authority epoch and accepted causal receipts unchanged. Write plans
+retain that frozen catalog while planning requests with the effective policy;
+reopening the owner reapplies the overlay. A changed model or source recipe
+cannot inherit an unrelated overlay. Structural catalog reconciliation compares
+semantic producer definitions and preserves current operational overrides.
+
+Standalone publication witnesses use a policy-neutral recipe. Before replacing
+a legacy catalog, its old policy-dependent recipe is linked to the neutral
+recipe in the same transaction. Compatibility requires exact parent and output
+digests, never just a matching artifact body. This creates records per historical
+producer policy, rather than walking the corpus or rewriting document receipts.
+Existing immutable catalog commands can validate their original semantic digest;
+new commands and transfer compatibility use the policy-neutral definition.
+
+Incomplete-only preparation reads coverage and generation from the same manifest
+snapshot. A durable target is that snapshot's next generation; a concurrent
+completion can fulfill it without a second OCR run. Synchronous preparation
+likewise respects an already fulfilled target. Range selection reads only the
+manifest, with a typed header decoder that skips child-range and operation payloads,
+without constructing public descriptors or loading saved extraction state.

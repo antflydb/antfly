@@ -855,3 +855,19 @@ release ZIP is a separate source: a bounded audio selection must retain its
 archive URL, strong ETag, member names/CRC32 and per-file SHA-256. Selected-member
 checks do not establish the full archive checksum or current official hosting.
 Record that distinction, and never treat a 403/interstitial as document bytes.
+
+### Resuming tables created before execution policies
+
+New tables use `grepstein-corpus-v2` semantic bindings. To resume or append to a
+released v1 table, run once with its original creation flags and reader file,
+including the original `max_tokens`. The loader verifies the old description and
+saves `table-binding.json` scoped to the endpoint, table name, table ID, original
+description and new semantic recipe. It preserves the server description,
+producer JSON, accepted records and `load.json` checkpoints. Subsequent runs can
+reuse that verified binding; append states can inherit it from `--accepted-state`.
+Model, source recipe, page-window or table-identity changes are still rejected.
+
+Changing a reader file alone does not update an existing table's execution
+policy. Use artifact PUT to set `execution.max_output_tokens_per_item`, preserving
+the stored producer, then an explicit incomplete-only reprocess job if needed.
+The loader's binding migration performs no table writes or OCR.

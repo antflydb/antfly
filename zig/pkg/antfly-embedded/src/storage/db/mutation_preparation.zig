@@ -1371,7 +1371,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     null;
                 defer if (document_execution) |execution| execution.destroy();
                 for (generated, 0..) |request, request_index| {
-                    if (only_incomplete_assets and request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request))) {
+                    const force_asset = request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request));
+                    var reprocess_snapshot: @import("enrichment/document_extraction_completion.zig").Snapshot = .{};
+                    if (force_asset) {
                         const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
                         defer alloc.free(key);
                         const manifest = S.ownerField(self, "core").*.store.get(alloc, key) catch |err| switch (err) {
@@ -1379,7 +1381,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             else => return err,
                         };
                         defer if (manifest) |raw| alloc.free(raw);
-                        if (manifest) |raw| if (try @import("enrichment/document_extraction_completion.zig").isComplete(alloc, raw)) continue;
+                        // Generic assets need not contain a document manifest.
+                        var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
+                        defer producer.deinit(alloc);
+                        if (producer.type == .document_extraction) {
+                            if (manifest) |raw| reprocess_snapshot = try @import("enrichment/document_extraction_completion.zig").snapshot(alloc, raw);
+                            if (only_incomplete_assets and reprocess_snapshot.complete()) continue;
+                        }
                     }
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
                         if (request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request))) {
@@ -1387,14 +1395,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             defer producer.deinit(alloc);
                             if (producer.type == .document_extraction) {
                                 const intent = @import("artifact_reprocess_intent.zig");
-                                const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
-                                defer alloc.free(manifest_key);
-                                const manifest = S.ownerField(self, "core").*.store.get(alloc, manifest_key) catch |err| switch (err) {
-                                    error.NotFound => null,
-                                    else => return err,
-                                };
-                                defer if (manifest) |raw| alloc.free(raw);
-                                const generation = if (manifest) |raw| try S.documentExtractionManifestGeneration(alloc, raw) else 0;
+                                const generation = reprocess_snapshot.generation;
                                 const encoded = intent.encode(request.producer_json, std.math.add(u64, generation, 1) catch return error.ResourceLimitExceeded);
                                 const key = try intent.keyAlloc(alloc, request.doc_key, requestArtifactName(request));
                                 errdefer alloc.free(key);
@@ -1430,11 +1431,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             // produced, its delete alone is intentional no-output,
                             // and a deferred prompt producer touches neither here —
                             // it settles in the batch flush below or through replay.
+                            var invocation_request = request;
+                            if (only_incomplete_assets and force_asset) invocation_request.reprocess_generation = try std.math.add(u64, reprocess_snapshot.generation, 1);
                             computeAssetRequestDerived(
                                 alloc,
                                 self,
                                 cleaned,
-                                request,
+                                invocation_request,
                                 &artifact_writes,
                                 &artifact_delete_keys,
                                 &documents,
