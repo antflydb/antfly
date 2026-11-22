@@ -671,8 +671,19 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 
     const audio_readers = if (loaded_config) |*config| try config.transcribers.hostedReaders(alloc) else &.{};
     defer alloc.free(audio_readers);
+    var image_readers: std.ArrayList(inference.server.NamedImageReader) = .empty;
+    defer image_readers.deinit(alloc);
+    if (loaded_config) |*config| {
+        var entries = config.readers.configs.iterator();
+        while (entries.next()) |entry| {
+            const reader = entry.value_ptr.*;
+            if (reader.provider != .openai) continue;
+            try image_readers.append(alloc, .{ .name = entry.key_ptr.*, .config = reader });
+        }
+    }
     var node = try InferenceNode.init(alloc, .{
         .audio_readers = audio_readers,
+        .image_readers = image_readers.items,
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .max_loaded_models = model_settings.max_loaded_models,

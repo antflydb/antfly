@@ -89,6 +89,56 @@ uses its reader profile; encoder-decoder readers use their decoder metadata;
 Moondream retains its caption budget; detection/recognition pipelines have no
 generative output-token default.
 
+## Run quantized models with llama.cpp
+
+Run a recent `llama-server` on the GPU host. Use the GGUF decoder and matching
+FP16 vision projector from the same model size. This example uses
+[LightOnOCR-3-0.8B Q4_K_M](https://huggingface.co/richardyoung/LightOnOCR-3-0.8B-GGUF/tree/main).
+The [0.8B](https://huggingface.co/richardyoung/LightOnOCR-3-0.8B-GGUF/tree/main)
+and [4B](https://huggingface.co/richardyoung/LightOnOCR-3-4B-GGUF/tree/main)
+repositories both supply Q4_K_M and Q8_0.
+
+```sh
+llama-server --model LightOnOCR-3-0.8B-Q4_K_M.gguf \
+  --mmproj mmproj-LightOnOCR-3-0.8B-F16.gguf \
+  --alias lighton-ocr --reasoning off -ngl 99 -c 8192 --parallel 1 \
+  --host 127.0.0.1 --port 18090
+```
+
+Register it in Antfly's runtime configuration as an OpenAI-compatible reader.
+
+```json
+{
+  "readers": {
+    "lighton-quantized": {
+      "provider": "openai",
+      "base_url": "http://127.0.0.1:18090/v1",
+      "model": "lighton-ocr",
+      "prompt": "",
+      "max_tokens": 4096
+    }
+  }
+}
+```
+
+The empty prompt sends an image-only message for transcription. Set the prompt
+to `grounding` for LightOnOCR's labeled layout output. Use
+`readers/lighton-quantized` as the model in Antfly's `/ai/v1/read` request.
+To serve the OCR API without a database process, use
+`antfly inference run --config inference.json`. To build the focused
+executable from source, run the following from `zig/`:
+
+```sh
+zig build inference-artifact -Doptimize=ReleaseFast -Dmetal=false
+zig-out/bin/antfly-inference run --config inference.json
+```
+
+llama.cpp owns GPU execution in this deployment. The inference-only listener
+defaults to `127.0.0.1:8090` and dispatches one upstream completion per image. For a standalone database deployment, enable [public inference](/docs/reference/inference-gateway#public-execution-policy) to call that route.
+For inline ingestion configuration, use the same reader object under `ocr.reader`.
+If llama-server runs on a separate machine, set `base_url` to an endpoint
+reachable from Antfly, such as a local SSH forwarded port.
+
 ## Read documents during ingestion
 
 To OCR scanned PDF pages and images as they are indexed, name the model as the

@@ -1308,6 +1308,8 @@ pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
 /// linked/direct execution as well as HTTP and discovery; zero is invalid.
 pub const RequestLimits = platform.resource_policy.InferenceRequestLimits;
 
+pub const NamedImageReader = struct { name: []const u8, config: readers_api.Config };
+
 pub const NodeConfig = struct {
     /// Fixed before model/client creation; CUDA requires explicit device and
     /// allocator capacities. F32 remains the default qualification profile.
@@ -1318,6 +1320,7 @@ pub const NodeConfig = struct {
     pjrt_decoder_cache: ?bool = null,
     pjrt_gemm: @import("../execution/precision.zig").Gemm = .provider_default,
     audio_readers: []const transcribing_api.NamedConfig = &.{},
+    image_readers: []const NamedImageReader = &.{},
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -23174,7 +23177,7 @@ pub const Node = struct {
     /// Read spans reader/ASR/generator storage. Other operations retain their
     /// own task namespace and may intentionally share a model identifier.
     pub fn documentDefinition(self: *Node, a: std.mem.Allocator, name: []const u8, operation: document_contract.Operation) !?[]const u8 {
-        if (self.hostedAudioReader(name) != null) return null;
+        if (self.hostedAudioReader(name) != null or self.hostedImageReader(name) != null) return null;
         if (std.mem.eql(u8, name, "antfly/native-document") or std.fs.path.isAbsolute(name)) return null;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*owned| owned.deinit();
@@ -23739,6 +23742,114 @@ pub const Node = struct {
         return self.readDocumentsJsonWithControl(a, raw, supplied_control);
     }
 
+    fn hostedImageReader(self: *const Node, model: []const u8) ?readers_api.Config {
+        const prefix = "readers/";
+        if (!std.mem.startsWith(u8, model, prefix)) return null;
+        for (self.config.image_readers) |reader| {
+            if (std.mem.eql(u8, reader.name, model[prefix.len..])) return reader.config;
+        }
+        return null;
+    }
+
+    fn readHostedImages(
+        self: *Node,
+        ctx: *httpx.Context,
+        body: api.ReadRequest,
+        cfg: readers_api.Config,
+        attachments: []const httpx.attachment_envelope.Attachment,
+        indexes: []const ?usize,
+        admission: ReadRequestAdmission,
+        reserved_units: *usize,
+        control: InferenceExecutionControl,
+    ) !httpx.Response {
+        const images = body.images.?;
+        self.config.request_limits.validateItemCount(images.len) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
+        const output_limit = self.config.request_limits.max_output_tokens_per_item orelse 8192;
+        const tokens = (validateReadMaxTokens(body.max_tokens orelse cfg.max_tokens) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'max_tokens' must be between 1 and 8192" })) orelse @min(4096, output_limit);
+        if (tokens > output_limit) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'max_tokens' exceeds the deployment limit" });
+
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var client = httpx.Client.init(ctx.allocator, ctx.io);
+        defer client.deinit();
+        const results = try alloc.alloc(api.ReadObject, images.len);
+        var batch_bytes: usize = 0;
+        var decoded = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
+        if (self.config.request_limits.max_decoded_pixels_per_batch) |limit|
+            decoded.max_pixels = @min(decoded.max_pixels, std.math.cast(usize, limit) orelse std.math.maxInt(usize));
+        const Cancel = struct {
+            fn requested(raw: *const anyopaque) bool {
+                const current: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                current.check() catch return true;
+                return false;
+            }
+        };
+        var prompt_tokens: usize = 0;
+        var completion_tokens: usize = 0;
+        var measured = false;
+        for (images, indexes, results, 0..) |image, attachment_index, *result, index| {
+            var item: ?scraping.DownloadedContent = null;
+            defer if (item) |*downloaded| downloaded.deinit(ctx.allocator);
+            const bytes, const mime = if (attachment_index) |i|
+                .{ attachments[i].data, attachments[i].mime_type }
+            else blk: {
+                item = downloadReadBatchContentForRequest(self, ctx.allocator, image.url, admission.byte_cap, batch_bytes, .{
+                    .io = ctx.io,
+                    .control = control,
+                }) catch |err| return documentFailureResponse(ctx, err);
+                break :blk .{ item.?.data, item.?.content_type };
+            };
+            batch_bytes +|= bytes.len;
+            if (batch_bytes > admission.byte_cap) return documentFailureResponse(ctx, error.ReadBatchTooLarge);
+            decoded.addImage(bytes) catch |err| return readImageErrorResponse(ctx, err);
+            validateEncodedImageMime(mime, bytes) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
+            const physical_mime = image_pipeline.mimeEssenceForEncoded(bytes) orelse
+                return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia);
+            const units = @max(reserved_units.*, @max(decoded.requiredUnits(), estimateReadAdmissionUnits(images.len, tokens)));
+            if (try self.growSlotUnits(ctx, reserved_units.*, units)) |response| return response;
+            reserved_units.* = units;
+
+            const encoder = std.base64.standard.Encoder;
+            const prefix = try std.fmt.allocPrint(ctx.allocator, "data:{s};base64,", .{physical_mime});
+            defer ctx.allocator.free(prefix);
+            const uri = try ctx.allocator.alloc(u8, prefix.len + encoder.calcSize(bytes.len));
+            @memcpy(uri[0..prefix.len], prefix);
+            _ = encoder.encode(uri[prefix.len..], bytes);
+            defer ctx.allocator.free(uri);
+            control.check() catch |err| return documentFailureResponse(ctx, err);
+            var reply = readers_api.readWithConfigReported(ctx.allocator, &client, cfg, .{
+                .images = &.{uri},
+                .prompt = body.prompt,
+                .max_tokens = @intCast(tokens),
+            }, .{
+                .cancellation = httpx.CancellationToken.fromCallback(&control, Cancel.requested),
+                .timeout_ms = if (control.deadline_ns) |deadline| @max(1, (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms) else null,
+            }) catch |err| switch (err) {
+                error.ReadOutputTruncated, error.DocumentUnresolved, error.Timeout, error.Cancelled, error.Canceled => return documentFailureResponse(ctx, err),
+                else => return ctx.status(502).json(.{ .@"error" = "READER_UPSTREAM_FAILED" }),
+            };
+            defer reply.deinit(ctx.allocator);
+            if (reply.items.len != 1) return ctx.status(502).json(.{ .@"error" = "INVALID_READER_RESPONSE" });
+            if (reply.usage) |usage| {
+                if (self.config.request_limits.max_input_tokens_per_item) |limit|
+                    if (usage.prompt_tokens > limit) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "image tokens exceed the deployment limit" });
+                measured = true;
+                prompt_tokens +|= std.math.cast(usize, usage.prompt_tokens) orelse 0;
+                completion_tokens +|= std.math.cast(usize, usage.completion_tokens) orelse 0;
+            }
+            result.* = .{ .object = "read", .status = "complete", .index = @intCast(index), .text = try alloc.dupe(u8, reply.items[0].text) };
+        }
+        return ctx.json(api.ReadResponse{
+            .object = "list",
+            .model = body.model,
+            .data = results,
+            .usage = if (measured) tokenUsage(prompt_tokens, completion_tokens) else null,
+        });
+    }
+
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var admission_failure = AdmissionFailureScope{};
         try admission_failure.bind(ctx);
@@ -23881,6 +23992,10 @@ pub const Node = struct {
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("read");
         defer self.metrics.decActive();
+
+        if (self.hostedImageReader(body.model)) |cfg| {
+            return self.readHostedImages(ctx, body, cfg, attachments, attachment_indexes, admission, &reserved_units, execution_control);
+        }
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
@@ -48913,6 +49028,69 @@ fn documentFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     const name = @errorName(err);
     const status: u16 = if (err == error.DocumentArtifactNotFound or err == error.ModelNotFound) 404 else if (err == error.DocumentArtifactExpired) 410 else if (err == error.DocumentModelRevisionMismatch) 409 else if (err == error.DocumentUnresolved) 422 else if (err == error.DocumentBudgetExhausted or err == error.Timeout) 504 else if (err == error.RemoteDocumentModelDenied) 403 else if (err == error.CloudflareRateLimited) 429 else if (std.mem.indexOf(u8, name, "Limit") != null or err == error.DocumentOutputTooLarge) 413 else if (std.mem.startsWith(u8, name, "Cloudflare") or err == error.InvalidCloudflareResponse) 502 else 400;
     return ctx.status(status).json(.{ .@"error" = name, .message = "Document operation could not satisfy its input, capability, evidence, or execution contract" });
+}
+
+test "hosted image reader routes the inference API alias to chat completions" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fixture = struct {
+        fn inspect(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, req.body, .{});
+            defer parsed.deinit();
+            const body = parsed.value.object;
+            try std.testing.expectEqualStrings("lighton-ocr", body.get("model").?.string);
+            try std.testing.expectEqual(@as(i64, 16), body.get("max_tokens").?.integer);
+            const parts = body.get("messages").?.array.items[0].object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), parts.len);
+            try std.testing.expectEqualStrings("image_url", parts[0].object.get("type").?.string);
+        }
+
+        fn serve(server: *httpx.TestServer) void {
+            server.handleOne() catch {};
+        }
+    };
+    var upstream = try httpx.TestServer.start(a, io, &.{.{
+        .method = .POST,
+        .path = "/v1/chat/completions",
+        .assert_request = Fixture.inspect,
+        .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"Invoice 12345\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}" },
+    }});
+    defer upstream.deinit();
+    upstream.max_request_bytes = 128 * 1024;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&upstream});
+    const base_url = try std.fmt.allocPrint(a, "{s}/v1", .{upstream.baseUrl()});
+    defer a.free(base_url);
+    var node = try Node.init(a, .{
+        .image_readers = &.{.{ .name = "ocr", .config = .{
+            .provider = .openai,
+            .model = "lighton-ocr",
+            .base_url = base_url,
+            .prompt = "",
+            .max_tokens = 16,
+        } }},
+    });
+    defer node.deinit();
+    const image = @embedFile("../models/testdata/lightonocr3/invoice.png");
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try a.alloc(u8, encoder.calcSize(image.len));
+    defer a.free(encoded);
+    const body = try std.fmt.allocPrint(a, "{{\"model\":\"readers/ocr\",\"images\":[{{\"url\":\"data:image/png;base64,{s}\"}}]}}", .{encoder.encode(encoded, image)});
+    defer a.free(body);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const reply = try std.json.parseFromSlice(api.ReadResponse, a, response.body.?, .{});
+    defer reply.deinit();
+    try std.testing.expectEqualStrings("readers/ocr", reply.value.model);
+    try std.testing.expectEqualStrings("Invoice 12345", reply.value.data[0].text);
+    try std.testing.expectEqual(@as(i64, 8), reply.value.usage.?.total_tokens);
 }
 
 test "audio read rejects mixed inputs and unsupported options before model admission" {

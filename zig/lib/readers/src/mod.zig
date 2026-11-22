@@ -1175,7 +1175,8 @@ fn CloudReaderState(comptime provider: Provider) type {
                 for (content.items) |*item| deinitJsonValue(alloc, item);
                 content.deinit();
             }
-            try appendTextPart(alloc, &content, req.prompt orelse self.prompt orelse "Read the image and return the text.");
+            const prompt = req.prompt orelse self.prompt orelse "Read the image and return the text.";
+            if (prompt.len > 0) try appendTextPart(alloc, &content, prompt);
             for (req.images) |image| try appendImageUrlPart(alloc, &content, image);
             const messages = [_]struct { role: []const u8, content: std.json.Value }{
                 .{ .role = "user", .content = .{ .array = content } },
@@ -2014,6 +2015,16 @@ test "hosted reader transports enforce complete OCR and retain measured usage fo
             server.handleOne() catch {};
         }
     };
+    const ImageOnly = struct {
+        fn inspect(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const messages = parsed.value.object.get("messages").?.array.items;
+            const parts = messages[0].object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), parts.len);
+            try std.testing.expectEqualStrings("image_url", parts[0].object.get("type").?.string);
+        }
+    };
     for ([_]Provider{ .cloudflare, .openai, .vertex }) |provider| {
         for (0..4) |mode| {
             const body: []const u8 = if (provider == .vertex) switch (mode) {
@@ -2028,7 +2039,12 @@ test "hosted reader transports enforce complete OCR and retain measured usage fo
                 else => "{\"choices\":[{\"message\":{\"content\":\"partial\"}}]}",
             };
             const path = if (provider == .vertex) "/projects/project/locations/us-central1/publishers/google/models/reader:generateContent" else "/chat/completions";
-            var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = path, .respond = .{ .body = body } }});
+            var server = try httpx.TestServer.start(a, io, &.{.{
+                .method = .POST,
+                .path = path,
+                .assert_request = if (provider == .openai) ImageOnly.inspect else null,
+                .respond = .{ .body = body },
+            }});
             defer server.deinit();
             var group = std.Io.Group.init;
             defer group.cancel(io);
@@ -2040,6 +2056,7 @@ test "hosted reader transports enforce complete OCR and retain measured usage fo
                 .account_id = if (provider == .cloudflare) "account" else null,
                 .model = if (provider == .cloudflare) "@cf/mistralai/mistral-small-3.1-24b-instruct" else "reader",
                 .base_url = server.baseUrl(),
+                .prompt = if (provider == .openai) "" else null,
                 .bearer_token = "fixture",
                 .project_id = "project",
             };
