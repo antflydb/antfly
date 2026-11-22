@@ -4210,8 +4210,15 @@ test "compatibility backend candidates honor required policy" {
     );
 
     session_manager.required_backend = .pjrt;
+    try std.testing.expectEqualSlices(
+        backends_mod.BackendType,
+        &.{.pjrt},
+        try compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+
+    session_manager.required_backend_invalid = true;
     try std.testing.expectError(
-        error.RequiredBackendUnavailable,
+        error.InvalidRequiredBackend,
         compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
     );
 }
@@ -30224,16 +30231,15 @@ test "gliner boundary microbatch capacity rejoins the caller with its original b
         \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada"}]}
     , .{});
     defer request.deinit();
-    // Default limits admit both heaps but refuse the output reservation; a
-    // smaller explicit limit refuses the second heap itself. Neither case
-    // reaches a model, and neither may turn a valid serial request into 507.
-    for ([_]usize{ 0, 256 * 1024 * 1024 }) |scratch_limit| {
+    // A two-heap limit permits the broker heap and refuses its output
+    // reservation. A one-heap limit refuses the broker heap itself.
+    const working_bytes = 16 * 1024;
+    for ([_]usize{ 2 * working_bytes, working_bytes }) |scratch_limit| {
         var node = try Node.init(a, .{
             .generation_budget_overrides = .{ .scratch_limit_bytes = scratch_limit },
         });
         defer node.deinit();
         const limits = node.config.generation_budget_overrides.apply(node.defaultGenerationLimits(.cpu));
-        const working_bytes = @min(512 * 1024 * 1024, @min(limits.host_limit_bytes, limits.scratch_limit_bytes));
         var caller = try node.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = working_bytes });
         defer caller.release();
         const before = node.model_manager.currentAdmissionAmounts();
