@@ -76,15 +76,15 @@ The driver observed 23 events and verified the snapshot, streamed
 `numeric(38,8)` before and after values, transaction identity and order,
 reconnect after offline writes, primary-key deletion and tombstone, and
 reconnect after killing the connector. Stock `pg_recvlogical` 18.6 separately
-covers Antfly restart for streaming-only and exported-snapshot slots. The
-Debezium run reported an unknown outcome for the final fixture `DROP TABLE`.
+covers Antfly restart for streaming-only and exported-snapshot slots.
 
-The two-table run on the multi-root implementation observed 25 events.
+The two-table run on Antfly `1f0728da0f` observed 25 events.
 The connector copied both tables, reported one transaction ID and three
 ordered changes for the cross-table commit, and resumed through both graceful
-disconnect and an abrupt client kill. Slot and publication cleanup succeeded.
-The final fixture table drops returned unknown outcomes, and both tables were
-still present in the catalog when checked. The fixture cluster was disposable.
+disconnect and an abrupt client kill. The driver dropped the slot and
+publication, retired both fixture primary-key constraints, and verified both
+tables were absent from the SQL catalog. Earlier builds returned unknown
+outcomes for the fixture table drops.
 
 The primary relation uses an integer primary key, text, numeric, and boolean
 columns and `REPLICA IDENTITY FULL`. The second relation uses an integer primary

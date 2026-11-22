@@ -212,6 +212,40 @@ def run(options, directory):
             *(arg for text in statements for arg in ("-c", text)),
         )
 
+    def drop_fixture_table(name):
+        statement = f"DROP TABLE IF EXISTS public.{name}"
+        retirement_blocked = "ERROR:  2BP01: The table cannot be dropped"
+        try:
+            sql(statement)
+            return
+        except CommandFailure as error:
+            if retirement_blocked not in error.stderr:
+                raise
+
+        try:
+            sql(f"ALTER TABLE public.{name} DROP CONSTRAINT {name}_pkey")
+        except CommandFailure as error:
+            if (
+                "ERROR:  55000: DDL declaration committed but is not ready"
+                not in error.stderr
+            ):
+                raise
+
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                sql(statement)
+                return
+            except CommandFailure as error:
+                # The drop guard proves non-admission while retirement runs.
+                if (
+                    retirement_blocked not in error.stderr
+                    or time.monotonic() >= deadline
+                ):
+                    raise
+            time.sleep(1)
+
+    cleanup_errors = []
     try:
         if not options.external:
             command(
@@ -422,24 +456,20 @@ def run(options, directory):
             for event in client.events[crash_resume:]
         )
         client.stop()
-        print(
-            json.dumps(
-                {
-                    "client": "Debezium 3.3.0.Final",
-                    "target": "external" if options.external else POSTGRES,
-                    "tables": len(members),
-                    "snapshot": True,
-                    "stream": True,
-                    "numeric_precision": True,
-                    "graceful_resume": True,
-                    "primary_key_change": True,
-                    "primary_key_tombstone": True,
-                    "crash_resume": True,
-                    "events": len(client.events),
-                    "artifacts": str(directory),
-                }
-            )
-        )
+        result = {
+            "client": "Debezium 3.3.0.Final",
+            "target": "external" if options.external else POSTGRES,
+            "tables": len(members),
+            "snapshot": True,
+            "stream": True,
+            "numeric_precision": True,
+            "graceful_resume": True,
+            "primary_key_change": True,
+            "primary_key_tombstone": True,
+            "crash_resume": True,
+            "events": len(client.events),
+            "artifacts": str(directory),
+        }
     finally:
         if client.process is not None:
             try:
@@ -450,18 +480,36 @@ def run(options, directory):
             try:
                 postgres_client("pg_recvlogical", "--drop-slot", "--slot", slot)
             except Exception as error:
-                print(f"qualification slot cleanup failed: {error}", file=sys.stderr)
-            for text in (
-                f"DROP PUBLICATION IF EXISTS {publication}",
-                f"DROP TABLE IF EXISTS public.{table}",
-                *([f"DROP TABLE IF EXISTS public.{second}"] if second else []),
-            ):
+                cleanup_errors.append(f"qualification slot cleanup failed: {error}")
+            try:
+                sql(f"DROP PUBLICATION IF EXISTS {publication}")
+            except Exception as error:
+                cleanup_errors.append(
+                    f"qualification publication cleanup failed: {error}"
+                )
+            for name in (table, second) if second else (table,):
                 try:
-                    sql(text)
+                    drop_fixture_table(name)
+                    remaining = sql(
+                        "SELECT count(*) FROM pg_catalog.pg_class c "
+                        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                        f"WHERE n.nspname = 'public' AND c.relname = '{name}'"
+                    )
+                    if remaining != "0":
+                        raise RuntimeError(
+                            "fixture relation still exists after DROP TABLE"
+                        )
                 except Exception as error:
-                    print(f"qualification cleanup failed: {error}", file=sys.stderr)
+                    cleanup_errors.append(
+                        f"qualification table cleanup failed for {name}: {error}"
+                    )
+            for error in cleanup_errors:
+                print(error, file=sys.stderr)
         else:
             subprocess.run(["docker", "rm", "-f", pg], capture_output=True)
+    if cleanup_errors:
+        raise RuntimeError("Debezium qualification fixture cleanup failed")
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":
