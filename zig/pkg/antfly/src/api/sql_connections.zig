@@ -641,14 +641,20 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
             session.commit_body_digest = @splat(4);
             try store.saveForTest(session, null);
         }
-        _ = try mutate(&store, .{ .uncertain = .{ .id = id, .guard = guard } }, "alice", 7, 2);
+        if (request_persisted) _ = try mutate(&store, .{ .uncertain = .{ .id = id, .guard = guard } }, "alice", 7, 2);
         try reconcileExpired(&store, &registry, alloc, 999);
         var pending = try load(&store, alloc, id, "alice", 7, 999);
         defer pending.deinit();
-        try std.testing.expectEqual(record.State.uncertain, pending.value.state);
+        try std.testing.expectEqual(if (request_persisted) record.State.uncertain else .active, pending.value.state);
         try reconcileExpired(&store, &registry, alloc, 1000);
         try std.testing.expectError(error.SqlConnectionNotFound, load(&store, alloc, id, "alice", 7, 2));
-        try std.testing.expect((try store.connectionLifecycle(txn_id)) == null);
+        const disposition = (try registry.getStatusForPrincipal(alloc, txn_id, "alice")).?;
+        try std.testing.expectEqual(transactions.SessionDisposition.aborted, disposition.disposition);
+        try std.testing.expectEqual(@as(u64, 0), disposition.lease_expires_at);
+        try std.testing.expect((try registry.getStatusForPrincipal(alloc, txn_id, "bob")) == null);
+        var receipt = (try store.load(txn_id)).?;
+        defer receipt.deinit(alloc);
+        try std.testing.expect(receipt.terminal_abort and receipt.staged == null and receipt.execution_plan == null);
     }
 }
 

@@ -3976,11 +3976,7 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
         // Non-session rows have no derived prefix-cache entry. Ordinary
         // range reads still reach the retained canonical value.
         try std.testing.expectEqualStrings("\xff", try old.getRange(key, 0, 1));
-        if (old.probePrefix(key, 1)) |bytes| {
-            try std.testing.expectEqualStrings("\xff", bytes);
-        } else |err| {
-            try std.testing.expectEqual(error.EndOfStream, err);
-        }
+        try std.testing.expectError(error.EndOfStream, old.probePrefix(key, 1));
     }
     var parent = try store.openSessionRead(a, group);
     var cursor = parent.openCursor() catch |err| {

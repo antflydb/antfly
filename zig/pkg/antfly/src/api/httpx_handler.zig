@@ -6847,6 +6847,8 @@ pub const AntflyApiHandler = struct {
                     self.connection_session_hex = std.fmt.bytesToHex(active, .lower);
                     if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) return error.SqlTransactionNotActive;
                     if (connection.state == .uncertain) {
+                        if (self.prepared_mode != .statement or self.parameters.len != 0 or
+                            !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlConnectionBusy;
                         self.adapter.outcome_transaction_id = self.connection_session_hex;
                         return error.SqlTransactionOutcomeUnknown;
                     }
@@ -15523,6 +15525,12 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     const txn_id = active.value.active_txn.?;
     const guard = try server.txn_sessions.mutation(alloc, txn_id, node);
     _ = try connections.mutate(&durable, .{ .uncertain = .{ .id = id, .guard = guard } }, principal, node, now_ms);
+    var blocked_read = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "SELECT 1");
+    defer blocked_read.deinit(alloc);
+    var busy = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, blocked_read.body, .{});
+    defer busy.deinit();
+    try std.testing.expectEqualStrings("25001", busy.value.code);
+    try std.testing.expect(busy.value.transaction_id == null);
     var repeated = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "COMMIT");
     defer repeated.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), repeated.status);
