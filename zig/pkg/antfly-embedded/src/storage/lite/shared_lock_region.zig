@@ -567,6 +567,7 @@ fn fcntlLockUntil(io: Io, fd: std.posix.fd_t, offset: i64, lock_type: i16, deadl
 /// for this one-time section, avoids that cross-mechanism conflict
 /// entirely rather than working around it.
 const setup_lock_offset: i64 = 1 << 48;
+const frontier_barrier_lock_offset = setup_lock_offset + 1;
 
 /// The byte-range liveness probe §8.4 describes: `true` means the
 /// recorded holder at this byte is dead (the kernel already dropped its
@@ -612,6 +613,7 @@ const FdEntry = struct {
     /// Serializes this process's region setup on this inode
     /// (`openSizedUntil`); the fcntl setup byte alone does not.
     setup_mutex: Io.Mutex = .init,
+    frontier_barrier_mutex: Io.Mutex = .init,
 };
 
 // `Io.Mutex`, matching `inode_lock.zig`'s own registry mutex -- never a
@@ -946,39 +948,61 @@ pub const Region = struct {
         return logNonceOffset(max_readers) + @as(u64, max_readers) * @sizeOf(std.atomic.Value(u64));
     }
 
-    fn frontierProofOffset(max_readers: u32) u64 {
-        return std.mem.alignForward(u64, publisherRegionBytes(max_readers), @alignOf(std.atomic.Value(u128)));
+    fn previousRegionBytes(max_readers: u32) u64 {
+        return std.mem.alignForward(u64, publisherRegionBytes(max_readers), @alignOf(std.atomic.Value(u128))) + 2 * @sizeOf(std.atomic.Value(u128));
     }
 
-    fn regionBytesFor(max_readers: u32) u64 {
-        return frontierProofOffset(max_readers) + 2 * @sizeOf(std.atomic.Value(u128));
+    // Use the padding between the publisher generation and its nonce table.
+    // An older publisher can resize the sidecar to its original length while
+    // other processes are mapped.
+    fn frontierProofField(self: *const Region, comptime T: type, offset: usize) *std.atomic.Value(T) {
+        const base: usize = @intCast(logPublisherOffset(self.header().max_readers));
+        return @ptrCast(@alignCast(self.mapping.ptr + base + offset));
     }
 
-    fn frontierProof(self: *const Region, full_sync: bool) *std.atomic.Value(u128) {
-        const offset = frontierProofOffset(self.header().max_readers) + @as(u64, @intFromBool(full_sync)) * @sizeOf(std.atomic.Value(u128));
-        return @ptrCast(@alignCast(self.mapping.ptr + @as(usize, @intCast(offset))));
-    }
-
-    // A full fingerprint makes a torn extension write a cache miss.
-    // This proof is written only after completion of the data barrier.
-    fn frontierFingerprint(sequence: u64, generation: u64, end_offset: u64) u128 {
-        var raw: [24]u8 = undefined;
+    fn frontierFingerprint(sequence: u64, generation: u64, end_offset: u64, full_sync: bool) [12]u8 {
+        var raw: [25]u8 = undefined;
         std.mem.writeInt(u64, raw[0..8], sequence, .little);
         std.mem.writeInt(u64, raw[8..16], generation, .little);
         std.mem.writeInt(u64, raw[16..24], end_offset, .little);
-        var digest: [16]u8 = undefined;
+        raw[24] = @intFromBool(full_sync);
+        var digest: [12]u8 = undefined;
         std.crypto.hash.Blake3.hash(&raw, &digest, .{});
-        return std.mem.readInt(u128, &digest, .little) | 1;
+        digest[0] |= 1;
+        return digest;
+    }
+
+    fn matchesFrontierProof(self: *const Region, sequence: u64, generation: u64, end_offset: u64, full_sync: bool) bool {
+        const tag = self.frontierProofField(u32, 20).load(.acquire);
+        if (tag == 0) return false;
+        const proof = frontierFingerprint(sequence, generation, end_offset, full_sync);
+        return tag == std.mem.readInt(u32, proof[0..4], .little) and
+            self.frontierProofField(u64, 24).load(.acquire) == std.mem.readInt(u64, proof[4..12], .little);
     }
 
     pub fn hasSyncedFrontier(self: *const Region, sequence: u64, generation: u64, end_offset: u64, full_sync: bool) bool {
-        const proof = frontierFingerprint(sequence, generation, end_offset);
-        return self.frontierProof(true).load(.acquire) == proof or
-            (!full_sync and self.frontierProof(false).load(.acquire) == proof);
+        return self.matchesFrontierProof(sequence, generation, end_offset, true) or
+            (!full_sync and self.matchesFrontierProof(sequence, generation, end_offset, false));
     }
 
     pub fn noteSyncedFrontier(self: *Region, sequence: u64, generation: u64, end_offset: u64, full_sync: bool) void {
-        self.frontierProof(full_sync).store(frontierFingerprint(sequence, generation, end_offset), .release);
+        if (!full_sync and self.matchesFrontierProof(sequence, generation, end_offset, true)) return;
+        const proof = frontierFingerprint(sequence, generation, end_offset, full_sync);
+        self.frontierProofField(u64, 24).store(std.mem.readInt(u64, proof[4..12], .little), .release);
+        self.frontierProofField(u32, 20).store(std.mem.readInt(u32, proof[0..4], .little), .release);
+    }
+
+    // Cold recoverers already hold a shared writer fence. This separate
+    // byte lets one complete the missing barrier while the others wait.
+    pub fn lockFrontierBarrier(self: *Region) !void {
+        try self.fd_entry.frontier_barrier_mutex.lock(self.io);
+        errdefer self.fd_entry.frontier_barrier_mutex.unlock(self.io);
+        try fcntlLockBlocking(self.io, self.fd_entry.fd, frontier_barrier_lock_offset, std.c.F.WRLCK);
+    }
+
+    pub fn unlockFrontierBarrier(self: *Region) void {
+        fcntlUnlock(self.fd_entry.fd, frontier_barrier_lock_offset);
+        self.fd_entry.frontier_barrier_mutex.unlock(self.io);
     }
 
     fn logPublisher(self: *const Region) *std.atomic.Value(u128) {
@@ -1359,8 +1383,7 @@ pub const Region = struct {
             try ensureNoLivePeer(io, fd_entry, &existing_raw, size);
         }
         if (need_init) {
-            // `regionBytesFor`'s own doc comment has the per-slot layout.
-            const region_bytes = regionBytesFor(max_readers);
+            const region_bytes = publisherRegionBytes(max_readers);
             // Rebuild from a clean slate: a corrupt region's leftover
             // reader-slot/liveness bytes are never trusted either, only
             // the header's own validity was checked above. `setLength(0)`
@@ -1412,7 +1435,7 @@ pub const Region = struct {
             const existing: *const Header = @ptrCast(@alignCast(&existing_raw));
             break :blk existing.max_readers;
         };
-        const map_len: usize = @intCast(regionBytesFor(final_max_readers));
+        const map_len: usize = @intCast(publisherRegionBytes(final_max_readers));
         if (!need_init and size < map_len) try setup_file.setLength(io, map_len);
 
         const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
@@ -1522,7 +1545,7 @@ pub const Region = struct {
         if (!std.mem.eql(u8, &h.magic, &magic)) return false;
         if (h.format_version != format_version) return false;
         return h.max_readers != 0 and
-            (h.region_bytes == legacyRegionBytes(h.max_readers) or h.region_bytes == publisherRegionBytes(h.max_readers) or h.region_bytes == regionBytesFor(h.max_readers)) and
+            (h.region_bytes == legacyRegionBytes(h.max_readers) or h.region_bytes == publisherRegionBytes(h.max_readers) or h.region_bytes == previousRegionBytes(h.max_readers)) and
             h.header_checksum == headerChecksum(h);
     }
 
@@ -5212,6 +5235,16 @@ test "shared lock region extends the publisher proof without invalidating existi
     try std.testing.expect(!observer.hasSyncedFrontier(5, 8, 512, false));
     try std.testing.expect(!observer.hasSyncedFrontier(5, 7, 1024, false));
     observer.noteSyncedFrontier(5, 7, 512, true);
+    try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
+    observer.noteSyncedFrontier(5, 7, 512, false);
+    try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
+    // An older extension-aware opener can shrink a file that still
+    // advertises the legacy size. Keep every live proof field mapped.
+    const file: Io.File = .{ .handle = observer.fd_entry.fd, .flags = .{ .nonblocking = false } };
+    const publisher_bytes = Region.publisherRegionBytes(observer.header().max_readers);
+    try std.testing.expectEqual(publisher_bytes, (try file.stat(io)).size);
+    try file.setLength(io, Region.previousRegionBytes(observer.header().max_readers));
+    try file.setLength(io, publisher_bytes);
     try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
     try std.testing.expect(!observer.isLogStateLive(state));
     {
