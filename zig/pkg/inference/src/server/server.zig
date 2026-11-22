@@ -5044,7 +5044,17 @@ pub const Node = struct {
     }
 
     fn tensorBatchDispatch(self: *Node, task: executor_microbatch.Task) @import("tensor_microbatch.zig").Dispatch {
-        return .{ .ptr = self, .task = task, .run_fn = runTensorBatch, .run_resident_fn = runResidentTensorBatch };
+        return .{ .ptr = self, .task = task, .run_fn = runTensorBatch, .run_resident_fn = runResidentTensorBatch, .run_stage_fn = runStageTensorBatch };
+    }
+
+    fn runStageTensorBatch(raw: *anyopaque, task: executor_microbatch.Task, allocator: std.mem.Allocator, session: backends_mod.Session, inputs: []const @import("../backends/session.zig").StageInput, supplied: ?InferenceExecutionControl) anyerror!@import("../backends/session.zig").ResidentOutputs {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        const control = self.bindExecutionControl(null, supplied orelse .{});
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*value| value.deinit();
+        const io = self.inferenceIo(allocator, control.io, &owned_io);
+        const gate = session.execution_gate orelse return error.MissingExecutionGate;
+        return @import("tensor_microbatch.zig").runStage(self.executorMicrobatchBroker(), allocator, io, task, session, gate, inputs, control, try directExecutorDeadline(io, control.deadline_ns), self.config.executor_microbatch_max_wait_us);
     }
 
     fn TensorBatchOutput(comptime resident: bool) type {

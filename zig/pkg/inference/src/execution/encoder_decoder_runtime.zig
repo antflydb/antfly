@@ -341,24 +341,32 @@ fn finalGreedyToken(allocator: std.mem.Allocator, decoder: backends.Session, enc
 
 pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Session, inputs: []const session_mod.StageInput, query_rows: usize, vocab: usize, control: ?Control) ![]f32 {
     if (query_rows == 0 or vocab == 0) return error.InvalidInputShape;
+    var outputs = (try decoder.runStageInputsWithControl(inputs, allocator, control)) orelse return error.UnexpectedResidentStageDecline;
+    defer outputs.deinit();
+    if (outputs.outputs.len != 1) return error.InvalidDecoderOutput;
+    return residentVocabularyRow(allocator, decoder, &outputs, 0, query_rows, vocab, control);
+}
+
+/// The result retains the provider's admission and tensor custody across the
+/// readback. Only the requested row crosses the device boundary.
+pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Session, outputs: *const session_mod.ResidentOutputs, logits_index: usize, query_rows: usize, vocab: usize, control: ?Control) ![]f32 {
+    if (query_rows == 0 or vocab == 0 or logits_index >= outputs.outputs.len) return error.InvalidDecoderOutput;
     const expected = [_]i64{
         1,
         std.math.cast(i64, query_rows) orelse return error.ResourceLimitExceeded,
         std.math.cast(i64, vocab) orelse return error.ResourceLimitExceeded,
     };
-    var outputs = (try decoder.runStageInputsWithControl(inputs, allocator, control)) orelse return error.UnexpectedResidentStageDecline;
-    defer outputs.deinit();
+    const logits = outputs.outputs[logits_index];
     var operation_scope: @import("backend_operation.zig").Scope = undefined;
     try @import("backend_operation.zig").enterInto(outputs.backend, null, outputs.backend.operationToken(), .legacy_unknown_frame, &operation_scope);
     var operation_succeeded = false;
     defer {
         if (operation_succeeded) operation_scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     }
-    if (outputs.outputs.len != 1) return error.InvalidDecoderOutput;
-    if (try outputs.backend.tensorShapeMatches(outputs.outputs[0], &expected)) |matches| {
+    if (try outputs.backend.tensorShapeMatches(logits, &expected)) |matches| {
         if (!matches) return error.InvalidDecoderOutput;
     } else {
-        const actual = try outputs.backend.tensorShape(outputs.outputs[0], allocator);
+        const actual = try outputs.backend.tensorShape(logits, allocator);
         defer allocator.free(actual);
         if (!std.mem.eql(i64, &expected, actual)) return error.InvalidDecoderOutput;
     }
@@ -366,7 +374,7 @@ pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Sessio
     var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
     defer if (guard) |*scope| scope.deinit();
     const slice = outputs.backend.vtable.sliceRows2D orelse return error.UnexpectedResidentStageDecline;
-    const row = try slice(outputs.backend.ptr, outputs.outputs[0], query_rows - 1, 1, vocab);
+    const row = try slice(outputs.backend.ptr, logits, query_rows - 1, 1, vocab);
     defer outputs.backend.free(row);
     const values = try outputs.backend.toFloat32(row, allocator);
     errdefer allocator.free(values);

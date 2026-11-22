@@ -11597,6 +11597,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const original = &toBuf(lease.tensor).metal_tensor.?;
         try original.uploadBytes(std.mem.sliceAsBytes(input));
     }
+    fn gatherDeviceRowsOp(ctx: *anyopaque, output: CT, sources: []const CT) !void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const target = toBuf(output).metal_tensor orelse return error.InvalidPhysicalTransferSize;
+        if (target.dtype != .f32 or target.physicalLease() == null or target.isReadOnlyPhysical() or sources.len == 0 or sources.len > 8) return error.InvalidPhysicalTransferSize;
+        const destination = target.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
+        var spans: [8]metal_runtime_mod.BufferGatherSource = undefined;
+        var cursor = target.deviceByteOffset();
+        const end = try std.math.add(usize, cursor, target.deviceByteLen());
+        for (sources, spans[0..sources.len]) |source, *span| {
+            const value = toBuf(source).metal_tensor orelse return error.InvalidPhysicalTransferSize;
+            const device = value.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
+            if (device == destination or value.dtype != .f32 or value.deviceByteLen() == 0 or value.deviceByteLen() > end - cursor) return error.InvalidPhysicalTransferSize;
+            span.* = .{ .device = device, .source_offset = value.deviceByteOffset(), .destination_offset = cursor, .length = value.deviceByteLen() };
+            cursor += span.length;
+        }
+        if (cursor != end) return error.InvalidPhysicalTransferSize;
+        if (metal_runtime_mod.termite_metal_buffer_gather(self.provider_impl.raw_decode_runtime, destination, &spans, sources.len) != 0) return error.MetalBufferCopyFailed;
+        for (spans[0..sources.len]) |span| @import("../execution/transfer_audit.zig").deviceCopy(span.length);
+    }
+
     fn copyPhysicalInputOp(_: *anyopaque, destination: CT, source: CT) anyerror!void {
         const target = &toBuf(destination).metal_tensor.?;
         const input = toBuf(source).metal_tensor orelse return error.InvalidPhysicalTransferSize;
@@ -11853,6 +11873,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// reshape constructor deliberately creates a NEW semantic value identity;
     /// model preparation instead retains this SAME value/version and SDK root.
     /// No host payload, conversion, slot preparation or upload is born here.
+    fn retainableCacheOutput(ctx: *anyopaque, value: CT) ?*const MetalTensor {
+        const source = toBuf(value);
+        if (source.resident_owner != ctx or source.integer_storage or source.lazy_multiply != null or
+            source.mutable_state or bufHasAnyQuantizedStorage(source) or hasHostView(source) or
+            source.logical_view_strides != null or source.view_base_offset != 0 or
+            source.native_dense_bytes != null or source.resident_index_storage != null) return null;
+        return if (source.metal_tensor) |*tensor| tensor else null;
+    }
+
+    fn standaloneOutputBytesOp(ctx: *anyopaque, value: CT) ?usize {
+        const tensor = retainableCacheOutput(ctx, value) orelse return null;
+        return tensor.standaloneOutputBytes();
+    }
+
+    fn pooledOutputStorageOp(ctx: *anyopaque, value: CT) ?*const ops.physical_storage.Lease {
+        const tensor = retainableCacheOutput(ctx, value) orelse return null;
+        if (tensor.deviceByteOffset() != 0 or tensor.deviceHandle() == null) return null;
+        return tensor.physicalLease();
+    }
+
     fn retainImmutableTensorOp(ctx: *anyopaque, value: CT) !?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const source = toBuf(value);
@@ -17212,6 +17252,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn negateOp(ctx: *anyopaque, a: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (toBuf(a).integer_storage) {
+            const dtype: ops.GraphDType = switch (try tensorDTypeOp(ctx, a)) {
+                inline .i8, .i16, .i32, .i64 => |tag| @field(ops.GraphDType, @tagName(tag)),
+                else => return error.UnsupportedTensorType,
+            };
+            const zero_bits: [8]u8 = @splat(0);
+            const zero = (try fromConstantBytesOp(ctx, zero_bits[0..dtype.byteSize()], dtype, &.{})) orelse return error.UnsupportedTensorType;
+            defer self.computeBackend().free(zero);
+            return self.integerBinary(zero, a, 1);
+        }
         if (try self.tryFlatDeviceUnaryRuntimeOp(a, .negate)) |device_result| return device_result;
         return self.hostFallbackUnary(a, null, .negate);
     }
@@ -19025,6 +19075,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         const rank = resolved_a.len;
 
+        if (kernel_geometry.ConcatAxis.emptyIdentity(resolved_a, resolved_b, axis_index)) |identity| {
+            const source = if (identity == .lhs) a_tensor else b_tensor;
+            const concrete = if (identity == .lhs) resolved_a else resolved_b;
+            var shape: [metal_tensor_mod.max_dims]i32 = undefined;
+            for (shape[0..rank], concrete) |*value, dim| value.* = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+            var retained = try source.retainedView(0, source.deviceByteLen(), shape[0..rank]);
+            errdefer self.retireTemporaryWorkspaceValue(&retained);
+            return try self.ctFromOwnedMetalTensor(retained);
+        }
+
         var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
         const geometry = kernel_geometry.ConcatAxis.init(resolved_a, resolved_b, axis_index, &out_shape) catch return null;
         const a_axis = geometry.a_axis;
@@ -19075,6 +19135,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) ?[]const i64 {
         if (declared_shape.len > scratch.len) return null;
         const elem_count = tensor.elemCount();
+        if (elem_count == 0) {
+            const actual = tensor.shape();
+            if (actual.len != declared_shape.len) return null;
+            var empty = false;
+            for (declared_shape, actual, 0..) |declared, dim, index| {
+                if (dim < 0 or (declared >= 0 and declared != dim)) return null;
+                scratch[index] = dim;
+                empty = empty or dim == 0;
+            }
+            return if (empty) scratch[0..actual.len] else null;
+        }
         if (resolveShapeFromDataLen(declared_shape, elem_count)) |resolved| {
             scratch.* = resolved;
             return scratch[0..declared_shape.len];
@@ -20022,7 +20093,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         },
                     );
                 }
-                if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and bufElemCount(weight_buf) == dim) {
+                if (input_metal.isDevice() and bufElemCount(weight_buf) == dim) {
                     var input_mt = try input_metal.retainedCopy();
                     defer self.retireTemporaryWorkspaceValue(&input_mt);
                     var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
@@ -40572,11 +40643,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn materializesOutputOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
-        // Contiguous Metal slices already return retained zero-copy views.
-        return descriptor.operation == .slice and supportsAssignedDescriptor(descriptor);
+        // Assigned last-dimension broadcasts write dense output, unlike
+        // the inferred affine view. Contiguous slices retain zero-copy views.
+        return (descriptor.operation == .slice or descriptor.operation == .broadcast) and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -50334,6 +50406,12 @@ test "metal_compute: resident scans and exact mixed integer comparisons" {
     };
     const ints = (try cb.fromInt32Shape(&.{ 16777217, -16777217, 2147483647, -2147483648 }, &.{4})) orelse return error.TestUnexpectedResult;
     defer cb.free(ints);
+    const negated = try cb.primNegate(ints);
+    defer cb.free(negated);
+    try std.testing.expect(MetalCompute.toBuf(negated).metal_tensor.?.isDevice());
+    const negated_bytes = (try cb.exportTensorData(negated, allocator)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(negated_bytes.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ -16777217, 16777217, -2147483647, -2147483648 }), negated_bytes.payload.bytes);
     const integer_scan = (try cb.tryCumulativeSum(ints, 0, false, false)) orelse return error.TestUnexpectedResult;
     defer cb.free(integer_scan);
     const integer_bytes = (try cb.exportTensorData(integer_scan, allocator)) orelse return error.TestUnexpectedResult;

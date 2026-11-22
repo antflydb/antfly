@@ -40,7 +40,7 @@ const null_node = node_mod.null_node;
 const OpCode = node_mod.OpCode;
 const Shape = shape_mod.Shape;
 
-const max_folded_constant_bytes = 16 * 1024 * 1024;
+pub const max_folded_constant_bytes = 16 * 1024 * 1024;
 
 pub const ConstFoldResult = struct {
     graph: Graph,
@@ -80,6 +80,29 @@ pub fn fold(allocator: std.mem.Allocator, graph: *const Graph) !ConstFoldResult 
     @memset(reachable, false);
     for (graph.outputs.items) |id| markReachable(graph, reachable, redirect, id);
 
+    // An index computation can temporarily use F32 (for example logarithmic
+    // position bucketing) before an exact cast back to integer indices.
+    // Integer masks can also end in a cast to F32 attention bias.
+    const index_grid = try allocator.alloc(bool, count);
+    defer allocator.free(index_grid);
+    @memset(index_grid, false);
+    var cursor = count;
+    while (cursor != 0) {
+        cursor -= 1;
+        if (!reachable[cursor]) continue;
+        const node = graph.nodes.items[cursor];
+        const index_cast = node.op == .convert_dtype and (integerDType(node.op.convert_dtype.target) or
+            (node.op.convert_dtype.target == .f32 and node.inputs[0] < cursor and integerDType(graph.node(node.inputs[0]).output_shape.dtype)));
+        if (node.op == .gather and node.num_inputs >= 2 and node.inputs[1] < cursor)
+            index_grid[node.inputs[1]] = true;
+        if (!index_cast and !index_grid[cursor]) continue;
+        for (node.getInputs()) |input| {
+            if (input >= cursor) continue;
+            const dtype = graph.node(input).output_shape.dtype;
+            if (dtype == .f32 or integerDType(dtype)) index_grid[input] = true;
+        }
+    }
+
     // Track which nodes are constant (original constants + folded nodes).
     const is_const = try allocator.alloc(bool, count);
     defer allocator.free(is_const);
@@ -98,6 +121,8 @@ pub fn fold(allocator: std.mem.Allocator, graph: *const Graph) !ConstFoldResult 
     errdefer work.deinit();
 
     var num_folded: u32 = 0;
+    var index_expansion_budget: usize = 128 * 1024;
+    var proven_index_budget: usize = 1024 * 1024;
 
     // Walk in topological order (append-only graph guarantees this).
     for (0..count) |i| {
@@ -146,13 +171,27 @@ pub fn fold(allocator: std.mem.Allocator, graph: *const Graph) !ConstFoldResult 
             var input_bytes: usize = 0;
             for (inputs) |input| {
                 const source = work.node(resolve(redirect, input));
-                const bytes = if (source.op == .constant) source.op.constant.data_len else 0;
+                const bytes = if (source.op == .constant) @as(usize, source.op.constant.data_len) * source.output_shape.dtype.byteSize() else 0;
                 input_bytes = std.math.add(usize, input_bytes, bytes) catch std.math.maxInt(usize);
             }
-            if (output_bytes / 4 > input_bytes) continue;
+            if (output_bytes / 4 > input_bytes) {
+                // A small index grid can eliminate an entire chain of
+                // device-side integer operations under shape specialization.
+                const limit: usize = if (index_grid[i]) 64 * 1024 else 16 * 1024;
+                const budget = if (index_grid[i]) &proven_index_budget else &index_expansion_budget;
+                if (n.op != .broadcast_in_dim or n.output_shape.rank() > 3 or (!integerDType(n.output_shape.dtype) and !index_grid[i]) or output_bytes > limit or output_bytes > budget.*) continue;
+                budget.* -= output_bytes;
+            }
         }
 
         if (try foldShapeTransform(allocator, &work, n, redirect)) |new_id| {
+            redirect[i] = new_id;
+            is_const[i] = true;
+            num_folded += 1;
+            continue;
+        }
+
+        if (try foldIntegerElementwise(allocator, &work, n, redirect, @intCast(elements))) |new_id| {
             redirect[i] = new_id;
             is_const[i] = true;
             num_folded += 1;
@@ -222,6 +261,106 @@ pub fn fold(allocator: std.mem.Allocator, graph: *const Graph) !ConstFoldResult 
 }
 
 // ── Evaluation ────────────────────────────────────────────────────────
+
+// Shape-derived index programs should become immutable integer payloads
+// before the provider prepares kernels. Never round indices through f32.
+fn foldIntegerElementwise(allocator: std.mem.Allocator, graph: *Graph, n: *const Node, redirect: []const NodeId, count: usize) !?NodeId {
+    const arity: u8 = switch (n.op) {
+        .neg => 1,
+        .add, .sub, .mul, .div, .less_than => 2,
+        .where_select => 3,
+        else => return null,
+    };
+    if (count == 0 or n.num_inputs != arity) return null;
+    const first = graph.node(resolve(redirect, n.inputs[0]));
+    const operand = if (n.op == .where_select) graph.node(resolve(redirect, n.inputs[1])) else first;
+    const dtype = operand.output_shape.dtype;
+    if (!integerDType(dtype) and !(n.op == .where_select and dtype == .f32)) return null;
+    const out_dtype = n.output_shape.dtype;
+    if (n.op == .less_than) {
+        if (!integerDType(out_dtype) and out_dtype != .f32) return null;
+    } else if (out_dtype != dtype or (dtype == .bool_ and n.op != .where_select)) return null;
+
+    var operands: [3]IntegerConstant = undefined;
+    for (n.getInputs(), operands[0..n.num_inputs], 0..) |input, *read, index| {
+        const node = graph.node(resolve(redirect, input));
+        const attrs = node.op.constant;
+        const condition = n.op == .where_select and index == 0;
+        if (node.output_shape.dtype != dtype and (!condition or
+            (!integerDType(node.output_shape.dtype) and node.output_shape.dtype != .f32))) return null;
+        if (attrs.data_len != 1 and (attrs.data_len != count or !std.mem.eql(i64, node.output_shape.dims[0..node.output_shape.rank()], n.output_shape.dims[0..n.output_shape.rank()]))) return null;
+        const width = node.output_shape.dtype.byteSize();
+        read.* = .{
+            .dtype = node.output_shape.dtype,
+            .data = graph.constantBytes(attrs.data_offset, @intCast(width * attrs.data_len)),
+            .scalar = attrs.data_len == 1,
+        };
+    }
+    const width = out_dtype.byteSize();
+    const result = try allocator.alloc(u8, count * width);
+    defer allocator.free(result);
+    for (0..count) |index| {
+        const a = operands[0].at(index);
+        const dst = result[index * width ..][0..width];
+        if (n.op == .where_select) {
+            @memcpy(dst, operands[if (a != 0) @as(usize, 1) else 2].bytesAt(index)[0..width]);
+            continue;
+        }
+        const value: i64 = switch (n.op) {
+            .neg => -%a,
+            .add => a +% operands[1].at(index),
+            .sub => a -% operands[1].at(index),
+            .mul => a *% operands[1].at(index),
+            .div => blk: {
+                const divisor = operands[1].at(index);
+                if (divisor == 0 or (a == std.math.minInt(i64) and divisor == -1)) return null;
+                break :blk @divTrunc(a, divisor);
+            },
+            .less_than => @intFromBool(a < operands[1].at(index)),
+            else => unreachable,
+        };
+        switch (out_dtype) {
+            .i8, .u8, .bool_ => dst[0] = @truncate(@as(u64, @bitCast(value))),
+            .i16 => std.mem.writeInt(i16, dst[0..2], @truncate(value), .little),
+            .i32 => std.mem.writeInt(i32, dst[0..4], @truncate(value), .little),
+            .i64 => std.mem.writeInt(i64, dst[0..8], value, .little),
+            .f32 => std.mem.writeInt(u32, dst[0..4], @bitCast(@as(f32, @floatFromInt(value))), .little),
+            else => unreachable,
+        }
+    }
+    const loc = try graph.internConstantBytes(result, out_dtype);
+    return try graph.addNode(.{ .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } }, .output_shape = n.output_shape });
+}
+
+fn integerDType(dtype: shape_mod.DType) bool {
+    return switch (dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => true,
+        else => false,
+    };
+}
+
+const IntegerConstant = struct {
+    dtype: shape_mod.DType,
+    data: []const u8,
+    scalar: bool,
+
+    fn bytesAt(self: IntegerConstant, index: usize) []const u8 {
+        return self.data[if (self.scalar) 0 else index * self.dtype.byteSize()..];
+    }
+
+    fn at(self: IntegerConstant, index: usize) i64 {
+        const source = self.bytesAt(index);
+        return switch (self.dtype) {
+            .i8 => @as(i8, @bitCast(source[0])),
+            .i16 => std.mem.readInt(i16, source[0..2], .little),
+            .i32 => std.mem.readInt(i32, source[0..4], .little),
+            .i64 => std.mem.readInt(i64, source[0..8], .little),
+            .u8, .bool_ => source[0],
+            .f32 => @intFromBool(@as(f32, @bitCast(std.mem.readInt(u32, source[0..4], .little))) != 0),
+            else => unreachable,
+        };
+    }
+};
 
 /// Try to evaluate a node on constant inputs. Returns the result data
 /// if the op is supported for constant folding, or null otherwise.
@@ -622,8 +761,9 @@ fn writeConverted(comptime Src: type, comptime Dst: type, src: []const Src, out_
         if (src_is_float and dst_is_float) {
             o.* = @floatCast(v);
         } else if (src_is_float and !dst_is_float) {
-            // Float → integer: truncation toward zero (matches @intFromFloat).
-            o.* = @intFromFloat(v);
+            // Float-to-integer Cast leaves out-of-range values unspecified.
+            // Use the same deterministic conversion as runtime evaluation.
+            o.* = std.math.lossyCast(Dst, @as(f64, v));
         } else if (!src_is_float and dst_is_float) {
             o.* = @floatFromInt(v);
         } else {
@@ -1639,10 +1779,10 @@ test "fold convert_dtype f32 → i32" {
     var g = Graph.init(allocator);
     var b = Builder.init(&g);
 
-    const c = try b.tensorConst(&.{ 0.5, 1.7, -2.3, 9.0 }, Shape.init(.f32, &.{4}));
+    const c = try b.tensorConst(&.{ 0.5, 1.7, -2.3, 9.0, -std.math.inf(f32), std.math.inf(f32), std.math.nan(f32) }, Shape.init(.f32, &.{7}));
     const cast = try g.addNode(.{
         .op = .{ .convert_dtype = .{ .target = .i32 } },
-        .output_shape = Shape.init(.i32, &.{4}),
+        .output_shape = Shape.init(.i32, &.{7}),
         .inputs = .{ c, null_node, null_node, null_node },
         .num_inputs = 1,
     });
@@ -1661,7 +1801,7 @@ test "fold convert_dtype f32 → i32" {
     };
     try std.testing.expectEqual(shape_mod.DType.i32, out_node.output_shape.dtype);
     const data = result.graph.constantDataAs(i32, attrs.data_offset, attrs.data_len);
-    try std.testing.expectEqualSlices(i32, &.{ 0, 1, -2, 9 }, data);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, -2, 9, std.math.minInt(i32), std.math.maxInt(i32), 0 }, data);
 }
 
 test "generic const-fold evaluator does not reinterpret typed constants as f32" {
@@ -1681,9 +1821,9 @@ test "generic const-fold evaluator does not reinterpret typed constants as f32" 
     defer result.deinit();
     g.deinit();
 
-    try std.testing.expectEqual(@as(u32, 0), result.num_folded);
-    const out_id = result.graph.outputs.items[0];
-    try std.testing.expectEqual(.add, std.meta.activeTag(result.graph.node(out_id).op));
+    try std.testing.expectEqual(@as(u32, 1), result.num_folded);
+    const attrs = result.graph.node(result.graph.outputs.items[0]).op.constant;
+    try std.testing.expectEqualSlices(i64, &.{ 4, 6 }, result.graph.constantDataAs(i64, attrs.data_offset, attrs.data_len));
 }
 
 test "fold convert_dtype f32 → f16" {
@@ -2009,4 +2149,56 @@ test "fold retains compact repeated broadcasts below the per-node byte ceiling" 
     defer result.deinit();
     try std.testing.expect(result.graph.constant_pool.items.len <= 16);
     try std.testing.expect(result.graph.node(result.graph.outputs.items[0]).op == .broadcast_in_dim);
+}
+
+test "fold integer index arithmetic and selection without float rounding" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const shape = Shape.init(.i64, &.{2});
+    const input = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, -9007199254740995 }), shape);
+    const zero = try b.scalarConst(.i64, 0);
+    const negated = try b.neg(input);
+    const predicate = try g.addNode(.{
+        .op = .{ .less_than = {} },
+        .output_shape = Shape.init(.bool_, &.{2}),
+        .inputs = .{ input, zero, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const pick = try g.addNode(.{
+        .op = .{ .where_select = {} },
+        .output_shape = shape,
+        .inputs = .{ predicate, negated, input, null_node },
+        .num_inputs = 3,
+    });
+    try g.markOutput(pick);
+
+    var out = try fold(a, &g);
+    defer out.deinit();
+    const folded = out.graph.node(out.graph.outputs.items[0]).op.constant;
+    try std.testing.expectEqualSlices(i64, &.{ 9007199254740993, 9007199254740995 }, out.graph.constantDataAs(i64, folded.data_offset, folded.data_len));
+}
+
+test "fold bounded float grids that feed exact integer casts" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const one = try b.scalarConst(.f32, 1);
+    const dims = Shape.init(.f32, &.{ 33, 33 });
+    const grid = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = .{ .target_shape = dims, .num_axes = 0 } },
+        .output_shape = dims,
+        .inputs = .{ one, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    const scaled = try b.mul(grid, try b.scalarConst(.f32, 4.5));
+    try g.markOutput(try b.convertDtype(scaled, .i64));
+    var result = try fold(a, &g);
+    defer result.deinit();
+    const literal = result.graph.node(result.graph.outputs.items[0]).op.constant;
+    const indices = result.graph.constantDataAs(i64, literal.data_offset, literal.data_len);
+    try std.testing.expectEqual(@as(usize, 1089), indices.len);
+    for (indices) |index| try std.testing.expectEqual(@as(i64, 4), index);
 }

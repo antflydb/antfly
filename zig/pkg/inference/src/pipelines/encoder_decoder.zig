@@ -193,7 +193,7 @@ pub const EncoderDecoderPipeline = struct {
                 try control.update(.executing, @intCast(step), @intCast(max_len));
             const dec_seq_len: usize = output_ids.items.len;
 
-            var row = numerical.step(dec_ids_i64[0..dec_seq_len], null, self.batch_dispatch) catch |err| switch (err) {
+            var row = numerical.step(dec_ids_i64[0..dec_seq_len], step, null, self.batch_dispatch) catch |err| switch (err) {
                 error.InvalidLogitsShape => return error.LogitsSizeMismatch,
                 else => return err,
             };

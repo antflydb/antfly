@@ -846,15 +846,20 @@ fn cudaWindowEnvelope(a: Allocator, node: *Node, directory: []const u8) !void {
 
     const Stop = struct {
         session: @import("../backends/session.zig").Session,
+        owner: std.Thread.Id,
         before: usize,
         fn check(raw: ?*anyopaque) anyerror!void {
             const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            // This injection observes owner-lane CUDA counters at cooperative
+            // checkpoints. The watchdog also polls the callback on its own
+            // thread, where the counters and allocator inventory are mutable.
+            if (std.Thread.getCurrentId() != self.owner) return;
             const stats = factory.getCudaRuntimeStats(self.session) orelse return error.MissingCudaRuntimeStats;
             if (stats.kernel_launches > self.before) return error.Cancelled;
         }
     };
     const before_stats = factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats;
-    var stop = Stop{ .session = session, .before = before_stats.kernel_launches };
+    var stop = Stop{ .session = session, .owner = std.Thread.getCurrentId(), .before = before_stats.kernel_launches };
     const control: @import("../execution_control.zig").InferenceExecutionControl = .{ .io = std.testing.io };
     try std.testing.expectError(error.Cancelled, node.extractV2DirectJsonWithControl(a, request, control.withCheckpoint(&stop, Stop.check)));
     _ = try expectIdleWithActiveHandles(node, 1);

@@ -14432,22 +14432,11 @@ fn executeRuntimeConstant(
     output_shape: ml.graph.Shape,
     attrs: anytype,
 ) !?CT {
-    const constant = try graph.constantDataAsF32(
-        graph.allocator,
-        output_shape.dtype,
-        attrs.data_offset,
-        attrs.data_len,
-    );
-    defer constant.deinit(graph.allocator);
-
-    var shape_buf: [ml.graph.shape.max_rank]i32 = undefined;
-    const rank = output_shape.rank();
-    const ct = if (rank > 1) blk: {
-        for (0..rank) |axis| shape_buf[axis] = @intCast(output_shape.dim(@intCast(axis)));
-        break :blk try cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
-    } else try cb.fromFloat32(constant.data);
+    const ct = try interpreter.materializeConstant(graph, cb, output_shape, attrs, true);
     errdefer cb.free(ct);
 
+    // Empty values are shape-only sentinels. No device buffer is needed.
+    if (attrs.data_len == 0) return ct;
     if (isMetalDeviceResident(cb, ct)) return ct;
     if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
         if (device_ct != ct) cb.free(ct);

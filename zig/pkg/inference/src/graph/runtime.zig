@@ -246,7 +246,7 @@ pub const FrozenPhysicalLayout = struct {
         fn capture(source_layout: *const PhysicalLayout, source_graph: *const Graph, backends: []const *const ComputeBackend) ?DescriptorPolicy {
             if (source_layout.target_kind != .native or source_layout.fallback or backends.len != 1 or source_layout.output_policy.len != source_graph.nodeCount()) return null;
             const backend = backends[0];
-            if (backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return null;
+            if (!@import("../ops/native_compute.zig").isCanonicalVTable(backend.vtable)) return null;
             const functions = backend.vtable.kernels orelse return null;
             if (!functions.accepts(backend.vtable)) return null;
             return .{ .table = backend.vtable, .kernels = functions, .ordinary = functions.materializesOutput orelse return null, .pure = functions.materializesOutputDescriptorOnly orelse return null };
@@ -346,7 +346,7 @@ pub const Runtime = struct {
         if (requested_strategy != .interpreter) {
             try runtime.initSingleDevicePlan(graph, backend, options);
             if (options.analysis) |analysis| runtime.partition_last_use = try multi_executor.partitionLastUses(allocator, graph, &runtime.plan.?.base, analysis.reachable, analysis.last_use);
-            if (requested_strategy == .compiled_required and !runtime.allComputePartitionsHaveAttachedExecutors(graph)) {
+            if (requested_strategy == .compiled_required and !runtime.strictCudaPlan() and !runtime.allComputePartitionsHaveAttachedExecutors(graph)) {
                 return error.UnsupportedCompiledGraphRuntime;
             }
         }
@@ -540,6 +540,18 @@ pub const Runtime = struct {
                     }
                     break :selected routes.pool;
                 } else self.physical_pool;
+                const strict_cuda = self.strictCudaPlan();
+                if (strict_cuda and (options.prepared_routes == null or selected_pool.?.completeOwnedPayload() == null)) {
+                    if (graphPartitionReportRequested()) {
+                        const coverage: @import("../execution/owned_coverage.zig").Coverage = if (options.prepared_routes) |routes| routes.pool.payload_coverage else .{ .compatibility = .no_selected_routes };
+                        const reason = switch (coverage) {
+                            .compatibility => |value| @tagName(value),
+                            .complete => "provider_not_qualified",
+                        };
+                        std.debug.print("graph-partition-report strict CUDA prepared coverage rejected reason={s}\n", .{reason});
+                    }
+                    return error.UnsupportedCompiledGraphRuntime;
+                }
                 if (options.host_inputs) |inputs| {
                     const pool = selected_pool orelse return error.PreparedHostIngressUnavailable;
                     if (options.donate != null) return error.InvalidHostIngressBinding;
@@ -570,6 +582,7 @@ pub const Runtime = struct {
                 var planned_options = options.*;
                 planned_options.backend_operation = backend_operation;
                 planned_options.physical_frame = frame;
+                planned_options.require_assigned_kernels = strict_cuda;
                 var input_storage: [16]interpreter.RuntimeInput = undefined;
                 var allocated_inputs: ?[]interpreter.RuntimeInput = null;
                 defer if (allocated_inputs) |inputs| allocator.free(inputs);
@@ -701,7 +714,8 @@ pub const Runtime = struct {
     ) !void {
         const target_kind = if (options.compiled) |context| context.requested_backend orelse return error.MissingCompiledBackend else backendKindForPartition(backend.kind());
         if (options.compiled != null and compiled_registry.find(target_kind) == null) return error.UnsupportedCompiledGraphBackend;
-        const use_native_fallback = target_kind != .native and build_options.enable_native and (options.compiled == null or options.compiled_allow_fallback);
+        const strict_cuda = self.strictCudaPlan();
+        const use_native_fallback = !strict_cuda and target_kind != .native and build_options.enable_native and (options.compiled == null or options.compiled_allow_fallback);
 
         if (use_native_fallback) {
             try self.initFallbackNativeBackend();
@@ -748,7 +762,7 @@ pub const Runtime = struct {
         for (base.partitions, 0..) |part, i| {
             assignments[i] = if (use_native_fallback and part.backend == .native) 1 else 0;
         }
-        if (options.compiled != null and !options.compiled_allow_fallback) for (base.partitions) |part| {
+        if (strict_cuda or (options.compiled != null and !options.compiled_allow_fallback)) for (base.partitions) |part| {
             if (partitionHasCompute(graph, part) and part.backend != target_kind) return error.UnsupportedCompiledGraphRuntime;
         };
         try self.attachNativePartitionExecutors(graph, &base, assignments);
@@ -767,6 +781,12 @@ pub const Runtime = struct {
         layout.buffers_owned = false;
         self.physical_pool = try @import("../execution/physical_buffers.zig").Pool.createWithDescriptors(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count], self.plan.?.base.node_operator_plans, options.kernel_descriptors);
         try self.buffer_plan.?.validate(graph, &self.plan.?.base);
+    }
+
+    /// The native CUDA executable is its validated physical route plan.
+    /// Its final coverage depends on concrete invocation bindings.
+    fn strictCudaPlan(self: *const Runtime) bool {
+        return self.strategy == .compiled_required and self.compiled_context == null and self.default_backend.kind() == .cuda;
     }
 
     fn allComputePartitionsHaveAttachedExecutors(self: *const Runtime, graph: *const Graph) bool {

@@ -128,7 +128,7 @@ pub const Scope = struct {
     /// Bind the funded byte range before recording or submitting any kernels.
     pub fn bind(plan: *Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
         if (backing == 0 or backing % alignment != 0 or layout.bytes > backing_bytes or
-            backing > std.math.maxInt(DevicePointer) - layout.bytes or
+            backing > @as(DevicePointer, std.math.maxInt(DevicePointer)) - @as(DevicePointer, layout.bytes) or
             !std.meta.eql(layout, try plan.layout(layout.scratch_offset))) return error.InvalidExecutionPlan;
         return .{ .plan = plan, .base = backing + layout.scratch_offset };
     }

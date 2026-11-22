@@ -163,7 +163,7 @@ pub const Decoder = struct {
             .cache_custody = switch (selected) {
                 .failed => .unavailable,
                 .full_prefix => .none,
-                .merged_incremental => .host_tensor_dispatch,
+                .merged_incremental => .merged_resident,
                 .native_incremental => .native_runtime,
                 .compiled_incremental => .compiled_runtime,
             },
@@ -194,13 +194,12 @@ pub const Decoder = struct {
 
     /// Dispatch stays a synchronous borrowed capability; no task pointer or
     /// tokenizer is retained. Rows preserve provider ownership without copies.
-    pub fn step(self: *Decoder, prefix: []const i64, stats_request: ?Native.StatsRequest, dispatch: anytype) !Row {
+    pub fn stepSuffix(self: *Decoder, suffix: @import("decoder_position.zig").Suffix, stats_request: ?Native.StatsRequest, dispatch: anytype) !Row {
         var row = Row{ .allocator = self.allocator, .vocab_size = self.vocab_size };
         errdefer row.deinit();
         if (self.native) |*decoder| {
-            const processed = decoder.positions();
-            if (prefix.len <= processed) return error.InvalidDecoderPosition;
-            const pending = prefix[processed..];
+            _ = try suffix.endAt(decoder.positions());
+            const pending = suffix.tokens;
             if (stats_request) |request| {
                 switch (try decoder.stepWith(pending, .{ .stats = request })) {
                     .stats => |stats| row.stats = stats,
@@ -218,15 +217,33 @@ pub const Decoder = struct {
         }
         if (self.compiled) |*decoder| {
             const outputs = self.encoder.host;
-            row.owned_logits = try decoder.encoderDecoderText(prefix, outputs[0], self.encoder_mask, self.allocator, self.control);
+            row.owned_logits = try decoder.encoderDecoderSuffix(suffix, outputs[0], self.encoder_mask, self.allocator, self.control);
             row.logits = row.owned_logits.?;
             return row;
         }
         if (self.incremental) |*state| {
-            row.host_logits = try state.step(prefix, dispatch, self.control);
-            try row.selectHostRow(row.host_logits.?, null);
+            const adapters = @import("tensor_dispatch.zig");
+            const stage = adapters.stageDispatcher(dispatch);
+            if (adapters.hasDispatcher(dispatch) and stage == null) return error.DecoderDispatchChanged;
+            row.owned_logits = try state.stepResidentDispatched(suffix, self.control, stage);
+            row.logits = row.owned_logits.?;
             return row;
         }
+        return error.InvalidDecoderPosition;
+    }
+
+    /// Append-only callers already own their history. Full-prefix routes
+    /// still need the whole slice, while incremental routes consume only
+    /// the explicitly positioned suffix.
+    pub fn step(self: *Decoder, prefix: []const i64, position: usize, stats_request: ?Native.StatsRequest, dispatch: anytype) !Row {
+        if (position >= prefix.len) return error.InvalidDecoderPosition;
+        if (self.full_prefix == null) return self.stepSuffix(.{ .position = position, .tokens = prefix[position..] }, stats_request, dispatch);
+        return self.stepFullPrefix(prefix, dispatch);
+    }
+
+    pub fn stepFullPrefix(self: *Decoder, prefix: []const i64, dispatch: anytype) !Row {
+        var row = Row{ .allocator = self.allocator, .vocab_size = self.vocab_size };
+        errdefer row.deinit();
         var inputs: stages.DecoderInputs = undefined;
         const plan = if (self.full_prefix) |*value| value else return error.InvalidDecoderInput;
         const hidden = try stages.decoderHiddenInput(self.encoder, self.encoder_mask.len);
@@ -281,7 +298,7 @@ test "decoder route retains actual host output rows without copies and cancels b
     try std.testing.expectEqual(@import("diagnostics.zig").DecoderRoute.Selection.failed, failed.report.?.decoder_route.?.selected);
     try std.testing.expectEqualStrings("NoEncoderOutput", failed.report.?.failure.bytes[0..failed.report.?.failure.len]);
     try std.testing.expect(failed.execution == null and failed.report.?.transfers == null);
-    var row = try decoder.step(&.{ 0, 1 }, null, null);
+    var row = try decoder.step(&.{ 0, 1 }, 0, null, null);
     defer row.deinit();
     try std.testing.expect(row.owned_logits == null);
     try std.testing.expectEqualSlices(f32, &.{ -3, 1, -1, 0 }, row.logits);
@@ -298,7 +315,7 @@ test "decoder route retains actual host output rows without copies and cancels b
     try std.testing.expectEqual(@import("diagnostics.zig").DecoderRoute.Selection.failed, cancelled.report.?.decoder_route.?.selected);
     try std.testing.expectEqualStrings("Cancelled", cancelled.report.?.failure.bytes[0..cancelled.report.?.failure.len]);
     try std.testing.expect(cancelled.execution == null and cancelled.report.?.transfers == null);
-    try std.testing.expectError(error.Cancelled, decoder.step(&.{ 0, 1 }, null, null));
+    try std.testing.expectError(error.Cancelled, decoder.step(&.{ 0, 1 }, 0, null, null));
     decoder.deinit();
     decoder_open = false;
     session.close();

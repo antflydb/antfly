@@ -39,6 +39,7 @@ const executable_mod = @import("../execution/executable.zig");
 const prepared_mod = @import("../execution/prepared_invocation.zig");
 const storage_admission = @import("../execution/storage_admission.zig");
 const graph_runtime_mod = executable_mod.runtime_module;
+const onnx_projection_pack = @import("onnx_projection_pack.zig");
 const ModelProgram = @import("../execution/program.zig").ModelProgram;
 const ProgramBinding = @import("../execution/program.zig").Binding;
 
@@ -85,6 +86,8 @@ pub const ImportedOnnxSession = struct {
     source_path: ?[]u8 = null,
     logical_source_path: ?[]u8 = null,
     shape_template: ?[]u8 = null,
+    packed_projections: onnx_projection_pack.Registry = .{},
+    cache_branch: bool = false,
     requested_strategy: graph_runtime_mod.Strategy = .interpreter,
     io: ?std.Io = null,
     specialization_mutex: std.atomic.Mutex = .unlocked,
@@ -138,6 +141,7 @@ pub const ImportedOnnxSession = struct {
 
         // Captures/executors retire before releasing initializer addresses.
         self.executable.deinitWithCleanup(cleanup);
+        self.packed_projections.deinit(self.allocator, &self.cb, cleanup);
         for (self.static_runtime_inputs) |ri| self.cb.freeWithCleanup(ri.value, cleanup);
         self.allocator.free(self.static_runtime_inputs);
         for (self.static_names) |name| self.allocator.free(name);
@@ -206,7 +210,8 @@ pub fn inspectGraphCompatibilityWithControl(allocator: std.mem.Allocator, onnx_p
     };
     if (control.deadline_ns != null or control.check_fn != null or control.cancellation != null)
         model.conversion_checkpoint = .{ .context = &control, .check = Check.call };
-    var converted = try model.convertToGraphWithDims(allocator, dim_overrides);
+    const boolean = try cacheBranchBinding(&model, null);
+    var converted = try model.convertToGraphWithBindings(allocator, dim_overrides, null, boolean);
     defer converted.deinit(allocator);
     try control.check();
     try validateImportedGraph(&converted.graph, "convert");
@@ -379,10 +384,7 @@ fn snapshotShapeTemplate(allocator: std.mem.Allocator, model: *onnx_graph.Model)
     // Missing unused initializers need no snapshot data. Every referenced shape
     // constant, however, must be captured successfully before publication.
     var referenced: std.StringHashMapUnmanaged(void) = .empty;
-    for (graph.nodes) |node| for (node.inputs) |name| {
-        try referenced.put(scratch, name, {});
-    };
-    for (graph.outputs) |output| try referenced.put(scratch, output.name, {});
+    try collectShapeTemplateReferences(scratch, graph, &referenced);
     graph.initializers = try scratch.alloc(onnx_graph.proto.TensorProto, model.initializer_map.count());
     var names = model.initializer_map.keyIterator();
     var i: usize = 0;
@@ -408,6 +410,49 @@ fn snapshotShapeTemplate(allocator: std.mem.Allocator, model: *onnx_graph.Model)
     var snapshot = model.onnx;
     snapshot.graph = graph;
     return onnx_graph.serializeModel(allocator, &snapshot);
+}
+
+fn collectShapeTemplateReferences(allocator: std.mem.Allocator, graph: onnx_graph.proto.GraphProto, names: *std.StringHashMapUnmanaged(void)) !void {
+    for (graph.nodes) |node| {
+        for (node.inputs) |name| try names.put(allocator, name, {});
+        for (node.attributes) |attribute| {
+            if (attribute.g) |body| try collectShapeTemplateReferences(allocator, body, names);
+            for (attribute.graphs) |body| try collectShapeTemplateReferences(allocator, body, names);
+        }
+    }
+    for (graph.outputs) |output| try names.put(allocator, output.name, {});
+}
+
+const cache_branch_name = "use_cache_branch";
+
+/// Only the declared ONNX decoder control is specialized. A runtime data
+/// condition cannot be bound by a shape-only or resident-only caller.
+fn cacheBranchBinding(model: *onnx_graph.Model, inputs: ?session_mod.ShapeInputs) !?onnx_graph.Model.BooleanBinding {
+    const graph = model.graph() orelse return null;
+    for (graph.nodes) |node| {
+        if (!std.mem.eql(u8, node.op_type, "If") or node.inputs.len != 1 or !std.mem.eql(u8, node.inputs[0], cache_branch_name)) continue;
+        if (!model.input_set.contains(cache_branch_name)) return null;
+        return .{ .name = cache_branch_name, .value = if (inputs) |actual| try cacheBranchValue(actual) else false };
+    }
+    return null;
+}
+
+fn cacheBranchValue(inputs: session_mod.ShapeInputs) !bool {
+    for (0..inputs.len()) |index| {
+        if (!std.mem.eql(u8, inputs.get(index).name, cache_branch_name)) continue;
+        const host = switch (inputs) {
+            .tensors => |values| values[index],
+            .stage_inputs => |stage| switch (stage.values[index]) {
+                .host => |value| value,
+                .resident => return error.MissingOnnxCacheBranch,
+            },
+            else => return error.MissingOnnxCacheBranch,
+        };
+        if (host.dtype != .bool_ or host.data.len != 1 or host.data[0] > 1 or host.shape.len > 1 or
+            (host.shape.len == 1 and host.shape[0] != 1)) return error.InvalidOnnxCacheBranch;
+        return host.data[0] == 1;
+    }
+    return error.MissingOnnxCacheBranch;
 }
 
 pub const ImportedOnnxSessionOptions = struct {
@@ -482,8 +527,21 @@ pub fn createSessionWithOptions(
             try concrete_inputs.put(allocator, input.name, Shape.init(std.meta.stringToEnum(ml.graph.DType, @tagName(input.dtype)) orelse return error.UnsupportedTensorType, input.shape));
         }
     }
-    var converted = try model.convertToGraphWithInputShapes(allocator, dim_overrides, if (options.input_shapes != null) &concrete_inputs else null);
+    const boolean = try cacheBranchBinding(&model, options.input_shapes);
+    var converted = try model.convertToGraphWithBindings(allocator, dim_overrides, if (options.input_shapes != null) &concrete_inputs else null, boolean);
     errdefer converted.deinit(allocator);
+    var parameter_names_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parameter_names_arena.deinit();
+    if (options.static_source) |parent| {
+        try parent.packed_projections.rewrite(allocator, parameter_names_arena.allocator(), &model, &converted);
+    }
+    const pack_projections = options.static_source == null and requested_backend == .cuda and
+        @import("antfly_platform").env.getenvBool("ANTFLY_INFERENCE_CUDA_GRAPH_PACK_STATIC_PROJECTIONS");
+    var projection_plan = if (pack_projections)
+        try onnx_projection_pack.Plan.init(allocator, &model, &converted.graph)
+    else
+        onnx_projection_pack.Plan{};
+    defer projection_plan.deinit(allocator);
 
     var bindings: std.ArrayListUnmanaged(ProgramBinding) = .empty;
     defer bindings.deinit(allocator);
@@ -570,6 +628,7 @@ pub fn createSessionWithOptions(
         .allocator = allocator,
         .program = program,
         .input_node_ids = owned_input_ids,
+        .cache_branch = boolean != null,
         .input_info = undefined,
         .output_info = undefined,
         .static_runtime_inputs = undefined,
@@ -595,7 +654,9 @@ pub fn createSessionWithOptions(
     if ((requested_backend == .native or requested_backend == .metal or requested_backend == .cuda) and options.graph_runtime_strategy == null and
         @import("antfly_platform").env.getenv("TERMITE_GRAPH_RUNTIME") == null and
         @import("antfly_platform").env.getenv("TERMITE_ONNX_GRAPH_RUNTIME") == null)
-        self.requested_strategy = .compiled_preferred;
+        // Short imported decoder steps benefit from the low setup cost of
+        // native primitives. Respect explicit strategy choices above.
+        self.requested_strategy = if (requested_backend == .native and boolean != null) .interpreter else .compiled_preferred;
     if ((requested_backend == .native or requested_backend == .metal or requested_backend == .cuda) and options.input_shapes == null) {
         for (self.input_node_ids) |node_id| {
             if (node_id == ml.graph.null_node) continue;
@@ -609,6 +670,7 @@ pub fn createSessionWithOptions(
             if (self.source_path != null) break;
         }
     }
+    if (boolean != null and options.static_source == null and self.source_path == null) self.source_path = try allocator.dupe(u8, onnx_path);
     errdefer if (self.source_path) |path| allocator.free(path);
     if (self.source_path != null) self.logical_source_path = try allocator.dupe(u8, logical_path);
     errdefer if (self.logical_source_path) |path| allocator.free(path);
@@ -644,6 +706,10 @@ pub fn createSessionWithOptions(
         owned.* = try allocator.dupe(u8, name);
         initialized_names += 1;
     }
+    if (comptime build_options.enable_cuda) {
+        if (options.shared_backend_ctx == null and self.shared_backend_ctx.ctx == .cuda)
+            try self.shared_backend_ctx.ctx.cuda.enableGraphBlas(hasDenseGraphProjections(&self.program.graph));
+    }
     self.static_runtime_inputs = buildStaticRuntimeInputs(
         allocator,
         &model,
@@ -661,6 +727,10 @@ pub fn createSessionWithOptions(
         allocator.free(self.static_runtime_inputs);
     }
 
+    errdefer self.packed_projections.deinit(allocator, &self.cb, .{ .outside_execution = true });
+    if (self.source_path != null and pack_projections) {
+        try self.packed_projections.import(allocator, &model, &projection_plan, self.shared_backend_ctx, construction_operation.token());
+    }
     const immutable_facts = try immutableRouteBindings(allocator, self.static_runtime_inputs, self.input_node_ids, &self.cb);
     defer allocator.free(immutable_facts);
     // With no static SDK values left to transfer, executable construction
@@ -826,6 +896,7 @@ fn prepareInvocationIntoWithCleanup(session: *const Session, shapes: session_mod
         _ = target.model_lifetime.retain();
     } else try validatePreparedShapes(root, shapes);
     prepared.target = target;
+    if (target.cache_branch) prepared.validate_stage_controls = validateStageCacheBranch;
     prepared.target_lifetime = if (target != root) &target.model_lifetime else null;
     prepared.backend_cookie = events;
     if (comptime !build_options.enable_wasm) {
@@ -860,7 +931,17 @@ fn validatePreparedShapes(target: *const ImportedOnnxSession, shapes: session_mo
             if (!validConcreteExtent(declared, concrete)) return error.PreparedInvocationShapeMismatch;
         }
     }
-    if (target.shape_key) |key| if (!shapeKeyMatches(key, shapes)) return error.PreparedInvocationShapeMismatch;
+    if (target.shape_key) |key| {
+        const branch = if (target.cache_branch) try cacheBranchValue(shapes) else null;
+        if (!shapeKeyMatches(key, shapes, branch)) return error.PreparedInvocationShapeMismatch;
+    }
+}
+
+fn validateStageCacheBranch(prepared: *prepared_mod.PreparedInvocation, inputs: []const session_mod.StageInput) !void {
+    const target: *ImportedOnnxSession = @ptrCast(@alignCast(prepared.target));
+    const key = target.shape_key orelse return error.MissingOnnxCacheBranch;
+    const value = try cacheBranchValue(.{ .stage_inputs = .{ .info = target.input_info, .values = inputs } });
+    if (key.len == 0 or key[0] != @intFromBool(value)) return error.PreparedInvocationShapeMismatch;
 }
 
 fn validatePreparedInputs(target: *ImportedOnnxSession, inputs: prepared_mod.Inputs, allocator: std.mem.Allocator) !void {
@@ -868,7 +949,7 @@ fn validatePreparedInputs(target: *ImportedOnnxSession, inputs: prepared_mod.Inp
         .host => |host| try validatePreparedShapes(target, .{ .tensors = host }),
         .resident => |resident| {
             if (resident.len != target.input_info.len) return error.InputArityMismatch;
-            var cursor: usize = 0;
+            var cursor: usize = @intFromBool(target.cache_branch);
             for (resident, target.input_info) |input, expected| {
                 try validateResidentInput(target, input);
                 if (try input.backend.tensorDType(input.value) != expected.dtype) return error.PreparedInvocationShapeMismatch;
@@ -894,6 +975,7 @@ fn validatePreparedInputs(target: *ImportedOnnxSession, inputs: prepared_mod.Inp
 fn dispatchPreparedInvocation(prepared: *prepared_mod.PreparedInvocation, inputs: prepared_mod.Inputs, placement: prepared_mod.Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, capability: ?storage_admission.Capability) !prepared_mod.Result {
     const root: *ImportedOnnxSession = @ptrCast(@alignCast(prepared.published.ptr));
     const target: *ImportedOnnxSession = @ptrCast(@alignCast(prepared.target));
+    if (target.cache_branch and inputs == .resident and !prepared.stage_controls_validated) return error.MissingOnnxCacheBranch;
     try validatePreparedInputs(target, inputs, allocator);
     if (prepared.routes) |routes| {
         try validatePreparedRouteFacts(target, routes, inputs, allocator, if (prepared.region_claims) |*claims| claims else null);
@@ -1025,6 +1107,28 @@ fn runWithControl(
 ) ![]Tensor {
     const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
     return runImpl(self, inputs, allocator, control);
+}
+
+/// Branch lowering can build shape programs that still require dynamic
+/// execution support. Keep the ordinary decoder available for those exports.
+pub fn supportsMergedCacheBranch(session: Session) bool {
+    if (session.vtable != &imported_session_vtable) return true;
+    const self: *const ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    if (!self.cache_branch) return true;
+    switch (self.cb.kind()) {
+        .native, .metal => return true,
+        .cuda => if (self.requested_strategy != .interpreter) return true,
+        else => {},
+    }
+    for (self.program.graph.nodes.items) |node| {
+        switch (node.op) {
+            .broadcast_in_dim => if (node.num_inputs > 1) return false,
+            .reshape => |attrs| if (attrs.runtime_shape) return false,
+            .slice => |attrs| if (attrs.runtime_starts or attrs.runtime_limits) return false,
+            else => {},
+        }
+    }
+    return true;
 }
 
 pub fn sharedBackendContext(session: Session) ?*SharedBackendContext {
@@ -1184,8 +1288,12 @@ fn runResidentInputsWithControl(
     return try runResidentImpl(self, null, inputs, allocator, control);
 }
 
-fn shapeKeyMatches(key: []const i64, inputs: session_mod.ShapeInputs) bool {
+fn shapeKeyMatches(key: []const i64, inputs: session_mod.ShapeInputs, branch: ?bool) bool {
     var cursor: usize = 0;
+    if (branch) |value| {
+        if (key.len == 0 or key[0] != @as(i64, @intFromBool(value))) return false;
+        cursor = 1;
+    }
     for (0..inputs.len()) |index| {
         const shape = inputs.get(index).shape;
         if (cursor >= key.len or key[cursor] != @as(i64, @intCast(shape.len))) return false;
@@ -1218,8 +1326,9 @@ fn specializeForInputsDetached(self: *ImportedOnnxSession, inputs: session_mod.S
             if (!validConcreteExtent(declared, actual)) return error.InvalidTensorShape;
         }
     }
+    const branch = if (self.cache_branch) try cacheBranchValue(inputs) else null;
     for (self.specializations.entries.items) |entry| {
-        if (shapeKeyMatches(entry.shapes, inputs)) return self.specializations.get(entry.shapes).?.session;
+        if (shapeKeyMatches(entry.shapes, inputs, branch)) return self.specializations.get(entry.shapes).?.session;
     }
     if (!allow_admitted_eviction and self.specializations.entries.items.len == ImportedOnnxSession.max_specializations) {
         const victim = self.specializations.entries.items[0].session;
@@ -1227,6 +1336,7 @@ fn specializeForInputsDetached(self: *ImportedOnnxSession, inputs: session_mod.S
     }
     var key: std.ArrayListUnmanaged(i64) = .empty;
     defer key.deinit(self.allocator);
+    if (branch) |value| try key.append(self.allocator, @intFromBool(value));
     for (0..inputs.len()) |index| {
         const input = inputs.get(index);
         try key.append(self.allocator, @intCast(input.shape.len));
@@ -1698,6 +1808,20 @@ fn buildOutputInfo(
     return infos;
 }
 
+fn hasDenseGraphProjections(graph: *const Graph) bool {
+    var count: usize = 0;
+    for (graph.nodes.items) |node| {
+        if (node.op != .dot_general or node.num_inputs != 2 or node.output_shape.dtype != .f32 or node.output_shape.rank() != 2) continue;
+        const dot = node.op.dot_general;
+        if (dot.num_batch != 0 or dot.num_contracting != 1 or dot.lhs_contracting[0] != 1 or dot.rhs_contracting[0] != 0) continue;
+        const weight = graph.node(node.inputs[1]).output_shape;
+        if (weight.dtype != .f32 or weight.rank() != 2 or weight.dim(0) < 128 or weight.dim(1) < 256) continue;
+        count += 1;
+        if (count == 2) return true;
+    }
+    return false;
+}
+
 fn buildStaticRuntimeInputs(
     allocator: std.mem.Allocator,
     model: *onnx_graph.Model,
@@ -1723,6 +1847,9 @@ fn buildStaticRuntimeInputs(
                 retained = try parent.cb.retainImmutableTensor(input.value, allocator);
                 break;
             }
+            if (retained == null) if (parent.packed_projections.get(name)) |packed_tensor| {
+                retained = try parent.cb.retainImmutableTensor(packed_tensor, allocator);
+            };
             if (retained) |value| {
                 runtime_inputs[i] = .{ .node_id = node_id, .value = value };
                 initialized += 1;
@@ -4193,6 +4320,9 @@ const InvocationInputFacts = struct {
             if (node_id >= target.program.graph.nodeCount()) return error.InvalidRuntimeInputNode;
             const logical = target.program.graph.node(node_id).output_shape;
             fact.* = .{ .node_id = node_id, .value = .unknown };
+            // An empty tensor has shape and dtype but no backing to prove.
+            // Preserve the same fact when a mixed stage imports it from host.
+            if (logical.numElements() == 0) continue;
             switch (shapes.source(index)) {
                 .unknown => {},
                 .host_dense => {
@@ -4271,6 +4401,25 @@ const InvocationInputFacts = struct {
             if (requirements.bytes != try std.math.mul(usize, @intCast(count), shape.dtype.byteSize()) or requirements.alignment == 0 or !std.math.isPowerOfTwo(requirements.alignment)) return false;
         }
         return live;
+    }
+
+    fn promoteStrictCudaDeviceInputs(self: *InvocationInputFacts, target: *const ImportedOnnxSession, selected: ?*const PreparedRoutes, stage: bool) void {
+        if (target.requested_strategy != .compiled_required or target.cb.kind() != .cuda) return;
+        for (self.inputs) |*input| {
+            const logical = switch (input.value) {
+                .resident => |resident| resident.logical,
+                .imported_host => |host| if (stage and selected == null) host.logical else continue,
+                else => continue,
+            };
+            if (selected) |routes| {
+                const selection = if (routes.pool.selection) |*value| value else continue;
+                const saved = selection.inputs.find(input.node_id) orelse continue;
+                if (saved != .imported_device) continue;
+            }
+            if (logical.dtype != .f32 and logical.dtype != .i32 and logical.dtype != .i64) continue;
+            if (!@import("../execution/assigned_kernel_route.zig").bindingDense(target.cb, input.value, logical)) continue;
+            input.value = .{ .imported_device = .{ .logical = logical, .implementation = .{ .context = target.cb.ptr, .table = target.cb.vtable } } };
+        }
     }
 
     /// Stage controls are uploaded before resident dispatch. Re-establish the
@@ -5259,6 +5408,7 @@ noinline fn prepareDevicePhysicalInvocation(prepared: *prepared_mod.PreparedInvo
         try facts.init(target, shapes, allocator, null);
     }
     defer facts.deinit();
+    facts.promoteStrictCudaDeviceInputs(target, null, shapes == .stage_inputs);
     return selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, if (control) |active| active.* else null);
 }
 
@@ -5267,6 +5417,7 @@ fn preparePhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocati
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, null);
     defer facts.deinit();
+    facts.promoteStrictCudaDeviceInputs(target, null, shapes == .stage_inputs);
     try selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, control);
 }
 
@@ -5277,6 +5428,7 @@ noinline fn preparePhysicalResidentInvocationWithCleanup(prepared: *prepared_mod
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, &storage);
     defer facts.deinit();
+    facts.promoteStrictCudaDeviceInputs(target, null, shapes == .stage_inputs);
     try selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, control);
 }
 
@@ -5330,14 +5482,35 @@ fn validatePreparedRouteFactsImpl(target: *ImportedOnnxSession, routes: *const P
 }
 
 noinline fn validateFreshPreparedRouteFacts(target: *ImportedOnnxSession, routes: *const PreparedRoutes, inputs: prepared_mod.Inputs, allocator: std.mem.Allocator, claims: ?*const @import("../execution/region_claims.zig").Set) !void {
+    var stack_info: [8]TensorInfo = undefined;
+    var heap_info: ?[]TensorInfo = null;
+    defer if (heap_info) |info| allocator.free(info);
     const shapes: session_mod.ShapeInputs = switch (inputs) {
         .host => |host| .{ .tensors = host },
-        .resident => |resident| .{ .resident_inputs = .{ .info = target.input_info, .values = resident } },
+        .resident => |resident| blk: {
+            const key = target.shape_key orelse break :blk .{ .resident_inputs = .{ .info = target.input_info, .values = resident } };
+            const info = if (resident.len <= stack_info.len) stack_info[0..resident.len] else allocated: {
+                heap_info = try allocator.alloc(TensorInfo, resident.len);
+                break :allocated heap_info.?;
+            };
+            // validatePreparedInputs already matched every actual CT to this
+            // specialization key. The original ONNX signature may still
+            // contain symbolic axes, which cannot describe concrete planes.
+            var offset: usize = @intFromBool(target.cache_branch);
+            for (target.input_info, info) |declared, *concrete| {
+                const rank = declared.shape.len;
+                concrete.* = declared;
+                concrete.shape = key[offset + 1 ..][0..rank];
+                offset += rank + 1;
+            }
+            break :blk .{ .resident_inputs = .{ .info = info, .values = resident } };
+        },
     };
     var storage: InvocationInputFacts.ResidentStorage = undefined;
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, if (InvocationInputFacts.needsResidentStorage(shapes)) &storage else null);
     defer facts.deinit();
+    facts.promoteStrictCudaDeviceInputs(target, routes, false);
     facts.satisfyImportedInputs(target, routes);
     try routes.validateWithClaims(facts.inputs, claims);
 }
@@ -5537,6 +5710,42 @@ test "Imported CUDA changing typed host indices replay without readback and reje
     }
     try std.testing.expectEqual(@as(u64, 1), captures);
     try std.testing.expect(replays >= 2);
+    const device_session = try createSessionWithOptions(a, path, .cuda, .{
+        .graph_runtime_strategy = .compiled_required,
+        .shared_backend_ctx = impl.shared_backend_ctx,
+    });
+    defer device_session.close();
+    try std.testing.expect(device_session.configureExecutionDiagnostics(true));
+    const device_backend = impl.shared_backend_ctx.stableBackend();
+    const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+    var device_replays: u64 = 0;
+    for (0..4) |iteration| {
+        const index = iteration % 3;
+        const raw_indices = [_]i64{ @intCast(index), -1 };
+        const value = (try device_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&raw_indices), .i64, &.{2})).?;
+        defer device_backend.free(value);
+        const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = device_backend, .shape = &.{2}, .estimated_bytes = 16 } };
+        var result = (try device_session.runStageInputsWithControl(&.{device_input}, a, control)).?;
+        defer result.deinit();
+        const stats = device_session.executionDiagnostics().?.execution.?;
+        device_replays += stats.physical_graph_replays;
+        try std.testing.expectEqual(@as(u64, 16), stats.physical_input_copy_bytes);
+        const actual = try result.backend.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        const expected = [_]f32{ -@as(f32, @floatFromInt(11 + 4 * index)), -@as(f32, @floatFromInt(13 + 4 * index)), -23, -25 };
+        try std.testing.expectEqualSlices(f32, &expected, actual);
+    }
+    try std.testing.expect(device_replays >= 2);
+    {
+        const invalid = [_]i64{ 3, -1 };
+        const value = (try device_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&invalid), .i64, &.{2})).?;
+        defer device_backend.free(value);
+        const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = device_backend, .shape = &.{2}, .estimated_bytes = 16 } };
+        const before = compute.stats.d2d_bytes;
+        try std.testing.expectError(error.IndexOutOfBounds, device_session.runStageInputsWithControl(&.{device_input}, a, control));
+        try std.testing.expectEqual(before, compute.stats.d2d_bytes);
+    }
+
     {
         var prepared = (try prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null)).?;
         defer prepared.deinit();
@@ -6383,7 +6592,21 @@ test "complete Imported Metal constant chain admits Shared staging Private liter
         for (actual, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(@abs(original) + 0.25 + 5 * original, value, 0.00001);
         return;
     }
-    if (!proof.hasCompleteOwnedPayload()) return error.MissingCompleteMetalLiteralPayload;
+    if (!proof.hasCompleteOwnedPayload()) {
+        const pool = if (proof.routes) |routes| routes.pool else proof.physical_pool orelse return error.MissingMetalLiteralPool;
+        std.debug.print("Metal literal payload unavailable: coverage={any}, owned frame={}, literal store={}\n", .{ pool.payload_coverage, pool.metal_frame_dispatch, pool.literal_store != null });
+        if (pool.literal_store) |store| {
+            for (store.literals) |entry| for (entry.consumers) |consumer| {
+                const node = impl.executable.graph.node(consumer);
+                std.debug.print("  consumer {d} {s} output={any} kernel={} slot={}\n", .{ consumer, @tagName(node.op), node.output_shape.dims[0..node.output_shape.rank()], pool.kernels[consumer] != null, pool.plan.slotForNode(consumer) != null });
+                for (node.getInputs()) |input_node| {
+                    const source_node = impl.executable.graph.node(input_node);
+                    std.debug.print("    input {d} {s} shape={any}\n", .{ input_node, @tagName(source_node.op), source_node.output_shape.dims[0..source_node.output_shape.rank()] });
+                }
+            };
+        }
+        return error.MissingCompleteMetalLiteralPayload;
+    }
     // Frames/banks belong to this exact selected variant, not the root Pool.
     // Keep its existing owner alive while observing it; this takes no credit.
     const selected_routes = proof.routes.?.retain();
@@ -6972,4 +7195,324 @@ test "retained ONNX shape snapshot propagates reader failures" {
     unused_model.external_reader = model.external_reader;
     const unused = try snapshotShapeTemplate(a, &unused_model);
     defer a.free(unused);
+}
+
+test "imported ONNX If specializes the cache branch independently of input shape" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const proto = onnx_graph.proto;
+    var dims = [_]proto.TensorShapeProto.Dimension{.{ .dim_value = 1 }};
+    const f32_type: proto.TypeProto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &dims } } };
+    var input_info = [_]proto.ValueInfoProto{
+        .{ .name = cache_branch_name, .type_proto = .{ .tensor_type = .{ .elem_type = .bool_, .shape = .{ .dims = &dims } } } },
+        .{ .name = "x", .type_proto = f32_type },
+    };
+    var output_info = [_]proto.ValueInfoProto{.{ .name = "y", .type_proto = f32_type }};
+    var branch_inputs = [_][]const u8{ "x", "bias" };
+    var branch_outputs = [_][]const u8{"selected"};
+    var branch_info = [_]proto.ValueInfoProto{.{ .name = "selected", .type_proto = f32_type }};
+    var plus = [_]proto.NodeProto{.{ .op_type = "Add", .inputs = &branch_inputs, .outputs = &branch_outputs }};
+    var minus = [_]proto.NodeProto{.{ .op_type = "Sub", .inputs = &branch_inputs, .outputs = &branch_outputs }};
+    var attrs = [_]proto.AttributeProto{
+        .{ .name = "then_branch", .attr_type = .graph, .g = .{ .nodes = &plus, .outputs = &branch_info } },
+        .{ .name = "else_branch", .attr_type = .graph, .g = .{ .nodes = &minus, .outputs = &branch_info } },
+    };
+    var condition = [_][]const u8{cache_branch_name};
+    var output_names = [_][]const u8{"y"};
+    var nodes = [_]proto.NodeProto{.{ .op_type = "If", .inputs = &condition, .outputs = &output_names, .attributes = &attrs }};
+    var bias_shape = [_]i64{1};
+    var bias = [_]f32{2};
+    var initializers = [_]proto.TensorProto{.{ .name = "bias", .data_type = .float32, .dims = &bias_shape, .raw_data = std.mem.asBytes(&bias) }};
+    const model = proto.ModelProto{ .ir_version = 7, .graph = .{ .name = "cache-branch", .nodes = &nodes, .inputs = &input_info, .outputs = &output_info, .initializers = &initializers } };
+    const bytes = try onnx_graph.serializeModel(a, &model);
+    defer a.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "if.onnx", .data = bytes });
+    const path = try dir.dir.realPathFileAlloc(std.testing.io, "if.onnx", a);
+    defer a.free(path);
+    try inspectGraphCompatibility(a, path);
+    const session = try createSession(a, path, .native);
+    defer session.close();
+    var x = try Tensor.initFloat32(a, "x", &.{1}, &.{9});
+    defer x.deinit();
+    for ([_]u8{ 0, 1, 0, 1 }) |branch| {
+        var flag = [_]u8{branch};
+        const control_tensor: Tensor = .{ .name = cache_branch_name, .dtype = .bool_, .shape = &.{1}, .data = &flag, .allocator = a, .owns_data = false, .owns_shape = false };
+        const result = (try session.runStageInputsWithControl(&.{ .{ .host = control_tensor }, .{ .host = x } }, a, .{ .native_call_policy = .in_process })) orelse return error.MissingOnnxCacheBranch;
+        var owned = result;
+        defer owned.deinit();
+        const actual = try result.backend.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, if (branch == 1) &.{11} else &.{7}, actual);
+    }
+}
+
+test "imported ONNX If cached decoding matches full prefix on optional T5-small" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const path = @import("antfly_platform").env.getenv("ANTFLY_ONNX_T5_MERGED_DECODER") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const platform = @import("antfly_platform");
+    const selected = platform.env.getenv("ANTFLY_ONNX_T5_BACKEND") orelse "native";
+    const requested_backend = std.meta.stringToEnum(BackendType, selected) orelse return error.InvalidBackend;
+    const setup_started = platform.time.monotonicNs();
+    const session = try createSession(a, path, requested_backend);
+    std.debug.print("t5 backend={s} model_setup_ns={d}\n", .{ selected, platform.time.monotonicNs() - setup_started });
+    defer session.close();
+    const root: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    if (platform.env.getenvBool("ANTFLY_ONNX_T5_REPLAY_DIAGNOSTICS")) {
+        try std.testing.expect(session.configureExecutionDiagnostics(true));
+    }
+    if (platform.env.getenvBool("ANTFLY_ONNX_T5_PREFILL_SWEEP")) return profileT5Prefill(a, session, selected);
+    try qualifyT5CachedRows(a, session, selected);
+    if (comptime build_options.enable_cuda) {
+        if (root.shared_backend_ctx.ctx == .cuda) {
+            const stats = &root.shared_backend_ctx.ctx.cuda.stats;
+            var packed_bindings: usize = 0;
+            for (root.specializations.entries.items) |entry| {
+                for (entry.session.static_names) |name| {
+                    if (root.packed_projections.get(name) != null) packed_bindings += 1;
+                }
+            }
+            std.debug.print("t5 cuda rectangular_attention={d} projection_relu={d} packed_weights={d} packed_variant_bindings={d}\n", .{
+                stats.head_major_attention_fused,
+                stats.projection_relu_fused,
+                root.packed_projections.entries.items.len,
+                packed_bindings,
+            });
+        }
+    }
+    const info = try a.dupe(TensorInfo, session.inputInfo());
+    defer a.free(info);
+    const values = try a.alloc(session_mod.StageInput, info.len);
+    defer a.free(values);
+    const cache_shapes = try a.alloc([4]i64, info.len);
+    defer a.free(cache_shapes);
+    for ([_]bool{ false, true }) |cached| {
+        var flag = [_]u8{@intFromBool(cached)};
+        for (session.inputInfo(), info, values, cache_shapes) |declared, *actual, *value, *cache| {
+            actual.* = declared;
+            actual.shape = if (std.mem.eql(u8, declared.name, "input_ids")) &.{ 1, 1 } else if (std.mem.eql(u8, declared.name, "encoder_attention_mask")) &.{ 1, 4 } else if (std.mem.eql(u8, declared.name, "encoder_hidden_states")) &.{ 1, 4, 512 } else if (std.mem.eql(u8, declared.name, cache_branch_name)) declared.shape else blk: {
+                const cross = std.mem.indexOf(u8, declared.name, ".encoder.") != null;
+                cache.* = .{ 1, 8, if (!cached) 0 else if (cross) 4 else 1, 64 };
+                break :blk cache;
+            };
+            value.* = .{ .host = .{
+                .name = actual.name,
+                .dtype = actual.dtype,
+                .shape = actual.shape,
+                .data = if (std.mem.eql(u8, actual.name, cache_branch_name)) &flag else &.{},
+                .allocator = a,
+                .owns_data = false,
+                .owns_shape = false,
+            } };
+        }
+        const specialized = try specializeForInputs(root, .{ .stage_inputs = .{ .info = info, .values = values } });
+        try std.testing.expectEqual(@as(usize, 25), specialized.program.graph.outputs.items.len);
+        try std.testing.expectEqual(@as(i64, @intFromBool(cached)), specialized.shape_key.?[0]);
+        for (specialized.program.graph.nodes.items) |node| switch (node.op) {
+            .broadcast_in_dim => try std.testing.expectEqual(@as(u8, 1), node.num_inputs),
+            .reshape => |attrs| try std.testing.expect(!attrs.runtime_shape),
+            .slice => |attrs| try std.testing.expect(!attrs.runtime_starts and !attrs.runtime_limits),
+            else => {},
+        };
+    }
+}
+
+fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const u8) !void {
+    const platform = @import("antfly_platform");
+    const runtime = @import("../execution/seq2seq_runtime.zig");
+    const vocab = 32128;
+    var hidden = try Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 4, 512 }, &(@as([2048]f32, @splat(0.01))));
+    defer hidden.deinit();
+    const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+    // ONNX Runtime CPU reference for google-t5/t5-small at revision
+    // df1b051c49625cf57a3d0d8d3863ed4d13564fe4, using token IDs 0..len.
+    const Case = struct { prefix: usize, sample: [4][4]f32, greedy: [4]usize };
+    const cases = [_]Case{
+        .{ .prefix = 1, .sample = .{
+            .{ -33.93827438, -20.12522507, -29.79670525, -12.76477337 },
+            .{ -17.49194527, -12.17225170, -11.22461414, -6.39384699 },
+            .{ -12.16430187, -6.19818735, -4.30723286, 0.17622055 },
+            .{ -25.06263542, -16.89302826, -0.98279798, -14.44580269 },
+        }, .greedy = .{ 32099, 3, 3, 2 } },
+        .{ .prefix = 8, .sample = .{
+            .{ -17.64667130, -9.35439968, -7.14395618, -3.96411180 },
+            .{ -22.54990959, -9.42711544, -6.75107241, -1.99726093 },
+            .{ -16.22362328, -10.87580776, -3.89143872, -2.64019608 },
+            .{ -20.34036255, -5.50432014, -3.94880056, -1.52778518 },
+        }, .greedy = .{ 15, 3, 929, 3 } },
+        .{ .prefix = 32, .sample = .{
+            .{ -33.86716843, -12.58306408, -10.92571259, -7.18844080 },
+            .{ -21.63209152, -9.29550934, -5.30314875, -1.93281758 },
+            .{ -26.34893990, -9.07049847, -8.19791126, -2.26858974 },
+            .{ -25.57821465, -11.38073349, -6.99592400, -3.20702434 },
+        }, .greedy = .{ 17, 3, 3, 58 } },
+        .{ .prefix = 64, .sample = .{
+            .{ -18.35554504, -9.80014801, -6.43746948, -3.34300971 },
+            .{ -16.49677086, -9.62594414, -7.66168690, -2.10093284 },
+            .{ -27.50853920, -9.25602150, -8.12774563, -2.18910623 },
+            .{ -25.24548531, -9.37337875, -9.10076714, -3.53217244 },
+        }, .greedy = .{ 41, 3, 3, 8 } },
+    };
+    var tokens: [67]i64 = undefined;
+    for (&tokens, 0..) |*token, index| token.* = @intCast(index);
+    for (cases) |case| {
+        var rows: [4][]f32 = undefined;
+        var row_count: usize = 0;
+        var captures: u64 = 0;
+        var replays: u64 = 0;
+        defer for (rows[0..row_count]) |row| a.free(row);
+        const diagnose_replay = platform.env.getenvBool("ANTFLY_ONNX_T5_REPLAY_DIAGNOSTICS");
+        var timings: [3][4]u64 = undefined;
+        for (timings[0..if (diagnose_replay) 3 else 2], 0..) |*measurements, repeat| {
+            var state = (try runtime.State.init(a, session, hidden, &.{ 1, 1, 1, 1 }, vocab)) orelse return error.UnqualifiedMergedDecoder;
+            defer state.deinit();
+            for (measurements, 0..) |*elapsed, offset| {
+                const end = case.prefix + offset;
+                const start = if (offset == 0) 0 else end - 1;
+                const before = platform.time.monotonicNs();
+                var profile: ?std.DynLib = if (repeat == 1 and case.prefix == 32 and offset == 2 and
+                    std.mem.eql(u8, selected, "cuda") and platform.env.getenvBool("ANTFLY_ONNX_T5_CUDA_PROFILE"))
+                    try startT5CudaProfile()
+                else
+                    null;
+                defer stopT5CudaProfile(&profile);
+                const row = try state.stepResident(.{ .position = start, .tokens = tokens[start..end] }, control);
+                elapsed.* = platform.time.monotonicNs() - before;
+                stopT5CudaProfile(&profile);
+                if (platform.env.getenvBool("ANTFLY_ONNX_T5_REPLAY_DIAGNOSTICS")) {
+                    if (session.executionDiagnostics()) |snapshot| {
+                        if (snapshot.execution) |stats| {
+                            captures += stats.physical_graph_captures;
+                            replays += stats.physical_graph_replays;
+                            std.debug.print("t5 replay prefix={d} step={d} decision={s}\n", .{ case.prefix, offset, @tagName(stats.physical_replay) });
+                        }
+                    }
+                }
+                if (repeat == 0) {
+                    rows[offset] = row;
+                    row_count += 1;
+                } else {
+                    defer a.free(row);
+                    try expectT5Logits(rows[offset], row);
+                }
+            }
+        }
+        std.debug.print("t5 backend={s} prefix={d} cold_ns={any} warm_ns={any}\n", .{ selected, case.prefix, timings[0], timings[1] });
+        if (platform.env.getenvBool("ANTFLY_ONNX_T5_REPLAY_DIAGNOSTICS")) {
+            std.debug.print("t5 physical prefix={d} captures={d} replays={d}\n", .{ case.prefix, captures, replays });
+        }
+        for (rows, 0..) |row, offset| {
+            var full = (try runtime.State.init(a, session, hidden, &.{ 1, 1, 1, 1 }, vocab)) orelse return error.UnqualifiedMergedDecoder;
+            defer full.deinit();
+            const reference = try full.stepResident(.{ .position = 0, .tokens = tokens[0 .. case.prefix + offset] }, control);
+            defer a.free(reference);
+            try std.testing.expectEqual(@as(usize, vocab), row.len);
+            try expectT5Logits(reference, row);
+            for (case.sample[offset], row[0..4]) |want, actual| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+            var greedy: usize = 0;
+            for (row, 0..) |value, index| if (value > row[greedy]) {
+                greedy = index;
+            };
+            try std.testing.expectEqual(case.greedy[offset], greedy);
+        }
+    }
+}
+
+fn expectT5Logits(expected: []const f32, actual: []const f32) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, value| try std.testing.expectApproxEqAbs(want, value, 1e-3);
+}
+
+fn profileT5Prefill(a: std.mem.Allocator, session: Session, backend_name: []const u8) !void {
+    const platform = @import("antfly_platform");
+    const values = try a.alloc(session_mod.StageInput, session.inputInfo().len);
+    defer a.free(values);
+    const shapes = try a.alloc([4]i64, values.len);
+    defer a.free(shapes);
+    const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+    const vocab = 32128;
+    const logits_index = for (session.outputInfo(), 0..) |output, index| {
+        if (std.mem.eql(u8, output.name, "logits")) break index;
+    } else return error.MissingOutput;
+    var reference_rows: [4]?[]f32 = @splat(null);
+    defer for (reference_rows) |reference| if (reference) |row| a.free(row);
+    var flag = [_]u8{0};
+    for ([_]usize{ 1, 2, 4, 8 }) |batch| {
+        for ([_]usize{ 1, 8, 32, 64 }, &reference_rows) |tokens, *reference| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const ids = try scratch.alloc(i64, batch * tokens);
+            for (ids, 0..) |*id, index| id.* = @intCast(index % tokens);
+            const hidden = try scratch.alloc(f32, batch * 4 * 512);
+            @memset(hidden, 0.01);
+            const mask = try scratch.alloc(i64, batch * 4);
+            @memset(mask, 1);
+            const b: i64 = @intCast(batch);
+            const t: i64 = @intCast(tokens);
+            for (session.inputInfo(), values, shapes) |declared, *value, *shape| {
+                const dims, const bytes = blk: {
+                    if (std.mem.eql(u8, declared.name, "input_ids")) {
+                        shape.* = .{ b, t, 0, 0 };
+                        break :blk .{ shape[0..2], std.mem.sliceAsBytes(ids) };
+                    }
+                    if (std.mem.eql(u8, declared.name, "encoder_hidden_states")) {
+                        shape.* = .{ b, 4, 512, 0 };
+                        break :blk .{ shape[0..3], std.mem.sliceAsBytes(hidden) };
+                    }
+                    if (std.mem.eql(u8, declared.name, "encoder_attention_mask")) {
+                        shape.* = .{ b, 4, 0, 0 };
+                        break :blk .{ shape[0..2], std.mem.sliceAsBytes(mask) };
+                    }
+                    if (std.mem.eql(u8, declared.name, cache_branch_name)) break :blk .{ declared.shape, flag[0..] };
+                    shape.* = .{ b, declared.shape[1], 0, declared.shape[3] };
+                    break :blk .{ shape[0..4], @as([]u8, @constCast(&.{})) };
+                };
+                value.* = .{ .host = .{ .name = declared.name, .dtype = declared.dtype, .shape = dims, .data = bytes, .allocator = scratch, .owns_data = false, .owns_shape = false } };
+            }
+            var elapsed: [4]u64 = undefined;
+            for (&elapsed) |*measurement| {
+                const start = platform.time.monotonicNs();
+                var outputs = (session.runStageInputsWithControl(values, a, control) catch |err| {
+                    std.debug.print("t5 prefill backend={s} batch={d} tokens={d} error={s}\n", .{ backend_name, batch, tokens, @errorName(err) });
+                    return err;
+                }) orelse return error.UnexpectedResidentStageDecline;
+                defer outputs.deinit();
+                const shape = try outputs.backend.tensorShape(outputs.outputs[logits_index], scratch);
+                try std.testing.expectEqualSlices(i64, &.{ b, t, vocab }, shape);
+                const last = try outputs.backend.sliceRows2D(a, outputs.outputs[logits_index], batch * tokens - 1, 1, vocab);
+                defer outputs.backend.free(last);
+                const row = try outputs.backend.toFloat32(last, a);
+                defer a.free(row);
+                measurement.* = platform.time.monotonicNs() - start;
+                if (reference.*) |expected| {
+                    try expectT5Logits(expected, row);
+                } else {
+                    for (row) |logit| try std.testing.expect(std.math.isFinite(logit));
+                    reference.* = try a.dupe(f32, row);
+                }
+            } else {
+                std.debug.print("t5 prefill backend={s} batch={d} tokens={d} elapsed_ns={any}\n", .{ backend_name, batch, tokens, elapsed });
+            }
+        }
+    }
+}
+
+fn startT5CudaProfile() !std.DynLib {
+    var lib = try std.DynLib.open("libcuda.so.1");
+    errdefer lib.close();
+    const start = lib.lookup(*const fn () callconv(.c) c_int, "cuProfilerStart") orelse return error.ProfilerUnavailable;
+    if (start() != 0) return error.ProfilerStartFailed;
+    return lib;
+}
+
+fn stopT5CudaProfile(profile: *?std.DynLib) void {
+    if (profile.*) |*lib| {
+        const stop = lib.lookup(*const fn () callconv(.c) c_int, "cuProfilerStop") orelse unreachable;
+        _ = stop();
+        lib.close();
+        profile.* = null;
+    }
 }

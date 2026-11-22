@@ -401,7 +401,7 @@ pub fn run(init: std.process.Init, source_model: anytype, a: std.mem.Allocator, 
             }
             // Required logits readback belongs to the consumer, after the
             // separate strict encoder-transfer audit has ended.
-            var row = try decoder.step(&.{ 0, 1 }, null, null);
+            var row = try decoder.step(&.{ 0, 1 }, 0, null, null);
             var row_open = true;
             defer if (row_open) row.deinit();
             if (row.logits.len != config.vocab_size) return error.InvalidLogitsShape;

@@ -313,7 +313,7 @@ pub const NativePrefixBinding = struct {
     }
 };
 fn canonicalNative(backend: *const ComputeBackend) bool {
-    return backend.vtable == &@import("../ops/native_compute.zig").vtable_impl and backend.kind() == .native;
+    return @import("../ops/native_compute.zig").isCanonicalVTable(backend.vtable) and backend.kind() == .native;
 }
 fn managerMatches(state: *const DecodeState, cache: *PrefixCache) bool {
     if (state.kv_manager != cache.managerPtr() or state.pool_id != cache.pool_id) return false;

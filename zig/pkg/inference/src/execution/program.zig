@@ -23,6 +23,7 @@ const NodeId = ml.graph.NodeId;
 /// Known process-stable stateless implementations. Unknown vtables may also
 /// legitimately ignore an undefined context: absence here never proves state.
 pub fn processMetadataAllocator(allocator: std.mem.Allocator) bool {
+    if (comptime @import("builtin").os.tag == .freestanding) return false;
     if (allocator.vtable == &std.heap.SmpAllocator.vtable or allocator.vtable == &std.heap.PageAllocator.vtable) return true;
     if (comptime @import("builtin").link_libc) {
         if (allocator.vtable == std.heap.c_allocator.vtable) return true;

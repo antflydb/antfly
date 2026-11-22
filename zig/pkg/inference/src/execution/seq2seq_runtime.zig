@@ -20,12 +20,22 @@ const backends = @import("../backends/backends.zig");
 const kv = @import("../graph/onnx_kv_cache.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
-pub fn qualified(session: backends.Session) bool {
-    return qualifiedSignature(session.inputInfo(), session.outputInfo());
+const sessions = @import("../backends/session.zig");
+const tensor_dispatch = @import("tensor_dispatch.zig");
+const Suffix = @import("decoder_position.zig").Suffix;
+
+pub fn qualified(session: backends.Session, vocabulary: usize) bool {
+    const context = session.shared_compute_context orelse return false;
+    if (session.vtable.runResidentInputs == null or session.vtable.runResidentInputsWithControl == null or
+        context.stableBackend().vtable.sliceRows2D == null or
+        !@import("../backends/imported_onnx_session.zig").supportsMergedCacheBranch(session)) return false;
+    return qualifiedSignature(session.inputInfo(), session.outputInfo(), vocabulary);
 }
 
 /// Shared by metadata-only cold planning and the loaded-session ABI check.
-pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const backends.TensorInfo) bool {
+pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const backends.TensorInfo, vocabulary: usize) bool {
+    const vocab = std.math.cast(i64, vocabulary) orelse return false;
+    if (vocab == 0) return false;
     var ids = false;
     var encoder = false;
     var branch = false;
@@ -61,7 +71,8 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
     for (outputs, 0..) |info, index| {
         for (outputs[0..index]) |prior| if (std.mem.eql(u8, prior.name, info.name)) return false;
         if (std.mem.eql(u8, info.name, "logits")) {
-            if (info.dtype != .f32 or info.shape.len != 3 or info.shape[0] == 0 or info.shape[0] > 1) return false;
+            if (info.dtype != .f32 or info.shape.len != 3 or info.shape[0] == 0 or info.shape[0] > 1 or
+                info.shape[1] >= 0 or (info.shape[2] >= 0 and info.shape[2] != vocab)) return false;
             logits = true;
         } else if (kv.presentOutputSuffix(info.name)) |suffix| {
             if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1) return false;
@@ -96,7 +107,7 @@ fn cacheBound(session: backends.Session, batch: usize, tokens: usize, context: u
 /// the retained inputs to the KV category without charging the same host
 /// payload again as temporary ingestion storage.
 pub fn estimateAdmission(session: backends.Session, admission: @import("../backends/session.zig").RunAdmission, base: @import("../backends/session.zig").RunRequest, batch: usize, tokens: usize, context: usize, vocabulary: usize) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
-    if (!qualified(session)) return admission.estimateRequest(base, session.outputInfo());
+    if (!qualified(session, vocabulary)) return admission.estimateRequest(base, session.outputInfo());
     const cache_bytes = try cacheBound(session, batch, tokens, context);
     const logit_bytes = try std.math.mul(usize, vocabulary, @sizeOf(f32));
     const per_item = try std.math.add(usize, logit_bytes, 3 * @sizeOf(i64));
@@ -118,29 +129,32 @@ const InputRole = union(enum) {
     past: struct { output_index: usize, empty_shape: [4]i64, cross: bool },
 };
 
+const ResidentSlot = struct {
+    pin: sessions.Session.ModelLifetime.ResourcePin,
+    input: sessions.ResidentInput,
+    shape: [4]i64,
+    independent: bool = false,
+};
+
 pub const State = struct {
     allocator: std.mem.Allocator,
     session: backends.Session,
     roles: []InputRole,
-    inputs: []backends.Tensor,
-    /// Outputs retain the signature order. The logits slot carries no
-    /// ownership after publication, and each cross slot owns its latest value.
-    cached_outputs: []backends.Tensor = &.{},
+    resident_slots: ?[]?ResidentSlot = null,
+    stage_inputs: []sessions.StageInput = &.{},
     logits_index: usize,
     /// Encoder buffers and mask are pinned by the enclosing generation request.
     encoder: backends.Tensor,
     mask: []const i64,
-    committed_prefix: std.ArrayList(i64) = .empty,
+    position: usize = 0,
     vocab_size: usize,
 
     pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: backends.Tensor, mask: []const i64, vocab_size: usize) !?State {
-        if (!qualified(session) or vocab_size == 0 or vocab_size > std.math.maxInt(i64)) return null;
+        if (!qualified(session, vocab_size)) return null;
         const input_info = session.inputInfo();
         const output_info = session.outputInfo();
         const roles = try allocator.alloc(InputRole, input_info.len);
         errdefer allocator.free(roles);
-        const inputs = try allocator.alloc(backends.Tensor, input_info.len);
-        errdefer allocator.free(inputs);
         for (input_info, roles) |info, *role| {
             role.* = if (kv.pastInputSuffix(info.name)) |suffix| cache: {
                 for (output_info, 0..) |output, index| {
@@ -165,7 +179,6 @@ pub const State = struct {
             .allocator = allocator,
             .session = planned,
             .roles = roles,
-            .inputs = inputs,
             .logits_index = logits_index,
             .encoder = encoder.borrowedView("encoder_hidden_states"),
             .mask = mask,
@@ -174,229 +187,292 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State) void {
-        if (self.cached_outputs.len != 0) kv.freeTensorSlice(self.allocator, self.cached_outputs);
-        self.allocator.free(self.inputs);
+        if (self.resident_slots) |slots| {
+            for (slots) |slot| if (slot) |owned| owned.pin.release();
+            self.allocator.free(slots);
+            self.allocator.free(self.stage_inputs);
+        }
         self.allocator.free(self.roles);
-        self.committed_prefix.deinit(self.allocator);
     }
 
     fn borrow(self: *const State, info: backends.TensorInfo, shape: []const i64, data: []const u8) backends.Tensor {
         return .{ .data = @constCast(data), .shape = shape, .dtype = info.dtype, .name = info.name, .allocator = self.allocator, .owns_data = false, .owns_shape = false };
     }
 
-    /// Prefix grows monotonically. The same typed input map is reused across
-    /// prefill and incremental calls; no names or empty cache tensors are
-    /// allocated at a token boundary.
-    pub fn step(self: *State, prefix: []const i64, dispatch: anytype, control: ?Control) !backends.Tensor {
-        const processed = self.committed_prefix.items.len;
-        if (prefix.len <= processed or !std.mem.eql(i64, prefix[0..processed], self.committed_prefix.items))
-            return error.InvalidDecoderPosition;
-        if (control) |active| try active.check();
-        _ = self.session.compactExclusiveRows(self.allocator, self.cached_outputs, 64 * 1024, control) catch |err| switch (err) {
-            error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => false,
-            else => return err,
-        };
-        const fresh = processed == 0;
-        const tokens = prefix[processed..];
-        try self.committed_prefix.ensureUnusedCapacity(self.allocator, tokens.len);
-        const shape = [_]i64{ 1, @intCast(tokens.len) };
+    /// Each cache binding retains its producer independently. Omitted cross
+    /// outputs keep their previous pin without retaining a chain of results.
+    pub fn stepResident(self: *State, suffix: Suffix, control: ?Control) ![]f32 {
+        return self.stepResidentDispatched(suffix, control, null);
+    }
+
+    pub fn stepResidentDispatched(self: *State, suffix: Suffix, control: ?Control, dispatch: ?tensor_dispatch.Dispatch) ![]f32 {
+        const end = try suffix.endAt(self.position);
+        const fresh = self.position == 0;
+        if (self.resident_slots == null) {
+            const slots = try self.allocator.alloc(?ResidentSlot, try std.math.mul(usize, 2, self.roles.len));
+            errdefer self.allocator.free(slots);
+            self.stage_inputs = try self.allocator.alloc(sessions.StageInput, self.roles.len);
+            @memset(slots, null);
+            self.resident_slots = slots;
+        }
+        const storage = self.resident_slots.?;
+        const slots = storage[0..self.roles.len];
+        const updated = storage[self.roles.len..];
+        const token_shape = [_]i64{ 1, @intCast(suffix.tokens.len) };
         const mask_shape = [_]i64{ 1, @intCast(self.mask.len) };
         const branch = [_]u8{@intFromBool(!fresh)};
-        const empty = std.mem.sliceAsBytes(@as([]const f32, &.{}));
-        for (self.session.inputInfo(), self.roles, self.inputs) |info, *role, *input| {
-            input.* = switch (role.*) {
-                .tokens => self.borrow(info, &shape, std.mem.sliceAsBytes(tokens)),
-                .encoder => self.encoder,
-                .mask => self.borrow(info, &mask_shape, std.mem.sliceAsBytes(self.mask)),
-                .cache_branch => self.borrow(info, info.shape, &branch),
-                .past => |*past| if (fresh)
-                    self.borrow(info, &past.empty_shape, empty)
-                else
-                    self.cached_outputs[past.output_index].borrowedView(info.name),
+        for (self.session.inputInfo(), self.roles, slots, self.stage_inputs) |info, *role, *slot, *binding| {
+            binding.* = switch (role.*) {
+                .tokens => .{ .host = self.borrow(info, &token_shape, std.mem.sliceAsBytes(suffix.tokens)) },
+                .encoder => .{ .host = self.encoder },
+                .mask => .{ .host = self.borrow(info, &mask_shape, std.mem.sliceAsBytes(self.mask)) },
+                .cache_branch => .{ .host = self.borrow(info, info.shape, &branch) },
+                .past => |*past| if (slot.*) |*owned| resident: {
+                    var input = owned.input;
+                    input.shape = &owned.shape;
+                    break :resident .{ .resident = input };
+                } else .{ .host = self.borrow(info, &past.empty_shape, &.{}) },
             };
         }
-        const tensor_dispatch = @import("tensor_dispatch.zig");
-        const outputs = try tensor_dispatch.run(self.allocator, self.session, null, self.session.execution_gate, self.inputs, control, dispatch);
-        errdefer kv.freeTensorSlice(self.allocator, outputs);
-        if (outputs.len != self.session.outputInfo().len) return error.InvalidDecoderOutput;
-        for (outputs, self.session.outputInfo()) |output, info| {
-            if (!std.mem.eql(u8, output.name, info.name) or output.dtype != .f32) return error.InvalidDecoderOutput;
-        }
-        const logits = outputs[self.logits_index];
-        const logits_shape = [_]i64{ 1, @intCast(tokens.len), @intCast(self.vocab_size) };
-        if (!std.mem.eql(i64, logits.shape, &logits_shape)) return error.InvalidDecoderOutput;
-        try validateOutputBytes(logits);
-        for (self.roles) |role| switch (role) {
+        var outputs = if (dispatch) |selected|
+            try selected.run_stage_fn.?(selected.ptr, selected.task, self.allocator, self.session, self.stage_inputs, control)
+        else
+            (try self.session.runStageInputsWithControl(self.stage_inputs, self.allocator, control)) orelse return error.UnexpectedResidentStageDecline;
+        defer outputs.deinit();
+        if (outputs.outputs.len != self.session.outputInfo().len) return error.InvalidDecoderOutput;
+        defer @memset(updated, null);
+        errdefer for (updated) |slot| if (slot) |owned| owned.pin.release();
+        for (self.roles, updated) |role, *slot| switch (role) {
             .past => |past| {
-                const output = outputs[past.output_index];
-                if (output.shape.len != 4) return error.InvalidDecoderOutput;
-                if (!fresh and past.cross and output.data.len == 0) {
-                    if (!tensor_dispatch.validTensor(output)) return error.InvalidDecoderOutput;
-                    continue;
+                const value = outputs.outputs[past.output_index];
+                if (try outputs.backend.tensorDType(value) != .f32) return error.InvalidDecoderOutput;
+                const shape = try outputs.backend.tensorShape(value, self.allocator);
+                defer self.allocator.free(shape);
+                if (shape.len != 4) return error.InvalidDecoderOutput;
+                const elements = try cacheElements(shape);
+                if (!fresh and past.cross and elements == 0) continue;
+                const want = [_]i64{ 1, past.empty_shape[1], @intCast(if (past.cross) self.mask.len else end), past.empty_shape[3] };
+                if (!std.mem.eql(i64, shape, &want)) return error.InvalidDecoderOutput;
+                const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+                slot.* = .{
+                    .pin = try outputs.retainResources(self.allocator),
+                    .input = .{ .value = value, .backend = outputs.backend, .estimated_bytes = bytes },
+                    .shape = want,
+                };
+            },
+            else => {},
+        };
+        const row = try @import("encoder_decoder_runtime.zig").residentVocabularyRow(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control);
+        errdefer self.allocator.free(row);
+        for (self.roles, updated) |role, *slot| switch (role) {
+            .past => |past| if (!past.cross) {
+                const provisional = slot.* orelse return error.InvalidDecoderOutput;
+                var aliases: usize = 0;
+                for (outputs.outputs) |value| {
+                    if (value == provisional.input.value) aliases += 1;
                 }
-                const expected = [_]i64{ 1, past.empty_shape[1], @intCast(if (past.cross) self.mask.len else prefix.len), past.empty_shape[3] };
-                if (!std.mem.eql(i64, output.shape, &expected)) return error.InvalidDecoderOutput;
-                try validateOutputBytes(output);
+                if (aliases != 1) continue;
+                const adopted = self.adoptSelfCache(provisional) catch |err| switch (err) {
+                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
+                    else => return err,
+                };
+                if (adopted) |independent| {
+                    // The new lease owns this backing. Keep the output vector
+                    // in signature order but remove this CT from the original
+                    // invocation's retirement inventory. Its destruction
+                    // already deduplicates repeated handles.
+                    outputs.outputs[past.output_index] = outputs.outputs[self.logits_index];
+                    outputs.backend.free(provisional.input.value);
+                    provisional.pin.release();
+                    slot.* = independent;
+                }
+            },
+            else => {},
+        };
+        // The logits readback has finished the invocation's numerical use.
+        // An omitted cross column can now be copied outside that frame.
+        if (!fresh) for (self.roles, slots, updated) |role, old, *slot| switch (role) {
+            .past => |past| if (past.cross and slot.* == null) {
+                const previous = old orelse return error.InvalidDecoderOutput;
+                if (!previous.independent) slot.* = self.copyCrossCache(previous, control) catch |err| switch (err) {
+                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
+                    else => return err,
+                };
             },
             else => {},
         };
         if (control) |active| try active.check();
-        // Every possible error precedes ownership transfer or advancement.
-        // An empty cross output explicitly keeps this request's previous K/V.
-        if (!fresh) {
-            for (self.roles) |role| switch (role) {
-                .past => |past| if (past.cross and outputs[past.output_index].data.len == 0) {
-                    const old = &self.cached_outputs[past.output_index];
-                    outputs[past.output_index].deinit();
-                    outputs[past.output_index] = old.*;
-                    old.* = old.borrowedView(old.name);
-                },
-                else => {},
-            };
-            kv.freeTensorSlice(self.allocator, self.cached_outputs);
-        }
-        outputs[self.logits_index] = self.borrow(self.session.outputInfo()[self.logits_index], &.{}, &.{});
-        self.cached_outputs = outputs;
-        self.committed_prefix.appendSliceAssumeCapacity(tokens);
-        return logits;
+        for (slots, updated) |*old, new| if (new) |value| {
+            if (old.*) |previous| previous.pin.release();
+            old.* = value;
+        };
+        self.position = end;
+        return row;
     }
 
-    fn validateOutputBytes(output: backends.Tensor) !void {
-        var elements: usize = 1;
-        for (output.shape) |dim| {
-            if (dim <= 0) return error.InvalidDecoderOutput;
-            elements = try std.math.mul(usize, elements, @intCast(dim));
+    fn adoptSelfCache(self: *State, source: ResidentSlot) !?ResidentSlot {
+        const shared = self.session.shared_compute_context orelse return null;
+        const backend = shared.stableBackend();
+        if (self.session.model_lifetime == null or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) return null;
+        const kernels = backend.vtable.kernels orelse return null;
+        if (!kernels.accepts(backend.vtable)) return null;
+        const retain = kernels.retainImmutableTensor orelse return null;
+        const pooled = if (kernels.pooledOutputStorage) |storage| storage(backend.ptr, source.input.value) else null;
+        var admission = if (pooled) |lease| blk: {
+            if (lease.backend.ptr != backend.ptr or lease.backend.vtable != backend.vtable or
+                lease.usage != .ordinary or lease.accounting_class != .activation or lease.isReadOnly() or
+                lease.byte_size < source.input.estimated_bytes) return null;
+            const backing_bytes = lease.backing_byte_size orelse lease.byte_size;
+            if (lease.admission) |charged| {
+                const expected = self.session.run_admission orelse return null;
+                if (!charged.identity.eql(.{ .controller = expected.controller, .backend_class = expected.backend_class }) or
+                    lease.admittedBytes() < backing_bytes) return null;
+                break :blk null;
+            }
+            // Raw CPU sessions can publish an uncharged frame view. The
+            // retained-state lease covers the whole synchronous CPU backing.
+            if (backend.kind() != .native or lease.isQuarantined()) return null;
+            break :blk try self.session.admitRetainedState(0, backing_bytes);
+        } else blk: {
+            const measure = kernels.standaloneOutputBytes orelse return null;
+            const bytes = measure(backend.ptr, source.input.value) orelse return null;
+            if (bytes < source.input.estimated_bytes) return null;
+            break :blk try self.session.admitRetainedState(0, bytes);
+        };
+        defer if (admission) |*reservation| reservation.deinit();
+        const handles = try self.allocator.alloc(@import("../ops/ops.zig").CT, 1);
+        var populated = false;
+        var owned: sessions.ResidentOutputs = .{ .outputs = handles, .backend = backend, .allocator = self.allocator };
+        defer if (populated) owned.deinit() else self.allocator.free(handles);
+        handles[0] = (try retain(backend.ptr, source.input.value)) orelse return null;
+        populated = true;
+        self.session.pinResident(&owned);
+        owned.physical_backing_requires_epoch = if (pooled) |lease| lease.retirement_owner != null else false;
+        // Physical banks carry their own charge through their final retained
+        // view. Standalone allocations need a separate retained-state charge.
+        if (admission) |*reservation| {
+            owned.resource_lease = reservation.lease;
+            reservation.lease = null;
         }
-        if (try std.math.mul(usize, elements, @sizeOf(f32)) != output.data.len) return error.InvalidDecoderOutput;
+        var result = source;
+        result.pin = try owned.retainResources(self.allocator);
+        result.input.value = handles[0];
+        result.input.backend = backend;
+        result.independent = true;
+        return result;
+    }
+
+    /// Move a cross cache off its original invocation once omission shows
+    /// that it could keep that invocation alive for the rest of the request.
+    fn copyCrossCache(self: *State, previous: ResidentSlot, control: ?Control) !?ResidentSlot {
+        const storage = @import("../ops/physical_storage.zig");
+        const operation = @import("backend_operation.zig");
+        const shared = self.session.shared_compute_context orelse return null;
+        const backend = shared.stableBackend();
+        if (self.session.model_lifetime == null or previous.input.backend.ptr != backend.ptr or previous.input.backend.vtable != backend.vtable) return null;
+        const kernels = backend.vtable.kernels orelse return null;
+        if (!kernels.accepts(backend.vtable) or kernels.physical_storage_policy == null) return null;
+        const view = kernels.physicalTensorView orelse return null;
+        const copy = kernels.copyPhysicalInput orelse return null;
+        if (backend.kind() != .native and backend.kind() != .metal and kernels.createPhysicalCompletion == null) return null;
+        if (control) |active| try active.check();
+        const bytes = previous.input.estimated_bytes;
+        var dimensions: [4]i32 = undefined;
+        for (&dimensions, previous.shape) |*dim, axis| dim.* = std.math.cast(i32, axis) orelse return null;
+        const bound = try storage.reservationBytes(backend.*, .{ .byte_size = bytes });
+        var admission = try self.session.admitRetainedState(0, bound);
+        defer admission.deinit();
+        var protection = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
+        defer if (protection) |*guard| guard.deinit();
+
+        const handles = try self.allocator.alloc(@import("../ops/ops.zig").CT, 1);
+        var populated = false;
+        var copied: sessions.ResidentOutputs = .{ .outputs = handles, .backend = backend, .allocator = self.allocator };
+        defer if (populated) copied.deinit() else self.allocator.free(handles);
+        {
+            var scope = try operation.enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame);
+            defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            // A standalone Metal blit completes synchronously. An open
+            // frame would require that frame's submission and retirement.
+            if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return null;
+            const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
+            defer if (completion) |event| event.deinit();
+            const allocation = (try storage.Lease.create(self.allocator, backend.*, bytes)) orelse return null;
+            defer allocation.release();
+            if ((allocation.backing_byte_size orelse return null) > bound) return error.PhysicalStorageExceededReservation;
+            handles[0] = (try view(backend.ptr, .{ .storage = allocation, .shape = &dimensions })) orelse return null;
+            populated = true;
+            self.session.pinResident(&copied);
+            copied.resource_lease = admission.lease;
+            admission.lease = null;
+            // A callback error can occur after an asynchronous submission.
+            // Complete the copy before releasing either source or destination.
+            {
+                defer if (completion) |event| {
+                    event.record() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                    event.wait() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                };
+                try copy(backend.ptr, handles[0], previous.input.value);
+            }
+            try scope.finish();
+        }
+        if (control) |active| try active.check();
+        return .{
+            .pin = try copied.retainResources(self.allocator),
+            .input = .{ .value = handles[0], .backend = backend, .estimated_bytes = bytes },
+            .shape = previous.shape,
+            .independent = true,
+        };
+    }
+
+    fn cacheElements(shape: []const i64) !usize {
+        var count: usize = 1;
+        for (shape) |dim| {
+            if (dim < 0) return error.InvalidDecoderOutput;
+            count = try std.math.mul(usize, count, @intCast(dim));
+        }
+        return count;
     }
 };
 
-const TestDecoder = struct {
-    calls: usize = 0,
-    submitted_tokens: usize = 0,
-    cancel_after: ?*std.atomic.Value(bool) = null,
-    const input_info = [_]backends.TensorInfo{
-        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
-        .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ -1, -1, 2 } },
-        .{ .name = "use_cache_branch", .dtype = .bool_, .shape = &.{1} },
-        .{ .name = "past_key_values.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
-        .{ .name = "past_key_values.0.decoder.value", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
-        .{ .name = "past_key_values.0.encoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
-        .{ .name = "past_key_values.0.encoder.value", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
-    };
-    const output_info = [_]backends.TensorInfo{
-        .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1, 4 } },
-        .{ .name = "present.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
-        .{ .name = "present.0.decoder.value", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
-        .{ .name = "present.0.encoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
-        .{ .name = "present.0.encoder.value", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
-    };
-    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
-        return &input_info;
-    }
-    fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
-        return &output_info;
-    }
-    fn backend(_: *anyopaque) backends.BackendType {
-        return .native;
-    }
-    fn close(_: *anyopaque) void {}
-    fn controlled(raw: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator, control: Control) ![]backends.Tensor {
-        try control.check();
-        return run(raw, inputs, allocator);
-    }
-    fn run(raw: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.calls += 1;
-        const ids = inputs[0].asInt64();
-        const rows: usize = @intCast(inputs[0].shape[0]);
-        const tokens = ids.len / rows;
-        self.submitted_tokens += ids.len;
-        const cached = inputs[2].data[0] == 1;
-        const old = inputs[3].asFloat32();
-        const old_time = old.len / rows / 2;
-        const time = old_time + tokens;
-        const values = try allocator.alloc(f32, rows * time * 2);
-        defer allocator.free(values);
-        for (0..rows) |row| {
-            const data = values[row * time * 2 ..][0 .. time * 2];
-            @memcpy(data[0 .. old_time * 2], old[row * old_time * 2 ..][0 .. old_time * 2]);
-            for (ids[row * tokens ..][0..tokens], 0..) |id, i| @memset(data[(old_time + i) * 2 ..][0..2], @as(f32, @floatFromInt(id)));
-        }
-        const outputs = try allocator.alloc(backends.Tensor, output_info.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (outputs[0..initialized]) |*output| output.deinit();
-            allocator.free(outputs);
-        }
-        const logits = try allocator.alloc(f32, ids.len * 4);
-        defer allocator.free(logits);
-        @memset(logits, 0);
-        for (0..rows) |row| {
-            const context = inputs[1].asFloat32()[row * 4];
-            if (cached) {
-                try std.testing.expect(old_time > 0);
-                try std.testing.expectEqual(context, inputs[5].asFloat32()[row * 4]);
-            } else try std.testing.expectEqual(@as(usize, 0), old_time);
-            var sum: usize = @intFromFloat(context);
-            var i: usize = 0;
-            while (i < time) : (i += 1) sum += @intFromFloat(values[(row * time + i) * 2]);
-            logits[((row + 1) * tokens - 1) * 4 + sum % 4] = 10;
-        }
-        for (output_info, 0..) |info, index| {
-            outputs[index] = if (index == 0)
-                try backends.Tensor.initFloat32(allocator, info.name, &.{ @intCast(rows), @intCast(tokens), 4 }, logits)
-            else if (index < 3)
-                try backends.Tensor.initFloat32(allocator, info.name, &.{ @intCast(rows), 1, @intCast(time), 2 }, values)
-            else if (cached)
-                try backends.Tensor.initFloat32(allocator, info.name, &.{ 0, 1, 0, 2 }, &.{})
-            else
-                try backends.Tensor.initFloat32(allocator, info.name, &.{ @intCast(rows), 1, 2, 2 }, inputs[1].asFloat32());
-            initialized += 1;
-        }
-        if (self.cancel_after) |flag| flag.store(true, .release);
-        return outputs;
-    }
-    fn session(self: *@This()) backends.Session {
-        return .{ .ptr = self, .vtable = &.{ .run = run, .runWithControl = controlled, .inputInfo = inputInfo, .outputInfo = outputInfo, .backend = backend, .close = close } };
-    }
+const fixture_inputs = [_]backends.TensorInfo{
+    .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+    .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ -1, -1, 2 } },
+    .{ .name = "use_cache_branch", .dtype = .bool_, .shape = &.{1} },
+    .{ .name = "past_key_values.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
+    .{ .name = "past_key_values.0.decoder.value", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
+    .{ .name = "past_key_values.0.encoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
+    .{ .name = "past_key_values.0.encoder.value", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
 };
-
-fn checkIncremental(allocator: std.mem.Allocator) !void {
-    const memory = @import("../runtime/tier/memory.zig");
-    var controller = memory.AdmissionController{};
-    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
-    var fake = TestDecoder{};
-    var session = fake.session();
-    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 8192 }, .static_workspace_bytes = 1, .check_live_memory = false };
-    var encoder = try backends.Tensor.initFloat32(allocator, "last_hidden_state", &.{ 1, 2, 2 }, &.{ 1, 1, 1, 1 });
-    defer encoder.deinit();
-    var other_encoder = try backends.Tensor.initFloat32(allocator, "last_hidden_state", &.{ 1, 2, 2 }, &.{ 2, 2, 2, 2 });
-    defer other_encoder.deinit();
-    var first = (try State.init(allocator, session, encoder, &.{ 1, 1 }, 4)).?;
-    defer first.deinit();
-    var second = (try State.init(allocator, session, other_encoder, &.{ 1, 1 }, 4)).?;
-    defer second.deinit();
-    const prefix = [_]i64{ 0, 2, 3 };
-    for (1..4) |length| {
-        for ([_]*State{ &first, &second }, 1..) |state, context| {
-            var logits = try state.step(prefix[0..length], null, null);
-            defer logits.deinit();
-            var full_prefix_sum = context;
-            for (prefix[0..length]) |id| full_prefix_sum += @intCast(id);
-            try std.testing.expectEqual(@as(f32, 10), logits.asFloat32()[full_prefix_sum % 4]);
-            try std.testing.expectEqual(@as(i64, 1), logits.shape[1]);
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 6), fake.calls);
-    try std.testing.expectEqual(@as(usize, 6), fake.submitted_tokens); // Full-prefix replay would submit 12.
-    try std.testing.expectEqual(@as(usize, 3), first.committed_prefix.items.len);
-    try std.testing.expectEqual(@as(usize, 3), second.committed_prefix.items.len);
-    try std.testing.expect(controller.snapshot().host_kv_bytes > 0);
-}
+const fixture_outputs = [_]backends.TensorInfo{
+    .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1, 4 } },
+    .{ .name = "present.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
+    .{ .name = "present.0.decoder.value", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
+    .{ .name = "present.0.encoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
+    .{ .name = "present.0.encoder.value", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } },
+};
 
 test "incremental seq2seq executes imported ONNX with empty and populated cache lengths" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try checkImportedCacheHandoff(.native, false);
+}
+
+test "incremental seq2seq imported ONNX Metal hands off resident cache" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    try checkImportedCacheHandoff(.metal, false);
+    try checkImportedCacheHandoff(.metal, true);
+}
+
+test "incremental seq2seq imported ONNX CUDA hands off resident cache" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    checkImportedCacheHandoff(.cuda, false) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+}
+
+fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent: bool) !void {
     const a = std.testing.allocator;
     const ml = @import("ml");
     var graph = ml.graph.Graph.init(a);
@@ -426,7 +502,13 @@ test "incremental seq2seq executes imported ONNX with empty and populated cache 
     try directory.dir.writeFile(std.testing.io, .{ .sub_path = "merged.onnx", .data = model });
     const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "merged.onnx" });
     defer a.free(path);
-    var session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, path, .native, .{});
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer std.debug.assert(std.meta.eql(memory.AdmissionAmounts{}, controller.snapshot()));
+    var session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, path, backend, .{
+        .graph_runtime_strategy = if (require_independent) .interpreter else null,
+    });
+    session.run_admission = .{ .controller = &controller, .backend_class = if (backend == .native) .cpu else .gpu, .limits = .{}, .opaque_workspace_bytes = if (backend == .native) 4096 else 0, .static_workspace_bytes = 1, .check_live_memory = false };
     var diagnostics = @import("diagnostics.zig").Diagnostics{};
     diagnostics.configure(true);
     session.invocation_diagnostics = .{ .diagnostics = &diagnostics };
@@ -435,159 +517,234 @@ test "incremental seq2seq executes imported ONNX with empty and populated cache 
     defer hidden.deinit();
     var values = [_]backends.Tensor{hidden};
     var encoded = @import("encoder_decoder_runtime.zig").EncoderOutputs{ .host = &values };
-    var decoder = try @import("decoder_stage.zig").Decoder.init(a, session, &encoded, 1, &.{1}, 4, null);
+    var decoder = try @import("decoder_stage.zig").Decoder.init(a, session, &encoded, 1, &.{1}, 4, .{ .native_call_policy = .in_process });
     defer decoder.deinit();
     const route = diagnostics.snapshot().?.report.?.decoder_route.?;
     try std.testing.expectEqual(.merged_incremental, route.selected);
-    try std.testing.expectEqual(.host_tensor_dispatch, route.cache_custody);
-    var prefix = [_]i64{ 2, 5 };
-    var first = try decoder.step(prefix[0..1], null, null);
+    try std.testing.expectEqual(.merged_resident, route.cache_custody);
+    if (backend == .native) {
+        const state = if (decoder.incremental) |*value| value else return error.InvalidMergedDecoderFixture;
+        var restricted = state.*;
+        restricted.session.run_admission.?.limits.kv_limit_bytes = 1;
+        defer if (restricted.resident_slots) |slots| {
+            a.free(slots);
+            a.free(restricted.stage_inputs);
+        };
+        try std.testing.expectError(error.ResourceLimitExceeded, restricted.stepResident(.{ .position = 0, .tokens = &.{2} }, .{ .native_call_policy = .in_process }));
+        try std.testing.expectEqual(@as(usize, 0), restricted.position);
+    }
+    var first = try decoder.step(&.{2}, 0, null, null);
     defer first.deinit();
     try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, first.logits);
-    prefix[0] = 3;
-    try std.testing.expectError(error.InvalidDecoderPosition, decoder.step(&prefix, null, null));
-    prefix[0] = 2;
-    var next = try decoder.step(&prefix, null, null);
+    try std.testing.expectError(error.InvalidDecoderPosition, decoder.stepSuffix(.{ .position = 0, .tokens = &.{5} }, null, null));
+    if (backend == .native) {
+        const Cancel = struct {
+            canceled: bool = false,
+            fn check(raw: ?*anyopaque) bool {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                return self.canceled;
+            }
+            fn run(raw: *anyopaque, _: tensor_dispatch.Task, allocator: std.mem.Allocator, target: backends.Session, inputs: []const sessions.StageInput, control: ?Control) !sessions.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const output = (try target.runStageInputsWithControl(inputs, allocator, control)) orelse return error.MissingResidentResult;
+                self.canceled = true;
+                return output;
+            }
+            fn unexpected(_: *anyopaque, _: tensor_dispatch.Task, _: std.mem.Allocator, _: backends.Session, _: ?*sessions.RunPermit, _: ?*std.atomic.Mutex, _: []const backends.Tensor, _: ?Control) ![]backends.Tensor {
+                return error.UnexpectedHostDecoderCall;
+            }
+        };
+        var probe: Cancel = .{};
+        const state = if (decoder.incremental) |*value| value else return error.InvalidMergedDecoderFixture;
+        try std.testing.expectError(error.Cancelled, state.stepResidentDispatched(.{ .position = 1, .tokens = &.{5} }, .{ .native_call_policy = .in_process, .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Cancel.check } }, .{ .ptr = &probe, .task = .rewrite, .run_fn = Cancel.unexpected, .run_stage_fn = Cancel.run }));
+        try std.testing.expectEqual(@as(usize, 1), state.position);
+    }
+    var next = try decoder.stepSuffix(.{ .position = 1, .tokens = &.{5} }, null, null);
     defer next.deinit();
     try std.testing.expectEqualSlices(f32, &.{ 7, 8, 9, 10 }, next.logits);
     const state = if (decoder.incremental) |*value| value else return error.InvalidMergedDecoderFixture;
-    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6, 7, 8, 9, 10 }, state.cached_outputs[1].asFloat32());
-}
-
-test "incremental seq2seq reuses self and cross KV with context isolation and full-prefix parity" {
-    try checkIncremental(std.testing.allocator);
-}
-
-test "incremental seq2seq fuses prefill and cached steps with broadcast branch and isolated contexts" {
-    const Dispatch = @import("../server/tensor_microbatch.zig").Dispatch;
-    const micro = @import("../server/executor_microbatch.zig");
-    const tensors = @import("../server/tensor_microbatch.zig");
-    const memory = @import("../runtime/tier/memory.zig");
-    const Harness = struct {
-        broker: micro.Broker,
-        fn dispatch(raw: *anyopaque, task: micro.Task, alloc: std.mem.Allocator, session: backends.Session, permit: ?*@import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, inputs: []const backends.Tensor, control: ?Control) ![]backends.Tensor {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            return tensors.run(&self.broker, alloc, std.testing.io, task, session, permit, gate.?, inputs, control, null, 500_000);
-        }
-    };
-    const Job = struct {
-        state: *State,
-        prefix: []const i64,
-        dispatch: Dispatch,
-        result: ?backends.Tensor = null,
-        err: ?anyerror = null,
-        fn run(self: *@This()) std.Io.Cancelable!void {
-            self.result = self.state.step(self.prefix, self.dispatch, null) catch |err| {
-                self.err = err;
-                return;
-            };
-        }
-    };
-    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
-    defer std.debug.assert(scheduler.head == null and scheduler.tail == null);
-    var harness = Harness{ .broker = micro.Broker.init(std.testing.allocator) };
-    defer harness.broker.deinit();
-    var controller = memory.AdmissionController{};
-    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
-    var fake = TestDecoder{};
-    var gate = std.atomic.Mutex.unlocked;
-    var session = fake.session();
-    session.execution_gate = &gate;
-    session.cohort_scheduler = &scheduler;
-    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false };
-    var encoder = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 1, 1, 1, 1 });
-    defer encoder.deinit();
-    var other = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 2, 2, 2, 2 });
-    defer other.deinit();
-    var first = (try State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4)).?;
-    defer first.deinit();
-    var second = (try State.init(std.testing.allocator, session, other, &.{ 1, 1 }, 4)).?;
-    defer second.deinit();
-    const prefix = [_]i64{ 0, 2, 3 };
-    for (1..4) |length| {
-        var jobs = [_]Job{
-            .{ .state = &first, .prefix = prefix[0..length], .dispatch = .{ .ptr = &harness, .task = .rewrite, .run_fn = Harness.dispatch } },
-            .{ .state = &second, .prefix = prefix[0..length], .dispatch = .{ .ptr = &harness, .task = .rewrite, .run_fn = Harness.dispatch } },
-        };
-        defer for (&jobs) |*job| if (job.result) |*value| value.deinit();
-        var group = std.Io.Group.init;
-        defer group.cancel(std.testing.io);
-        for (&jobs) |*job| group.async(std.testing.io, Job.run, .{job});
-        try group.await(std.testing.io);
-        for (&jobs, 1..) |*job, context| {
-            if (job.err) |err| return err;
-            var sum = context;
-            for (prefix[0..length]) |id| sum += @intCast(id);
-            try std.testing.expectEqual(@as(f32, 10), job.result.?.asFloat32()[sum % 4]);
-        }
+    const expected_cache: []const f32 = &.{ 3, 4, 5, 6, 7, 8, 9, 10 };
+    if (backend == .native) {
+        const slots = state.resident_slots orelse return error.MissingResidentResult;
+        const cpu_cache = for (slots[0..state.roles.len]) |slot| {
+            if (slot) |value| break value;
+        } else return error.MissingResidentResult;
+        if (!cpu_cache.independent) return error.MissingIndependentCpuCache;
+        const actual = try cpu_cache.input.backend.toFloat32(cpu_cache.input.value, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, expected_cache, actual);
+        const kernels = cpu_cache.input.backend.vtable.kernels.?;
+        const pooled = kernels.pooledOutputStorage.?(cpu_cache.input.backend.ptr, cpu_cache.input.value);
+        const accounting = controller.snapshot();
+        if (pooled) |lease| {
+            if (lease.admission != null) {
+                try std.testing.expect(lease.admittedBytes() >= cpu_cache.input.estimated_bytes);
+                try std.testing.expect(accounting.host_scratch_bytes >= lease.admittedBytes());
+            } else try std.testing.expect(accounting.host_kv_bytes >= cpu_cache.input.estimated_bytes);
+        } else try std.testing.expect(accounting.host_kv_bytes >= cpu_cache.input.estimated_bytes);
+    } else {
+        try std.testing.expect(controller.snapshot().backendTotalBytes() > 0);
+        const slots = state.resident_slots orelse return error.MissingResidentResult;
+        for (slots[0..state.roles.len]) |*slot| {
+            if (slot.*) |owned| {
+                if (require_independent) {
+                    try std.testing.expect(owned.independent);
+                    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+                }
+                const hooks = owned.input.backend.vtable.kernels.?;
+                if (hooks.pooledOutputStorage) |query| {
+                    if (query(owned.input.backend.ptr, owned.input.value)) |lease| {
+                        if (lease.admission != null) {
+                            try std.testing.expect(owned.independent);
+                            try std.testing.expect(lease.admittedBytes() >= owned.input.estimated_bytes);
+                        }
+                    }
+                }
+                const cache = try owned.input.backend.toFloat32(owned.input.value, a);
+                defer a.free(cache);
+                try std.testing.expectEqualSlices(f32, expected_cache, cache);
+                // The graph may publish a frame view. Exercise standalone
+                // adoption separately with a provider-owned allocation.
+                const shared = state.session.shared_compute_context.?;
+                var standalone = try backends.Tensor.initFloat32(a, "present.0.decoder.key", &owned.shape, expected_cache);
+                defer standalone.deinit();
+                const original = try shared.importHostTensor(a, &standalone);
+                var original_live = true;
+                defer if (original_live) shared.stableBackend().free(original);
+                var standalone_input = owned;
+                standalone_input.input.value = original;
+                standalone_input.input.backend = shared.stableBackend();
+                const before_adopt = controller.snapshot();
+                const adopted = (try state.adoptSelfCache(standalone_input)) orelse return error.MissingIndependentSelfCache;
+                defer adopted.pin.release();
+                try std.testing.expect(adopted.independent);
+                try std.testing.expect(controller.snapshot().backend_kv_bytes >= before_adopt.backend_kv_bytes + owned.input.estimated_bytes);
+                shared.stableBackend().free(original);
+                original_live = false;
+                const adopted_cache = try adopted.input.backend.toFloat32(adopted.input.value, a);
+                defer a.free(adopted_cache);
+                try std.testing.expectEqualSlices(f32, expected_cache, adopted_cache);
+                try checkPooledSelfAdoption(state, owned, &controller, expected_cache);
+                const bound = try @import("../ops/physical_storage.zig").reservationBytes(owned.input.backend.*, .{ .byte_size = owned.input.estimated_bytes });
+                var below = state.*;
+                below.session.run_admission.?.limits.kv_limit_bytes = bound - 1;
+                const before_denial = controller.snapshot();
+                const copy_control: Control = .{ .native_call_policy = .in_process };
+                try std.testing.expectError(error.ResourceLimitExceeded, below.copyCrossCache(owned, copy_control));
+                try std.testing.expectEqualDeep(before_denial, controller.snapshot());
+                const detached = (try state.copyCrossCache(owned, copy_control)) orelse return error.MissingIndependentResidentCache;
+                defer detached.pin.release();
+                try std.testing.expect(detached.independent);
+                try std.testing.expect(controller.snapshot().backend_kv_bytes >= owned.input.estimated_bytes);
+                slot.* = null;
+                owned.pin.release();
+                try std.testing.expect(controller.snapshot().backend_kv_bytes >= bound + owned.input.estimated_bytes);
+                const independent_cache = try detached.input.backend.toFloat32(detached.input.value, a);
+                defer a.free(independent_cache);
+                try std.testing.expectEqualSlices(f32, expected_cache, independent_cache);
+                break;
+            }
+        } else return error.MissingResidentResult;
     }
-    try std.testing.expectEqual(@as(usize, 3), fake.calls);
-    try std.testing.expectEqual(@as(usize, 6), fake.submitted_tokens);
+
+    // Exercise the same imported graph through mixed resident inputs. Keep
+    // both output owners live across the second invocation and read only
+    // logits until the final cache comparison.
+    const stages = @import("encoder_decoder_runtime.zig");
+    const test_control: Control = .{ .native_call_policy = .in_process };
+    const prefill_ids = [_]i64{2};
+    const decode_ids = [_]i64{5};
+    const prefill_branch = [_]u8{0};
+    const decode_branch = [_]u8{1};
+    const token_shape = [_]i64{ 1, 1 };
+    const cache_shape = [_]i64{ 1, 1, 1, 4 };
+    var bindings: [4]sessions.StageInput = undefined;
+    for (state.session.inputInfo(), state.roles, &bindings) |info, *role, *binding| {
+        binding.* = .{ .host = switch (role.*) {
+            .tokens => state.borrow(info, &token_shape, std.mem.sliceAsBytes(&prefill_ids)),
+            .encoder => hidden,
+            .cache_branch => state.borrow(info, info.shape, &prefill_branch),
+            .past => |*cache| state.borrow(info, &cache.empty_shape, &.{}),
+            .mask => return error.InvalidMergedDecoderFixture,
+        } };
+    }
+    var prefill = (try state.session.runStageInputsWithControl(&bindings, a, test_control)) orelse return error.MissingResidentResult;
+    defer prefill.deinit();
+    const prefill_logits = try stages.residentVocabularyRow(a, state.session, &prefill, state.logits_index, 1, 4, test_control);
+    defer a.free(prefill_logits);
+    try std.testing.expectEqualSlices(f32, first.logits, prefill_logits);
+    for (state.session.inputInfo(), state.roles, &bindings) |info, role, *binding| switch (role) {
+        .tokens => binding.* = .{ .host = state.borrow(info, &token_shape, std.mem.sliceAsBytes(&decode_ids)) },
+        .cache_branch => binding.* = .{ .host = state.borrow(info, info.shape, &decode_branch) },
+        .past => |cache| binding.* = .{ .resident = .{ .value = prefill.outputs[cache.output_index], .backend = prefill.backend, .shape = &cache_shape, .estimated_bytes = 4 * @sizeOf(f32) } },
+        else => {},
+    };
+    var decoded = (try state.session.runStageInputsWithControl(&bindings, a, test_control)) orelse return error.MissingResidentResult;
+    defer decoded.deinit();
+    const decode_logits = try stages.residentVocabularyRow(a, state.session, &decoded, state.logits_index, 1, 4, test_control);
+    defer a.free(decode_logits);
+    try std.testing.expectEqualSlices(f32, next.logits, decode_logits);
+    const final_cache = try decoded.backend.toFloat32(decoded.outputs[1], a);
+    defer a.free(final_cache);
+    try std.testing.expectEqualSlices(f32, expected_cache, final_cache);
 }
 
-test "incremental seq2seq cache ownership unwinds allocation failures" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkIncremental, .{});
+fn checkPooledSelfAdoption(state: *State, previous: ResidentSlot, controller: *@import("../runtime/tier/memory.zig").AdmissionController, expected: []const f32) !void {
+    const storage = @import("../ops/physical_storage.zig");
+    const admission = @import("storage_admission.zig");
+    const memory = @import("../runtime/tier/memory.zig");
+    const Reserve = struct {
+        controller: *memory.AdmissionController,
+        run: memory.AdmissionLease,
+
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: @import("../graph/backend_contracts.zig").BackendKind, class: @import("storage_accounting.zig").Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.run, .{
+                .controller = self.controller,
+                .backend_class = .gpu,
+                .limits = .{},
+                .check_live_memory = false,
+            }, kind, class, bytes);
+        }
+    };
+    var reserve: Reserve = .{ .controller = controller, .run = try controller.tryAcquire(.gpu, .{}, .{}, false) };
+    defer reserve.run.release();
+    const backend = previous.input.backend;
+    const kernels = backend.vtable.kernels.?;
+    const bytes = previous.input.estimated_bytes;
+    const before = controller.snapshot();
+    const adopted = blk: {
+        const lease = (try storage.Lease.createAdmitted(state.allocator, backend.*, bytes, null, .activation, .{
+            .identity = .{ .controller = controller, .backend_class = .gpu },
+            .context = &reserve,
+            .services = &.{ .reserve = Reserve.reserve },
+        })) orelse return error.MissingPooledCacheBank;
+        defer lease.release();
+        var shape: [4]i32 = undefined;
+        for (&shape, previous.shape) |*dim, size| dim.* = @intCast(size);
+        const value = (try kernels.physicalTensorView.?(backend.ptr, .{ .storage = lease, .shape = &shape })) orelse return error.MissingPooledCacheView;
+        defer backend.free(value);
+        try kernels.writePhysicalFloat32.?(backend.ptr, value, expected);
+        const charged = controller.snapshot();
+        var source = previous;
+        source.input.value = value;
+        const result = (try state.adoptSelfCache(source)) orelse return error.MissingIndependentPooledCache;
+        errdefer result.pin.release();
+        try std.testing.expect(result.independent);
+        try std.testing.expectEqualDeep(charged, controller.snapshot());
+        break :blk result;
+    };
+    {
+        defer adopted.pin.release();
+        try std.testing.expect(controller.snapshot().backend_scratch_bytes > before.backend_scratch_bytes);
+        const actual = try backend.toFloat32(adopted.input.value, state.allocator);
+        defer state.allocator.free(actual);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+    }
+    try std.testing.expectEqualDeep(before, controller.snapshot());
 }
 
 test "incremental seq2seq requires explicit merged ABI" {
-    var fake = TestDecoder{};
-    try std.testing.expect(qualified(fake.session()));
-    var vtable = fake.session().vtable.*;
-    const MissingBranch = struct {
-        fn info(_: *anyopaque) []const backends.TensorInfo {
-            return TestDecoder.input_info[3..];
-        }
-    };
-    vtable.inputInfo = MissingBranch.info;
-    try std.testing.expect(!qualified(.{ .ptr = &fake, .vtable = &vtable }));
-}
-
-test "incremental seq2seq request admission charges retained and replacement caches separately from host IO" {
-    const memory = @import("../runtime/tier/memory.zig");
-    var controller = memory.AdmissionController{};
-    var fake = TestDecoder{};
-    var session = fake.session();
-    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
-    const amount = try estimateAdmission(session, session.run_admission.?, .{ .batch = 2, .sequence = 3, .input_bytes = 20 }, 2, 3, 5, 4);
-    try std.testing.expectEqual(@as(usize, 1152), amount.host_kv_bytes);
-    try std.testing.expectEqual(@as(usize, 180), amount.host_scratch_bytes);
-}
-
-test "incremental seq2seq admits cache bytes before the backend call" {
-    const memory = @import("../runtime/tier/memory.zig");
-    var controller = memory.AdmissionController{};
-    var fake = TestDecoder{};
-    var session = fake.session();
-    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .kv_limit_bytes = 1 }, .static_workspace_bytes = 1, .check_live_memory = false };
-    var encoder = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 1, 1, 1, 1 });
-    defer encoder.deinit();
-    var state = (try State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4)).?;
-    defer state.deinit();
-    try std.testing.expectError(error.ResourceLimitExceeded, state.step(&.{0}, null, null));
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
-}
-
-test "incremental seq2seq cancellation after forwarding does not publish or replay cache" {
-    const memory = @import("../runtime/tier/memory.zig");
-    var controller = memory.AdmissionController{};
-    var canceled = std.atomic.Value(bool).init(false);
-    var fake = TestDecoder{ .cancel_after = &canceled };
-    var session = fake.session();
-    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false };
-    var encoder = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 1, 1, 1, 1 });
-    defer encoder.deinit();
-    var state = (try State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4)).?;
-    defer state.deinit();
-    const Probe = struct {
-        fn check(raw: ?*anyopaque) bool {
-            const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
-            return flag.load(.acquire);
-        }
-    };
-    try std.testing.expectError(error.Cancelled, state.step(&.{0}, null, .{ .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = Probe.check } }));
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(usize, 0), state.committed_prefix.items.len);
-    try std.testing.expectEqual(@as(usize, 0), state.cached_outputs.len);
-    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+    try std.testing.expect(qualifiedSignature(&fixture_inputs, &fixture_outputs, 4));
+    try std.testing.expect(!qualifiedSignature(fixture_inputs[3..], &fixture_outputs, 4));
 }

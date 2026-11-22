@@ -363,20 +363,22 @@ output bank. A staged, backed-off upgrade can later fund a separate scratch bank
 without invalidating queued output references or resetting replay selection.
 Both placements use the same checked view geometry and byte bounds. Partial
 upgrades retire only their own quota and views before retry.
-Merged seq2seq caches and full-prefix host decoders use the same execution-owned
-stage entry as encoders. That entry preserves an installed dispatcher's exact
-permit, gate and cancellation contract, propagates its failures without serial
-replay, and rejects a foreign prepaid model permit on the serial path. Host
-outputs leave through the same prepared Source custody and retirement boundary.
+The merged seq2seq route accepts mixed inputs. Tokens, masks, and branch
+controls use host tensors. Self and cross K/V feed backend tensors directly
+into the next invocation on imported ONNX CPU, Metal, and CUDA. The decoder
+reads only the final vocabulary row. The serving broker gathers compatible
+resident rows into admitted backing and keeps each request's output rows
+separate. Fixed batch exports run through the serial mixed-input route. CPU
+serving uses that route by default and batches when the collection window is
+explicitly enabled.
 
-Decoder construction publishes the selected route, encoder storage, cache
-owner, and requested policy through the uniform report. The generic merged ONNX
-route uses the host-tensor dispatch ABI. Its typed control, self K/V, and cross K/V
-remain available to the batching callback. A verified optional merged artifact
-with an unsupported operator selects the ordinary decoder at load time. Receipt
-or checksum failure remains an error. Native and compiled resident caches
-report their actual runtime owner. Failed construction publishes the initiating
-error, with cache ownership and numerical counters unavailable.
+Standalone self K/V can keep its allocation under an independent K/V charge.
+Admitted pooled outputs retain their physical lease. An omitted cross output
+can move its prior cache to independently admitted backing. Admission pressure
+preserves the producer pin where a separate reservation would exceed limits.
+The model loader selects the ordinary full-prefix decoder when an optional
+merged export lacks a supported operator, mixed-input ABI, or compatible
+geometry. Receipt and checksum failures remain errors.
 
 Metal reports the device's instantaneous worker-process allocation gauge alongside
 tracked project allocations. It includes vendor resources visible to the driver;
@@ -568,9 +570,12 @@ preparation API do not by themselves complete these remaining requirements:
   Decoder storage installs the request-local replay bound before CUDA KV writes.
   Prepared-media and text prefill share chunk policy, and decoder prefill
   selects the prepared-media KV window before numerical submission.
-  Merged seq2seq ONNX decoders resolve input/cache bindings at construction.
-  After shape validation they commit the ordered outputs directly, keep the
-  previous cross KV for declared empty outputs, and publish the logits owner.
+  Incremental encoder-decoder callers supply new tokens and their absolute
+  starting position. Native, compiled and merged decoders validate the position
+  before submission and advance it only on success. Merged seq2seq ONNX
+  decoders resolve input/cache bindings at construction, then validate outputs
+  before committing them. An empty cross KV output retains the previous cross
+  KV. Token history stays with the caller.
   Canonical KV owners prepare unpublished attachment, full prefill, generated-token page growth,
   shared-tail copies, window trimming, replay reservations and view metadata
   before committing either owner. The unchanged-ID path preserves the existing
@@ -585,8 +590,10 @@ preparation API do not by themselves complete these remaining requirements:
   metadata. Metadata synchronization failures propagate before publishing a new
   view. Canonical truncation stages both owners before the final backend
   notification and paired metadata commit. Session admission combines distinct
-  prepaid workspaces before applying explicit operator limits once. Opaque
-  providers and incompatible state transitions retain compatibility ownership; host-table
+  prepaid workspaces before applying explicit operator limits once. Independently
+  declared opaque scratch remains charged even when a prepaid arena covers the
+  invocation workspace. Opaque providers and incompatible state transitions
+  retain compatibility ownership. Host-table
   retention alone does not certify every device cancellation/drain endpoint.
   Ordinary F32 attention reuses the existing physical producer: CUDA singleton
   batch rows write directly into their output parent, and Metal cold paged

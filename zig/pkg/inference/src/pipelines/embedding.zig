@@ -1912,7 +1912,7 @@ pub const EmbeddingPipeline = struct {
                     .native_weights = run_permit.native_weights,
                 };
                 const native_source = if (comptime build_options.enable_native)
-                    managed.backend.vtable == &@import("../ops/native_compute.zig").vtable_impl and run_permit.session.nativePanelPreparationReceiver()
+                    @import("../ops/native_compute.zig").isCanonicalVTable(managed.backend.vtable) and run_permit.session.nativePanelPreparationReceiver()
                 else
                     false;
                 if (native_source) {

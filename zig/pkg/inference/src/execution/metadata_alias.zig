@@ -215,7 +215,7 @@ pub fn fullSpanRequest(value: *const Request, actual_shape: []const i64, availab
 }
 /// Follow the existing planner's alias/root lifetime, never inventing a new
 /// root or recoloring a live source. External inputs/constants remain opaque.
-pub fn activationRoot(plan: *const @import("../graph/buffer_plan.zig").BufferPlan, node: ml.graph.NodeId, backend: contracts.BackendKind) ?@import("../graph/buffer_plan.zig").LogicalSlot {
+pub fn fullSpanRoot(plan: *const @import("../graph/buffer_plan.zig").BufferPlan, node: ml.graph.NodeId, backend: contracts.BackendKind) ?@import("../graph/buffer_plan.zig").LogicalSlot {
     var current = (plan.slotForNode(node) orelse return null).*;
     var depth: usize = 0;
     while (current.kind == .view) : (depth += 1) {
@@ -224,7 +224,7 @@ pub fn activationRoot(plan: *const @import("../graph/buffer_plan.zig").BufferPla
         if (parent >= plan.slots.len) return null;
         current = plan.slots[parent];
     }
-    return if (current.backend == backend and current.kind == .allocation) current else null;
+    return if (current.backend == backend) current else null;
 }
 
 test "GPU full span alias metadata preserves source offsets and rejects padded or strided claims" {

@@ -221,7 +221,7 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
                 error.IncompatibleModel, error.UnsupportedDType => break :blk false,
                 else => return err,
             };
-            break :blk @import("../execution/seq2seq_runtime.zig").qualifiedSignature(signature.inputs, signature.outputs);
+            break :blk @import("../execution/seq2seq_runtime.zig").qualifiedSignature(signature.inputs, signature.outputs, decoder_config.vocab_size);
         } else false;
         if (merged) {
             const selected = [_][]const u8{ component_paths[0], component_paths[2] };
@@ -231,7 +231,7 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
                 encoder = (if (control) |active| loader.loadWithControl(selected[0], active) else loader.load(selected[0])) catch |err| break :blk err;
                 var strict = loader.restrictToBackend(encoder.?.session.backend()) catch |err| break :blk err;
                 decoder = strict.loadWithImportedOnnxContextAndControl(selected[1], backends.imported_onnx_session.sharedBackendContext(encoder.?.session), control) catch |err| break :blk err;
-                if (!@import("../execution/seq2seq_runtime.zig").qualified(decoder.?.session)) break :blk error.IncompatibleModel;
+                if (!@import("../execution/seq2seq_runtime.zig").qualified(decoder.?.session, decoder_config.vocab_size)) break :blk error.IncompatibleModel;
                 break :blk @as(anyerror!void, {});
             };
             if (loaded) |_| {} else |err| {
@@ -289,7 +289,7 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
         .encoder = encoder,
         .decoder = decoder,
         .kind = kind,
-        .decoder_execution = if (decoder != null and @import("../execution/seq2seq_runtime.zig").qualified(decoder.?.session)) .merged_kv else .full_prefix,
+        .decoder_execution = if (decoder != null and @import("../execution/seq2seq_runtime.zig").qualified(decoder.?.session, decoder_config.vocab_size)) .merged_kv else .full_prefix,
         .considered_merged_decoder = component_paths.len == 3,
         .decoder_config = decoder_config,
         .generation = asset_generation,

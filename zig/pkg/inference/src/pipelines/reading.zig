@@ -1683,7 +1683,7 @@ pub const ReadingPipeline = struct {
         while (dec_len < max_len) {
             const decoder_run_start = nowNs();
             if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
-            var row = try numerical.step(dec_ids[0..dec_len], null, null);
+            var row = try numerical.stepFullPrefix(dec_ids[0..dec_len], null);
             defer row.deinit();
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;

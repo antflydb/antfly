@@ -13454,7 +13454,8 @@ test "model selection composite ignores unlisted merged decoders and preserves l
     var signature_arena = std.heap.ArenaAllocator.init(a);
     defer signature_arena.deinit();
     const signature = try backends.imported_onnx_session.inspectSignature(signature_arena.allocator(), raw);
-    try std.testing.expect(@import("../execution/seq2seq_runtime.zig").qualifiedSignature(signature.inputs, signature.outputs));
+    try std.testing.expect(@import("../execution/seq2seq_runtime.zig").qualifiedSignature(signature.inputs, signature.outputs, 4));
+    try std.testing.expect(!@import("../execution/seq2seq_runtime.zig").qualifiedSignature(signature.inputs, signature.outputs, 8));
     const paths = try encoder_decoder.findEncoderDecoderPaths(a, root);
     defer a.free(paths.encoder);
     defer a.free(paths.decoder);
@@ -13523,7 +13524,7 @@ test "model selection composite ignores unlisted merged decoders and preserves l
     defer a.free(mismatched_bytes);
     try @import("../registry/download.zig").writeFileAtomically(a, io, raw, mismatched_bytes);
     const mismatched_signature = try backends.imported_onnx_session.inspectSignature(signature_arena.allocator(), raw);
-    try std.testing.expect(!@import("../execution/seq2seq_runtime.zig").qualifiedSignature(mismatched_signature.inputs, mismatched_signature.outputs));
+    try std.testing.expect(!@import("../execution/seq2seq_runtime.zig").qualifiedSignature(mismatched_signature.inputs, mismatched_signature.outputs, 4));
     std.crypto.hash.sha2.Sha256.hash(mismatched_bytes, &merged_digest, .{});
     const mismatched_receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "seq2seq", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{
         .{ .path = "encoder_model.onnx", .size = ordinary.len },
