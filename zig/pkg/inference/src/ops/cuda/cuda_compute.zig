@@ -20647,12 +20647,16 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const storage = plan.layout(input_bytes) catch return null;
     const output = storage.output orelse return null;
     const first_input = tensorFromCt(inputs[0]);
-    const output_bytes = first_input.elem_count * @sizeOf(f32);
-    if (output_bytes > output.bytes) return null;
+    const output_bytes = spans[0].bytes;
+    if (output_bytes == 0 or output_bytes > output.bytes) return null;
     // The same complete event ABI drives preflight and actual arena lookup.
     const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
     const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), storage.bytes)) orelse return null;
     defer arena.noteUse(&self.ctx);
+    const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
+    var out_owned = true;
+    defer if (out_owned) freeTensor(self, out);
+    var published_directly = false;
     var stable: [20]CT = undefined;
     var count: usize = 0;
     defer for (stable[0..count]) |ct| freeTensor(self, ct);
@@ -20692,6 +20696,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         try prepareSourceLinearArenaScope(self);
         var scope = try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
         const capture = arena.graph == null and !arena.disabled;
+        if (!capture and output.bytes == output_bytes) {
+            try scope.bindPublishedOutput(tensorFromCt(out).buffer.ptr, output_bytes);
+            published_directly = true;
+        }
         if (capture) self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED) catch {
             arena.disabled = true;
             return null;
@@ -20712,7 +20720,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         };
         self.execution_scope = null;
         const result_tensor = tensorFromCt(result);
-        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.complete() and result_tensor.buffer.ptr == arena.buffers[0].ptr + output.offset;
+        const expected_output = if (published_directly) tensorFromCt(out).buffer.ptr else arena.buffers[0].ptr + output.offset;
+        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.complete() and result_tensor.buffer.ptr == expected_output;
         if (!matches and capture) graph_mod.discardRecording(&self.ctx);
         if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
         freeTensor(self, result);
@@ -20735,10 +20744,11 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         try self.ctx.recordProfileEnd(pair);
         arena.timing_replay = if (capture_sample) null else replay;
     };
-    const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
-    errdefer freeTensor(self, out);
-    const result = try audioBufferView(arena.buffers[0], output.offset, output_bytes);
-    try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
+    if (!published_directly) {
+        const result = try audioBufferView(arena.buffers[0], output.offset, output_bytes);
+        try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
+    }
+    out_owned = false;
     return out;
 }
 fn audioBatchLayoutsEnabledOp(ctx: *anyopaque) bool {
@@ -60100,14 +60110,27 @@ test "public source audio linear recreates input bank through actual learning ca
     const Run = struct {
         cb: ops.ComputeBackend,
         calls: usize = 0,
+        output_pointer: driver_mod.CUdeviceptr = 0,
         fn call(raw: *anyopaque, inputs: []const CT) !CT {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
-            return (try self.cb.tryBf16SourceOperation(&.{ .linear = .{ .input = inputs[0], .weight = inputs[1], .rows = 2, .width = 2, .columns = 2 } })) orelse error.SourceArithmeticUnavailable;
+            const result = (try self.cb.tryBf16SourceOperation(&.{ .linear = .{ .input = inputs[0], .weight = inputs[1], .rows = 2, .width = 2, .columns = 2 } })) orelse return error.SourceArithmeticUnavailable;
+            self.output_pointer = tensorFromCt(result).buffer.ptr;
+            return result;
         }
     };
     var run = Run{ .cb = cb };
-    for (0..4) |iteration| {
+    var held: ?CT = null;
+    defer if (held) |output| cb.free(output);
+    for (0..6) |iteration| {
+        if (iteration >= 4) {
+            for (&compute.embedding_gemma2_execution.arenas) |*arena| {
+                if (arena.kind != .audio or arena.graph == null) continue;
+                arena.replay_samples = 2;
+                arena.eager_samples = 0;
+                arena.timing_replay = null;
+            }
+        }
         const values: [4]f32 = @splat(@floatFromInt(iteration + 1));
         const input = try cb.fromFloat32Shape(&values, &.{ 2, 2 });
         defer cb.free(input);
@@ -60124,7 +60147,8 @@ test "public source audio linear recreates input bank through actual learning ca
         try std.testing.expect(ordinary_pointer != 0 and compute.source_linear_scratch.active);
         const before_calls = run.calls;
         const output = (try cb.audioExecution(0x303, &.{ projected, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
-        defer cb.free(output);
+        defer if (iteration != 4) cb.free(output);
+        if (iteration == 4) held = output;
         try std.testing.expect(compute.source_linear_scratch.active);
         if (iteration == 2) {
             try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), compute.source_linear_scratch.buffer.ptr);
@@ -60135,6 +60159,10 @@ test "public source audio linear recreates input bank through actual learning ca
             try std.testing.expectEqual(@as(u64, 1), compute.audio_graph_replays);
             try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);
         }
+        if (iteration >= 4) {
+            try std.testing.expectEqual(before_calls + 1, run.calls);
+            try std.testing.expectEqual(run.output_pointer, tensorFromCt(output).buffer.ptr);
+        }
         const actual = try cb.toFloat32(output, std.testing.allocator);
         defer std.testing.allocator.free(actual);
         try std.testing.expectEqualSlices(f32, &values, actual);
@@ -60142,8 +60170,11 @@ test "public source audio linear recreates input bank through actual learning ca
         storage_live = false;
         try std.testing.expect(!compute.source_linear_scratch.active and compute.source_linear_scratch.buffer.ptr == 0);
     }
-    try std.testing.expectEqual(@as(usize, 3), run.calls);
-    try std.testing.expectEqual(@as(u64, 2), compute.audio_arena_executes);
+    const held_values = try cb.toFloat32(held.?, std.testing.allocator);
+    defer std.testing.allocator.free(held_values);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 5 }, held_values);
+    try std.testing.expectEqual(@as(usize, 5), run.calls);
+    try std.testing.expectEqual(@as(u64, 4), compute.audio_arena_executes);
 }
 
 test "source GEMM row descriptors reject missing physical input before opaque CUDA access" {

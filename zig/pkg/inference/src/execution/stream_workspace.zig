@@ -125,6 +125,7 @@ pub const Scope = struct {
     output_bytes: usize = 0,
     output_active: bool = false,
     output_taken: bool = false,
+    published_ptr: DevicePointer = 0,
     /// Bind the funded byte range before recording or submitting any kernels.
     pub fn bind(plan: *Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
         if (backing == 0 or backing % alignment != 0 or layout.bytes > backing_bytes or
@@ -137,8 +138,20 @@ pub const Scope = struct {
         return self.base != 0 and self.valid and self.cursor == self.plan.event_count;
     }
 
+    /// Ordinary execution may redirect the sealed output slot to independently
+    /// owned storage. Capture continues to use the stable arena address.
+    pub fn bindPublishedOutput(self: *Scope, pointer: DevicePointer, bytes: usize) !void {
+        const slot = self.plan.output orelse return error.InvalidExecutionPlan;
+        if (self.base == 0 or !self.valid or self.cursor != 0 or self.published_ptr != 0 or
+            pointer == 0 or pointer % alignment != 0 or bytes != self.plan.allocations[slot].bytes or
+            pointer > std.math.maxInt(DevicePointer) - bytes) return error.InvalidExecutionPlan;
+        if (pointer < self.base + self.plan.peak and self.base < pointer + bytes) return error.InvalidExecutionPlan;
+        self.published_ptr = pointer;
+    }
+
     pub fn owns(self: *const Scope, pointer: DevicePointer) bool {
-        return self.base != 0 and pointer >= self.base and pointer - self.base < self.plan.peak;
+        return self.base != 0 and ((self.published_ptr != 0 and pointer == self.published_ptr) or
+            (pointer >= self.base and pointer - self.base < self.plan.peak));
     }
     pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
         if (!self.valid or self.cursor == self.plan.event_count) return error.AudioPlanChanged;
@@ -148,6 +161,7 @@ pub const Scope = struct {
             return error.AudioPlanChanged;
         }
         self.cursor += 1;
+        if (self.published_ptr != 0 and self.plan.output == e.slot) return self.published_ptr;
         return self.base + self.plan.allocations[e.slot].offset;
     }
     pub fn release(self: *Scope, pointer: DevicePointer) void {
