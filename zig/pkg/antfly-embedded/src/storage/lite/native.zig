@@ -7669,7 +7669,9 @@ pub const NativeFile = struct {
         // See the matching comment in `createWithIo`.
         if (result.manifest_commits_enabled) try result.manifest_builder.reserveCapacity(allocator);
         result.registerLifetimeWriter();
-        if (result.writer_lock_file != null and result.redoRecoveryCursor() != null) result.publishRedoLogState();
+        // Even an empty, recovered WAL has a durable checkpoint and can
+        // reestablish mapped writer readiness after a crashed lease.
+        if (result.writer_lock_file != null and result.header.protected_redo) result.publishRedoLogState();
         return result;
     }
 
@@ -41086,6 +41088,11 @@ test "lite redo sidecar registration is removed with canceled stat I/O" {
 }
 
 test "lite redo lifetime successor repairs a dead mapped writer after recovery" {
+    try exerciseDeadLifetimeWriterRecovery(false);
+    try exerciseDeadLifetimeWriterRecovery(true);
+}
+
+fn exerciseDeadLifetimeWriterRecovery(has_records: bool) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -41095,7 +41102,7 @@ test "lite redo lifetime successor repairs a dead mapped writer after recovery" 
     {
         var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
         defer writer.close();
-        try writer.putDocument("key", "durable");
+        if (has_records) try writer.putDocument("key", "durable");
     }
 
     var observer = try shared_lock_region.Region.open(a, io, path);
