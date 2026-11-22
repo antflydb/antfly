@@ -155,7 +155,7 @@ fn runRecoveryPageWithConfig(
             const admission = retained.value.admission;
             // Never pass completion work through the unfenced legacy resolver.
             if (!txn.coordinator_known or !txn.coordinator) continue;
-            if (admission.version != 3) {
+            if (admission.version < 3) {
                 summary.recovery.deferred_unresolved += 1;
                 continue;
             }

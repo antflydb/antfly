@@ -1317,7 +1317,8 @@ pub const TxnManager = struct {
             var admission = (try self.getCompletionAdmission(self.alloc, proof.slot.transaction_id)) orelse return error.SourceOutcomeUnresolved;
             defer admission.deinit();
             if (!std.mem.eql(u8, &admission.value.digest, &proof.slot.admission_digest)) return error.SourceTransactionIdentityConflict;
-            const member = try admission.value.admission.member(proof.root.namespace);
+            const member = try admission.value.localMember(proof.root.namespace);
+            if (!std.mem.eql(u8, &member.owner_fence, &command.intent.owner.digest())) return error.InvalidParticipant;
             _ = try self.resolveIntentsWithExtraBatch(proof.slot.transaction_id, .aborted, command.observation.decision.?.record.finalized_at_ns, .{
                 .completion_owner = command.intent.owner,
                 .source_purpose = proof.slot.source_purpose,
@@ -1463,13 +1464,14 @@ pub const TxnManager = struct {
                 if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
                     var admission = saved;
                     defer admission.deinit();
-                    if (admission.value.admission.version == 3) {
+                    if (admission.value.admission.version >= 3) {
                         const owner = extra_batch.completion_owner.?;
                         try admission.value.admission.requireRoutedOwner(owner);
                         const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
                         defer self.alloc.free(namespace);
                         if (!std.mem.eql(u8, namespace, &owner.namespace)) return error.InvalidParticipant;
-                        const local = try admission.value.admission.member(owner.namespace);
+                        const local = try admission.value.localMember(owner.namespace);
+                        if (!std.mem.eql(u8, &local.owner_fence, &owner.digest())) return error.InvalidParticipant;
                         const coordinator = try admission.value.admission.coordinatorMember();
                         if (participants.len == 1 and std.mem.eql(u8, participants[0], coordinator.locator) and std.mem.eql(u8, participant, local.locator)) {
                             durable_participant = participants[0];
@@ -3491,11 +3493,11 @@ pub const TxnManager = struct {
                     var parsed = try completion.parseAdmission(scope_arena.allocator(), supplied orelse try batch.get(&admission_key));
                     defer parsed.deinit();
                     const admission = parsed.value.admission;
-                    if (admission.version != 3 or !std.mem.eql(u8, &admission.transaction_id, &id)) return error.InvalidTxnRecord;
+                    if (admission.version < 3 or !std.mem.eql(u8, &admission.transaction_id, &id)) return error.InvalidTxnRecord;
                     const namespace = try batch.get(&internal_keys.identity_namespace_key);
                     if (namespace.len != 24) return error.InvalidTxnRecord;
-                    const member = try admission.member(namespace[0..24].*);
-                    if (next_record.coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return error.InvalidParticipant;
+                    const member = try parsed.value.localMember(namespace[0..24].*);
+                    if (next_record.coordinator != admission.isCoordinator(member)) return error.InvalidParticipant;
                     try producer_policy.Store.require(scope_arena.allocator(), &batch, try source_scope.Basis.fromOwner(member.routed_owner.?), .ordinary);
                 }
             }
@@ -3537,12 +3539,12 @@ pub const TxnManager = struct {
             var parsed = try completion.parseAdmission(scope_arena.allocator(), retained);
             defer parsed.deinit();
             const admission = parsed.value.admission;
-            if (admission.version != 3 or !std.mem.eql(u8, &admission.transaction_id, &id)) return error.InvalidTxnRecord;
+            if (admission.version < 3 or !std.mem.eql(u8, &admission.transaction_id, &id)) return error.InvalidTxnRecord;
             const namespace = try batch.get(&internal_keys.identity_namespace_key);
             if (namespace.len != 24) return error.InvalidTxnRecord;
-            const member = try admission.member(namespace[0..24].*);
+            const member = try parsed.value.localMember(namespace[0..24].*);
             const coordinator = try admission.coordinatorMember();
-            if (coordinator.roles & completion.Roles.checkpoint == 0 or next.coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return error.InvalidParticipant;
+            if (coordinator.roles & completion.Roles.checkpoint == 0 or next.coordinator != admission.isCoordinator(member)) return error.InvalidParticipant;
             const root = try source_scope.Basis.fromOwner(member.routed_owner.?);
             try producer_policy.Store.require(scope_arena.allocator(), &batch, root, .scoped_source);
             const coordinator_root = try source_scope.Basis.fromOwner(coordinator.routed_owner.?);

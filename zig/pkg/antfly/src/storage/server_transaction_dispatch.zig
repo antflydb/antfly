@@ -96,7 +96,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
                 var plan = try completion.parseAdmission(alloc, raw);
                 defer plan.deinit();
-                const member = try plan.value.admission.member(binding.namespace);
+                const member = try plan.value.admission.memberForOwner(binding);
                 if (!std.mem.eql(u8, member.locator, local_participant)) return error.InvalidParticipant;
                 if (begin.source_purpose) |purpose| {
                     if (!begin.retain_terminal) return error.InvalidBatchRequest;

@@ -134,7 +134,7 @@ pub const Recovery = struct {
         const fences = try a.alloc(metadata.CatalogRouteFence, admission.participants.len);
         defer a.free(fences);
         for (admission.participants, fences) |member, *fence| {
-            fence.* = try routeRetainedOwner(&session, try admission.recoveryOwner(member.namespace), member.locator, budget, context);
+            fence.* = try routeRetainedOwner(&session, (member.routed_owner orelse return error.ChangefeedCapabilityUnsupported), member.locator, budget, context);
         }
         if (decision.record.status == .aborted) {
             for (fences, 0..) |fence, index| {
@@ -150,7 +150,7 @@ pub const Recovery = struct {
         defer assembly.deinit();
         for (admission.participants, fences, 0..) |member, fence, index| {
             try self.checkpoint(context);
-            const owner = try admission.recoveryOwner(member.namespace);
+            const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
             const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
             const input: resolution_ops.Request = .{ .version = 1, .authority = .raft, .namespace = member.namespace, .transaction_id = transaction_id, .owner_fence = owner.digest(), .manifest_digest = manifest.digest(), .commit_version = manifest.commit_version, .minimum_applied_index = 1 };
             var receipt = try self.resolutions.read(a, fence, locator.table_name, input, context);
@@ -174,7 +174,7 @@ pub const Recovery = struct {
         var complete = true;
         for (admission.participants, fences, 0..) |member, fence, index| {
             try self.checkpoint(context);
-            const owner = try admission.recoveryOwner(member.namespace);
+            const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
             const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
             const input: publication_ops.Request = .{ .version = 1, .owner = owner, .transaction_id = transaction_id, .manifest_digest = manifest.digest(), .commit_version = manifest.commit_version, .minimum_applied_index = 1 };
             var publication = try self.publications.read(a, fence, locator.table_name, input, context);

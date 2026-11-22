@@ -126,29 +126,22 @@ pub const Assembly = struct {
         try reply.validate(request);
         const frozen = self.manifest();
         if (!equal(request.transaction_id, frozen.transaction_id) or !equal(request.manifest_digest, frozen.digest()) or request.commit_version != frozen.commit_version) return error.HistoryCorrupt;
-        var low: usize = 0;
-        var high = frozen.participants.len;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            switch (std.mem.order(u8, &frozen.participants[middle].namespace, &request.namespace)) {
-                .lt => low = middle + 1,
-                .gt => high = middle,
-                .eq => {
-                    const participant = frozen.participants[middle];
-                    if (!equal(request.owner_fence, participant.owner_fence)) return error.HistoryCorrupt;
-                    const receipt = reply.resolution orelse return false;
-                    try receipt.validate(frozen);
-                    if (self.receipts[middle]) |previous| {
-                        if (!equal(previous.digest(), receipt.digest())) return error.DecisionConflict;
-                    } else {
-                        self.receipts[middle] = receipt;
-                        self.received += 1;
-                    }
-                    return true;
-                },
+        var namespace_present = false;
+        for (frozen.participants, 0..) |participant, index| {
+            if (!equal(participant.namespace, request.namespace)) continue;
+            namespace_present = true;
+            if (!equal(participant.owner_fence, request.owner_fence)) continue;
+            const receipt = reply.resolution orelse return false;
+            try receipt.validate(frozen);
+            if (self.receipts[index]) |previous| {
+                if (!equal(previous.digest(), receipt.digest())) return error.DecisionConflict;
+            } else {
+                self.receipts[index] = receipt;
+                self.received += 1;
             }
+            return true;
         }
-        return error.InvalidParticipant;
+        return if (namespace_present) error.HistoryCorrupt else error.InvalidParticipant;
     }
     pub fn encode(self: *const Assembly, a: A) ![]u8 {
         if (self.received != self.receipts.len) return error.SourceOutcomeUnresolved;

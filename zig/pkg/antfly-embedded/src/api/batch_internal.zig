@@ -4050,7 +4050,10 @@ pub fn requireCompletionPrepareInput(a: std.mem.Allocator, plan: @import("../sto
     if (!std.mem.eql(u8, &mutation.prepare.txn_id, &plan.transaction_id)) return error.SourceTransactionIdentityConflict;
     const encoded = try completionPrepareInput(a, request);
     defer a.free(encoded);
-    try plan.requirePreparedInput(namespace, encoded);
+    if (mutation.prepare.completion_owner) |owner| {
+        if (!std.mem.eql(u8, &namespace, &owner.namespace)) return error.InvalidParticipant;
+        try plan.requireOwnerPreparedInput(owner, encoded);
+    } else try plan.requirePreparedInput(namespace, encoded);
 }
 
 /// Completion control phases cannot carry another mutation.
@@ -4100,7 +4103,7 @@ pub fn validateCompletionPublication(a: std.mem.Allocator, id: [16]u8, owner: @i
 fn validateOrdinaryCompletionBegin(a: std.mem.Allocator, raw: []const u8) !void {
     var parsed = try @import("../storage/transaction_completion.zig").parseAdmission(a, raw);
     defer parsed.deinit();
-    if (parsed.value.admission.version != 3) return error.ChangefeedCapabilityUnsupported;
+    if (parsed.value.admission.version < 3) return error.ChangefeedCapabilityUnsupported;
 }
 
 pub fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8, participants: []const []const u8, owner: ?@import("../storage/transaction_completion.zig").RoutedOwner, topology_epoch: u64) !void {
@@ -4108,6 +4111,7 @@ pub fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8
     var plan = completion.parseAdmission(a, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
     defer plan.deinit();
     const admission = plan.value.admission;
+    if (plan.value.local_owner_fence != null) return error.InvalidBatchRequest;
     if (admission.version >= 2) {
         const binding = owner orelse return error.InvalidBatchRequest;
         try admission.requireRoutedOwner(binding);
@@ -4118,7 +4122,7 @@ pub fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8
     if (!std.mem.eql(u8, participants[0], coordinator.locator)) return error.InvalidBatchRequest;
     var index: usize = 1;
     for (admission.participants) |member| {
-        if (std.mem.eql(u8, &member.namespace, &admission.coordinator_namespace)) continue;
+        if (admission.isCoordinator(member)) continue;
         if (!std.mem.eql(u8, participants[index], member.locator)) return error.InvalidBatchRequest;
         index += 1;
     }

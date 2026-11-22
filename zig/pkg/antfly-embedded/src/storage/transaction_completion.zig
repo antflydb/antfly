@@ -262,6 +262,11 @@ pub const Admission = struct {
         const participant = try self.member(namespace);
         if (encoded_input.len == 0 or !same(participant.input_digest.?, preparedInputDigest(namespace, encoded_input))) return error.SourceTransactionIdentityConflict;
     }
+    pub fn requireOwnerPreparedInput(self: Admission, owner: RoutedOwner, encoded_input: []const u8) !void {
+        const participant = try self.memberForOwner(owner);
+        if (encoded_input.len == 0 or !same(participant.input_digest.?, preparedInputDigest(owner.namespace, encoded_input)))
+            return error.SourceTransactionIdentityConflict;
+    }
     pub fn manifest(self: Admission, commit_version: u64) !Manifest {
         const result: Manifest = .{ .version = self.version, .transaction_id = self.transaction_id, .admission_digest = self.admission_digest, .coordinator_namespace = self.coordinator_namespace, .coordinator_fence = self.coordinator_fence, .commit_version = commit_version, .participants = self.participants };
         try result.validate();
@@ -307,6 +312,12 @@ pub const AdmissionEnvelope = struct {
     digest: Digest,
     local_owner_fence: ?Digest = null,
 
+    pub fn jsonStringify(self: AdmissionEnvelope, stream: anytype) !void {
+        if (self.local_owner_fence) |fence|
+            return stream.write(.{ .admission = self.admission, .digest = self.digest, .local_owner_fence = fence });
+        return stream.write(.{ .admission = self.admission, .digest = self.digest });
+    }
+
     pub fn localMember(self: AdmissionEnvelope, namespace: Namespace) !Participant {
         if (self.admission.version < physical_participant_version) return self.admission.member(namespace);
         const fence = self.local_owner_fence orelse return error.InvalidTxnRecord;
@@ -327,11 +338,8 @@ pub fn encodeLocalAdmission(a: A, admission: Admission, owner: RoutedOwner) ![]u
 
 fn encodeAdmissionEnvelope(a: A, admission: Admission, local_owner_fence: ?Digest) ![]u8 {
     try admission.validate();
-    const digest = admission.digest();
-    const bytes = if (local_owner_fence) |fence|
-        try std.json.Stringify.valueAlloc(a, .{ .admission = admission, .digest = digest, .local_owner_fence = fence }, .{})
-    else
-        try std.json.Stringify.valueAlloc(a, .{ .admission = admission, .digest = digest }, .{});
+    const stored: AdmissionEnvelope = .{ .admission = admission, .digest = admission.digest(), .local_owner_fence = local_owner_fence };
+    const bytes = try std.json.Stringify.valueAlloc(a, stored, .{});
     errdefer a.free(bytes);
     if (bytes.len > max_bytes) return error.HistoryTooLarge;
     return bytes;

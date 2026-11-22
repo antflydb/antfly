@@ -94,7 +94,7 @@ pub const Decision = struct {
         try self.record.validate();
         try self.admission.admission.validate();
         const admission = self.admission.admission;
-        if (admission.version != 3) return error.ChangefeedCapabilityUnsupported;
+        if (admission.version < 3) return error.ChangefeedCapabilityUnsupported;
         if (!std.mem.eql(u8, &admission.transaction_id, &query.transaction_id) or
             !std.mem.eql(u8, &admission.coordinator_namespace, &query.owner.namespace) or
             !std.mem.eql(u8, &admission.coordinator_fence, &query.owner.digest()) or
@@ -104,7 +104,7 @@ pub const Decision = struct {
     pub fn committedManifest(self: Decision) !completion.Manifest {
         try self.record.validate();
         try self.admission.admission.validate();
-        if (self.admission.admission.version != 3) return error.ChangefeedCapabilityUnsupported;
+        if (self.admission.admission.version < 3) return error.ChangefeedCapabilityUnsupported;
         if (!std.mem.eql(u8, &self.admission.digest, &self.admission.admission.digest())) return error.HistoryCorrupt;
         if (self.record.status != .committed) return error.SourceOutcomeUnresolved;
         return self.admission.admission.manifest(self.record.commit_version);
