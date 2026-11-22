@@ -1259,7 +1259,7 @@ pub const DurableSessionStore = struct {
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         const key = try makeSessionKey(self.alloc, session.txn_id);
         defer self.alloc.free(key);
-        const value = try encodeSessionRecord(self.alloc, session);
+        const value = try encodeSessionRecordWithListingLimit(self.alloc, session, @min(max_record_bytes orelse std.math.maxInt(usize), self.graphRecordLimit()) -| session.graph_admission_growth);
         defer self.alloc.free(value);
         try self.checkRecordSize(session, value.len, max_record_bytes, options.creating);
         switch (self.backend) {
@@ -1393,7 +1393,7 @@ pub const DurableSessionStore = struct {
             epoch = certified_lease_epoch;
         }
 
-        const session_value = try encodeSessionRecord(self.alloc, session);
+        const session_value = try encodeSessionRecordWithListingLimit(self.alloc, session, @min(max_record_bytes orelse std.math.maxInt(usize), self.graphRecordLimit()) -| session.graph_admission_growth);
         defer self.alloc.free(session_value);
         try self.checkRecordSize(session, session_value.len, max_record_bytes, expected == null);
         const lease_value = try std.json.Stringify.valueAlloc(self.alloc, lease_mod.LeaseRecord{
@@ -1499,6 +1499,11 @@ pub const DurableSessionStore = struct {
         defer self.alloc.free(key);
         _ = txn.get(key) catch |err| switch (err) {
             error.NotFound => {
+                const receipt = try makeSqlAbortReceiptKey(self.alloc, session.txn_id);
+                defer self.alloc.free(receipt);
+                if (txn.get(receipt)) |_| {
+                    return error.CypherWriteRequestAlreadyUsed;
+                } else |err| if (err != error.NotFound) return err;
                 const directory = try completionDirectoryKey(self.alloc, session.txn_id);
                 defer self.alloc.free(directory);
                 _ = txn.get(directory) catch |missing| switch (missing) {
@@ -1903,6 +1908,7 @@ pub const DurableSessionStore = struct {
         detached.revision += 1;
         if (commit_settings) detached.overlay = session.setting_committed.items;
         try sql_connection_record.putTxn(txn, self.alloc, detached);
+        try self.deleteLoadedSessionTxn(txn, key, session, expected, null, guard);
         if (condition == .expired and connection.value.state != .beginning) {
             // The uncertain-state update may itself have lost its acknowledgement.
             // Keep the abort proof for either state and release the connection
@@ -1921,10 +1927,12 @@ pub const DurableSessionStore = struct {
             touchSession(&receipt);
             const encoded = try encodeSessionRecord(self.alloc, receipt);
             defer self.alloc.free(encoded);
-            try self.putSessionAndExpiryTxn(txn, key, encoded, receipt, .{ .expected = expected, .guard = guard });
-            try self.clearSessionLeaseTxn(txn, txn_id);
-        } else {
-            try self.deleteLoadedSessionTxn(txn, key, session, expected, null, guard);
+            const receipt_key = try makeSqlAbortReceiptKey(self.alloc, txn_id);
+            defer self.alloc.free(receipt_key);
+            const expiry_key = try makeSessionExpiryKey(self.alloc, receipt.last_touched_timestamp, txn_id);
+            defer self.alloc.free(expiry_key);
+            try txn.put(receipt_key, encoded);
+            try txn.put(expiry_key, &.{});
         }
     }
 
@@ -2052,6 +2060,50 @@ pub const DurableSessionStore = struct {
         } else if (previous_needs_recovery) {
             try clearSessionRecoveryIndexTxn(self, txn, session.txn_id);
         }
+    }
+
+    fn expireSqlAbortReceipt(self: *DurableSessionStore, id: db_mod.types.TxnId, cutoff: u64) !bool {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                if (!try self.expireSqlAbortReceiptTxn(&txn, id, cutoff)) {
+                    txn.abort();
+                    return false;
+                }
+                try txn.commit();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                if (!try self.expireSqlAbortReceiptTxn(&txn, id, cutoff)) {
+                    txn.abort();
+                    return false;
+                }
+                try txn.commit();
+            },
+        }
+        return true;
+    }
+
+    fn expireSqlAbortReceiptTxn(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId, cutoff: u64) !bool {
+        const key = try makeSqlAbortReceiptKey(self.alloc, id);
+        defer self.alloc.free(key);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        var receipt = try decodeSessionRecord(self.alloc, id, raw);
+        defer receipt.deinit(self.alloc);
+        if (receipt.last_touched_timestamp >= cutoff) return false;
+        const expiry_key = try makeSessionExpiryKey(self.alloc, receipt.last_touched_timestamp, id);
+        defer self.alloc.free(expiry_key);
+        try txn.delete(expiry_key);
+        try txn.delete(key);
+        return true;
     }
 
     fn deleteSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId, expected: Version, cutoff: ?u64, guard: ?Mutation) !void {
@@ -4408,7 +4460,18 @@ pub const SessionRegistry = struct {
                 },
             };
         }
-        var view = (try self.readSessionAssumeStripe(txn_id)) orelse return null;
+        var view = (try self.readSessionAssumeStripe(txn_id)) orelse {
+            const durable = self.durable orelse return null;
+            if (try durable.readStatus(txn_id, filter, false)) |projection| switch (projection) {
+                .found => |status| {
+                    var result = status;
+                    applySavepointLimits(self, &result);
+                    return result;
+                },
+                .absent => {},
+            };
+            return null;
+        };
         defer view.deinit();
         const session = view.session;
         switch (filter) {
@@ -4459,18 +4522,23 @@ pub const SessionRegistry = struct {
                 },
             }) orelse return null;
             defer snapshot.session.deinit(alloc);
+            defer if (snapshot.summary) |summary| summary.deinit();
             if (!colocated_lease) snapshot.status.lease_expires_at = try self.loadLeaseExpiryLocked(alloc, txn_id);
-            return try projectDetails(alloc, &snapshot.session, snapshot.status, projection);
+            return try projectDetails(alloc, &snapshot.session, snapshot.status, projection, if (snapshot.summary) |summary| summary.value else null);
         }
         var view = (try self.readSessionAssumeStripe(txn_id)) orelse return null;
         defer view.deinit();
         const session = view.session;
         if (!detailsPrincipalMatches(&session, filter)) return null;
         const status = if (projection != .authorization) try sessionStatusFromSession(self, alloc, &session) else sessionStatusSnapshot(&session, self.durable != null);
-        return try projectDetails(alloc, &session, status, projection);
+        return try projectDetails(alloc, &session, status, projection, null);
     }
 
-    const DetailsSnapshot = struct { session: Session, status: SessionStatus };
+    const DetailsSnapshot = struct {
+        session: Session,
+        status: SessionStatus,
+        summary: ?std.json.Parsed(SessionListingSummary) = null,
+    };
 
     fn detailsFromTxn(self: *SessionRegistry, txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: db_mod.types.TxnId, filter: StatusPrincipalFilter, projection: DetailsProjection, colocated_lease: bool) !?DetailsSnapshot {
         const raw = txn.get(key) catch |err| switch (err) {
@@ -4478,20 +4546,29 @@ pub const SessionRegistry = struct {
             else => return err,
         };
         var savepoint_count: usize = 0;
+        var summary: ?std.json.Parsed(SessionListingSummary) = null;
+        errdefer if (summary) |value| value.deinit();
         var session = if (projection == .listing)
-            try decodeSessionForListing(alloc, id, raw, &savepoint_count)
+            try decodeSessionForListing(alloc, id, raw, &savepoint_count, &summary)
         else
             try decodeSessionRecord(alloc, id, raw);
         errdefer session.deinit(alloc);
         if (!detailsPrincipalMatches(&session, filter)) {
             session.deinit(alloc);
+            if (summary) |value| value.deinit();
             return null;
         }
         var status = sessionStatusSnapshot(&session, true);
         if (projection == .listing) status.savepoint_count = savepoint_count;
         if (colocated_lease) status.lease_expires_at = try matchingLeaseExpiry(txn, alloc, id, session.owner_node_id);
+        if (summary) |value| {
+            status.staged_table_count = value.value.counts.tables;
+            status.staged_read_count = value.value.counts.reads;
+            status.staged_write_count = value.value.counts.writes;
+            status.staged_delete_count = value.value.counts.deletes;
+        }
         applySavepointLimits(self, &status);
-        return .{ .session = session, .status = status };
+        return .{ .session = session, .status = status, .summary = summary };
     }
 
     fn detailsPrincipalMatches(session: *const Session, filter: StatusPrincipalFilter) bool {
@@ -4501,7 +4578,7 @@ pub const SessionRegistry = struct {
         };
     }
 
-    fn projectDetails(alloc: std.mem.Allocator, session: *const Session, status: SessionStatus, projection: DetailsProjection) !SessionDetails {
+    fn projectDetails(alloc: std.mem.Allocator, session: *const Session, status: SessionStatus, projection: DetailsProjection, summary: ?SessionListingSummary) !SessionDetails {
         var details: SessionDetails = .{
             .graph_receipt = session.graph_receipt,
             .status = status,
@@ -4511,28 +4588,34 @@ pub const SessionRegistry = struct {
             .savepoint_ids = &.{},
         };
         errdefer details.deinit(alloc);
-        details.tables = if (session.graph_receipt and session.terminal_abort and session.staged == null) try cloneTableDetails(alloc, session.graph_abort_tables) else try sessionTableDetails(alloc, session.staged, projection == .details);
+        details.tables = if (summary) |value| try cloneTableDetails(alloc, value.tables) else if (session.graph_receipt and session.terminal_abort and session.staged == null) try cloneTableDetails(alloc, session.graph_abort_tables) else try sessionTableDetails(alloc, session.staged, projection == .details);
         details.read_snapshots = try sessionReadSnapshots(alloc, session, projection == .details);
         if (projection == .details) details.savepoint_ids = try sessionSavepointIds(alloc, session);
-        if (session.staged) |*staged| {
-            var bindings = std.ArrayList(CatalogBinding).empty;
-            errdefer {
-                for (bindings.items) |binding| {
-                    alloc.free(binding.logical);
-                    alloc.free(binding.physical);
-                }
-                bindings.deinit(alloc);
-            }
-            for (staged.catalog_bindings.items) |binding| {
-                const logical = try alloc.dupe(u8, binding.logical);
-                errdefer alloc.free(logical);
-                const physical = try alloc.dupe(u8, binding.physical);
-                errdefer alloc.free(physical);
-                try bindings.append(alloc, .{ .logical = logical, .physical = physical });
-            }
-            details.catalog_bindings = try bindings.toOwnedSlice(alloc);
+        if (summary) |value| {
+            try cloneDetailBindings(alloc, &details, value.bindings);
+        } else if (session.staged) |*staged| {
+            try cloneDetailBindings(alloc, &details, staged.catalog_bindings.items);
         }
         return details;
+    }
+
+    fn cloneDetailBindings(alloc: std.mem.Allocator, details: *SessionDetails, source: []const CatalogBinding) !void {
+        var bindings = std.ArrayList(CatalogBinding).empty;
+        errdefer {
+            for (bindings.items) |binding| {
+                alloc.free(binding.logical);
+                alloc.free(binding.physical);
+            }
+            bindings.deinit(alloc);
+        }
+        for (source) |binding| {
+            const logical = try alloc.dupe(u8, binding.logical);
+            errdefer alloc.free(logical);
+            const physical = try alloc.dupe(u8, binding.physical);
+            errdefer alloc.free(physical);
+            try bindings.append(alloc, .{ .logical = logical, .physical = physical });
+        }
+        details.catalog_bindings = try bindings.toOwnedSlice(alloc);
     }
 
     pub fn listSessionIds(self: *SessionRegistry, alloc: std.mem.Allocator, principal: ?[]const u8) ![]db_mod.types.TxnId {
@@ -4765,7 +4848,12 @@ pub const SessionRegistry = struct {
             session_lock.lock();
             defer session_lock.unlock();
             // Scanning pinned receipts must not populate the foreground cache.
-            var view = (try self.readSessionAssumeStripe(txn_id)) orelse continue;
+            var view = (try self.readSessionAssumeStripe(txn_id)) orelse {
+                if (self.durable) |durable| {
+                    if (try durable.expireSqlAbortReceipt(txn_id, cutoff_ns)) removed_count += 1;
+                }
+                continue;
+            };
             defer view.deinit();
             const current = view.session;
             if (current.last_touched_timestamp >= cutoff_ns) continue;
@@ -6896,6 +6984,10 @@ fn sessionSavepointIds(alloc: std.mem.Allocator, session: *const Session) ![]u64
     return out;
 }
 
+fn makeSqlAbortReceiptKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__api_sql_abort_receipt__:{s}", .{&std.fmt.bytesToHex(txn_id, .lower)});
+}
+
 fn makeSessionKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]u8 {
     const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ session_prefix, &txn_hex });
@@ -7201,9 +7293,13 @@ fn encodeGraphStatus(out: *std.ArrayList(u8), alloc: std.mem.Allocator, session:
 }
 
 fn readStatusTxn(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: db_mod.types.TxnId, filter: SessionRegistry.StatusPrincipalFilter, colocated: bool) !?GraphStatusLookup {
-    var result: GraphStatusLookup = (try readGraphStatus(txn, alloc, key, id, filter)) orelse legacy: {
+    const projected = try readGraphStatus(txn, alloc, key, id, filter);
+    var result: GraphStatusLookup = if (projected) |value| switch (value) {
+        .absent => try readSqlAbortStatus(txn, alloc, id, filter),
+        .found => value,
+    } else legacy: {
         const raw = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return .absent,
+            error.NotFound => return try readSqlAbortStatus(txn, alloc, id, filter),
             else => return err,
         };
         var session = try decodeSessionRecord(alloc, id, raw);
@@ -7217,6 +7313,22 @@ fn readStatusTxn(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: db
     if (!colocated or result == .absent) return result;
     result.found.lease_expires_at = try matchingLeaseExpiry(txn, alloc, id, result.found.owner_node_id);
     return result;
+}
+
+fn readSqlAbortStatus(txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, filter: SessionRegistry.StatusPrincipalFilter) !GraphStatusLookup {
+    const key = try makeSqlAbortReceiptKey(alloc, id);
+    defer alloc.free(key);
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return .absent,
+        else => return err,
+    };
+    var receipt = try decodeSessionRecord(alloc, id, raw);
+    defer receipt.deinit(alloc);
+    switch (filter) {
+        .all => {},
+        .principal => |principal| if (!principalsEqual(receipt.principal, principal)) return .absent,
+    }
+    return .{ .found = sessionStatusSnapshot(&receipt, true) };
 }
 
 fn matchingLeaseExpiry(txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, owner_node_id: u64) !u64 {
@@ -7305,7 +7417,17 @@ fn graphStatusFromPrefix(raw: []const u8, id: db_mod.types.TxnId, filter: Sessio
     } };
 }
 
+const SessionListingSummary = struct {
+    counts: StagedCounts,
+    tables: []const SessionTableDetail,
+    bindings: []const CatalogBinding,
+};
+
 fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
+    return encodeSessionRecordWithListingLimit(alloc, session, std.math.maxInt(usize));
+}
+
+fn encodeSessionRecordWithListingLimit(alloc: std.mem.Allocator, session: Session, listing_limit: usize) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     const bound = if (session.staged != null and session.staged.?.bound_catalog_incarnation != null) true else blk: {
@@ -7372,6 +7494,21 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     try appendJsonString(alloc, &out, syncLevelText(session.sync_level));
     try out.appendSlice(alloc, ",\"next_savepoint_id\":");
     try out.print(alloc, "{d}", .{session.next_savepoint_id});
+    const listing_start = out.items.len;
+    if (session.staged) |staged| {
+        const tables = try sessionTableDetails(alloc, staged, false);
+        defer {
+            for (tables) |*table| table.deinit(alloc);
+            if (tables.len != 0) alloc.free(tables);
+        }
+        try out.appendSlice(alloc, ",\"listing_v1\":");
+        try out.print(alloc, "{f}", .{std.json.fmt(SessionListingSummary{
+            .counts = stagedCounts(&session),
+            .tables = tables,
+            .bindings = staged.catalog_bindings.items,
+        }, .{})});
+    }
+    const listing_end = out.items.len;
     try out.appendSlice(alloc, ",\"staged\":");
     if (session.staged) |staged| {
         const encoded = try encodeCommitRequestMode(alloc, staged, true);
@@ -7477,6 +7614,10 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "]}");
+    if (listing_end != listing_start and out.items.len > listing_limit) {
+        std.mem.copyForwards(u8, out.items[listing_start..], out.items[listing_end..]);
+        out.items.len -= listing_end - listing_start;
+    }
     return try out.toOwnedSlice(alloc);
 }
 
@@ -7558,7 +7699,7 @@ fn decodeSessionRecordForOwner(alloc: std.mem.Allocator, txn_id: db_mod.types.Tx
     return decodeSessionObject(alloc, txn_id, obj);
 }
 
-fn decodeSessionForListing(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw: []const u8, savepoint_count: *usize) !Session {
+fn decodeSessionForListing(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw: []const u8, savepoint_count: *usize, summary: *?std.json.Parsed(SessionListingSummary)) !Session {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -7566,6 +7707,7 @@ fn decodeSessionForListing(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw
     defer scanner.deinit();
     if (try scanner.next() != .object_begin) return error.InvalidTransactionSessionRecord;
     var object: std.json.ObjectMap = .empty;
+    var has_current_kind = false;
     while (true) {
         const key = switch (try scanner.nextAlloc(scratch, .alloc_if_needed)) {
             .object_end => break,
@@ -7573,9 +7715,22 @@ fn decodeSessionForListing(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw
             .allocated_string => |key| key,
             else => return error.InvalidTransactionSessionRecord,
         };
+        if (std.mem.eql(u8, key, "graph_receipt") or
+            std.mem.eql(u8, key, "s1") or
+            std.mem.eql(u8, key, "c1")) has_current_kind = true;
         const entry = try object.getOrPut(scratch, key);
         if (entry.found_existing) return error.InvalidTransactionSessionRecord;
-        if (std.mem.eql(u8, key, "savepoints")) {
+        if (std.mem.eql(u8, key, "listing_v1")) {
+            const value = try std.json.innerParse(std.json.Value, scratch, &scanner, .{
+                .allocate = .alloc_if_needed,
+                .max_value_len = raw.len,
+            });
+            summary.* = try std.json.parseFromValue(SessionListingSummary, alloc, value, .{ .allocate = .alloc_always });
+            entry.value_ptr.* = .null;
+        } else if (summary.* != null and std.mem.eql(u8, key, "staged")) {
+            try scanner.skipValue();
+            entry.value_ptr.* = .null;
+        } else if (std.mem.eql(u8, key, "savepoints")) {
             if (try scanner.next() != .array_begin) return error.InvalidTransactionSessionRecord;
             while (try scanner.peekNextTokenType() == .object_begin) {
                 try scanner.skipValue();
@@ -7583,6 +7738,13 @@ fn decodeSessionForListing(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw
             }
             if (try scanner.next() != .array_end) return error.InvalidTransactionSessionRecord;
             entry.value_ptr.* = .{ .array = std.json.Array.init(scratch) };
+        } else if ((has_current_kind and std.mem.eql(u8, key, "execution_plan")) or
+            std.mem.eql(u8, key, "lake_cuts") or std.mem.eql(u8, key, "setting_active") or
+            std.mem.eql(u8, key, "setting_committed"))
+        {
+            try scanner.skipValue();
+            entry.value_ptr.* = .null;
+            _ = object.orderedRemove(key);
         } else {
             entry.value_ptr.* = try std.json.innerParse(std.json.Value, scratch, &scanner, .{
                 .allocate = .alloc_if_needed,

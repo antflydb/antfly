@@ -5663,6 +5663,12 @@ pub const ApiHttpServer = struct {
         self.retryPendingTransactionRecovery(32) catch |err| {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
         };
+        if (self.txn_sessions.durable) |store| {
+            const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+            @import("sql_connections.zig").reconcileExpired(store, &self.txn_sessions, self.alloc, now_ms) catch |err| {
+                std.log.warn("expired SQL connection cleanup deferred err={s}", .{@errorName(err)});
+            };
+        }
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
     }

@@ -625,6 +625,7 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
     var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
     var registry = transactions.SessionRegistry.initWithLeaseTtl(&store, transactions.SessionLeaseStore.initFromDurable(&store), 60 * std.time.ns_per_s);
     registry.durable_scope = .cluster_shared;
+    registry.max_sessions = 1;
     defer registry.deinit(alloc);
 
     for ([_]bool{ false, true }, [_]u8{ 'a', 'b' }) |request_persisted, digit| {
@@ -652,10 +653,9 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
         try std.testing.expectEqual(transactions.SessionDisposition.aborted, disposition.disposition);
         try std.testing.expectEqual(@as(u64, 0), disposition.lease_expires_at);
         try std.testing.expect((try registry.getStatusForPrincipal(alloc, txn_id, "bob")) == null);
-        var receipt = (try store.load(txn_id)).?;
-        defer receipt.deinit(alloc);
-        try std.testing.expect(receipt.terminal_abort and receipt.staged == null and receipt.execution_plan == null);
+        try std.testing.expect((try store.load(txn_id)) == null);
     }
+    try std.testing.expectEqual(@as(usize, 2), try registry.cleanupExpired(alloc, std.math.maxInt(u64)));
 }
 
 test "HTTP connection reconciles a durable aborted coordinator decision" {

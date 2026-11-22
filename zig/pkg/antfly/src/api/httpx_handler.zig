@@ -6717,6 +6717,7 @@ pub const AntflyApiHandler = struct {
         diagnostic_message_buffer: [256]u8 = undefined,
         compile_diagnostic_valid: bool = false,
         execution_entered: bool = false,
+        reports_existing_commit: bool = false,
         is_write: bool = false,
         preparation: *RequestAdmission.Lease,
         prepared_mode: SQLPreparedMode = .statement,
@@ -6849,6 +6850,7 @@ pub const AntflyApiHandler = struct {
                     if (connection.state == .uncertain) {
                         if (self.prepared_mode != .statement or self.parameters.len != 0 or
                             !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlConnectionBusy;
+                        self.reports_existing_commit = true;
                         self.adapter.outcome_transaction_id = self.connection_session_hex;
                         return error.SqlTransactionOutcomeUnknown;
                     }
@@ -7360,7 +7362,7 @@ pub const AntflyApiHandler = struct {
         completion.unknown = false;
         if (job.failure) |err| {
             const diagnostic = sql_execution.diagnostic(err);
-            if (std.mem.eql(u8, diagnostic.code, "40003")) completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
+            if (!job.reports_existing_commit and std.mem.eql(u8, diagnostic.code, "40003")) completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
             if (std.mem.eql(u8, diagnostic.code, "53300")) try ctx.setHeader("Retry-After", "1");
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
