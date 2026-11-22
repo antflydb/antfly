@@ -965,6 +965,7 @@ pub const Runner = struct {
         source: *media.source.Source,
         observed: ?struct { builder: *media.webm_audio.DirectoryBuilder, memory: *media.admission.TrackedAllocator } = null,
         warm: ?*@import("media_index_cache.zig").Cache.Entry = null,
+        flight: ?@import("media_speaker_flights.zig").Registry.Lease = null,
         track: ?@import("media_chunking_audio_source.zig").Track = null,
         frames: @import("media_chunking_audio.zig").FrameCheckpointSession = .{},
     };
@@ -1009,9 +1010,11 @@ pub const Runner = struct {
             owner.warm = null;
             break :warm Track.fromCachedAudio(self.allocator, owner.source, self.control, self.request.index_cache.?, entry);
         } else if (owner.observed) |observed|
-            Track.initObservedWebm(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission, observed.builder, observed.memory.live)
+            Track.initObservedWebm(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission, observed.builder, observed.memory.live, owner.flight != null)
         else
             Track.initCached(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission);
+        if (owner.flight) |lease| lease.deinit();
+        owner.flight = null;
         if (owner.observed) |observed| {
             observed.builder.deinit();
             owner.observed = null;
@@ -1033,6 +1036,7 @@ pub const Runner = struct {
         self.audio_provider = null;
         if (owner.track) |*track| track.deinit();
         if (owner.warm) |entry| self.request.index_cache.?.release(entry);
+        if (owner.flight) |lease| lease.deinit();
     }
 
     fn isWebmPrefix(bytes: []const u8) bool {
@@ -1124,6 +1128,17 @@ pub const Runner = struct {
         if (webm and source.storage == .range and self.pageNeedsAudio()) {
             const audio_key = Cache.audioKey(source, count, self.request.max_working_bytes);
             audio_owner.warm = if (audio_key) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
+            if (audio_owner.warm == null and self.request.index_cache_admission != null) if (audio_key) |key| if (self.request.index_cache) |cache| {
+                audio_owner.flight = cache.acquireBuild(key, self.control) catch |err| switch (err) {
+                    error.ResourceTemporarilyUnavailable => null,
+                    else => return err,
+                };
+                audio_owner.warm = cache.get(key);
+                if (audio_owner.warm != null) {
+                    if (audio_owner.flight) |lease| lease.deinit();
+                    audio_owner.flight = null;
+                }
+            };
             if (audio_owner.warm == null) {
                 var memory = media.admission.TrackedAllocator{ .backing = self.allocator, .reservation = try self.pool.acquire(.{}), .limit = self.request.max_working_bytes };
                 defer memory.reservation.deinit();
@@ -1189,7 +1204,8 @@ pub const Runner = struct {
         build.* = null;
         const reclaimer = reader.input.reclaimer;
         reader.input.reclaimer = null;
-        self.pool.setReclaimer(reclaimer);
+        const reclaimable = if (self.video_audio) |owner| if (owner.observed) |observed| observed.memory.live else 0 else 0;
+        self.pool.setReclaimer(if (reclaimer) |callback| .{ .callback = callback, .bytes = reclaimable } else null);
         defer self.pool.setReclaimer(null);
         try self.webmWindowsSnapshot(reader, &snapshot);
     }
@@ -3943,7 +3959,7 @@ test "model aware media video admission can reclaim optional audio geometry" {
     var builder = media.webm_audio.DirectoryBuilder{ .allocator = memory.allocator(), .limits = .{} };
     defer builder.deinit();
     try builder.packets.ensureTotalCapacityPrecise(builder.allocator, 2);
-    pool.setReclaimer(.{ .context = &builder, .release = Runner.reclaimVideoAudio });
+    pool.setReclaimer(.{ .callback = .{ .context = &builder, .release = Runner.reclaimVideoAudio }, .bytes = memory.live });
     defer pool.setReclaimer(null);
     var video_window = try pool.acquire(.{ .host_bytes = 1 });
     defer video_window.deinit();

@@ -174,10 +174,18 @@ pub const Cache = struct {
         return result;
     }
     pub fn audioKey(source: *const media.source.Source, max_packets: usize, max_bytes_: usize) ?[32]u8 {
-        const base = key(source, false, max_packets, max_bytes_) orelse return null;
+        const binding = switch (source.storage) {
+            .range => |range| range.immutable_binding orelse return null,
+            .borrowed => return null,
+        };
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("media-audio-seek-v1");
-        hash.update(&base);
+        hash.update("media-audio-seek-v2");
+        hash.update(&binding);
+        for ([_]u64{ source.length(), max_packets, max_bytes_ }) |n| {
+            var raw: [8]u8 = undefined;
+            std.mem.writeInt(u64, &raw, n, .little);
+            hash.update(&raw);
+        }
         var result: [32]u8 = undefined;
         hash.final(&result);
         return result;
@@ -749,4 +757,18 @@ test "model aware media speaker cache owns immutable progress and cannot regress
     cache.release(complete);
     try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
     try std.testing.expectEqual(@as(usize, 0), fixture.controller.snapshot().hostTotalBytes());
+}
+
+test "model aware media pinned audio keys ignore request-local identity aliases" {
+    var marker: u8 = 0;
+    const Provider = struct {
+        fn read(_: *anyopaque, _: u64, _: []u8, _: media.source.Control) !usize {
+            return error.UnexpectedRead;
+        }
+    };
+    var source = media.source.Source{ .allocator = std.testing.allocator, .identity = "resource", .storage = .{ .range = .{ .context = &marker, .read_at = Provider.read, .length = 100, .immutable_binding = @splat(1) } } };
+    const key = Cache.audioKey(&source, 10, 100).?;
+    source.identity = "video chunk fingerprint";
+    try std.testing.expectEqual(key, Cache.audioKey(&source, 10, 100).?);
+    try std.testing.expect(!std.mem.eql(u8, &key, &Cache.audioKey(&source, 11, 100).?));
 }

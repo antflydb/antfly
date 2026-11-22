@@ -1095,7 +1095,7 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
     defer unavailable.deinit();
     const Track = @import("media_chunking_audio_source.zig").Track;
     // Use an uncached key with the same source while every flight is busy.
-    try std.testing.expectError(error.AudioTooLarge, Track.initObservedWebm(a, &source, .{}, 64 * 1024, 1023, &cache, admission, &unavailable, 0));
+    try std.testing.expectError(error.AudioTooLarge, Track.initObservedWebm(a, &source, .{}, 64 * 1024, 1023, &cache, admission, &unavailable, 0, false));
     const reads = source.reads;
     var warm = try @import("media_chunking_audio_source.zig").Track.initCached(a, &source, .{}, 64 * 1024, 1024, &cache, admission);
     defer warm.deinit();

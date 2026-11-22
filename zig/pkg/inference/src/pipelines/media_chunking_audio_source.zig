@@ -218,14 +218,14 @@ pub const Track = struct {
         return .{ .allocator = a, .control = control, .cache = cache, .cached = entry, .seek_reader = .{ .index = &entry.data.audio, .source = source, .control = control } };
     }
 
-    pub fn initObservedWebm(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, max_bytes: usize, max_packets: usize, cache: ?*@import("media_index_cache.zig").Cache, admission: ?@import("media_index_cache.zig").Cache.Admission, builder: *media.webm_audio.DirectoryBuilder, directory_bytes: usize) !Track {
+    pub fn initObservedWebm(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, max_bytes: usize, max_packets: usize, cache: ?*@import("media_index_cache.zig").Cache, admission: ?@import("media_index_cache.zig").Cache.Admission, builder: *media.webm_audio.DirectoryBuilder, directory_bytes: usize, flight_held: bool) !Track {
         var self = Track{ .allocator = a, .cache = cache, .control = control };
         errdefer self.deinit();
         try control.check();
         const identity = @import("media_index_cache.zig").Cache.audioKey(source, max_packets, max_bytes);
         if (self.bindCached(source, null, identity)) return self;
         const directory = try builder.borrowDirectory();
-        const flight = if (admission != null) if (identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null else null;
+        const flight = if (!flight_held and admission != null) if (identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null else null;
         defer if (flight) |lease| lease.deinit();
         if (flight != null and self.bindCached(source, null, identity)) return self;
         const check = control.imageWorkControl();

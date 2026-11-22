@@ -21,6 +21,8 @@ const admission = @import("admission.zig");
 pub const Control = struct {
     context: ?*const anyopaque = null,
     check_fn: ?*const fn (?*const anyopaque) anyerror!void = null,
+    /// A range callback can report the valid prefix when it returns an error.
+    failed_prefix: ?*usize = null,
     pub fn check(self: Control) !void {
         if (self.check_fn) |callback| try callback(self.context);
     }
@@ -178,8 +180,9 @@ pub const Source = struct {
         if (!self.supportsPreferredSparseRead()) return self.readSparseControlled(offset, required, control);
         const limits = self.remaining();
         const size: usize = if (limits.max_reads <= 1) required else @intCast(@max(required, @min(preferred, self.length() - offset, limits.max_read_bytes, limits.max_retained_bytes, limits.max_total_bytes)));
-        return self.readSpanWithControl(offset, required, size, control, null, .sparse) catch |err| {
-            if (size == required or (err != error.ResourceLimitExceeded and err != error.OutOfMemory)) return err;
+        var started_io = false;
+        return self.readSpanWithControl(offset, required, size, control, null, .sparse, &started_io) catch |err| {
+            if (started_io or size == required or (err != error.ResourceLimitExceeded and err != error.OutOfMemory)) return err;
             return self.readSparseControlled(offset, required, control);
         };
     }
@@ -187,9 +190,9 @@ pub const Source = struct {
     const ReadMode = enum { normal, sparse, isolated };
 
     fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, mode: ReadMode) !Lease {
-        return self.readSpanWithControl(offset, size, size, caller, reclaimer, mode);
+        return self.readSpanWithControl(offset, size, size, caller, reclaimer, mode, null);
     }
-    fn readSpanWithControl(self: *Source, offset: u64, minimum: usize, size: usize, caller: Control, explicit_reclaimer: ?admission.Reclaimer, mode: ReadMode) !Lease {
+    fn readSpanWithControl(self: *Source, offset: u64, minimum: usize, size: usize, caller: Control, explicit_reclaimer: ?admission.Reclaimer, mode: ReadMode, started_io: ?*bool) !Lease {
         const reclaimer = explicit_reclaimer orelse self.reclaimer;
         const owner = self.physical orelse self;
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -258,11 +261,18 @@ pub const Source = struct {
             try control.check();
             if (first_call_used) try self.chargeCall(owner);
             first_call_used = true;
+            if (started_io) |started| started.* = true;
+            var failed_prefix: usize = 0;
+            var range_control = control;
+            range_control.failed_prefix = &failed_prefix;
             const read_result = if (mode == .sparse and range.sparse_read_preferring != null and target > minimum)
-                range.sparse_read_preferring.?(range.context, offset + done, owned[done..target], minimum - done, control)
+                range.sparse_read_preferring.?(range.context, offset + done, owned[done..target], minimum - done, range_control)
             else
-                read_at(range.context, offset + done, owned[done..target], control);
+                read_at(range.context, offset + done, owned[done..target], range_control);
             const n = read_result catch |err| {
+                if (failed_prefix > target - done) return error.InvalidSourceRead;
+                done += failed_prefix;
+                if (failed_prefix != 0) return err;
                 if (err != error.RemoteReadBudgetExceeded or target == minimum) return err;
                 target = minimum;
                 continue;

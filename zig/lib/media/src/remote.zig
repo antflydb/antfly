@@ -190,6 +190,9 @@ pub const ReadAhead = struct {
         const cached = self.copyCached(offset, out);
         if (cached == out.len) return cached;
         const suffix = out[cached..];
+        errdefer if (control.failed_prefix) |prefix| {
+            prefix.* += cached;
+        };
         return cached + try self.readRequired(offset + cached, suffix, self.max_request_bytes orelse suffix.len, control);
     }
 
@@ -197,12 +200,20 @@ pub const ReadAhead = struct {
         if (self.reads >= self.max_reads) return error.RemoteRequestBudgetExceeded;
         self.reads += 1;
         self.charged_bytes += out.len;
+        var child_prefix: usize = 0;
+        var upstream_control = control;
+        upstream_control.failed_prefix = &child_prefix;
         const result = if (minimum < out.len and self.upstream.sparse_read_preferring != null)
-            self.upstream.sparse_read_preferring.?(self.upstream.context, offset, out, minimum, control)
+            self.upstream.sparse_read_preferring.?(self.upstream.context, offset, out, minimum, upstream_control)
         else
-            self.upstream.read_at(self.upstream.context, offset, out, control);
+            self.upstream.read_at(self.upstream.context, offset, out, upstream_control);
         const n = result catch |err| {
-            if (err == error.RemoteReadBudgetExceeded) self.charged_bytes -= out.len;
+            if (child_prefix > out.len) return error.InvalidSourceRead;
+            if (child_prefix != 0) {
+                self.transferred_bytes += child_prefix;
+                if (control.failed_prefix) |prefix| prefix.* += child_prefix;
+            }
+            if (err == error.RemoteReadBudgetExceeded) self.charged_bytes -= out.len - child_prefix;
             return err;
         };
         if (n == 0 or n > out.len) return error.InvalidSourceRead;
@@ -224,6 +235,9 @@ pub const ReadAhead = struct {
         const cached = self.copyCached(offset, out);
         if (cached >= minimum) return cached;
         const suffix = out[cached..];
+        errdefer if (control.failed_prefix) |prefix| {
+            prefix.* += cached;
+        };
         const required = minimum - cached;
         const limit = self.max_request_bytes orelse if (self.upstream.accepts_full_read_size) required else self.window_bytes;
         if (required > @min(self.window_bytes, limit)) return cached + try self.readRequired(offset + cached, suffix[0..required], limit, control);
@@ -237,6 +251,9 @@ pub const ReadAhead = struct {
         if (limit == 0) return error.RemoteReadBudgetExceeded;
         if (1 + (out.len - 1) / limit > self.max_reads -| self.reads) return error.RemoteRequestBudgetExceeded;
         var done: usize = 0;
+        errdefer if (control.failed_prefix) |prefix| {
+            prefix.* += done;
+        };
         while (done < out.len) {
             try control.check();
             const size = @min(out.len - done, limit);
@@ -273,7 +290,16 @@ pub const ReadAhead = struct {
         if (fetch == 0) return error.RemoteReadBudgetExceeded;
         self.valid = retained;
         if (!append) self.start = offset;
-        errdefer self.valid = retained;
+        var child_prefix: usize = 0;
+        var fetch_control = control;
+        fetch_control.failed_prefix = &child_prefix;
+        errdefer {
+            const complete = self.valid - retained;
+            const prefix = @min(out.len, complete + child_prefix);
+            @memcpy(out[0..prefix], self.buffer.?[retained..][0..prefix]);
+            if (control.failed_prefix) |reported| reported.* += prefix;
+            self.valid = retained;
+        }
         var wanted = retained + fetch;
         const required = retained + @min(minimum, fetch);
         while (self.valid < wanted) {
@@ -288,7 +314,9 @@ pub const ReadAhead = struct {
                 if (self.valid >= required) break;
                 wanted = required;
             }
-            const n = self.fetchAt(self.start + self.valid, self.buffer.?[self.valid..wanted], required -| self.valid, control) catch |err| {
+            child_prefix = 0;
+            const n = self.fetchAt(self.start + self.valid, self.buffer.?[self.valid..wanted], required -| self.valid, fetch_control) catch |err| {
+                if (child_prefix != 0) return err;
                 if (err == error.RemoteReadBudgetExceeded) {
                     self.prefetch_limited = true;
                     if (self.valid >= required) break;
@@ -787,4 +815,29 @@ test "cold and isolated reads honor the provider cap independently of cache capa
     defer reused.deinit();
     try std.testing.expectEqualSlices(u8, "klmn", reused.bytes);
     try std.testing.expectEqual(@as(usize, 4), cache.reads);
+}
+
+test "a later required fetch failure preserves the completed prefix in source accounting" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            if (offset != 0) return error.Cancelled;
+            @memset(out, 1);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var cache = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 8, .accepts_full_read_size = true },
+        .max_request_bytes = 4,
+    };
+    defer cache.deinit();
+    var root = source.Source{ .allocator = std.testing.allocator, .identity = "partial", .storage = .{ .range = cache.range() } };
+    var child = root.view(std.testing.allocator, null, .{});
+    try std.testing.expectError(error.Cancelled, child.readSparsePreferring(0, 7, 8, .{}));
+    try std.testing.expectEqual(@as(u64, 4), cache.transferred_bytes);
+    try std.testing.expectEqual(@as(u64, 4), child.total_bytes);
+    try std.testing.expectEqual(@as(u64, 4), root.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), root.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), root.reads);
 }
