@@ -163,7 +163,7 @@ pub const Owner = struct {
     }
     pub fn poll(self: *Owner, svc: anytype, registry: anytype, policy: anytype, a: A, after: u64, maximum: u32, request: anytype) !Page {
         var phase: enum { metadata, authorize, artifact_store, manifest, message, recheck_metadata, reauthorize } = .metadata;
-        errdefer if (zig017_return_error) |err| std.log.debug("retained replication poll failed phase={s} err={s}", .{ @tagName(phase), @errorName(err) });
+        errdefer std.log.debug("retained replication poll failed phase={s}", .{@tagName(phase)});
         const retained_span = span: {
             var before = try load(svc, a, self.id, request);
             defer before.deinit();
