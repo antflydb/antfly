@@ -42,14 +42,11 @@ pub fn shape(group: grouped.Group) !?micro.Shape {
     if (group.title != null or group.content.len != 1) return null;
     const part = group.content[0];
     if (part == .audio) return .{ .bytes = part.audio.bytes.len, .tokens = 1024 };
-    const dimensions = switch (part) {
-        .image => |bytes| try @import("image.zig").inspectEncodedForInference(bytes, null),
-        .raster => |raster| blk: {
-            try raster.validate();
-            break :blk @import("image.zig").EncodedImageInfo{ .width = raster.width, .height = raster.height };
-        },
-        else => return null,
-    };
+    if (part != .image and part != .raster) return null;
+    return try imageShape(part, try group.imageInfo(0));
+}
+
+fn imageShape(part: grouped.Part, dimensions: @import("image.zig").EncodedImageInfo) !micro.Shape {
     const geometry = try projector.embeddingGemma2ImageGeometry(dimensions.width, dimensions.height);
     return .{
         .geometry_key = projector.embeddingGemma2GeometryKey(geometry),
@@ -67,14 +64,17 @@ pub fn shape(group: grouped.Group) !?micro.Shape {
 /// executor; callers already validated source policies and decoded-pixel limits.
 pub fn groupShape(group: grouped.Group) !micro.Shape {
     var result = micro.Shape{ .tokens = 128 };
-    if (group.title) |title| result.bytes = title.len;
-    for (group.content) |part| switch (part) {
+    if (group.title) |title| {
+        result.bytes = title.len;
+        result.tokens = @min(8192, result.tokens +| title.len);
+    }
+    for (group.content, 0..) |part, index| switch (part) {
         .text => |text| {
             result.bytes = try std.math.add(usize, result.bytes, text.len);
             result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, text.len));
         },
         .image, .raster => {
-            const item = (try shape(.{ .content = &.{part} })).?;
+            const item = try imageShape(part, try group.imageInfo(index));
             result.bytes = try std.math.add(usize, result.bytes, item.bytes);
             result.pixels = try std.math.add(u64, result.pixels, item.pixels);
             result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, item.tokens));
@@ -87,13 +87,14 @@ pub fn groupShape(group: grouped.Group) !micro.Shape {
             result.bytes = try std.math.add(usize, result.bytes, try std.math.mul(usize, pcm.samples.len, @sizeOf(f32)));
             result.tokens = @min(@as(usize, 8192), result.tokens + try projector.embeddingGemma2PcmSequenceLength(pcm.samples.len, pcm.sample_rate));
         },
-        .video => |bytes| {
-            result.bytes = try std.math.add(usize, result.bytes, bytes.len);
-            result.tokens = 8192;
-        },
-        .sampled_video => |movie| {
-            result.bytes = try std.math.add(usize, result.bytes, if (movie.reader != null) 0 else movie.bytes.len);
-            result.tokens = 8192;
+        .video, .sampled_video => {
+            // Reader-backed windows without an admitted public request shape
+            // run in their owning executor. Never queue unmeasured pixels.
+            const movie = grouped.Group.encodedVideo(part) orelse return error.InvalidVideoReaderSelection;
+            const item = group.inspection(movie) orelse return error.InvalidVideoReaderSelection;
+            result.bytes = try std.math.add(usize, result.bytes, movie.bytes.len);
+            result.pixels = try std.math.add(u64, result.pixels, item.pixels);
+            result.tokens = if (item.portable) |entry| @min(8192, result.tokens + entry.plan.sequence_tokens) else 8192;
         },
     };
     return result;
@@ -108,17 +109,24 @@ const Ticket = struct {
     group: ?grouped.Group = null,
     control: Control,
     input_tokens: usize,
+    geometry_key: u64,
 };
 
 /// Options/timing compatibility and generation identity are part of admission.
 /// A 200-us server default is bounded further by the broker's earliest deadline.
 pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, model: []const u8, generation: usize, session: Session, tokenizer: Tokenizer, gate: ?*std.atomic.Mutex, control: Control, groups: []const grouped.Group, options: grouped.Options, max_wait_us: u64, max_bytes: usize, max_pixels: u64, max_batch: usize) !?Result {
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return null;
-    if (options.timings != null or groups.len == 0 or !options.prepare_ahead or options.video_ahead != null or options.video_prepared != null or options.video_decoder.telemetry != null or (session.backend() != .native and session.backend() != .metal and session.backend() != .cuda)) return null;
+    if (groups.len == 0 or !options.prepare_ahead or (session.backend() != .native and session.backend() != .metal and session.backend() != .cuda)) return null;
+    // Per-request hooks, borrowed state and result storage cannot be forwarded
+    // as shared options to an execution spanning multiple callers.
+    if (options.execution_lane != null or options.timings != null or options.video_decoder.telemetry != null or
+        options.video_ahead != null or options.video_prepared != null or options.video_prepared_frames != null or
+        options.video_observer != null or options.video_coefficients != null or options.video_inspection_scope != null or
+        options.video_cache_pins != null or options.video_encoded != null or options.video_composition != null) return null;
     var general = false;
     for (groups) |group| {
         grouped.validateGroup(group, options) catch return null;
-        if ((shape(group) catch return null) == null) general = true;
+        if (group.title != null or (group.content[0] != .image and group.content[0] != .raster and group.content[0] != .audio)) general = true;
         if (group.content.len != 1 or (groups[0].content.len == 1 and @backingInt(std.meta.activeTag(group.content[0])) != @backingInt(std.meta.activeTag(groups[0].content[0])))) general = true;
     }
     if (session.backend() == .cuda) {
@@ -153,8 +161,11 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     var largest_sequence: usize = 0;
     var largest_decoded: usize = 0;
     for (groups, 0..) |group, index| {
-        grouped.validateGroup(group, options) catch return null;
-        shapes[index] = if (general) (groupShape(group) catch return null) else (shape(group) catch return null) orelse return null;
+        const dimensions = if (!general and !audio_mode) group.imageInfo(0) catch return null else null;
+        shapes[index] = if (general) (groupShape(group) catch return null) else if (dimensions) |info| imageShape(group.content[0], info) catch return null else (try shape(group)).?;
+        // General queue bytes include captions and raw buffers. A valid item
+        // may fit the executor's encoded-media cap but exceed this queue cap.
+        if (general and shapes[index].bytes > max_bytes) return null;
         if (!general and (group.content[0] == .audio) != audio_mode) return null;
         const raw = group.content[0] == .raster;
         if (raster_mode) |mode| {
@@ -162,8 +173,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
         } else raster_mode = raw;
         const part = group.content[0];
         largest_input = @max(largest_input, shapes[index].bytes);
-        if (!general and !audio_mode) {
-            const info = if (raw) @import("image.zig").EncodedImageInfo{ .width = part.raster.width, .height = part.raster.height } else try @import("image.zig").inspectEncodedForInference(part.image, null);
+        if (dimensions) |info| {
             if (grouped.boundedVision(session.backend())) {
                 const geometry = try projector.embeddingGemma2ImageGeometry(info.width, info.height);
                 largest_patches = @max(largest_patches, geometry.grid_x * geometry.grid_y);
@@ -171,7 +181,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
                 if (!raw) largest_decoded = @max(largest_decoded, try std.math.mul(usize, try std.math.mul(usize, info.width, info.height), 3));
             } else largest_scratch = @max(largest_scratch, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
         }
-        payloads[index] = .{ .session = session, .tokenizer = tokenizer, .gate = gate, .options = effective_options, .part = part, .group = if (general) group else null, .control = control, .input_tokens = shapes[index].tokens };
+        payloads[index] = .{ .session = session, .tokenizer = tokenizer, .gate = gate, .options = effective_options, .part = part, .group = if (general) group else null, .control = control, .input_tokens = shapes[index].tokens, .geometry_key = shapes[index].geometry_key };
         identities[index] = if (raw) .{ .item_id = part.raster.item_id, .source_fingerprint = part.raster.source_fingerprint, .page_number = part.raster.page_number } else .{};
     }
     // Plan against immutable policy limits without reserving GPU scratch.
@@ -246,12 +256,19 @@ fn execute(_: *anyopaque, items: []const micro.ExecuteItem) void {
     };
 }
 
+fn embedSingleton(a: std.mem.Allocator, items: *const [1]micro.ExecuteItem, group: grouped.Group) !grouped.Result {
+    var execution = micro.ExecutionControl{ .items = items };
+    const ticket = items[0].payloadAs(Ticket);
+    const control = ticket.control.withCheckpoint(&execution, micro.ExecutionControl.check);
+    try control.check();
+    return grouped.embed(a, ticket.session, ticket.tokenizer, group, ticket.options, ticket.gate, control);
+}
+
 fn executeChecked(items: []const micro.ExecuteItem) !void {
     if (items.len == 0 or items.len > 4) return error.InvalidImageBatch;
     const first = items[0].payloadAs(Ticket);
     if (first.group == null and first.part != .audio and @import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_IMAGE_BROKER_TRACE")) {
-        const geometry = (try shape(.{ .content = &.{first.part} })).?.geometry_key;
-        std.debug.print("gemma4-image-cohort items={d} geometry={d}\n", .{ items.len, geometry });
+        std.debug.print("gemma4-image-cohort items={d} geometry={d}\n", .{ items.len, first.geometry_key });
     }
     var cohort = micro.ExecutionControl{ .items = items };
     var control = first.control;
@@ -280,12 +297,8 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
                 shared.free(vectors);
             }
             @memset(errors[0..items.len], null);
-            for (items, groups[0..items.len], 0..) |item, group, index| {
-                item.control.check() catch |failure| {
-                    errors[index] = failure;
-                    continue;
-                };
-                const singleton = grouped.embed(shared, first.session, first.tokenizer, group, first.options, first.gate, control) catch |failure| {
+            for (groups[0..items.len], 0..) |group, index| {
+                const singleton = embedSingleton(shared, items[index..][0..1], group) catch |failure| {
                     errors[index] = failure;
                     continue;
                 };
@@ -299,14 +312,10 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
         // The scheduler preserves finished peers and shrinks prepared encoder
         // cohorts before returning pressure errors. Once its prepared owners
         // drain, retry only the failed items; completed towers never replay.
-        for (items, groups[0..items.len], 0..) |item, group, index| {
+        for (groups[0..items.len], 0..) |group, index| {
             const failure = errors[index] orelse continue;
             if (failure != error.MemoryBudgetExceeded and failure != error.ResourceLimitExceeded and failure != error.ResourceTemporarilyUnavailable) continue;
-            item.control.check() catch |err| {
-                errors[index] = err;
-                continue;
-            };
-            const singleton = grouped.embed(shared, first.session, first.tokenizer, group, first.options, first.gate, control) catch |err| {
+            const singleton = embedSingleton(shared, items[index..][0..1], group) catch |err| {
                 errors[index] = err;
                 continue;
             };
@@ -356,6 +365,17 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
             .fallback => .fallback,
         });
     }
+}
+
+test "embeddinggemma2 image broker stops singleton fallback with a live peer" {
+    var ticket: Ticket = undefined;
+    ticket.control = .{};
+    var stopped = std.atomic.Value(bool).init(true);
+    var items: [2]micro.ExecuteItem = @splat(.{ .allocator = std.testing.allocator, .identity = .{}, .payload = &ticket, .slot = undefined });
+    items[0].control.cancel_requested = &stopped;
+    var cohort = micro.ExecutionControl{ .items = &items };
+    try micro.ExecutionControl.check(&cohort);
+    try std.testing.expectError(error.Canceled, embedSingleton(std.testing.allocator, items[0..1], .{ .content = &.{} }));
 }
 
 test "gemma4 image broker rejects mixed prompts and distinguishes rotated grids" {
@@ -445,7 +465,26 @@ test "embeddinggemma2 prepared broker accounts mixed and video groups before dec
     try std.testing.expectEqual(@as(u64, 4), header.pixels);
     try std.testing.expect(header.tokens <= 8192);
     // Invalid coded payloads have not entered decode or acquired device scratch.
-    const video = try groupShape(.{ .content = &.{ .{ .video = "coded bytes" }, .{ .text = "caption" } } });
+    const parts = [_]grouped.Part{ .{ .video = "coded bytes" }, .{ .text = "caption" } };
+    try std.testing.expectError(error.InvalidVideoReaderSelection, groupShape(.{ .content = &parts }));
+    const inspection = @import("embedding_gemma2_video.zig").PixelInspection{ .bytes = parts[0].video, .pixels = 320 * 240 };
+    const metadata = grouped.GroupMedia{ .videos = .{ .items = &.{&inspection} } };
+    const video = try groupShape(.{ .content = &parts, .media = &metadata });
+    try std.testing.expectEqual(@as(u64, 320 * 240), video.pixels);
     try std.testing.expectEqual(@as(usize, 8192), video.tokens);
     try std.testing.expectEqual(@as(usize, 18), video.bytes);
+
+    const Width = struct {
+        fn record(_: *anyopaque, batch: []const micro.ExecuteItem) void {
+            for (batch) |item| item.slot.setValue(usize, batch.len, .serial);
+        }
+    };
+    const a = std.testing.allocator;
+    var broker = micro.Broker.init(a);
+    defer broker.deinit();
+    for ([_]u64{ 2 * video.pixels - 1, 2 * video.pixels }, [_]usize{ 1, 2 }) |limit, expected_width| {
+        const results = try broker.submitBatchControlled(usize, usize, std.testing.io, a, .{ .model = "video", .task = .embed, .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_pixels = limit }, &.{ video, video }, &.{ .{}, .{} }, null, .{}, &.{ 0, 1 }, &broker, Width.record);
+        defer a.free(results);
+        for (results) |row| try std.testing.expectEqual(expected_width, row.result.value);
+    }
 }

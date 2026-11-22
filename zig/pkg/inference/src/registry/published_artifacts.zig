@@ -16,6 +16,7 @@
 //! Filesystem authority for managed model construction and readers. A receipt
 //! authenticates its listed files, never arbitrary siblings in the directory.
 const std = @import("std");
+const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const managed = @import("managed_receipt.zig");
 pub const Expected = struct { publication: ?[32]u8 };
 /// Process-owned successful checksum proofs. Keys own no pathname memory;
@@ -68,18 +69,25 @@ pub const VerificationCache = struct {
         }
         try self.entries.put(self.owner_allocator orelse a, key, .{ .stamp = stamp, .used = self.clock });
     }
-    fn verify(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, initial: managed.ArtifactStamp) !managed.ArtifactStamp {
+    fn verify(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, initial: managed.ArtifactStamp, control: ExecutionControl) !managed.ArtifactStamp {
+        try control.check();
         const key = keyFor(publication, artifact);
         if (self.hit(key, initial)) return initial;
         const builder = &self.builders[key[0] % self.builders.len];
-        try builder.lock(io);
+        if (control.deadline_ns != null or control.cancellation != null or control.check_fn != null) {
+            while (!builder.tryLock()) {
+                try control.check();
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        } else try builder.lock(io);
         defer builder.unlock(io);
+        try control.check();
         // Another acquisition may have verified or replaced the file while
         // this request waited. Never reuse the pre-wait filesystem stamp.
         const stamp = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(io, artifact.canonical_path, .{ .follow_symlinks = false }));
         if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
         if (self.hit(key, stamp)) return stamp;
-        const verified = try managed.verifyValidatedArtifactSha256AndStamp(io, artifact, artifact.sha256.?);
+        const verified = try managed.verifyValidatedArtifactSha256AndStampWithControl(io, artifact, artifact.sha256.?, control);
         self.remember(a, key, verified) catch {}; // Cache pressure cannot deny a valid construction.
         return verified;
     }
@@ -324,24 +332,29 @@ pub const PublishedArtifacts = struct {
     /// Verification belongs to one reader acquisition, not path resolution.
     /// Reuse it across graph collection, backend retries and shared external
     /// tensors only while the opened file's complete identity is unchanged.
-    fn verifyIndex(self: *PublishedArtifacts, index: usize) !void {
+    fn verifyIndex(self: *PublishedArtifacts, index: usize, control: ExecutionControl) !void {
+        try control.check();
         const artifact = &self.receipt.?.artifacts[index];
         const stamp = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(self.io, artifact.canonical_path, .{ .follow_symlinks = false }));
         if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
         if (self.verified_stamps[index]) |prior| if (std.meta.eql(prior, stamp)) return;
         self.verified_stamps[index] = if (artifact.sha256) |expected|
             if (self.verification_cache) |cache|
-                try cache.verify(self.allocator, self.io, self.publication.?, artifact, stamp)
+                try cache.verify(self.allocator, self.io, self.publication.?, artifact, stamp, control)
             else
-                try managed.verifyValidatedArtifactSha256AndStamp(self.io, artifact, expected)
+                try managed.verifyValidatedArtifactSha256AndStampWithControl(self.io, artifact, expected, control)
         else
             stamp;
     }
     pub fn verifyFile(self: *PublishedArtifacts, relative: []const u8) !void {
+        return self.verifyFileWithControl(relative, .{});
+    }
+
+    pub fn verifyFileWithControl(self: *PublishedArtifacts, relative: []const u8, control: ExecutionControl) !void {
         if (self.receipt) |*receipt| {
             const index = receipt.path_index.get(relative) orelse return error.InvalidManagedDownload;
             // Every canonical alias now shares one normalized digest and proof.
-            try self.verifyIndex(self.canonical_index.get(receipt.artifacts[index].canonical_path).?);
+            try self.verifyIndex(self.canonical_index.get(receipt.artifacts[index].canonical_path).?, control);
         }
     }
     /// ONNX external tensors are consumed by a component loader, not by
@@ -352,7 +365,7 @@ pub const PublishedArtifacts = struct {
             const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
             defer self.allocator.free(canonical);
             if (!std.mem.eql(u8, canonical, self.receipt.?.artifacts[index].canonical_path)) return error.ModelArtifactsChanging;
-            try self.verifyIndex(self.canonical_index.get(canonical).?);
+            try self.verifyIndex(self.canonical_index.get(canonical).?, .{});
         }
     }
     /// Authenticate the complete graph dependency set before a pathname-based

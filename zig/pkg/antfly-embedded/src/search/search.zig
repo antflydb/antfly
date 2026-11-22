@@ -275,6 +275,9 @@ pub const MultiPhraseQuery = struct {
 
 pub const NumericRangeQuery = struct {
     field: []const u8,
+    exact_bounds: ?query_mod.RangeFilter.ExactBounds = null,
+    /// Borrowed structured range for exact residual evaluation after postings.
+    stored_standard_range: ?*const std.json.Value = null,
     min: ?f64 = null,
     max: ?f64 = null,
     inclusive_min: bool = true,
@@ -1390,19 +1393,25 @@ fn executeFuzzy(
     } }, request, fq.boost);
 }
 
+fn nativeNumericRange(rq: NumericRangeQuery) !query_mod.Filter {
+    if (rq.stored_standard_range != null and rq.exact_bounds == null) return error.UnsupportedQueryRequest;
+    return .{ .range = .{
+        .field = rq.field,
+        .min_val = rq.min,
+        .max_val = rq.max,
+        .exact_bounds = rq.exact_bounds,
+        .inclusive_min = rq.inclusive_min,
+        .inclusive_max = rq.inclusive_max,
+    } };
+}
+
 fn executeNumericRange(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
     rq: NumericRangeQuery,
     request: SearchRequest,
 ) !SearchResult {
-    return executeFilterQuery(alloc, snap, .{ .range = .{
-        .field = rq.field,
-        .min_val = rq.min,
-        .max_val = rq.max,
-        .inclusive_min = rq.inclusive_min,
-        .inclusive_max = rq.inclusive_max,
-    } }, request, rq.boost);
+    return executeFilterQuery(alloc, snap, try nativeNumericRange(rq), request, rq.boost);
 }
 
 fn executeDateRange(
@@ -5717,13 +5726,7 @@ pub fn searchQueryToFilterWithPreparation(alloc: Allocator, sq: SearchQuery, pre
                 fq.max_edits,
             .prefix_len = fq.prefix_len,
         } },
-        .numeric_range => |rq| .{ .range = .{
-            .field = rq.field,
-            .min_val = rq.min,
-            .max_val = rq.max,
-            .inclusive_min = rq.inclusive_min,
-            .inclusive_max = rq.inclusive_max,
-        } },
+        .numeric_range => |rq| try nativeNumericRange(rq),
         .date_range => |rq| .{ .date_range = .{
             .field = rq.field,
             .start_ns = rq.start_ns,
@@ -5868,13 +5871,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .numeric_range => |rq| .{
-            .filter = .{ .range = .{
-                .field = rq.field,
-                .min_val = rq.min,
-                .max_val = rq.max,
-                .inclusive_min = rq.inclusive_min,
-                .inclusive_max = rq.inclusive_max,
-            } },
+            .filter = try nativeNumericRange(rq),
             .duped_terms = &.{},
             .filter_slice = &.{},
         },

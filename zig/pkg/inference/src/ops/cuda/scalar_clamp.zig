@@ -17,50 +17,67 @@ const std = @import("std");
 const context = @import("context.zig");
 const driver = @import("driver.zig");
 
+const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("scalar_clamp.ptx"), .{ .clamp = "scalar_clamp", .widen = "widen_16bit", .split = "split_bf16_terms", .split_rounded = "split_rounded_terms", .finish_projection = "finish_projection" });
+
 pub const Kernel = struct {
-    module: driver.CUmodule = null,
-    function: driver.CUfunction = null,
-    widen: driver.CUfunction = null,
+    program: Program = .{},
 
     pub fn deinit(self: *Kernel, ctx: *context.CudaContext) void {
-        if (self.module != null) {
-            ctx.makeCurrent() catch {};
-            _ = ctx.driver.fns.cuModuleUnload(self.module);
-            self.* = .{};
-        }
+        self.program.deinit(ctx);
     }
 
-    fn init(self: *Kernel, ctx: *context.CudaContext) !void {
-        try ctx.makeCurrent();
-        if (self.module == null) {
-            var module: driver.CUmodule = null;
-            try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, @embedFile("scalar_clamp.ptx").ptr, 0, null, null));
-            errdefer _ = ctx.driver.fns.cuModuleUnload(module);
-            var function: driver.CUfunction = null;
-            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, "scalar_clamp"));
-            var widen: driver.CUfunction = null;
-            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&widen, module, "widen_16bit"));
-            self.* = .{ .module = module, .function = function, .widen = widen };
-        }
+    pub fn prepare(self: *Kernel, ctx: *context.CudaContext) !void {
+        try self.program.init(ctx);
+    }
+
+    pub fn finishProjection(self: *Kernel, ctx: *context.CudaContext, output: driver.CUdeviceptr, correction: driver.CUdeviceptr, input: driver.CUdeviceptr, weights: driver.CUdeviceptr, rows: usize, in_dim: usize, out_dim: usize, bf16: bool) !void {
+        const count = try std.math.mul(usize, rows, out_dim);
+        if (in_dim == 0 or in_dim > std.math.maxInt(u32) or count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        if (count == 0) return;
+        try self.prepare(ctx);
+        var dst = output;
+        var addend = correction;
+        var src = input;
+        var w = weights;
+        var n: u32 = @intCast(count);
+        var inner: u32 = @intCast(in_dim);
+        var cols: u32 = @intCast(out_dim);
+        var format: u32 = @intFromBool(bf16);
+        var args = [_]?*anyopaque{ &dst, &addend, &src, &w, &n, &inner, &cols, &format };
+        try ctx.launchKernel(self.program.function(.finish_projection), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
+        ctx.noteKernelLaunch();
+    }
+
+    pub fn splitProjector(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, outputs: [3]driver.CUdeviceptr, count: usize, bf16: bool, nearest_even: bool) !void {
+        if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        if (count == 0) return;
+        try self.prepare(ctx);
+        var src = input;
+        var planes = outputs;
+        var n: u32 = @intCast(count);
+        var format: u32 = @intFromBool(bf16);
+        var args = [_]?*anyopaque{ &src, &planes[0], &planes[1], &planes[2], &n, &format };
+        try ctx.launchKernel(if (nearest_even) self.program.function(.split_rounded) else self.program.function(.split), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
+        ctx.noteKernelLaunch();
     }
 
     pub fn widen16Bit(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, output: driver.CUdeviceptr, count: usize, bf16: bool) !void {
         if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
         if (count == 0) return;
-        try self.init(ctx);
+        try self.prepare(ctx);
         var src = input;
         var dst = output;
         var n: u32 = @intCast(count);
         var bf: u32 = @intFromBool(bf16);
         var args = [_]?*anyopaque{ &src, &dst, &n, &bf };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.widen, @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.program.function(.widen), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
         ctx.noteKernelLaunch();
     }
 
     pub fn launch(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, output: driver.CUdeviceptr, count: usize, lower: ?f32, upper: ?f32) !void {
         if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
         if (count == 0) return;
-        try self.init(ctx);
+        try self.prepare(ctx);
         var src = input;
         var dst = output;
         var n: u32 = @intCast(count);
@@ -68,7 +85,7 @@ pub const Kernel = struct {
         var hi = upper orelse std.math.inf(f32);
         var flags: u32 = @as(u32, @intFromBool(lower != null)) | (@as(u32, @intFromBool(upper != null)) << 1);
         var args = [_]?*anyopaque{ &src, &dst, &n, &lo, &hi, &flags };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.function, @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.program.function(.clamp), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
         ctx.noteKernelLaunch();
     }
 };

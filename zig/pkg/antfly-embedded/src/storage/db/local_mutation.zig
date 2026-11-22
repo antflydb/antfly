@@ -280,6 +280,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const notifyResolverReplayRuntimesForced = commit.notifyResolverReplayRuntimesForced;
         pub const pendingRowPolicyReceipt = commit.pendingRowPolicyReceipt;
         pub const preflightReplicationBatchSyncCommit = commit.preflightReplicationBatchSyncCommit;
+        pub const prepareLocalIntegrityDecision = commit.prepareLocalIntegrityDecision;
         pub const prepareMergeArtifactEffects = preparation.prepareMergeArtifactEffects;
         pub const projectedBatchLsmAdmissionBytes = preparation.projectedBatchLsmAdmissionBytes;
         pub const rememberBulkIngestAllNewIdentityUpserts = commit.rememberBulkIngestAllNewIdentityUpserts;
@@ -391,6 +392,16 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const applyDerivedBatchTargetsProfiled = materialization.applyDerivedBatchTargetsProfiled;
         pub const applyDerivedBatchToIndexContext = materialization.applyDerivedBatchToIndexContext;
         pub const applyDerivedBatchToIndexContextProfiled = materialization.applyDerivedBatchToIndexContextProfiled;
+        pub const InlineTextPublication = materialization.InlineTextPublication;
+        pub const prepareInlineTextPublication = materialization.prepareInlineTextPublication;
+        pub const InlineGraphPublication = materialization.InlineGraphPublication;
+        pub const prepareInlineGraphPublication = materialization.prepareInlineGraphPublication;
+        pub const InlineSparsePublication = materialization.InlineSparsePublication;
+        pub const prepareInlineSparsePublication = materialization.prepareInlineSparsePublication;
+        pub const InlineDensePublication = materialization.InlineDensePublication;
+        pub const prepareInlineDensePublication = materialization.prepareInlineDensePublication;
+        pub const InlineAlgebraicPublication = materialization.InlineAlgebraicPublication;
+        pub const prepareInlineAlgebraicPublication = materialization.prepareInlineAlgebraicPublication;
         pub const applyGraphArtifactMutationPages = materialization.applyGraphArtifactMutationPages;
         pub const applyGraphDocClearsForIndex = materialization.applyGraphDocClearsForIndex;
         pub const applyPrecomputeAssetProducerOutput = materialization.applyPrecomputeAssetProducerOutput;
@@ -607,7 +618,9 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const loadSourceExtractionForResolution = materialization.loadSourceExtractionForResolution;
         pub const lockApply = commit.lockApply;
         pub const lockAtomicWithBackoff = commit.lockAtomicWithBackoff;
+        pub const lockAtomicWithBackoffIo = commit.lockAtomicWithBackoffIo;
         pub const lockAtomicWithBackoffProfiled = commit.lockAtomicWithBackoffProfiled;
+        pub const lockAtomicWithBackoffProfiledIo = commit.lockAtomicWithBackoffProfiledIo;
         pub const logSparseWriteProfileDelta = materialization.logSparseWriteProfileDelta;
         pub const makeChunkCacheKey = materialization.makeChunkCacheKey;
         pub const makeTimestampKey = preparation.makeTimestampKey;

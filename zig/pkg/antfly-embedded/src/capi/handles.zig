@@ -51,6 +51,15 @@ pub const Handle = struct {
     /// Active connection context while its private SQL state is attached.
     lite_connection_context: ?*@import("lite_connection.zig").Connection = null,
     lease_snapshot: bool = false,
+    /// The root file's `NativeFile.adoptionEpoch()` when the Lite owner last
+    /// decided this root was current. A later adoption (a writer's begin,
+    /// a lease-time commit) can make the file match a fresh probe while this
+    /// root's in-memory runtime still reflects the older state.
+    lite_refresh_adoption_epoch: u64 = 0,
+    /// The root file's committed sequence its loaded runtime (indexes cache
+    /// their content in memory) is known to reflect. Another process's index
+    /// change past it forces a reopen, even after the file adopted it.
+    lite_runtime_sequence: u64 = 0,
     selected_table_name: ?[]u8 = null,
     selected_table_id: u64 = 0,
     // Table handles borrow a DB and enter their owning database's fence.
@@ -141,6 +150,20 @@ pub const Handle = struct {
     query_producer_mutex: std.Io.Mutex = .init,
     /// Protected by the native path gate; pins provider and extractor lifetime.
     query_borrows: usize = 0,
+    /// WS3 writer lane: how many in-flight lane members (`WriterLane.
+    /// checkout` through the matching unpin in `HandleGuard.
+    /// leaveWithRegistry`, spanning that call's own durability wait) are
+    /// pinning this generation. Atomic, unlike `query_borrows`: lane
+    /// members pin/unpin without holding `connection.gate.mutex`
+    /// (the whole point of the lane), so concurrent same-Store writers
+    /// can touch this from different threads with no other lock in
+    /// common. `Owner.collectRetired` must never close a generation while
+    /// this is nonzero -- a writer still mid-flight on it, specifically
+    /// because another concurrent writer's own lane checkout triggered a
+    /// refresh/replacement, must never see its own backend torn out from
+    /// under it (observed empirically as a `metadata_pool`/
+    /// `source_certificates` crash before this field existed).
+    lane_pins: std.atomic.Value(usize) = .init(0),
     /// Borrowers executing against this root's immutable catalog and indexes.
     /// The path gate protects this count; refresh must replace rather than
     /// mutate a root while any such borrower remains.

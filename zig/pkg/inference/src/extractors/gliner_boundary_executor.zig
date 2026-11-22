@@ -17,6 +17,7 @@
 //! Metal group compatible inputs into bounded physical batches; native retains
 //! its qualified serial request execution.
 //! Output is buffered atomically and independently bounded across all inputs.
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const wire = @import("extraction_v2.zig");
 const model = @import("../models/gliner_boundary.zig");
@@ -46,6 +47,10 @@ pub const ItemExecution = struct {
 };
 
 pub const Options = struct {
+    /// A real compiled session owns every encoder/head stage. Native callers
+    /// leave this null and retain their qualified eager program.
+    compiled_batch_size: usize = 1,
+    compiled_session: ?@import("../backends/session.zig").Session = null,
     /// Synchronous row consumer for independent broker callers. It owns
     /// serialization failures locally; the executor never builds a combined
     /// response when this sink is installed.
@@ -171,6 +176,7 @@ pub fn observeSample(observer: ?observation.Observer, sample: pipeline.Sample, t
 /// Runs before acquiring a backend or executing an input, so unsupported
 /// features in later items cannot consume earlier items' model execution.
 pub fn preflight(request: *const wire.Request, options: Options) !void {
+    if (options.compiled_batch_size == 0 or options.compiled_batch_size > 8) return error.ResourceLimitExceeded;
     try progress(options, null, "preflight");
     if (request.items.len == 0 or options.max_response_bytes == 0) return error.InvalidExtractionRequest;
     for (request.items, 0..) |item, index| {
@@ -236,13 +242,20 @@ pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator,
     if (options.control) |control| try control.check();
     try cb.checkExecutionControl();
     if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
+    if (options.compiled_session) |session| {
+        const profile = @import("../architectures/session_factory.zig").getPjrtExecutionProfile(session) orelse return error.UnsupportedGlinerBoundaryRuntime;
+        // The BF16 source gate is qualified only for one physical row.
+        // Batching changes reductions even with deterministic compilation.
+        if (profile.precision == .bf16 and options.compiled_batch_size != 1) return error.UnsupportedGlinerBoundaryRuntime;
+    }
     const identity = options.identity orelse return error.UnsupportedGlinerBoundaryRuntime;
     if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
-    var gate = try qualification.Admission.initResolved(identity, switch (cb.kind()) {
+    const qualified_backend: @import("../models/gliner_boundary_qualification.zig").Backend = if (options.compiled_session) |session| try qualification.backendForSession(session) else switch (cb.kind()) {
         .metal => .metal,
         .cuda => .cuda,
         else => .native,
-    }, request, options.pipeline, options.control);
+    };
+    var gate = try qualification.Admission.initResolved(identity, qualified_backend, request, options.pipeline, options.control);
     var local_store = PreparationStore.init(allocator);
     defer local_store.deinit();
     var prepared_options = options;
@@ -381,7 +394,7 @@ pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allo
 /// Contiguous compatible items share one forward pass without reordering results.
 /// The same preparation/planning routine runs before qualification and execution.
 fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, items: []const wire.Item, options: Options) !processor.PreparedBatch {
-    const limit = if (backend == .cuda or backend == .metal) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
+    const limit = if (options.compiled_session != null) @min(options.compiled_batch_size, @min(options.processor.max_batch_items, @min(options.engine.limits.max_batch, options.pipeline.head_limits.max_batch))) else if (backend == .cuda or backend == .metal) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
     if (limit == 0 or items.len == 0) return error.ResourceLimitExceeded;
     var count: usize = 1;
     while (count < @min(limit, items.len) and items[count].options.long_document.mode != .window and std.meta.eql(items[0].options, items[count].options)) : (count += 1) {}
@@ -434,6 +447,32 @@ fn observeGroup(allocator: Allocator, config: *const model.Config, items: []cons
         view.samples = prepared.samples[index..][0..1];
         try gate.observeSingle(allocator, item.text, &view, qualification.singleProcessor(config, item, options.processor, options.engine.limits.max_queries, options.control));
     }
+}
+
+/// Measure the actual tokenizer/window geometry used by this executor.
+/// Qualification callers retain these observations; no range is inferred from
+/// checkpoint metadata or a configured maximum.
+pub fn measureRequestGeometry(allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !@import("../models/gliner_boundary_qualification.zig").LengthContract {
+    const Policy = @import("../models/gliner_boundary_qualification.zig");
+    const Measurement = struct {
+        items: usize,
+        value: ?Policy.LengthContract = null,
+        pub fn observe(self: *@This(), bytes: usize, words: usize, windows: usize, prepared: *const processor.PreparedBatch) !void {
+            const measured = try qualification.lengths(self.items, bytes, words, windows, prepared);
+            if (self.value) |*previous| {
+                inline for (comptime std.meta.fieldNames(Policy.LengthContract)) |name| {
+                    @field(previous, name).min = @min(@field(previous, name).min, @field(measured, name).min);
+                    @field(previous, name).max = @max(@field(previous, name).max, @field(measured, name).max);
+                }
+            } else self.value = measured;
+        }
+        pub fn observeSingle(self: *@This(), a: Allocator, text: []const u8, prepared: *const processor.PreparedBatch, processor_options: processor.Options) !void {
+            try self.observe(text.len, try qualification.sourceWords(a, text, processor_options), 1, prepared);
+        }
+    };
+    var measurement = Measurement{ .items = request.items.len };
+    try planRequestGeometry(.native, allocator, config, tokenizer, request, options, &measurement);
+    return measurement.value orelse error.InvalidExtractionRequest;
 }
 
 fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options, gate: anytype) !void {
@@ -489,6 +528,14 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
 }
 
 fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options, gate: ?*qualification.Admission) ![]u8 {
+    if (options.compiled_session) |session| {
+        if (session.backend() != .pjrt) return error.UnsupportedGlinerBoundaryBackend;
+        if (options.identity) |expected| {
+            const actual = try @import("../architectures/session_factory.zig").getGlinerBoundaryIdentity(session);
+            if (!std.mem.eql(u8, &expected.fingerprint(), &actual.fingerprint())) return error.GlinerBoundaryArtifactMismatch;
+        }
+    }
+
     if (cb.kind() != .native and cb.kind() != .wasm and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.kind() != .native and options.identity == null) return error.MissingGlinerBoundaryIdentity;
     if (options.identity) |identity| if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
@@ -523,6 +570,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             pipeline_options.control = options.control;
             pipeline_options.max_output_values = remaining_values;
             const long_options = long_executor.Options{
+                .compiled_session = options.compiled_session,
                 .preparations = options.preparations,
                 .identity = options.identity orelse return error.MissingGlinerBoundaryIdentity,
                 .processor = item.options.preprocessing(options.processor),
@@ -582,7 +630,9 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             row_check = .{ .sink = sink, .first = index };
             pipeline_options.independent_rows = .{ .errors = row_errors[0..prepared.samples.len], .context = &row_check, .check_fn = RowCheck.check };
         }
-        var result = switch (cb.kind()) {
+        var result = if (options.compiled_session) |session|
+            try @import("../pipelines/gliner_boundary_program.zig").run(session, allocator, config, &prepared, schemas, pipeline_options, engine_options)
+        else switch (cb.kind()) {
             .native, .wasm => native: {
                 var encoded = try engine.encodeNative(cb, allocator, config, &prepared, engine_options);
                 defer encoded.deinit();
@@ -768,7 +818,7 @@ fn testPinnedSmallExecutor(directory: []const u8, converted: bool, metal: bool) 
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
+    var managed = try compute_provider.acquire(session, scratch, null, control);
     defer managed.deinit();
     const response = try execute(&managed.backend, scratch, &config, tokenizer.tokenizer(), &request, .{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control });
     defer scratch.free(response);
@@ -866,7 +916,7 @@ fn testWindowBatch(directory: []const u8, metal: bool) !void {
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
+    var managed = try compute_provider.acquire(session, scratch, null, control);
     defer managed.deinit();
     const options = Options{ .identity = identity, .control = control };
     const result = try execute(&managed.backend, scratch, &config, tokenizer.tokenizer(), &request, options);
@@ -1721,13 +1771,17 @@ test "GPU boundary classification windows fit backend-specific reference reserva
     if (receiver.failure) |err| return err;
     try std.testing.expectEqual(receiver.peak, reserved);
     try std.testing.expect(reserved > metal_reserved);
-    var tight = options;
-    tight.device.max_encoder_device_bytes = reserved - 1;
-    // Window fitting can repartition the document to honor a smaller budget.
-    // Check the resulting reservation, then reject a budget no window can fit.
-    const fitted = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, tight);
-    try std.testing.expect(fitted > 0);
-    try std.testing.expect(fitted <= tight.device.max_encoder_device_bytes);
+    // CUDA may reduce a physical window group while preserving every window.
+    var bounded = options;
+    bounded.device.max_encoder_device_bytes = reserved - 1;
+    const replanned = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, bounded);
+    try std.testing.expect(replanned > 0 and replanned <= bounded.device.max_encoder_device_bytes);
+    var serial = options;
+    serial.long_document.window_batch_size = 1;
+    const irreducible = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, serial);
+    try std.testing.expect(irreducible > 0 and irreducible < reserved);
+    var tight = serial;
+    // Upstream can also repartition single-row windows; reject the true minimum.
     tight.device.max_encoder_device_bytes = 1;
     try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, tight));
 }
@@ -1773,7 +1827,7 @@ test "CUDA boundary managed Multi-Decide batches windows and recovers after canc
     var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 256 * 1024 * 1024 };
     defer std.debug.assert(bounded.live == 0);
     const scratch = bounded.allocator();
-    var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
+    var managed = try compute_provider.acquire(session, scratch, null, control);
     defer managed.deinit();
     const options = Options{ .identity = identity, .control = control };
     for ([_]usize{ 0, 2, 8, 32 }) |window_count| {

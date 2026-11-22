@@ -67,6 +67,14 @@ pub const ConvertError = error{
 pub const NameScope = struct {
     map: *const std.StringHashMapUnmanaged(NodeId),
     parent: ?*const NameScope = null,
+    capture: ?struct { context: *anyopaque, resolve: *const fn (*anyopaque, []const u8) ConvertError!NodeId } = null,
+
+    fn resolve(self: *const NameScope, name: []const u8) ConvertError!NodeId {
+        if (self.map.get(name)) |id| return if (id == null_node) error.MissingInput else id;
+        if (self.parent) |parent| return parent.resolve(name);
+        if (self.capture) |source| return source.resolve(source.context, name);
+        return error.MissingInput;
+    }
 
     pub fn lookup(self: *const NameScope, name: []const u8) ?NodeId {
         if (self.map.get(name)) |nid| return nid;
@@ -126,7 +134,7 @@ pub fn convertNodeWithScope(
         .Add => broadcastBinaryOp(builder, .add, inputs[0], inputs[1]),
         .Sub => broadcastBinaryOp(builder, .sub, inputs[0], inputs[1]),
         .Mul => broadcastBinaryOp(builder, .mul, inputs[0], inputs[1]),
-        .Div => broadcastBinaryOp(builder, .div, inputs[0], inputs[1]),
+        .Div => convertDiv(builder, inputs[0], inputs[1]),
 
         // Comparison & logical
         .Less => broadcastBinaryOp(builder, .less_than, inputs[0], inputs[1]),
@@ -141,7 +149,12 @@ pub fn convertNodeWithScope(
 
         // Activations (fused)
         .Relu => builder.relu(inputs[0]),
-        .Gelu => builder.gelu(inputs[0]),
+        .Gelu => blk: {
+            const approximation = getString(node.attributes, "approximate", "none");
+            if (std.mem.eql(u8, approximation, "none")) break :blk builder.geluExact(inputs[0]);
+            if (std.mem.eql(u8, approximation, "tanh")) break :blk builder.gelu(inputs[0]);
+            return error.InvalidAttribute;
+        },
         .FastGelu => builder.gelu(inputs[0]),
         .Sigmoid => convertSigmoid(builder, inputs[0]),
         .Silu => builder.silu(inputs[0]),
@@ -237,7 +250,7 @@ pub fn convertNodeWithScope(
         .GroupNormalization => convertGroupNorm(builder, node, inputs),
         .SkipLayerNormalization => convertSkipLayerNorm(builder, node, inputs),
         .If => convertIf(allocator, builder, node, inputs, extra_outputs, outer_scope),
-        .Loop => convertLoop(allocator, builder, node, inputs, outer_scope),
+        .Loop => convertLoop(allocator, builder, node, inputs, extra_outputs, outer_scope),
         .Scan => convertScan(allocator, builder, node, inputs, extra_outputs, outer_scope),
     };
 }
@@ -505,6 +518,20 @@ fn computeBroadcastShape(shapes: []const Shape, dtype: DType) Shape {
     }
 
     return Shape{ .dtype = dtype, .dims = out_dims, .rank_ = out_rank };
+}
+
+fn convertDiv(builder: *Builder, numerator: NodeId, denominator: NodeId) ConvertError!NodeId {
+    const lhs = builder.graph.node(numerator).output_shape;
+    const rhs = builder.graph.node(denominator);
+    // Recognize the reciprocal-square-root spelling used by exported
+    // normalization layers before broadcasting hides the scalar numerator.
+    if (rhs.op == .sqrt and lhs.dtype == .f32 and rhs.output_shape.dtype == .f32 and
+        lhs.rank() <= rhs.output_shape.rank() and lhs.numElements() == 1 and
+        materializeFloatScalar(builder, numerator) == 1.0)
+    {
+        return builder.rsqrt(rhs.inputs[0]);
+    }
+    return broadcastBinaryOp(builder, .div, numerator, denominator);
 }
 
 fn broadcastBinaryOp(builder: *Builder, op: BinaryOp, a_orig: NodeId, b_orig: NodeId) ConvertError!NodeId {
@@ -948,7 +975,7 @@ fn nodeRuntimeDependency(builder: *Builder, node_id: NodeId, shape_only: bool) b
                 }
             }
             switch (n.op) {
-                .constant, .parameter, .fused_from_float32 => continue,
+                .constant, .parameter, .fused_from_float32, .shape_of, .size_of => continue,
                 .reshape => |attrs| {
                     if (attrs.runtime_shape) fact.* = true;
                 },
@@ -1670,6 +1697,153 @@ fn convertConcat(builder: *Builder, node: *const NodeProto, inputs: []const Node
     return result;
 }
 
+/// Project a contiguous interval through shape and pointwise operations.
+/// In cached decoders this keeps relative-position gathers and their index
+/// arithmetic proportional to suffix length times context length.
+const SliceProjection = struct {
+    builder: *Builder,
+    start: i64,
+    end: i64,
+    memo: std.AutoHashMapUnmanaged(u64, NodeId) = .empty,
+
+    fn project(self: *SliceProjection, id: NodeId, axis: u8, depth: u8) ConvertError!NodeId {
+        const key = (@as(u64, id) << 8) | axis;
+        if (self.memo.get(key)) |cached| return cached;
+        const n = self.builder.graph.node(id).*;
+        var narrowed = n;
+        narrowed.vjp_alternate = null_node;
+        narrowed.output_shape.dims[axis] = self.end - self.start;
+        narrowed.output_shape.bounds[axis] = 0;
+        const result = if (depth < 32 and try self.push(&narrowed, n.output_shape, axis, depth)) blk: {
+            break :blk try self.builder.graph.addNode(narrowed);
+        } else blk: {
+            var attrs: ml.graph.node.SliceAttrs = .{ .num_axes = n.output_shape.rank(), .limits = n.output_shape.dims };
+            attrs.starts[axis] = self.start;
+            attrs.limits[axis] = self.end;
+            break :blk try self.builder.graph.addNode(.{
+                .op = .{ .slice = attrs },
+                .output_shape = narrowed.output_shape,
+                .inputs = .{ id, null_node, null_node, null_node },
+                .num_inputs = 1,
+            });
+        };
+        try self.memo.put(self.builder.graph.allocator, key, result);
+        return result;
+    }
+
+    fn push(self: *SliceProjection, n: *ml.graph.Node, original: Shape, axis: u8, depth: u8) ConvertError!bool {
+        const graph = self.builder.graph;
+        const extent = original.dim(axis);
+        switch (n.op) {
+            .transpose => |attrs| {
+                if (attrs.num_axes != original.rank()) return false;
+                n.inputs[0] = try self.project(n.inputs[0], attrs.perm[axis], depth + 1);
+            },
+            .reshape => |*attrs| {
+                if (attrs.runtime_shape) return false;
+                const source = graph.node(n.inputs[0]).output_shape;
+                const source_axis = singletonReshapeAxis(source, original, axis) orelse return false;
+                n.inputs[0] = try self.project(n.inputs[0], source_axis, depth + 1);
+                attrs.new_shape = n.output_shape;
+            },
+            .gather => |attrs| {
+                if (attrs.nd or attrs.elements or axis < attrs.axis) return false;
+                const index_axis = axis - attrs.axis;
+                const indices = graph.node(n.inputs[1]).output_shape;
+                if (index_axis >= indices.rank() or indices.dim(index_axis) != extent) return false;
+                n.inputs[1] = try self.project(n.inputs[1], index_axis, depth + 1);
+            },
+            .broadcast_in_dim => |*attrs| {
+                if (n.num_inputs != 1) return false;
+                const source = graph.node(n.inputs[0]).output_shape;
+                const source_axis = std.mem.indexOfScalar(u8, attrs.broadcast_axes[0..attrs.num_axes], axis);
+                if (source_axis) |mapped| {
+                    const dim = source.dim(@intCast(mapped));
+                    if (dim != 1 and dim != extent) return false;
+                    if (dim != 1) n.inputs[0] = try self.project(n.inputs[0], @intCast(mapped), depth + 1);
+                }
+                attrs.target_shape = n.output_shape;
+            },
+            .add, .sub, .mul, .div, .less_than, .where_select, .neg, .log, .convert_dtype => {
+                var input_axes: [4]?u8 = @splat(null);
+                for (n.getInputs(), input_axes[0..n.num_inputs]) |input, *input_axis| {
+                    const source = graph.node(input).output_shape;
+                    if (source.rank() > original.rank()) return false;
+                    const pad = original.rank() - source.rank();
+                    if (axis < pad) continue;
+                    const dim = source.dim(axis - pad);
+                    if (dim == 1) continue;
+                    if (dim != extent) return false;
+                    input_axis.* = axis - pad;
+                }
+                for (n.inputs[0..n.num_inputs], input_axes[0..n.num_inputs]) |*input, input_axis| {
+                    if (input_axis) |selected| input.* = try self.project(input.*, selected, depth + 1);
+                }
+            },
+            else => return false,
+        }
+        return true;
+    }
+};
+
+fn singletonReshapeAxis(source: Shape, target: Shape, axis: u8) ?u8 {
+    var from: u8 = 0;
+    var to: u8 = 0;
+    var mapped: ?u8 = null;
+    while (true) {
+        while (from < source.rank() and source.dim(from) == 1) : (from += 1) {}
+        while (to < target.rank() and target.dim(to) == 1) : (to += 1) {}
+        if (from == source.rank() or to == target.rank()) {
+            return if (from == source.rank() and to == target.rank()) mapped else null;
+        }
+        if (source.dim(from) != target.dim(to) or source.dim(from) <= 0) return null;
+        if (to == axis) mapped = from;
+        from += 1;
+        to += 1;
+    }
+}
+
+fn projectContiguousSlice(builder: *Builder, input: NodeId, attrs: ml.graph.node.SliceAttrs, output: Shape) ConvertError!?NodeId {
+    const source = builder.graph.node(input);
+    switch (source.op) {
+        .reshape, .transpose, .gather, .broadcast_in_dim => {},
+        else => return null,
+    }
+    if (source.output_shape.numElements() == null or output.numElements() == null) return null;
+    var selected: ?u8 = null;
+    for (0..attrs.num_axes) |i| {
+        const extent = source.output_shape.dims[i];
+        if (attrs.strides[i] != 1 or attrs.starts[i] < 0 or attrs.limits[i] > extent or attrs.limits[i] <= attrs.starts[i]) return null;
+        if (attrs.starts[i] == 0 and attrs.limits[i] == extent) continue;
+        if (selected != null) return null;
+        selected = @intCast(i);
+    }
+    if (nodeHasRuntimeDependentShape(builder, input, 0)) return null;
+    const axis = selected orelse return input;
+    var projection: SliceProjection = .{ .builder = builder, .start = attrs.starts[axis], .end = attrs.limits[axis] };
+    defer projection.memo.deinit(builder.graph.allocator);
+    return try projection.project(input, axis, 0);
+}
+
+fn materializeSliceBounds(builder: *Builder, input: NodeId, buf: *[8]i64) ?[]const i64 {
+    if (input == null_node) return null;
+    const node = builder.graph.node(input);
+    if (node.op == .constant and isIntegerDType(node.output_shape.dtype)) {
+        const count = node.op.constant.data_len;
+        if (count > buf.len) return null;
+        for (buf[0..count], 0..) |*value, i| value.* = integerConstantAt(builder, input, i) orelse return null;
+        return buf[0..count];
+    }
+    if (materializeIntegerScalar(builder, input)) |value| {
+        buf[0] = value;
+        return buf[0..1];
+    }
+    var fallback: [8]f32 = undefined;
+    const values = materializeConstantValues(builder, input, &fallback) orelse return null;
+    for (values, buf[0..values.len]) |value, *output| output.* = clampF32ToI64(value);
+    return buf[0..values.len];
+}
+
 fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
     _ = allocator;
     _ = node;
@@ -1680,24 +1854,36 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
     // Materialize starts, ends for static shape inference (they may be behind
     // Cast/Reshape/Gather). Runtime-derived values stay connected to the Slice
     // node and override these fallback attrs during execution.
-    var starts_buf: [8]f32 = undefined;
-    var ends_buf: [8]f32 = undefined;
-    const starts_data = materializeConstantValues(builder, inputs[1], &starts_buf) orelse return error.ConstantMaterializationFailed;
-    const ends_data = materializeConstantValues(builder, inputs[2], &ends_buf) orelse return error.ConstantMaterializationFailed;
-    if (starts_data.len != ends_data.len or starts_data.len > 8) return error.InvalidAttribute;
-    const runtime_starts = nodeDependsOnRuntimeValue(builder, inputs[1], 0);
-    const runtime_limits = nodeDependsOnRuntimeValue(builder, inputs[2], 0);
+    var starts_buf: [8]i64 = undefined;
+    var ends_buf: [8]i64 = undefined;
+    const starts_data = materializeSliceBounds(builder, inputs[1], &starts_buf);
+    const ends_data = materializeSliceBounds(builder, inputs[2], &ends_buf);
+    const runtime_starts = starts_data == null or nodeDependsOnRuntimeValue(builder, inputs[1], 0);
+    const runtime_limits = ends_data == null or nodeDependsOnRuntimeValue(builder, inputs[2], 0);
 
-    var strides_data: ?[]const f32 = null;
-    var axes_data: ?[]const f32 = null;
     var axes_buf: [8]f32 = undefined;
-    var strides_buf_: [8]f32 = undefined;
-    if (inputs.len >= 4 and inputs[3] != null_node) axes_data = materializeConstantValues(builder, inputs[3], &axes_buf);
-    if (inputs.len >= 5 and inputs[4] != null_node) strides_data = materializeConstantValues(builder, inputs[4], &strides_buf_);
+    var strides_buf: [8]f32 = undefined;
+    const axes_data = if (inputs.len >= 4 and inputs[3] != null_node)
+        materializeConstantValues(builder, inputs[3], &axes_buf) orelse return error.ConstantMaterializationFailed
+    else
+        null;
+    const strides_data = if (inputs.len >= 5 and inputs[4] != null_node)
+        materializeConstantValues(builder, inputs[4], &strides_buf) orelse return error.ConstantMaterializationFailed
+    else
+        null;
+    const bound_count = if (axes_data) |axes| axes.len else if (starts_data) |starts| starts.len else if (ends_data) |ends| ends.len else blk: {
+        const shape = builder.graph.node(inputs[1]).output_shape;
+        if (shape.rank() != 1) return error.ShapeMismatch;
+        break :blk std.math.cast(usize, shape.dim(0)) orelse return error.ConstantMaterializationFailed;
+    };
+    if (bound_count > in_shape.rank() or
+        (starts_data != null and starts_data.?.len != bound_count) or
+        (ends_data != null and ends_data.?.len != bound_count) or
+        (strides_data != null and strides_data.?.len != bound_count)) return error.InvalidAttribute;
 
     var slice_attrs = ml.graph.node.SliceAttrs{};
     slice_attrs.num_axes = in_shape.rank();
-    slice_attrs.num_bound_axes = @intCast(starts_data.len);
+    slice_attrs.num_bound_axes = @intCast(bound_count);
     slice_attrs.runtime_starts = runtime_starts;
     slice_attrs.runtime_limits = runtime_limits;
     var dynamic_bound_axes: [8]bool = @splat(false);
@@ -1710,7 +1896,7 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
     }
 
     // Apply specified axes
-    for (0..starts_data.len) |i| {
+    for (0..bound_count) |i| {
         // Normalize negative axes
         var ax_val: i64 = if (axes_data) |ad| @intFromFloat(ad[i]) else @intCast(i);
         if (ax_val < 0) ax_val += in_shape.rank();
@@ -1718,10 +1904,8 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
         const ax: u8 = @intCast(ax_val);
         slice_attrs.bound_axes[i] = ax;
         dynamic_bound_axes[ax] = runtime_starts or runtime_limits;
-        // Clamp to i64 range — ONNX uses INT64_MAX as "to the end" sentinel,
-        // which overflows when round-tripped through f32.
-        var start: i64 = clampF32ToI64(starts_data[i]);
-        var end: i64 = clampF32ToI64(ends_data[i]);
+        var start = if (starts_data) |starts| starts[i] else 0;
+        var end = if (ends_data) |ends| ends[i] else in_shape.dim(ax);
         const dim_size = in_shape.dim(ax);
         // Skip normalization if dimension is dynamic
         if (dim_size > 0) {
@@ -1772,6 +1956,9 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
     const out_shape = Shape{ .dtype = in_shape.dtype, .dims = out_dims, .rank_ = in_shape.rank_ };
 
     const runtime_bounds = runtime_starts or runtime_limits;
+    if (!runtime_bounds) {
+        if (try projectContiguousSlice(builder, inputs[0], slice_attrs, out_shape)) |projected| return projected;
+    }
     return builder.graph.addNode(.{
         .op = .{ .slice = slice_attrs },
         .output_shape = out_shape,
@@ -1805,10 +1992,8 @@ fn convertConstant(allocator: std.mem.Allocator, builder: *Builder, node: *const
                 if (data.len == 1) data[0] else 0,
             );
         }
-        // Tensor with explicit dims (even [1]) → tensorConst to preserve rank
-        if (data.len == 0) {
-            return builder.scalarConst(shape.dtype, 0);
-        }
+        // Keep the declared rank for empty cache outputs as well as nonempty
+        // tensors. A true scalar is handled above.
         return builder.tensorConst(data, shape);
     }
 
@@ -2178,31 +2363,29 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
     const in_rank = in_shape.rank();
     const out_rank = @max(target_rank, in_rank);
 
+    const start = out_rank - in_rank;
+    const target_start = out_rank - target_rank;
+    const target = builder.graph.node(inputs[1]);
+    const exact_target = target.op == .constant and target.output_shape.dtype == .i64 and target.op.constant.data_len == target_rank;
+    var static_target = exact_target;
     var out_dims: [8]i64 = @splat(0);
-    for (0..out_rank) |i| {
-        const ri: u8 = @intCast(i);
-        const in_dim: i64 = if (ri >= out_rank - in_rank) in_shape.dim(ri - (out_rank - in_rank)) else 1;
-        const target_dim: i64 = if (ri >= out_rank - target_rank) @intFromFloat(shape_data[ri - (out_rank - target_rank)]) else 1;
-        out_dims[i] = if (target_dim == 1) in_dim else if (in_dim == 1) target_dim else target_dim;
+    for (0..out_rank) |axis| {
+        const in_dim = if (axis < start) 1 else in_shape.dims[axis - start];
+        const target_dim = if (axis < target_start) 1 else blk: {
+            const index = axis - target_start;
+            if (exact_target) break :blk integerConstantAt(builder, inputs[1], index).?;
+            const inferred = shape_data[index];
+            if (!std.math.isFinite(inferred) or inferred < -1 or inferred >= 0x1p63 or @trunc(inferred) != inferred) return error.ShapeMismatch;
+            break :blk @as(i64, @intFromFloat(inferred));
+        };
+        if (in_dim < 0 or target_dim < 0 or (in_dim != 1 and target_dim != 1 and in_dim != target_dim)) static_target = false;
+        out_dims[axis] = if (target_dim == 1) in_dim else target_dim;
     }
-
     const out_shape = Shape{ .dtype = in_shape.dtype, .dims = out_dims, .rank_ = out_rank };
-
-    // If shapes match, no-op
-    if (out_rank == in_rank) {
-        var same = true;
-        for (0..in_rank) |i| {
-            if (out_dims[i] != in_shape.dim(@intCast(i))) {
-                same = false;
-                break;
-            }
-        }
-        if (same) return inputs[0];
-    }
+    if (static_target and out_shape.eq(in_shape)) return inputs[0];
 
     // Use broadcast_in_dim
     var broadcast_axes: [8]u8 = @splat(0);
-    const start = out_rank - in_rank;
     for (0..out_rank) |i| {
         broadcast_axes[i] = @intCast(i);
     }
@@ -2224,11 +2407,10 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
             .num_axes = out_rank,
         } },
         .output_shape = out_shape,
-        // Keep the ONNX shape input live. Static dimensions remain embedded
-        // in target_shape, while the interpreter can use the tensor's values
-        // when shape arithmetic resolves symbolic dimensions at runtime.
-        .inputs = .{ src, inputs[1], null_node, null_node },
-        .num_inputs = 2,
+        // Symbolic or computed targets retain the shape operand for the
+        // interpreter when runtime dimensions differ from the inferred ones.
+        .inputs = .{ src, if (static_target) null_node else inputs[1], null_node, null_node },
+        .num_inputs = if (static_target) 1 else 2,
     });
 }
 
@@ -2433,38 +2615,63 @@ fn convertShape(builder: *Builder, node: *const NodeProto, input: NodeId) Conver
 }
 
 fn convertConstantOfShape(allocator: std.mem.Allocator, builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
-    // Input is a 1-D shape tensor; output is a tensor of that shape filled with a value
-    var cos_buf: [8]f32 = undefined;
-    const shape_data = materializeConstantValues(builder, inputs[0], &cos_buf) orelse return error.ConstantMaterializationFailed;
+    if (inputs.len == 0) return error.MissingInput;
+    const shape = builder.graph.node(inputs[0]).output_shape;
+    if (shape.rank() != 1) return error.ShapeMismatch;
+    const rank = std.math.cast(usize, shape.dim(0)) orelse return error.ConstantMaterializationFailed;
+    if (rank > 8) return error.TooManyDimensions;
 
-    // Get fill value from attribute (default 0)
-    var fill_val: f32 = 0.0;
-    if (getTensor(node.attributes, "value")) |tensor| {
-        if (tensor.float_data.len >= 4) {
-            fill_val = @bitCast(std.mem.readInt(u32, tensor.float_data[0..4], .little));
-        } else if (tensor.raw_data.len >= 4) {
-            fill_val = @bitCast(std.mem.readInt(u32, tensor.raw_data[0..4], .little));
+    const fill_tensor = getTensor(node.attributes, "value");
+    const zero: [4]u8 = @splat(0);
+    const dtype, const fill = if (fill_tensor) |tensor| blk: {
+        const fill_shape = try tensor_mod.tensorShape(tensor);
+        if (fill_shape.numElements() != 1) return error.ShapeMismatch;
+        const bytes = tensor_mod.extractNativeBytesWithExternal(allocator, tensor, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ConstantMaterializationFailed,
+        };
+        break :blk .{ fill_shape.dtype, @as([]const u8, bytes) };
+    } else .{ DType.f32, @as([]const u8, &zero) };
+    defer if (fill_tensor != null) allocator.free(fill);
+    if (fill.len != dtype.byteSize()) return error.ShapeMismatch;
+
+    var dims: [8]i64 = @splat(-1);
+    const shape_node = builder.graph.node(inputs[0]);
+    const literal = shape_node.op == .constant and shape.dtype == .i64 and shape_node.op.constant.data_len == rank;
+    var fallback: [8]f32 = undefined;
+    const computed = if (literal) null else materializeConstantValues(builder, inputs[0], &fallback);
+    const static_shape = literal or (computed != null and !nodeDependsOnRuntimeValue(builder, inputs[0], 0));
+    if (literal) {
+        for (dims[0..rank], 0..) |*dim, axis| {
+            dim.* = integerConstantAt(builder, inputs[0], axis).?;
+            if (dim.* < 0) return error.ShapeMismatch;
+        }
+    } else if (computed) |values| {
+        if (values.len != rank) return error.ShapeMismatch;
+        for (values, dims[0..rank]) |dimension, *dim| {
+            if (!std.math.isFinite(dimension) or dimension < (if (static_shape) @as(f32, 0) else -1) or dimension >= 0x1p63 or @trunc(dimension) != dimension) return error.ShapeMismatch;
+            dim.* = @intFromFloat(dimension);
         }
     }
-
-    // Build target shape
-    const rank: u8 = @intCast(@min(shape_data.len, 8));
-    var dims: [8]i64 = @splat(0);
-    var total_elems: usize = 1;
-    for (0..rank) |i| {
-        dims[i] = @intFromFloat(shape_data[i]);
-        if (dims[i] > 0) total_elems *= @intCast(dims[i]);
+    const out_shape = Shape.init(dtype, dims[0..rank]);
+    if (!static_shape) {
+        const scalar = try builder.tensorConstBytes(fill, Shape.scalar(dtype));
+        return builder.graph.addNode(.{
+            .op = .{ .broadcast_in_dim = .{ .target_shape = out_shape, .num_axes = 0 } },
+            .output_shape = out_shape,
+            .inputs = .{ scalar, inputs[0], null_node, null_node },
+            .num_inputs = 2,
+        });
     }
-    const out_shape = Shape{ .dtype = .f32, .dims = dims, .rank_ = rank };
-
-    // For scalar shapes (rank=0 or total 1 element), use scalarConst
-    if (total_elems <= 1) return builder.scalarConst(out_shape.dtype, fill_val);
-
-    // Create a filled tensor constant
-    const data = try allocator.alloc(f32, total_elems);
+    const total_elems = std.math.cast(usize, out_shape.numElements() orelse return error.ShapeMismatch) orelse return error.Overflow;
+    const data = try allocator.alloc(u8, std.math.mul(usize, total_elems, fill.len) catch return error.Overflow);
     defer allocator.free(data);
-    @memset(data, fill_val);
-    return builder.tensorConst(data, out_shape);
+    if (fill.len == 1) {
+        @memset(data, fill[0]);
+    } else {
+        for (0..total_elems) |i| @memcpy(data[i * fill.len ..][0..fill.len], fill);
+    }
+    return builder.tensorConstBytes(data, out_shape);
 }
 
 fn convertTile(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId {
@@ -4875,171 +5082,94 @@ fn cubicResizeWeight(x: f32, a: f32) f32 {
 /// We unroll by inlining the body sub-graph N times, chaining
 /// loop-carried deps from one iteration to the next. Scan outputs
 /// are concatenated across iterations.
+/// Inline a supported subgraph. Never substitute a primary result for an
+/// unimplemented secondary output or leave stale state after a failed body op.
+fn inlineSubgraph(
+    allocator: std.mem.Allocator,
+    builder: *Builder,
+    body: *const proto.GraphProto,
+    names: *std.StringHashMapUnmanaged(NodeId),
+    outer_scope: ?*const NameScope,
+) ConvertError!void {
+    for (body.initializers) |initializer| {
+        var attributes = [_]AttributeProto{.{ .name = "value", .t = initializer, .attr_type = .tensor }};
+        const constant = NodeProto{ .op_type = "Constant", .attributes = &attributes };
+        try names.put(allocator, initializer.name, try convertConstant(allocator, builder, &constant));
+    }
+    const scope = NameScope{ .map = names, .parent = outer_scope };
+    for (body.nodes) |*node| {
+        if (node.inputs.len > 16 or node.outputs.len == 0) return error.UnsupportedOp;
+        var inputs: [16]NodeId = @splat(null_node);
+        for (node.inputs, 0..) |name, i| {
+            if (name.len > 0) inputs[i] = try scope.resolve(name);
+        }
+        const extra_count = node.outputs.len - 1;
+        var inline_extras: [7]NodeId = undefined;
+        const extras = if (extra_count <= inline_extras.len) inline_extras[0..extra_count] else try allocator.alloc(NodeId, extra_count);
+        defer if (extra_count > inline_extras.len) allocator.free(extras);
+        @memset(extras, null_node);
+        const primary = convertNodeWithScope(allocator, builder, node, inputs[0..node.inputs.len], extras, &scope) catch |err| {
+            log.warn("subgraph {s}: {s} ({s}) failed: {s}", .{ body.name, node.op_type, node.name, @errorName(err) });
+            return err;
+        };
+        for (node.outputs, 0..) |name, i| {
+            if (name.len == 0) continue;
+            const id = if (i == 0) primary else extras[i - 1];
+            if (id == null_node) return error.UnsupportedOp;
+            try names.put(allocator, name, id);
+        }
+    }
+    for (body.outputs) |output| {
+        _ = try scope.resolve(output.name);
+    }
+}
+
 fn convertLoop(
     allocator: std.mem.Allocator,
     builder: *Builder,
     node: *const NodeProto,
     inputs: []const NodeId,
+    extra_outputs: ?[]NodeId,
     outer_scope: ?*const NameScope,
 ) ConvertError!NodeId {
     if (inputs.len < 2) return error.MissingInput;
+    const body = getGraph(node.attributes, "body") orelse return error.UnsupportedOp;
+    if (body.inputs.len != inputs.len or inputs.len < 3) return error.UnsupportedOp;
+    const num_carried = inputs.len - 2;
+    // Scan outputs need empty/stacked tensor semantics which this unroller does
+    // not implement. Reject them instead of returning a carried value for them.
+    if (body.outputs.len != num_carried + 1) return error.UnsupportedOp;
+    if (node.outputs.len > 0 and node.outputs.len != num_carried) return error.UnsupportedOp;
 
-    // inputs[0] = max_trip_count M, inputs[1] = initial condition
-    // inputs[2..] = initial loop-carried dependencies
-    const trip_count_value = materializeConstantScalar(builder, inputs[0]);
-    if (trip_count_value == null) {
-        log.warn("Loop: cannot unroll — trip count is not a constant", .{});
-        return error.UnsupportedOp;
+    if (inputs[0] == null_node) return error.UnsupportedOp;
+    const trip_value = materializeConstantScalar(builder, inputs[0]) orelse return error.UnsupportedOp;
+    if (!std.math.isFinite(trip_value) or @trunc(trip_value) != trip_value) return error.InvalidAttribute;
+    if (trip_value > 128) return error.UnsupportedOp;
+    const trip_count: usize = @intFromFloat(@max(0, trip_value));
+    var condition = if (inputs[1] == null_node) try builder.scalarConst(.bool_, 1) else inputs[1];
+    const carried = try allocator.dupe(NodeId, inputs[2..]);
+    defer allocator.free(carried);
+    for (0..trip_count) |iteration| {
+        const active = materializeConstantScalar(builder, condition) orelse return error.UnsupportedOp;
+        if (active == 0) break;
+        var names: std.StringHashMapUnmanaged(NodeId) = .empty;
+        defer names.deinit(allocator);
+        const iter = try builder.scalarConst(.i64, @floatFromInt(iteration));
+        try names.put(allocator, body.inputs[0].name, iter);
+        try names.put(allocator, body.inputs[1].name, condition);
+        for (carried, body.inputs[2..]) |id, input| try names.put(allocator, input.name, id);
+        try inlineSubgraph(allocator, builder, body, &names, outer_scope);
+        const scope = NameScope{ .map = &names, .parent = outer_scope };
+        condition = scope.lookup(body.outputs[0].name) orelse return error.MissingInput;
+        for (carried, body.outputs[1..]) |*id, output| id.* = scope.lookup(output.name) orelse return error.MissingInput;
     }
-
-    const trip_count: usize = @intFromFloat(trip_count_value.?);
-    if (trip_count == 0) {
-        // Zero iterations: return initial loop-carried deps.
-        // Loop returns loop_carried + scan_outputs. With 0 iters, scan outputs are empty.
-        if (inputs.len > 2) return inputs[2]; // first loop-carried dep
-        return inputs[0]; // fallback
-    }
-    if (trip_count > 128) {
-        log.warn("Loop: trip count {d} exceeds unroll limit of 128", .{trip_count});
-        return error.UnsupportedOp;
-    }
-
-    const body_graph = getGraph(node.attributes, "body") orelse return error.UnsupportedOp;
-    if (body_graph.nodes.len == 0 or body_graph.inputs.len < 2) return error.UnsupportedOp;
-
-    const num_loop_carried = body_graph.inputs.len - 2; // subtract iter_num and cond
-    const num_body_outputs = body_graph.outputs.len;
-    if (num_body_outputs == 0) return error.UnsupportedOp;
-    const num_scan_outputs = if (num_body_outputs > num_loop_carried + 1)
-        num_body_outputs - num_loop_carried - 1
-    else
-        0;
-
-    // Build output-name → node-index map for the sub-graph
-    var body_output_map = std.StringHashMapUnmanaged(u32).empty;
-    defer body_output_map.deinit(allocator);
-    for (body_graph.nodes, 0..) |*bn, idx| {
-        for (bn.outputs) |out_name| {
-            if (out_name.len > 0) {
-                try body_output_map.put(allocator, out_name, @intCast(idx));
-            }
+    if (extra_outputs) |extras| {
+        for (carried[1..], 0..) |id, i| {
+            if (i >= extras.len) break;
+            extras[i] = id;
         }
     }
-
-    // Current loop-carried values (start with initial values from inputs[2..])
-    var carried = std.ArrayListUnmanaged(NodeId).empty;
-    defer carried.deinit(allocator);
-    for (0..num_loop_carried) |i| {
-        const input_idx = i + 2;
-        if (input_idx < inputs.len) {
-            try carried.append(allocator, inputs[input_idx]);
-        } else {
-            try carried.append(allocator, null_node);
-        }
-    }
-
-    // Accumulate scan outputs per iteration for later concat
-    var scan_accum = std.ArrayListUnmanaged(std.ArrayListUnmanaged(NodeId)).empty;
-    defer {
-        for (scan_accum.items) |*s| s.deinit(allocator);
-        scan_accum.deinit(allocator);
-    }
-    for (0..num_scan_outputs) |_| {
-        try scan_accum.append(allocator, std.ArrayListUnmanaged(NodeId).empty);
-    }
-
-    // Unroll: for each iteration, inline the body sub-graph
-    for (0..trip_count) |iter| {
-        // Map body input names → current values
-        var name_map = std.StringHashMapUnmanaged(NodeId).empty;
-        defer name_map.deinit(allocator);
-
-        // Body input 0: iteration number (i64 scalar)
-        const iter_const = try builder.scalarConst(.i32, @floatFromInt(iter));
-        if (body_graph.inputs.len > 0 and body_graph.inputs[0].name.len > 0) {
-            try name_map.put(allocator, body_graph.inputs[0].name, iter_const);
-        }
-        // Body input 1: condition (pass through)
-        if (body_graph.inputs.len > 1 and body_graph.inputs[1].name.len > 0) {
-            try name_map.put(allocator, body_graph.inputs[1].name, inputs[1]);
-        }
-        // Body inputs 2..N: loop-carried deps
-        for (0..num_loop_carried) |ci| {
-            if (ci + 2 < body_graph.inputs.len and body_graph.inputs[ci + 2].name.len > 0) {
-                try name_map.put(allocator, body_graph.inputs[ci + 2].name, carried.items[ci]);
-            }
-        }
-
-        // Nested scope for implicit captures (outer-graph references).
-        const body_scope = NameScope{ .map = &name_map, .parent = outer_scope };
-
-        // Process body nodes in order (they should be topologically sorted)
-        for (body_graph.nodes) |*bn| {
-            // Resolve inputs — skip node if any required input is unmapped
-            var body_inp: [16]NodeId = @splat(null_node);
-            const ninp = @min(bn.inputs.len, 16);
-            var all_resolved = true;
-            for (0..ninp) |bi| {
-                if (bn.inputs[bi].len > 0) {
-                    if (body_scope.lookup(bn.inputs[bi])) |nid| {
-                        body_inp[bi] = nid;
-                    } else {
-                        all_resolved = false;
-                        break;
-                    }
-                }
-            }
-            if (!all_resolved) continue;
-
-            // Convert the node
-            const result_id = convertNodeWithScope(allocator, builder, bn, body_inp[0..ninp], null, &body_scope) catch |e| switch (e) {
-                error.UnsupportedOp => {
-                    log.warn("Loop body iter {d}: skipping unsupported op '{s}'", .{ iter, bn.op_type });
-                    continue;
-                },
-                else => {
-                    log.warn("Loop body iter {d}: {s} failed: {}", .{ iter, bn.op_type, e });
-                    return e;
-                },
-            };
-
-            // Map outputs
-            if (bn.outputs.len > 0 and bn.outputs[0].len > 0) {
-                try name_map.put(allocator, bn.outputs[0], result_id);
-            }
-            for (bn.outputs[1..]) |out_name| {
-                if (out_name.len > 0) {
-                    try name_map.put(allocator, out_name, result_id);
-                }
-            }
-        }
-
-        // Extract body outputs: [cond_out, v_1_out, ..., scan_1, ...]
-        // Update loop-carried values
-        for (0..num_loop_carried) |ci| {
-            const out_idx = ci + 1; // skip cond_out
-            if (out_idx < body_graph.outputs.len and body_graph.outputs[out_idx].name.len > 0) {
-                if (name_map.get(body_graph.outputs[out_idx].name)) |nid| {
-                    carried.items[ci] = nid;
-                }
-            }
-        }
-
-        // Accumulate scan outputs
-        for (0..num_scan_outputs) |si| {
-            const out_idx = num_loop_carried + 1 + si;
-            if (out_idx < body_graph.outputs.len and body_graph.outputs[out_idx].name.len > 0) {
-                if (name_map.get(body_graph.outputs[out_idx].name)) |nid| {
-                    try scan_accum.items[si].append(allocator, nid);
-                }
-            }
-        }
-    }
-
-    // Loop outputs: [final_loop_carried..., concat(scan_outputs)...]
-    // The primary output (index 0) is typically the first loop-carried dep
-    if (carried.items.len > 0) return carried.items[0];
-    return inputs[0]; // fallback
+    return carried[0];
 }
 
 /// Convert ONNX Scan by unrolling over the sequence dimension.
@@ -5092,26 +5222,35 @@ fn convertScan(
     }
     const K: usize = body_graph.outputs.len - N; // number of scan output elements per step
 
+    if (M > 8 or K > 8) return error.UnsupportedOp;
+    if (node.outputs.len > 0 and node.outputs.len != N + K) return error.UnsupportedOp;
+    for ([_][]const u8{ "scan_input_axes", "scan_input_directions", "scan_output_axes", "scan_output_directions" }, [_]usize{ M, M, K, K }) |name, expected| {
+        const values = getInts(node.attributes, name);
+        if (values.len != 0 and values.len != expected) return error.InvalidAttribute;
+    }
+
     // scan_input_axes: which axis to iterate for each scan input (default all 0)
     const scan_input_axes_attr = getInts(node.attributes, "scan_input_axes");
     var scan_input_axes: [8]u8 = @splat(0);
     for (0..M) |i| {
         if (i < scan_input_axes_attr.len) {
-            scan_input_axes[i] = @intCast(scan_input_axes_attr[i]);
+            const rank = builder.graph.node(inputs[N + i]).output_shape.rank();
+            const axis = scan_input_axes_attr[i];
+            const normalized = if (axis < 0) axis + rank else axis;
+            if (normalized < 0 or normalized >= rank) return error.InvalidAttribute;
+            scan_input_axes[i] = @intCast(normalized);
         }
     }
 
     // scan_input_directions: 0=forward, 1=backward (default all forward)
     const scan_input_dirs_attr = getInts(node.attributes, "scan_input_directions");
+    const scan_output_dirs = getInts(node.attributes, "scan_output_directions");
+    for (scan_input_dirs_attr) |direction| if (direction != 0 and direction != 1) return error.InvalidAttribute;
+    for (scan_output_dirs) |direction| if (direction != 0 and direction != 1) return error.InvalidAttribute;
 
     // scan_output_axes: which axis to accumulate scan outputs along (default all 0)
     const scan_output_axes_attr = getInts(node.attributes, "scan_output_axes");
     var scan_output_axes: [8]u8 = @splat(0);
-    for (0..K) |i| {
-        if (i < scan_output_axes_attr.len) {
-            scan_output_axes[i] = @intCast(scan_output_axes_attr[i]);
-        }
-    }
 
     // Determine sequence length from first scan input
     const first_scan_idx = N; // first scan input in node inputs
@@ -5122,6 +5261,10 @@ fn convertScan(
         return error.UnsupportedOp;
     }
     const seq_len_u: usize = @intCast(seq_len);
+    for (0..M) |mi| {
+        const shape = builder.graph.node(inputs[N + mi]).output_shape;
+        if (shape.rank() == 0 or shape.dim(scan_input_axes[mi]) != seq_len) return error.ShapeMismatch;
+    }
 
     // Initialize state variables
     var state = std.ArrayListUnmanaged(NodeId).empty;
@@ -5206,63 +5349,23 @@ fn convertScan(
             const squeezed_shape = Shape{
                 .dtype = scan_shape.dtype,
                 .dims = squeezed_dims,
-                .rank_ = if (rank > 1) rank - 1 else 1,
+                .rank_ = rank - 1,
             };
-            const slice_elem = if (rank > 1)
-                try builder.reshape(sliced, squeezed_shape)
-            else
-                sliced;
+            const slice_elem = try builder.reshape(sliced, squeezed_shape);
 
             if (N + mi < body_graph.inputs.len and body_graph.inputs[N + mi].name.len > 0) {
                 try name_map.put(allocator, body_graph.inputs[N + mi].name, slice_elem);
             }
         }
 
-        // Nested scope for implicit captures from outer graph.
+        try inlineSubgraph(allocator, builder, body_graph, &name_map, outer_scope);
+
         const body_scope = NameScope{ .map = &name_map, .parent = outer_scope };
-
-        // Process body nodes in topological order
-        for (body_graph.nodes) |*bn| {
-            var body_inp: [16]NodeId = @splat(null_node);
-            const ninp = @min(bn.inputs.len, 16);
-            var all_resolved = true;
-            for (0..ninp) |bi| {
-                if (bn.inputs[bi].len > 0) {
-                    if (body_scope.lookup(bn.inputs[bi])) |nid| {
-                        body_inp[bi] = nid;
-                    } else {
-                        all_resolved = false;
-                        break;
-                    }
-                }
-            }
-            if (!all_resolved) continue;
-
-            const result_id = convertNodeWithScope(allocator, builder, bn, body_inp[0..ninp], null, &body_scope) catch |e| switch (e) {
-                error.UnsupportedOp => {
-                    log.warn("Scan body step {d}: skipping unsupported op '{s}'", .{ t_raw, bn.op_type });
-                    continue;
-                },
-                else => {
-                    log.warn("Scan body step {d}: {s} failed: {}", .{ t_raw, bn.op_type, e });
-                    return e;
-                },
-            };
-
-            if (bn.outputs.len > 0 and bn.outputs[0].len > 0) {
-                try name_map.put(allocator, bn.outputs[0], result_id);
-            }
-            for (bn.outputs[1..]) |out_name| {
-                if (out_name.len > 0) {
-                    try name_map.put(allocator, out_name, result_id);
-                }
-            }
-        }
 
         // Extract body outputs: first N are updated state, rest are scan elements
         for (0..N) |i| {
             if (body_graph.outputs[i].name.len > 0) {
-                if (name_map.get(body_graph.outputs[i].name)) |nid| {
+                if (body_scope.lookup(body_graph.outputs[i].name)) |nid| {
                     state.items[i] = nid;
                 }
             }
@@ -5270,11 +5373,16 @@ fn convertScan(
         for (0..K) |ki| {
             const out_idx = N + ki;
             if (out_idx < body_graph.outputs.len and body_graph.outputs[out_idx].name.len > 0) {
-                if (name_map.get(body_graph.outputs[out_idx].name)) |nid| {
+                if (body_scope.lookup(body_graph.outputs[out_idx].name)) |nid| {
                     // Unsqueeze: insert dim=1 at scan_output_axis for concat
-                    const out_axis: u8 = scan_output_axes[ki];
                     const elem_shape = builder.graph.node(nid).output_shape;
                     const elem_rank = elem_shape.rank();
+                    if (elem_rank >= 8) return error.TooManyDimensions;
+                    const declared_axis = if (ki < scan_output_axes_attr.len) scan_output_axes_attr[ki] else 0;
+                    const normalized_axis = if (declared_axis < 0) declared_axis + elem_rank + 1 else declared_axis;
+                    if (normalized_axis < 0 or normalized_axis > elem_rank) return error.InvalidAttribute;
+                    const out_axis: u8 = @intCast(normalized_axis);
+                    scan_output_axes[ki] = out_axis;
                     var unsq_dims: [8]i64 = @splat(0);
                     var di: u8 = 0;
                     for (0..elem_rank + 1) |d| {
@@ -5302,7 +5410,8 @@ fn convertScan(
     defer scan_results.deinit(allocator);
     for (0..K) |ki| {
         const elems = scan_accum.items[ki].items;
-        if (elems.len == 0) continue;
+        if (elems.len != seq_len_u) return error.UnsupportedOp;
+        if (ki < scan_output_dirs.len and scan_output_dirs[ki] == 1) std.mem.reverse(NodeId, elems);
         const out_axis: u8 = scan_output_axes[ki];
         var result = elems[0];
         for (elems[1..]) |next| {
@@ -5355,94 +5464,27 @@ fn convertIf(
 ) ConvertError!NodeId {
     if (inputs.len < 1) return error.MissingInput;
 
-    // termite's graph IR is a flat DAG with no control flow.
-    // We handle If by statically resolving constant conditions and
-    // inlining the chosen branch sub-graph.
-    const cond = inputs[0];
-    const cond_value = materializeConstantScalar(builder, cond);
+    const value = materializeConstantScalar(builder, inputs[0]) orelse {
+        log.warn("If: condition requires a compile-time binding", .{});
+        return error.UnsupportedOp;
+    };
+    const branch = getGraph(node.attributes, if (value != 0) "then_branch" else "else_branch") orelse return error.UnsupportedOp;
+    if (branch.outputs.len == 0 or (node.outputs.len != 0 and branch.outputs.len != node.outputs.len)) return error.UnsupportedOp;
 
-    if (cond_value) |value| {
-        const is_true = value != 0;
-        const branch_name: []const u8 = if (is_true) "then_branch" else "else_branch";
-        const branch_graph = getGraph(node.attributes, branch_name) orelse return error.UnsupportedOp;
-
-        if (branch_graph.nodes.len == 0 and branch_graph.outputs.len == 0) return error.UnsupportedOp;
-
-        // Map branch input names → parent graph values.
-        // Branch sub-graph inputs correspond to If node's inputs[1..] (the feed values).
-        var name_map = std.StringHashMapUnmanaged(NodeId).empty;
-        defer name_map.deinit(allocator);
-
-        for (branch_graph.inputs, 0..) |inp, i| {
-            if (inp.name.len > 0 and i + 1 < inputs.len) {
-                try name_map.put(allocator, inp.name, inputs[i + 1]);
-            }
-        }
-
-        // Nested scope: local name_map wins, otherwise fall back to outer_scope
-        // so body nodes can capture parent-graph values implicitly.
-        const body_scope = NameScope{ .map = &name_map, .parent = outer_scope };
-
-        // Process branch body nodes in topological order
-        for (branch_graph.nodes) |*bn| {
-            var body_inp: [16]NodeId = @splat(null_node);
-            const ninp = @min(bn.inputs.len, 16);
-            var all_resolved = true;
-            for (0..ninp) |bi| {
-                if (bn.inputs[bi].len > 0) {
-                    if (body_scope.lookup(bn.inputs[bi])) |nid| {
-                        body_inp[bi] = nid;
-                    } else {
-                        all_resolved = false;
-                        break;
-                    }
-                }
-            }
-            if (!all_resolved) continue;
-
-            const result_id = convertNodeWithScope(allocator, builder, bn, body_inp[0..ninp], null, &body_scope) catch |e| switch (e) {
-                error.UnsupportedOp => {
-                    log.warn("If {s}: skipping unsupported op '{s}'", .{ branch_name, bn.op_type });
-                    continue;
-                },
-                else => {
-                    log.warn("If {s}: {s} failed: {}", .{ branch_name, bn.op_type, e });
-                    return e;
-                },
-            };
-
-            // Map all outputs
-            for (bn.outputs, 0..) |out_name, oi| {
-                if (out_name.len > 0) {
-                    // For multi-output sub-ops, first output gets the result_id
-                    _ = oi;
-                    try name_map.put(allocator, out_name, result_id);
-                }
-            }
-        }
-
-        // Extract branch outputs — these correspond to the If node's outputs
-        if (branch_graph.outputs.len > 0 and branch_graph.outputs[0].name.len > 0) {
-            if (name_map.get(branch_graph.outputs[0].name)) |primary| {
-                // Fill extra outputs for multi-output If
-                if (extra_outputs) |eo| {
-                    for (branch_graph.outputs[1..], 0..) |out, ei| {
-                        if (ei >= eo.len) break;
-                        if (out.name.len > 0) {
-                            if (name_map.get(out.name)) |nid| {
-                                eo[ei] = nid;
-                            }
-                        }
-                    }
-                }
-                return primary;
-            }
-        }
+    var names: std.StringHashMapUnmanaged(NodeId) = .empty;
+    defer names.deinit(allocator);
+    // A branch can also capture values lexically from the parent graph.
+    const bound_count = @min(branch.inputs.len, inputs.len - 1);
+    for (branch.inputs[0..bound_count], inputs[1..][0..bound_count]) |input, id| {
+        if (input.name.len != 0) try names.put(allocator, input.name, id);
     }
-
-    // Non-constant condition: not supported in flat DAG IR.
-    log.warn("If: non-constant condition cannot be statically resolved", .{});
-    return error.UnsupportedOp;
+    try inlineSubgraph(allocator, builder, branch, &names, outer_scope);
+    const scope = NameScope{ .map = &names, .parent = outer_scope };
+    if (extra_outputs) |extra| {
+        if (extra.len < branch.outputs.len - 1) return error.UnsupportedOp;
+        for (branch.outputs[1..], extra[0 .. branch.outputs.len - 1]) |output, *result| result.* = try scope.resolve(output.name);
+    }
+    return scope.resolve(branch.outputs[0].name);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -5649,24 +5691,50 @@ fn floatTensorConst(builder: *Builder, values: []const f64, dtype: ml.graph.DTyp
 /// Materialize a scalar integer control value without narrowing i64 constants
 /// through f32. Shape expressions commonly place Cast or Reshape between the
 /// initializer and the consumer, so those value-preserving nodes are followed.
+fn integerConstantAt(builder: *Builder, node_id: NodeId, index: usize) ?i64 {
+    const n = builder.graph.node(node_id);
+    if (n.op != .constant) return null;
+    const attrs = n.op.constant;
+    if (index >= attrs.data_len) return null;
+    return switch (n.output_shape.dtype) {
+        .i8 => builder.graph.constantDataAs(i8, attrs.data_offset, attrs.data_len)[index],
+        .i16 => builder.graph.constantDataAs(i16, attrs.data_offset, attrs.data_len)[index],
+        .i32 => builder.graph.constantDataAs(i32, attrs.data_offset, attrs.data_len)[index],
+        .i64 => builder.graph.constantDataAs(i64, attrs.data_offset, attrs.data_len)[index],
+        .u8, .bool_ => builder.graph.constantDataAs(u8, attrs.data_offset, attrs.data_len)[index],
+        else => null,
+    };
+}
+
 fn materializeIntegerScalar(builder: *Builder, node_id: NodeId) ?i64 {
     if (node_id == null_node) return null;
     const n = builder.graph.node(node_id);
     switch (n.op) {
-        .constant => |attrs| {
-            if (attrs.data_len != 1) return null;
-            return switch (n.output_shape.dtype) {
-                .i8 => builder.graph.constantDataAs(i8, attrs.data_offset, attrs.data_len)[0],
-                .i16 => builder.graph.constantDataAs(i16, attrs.data_offset, attrs.data_len)[0],
-                .i32 => builder.graph.constantDataAs(i32, attrs.data_offset, attrs.data_len)[0],
-                .i64 => builder.graph.constantDataAs(i64, attrs.data_offset, attrs.data_len)[0],
-                .u8, .bool_ => builder.graph.constantDataAs(u8, attrs.data_offset, attrs.data_len)[0],
-                else => null,
-            };
+        .constant => return if (n.output_shape.numElements() == 1) integerConstantAt(builder, node_id, 0) else null,
+        .gather => |attrs| {
+            if (attrs.axis != 0 or attrs.elements or n.output_shape.numElements() != 1) return null;
+            const inputs = n.getInputs();
+            if (inputs.len != 2) return null;
+            const source = builder.graph.node(inputs[0]);
+            if (source.output_shape.rank() != 1 or source.op != .constant) return null;
+            const size = source.output_shape.dim(0);
+            if (size <= 0) return null;
+            const raw = materializeIntegerScalar(builder, inputs[1]) orelse return null;
+            const index = std.math.cast(usize, if (raw < 0) raw + size else raw) orelse return null;
+            return integerConstantAt(builder, inputs[0], index);
         },
         .reshape, .convert_dtype => {
             const inputs = n.getInputs();
-            return if (inputs.len == 1) materializeIntegerScalar(builder, inputs[0]) else null;
+            if (inputs.len != 1 or n.output_shape.numElements() != 1) return null;
+            if (n.op == .convert_dtype and n.output_shape.dtype != .i64 and
+                n.output_shape.dtype != builder.graph.node(inputs[0]).output_shape.dtype) return null;
+            return materializeIntegerScalar(builder, inputs[0]);
+        },
+        .neg => {
+            const inputs = n.getInputs();
+            if (inputs.len != 1) return null;
+            const value = materializeIntegerScalar(builder, inputs[0]) orelse return null;
+            return std.math.sub(i64, 0, value) catch null;
         },
         .add, .sub, .mul, .div => {
             const inputs = n.getInputs();
@@ -6770,6 +6838,40 @@ test "convertNode Size keeps dynamic input sizes at runtime" {
     try std.testing.expectEqual(@as(u8, 0), g.node(result).output_shape.rank());
 }
 
+test "convertNode Range folds a dimension gathered from a concrete Shape" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 3 }));
+    const shape = try convertShape(&b, &.{ .op_type = "Shape" }, x);
+    const last = try b.tensorConstBytes(std.mem.asBytes(&@as(i64, -1)), Shape.scalar(.i64));
+    const limit = try convertGather(&b, &.{ .op_type = "Gather" }, &.{ shape, last });
+    const start = try b.tensorConstBytes(std.mem.asBytes(&@as(i64, 0)), Shape.scalar(.i64));
+    const step = try b.tensorConstBytes(std.mem.asBytes(&@as(i64, 1)), Shape.scalar(.i64));
+    const range = try convertRange(a, &b, &.{ .op_type = "Range" }, &.{ start, limit, step });
+    const attrs = g.node(range).op.constant;
+    try std.testing.expectEqualSlices(i64, &.{ 0, 1, 2 }, g.constantDataAs(i64, attrs.data_offset, attrs.data_len));
+}
+
+test "convertNode ConstantOfShape preserves exact integer fill and empty dimensions" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    var value = std.mem.toBytes(@as(i64, 9007199254740993));
+    var attr = [_]AttributeProto{.{ .name = "value", .attr_type = .tensor, .t = .{ .data_type = .int64, .raw_data = &value } }};
+    const op: NodeProto = .{ .op_type = "ConstantOfShape", .attributes = &attr };
+    for ([_][2]i64{ .{ 1, 2 }, .{ 1, 0 } }) |dimensions| {
+        const shape = try b.tensorConstBytes(std.mem.asBytes(&dimensions), Shape.init(.i64, &.{2}));
+        const result = g.node(try convertConstantOfShape(a, &b, &op, &.{shape}));
+        try std.testing.expect(result.output_shape.eq(Shape.init(.i64, &dimensions)));
+        const attrs = result.op.constant;
+        const expected: []const i64 = if (dimensions[1] == 0) &.{} else &.{ 9007199254740993, 9007199254740993 };
+        try std.testing.expectEqualSlices(i64, expected, g.constantDataAs(i64, attrs.data_offset, attrs.data_len));
+    }
+}
+
 test "convertNode Range folds signed i64 controls exactly" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -7136,6 +7238,24 @@ test "convertNode Expand" {
     try std.testing.expectEqual(target, g.node(result).inputs[1]);
 }
 
+test "convertNode Expand drops literal i64 shapes only for concrete input geometry" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const dimensions = [_]i64{ 3, 4 };
+    const target = try builder.tensorConstBytes(std.mem.sliceAsBytes(&dimensions), Shape.init(.i64, &.{2}));
+    const op = NodeProto{ .op_type = "Expand" };
+    const concrete = try builder.parameter("concrete", Shape.init(.f32, &.{ 1, 4 }));
+    const placed = try convertNode(allocator, &builder, &op, &.{ concrete, target }, null);
+    try std.testing.expectEqualSlices(i64, &dimensions, graph.node(placed).output_shape.dims[0..2]);
+    try std.testing.expectEqualSlices(NodeId, &.{concrete}, graph.node(placed).getInputs());
+
+    const symbolic = try builder.parameter("symbolic", Shape.init(.f32, &.{ 1, -1 }));
+    const dynamic = try convertNode(allocator, &builder, &op, &.{ symbolic, target }, null);
+    try std.testing.expectEqualSlices(NodeId, &.{ symbolic, target }, graph.node(dynamic).getInputs());
+}
+
 test "convertNode GatherElements preserves elementwise semantics" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -7425,6 +7545,43 @@ test "convertNode Reshape infers split axis when target has two symbolic dims" {
     try std.testing.expectEqual(@as(i64, 64), out_shape.dim(1));
     try std.testing.expectEqual(@as(i64, 4), out_shape.dim(2));
     try std.testing.expectEqual(@as(i64, 32), out_shape.dim(3));
+}
+
+test "contiguous suffix Slice narrows the indices before relative-bias Gather" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const table = try b.parameter("table", Shape.init(.f32, &.{ 32, 8 }));
+    const positions = try b.parameter("positions", Shape.init(.i64, &.{ 4, 4 }));
+    const gathered = try convertGather(&b, &.{ .op_type = "Gather" }, &.{ table, positions });
+    const head_first = try b.transpose(gathered, &.{ 2, 0, 1 });
+    const batched = try b.reshape(head_first, Shape.init(.f32, &.{ 1, 8, 4, 4 }));
+    const sliced = (try projectContiguousSlice(&b, batched, .{
+        .num_axes = 4,
+        .starts = .{ 0, 0, 3, 0, 0, 0, 0, 0 },
+        .limits = .{ 1, 8, 4, 4, 0, 0, 0, 0 },
+    }, Shape.init(.f32, &.{ 1, 8, 1, 4 }))).?;
+    const transpose = g.node(g.node(sliced).inputs[0]);
+    const gather = g.node(transpose.inputs[0]);
+    try std.testing.expectEqual(.gather, std.meta.activeTag(gather.op));
+    try std.testing.expectEqual(table, gather.inputs[0]);
+    try std.testing.expect(gather.output_shape.eq(Shape.init(.f32, &.{ 1, 4, 8 })));
+    const indices = g.node(gather.inputs[1]);
+    try std.testing.expectEqual(positions, indices.inputs[0]);
+    try std.testing.expectEqual(@as(i64, 3), indices.op.slice.starts[0]);
+}
+
+test "convertNode Constant preserves empty floating-point cache geometry" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    var shape = [_]i64{ 0, 8, 1, 64 };
+    var attr = [_]AttributeProto{.{ .name = "value", .attr_type = .tensor, .t = .{ .dims = &shape, .data_type = .float32 } }};
+    const result = g.node(try convertConstant(a, &b, &.{ .op_type = "Constant", .attributes = &attr }));
+    try std.testing.expect(result.output_shape.eq(Shape.init(.f32, &shape)));
+    try std.testing.expectEqual(@as(u32, 0), result.op.constant.data_len);
 }
 
 test "convertNode Slice" {
@@ -7849,7 +8006,14 @@ test "convertNode Gelu emits fused" {
     const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
     const node = NodeProto{ .op_type = "Gelu" };
     const result = try convertNode(allocator, &b, &node, &.{x}, null);
-    try std.testing.expect(g.node(result).op.isFused());
+    try std.testing.expect(g.node(result).op == .fused_gelu_exact);
+    var approximate_attrs = [_]proto.AttributeProto{.{ .name = "approximate", .s = "tanh" }};
+    const approximate = NodeProto{ .op_type = "Gelu", .attributes = &approximate_attrs };
+    const tanh_result = try convertNode(allocator, &b, &approximate, &.{x}, null);
+    try std.testing.expect(g.node(tanh_result).op == .fused_gelu);
+    var unsupported_attrs = [_]proto.AttributeProto{.{ .name = "approximate", .s = "other" }};
+    const unsupported = NodeProto{ .op_type = "Gelu", .attributes = &unsupported_attrs };
+    try std.testing.expectError(error.InvalidAttribute, convertNode(allocator, &b, &unsupported, &.{x}, null));
 }
 
 test "convertNode Softmax emits fused" {
@@ -8449,7 +8613,7 @@ test "convertNodeWithScope Loop body captures outer-scope value" {
         .{ .name = "v_in" },
     };
     var body_outputs = [_]proto.ValueInfoProto{
-        .{ .name = "cond_out" },
+        .{ .name = "cond_in" },
         .{ .name = "v_out" },
     };
     _ = &body_nodes;
@@ -8523,7 +8687,7 @@ test "convertNode Loop unrolls constant iterations" {
         .{ .name = "v_in" },
     };
     var body_outputs = [_]proto.ValueInfoProto{
-        .{ .name = "cond_out" },
+        .{ .name = "cond_in" },
         .{ .name = "v_out" },
     };
     _ = &body_nodes;
@@ -8940,4 +9104,61 @@ test "convertNode GatherND infers coordinate slices and validates batch dimensio
     const bad_depth = try b.parameter("bad_depth", Shape.init(.i64, &.{ 5, 4 }));
     const unbatched = NodeProto{ .op_type = "GatherND" };
     try std.testing.expectError(error.InvalidAttribute, convertNode(a, &b, &unbatched, &.{ data, bad_depth }, null));
+}
+
+test "control flow Loop honors conditions and rejects incomplete semantics" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const trip = try b.scalarConst(.i64, 3);
+    const yes = try b.scalarConst(.bool_, 1);
+    const no = try b.scalarConst(.bool_, 0);
+    const x = try b.parameter("x", Shape.init(.f32, &.{4}));
+    const dynamic = try b.parameter("condition", Shape.scalar(.bool_));
+    var body_inputs = [_]proto.ValueInfoProto{ .{ .name = "i" }, .{ .name = "cond" }, .{ .name = "value" } };
+    var body_outputs = [_]proto.ValueInfoProto{ .{ .name = "cond" }, .{ .name = "out" } };
+    var body_in = [_][]const u8{ "value", "value" };
+    var body_out = [_][]const u8{"out"};
+    var nodes = [_]NodeProto{.{ .op_type = "Add", .inputs = &body_in, .outputs = &body_out }};
+    var attrs = [_]AttributeProto{.{ .name = "body", .attr_type = .graph, .g = .{ .nodes = &nodes, .inputs = &body_inputs, .outputs = &body_outputs } }};
+    const loop = NodeProto{ .op_type = "Loop", .attributes = &attrs };
+    try std.testing.expectEqual(x, try convertNode(a, &b, &loop, &.{ trip, no, x }, null));
+    try std.testing.expectError(error.UnsupportedOp, convertNode(a, &b, &loop, &.{ trip, dynamic, x }, null));
+    nodes[0].op_type = "UnimplementedBodyOp";
+    try std.testing.expectError(error.UnsupportedOp, convertNode(a, &b, &loop, &.{ trip, yes, x }, null));
+    nodes[0].op_type = "Add";
+    body_in[0] = "unresolved";
+    try std.testing.expectError(error.MissingInput, convertNode(a, &b, &loop, &.{ trip, yes, x }, null));
+    body_in[0] = "value";
+    // The body can stop after its first iteration, with a captured constant.
+    var outer_names: std.StringHashMapUnmanaged(NodeId) = .empty;
+    defer outer_names.deinit(a);
+    try outer_names.put(a, "stop", no);
+    const scope = NameScope{ .map = &outer_names };
+    body_outputs[0].name = "stop";
+    const once = try convertNodeWithScope(a, &b, &loop, &.{ trip, yes, x }, null, &scope);
+    try std.testing.expectEqual(x, graph.node(once).inputs[0]);
+    try std.testing.expectEqual(x, graph.node(once).inputs[1]);
+    // A missing body output cannot leave the previous carried value in place.
+    body_outputs[1].name = "missing";
+    try std.testing.expectError(error.MissingInput, convertNodeWithScope(a, &b, &loop, &.{ trip, yes, x }, null, &scope));
+}
+
+test "ONNX division by sqrt exposes inverse root without changing broadcast rank" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 1 }));
+    const one = try b.scalarConst(.f32, 1);
+    const root = try b.sqrt(x);
+    const inverse = g.node(try convertDiv(&b, one, root));
+    try std.testing.expectEqual(.rsqrt, std.meta.activeTag(inverse.op));
+    try std.testing.expectEqual(x, inverse.inputs[0]);
+
+    const higher_rank_one = try b.reshape(one, Shape.init(.f32, &.{ 1, 1, 1 }));
+    const broadcast = g.node(try convertDiv(&b, higher_rank_one, root));
+    try std.testing.expectEqual(.div, std.meta.activeTag(broadcast.op));
+    try std.testing.expectEqual(@as(u8, 3), broadcast.output_shape.rank());
 }

@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stddef.h>
 
 // The callback borrows an NV12 or P016 surface on the caller's CUDA context/stream.
 // It must finish reading before returning. No pixels ever cross the host ABI.
@@ -25,6 +26,14 @@ typedef int (*frame_callback)(void *, uint64_t, unsigned, unsigned, unsigned,
                              int64_t, unsigned, unsigned, unsigned, unsigned);
 typedef int (*reserve_decoder)(void *, unsigned, unsigned, unsigned, unsigned);
 typedef void (*release_decoder)(void *);
+// Immutable parser result. This carries no decoder, stream, callback or IO.
+// Kept in lockstep with video_cache_budget.Sequence's explicit C ABI.
+typedef struct {
+    uint32_t width, height, coded_width, coded_height, surfaces;
+    uint32_t codec, display_left, display_top, matrix, full_range, bit_depth, transfer;
+} AntflyNvdecSequence;
+_Static_assert(sizeof(AntflyNvdecSequence) == 48, "NVDEC sequence ABI");
+_Static_assert(offsetof(AntflyNvdecSequence, bit_depth) == 40 && offsetof(AntflyNvdecSequence, transfer) == 44, "NVDEC sequence field ABI");
 typedef struct {
     void *library, *user;
     void *budget_user;
@@ -36,12 +45,17 @@ typedef struct {
     CUstream stream;
     frame_callback frame;
     unsigned width, height, matrix, full_range, coded_width, coded_height, bit_depth, transfer;
-    int failed, sequence_seen;
+    int failed, sequence_seen, probing, probe_done, require_prepared_sequence;
+    AntflyNvdecSequence prepared_sequence;
+    unsigned remaining_pictures;
     unsigned surfaces, expected_width, expected_height;
     cudaVideoCodec codec, expected_codec;
     int display_left, display_top, matrix_override, range_override, transfer_override, primaries_override;
     unsigned sar_h, sar_v;
     int aspect_declared;
+    int single_picture_packet, decoded_in_packet;
+    int64_t packet_tag, surface_tag[32];
+    unsigned tagged_surfaces;
     tcuvidCreateVideoParser *create_parser;
     tcuvidDestroyVideoParser *destroy_parser;
     tcuvidParseVideoData *parse;
@@ -83,10 +97,10 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     if (d->primaries_override >= 0) primaries = d->primaries_override;
     // HDR tone mapping needs an explicit, consistent gamut, as the portable policy does.
     int hdr = transfer == 16 || transfer == 18;
-    if (w == 0 || h == 0 || w % 2 || h % 2 || w > 4096 || h > 4096 || w != d->expected_width || h != d->expected_height ||
+    if (f->coded_width > 4096 || f->coded_height > 4096 || f->min_num_decode_surfaces > 32) { d->failed = 7; return 0; }
+    if (w == 0 || h == 0 || w % 2 || h % 2 || w != d->expected_width || h != d->expected_height ||
         f->codec != d->expected_codec || !f->progressive_sequence || f->chroma_format != cudaVideoChromaFormat_420 ||
         (bit_depth != 8 && bit_depth != 10) || f->bit_depth_chroma_minus8 != f->bit_depth_luma_minus8 ||
-        f->coded_width > 4096 || f->coded_height > 4096 ||
         f->display_area.left < 0 || f->display_area.top < 0 ||
         f->display_area.right > (int)f->coded_width || f->display_area.bottom > (int)f->coded_height ||
         // A declared container aspect wins. Without one, this came from the stream's
@@ -97,7 +111,19 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
              : ((matrix != 1 && matrix != 2 && matrix != 5 && matrix != 6) ||
                 (primaries != 1 && primaries != 2 && primaries != 5 && primaries != 6) ||
                 (transfer != 1 && transfer != 2 && transfer != 6 && transfer != 13))) ||
-        !f->min_num_decode_surfaces || f->min_num_decode_surfaces > 32) { d->failed = 2; return 0; }
+        !f->min_num_decode_surfaces) { d->failed = 2; return 0; }
+    AntflyNvdecSequence observed = { w, h, f->coded_width, f->coded_height,
+        f->min_num_decode_surfaces, (uint32_t)f->codec, (uint32_t)f->display_area.left,
+        (uint32_t)f->display_area.top, matrix, full_range, bit_depth, transfer };
+    if (d->require_prepared_sequence && !d->sequence_seen) {
+        const AntflyNvdecSequence *p = &d->prepared_sequence;
+        if (p->width != w || p->height != h || p->coded_width != f->coded_width ||
+            p->coded_height != f->coded_height || p->surfaces != f->min_num_decode_surfaces ||
+            p->codec != (uint32_t)f->codec || p->display_left != (uint32_t)f->display_area.left ||
+            p->display_top != (uint32_t)f->display_area.top || p->matrix != matrix || p->full_range != full_range || p->bit_depth != bit_depth || p->transfer != transfer) {
+            d->failed = 2; return 0; // before old destruction, reserve or decode
+        }
+    }
     // Never silently reinterpret a stream whose geometry or color changes.
     int compatible = d->codec == f->codec && d->width == w && d->height == h && d->coded_width == f->coded_width &&
         d->coded_height == f->coded_height && d->surfaces >= f->min_num_decode_surfaces && d->bit_depth == bit_depth &&
@@ -109,19 +135,38 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
         return d->surfaces;
     }
     d->sequence_seen = 1;
+    if (d->probing) {
+        // Header parsing only: no caps query, decoder allocation, mapped
+        // surface or caller callback. The shared validator above is identical.
+        d->width = w; d->height = h; d->coded_width = f->coded_width; d->coded_height = f->coded_height;
+        d->matrix = matrix; d->full_range = full_range; d->bit_depth = bit_depth; d->transfer = transfer;
+        d->display_left = f->display_area.left; d->display_top = f->display_area.top;
+        d->surfaces = f->min_num_decode_surfaces; d->codec = f->codec;
+        d->prepared_sequence = observed;
+        return d->surfaces;
+    }
+    if (d->require_prepared_sequence && d->decoder && !compatible) {
+        d->failed = 2; return 0; // typed owner must retire incompatible old SDK first
+    }
     if (d->decoder && compatible) {
         d->matrix = matrix; d->full_range = full_range; d->transfer = transfer;
         return d->surfaces;
     }
-    if (d->decoder) { d->destroy_decoder(d->decoder); d->decoder = NULL; release_budget(d); }
+    if (d->decoder) {
+        if (d->destroy_decoder(d->decoder) != CUDA_SUCCESS) { d->failed = 3; return 0; }
+        d->decoder = NULL;
+        release_budget(d);
+    }
     CUVIDDECODECAPS caps = {0};
     caps.eCodecType = f->codec; caps.eChromaFormat = f->chroma_format; caps.nBitDepthMinus8 = f->bit_depth_luma_minus8;
     cudaVideoSurfaceFormat output = bit_depth == 10 ? cudaVideoSurfaceFormat_P016 : cudaVideoSurfaceFormat_NV12;
     if (d->caps(&caps) || !caps.bIsSupported || !(caps.nOutputFormatMask & (1u << output)) ||
-        f->coded_width > caps.nMaxWidth || f->coded_height > caps.nMaxHeight ||
-        f->coded_width < caps.nMinWidth || f->coded_height < caps.nMinHeight ||
-        ((f->coded_width+15)/16)*((f->coded_height+15)/16) > caps.nMaxMBCount) {
+        f->coded_width < caps.nMinWidth || f->coded_height < caps.nMinHeight) {
         d->failed = 2; return 0;
+    }
+    if (f->coded_width > caps.nMaxWidth || f->coded_height > caps.nMaxHeight ||
+        ((f->coded_width + 15) / 16) * ((f->coded_height + 15) / 16) > caps.nMaxMBCount) {
+        d->failed = 7; return 0;
     }
     CUVIDDECODECREATEINFO c = {0};
     c.CodecType = f->codec; c.ChromaFormat = f->chroma_format;
@@ -139,7 +184,15 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
         d->failed = 6; return 0;
     }
     d->budget_live = 1;
-    if (d->create_decoder(&d->decoder, &c)) { release_budget(d); d->failed = 3; return 0; }
+    if (d->create_decoder(&d->decoder, &c)) {
+        // A failed driver may still return an owned endpoint. Typed cleanup
+        // never refunds the prepared envelope before checking its actual death.
+        if (d->decoder) {
+            if (d->destroy_decoder(d->decoder) != CUDA_SUCCESS) { d->failed = 3; return 0; }
+            d->decoder = NULL;
+        }
+        release_budget(d); d->failed = 3; return 0;
+    }
     d->width = w; d->height = h; d->coded_width = f->coded_width; d->coded_height = f->coded_height;
     d->matrix = matrix; d->full_range = full_range; d->bit_depth = bit_depth; d->transfer = transfer;
     d->display_left = f->display_area.left; d->display_top = f->display_area.top;
@@ -149,15 +202,35 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
 }
 static int decode(void *opaque, CUVIDPICPARAMS *picture) {
     Decoder *d = opaque;
+    if (d->probing) { d->probe_done = 1; return 0; } // stop before first HW decode
+    if (!d->remaining_pictures) { d->failed = 7; return 0; }
+    --d->remaining_pictures;
+    // Parser timestamps are presentation clocks. They can be reassigned when
+    // the input numbers are opaque packet IDs and B pictures are reordered.
+    // Associate an access unit with the decoder surface it actually produced.
+    if (d->expected_codec != cudaVideoCodec_AV1) {
+        int slot = picture->CurrPicIdx;
+        if (!d->single_picture_packet || d->decoded_in_packet || slot < 0 || slot >= 32) { d->failed = 2; return 0; }
+        d->decoded_in_packet = 1;
+        d->surface_tag[slot] = d->packet_tag;
+        d->tagged_surfaces |= 1u << slot;
+    }
     if (d->decode(d->decoder, picture)) { d->failed = 3; return 0; }
     return 1;
 }
 static int display(void *opaque, CUVIDPARSERDISPINFO *picture) {
     Decoder *d = opaque;
-    if (!picture) return 1;
+    if (!picture || d->probing) return 1;
     if (!picture->progressive_frame) { d->failed = 2; return 0; }
-    // Ask whether this presentation timestamp is wanted before mapping a surface.
-    int wanted = d->frame(d->user, 0, 0, d->width, d->height, picture->timestamp, d->matrix, d->full_range, d->bit_depth, d->transfer);
+    int64_t tag = picture->timestamp;
+    if (d->expected_codec != cudaVideoCodec_AV1) {
+        int slot = picture->picture_index;
+        if (slot < 0 || slot >= 32 || !(d->tagged_surfaces & (1u << slot))) { d->failed = 2; return 0; }
+        tag = d->surface_tag[slot];
+        d->tagged_surfaces &= ~(1u << slot);
+    }
+    // Ask whether the displayed picture is wanted before mapping a surface.
+    int wanted = d->frame(d->user, 0, 0, d->width, d->height, tag, d->matrix, d->full_range, d->bit_depth, d->transfer);
     if (wanted < 0) { d->failed = 4; return 0; }
     if (!wanted) return 1;
     CUVIDPROCPARAMS p = {0};
@@ -170,29 +243,62 @@ static int display(void *opaque, CUVIDPARSERDISPINFO *picture) {
         status.decodeStatus == cuvidDecodeStatus_Error || status.decodeStatus == cuvidDecodeStatus_Error_Concealed) {
         d->unmap(d->decoder, device); d->failed = 3; return 0;
     }
-    int ok = d->frame(d->user, device, pitch, d->width, d->height, picture->timestamp, d->matrix, d->full_range, d->bit_depth, d->transfer);
+    int ok = d->frame(d->user, device, pitch, d->width, d->height, tag, d->matrix, d->full_range, d->bit_depth, d->transfer);
     int unmapped = d->unmap(d->decoder, device);
     if (ok < 0 || unmapped) { d->failed = 4; return 0; }
     return 1;
 }
-void antfly_nvdec_close(Decoder *d) {
-    if (!d) return;
-    if (d->parser) d->destroy_parser(d->parser);
-    if (d->decoder) d->destroy_decoder(d->decoder);
-    release_budget(d);
-    if (d->library) dlclose(d->library);
+static int close_decoder(Decoder *d) {
+    if (!d) return 0;
+    if (d->parser) {
+        CUresult status = d->destroy_parser(d->parser);
+        if (status != CUDA_SUCCESS) return 3;
+        d->parser = NULL;
+    }
+    if (d->decoder) {
+        CUresult status = d->destroy_decoder(d->decoder);
+        if (status != CUDA_SUCCESS) return 3;
+        d->decoder = NULL;
+    }
+    if (d->library) {
+        int status = dlclose(d->library);
+        if (status != 0) return 3;
+        d->library = NULL;
+    }
+    release_budget(d); // strict retirement follows actual surface/SDK death
     free(d);
+    return 0;
+}
+int antfly_nvdec_close_checked(Decoder *d) { return close_decoder(d); }
+// Exact idle decoder budget ownership, not a pointer into the context's next
+// decoder generation. No SDK operation, allocation or supplier callback here.
+int antfly_nvdec_retirement_ready(Decoder *d, void *expected_user, release_decoder expected_release) {
+    return d && !d->parser && !d->user && !d->frame &&
+        d->budget_user == expected_user && d->release_budget == expected_release;
+}
+int antfly_nvdec_detach_budget(Decoder *d, void *expected_user, release_decoder expected_release,
+                             void *new_user, release_decoder new_release) {
+    if (!antfly_nvdec_retirement_ready(d, expected_user, expected_release)) return 0;
+    d->budget_user = new_user;
+    d->reserve_budget = NULL; // retired decoder can only be destroyed
+    d->release_budget = new_release;
+    return 1;
 }
 int antfly_nvdec_open(Decoder **out, void *stream, void *user, frame_callback callback) {
+    if (!out) return 5;
+    *out = NULL;
     Decoder *d = calloc(1, sizeof(*d));
     if (!d) return 5;
+    // Publish ownership BEFORE every fallible library/SDK-metadata step. The
+    // Zig owner checked-closes this exact partial object on any open failure.
+    *out = d;
     d->stream = stream; d->user = user; d->frame = callback;
     // Zig's debug allocator caches DSO unwind metadata. Keep libnvcuvid's code
     // and .eh_frame mapped after dlclose so later stack captures cannot follow
     // stale metadata between independently owned CUDA contexts.
     d->library = dlopen("libnvcuvid.so.1", RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
-    if (!d->library) { antfly_nvdec_close(d); return 1; }
-#define LOAD(field, symbol) if (!(d->field = dlsym(d->library, symbol))) { antfly_nvdec_close(d); return 1; }
+    if (!d->library) return 1;
+#define LOAD(field, symbol) if (!(d->field = dlsym(d->library, symbol))) return 1;
     LOAD(create_parser,"cuvidCreateVideoParser") LOAD(destroy_parser,"cuvidDestroyVideoParser")
     LOAD(parse,"cuvidParseVideoData") LOAD(caps,"cuvidGetDecoderCaps")
     LOAD(create_decoder,"cuvidCreateDecoder") LOAD(destroy_decoder,"cuvidDestroyDecoder")
@@ -203,13 +309,14 @@ int antfly_nvdec_open(Decoder **out, void *stream, void *user, frame_callback ca
 }
 // The previous request must have drained EOS before reuse. A new parser owns
 // the new stream's reference-picture state; compatible decoder surfaces persist.
-int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int codec, int matrix, int range, int transfer, int primaries, unsigned sar_h, unsigned sar_v, int aspect_declared) {
+int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int codec, int matrix, int range, int transfer, int primaries, unsigned sar_h, unsigned sar_v, int aspect_declared, unsigned picture_limit) {
     if (d->parser) return 3;
     if (codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC && codec != cudaVideoCodec_AV1) return 2;
     d->stream = stream; d->user = user; d->frame = callback;
-    d->failed = 0; d->sequence_seen = 0;
+    d->failed = 0; d->sequence_seen = 0; d->tagged_surfaces = 0; d->probing = 0; d->probe_done = 0;
     d->expected_width = width; d->expected_height = height; d->matrix_override = matrix; d->range_override = range;
     d->transfer_override = transfer; d->primaries_override = primaries; d->sar_h = sar_h; d->sar_v = sar_v; d->aspect_declared = aspect_declared;
+    d->remaining_pictures = picture_limit;
     d->expected_codec = codec;
     CUVIDPARSERPARAMS p = {0};
     p.CodecType = codec; p.ulMaxNumDecodeSurfaces = 1;
@@ -217,15 +324,56 @@ int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback call
     p.pUserData = d; p.pfnSequenceCallback = sequence; p.pfnDecodePicture = decode; p.pfnDisplayPicture = display;
     return d->create_parser(&d->parser, &p) ? 3 : 0;
 }
-void antfly_nvdec_finish(Decoder *d) {
-    if (d->parser) d->destroy_parser(d->parser);
-    d->parser = NULL; d->user = NULL; d->frame = NULL;
+// Probe owns a separate ordinary parser header and never enters the live
+// decoder cache. Caller supplies current-device lifetime, no stream work.
+int antfly_nvdec_probe_begin(Decoder *d, unsigned width, unsigned height, int codec, int matrix, int range, int transfer, int primaries, unsigned sar_h, unsigned sar_v, int aspect_declared) {
+    if (!d || d->decoder || d->budget_live) return 3;
+    int result = antfly_nvdec_begin(d, NULL, NULL, NULL, width, height, codec, matrix, range, transfer, primaries, sar_h, sar_v, aspect_declared, 0);
+    if (result == 0) d->probing = 1;
+    return result;
 }
+int antfly_nvdec_probe_result(Decoder *d, AntflyNvdecSequence *out) {
+    if (!d || !out || !d->probing || !d->sequence_seen || d->failed) return 0;
+    *out = d->prepared_sequence;
+    return 1;
+}
+int antfly_nvdec_expect_sequence(Decoder *d, const AntflyNvdecSequence *expected) {
+    if (!d || d->parser || d->probing) return 0;
+    d->require_prepared_sequence = expected != NULL;
+    if (expected) d->prepared_sequence = *expected;
+    return 1;
+}
+int antfly_nvdec_sequence_matches(Decoder *d, const AntflyNvdecSequence *p) {
+    if (!d || !p || d->parser || d->probing || !d->decoder) return 0;
+    return d->width == p->width && d->height == p->height &&
+        d->coded_width == p->coded_width && d->coded_height == p->coded_height &&
+        d->surfaces >= p->surfaces && (uint32_t)d->codec == p->codec &&
+        d->display_left == (int)p->display_left && d->display_top == (int)p->display_top &&
+        d->bit_depth == p->bit_depth && d->transfer == p->transfer;
+}
+static int finish_parser(Decoder *d) {
+    // Preserve a failed SDK handle for checked retirement. Losing it here
+    // would falsely certify an idle decoder while its parser is still live.
+    if (d->parser && d->destroy_parser(d->parser) != CUDA_SUCCESS) {
+        d->failed = 3;
+        d->user = NULL; d->frame = NULL;
+        return 3;
+    }
+    d->parser = NULL; d->user = NULL; d->frame = NULL;
+    return 0;
+}
+int antfly_nvdec_finish_checked(Decoder *d) { return finish_parser(d); }
 
-int antfly_nvdec_packet(Decoder *d, const unsigned char *bytes, unsigned size, int64_t pts, int eos) {
+enum parser_packet_kind { PACKET_CONFIGURATION, PACKET_END_OF_STREAM, PACKET_SAMPLE };
+int antfly_nvdec_packet(Decoder *d, const unsigned char *bytes, unsigned size, int64_t pts, enum parser_packet_kind kind) {
     CUVIDSOURCEDATAPACKET p = {0};
-    p.flags = eos ? CUVID_PKT_ENDOFSTREAM : CUVID_PKT_TIMESTAMP;
+    d->single_picture_packet = kind == PACKET_SAMPLE && d->expected_codec != cudaVideoCodec_AV1;
+    d->packet_tag = pts;
+    d->decoded_in_packet = 0;
+    p.flags = kind == PACKET_END_OF_STREAM ? CUVID_PKT_ENDOFSTREAM : kind == PACKET_SAMPLE ? CUVID_PKT_TIMESTAMP : 0;
+    if (d->single_picture_packet) p.flags |= CUVID_PKT_ENDOFPICTURE;
     p.payload = bytes; p.payload_size = size; p.timestamp = pts;
     int result = d->parse(d->parser, &p);
+    if (d->probing && d->probe_done && !d->failed) return 8; // intentional no-decode stop
     return d->failed ? d->failed : (result ? 3 : 0);
 }

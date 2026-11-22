@@ -74,6 +74,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     RaftBatchWriteOutcomeUnknown,
     OnlineMergeArtifactCatalogUncoordinated,
     DecisionConflict,
+    DecisionNotProposed,
     TransactionConflict,
     TransactionTooLarge,
     EnrichmentWaitCanceled,
@@ -550,6 +551,8 @@ pub const Operations = struct {
                 .{ .ignore_unknown_fields = false },
             ) catch return error.InvalidArgument;
             parsed_fence.?.value.validate() catch return error.InvalidArgument;
+            if (parsed_fence.?.value.protocol == metadata_api.CatalogRouteFence.decision_protocol and
+                (input.transaction == null or input.transaction.? != .resolve)) return error.InvalidArgument;
             if (parsed_fence.?.value.route.group_id != group_id) return error.InvalidArgument;
             parsed_fence.?.value.admission_deadline_ns = request.deadline_ns;
             parsed_fence.?.value.admission_deadline_io = request.deadline_io;
@@ -657,6 +660,7 @@ pub const Operations = struct {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
+            error.DecisionNotProposed => return error.DecisionNotProposed,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
@@ -722,9 +726,24 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            // All four are raised before any Raft proposal for this txn: a
+            // leader/term/incarnation check (NotLeader) or a stale/unavailable
+            // local catalog snapshot (CatalogRoutingSnapshotTimeout), same as
+            // the two below. Nothing was proposed, so GroupLeaderUnavailable's
+            // "definitely not proposed, safe to retry another candidate or
+            // wait" contract holds. Omitting NotLeader/CatalogRoutingSnapshotTimeout
+            // here previously fell through to the generic `error.Internal` ->
+            // HTTP 500 below, which a client cannot safely retry (a 500 does
+            // not prove nothing was applied) -- turning an ordinary transient
+            // "not currently the leader" or "catalog view not yet caught up"
+            // condition (e.g. right after a Raft leader election following a
+            // network partition) into a permanent failure for the whole
+            // cross-group transaction.
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.MetadataSnapshotUnavailable,
+            error.NotLeader,
+            error.CatalogRoutingSnapshotTimeout,
             => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
@@ -749,6 +768,7 @@ pub const Operations = struct {
             const validator = self.txn_validator orelse return error.Unavailable;
             validator.validate(request, table_name, input.req.writes) catch |err| switch (err) {
                 error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+                error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
                 error.TableNotFound => return error.NotFound,
                 error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
                 error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
@@ -770,6 +790,7 @@ pub const Operations = struct {
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -782,9 +803,15 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            // See the matching comment in txnBegin: NotLeader and
+            // CatalogRoutingSnapshotTimeout are both raised before this
+            // prepare is proposed and belong in the same "definitely not
+            // proposed" bucket as the three below.
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.MetadataSnapshotUnavailable,
+            error.NotLeader,
+            error.CatalogRoutingSnapshotTimeout,
             => return error.GroupLeaderUnavailable,
             else => {
                 // One registry drives Raft terminal results and participant
@@ -803,6 +830,7 @@ pub const Operations = struct {
         _ = (distributed_txn.resolveGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
             error.OnlineSourcePinPending => return error.EnrichmentRetryInProgress,
             error.RetainedEffectsFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
+            error.DecisionNotProposed => return error.DecisionNotProposed,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -1539,6 +1567,8 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
+            source.failure = error.StorageReadTemporarilyUnavailable;
+            try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             const execution_errors = @import("antfly_local_sources").schema_relational_expression_errors.Error || @import("relational_row_errors.zig").PolicyError;
             inline for (@typeInfo(execution_errors).error_set.error_names.?) |field| {
                 source.failure = @field(execution_errors, field);
@@ -1822,6 +1852,39 @@ fn consumerTests() type {
                 "docs",
                 .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
             ));
+
+            // NotLeader (a leader/term/incarnation check failing before any
+            // proposal) and CatalogRoutingSnapshotTimeout (a stale/unavailable
+            // local catalog snapshot, also checked before proposing) are both
+            // raised pre-decision, the same as LeaderUnavailable and
+            // MetadataSnapshotUnavailable above. A network partition that
+            // forces a Raft leader election, or otherwise disrupts catalog
+            // sync, routinely produces these on the node a client happens to
+            // have cached as "the leader." Regression for a prior gap where
+            // both fell through to the generic error.Internal (-> HTTP 500),
+            // which a client cannot safely retry against another candidate
+            // (a 500 does not prove nothing was applied) -- turning an
+            // ordinary transient condition into a permanent failure for the
+            // whole cross-group transaction instead of the "definitely not
+            // proposed, try the next candidate or wait" GroupLeaderUnavailable
+            // contract.
+            for ([_]anyerror{ error.NotLeader, error.CatalogRoutingSnapshotTimeout }) |failure| {
+                context_deadline_source.failure = failure;
+                try std.testing.expectError(error.GroupLeaderUnavailable, context_deadline_operations.txnBegin(
+                    std.testing.allocator,
+                    .{},
+                    7,
+                    "docs",
+                    .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+                ));
+                try std.testing.expectError(error.GroupLeaderUnavailable, context_deadline_operations.txnPrepare(
+                    std.testing.allocator,
+                    .{},
+                    7,
+                    "docs",
+                    .{ .txn_id = txn_id, .req = .{} },
+                ));
+            }
         }
 
         test "typed routed batch preserves forwarding cancellation and identity conflicts" {

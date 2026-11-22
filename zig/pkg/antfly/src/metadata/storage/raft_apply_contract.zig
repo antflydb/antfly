@@ -280,6 +280,7 @@ pub const CatalogProjectionRequest = union(enum) {
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
     catalog_graph_authority: @import("../../system_catalog/server_call.zig").GraphAuthority,
     catalog_read: system_catalog.Read,
+    catalog_policy_definition: system_catalog.PolicyRead,
     catalog_export: void,
     catalog_export_standalone_portable: void,
     catalog_list_tables: system_catalog.TableList,
@@ -300,6 +301,7 @@ pub const CatalogProjectionRequest = union(enum) {
     report_cursor: u64,
     read_control_stores: []const u64,
     owner_readiness: @import("../api.zig").OwnerReadinessRequest,
+    decision_admission: @import("../api.zig").DecisionAdmissionRequest,
     owner_readiness_transitions: @import("../api.zig").OwnerReadinessRequest,
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
@@ -330,4 +332,5 @@ pub const CatalogProjectionRequest = union(enum) {
     store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
     has_index_alias_lifecycle_state: void,
+    policy_create_has_capacity: void,
 };

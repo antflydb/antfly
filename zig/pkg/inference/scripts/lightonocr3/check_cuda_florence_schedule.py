@@ -34,7 +34,7 @@ def main():
     parser.add_argument(
         "--source",
         type=Path,
-        default=package / "src/ops/cuda/prototypes/florence_fused.cu",
+        default=package / "src/ops/cuda/prototypes/vision_f16_programs.cu",
     )
     parser.add_argument(
         "--output-dir", type=Path, default=repository / ".cache/florence-cuda-schedule"

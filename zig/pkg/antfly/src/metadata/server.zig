@@ -121,9 +121,13 @@ const MetadataSessions = struct {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return svc.localMetadataLeadershipTerm();
     }
-    fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64) !void {
+    fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64, submitted: *bool) !bool {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .apply_transaction_sessions = bytes }, expected_term);
+        const receipt = try svc.proposeSessionCommandObserved(bytes, expected_term, submitted);
+        const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
+        var txn = try projected.openSessionRead(svc.alloc, svc.metadata_group_id);
+        defer txn.abort();
+        return @import("transaction_session_record.zig").readApplyResult(&txn, svc.alloc, svc.metadata_group_id, receipt.term, receipt.index);
     }
 };
 
@@ -990,13 +994,15 @@ fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []co
 fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const protocol = @import("topology_protocol.zig");
-    const required_version = if (try restore_jobs.requiresPinnedRestoreWorker(alloc, value)) protocol.pinned_restore_job_version else protocol.coordinated_lifecycle_version;
+    const guard = try @import("restore_staging.zig").PlanGuard.read(alloc, plan_json);
+    const required_version = if (guard.expected_incarnation != null) protocol.guarded_generation_admission_version else if (try restore_jobs.requiresPinnedRestoreWorker(alloc, value)) protocol.pinned_restore_job_version else protocol.coordinated_lifecycle_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
-    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } }, leadership_term);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    try store.requireMetadataIncarnation(svc.metadata_group_id, guard.expected_incarnation);
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } }, leadership_term);
     return (try store.getRestoreJobRecord(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
 }
 

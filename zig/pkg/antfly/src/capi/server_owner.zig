@@ -2130,6 +2130,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.graphAuthority(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .catalog_policy_definition => |input| {
+                    const value = handle.store.policyDefinitionRead(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .catalog_read => |input| {
                     const value = handle.store.systemCatalogRead(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2216,6 +2220,15 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.reportBaselineProgressForKey(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .decision_admission => |input| {
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
+                    const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{
+                        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+                        .cancellation = ownerQueryCancellation(&request.control),
+                    };
+                    const value = handle.store.decisionAdmission(a, group_id, input, budget) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .owner_readiness => |input| {
                     if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{
@@ -2288,6 +2301,10 @@ pub fn metadataApplyStoreProjection(
                         break :result .valid;
                     };
                     break :blk metadataProjectionJson(alloc, out_json, result);
+                },
+                .policy_create_has_capacity => {
+                    const available = handle.store.policyCreateHasCapacity(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, available);
                 },
                 .require_policy_index_mutation_allowed => |input| {
                     handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -2733,6 +2750,8 @@ const MetadataSessionRead = struct {
     alloc: Allocator,
     txn: antfly.capi_dependencies.storage_docstore.DocStore.Txn,
     prefix: []u8,
+    group: u64,
+    refs: std.atomic.Value(usize) = .init(1),
 };
 pub fn metadataSessionReadOpen(store_ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataApplyGroupRequest, out_read: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     out_read.* = null;
@@ -2753,12 +2772,13 @@ pub fn metadataSessionReadOpen(store_ptr: ?*anyopaque, request: *const kernel_ow
         owner.alloc.destroy(read);
         return storageOwnerStatusFromError(err);
     };
-    read.* = .{ .alloc = owner.alloc, .txn = txn, .prefix = owned };
+    read.* = .{ .alloc = owner.alloc, .txn = txn, .prefix = owned, .group = request.group_id };
     out_read.* = read;
     return .ok;
 }
 pub fn metadataSessionReadClose(read_ptr: ?*anyopaque) callconv(.c) void {
     const read: *MetadataSessionRead = @ptrCast(@alignCast(read_ptr orelse return));
+    if (read.refs.fetchSub(1, .acq_rel) != 1) return;
     const alloc = read.alloc;
     read.txn.abort();
     alloc.free(read.prefix);
@@ -2773,15 +2793,41 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     @memcpy(upper[0..read.prefix.len], read.prefix);
     upper[read.prefix.len - 1] += 1;
     const upper_bound = upper[0..read.prefix.len];
+    if (request.operation == .prefix_page) {
+        if (request.offset > key.len or request.length > 128) return .invalid_argument;
+        const prefix_len: usize = @intCast(request.offset);
+        const prefix = key[0..prefix_len];
+        const after = key[prefix_len..];
+        if (!std.mem.startsWith(u8, prefix, read.prefix) or prefix.len > read.prefix.len + 512 or
+            (after.len != 0 and (!std.mem.startsWith(u8, after, prefix) or after.len > read.prefix.len + 512))) return .invalid_argument;
+        metadataSessionReadPrefixPage(read, prefix, after, request.length, out_value) catch |err| return storageOwnerStatusFromError(err);
+        return .ok;
+    }
     const bounded = switch (request.operation) {
-        .get, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
+        .get, .get_range, .probe_prefix, .count_prefix, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
         else => false,
     };
     const upper_seek = request.operation == .seek_at_or_before and std.mem.eql(u8, key, upper_bound);
     if (bounded and ((!std.mem.startsWith(u8, key, read.prefix) and !upper_seek) or key.len > read.prefix.len + 512)) return .invalid_argument;
-    if (request.operation == .get) {
-        const value = read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
-        if (value.len > 32 << 20) return .invalid_argument;
+    if (request.operation == .count_prefix) {
+        const count = read.txn.countPrefix(key) catch |err| return storageOwnerStatusFromError(err);
+        const bytes = read.alloc.alloc(u8, 8) catch return .out_of_memory;
+        std.mem.writeInt(u64, bytes[0..8], count, .little);
+        out_value.* = .{ .ptr = bytes.ptr, .len = 8 };
+        return .ok;
+    }
+    if (request.operation == .probe_prefix and (request.offset != 0 or request.length > 128)) return .invalid_argument;
+    if (request.operation == .get or request.operation == .get_range or request.operation == .probe_prefix) {
+        var scope = if (request.operation != .get) read.txn.openReadScope(read.alloc) catch |err| return storageOwnerStatusFromError(err) else null;
+        defer if (scope) |*s| s.close();
+        const value = if (scope) |*s| blk: {
+            if (request.length > kernel_owner_abi.metadata_session_max_value_bytes) return .invalid_argument;
+            const session_record = @import("../metadata/transaction_session_record.zig");
+            const logical = key[read.prefix.len..];
+            const mode: session_record.RangeRead = if (request.operation == .probe_prefix) .bounded_probe else .ordinary;
+            break :blk session_record.readRange(s, read.alloc, read.group, key, logical, request.offset, request.length, mode) catch |err| return storageOwnerStatusFromError(err);
+        } else read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
+        if (value.len > kernel_owner_abi.metadata_session_max_value_bytes) return .invalid_argument;
         const copy = read.alloc.dupe(u8, value) catch return .out_of_memory;
         out_value.* = .{ .ptr = if (copy.len == 0) null else copy.ptr, .len = @intCast(copy.len) };
         return .ok;
@@ -2789,7 +2835,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     var cursor = read.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
     defer cursor.close();
     var entry = switch (request.operation) {
-        .get => unreachable,
+        .get, .get_range, .probe_prefix, .count_prefix, .prefix_page => unreachable,
         .first => cursor.seekAtOrAfter(read.prefix),
         .last => cursor.seekAtOrBefore(upper_bound),
         .next, .seek_at_or_after => cursor.seekAtOrAfter(key),
@@ -2801,8 +2847,118 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     }
     const current = entry orelse return .not_found;
     if (!std.mem.startsWith(u8, current.key, read.prefix)) return .not_found;
+    return encodeMetadataSessionCursorEntry(read, current, out_value);
+}
+
+fn metadataSessionReadPrefixPage(read: *MetadataSessionRead, prefix: []const u8, after: []const u8, length: usize, out: *kernel_owner_abi.OwnedBytes) !void {
+    var cursor = try read.txn.openPhysicalKeyCursorAdapter();
+    defer cursor.close();
+    var scope = try read.txn.openReadScope(read.alloc);
+    defer scope.close();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(read.alloc);
+    var entry = try cursor.seekAtOrAfter(if (after.len == 0) prefix else after);
+    if (entry != null and after.len != 0 and std.mem.eql(u8, entry.?.key, after)) entry = try cursor.next();
+    const session_record = @import("../metadata/transaction_session_record.zig");
+    var checked_generation = false;
+    var cache_generation: ?u64 = null;
+    var count: usize = 0;
+    while (entry) |row| {
+        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+        const value = scope.getRange(row.key, 0, length) catch |err| switch (err) {
+            error.EndOfStream, error.NotFound => &.{},
+            error.Unsupported => cached: {
+                if (!checked_generation) {
+                    cache_generation = try session_record.cachedPrefixGeneration(&scope, read.alloc, read.group);
+                    checked_generation = true;
+                }
+                const generation = cache_generation orelse break :cached &.{};
+                const cached = session_record.cachedRangeForGeneration(&scope, read.alloc, read.group, row.key[read.prefix.len..], 0, length, generation) catch |cache_err| switch (cache_err) {
+                    error.EndOfStream => null,
+                    else => return cache_err,
+                };
+                break :cached cached orelse &.{};
+            },
+            else => return err,
+        };
+        var lengths: [4]u8 = undefined;
+        std.mem.writeInt(u16, lengths[0..2], @intCast(row.key.len), .little);
+        std.mem.writeInt(u16, lengths[2..4], @intCast(value.len), .little);
+        try bytes.appendSlice(read.alloc, &lengths);
+        try bytes.appendSlice(read.alloc, row.key);
+        try bytes.appendSlice(read.alloc, value);
+        count += 1;
+        if (count == 64) break;
+        entry = try cursor.next();
+    }
+    const owned = try bytes.toOwnedSlice(read.alloc);
+    out.* = .{ .ptr = if (owned.len == 0) null else owned.ptr, .len = @intCast(owned.len) };
+}
+
+const MetadataSessionCursor = struct {
+    read: *MetadataSessionRead,
+    cursor: antfly.capi_dependencies.storage_docstore.DocStore.Txn.CursorAdapter,
+};
+
+pub fn metadataSessionCursorOpen(read_ptr: ?*anyopaque, out_cursor: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    out_cursor.* = null;
+    const read: *MetadataSessionRead = @ptrCast(@alignCast(read_ptr orelse return .invalid_argument));
+    const state = read.alloc.create(MetadataSessionCursor) catch return .out_of_memory;
+    const cursor = read.txn.openPhysicalCursorAdapter() catch |err| {
+        read.alloc.destroy(state);
+        return storageOwnerStatusFromError(err);
+    };
+    _ = read.refs.fetchAdd(1, .monotonic);
+    state.* = .{ .read = read, .cursor = cursor };
+    out_cursor.* = state;
+    return .ok;
+}
+
+pub fn metadataSessionCursorClose(ptr: ?*anyopaque) callconv(.c) void {
+    const state: *MetadataSessionCursor = @ptrCast(@alignCast(ptr orelse return));
+    const read = state.read;
+    state.cursor.close();
+    read.alloc.destroy(state);
+    metadataSessionReadClose(read);
+}
+
+pub fn metadataSessionCursorInvoke(ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataSessionReadRequest, out_value: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_value.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const state: *MetadataSessionCursor = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+    const read = state.read;
+    const key = request.key.slice();
+    var upper: [96]u8 = undefined;
+    @memcpy(upper[0..read.prefix.len], read.prefix);
+    upper[read.prefix.len - 1] += 1;
+    const upper_bound = upper[0..read.prefix.len];
+    if (request.operation == .seek_at_or_after or request.operation == .seek_at_or_before) {
+        const at_upper = request.operation == .seek_at_or_before and std.mem.eql(u8, key, upper_bound);
+        if ((!std.mem.startsWith(u8, key, read.prefix) and !at_upper) or key.len > read.prefix.len + 512) return .invalid_argument;
+    }
+    if (request.length == 1) state.cursor.setKeysOnly();
+    var entry = switch (request.operation) {
+        .first => state.cursor.seekAtOrAfter(read.prefix),
+        .last => state.cursor.seekAtOrBefore(upper_bound),
+        .next => state.cursor.next(),
+        .prev => state.cursor.prev(),
+        .seek_at_or_after => state.cursor.seekAtOrAfter(key),
+        .seek_at_or_before => state.cursor.seekAtOrBefore(key),
+        else => return .invalid_argument,
+    } catch |err| return storageOwnerStatusFromError(err);
+    if (entry) |row| {
+        if ((request.operation == .last or request.operation == .seek_at_or_before) and std.mem.eql(u8, row.key, upper_bound))
+            entry = state.cursor.prev() catch |err| return storageOwnerStatusFromError(err);
+    }
+    var row = entry orelse return .not_found;
+    if (!std.mem.startsWith(u8, row.key, read.prefix)) return .not_found;
+    if (request.length == 1) row.value = &.{};
+    return encodeMetadataSessionCursorEntry(read, row, out_value);
+}
+
+fn encodeMetadataSessionCursorEntry(read: *MetadataSessionRead, current: @import("antfly_local_sources").storage_backend_erased.Entry, out_value: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
     const size = current.key.len +| current.value.len +| 4;
-    if (size > (32 << 20) + 1024) return .invalid_argument;
+    if (size > kernel_owner_abi.metadata_session_max_value_bytes + 1024) return .invalid_argument;
     const output = read.alloc.alloc(u8, size) catch return .out_of_memory;
     std.mem.writeInt(u32, output[0..4], @intCast(current.key.len), .little);
     @memcpy(output[4..][0..current.key.len], current.key);

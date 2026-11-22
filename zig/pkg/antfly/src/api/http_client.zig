@@ -2797,6 +2797,10 @@ pub const ApiHttpClient = struct {
             }
             if (resp.status == 409) {
                 if (@import("relational_integrity_errors.zig").decode(resp.body)) |reason| return reason;
+                if (std.mem.eql(u8, resp.body, "decision not proposed")) {
+                    if (outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)) return error.DecisionNotProposed;
+                    return error.RaftBatchWriteOutcomeUnknown;
+                }
                 if (std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "OnlineMergeArtifactCatalogUncoordinated")) {
                     if (forwarding != null and (outcome == null or
                         !std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
@@ -3434,6 +3438,7 @@ pub const ApiHttpClient = struct {
         if (isRetainedPreDecisionPressure(resp)) return error.RetainedEffectsFull;
         if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
         if (remoteRelationalRowError(resp.status, resp.body)) |reason| return reason;
+        if (resp.status == 503 and std.mem.eql(u8, resp.body, "storage read temporarily unavailable")) return error.StorageReadTemporarilyUnavailable;
         switch (resp.status) {
             200 => return .applied,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
@@ -4335,6 +4340,11 @@ test "relational row query remote transaction prepare preserves scalar validatio
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
     }
     executor.status = 500;
+    executor.body = "storage read temporarily unavailable";
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+    executor.status = 503;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+    executor.status = 500;
     executor.body = "RelationalExpressionOverflow";
     try std.testing.expectError(error.InvalidRemoteResponse, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
 }
@@ -4350,7 +4360,21 @@ fn remoteGraphEdgesError(body: []const u8) anyerror {
 
 fn remotePublicBatchError(alloc: std.mem.Allocator, status: u16, body: []const u8) anyerror {
     const message = std.mem.trim(u8, body, " \t\r\n");
+    const classified = struct {
+        code: []const u8,
+        retryable: bool,
+    };
+    if ((status == 403 or status == 503) and message.len > 0 and message.len <= 1024 and message[0] == '{') {
+        if (std.json.parseFromSlice(classified, alloc, message, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            if (status == 403 and !parsed.value.retryable and std.mem.eql(u8, parsed.value.code, "row_policy_denied"))
+                return error.TransactionPrepareAbortedRowPolicyDenied;
+            if (status == 503 and parsed.value.retryable and std.mem.eql(u8, parsed.value.code, "transaction_precommit_aborted"))
+                return error.TransactionPrepareAbortedUnavailable;
+        } else |_| {}
+    }
     switch (status) {
+        403 => return error.Forbidden,
         409 => {
             // Preserve terminal constraint identity across a public HTTP hop;
             // these failures must never become generic retryable conflicts.
@@ -4374,13 +4398,6 @@ fn remotePublicBatchError(alloc: std.mem.Allocator, status: u16, body: []const u
             return remoteGroupConflictError(message);
         },
         503 => {
-            if (message.len > 0 and message.len <= 1024 and message[0] == '{') {
-                if (std.json.parseFromSlice(struct { code: ?[]const u8 = null, retryable: bool = false }, alloc, message, .{ .ignore_unknown_fields = true })) |parsed| {
-                    defer parsed.deinit();
-                    if (parsed.value.code) |code| if (parsed.value.retryable and std.mem.eql(u8, code, "transaction_precommit_aborted"))
-                        return error.TransactionPrepareAbortedUnavailable;
-                } else |_| {}
-            }
             if (std.mem.eql(u8, message, "write unavailable")) return error.LeaderUnavailable;
             if (std.mem.eql(u8, message, "doc identity unavailable")) return error.DocIdentityUnavailable;
             if (std.mem.eql(u8, message, "maintenance routes unavailable on query-only runtime")) {
@@ -4526,6 +4543,7 @@ fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
 }
 
 fn remoteGroupTxnResolveConflictError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "decision not proposed")) return error.DecisionNotProposed;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "topology changed") or std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
@@ -4776,6 +4794,9 @@ fn consumerTests() type {
                 500,
                 "transaction outcome is unknown; do not retry this stateless batch",
             ));
+            try std.testing.expectEqual(error.TransactionPrepareAbortedRowPolicyDenied, remotePublicBatchError(alloc, 403, "{\"code\":\"row_policy_denied\",\"retryable\":false}"));
+            try std.testing.expectEqual(error.Forbidden, remotePublicBatchError(alloc, 403, "write permission required for every table affected by this mutation"));
+            try std.testing.expectEqual(error.Forbidden, remotePublicBatchError(alloc, 403, "{\"code\":\"row_policy_denied\"}"));
             try std.testing.expectEqual(error.LeaderUnavailable, remotePublicBatchError(alloc, 503, "write unavailable"));
             try std.testing.expectEqual(error.TransactionPrepareAbortedUnavailable, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true}"));
             try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":false}"));

@@ -48,15 +48,22 @@ pub const CancelHooks = struct {
 };
 
 const Prepared = struct {
+    refreshed: ?std.heap.ArenaAllocator = null,
     arena: std.heap.ArenaAllocator,
     statement: []const u8,
     parameter_oids: []const u32,
     description: backend.Description,
     namespace: []const u8,
     search_path: ?commands.SearchPath = null,
+
+    fn deinit(self: *Prepared) void {
+        if (self.refreshed) |*arena| arena.deinit();
+        self.arena.deinit();
+    }
 };
 
 const Portal = struct {
+    creation_epoch: u64 = 0,
     arena: std.heap.ArenaAllocator,
     statement: []const u8,
     parameters: []const std.json.Value,
@@ -65,10 +72,12 @@ const Portal = struct {
     types: []const backend.Type,
     formats: []const u16,
     description: backend.Description,
+    describe_stamp: ?backend.DescriptionStamp = null,
     namespace: ?[]const u8 = null,
     search_path: ?commands.SearchPath = null,
     result: ?backend.Result = null,
     stream: ?backend.ReadStream = null,
+    session_id: ?[]const u8 = null,
     stream_opened: bool = false,
     stream_complete: bool = false,
     offset: usize = 0,
@@ -79,6 +88,7 @@ const SqlCursor = struct {
     arena: std.heap.ArenaAllocator,
     statement: []const u8,
     description: backend.Description,
+    authority: ?backend.CursorAuthority = null,
     stream: ?backend.ReadStream,
     session_id: []const u8,
     fetched: u64 = 0,
@@ -109,10 +119,11 @@ pub const Session = struct {
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
     // Results borrow their portal allocator until release. Registry growth and
     // removal must never move that allocator.
-    portals: std.StringHashMapUnmanaged(*Portal) = .empty,
+    portals: std.StringArrayHashMapUnmanaged(*Portal) = .empty,
     sql_cursors: std.StringHashMapUnmanaged(SqlCursor) = .empty,
     cursor_budget: ?*Budget = null,
     cursor_epoch: u64 = 0,
+    rollback_portal_epoch: ?u64 = null,
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
     lake_visibility: commands.ReadRequirements = .{},
@@ -216,6 +227,21 @@ pub const Session = struct {
             self.setDeadline(if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms));
             self.diagnostic = .{};
             self.mutation_ack_pending = false;
+            const status_before_frame = self.status;
+            // The portal executing COMMIT or ROLLBACK owns its response.
+            // Release it and its siblings before reading the next frame.
+            defer {
+                if (status_before_frame != .idle and self.status == .idle) {
+                    self.clearPortals();
+                } else if (self.rollback_portal_epoch) |epoch| {
+                    var i = self.portals.count();
+                    while (i != 0) {
+                        i -= 1;
+                        if (self.portals.values()[i].creation_epoch > epoch) self.removePortalAt(i);
+                    }
+                }
+                self.rollback_portal_epoch = null;
+            }
             self.dispatch(tag, payload) catch |err| {
                 const completion_code: []const u8 = if (self.diagnostic.code) |*code| code else sqlstate(err);
                 if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending) {
@@ -224,6 +250,9 @@ pub const Session = struct {
                 }
                 if (err == error.Canceled) return err;
                 self.skip_until_sync = tag != 'Q';
+                // The socket no longer owns this transaction. Drop its local
+                // attachment before error handling or disconnect can mutate it.
+                if (err == error.SessionLeaseLost) self.diagnostic.transaction_status = .idle;
                 if (self.diagnostic.transaction_status) |status| {
                     self.status = status;
                     if (status == .idle) {
@@ -423,9 +452,6 @@ pub const Session = struct {
                 .discard_all => &.{},
             } };
         }
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         var req = self.request(statement, &.{}, types);
         req.parameter_descriptors = descriptors;
         try req.check();
@@ -443,18 +469,65 @@ pub const Session = struct {
         return result;
     }
 
-    /// Recompile against the current catalog before an unstarted execution.
-    /// Preserve the client's fixed parameter/result contract; retain fresh
-    /// schema and settings guards so concurrent changes still fence admission.
-    /// Never call this for a suspended portal or an already admitted mutation.
     fn cachedPlanChanged(self: *Session) anyerror {
         self.diagnostic.set("0A000", "cached plan must not change result type", null, null);
         return error.CachedPlanResultTypeChanged;
     }
 
+    fn descriptionCurrent(self: *Session, alloc: std.mem.Allocator, statement: []const u8, description: backend.Description) !bool {
+        const check = self.source.vtable.description_current orelse return false;
+        const stamp = description.stamp orelse return false;
+        if (!stamp.reusable) return false;
+        const req = self.request(statement, &.{}, description.parameter_types);
+        try req.check();
+        return check(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, description);
+    }
+
+    fn preparedDescription(self: *Session, prepared: *Prepared, scratch: std.mem.Allocator) !backend.Description {
+        const namespace = self.request_namespace orelse self.effectiveNamespace();
+        const path = self.effectiveSearchPath();
+        if (std.mem.eql(u8, namespace, prepared.namespace) and std.meta.eql(path, prepared.search_path) and
+            try self.descriptionCurrent(scratch, prepared.statement, prepared.description)) return prepared.description;
+
+        // Replace the entire generation only after validation succeeds. Portals
+        // own their copies, including when the originating statement is closed.
+        var fresh = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer fresh.deinit();
+        const current = try self.rebindCached(fresh.allocator(), prepared.statement, prepared.description);
+        const owned_namespace = try fresh.allocator().dupe(u8, namespace);
+        if (prepared.refreshed) |*old| old.deinit();
+        prepared.refreshed = fresh;
+        prepared.namespace = owned_namespace;
+        prepared.search_path = path;
+        prepared.description = current;
+        return current;
+    }
+
+    fn checkedPortalDescription(self: *Session, alloc: std.mem.Allocator, portal: *Portal, describe_only: bool) !backend.Description {
+        const bound = portal.description;
+        var probe = bound;
+        if (describe_only) probe.stamp = portal.describe_stamp orelse bound.stamp;
+        if (try self.descriptionCurrent(alloc, portal.statement, probe)) return probe;
+        const current = try self.rebindCached(alloc, portal.statement, bound);
+        if (bound.binding_guard) |before| {
+            if (if (bound.stamp) |s| s.catalog else null) |previous| {
+                const stamp = (current.stamp orelse return error.CatalogGenerationChanged).catalog orelse return error.CatalogGenerationChanged;
+                if (!std.mem.eql(u8, &previous.relation_epoch.incarnation, &stamp.relation_epoch.incarnation))
+                    return error.CatalogGenerationChanged;
+            }
+            const after = current.binding_guard orelse return error.CatalogGenerationChanged;
+            const same = if (self.source.vtable.same_binding_targets) |check| check(before, after) else std.mem.eql(u8, before, after);
+            if (!same) return error.CatalogGenerationChanged;
+        } else if (current.binding_guard != null) return error.CatalogGenerationChanged;
+        return current;
+    }
+
     fn rebindCached(self: *Session, alloc: std.mem.Allocator, statement: []const u8, original: backend.Description) !backend.Description {
-        const current = try self.describeTyped(alloc, statement, original.parameter_types, original.parameter_descriptors);
-        if (!cachedColumnsEqual(original.columns, current.columns) or
+        // Backends may return the input hints as part of the new description.
+        const types = try alloc.dupe(backend.Type, original.parameter_types);
+        const descriptors = try alloc.dupe(backend.Parameter, original.parameter_descriptors);
+        const current = try self.describeTyped(alloc, statement, types, descriptors);
+        if (!columnsEqual(original.columns, current.columns) or
             original.parameter_types.len != current.parameter_types.len)
             return self.cachedPlanChanged();
         for (original.parameter_types, current.parameter_types, 0..) |before, after, i| {
@@ -471,15 +544,7 @@ pub const Session = struct {
         return current;
     }
 
-    fn execute(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
-        return self.executeTyped(alloc, statement, parameters, types, &.{}, binding_guard, setting_epoch);
-    }
-
-    fn executeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
-        return self.executeCells(alloc, statement, parameters, types, descriptors, null, null, binding_guard, setting_epoch);
-    }
-
-    fn executeCells(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum, parameter_owner: ?*@import("antfly_local_sources").sql_parameter_frame.Ingress, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
+    fn executeCells(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum, parameter_owner: ?*@import("antfly_local_sources").sql_parameter_frame.Ingress, binding_guard: ?[]const u8, setting_epoch: ?u64, capture: backend.CursorCapture) !backend.Result {
         if (self.identity) |identity| if (identity.renewable) {
             if (!commands.isRollback(statement)) {
                 if (self.source.vtable.reserve_completion) |reserve| reserve(self.source.context, &self.completion, 3) catch {
@@ -512,14 +577,12 @@ pub const Session = struct {
                 .discard_all => self.executeDiscardAll(),
             };
         }
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
         if (self.identity.?.renewable) {
             req.completion = &self.completion;
             req.completion_allocator = self.alloc;
         }
+        req.capture_cursor_authority = capture;
         req.parameter_descriptors = descriptors;
         req.parameter_cells = native_cells;
         req.parameter_owner = if (parameter_owner) |owner| owner.lease() else null;
@@ -578,7 +641,9 @@ pub const Session = struct {
                     if (std.mem.eql(u8, name, self.savepoints.items[index].name)) {
                         if (value == .rollback_to) {
                             if (self.catalog_settings) |*state| if (self.savepoints.items[index].catalog) |snapshot| try state.rollbackTo(snapshot);
-                            self.discardCursorsAfter(self.savepoints.items[index].epoch);
+                            const epoch = self.savepoints.items[index].epoch;
+                            self.discardCursorsAfter(epoch);
+                            self.rollback_portal_epoch = @min(self.rollback_portal_epoch orelse epoch, epoch);
                             self.statement_timeout = self.savepoints.items[index].timeout;
                             self.namespace_setting = self.savepoints.items[index].namespace;
                             self.application_name = self.savepoints.items[index].application;
@@ -635,9 +700,6 @@ pub const Session = struct {
         var request_value = self.request(statement, &.{}, &.{});
         request_value.namespace = if (update.path) |*value| value.first() else self.namespace orelse "public";
         request_value.search_path = update.path;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         try request_value.check();
         if (update.path) |path| {
             for (path.entries[0..path.len]) |*entry| {
@@ -863,6 +925,14 @@ pub const Session = struct {
 
     fn dispatch(self: *Session, tag: u8, payload: []const u8) !void {
         var cursor = Cursor{ .bytes = payload };
+        // Only the session thread dispatches frames. Keep CancelRequest live
+        // through binding, opening a reader, materializing and sending pages.
+        const active = tag == 'Q' or tag == 'P' or tag == 'B' or tag == 'D' or tag == 'E';
+        if (active) {
+            self.cancel_requested.store(false, .release);
+            self.executing.store(true, .release);
+        }
+        defer if (active) self.executing.store(false, .release);
         switch (tag) {
             'Q' => {
                 self.read_receipt_budget = .{};
@@ -888,12 +958,9 @@ pub const Session = struct {
                         try self.ready();
                         return;
                     }
-                    var result = try self.execute(arena.allocator(), statement, &.{}, &.{}, null, null);
+                    var result = try self.executeCells(arena.allocator(), statement, &.{}, &.{}, &.{}, null, null, null, null, .if_select);
                     defer result.deinit();
-                    if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
-                    if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                    try self.dataResult(result, &.{});
-                    try self.complete(result);
+                    try self.deliverSimpleResult(result, self.request(statement, &.{}, &.{}));
                     self.finishDiscardAll();
                 }
                 if (self.status == .idle) {
@@ -922,13 +989,13 @@ pub const Session = struct {
                     descriptor.* = try values.parameterFromOid(oid.*);
                 }
                 try cursor.finish();
-                const description = try self.describeTyped(a, statement, types, descriptors);
+                const owned_statement = try a.dupe(u8, statement);
+                const description = try self.describeTyped(a, owned_statement, types, descriptors);
                 if (count > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
                 for (oids, description.parameter_types, 0..) |*oid, kind, index| {
                     oid.* = if (index < declared.len and declared[index] != 0) declared[index] else if (description.parameter_descriptors.len == oids.len) try values.parameterOid(description.parameter_descriptors[index]) else try values.oid(kind);
                 }
-                const owned_statement = try a.dupe(u8, statement);
                 const owned_name = try self.alloc.dupe(u8, name);
                 errdefer if (!transferred) self.alloc.free(owned_name);
                 self.removePrepared(name);
@@ -941,20 +1008,13 @@ pub const Session = struct {
             'B' => {
                 const name = try cursor.string();
                 const statement_name = try cursor.string();
-                const statement = self.prepared.get(statement_name) orelse return error.InvalidStatementName;
+                const statement = self.prepared.getPtr(statement_name) orelse return error.InvalidStatementName;
                 if (name.len != 0 and self.portals.contains(name)) return error.DuplicatePortal;
                 if (!self.portals.contains(name) and self.portals.count() >= self.limits.portals) return error.ProgramLimitExceeded;
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 var transferred = false;
                 errdefer if (!transferred) arena.deinit();
                 const a = arena.allocator();
-                const previous_namespace = self.request_namespace;
-                const previous_search_path = self.request_search_path;
-                self.request_namespace = statement.namespace;
-                defer self.request_namespace = previous_namespace;
-                self.request_search_path = statement.search_path;
-                defer self.request_search_path = previous_search_path;
-                const current = try self.rebindCached(a, statement.statement, statement.description);
                 const format_count = try cursor.int(u16);
                 if (format_count > self.limits.parameters) return error.ProgramLimitExceeded;
                 const formats = try a.alloc(u16, format_count);
@@ -1004,11 +1064,14 @@ pub const Session = struct {
                 }
                 try cursor.finish();
                 const text = try a.dupe(u8, statement.statement);
+                const current = try self.preparedDescription(statement, a);
                 const description = backend.Description{
-                    .columns = current.columns,
+                    .stamp = current.stamp,
+                    .is_select = current.is_select,
+                    .columns = try cloneColumns(a, current.columns),
                     .parameter_types = types,
-                    .parameter_descriptors = current.parameter_descriptors,
-                    .binding_guard = current.binding_guard,
+                    .parameter_descriptors = try a.dupe(backend.Parameter, current.parameter_descriptors),
+                    .binding_guard = if (current.binding_guard) |guard| try a.dupe(u8, guard) else null,
                     .setting_epoch = current.setting_epoch,
                 };
                 const owned_name = try self.alloc.dupe(u8, name);
@@ -1017,7 +1080,8 @@ pub const Session = struct {
                 const namespace = try a.dupe(u8, statement.namespace);
                 const portal = try self.alloc.create(Portal);
                 errdefer if (!transferred) self.alloc.destroy(portal);
-                portal.* = .{ .arena = arena, .statement = text, .parameters = parameters, .parameter_cells = native_cells, .parameter_owner = parameter_owner, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
+                self.cursor_epoch = try self.nextCursorEpoch();
+                portal.* = .{ .creation_epoch = self.cursor_epoch, .arena = arena, .statement = text, .parameters = parameters, .parameter_cells = native_cells, .parameter_owner = parameter_owner, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
                 try self.portals.put(self.alloc, owned_name, portal);
                 transferred = true;
                 try self.message('2', "");
@@ -1028,16 +1092,10 @@ pub const Session = struct {
                 try cursor.finish();
                 switch (target) {
                     'S' => {
-                        const prepared = self.prepared.get(name) orelse return error.InvalidStatementName;
+                        const prepared = self.prepared.getPtr(name) orelse return error.InvalidStatementName;
                         var arena = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena.deinit();
-                        const previous_namespace = self.request_namespace;
-                        const previous_search_path = self.request_search_path;
-                        self.request_namespace = prepared.namespace;
-                        defer self.request_namespace = previous_namespace;
-                        self.request_search_path = prepared.search_path;
-                        defer self.request_search_path = previous_search_path;
-                        const description = try self.rebindCached(arena.allocator(), prepared.statement, prepared.description);
+                        const description = try self.preparedDescription(prepared, arena.allocator());
                         var bytes = std.Io.Writer.Allocating.init(self.alloc);
                         defer bytes.deinit();
                         try bytes.writer.writeInt(u16, @intCast(prepared.parameter_oids.len), .big);
@@ -1047,6 +1105,32 @@ pub const Session = struct {
                     },
                     'P' => {
                         const portal = self.portals.get(name) orelse return error.InvalidPortalName;
+                        if (portal.failed) return error.PortalExecutionFailed;
+                        const previous_namespace = self.request_namespace;
+                        const previous_path = self.request_search_path;
+                        self.request_namespace = portal.namespace;
+                        self.request_search_path = portal.search_path;
+                        defer self.request_namespace = previous_namespace;
+                        defer self.request_search_path = previous_path;
+                        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                        defer scratch.deinit();
+                        const current = try self.checkedPortalDescription(scratch.allocator(), portal, true);
+                        var req = self.request(portal.statement, portal.parameters, portal.types);
+                        req.binding_guard = portal.description.binding_guard;
+                        req.setting_epoch = portal.description.setting_epoch;
+                        if (portal.stream_opened) req.session_id = portal.session_id;
+                        if (portal.stream) |stream| {
+                            const check = stream.validate orelse return error.UnsupportedSqlExecution;
+                            try check(stream.context, scratch.allocator(), req);
+                        } else if (portal.result) |result| {
+                            if (result.cursor_authority) |authority| {
+                                try authority.validate(authority.ptr, scratch.allocator(), self.identity orelse return error.AuthenticationFailed, req, false);
+                            }
+                        }
+                        try req.check();
+                        // Only the value stamp is reusable. The original guard
+                        // belongs to the captured reader and lives in its arena.
+                        portal.describe_stamp = current.stamp;
                         try self.rowDescription(portal.description.columns, portal.formats);
                     },
                     else => return error.ProtocolViolation,
@@ -1072,12 +1156,11 @@ pub const Session = struct {
                 };
                 if (!portal.stream_opened) {
                     self.read_receipt_budget = .{};
-                    portal.description = try self.rebindCached(portal.arena.allocator(), portal.statement, portal.description);
+                    portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal, false);
+                    portal.describe_stamp = portal.description.stamp;
                     portal.stream_opened = true;
+                    if (self.session_id) |id| portal.session_id = try portal.arena.allocator().dupe(u8, id);
                     if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
-                        self.cancel_requested.store(false, .release);
-                        self.executing.store(true, .release);
-                        defer self.executing.store(false, .release);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
                         req.parameter_cells = portal.parameter_cells;
                         req.parameter_owner = if (portal.parameter_owner) |owner| owner.lease() else null;
@@ -1085,15 +1168,20 @@ pub const Session = struct {
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
                         portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
+                        if (portal.stream) |stream| {
+                            if (stream.validate == null or stream.detach == null) return error.UnsupportedSqlExecution;
+                        }
+                        try req.check();
                     };
                 }
                 if (portal.stream != null or portal.stream_complete) {
-                    try self.executeStream(portal, requested);
+                    try self.executeStream(portal, requested, false);
                     portal.failed = false;
                     return;
                 }
-                if (portal.result == null) {
-                    portal.result = try self.executeCells(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.parameter_cells, portal.parameter_owner, portal.description.binding_guard, portal.description.setting_epoch);
+                const first_delivery = portal.result == null;
+                if (first_delivery) {
+                    portal.result = try self.executeCells(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.parameter_cells, portal.parameter_owner, portal.description.binding_guard, portal.description.setting_epoch, if (portal.description.is_select) .require_select else .none);
                     const result = portal.result.?;
                     if (!columnsEqual(portal.description.columns, result.columns)) return error.ResultShapeChanged;
                 }
@@ -1104,8 +1192,16 @@ pub const Session = struct {
                 }
                 const count = if (requested == 0) result.rowCount() - portal.offset else @min(@as(usize, @intCast(requested)), result.rowCount() - portal.offset);
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                try self.dataResult(try result.view(portal.offset, count), portal.formats);
-                portal.offset += count;
+                if (portal.description.is_select) {
+                    var req = self.request(portal.statement, portal.parameters, portal.types);
+                    req.binding_guard = portal.description.binding_guard;
+                    req.setting_epoch = portal.description.setting_epoch;
+                    req.session_id = portal.session_id;
+                    try self.deliverSelect(result, portal.formats, req, &portal.offset, count, first_delivery, false);
+                } else {
+                    try self.dataResult(try result.view(portal.offset, count), portal.formats);
+                    portal.offset += count;
+                }
                 if (portal.offset < result.rowCount()) try self.message('s', "") else try self.complete(result);
                 if (result.ddl_receipt_json != null and std.mem.eql(u8, result.command_tag, "DDL PENDING")) {
                     self.skip_until_sync = true;
@@ -1149,11 +1245,13 @@ pub const Session = struct {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 errdefer arena.deinit();
                 const a = arena.allocator();
-                const description = try self.describeTyped(a, prepare.statement, prepare.types, prepare.descriptors);
+                const sql = try a.dupe(u8, prepare.statement);
+                const types = try a.dupe(backend.Type, prepare.types);
+                const descriptors = try a.dupe(backend.Parameter, prepare.descriptors);
+                const description = try self.describeTyped(a, sql, types, descriptors);
                 if (prepare.types.len > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
                 for (oids, description.parameter_types, 0..) |*oid, kind, index| oid.* = if (description.parameter_descriptors.len == oids.len) try values.parameterOid(description.parameter_descriptors[index]) else try values.oid(kind);
-                const sql = try a.dupe(u8, prepare.statement);
                 const name = try self.alloc.dupe(u8, prepare.name);
                 errdefer self.alloc.free(name);
                 const namespace = try a.dupe(u8, self.request_namespace orelse self.effectiveNamespace());
@@ -1166,27 +1264,13 @@ pub const Session = struct {
                     if (!self.prepared.contains(named)) return error.InvalidStatementName;
                     self.removePrepared(named);
                 } else {
-                    var iterator = self.prepared.iterator();
-                    while (iterator.next()) |entry| {
-                        self.alloc.free(entry.key_ptr.*);
-                        entry.value_ptr.arena.deinit();
-                    }
-                    self.prepared.clearRetainingCapacity();
+                    self.clearPrepared();
                 }
             },
             .execute => |execute_command| {
-                const prepared = self.prepared.get(execute_command.name) orelse return error.InvalidStatementName;
-                const previous_namespace = self.request_namespace;
-                const previous_search_path = self.request_search_path;
-                self.request_namespace = prepared.namespace;
-                defer self.request_namespace = previous_namespace;
-                self.request_search_path = prepared.search_path;
-                defer self.request_search_path = previous_search_path;
-                const description = try self.rebindCached(alloc, prepared.statement, prepared.description);
+                const prepared = self.prepared.getPtr(execute_command.name) orelse return error.InvalidStatementName;
+                const description = try self.preparedDescription(prepared, alloc);
                 if (execute_command.expressions.len != description.parameter_types.len) return error.InvalidParameter;
-                self.cancel_requested.store(false, .release);
-                self.executing.store(true, .release);
-                defer self.executing.store(false, .release);
                 var req = self.request(prepared.statement, &.{}, description.parameter_types);
                 req.parameter_descriptors = description.parameter_descriptors;
                 try req.check();
@@ -1199,12 +1283,12 @@ pub const Session = struct {
                 } else try (self.source.vtable.evaluate_parameters orelse return error.UnsupportedSqlExecution)(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, execute_command.expressions);
                 if (parameters.len != description.parameter_types.len) return error.InvalidParameter;
                 if (try self.simpleStreamCells(prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, native_cells, description.binding_guard, description.setting_epoch)) return true;
-                var result = try self.executeCells(alloc, prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, native_cells, null, description.binding_guard, description.setting_epoch);
+                var result = try self.executeCells(alloc, prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, native_cells, null, description.binding_guard, description.setting_epoch, if (description.is_select) .require_select else .if_select);
                 defer result.deinit();
-                if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
-                if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                try self.dataResult(result, &.{});
-                try self.complete(result);
+                var delivery = self.request(prepared.statement, parameters, description.parameter_types);
+                delivery.binding_guard = description.binding_guard;
+                delivery.setting_epoch = description.setting_epoch;
+                try self.deliverSimpleResult(result, delivery);
                 return true;
             },
             .declare_cursor => |declaration| {
@@ -1245,9 +1329,6 @@ pub const Session = struct {
         defer if (!arena_moved) arena.deinit();
         const description = try self.describe(arena.allocator(), statement, &.{});
         if (description.parameter_types.len != 0) return error.InvalidParameter;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         var req = self.request(statement, &.{}, &.{});
         req.binding_guard = description.binding_guard;
         req.setting_epoch = description.setting_epoch;
@@ -1261,7 +1342,7 @@ pub const Session = struct {
         defer if (!spool_moved) if (spool) |*owned| owned.deinit();
         if (stream) |opened| {
             if (!columnsEqual(description.columns, opened.columns)) return error.InvalidResult;
-            if (scroll or hold) if (opened.validate == null or opened.detach == null) return error.UnsupportedSqlExecution;
+            if (opened.validate == null or opened.detach == null) return error.UnsupportedSqlExecution;
         }
         if (stream == null or scroll or hold) {
             if (self.cursor_budget == null) {
@@ -1271,12 +1352,17 @@ pub const Session = struct {
             }
             spool = Spool.init(self.cursor_budget.?);
         }
+        var buffered_authority: ?backend.CursorAuthority = null;
         if (stream == null) {
             // Blocking sorts/aggregates decline pull execution. Materialize
             // once under the statement row cap, then copy into the shared
             // cursor byte/row budget before exposing a cursor name.
+            req.capture_cursor_authority = .require_select;
             var result = try self.source.vtable.execute(self.source.context, arena.allocator(), identity, req);
             defer result.deinit();
+            const authority = result.cursor_authority orelse return error.UnsupportedSqlExecution;
+            try authority.validate(authority.ptr, arena.allocator(), identity, req, true);
+            buffered_authority = authority;
             const same_session = if (self.session_id) |id|
                 if (result.session_id) |observed| std.mem.eql(u8, id, observed) else false
             else
@@ -1293,8 +1379,8 @@ pub const Session = struct {
         defer if (!key_moved) self.alloc.free(key);
         const database = if (self.database) |value| try arena.allocator().dupe(u8, value) else null;
         const namespace = try arena.allocator().dupe(u8, self.request_namespace orelse self.effectiveNamespace());
-        self.cursor_epoch = std.math.add(u64, self.cursor_epoch, 1) catch return error.ProgramLimitExceeded;
-        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
+        self.cursor_epoch = try self.nextCursorEpoch();
+        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .authority = buffered_authority, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
         key_moved = true;
         arena_moved = true;
         stream_moved = true;
@@ -1308,15 +1394,7 @@ pub const Session = struct {
         if (self.status == .failed) return error.SqlTransactionAborted;
         const cursor = self.sql_cursors.getPtr(fetch.name) orelse return error.InvalidCursorName;
         if (!cursor.committed and (self.status != .in_transaction or self.session_id == null or !std.mem.eql(u8, cursor.session_id, self.session_id.?))) return error.CursorMustBeInTransaction;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
-        var req = self.request(cursor.statement, &.{}, &.{});
-        req.binding_guard = cursor.description.binding_guard;
-        req.setting_epoch = cursor.description.setting_epoch;
-        req.database = cursor.database;
-        req.namespace = cursor.namespace;
-        req.search_path = cursor.search_path;
+        const req = self.cursorRequest(cursor);
         try req.check();
         if (cursor.spool != null) {
             self.fetchSpooled(cursor, fetch, req) catch |err| {
@@ -1334,7 +1412,7 @@ pub const Session = struct {
                 stream.close(stream.context);
             }
         };
-        if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
+        var pulled = false;
         var remaining: usize = if (fetch.count == std.math.maxInt(u32)) std.math.maxInt(usize) else fetch.count;
         while (!cursor.exhausted and remaining != 0) {
             try req.check();
@@ -1352,10 +1430,15 @@ pub const Session = struct {
                     return err;
                 };
                 defer page.result.deinit();
+                try req.check();
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
                 if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
                 if (page.result.sql_nulls) |flags| if (flags.len != page.result.rowCount()) return error.InvalidResult;
-                if (!fetch.move) try self.dataResult(page.result, &.{});
+                if (!fetch.move) {
+                    if (!pulled) try self.rowDescription(cursor.description.columns, &.{});
+                    try self.dataResult(page.result, &.{});
+                }
+                pulled = true;
                 cursor.fetched += page.result.rowCount();
                 remaining -= page.result.rowCount();
                 cursor.exhausted = page.exhausted;
@@ -1363,10 +1446,15 @@ pub const Session = struct {
             }
             // Native pages borrow the stream's memory admission. Release the
             // page before releasing the exhausted stream and its snapshots.
-            if (cursor.exhausted) {
-                cursor.stream = null;
-                stream.close(stream.context);
-            }
+            if (cursor.exhausted) stream.detach.?(stream.context);
+        }
+        if (!pulled) {
+            const stream = cursor.stream orelse return error.InvalidCursorName;
+            var validation = std.heap.ArenaAllocator.init(self.alloc);
+            defer validation.deinit();
+            try stream.validate.?(stream.context, validation.allocator(), req);
+            try req.check();
+            if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
         }
         var tag: [64]u8 = undefined;
         try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", cursor.fetched - fetched_before }));
@@ -1402,6 +1490,7 @@ pub const Session = struct {
                 const wanted: u32 = @intCast(@min(through - spool.row_count, @min(self.limits.result_rows, 256)));
                 var page = try stream.next(stream.context, arena.allocator(), req, wanted);
                 defer page.result.deinit();
+                try req.check();
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
                 if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
                 spool.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
@@ -1422,6 +1511,7 @@ pub const Session = struct {
         var validation = std.heap.ArenaAllocator.init(self.alloc);
         defer validation.deinit();
         try self.validateSpooledCursor(cursor, validation.allocator(), req);
+        try req.check();
         const spool = &cursor.spool.?;
         if (fetch.direction == .absolute and fetch.offset < 0) try self.fillCursor(cursor, std.math.maxInt(usize));
         var target: i64 = switch (fetch.direction) {
@@ -1448,6 +1538,7 @@ pub const Session = struct {
             if (emitted != 0 and emitted % 256 == 0) {
                 _ = validation.reset(.retain_capacity);
                 try self.validateSpooledCursor(cursor, validation.allocator(), req);
+                try req.check();
             }
             if (!fetch.move) {
                 row_bytes.writer.end = 0;
@@ -1470,9 +1561,8 @@ pub const Session = struct {
         if (cursor.stream) |stream| return stream.validate.?(stream.context, alloc, req);
         if (!cursor.exhausted) return error.InvalidCursorName;
         const identity = self.identity orelse return error.AuthenticationFailed;
-        const current = try self.source.vtable.describe(self.source.context, alloc, identity, req);
-        if (!columnsEqual(cursor.description.columns, current.columns) or
-            !std.mem.eql(u8, cursor.description.binding_guard orelse "", current.binding_guard orelse "")) return error.CatalogGenerationChanged;
+        const authority = cursor.authority orelse return error.InvalidCursorName;
+        try authority.validate(authority.ptr, alloc, identity, req, false);
     }
 
     fn finishSqlCursors(self: *Session, committed: bool) void {
@@ -1497,6 +1587,10 @@ pub const Session = struct {
             if (point.catalog) |*snapshot| snapshot.deinit(self.alloc);
         }
         self.savepoints.clearRetainingCapacity();
+    }
+
+    fn nextCursorEpoch(self: *Session) !u64 {
+        return std.math.add(u64, self.cursor_epoch, 1) catch error.ProgramLimitExceeded;
     }
 
     fn discardCursorsAfter(self: *Session, epoch: u64) void {
@@ -1534,7 +1628,7 @@ pub const Session = struct {
         if (self.prepared.fetchRemove(name)) |entry| {
             self.alloc.free(entry.key);
             var value = entry.value;
-            value.arena.deinit();
+            value.deinit();
         }
     }
 
@@ -1542,47 +1636,49 @@ pub const Session = struct {
         var it = self.prepared.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
-            entry.value_ptr.arena.deinit();
+            entry.value_ptr.deinit();
         }
         self.prepared.clearRetainingCapacity();
     }
 
     fn removePortal(self: *Session, name: []const u8) void {
-        if (self.portals.fetchRemove(name)) |entry| {
-            self.alloc.free(entry.key);
-            const value = entry.value;
-            if (value.stream) |stream| stream.close(stream.context);
-            if (value.result) |*result| result.deinit();
-            if (value.parameter_owner) |owner| owner.release();
-            value.arena.deinit();
-            self.alloc.destroy(value);
-        }
+        if (self.portals.getIndex(name)) |i| self.removePortalAt(i);
+    }
+
+    fn removePortalAt(self: *Session, i: usize) void {
+        const name = self.portals.keys()[i];
+        const portal = self.portals.values()[i];
+        self.portals.swapRemoveAt(i);
+        self.alloc.free(name);
+        if (portal.stream) |stream| stream.close(stream.context);
+        if (portal.result) |*result| result.deinit();
+        if (portal.parameter_owner) |owner| owner.release();
+        portal.arena.deinit();
+        self.alloc.destroy(portal);
     }
 
     fn clearPortals(self: *Session) void {
-        var it = self.portals.iterator();
-        while (it.next()) |entry| {
-            self.alloc.free(entry.key_ptr.*);
-            const portal = entry.value_ptr.*;
-            if (portal.stream) |stream| stream.close(stream.context);
-            if (portal.result) |*result| result.deinit();
-            if (portal.parameter_owner) |owner| owner.release();
-            portal.arena.deinit();
-            self.alloc.destroy(portal);
-        }
-        self.portals.clearRetainingCapacity();
+        while (self.portals.count() != 0) self.removePortalAt(self.portals.count() - 1);
     }
 
-    fn executeStream(self: *Session, portal: *Portal, requested: i32) !void {
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
+    fn executeStream(self: *Session, portal: *Portal, requested: i32, describe_rows: bool) !void {
         var req = self.request(portal.statement, portal.parameters, portal.types);
         req.parameter_cells = portal.parameter_cells;
         req.parameter_owner = if (portal.parameter_owner) |owner| owner.lease() else null;
         req.parameter_descriptors = portal.description.parameter_descriptors;
         req.binding_guard = portal.description.binding_guard;
         req.setting_epoch = portal.description.setting_epoch;
+        const previously_complete = portal.stream_complete;
+        if (!describe_rows and portal.stream_opened) req.session_id = portal.session_id;
+        try req.check();
+        if (previously_complete) if (portal.stream) |stream| {
+            if (stream.validate) |check| {
+                var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                defer scratch.deinit();
+                try check(stream.context, scratch.allocator(), req);
+                try req.check();
+            }
+        };
         var remaining: usize = if (requested == 0) std.math.maxInt(usize) else @intCast(requested);
         while (!portal.stream_complete and remaining != 0) {
             try req.check();
@@ -1592,12 +1688,14 @@ pub const Session = struct {
             const wanted: u32 = @intCast(@min(remaining, @min(self.limits.result_rows, 256)));
             var page = try stream.next(stream.context, arena.allocator(), req, wanted);
             defer page.result.deinit();
+            try req.check();
             const result = page.result;
             if (result.rowCount() > wanted or !columnsEqual(portal.description.columns, result.columns) or
                 result.mutation_outcome != null or result.continuation != null or result.session_id != null)
                 return error.InvalidResult;
             if (!page.exhausted and result.rowCount() == 0) return error.InvalidResult;
             if (result.sql_nulls) |flags| if (flags.len != result.rowCount()) return error.InvalidResult;
+            if (describe_rows and portal.offset == 0) try self.rowDescription(result.columns, portal.formats);
             try self.dataResult(result, portal.formats);
             remaining -= result.rowCount();
             portal.offset += result.rowCount();
@@ -1607,8 +1705,16 @@ pub const Session = struct {
             try self.writer.flush();
         }
         if (portal.stream_complete) {
-            if (portal.stream) |stream| stream.close(stream.context);
-            portal.stream = null;
+            if (!previously_complete) if (portal.stream) |stream| {
+                if (!describe_rows and stream.detach != null and stream.validate != null) {
+                    // Release the execution plan and storage cut. Describe and
+                    // repeated Execute still need this portal's reader tenure.
+                    stream.detach.?(stream.context);
+                } else {
+                    stream.close(stream.context);
+                    portal.stream = null;
+                }
+            };
             var tag: [64]u8 = undefined;
             try self.command(try std.fmt.bufPrint(&tag, "SELECT {d}", .{portal.offset}));
         } else try self.message('s', "");
@@ -1627,9 +1733,6 @@ pub const Session = struct {
         defer settings_arena.deinit();
         if (try commands.settingCommand(settings_arena.allocator(), statement) != null) return false;
         const open = self.source.vtable.open_stream orelse return false;
-        self.cancel_requested.store(false, .release);
-        self.executing.store(true, .release);
-        defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
         req.parameter_descriptors = descriptors;
         req.parameter_cells = native_cells;
@@ -1650,8 +1753,7 @@ pub const Session = struct {
         defer portal.arena.deinit();
         defer if (portal.stream) |remaining| remaining.close(remaining.context);
         if (stream.columns.len > self.limits.columns) return error.ProgramLimitExceeded;
-        try self.rowDescription(stream.columns, &.{});
-        try self.executeStream(&portal, 0);
+        try self.executeStream(&portal, 0, true);
         return true;
     }
 
@@ -1790,6 +1892,38 @@ pub const Session = struct {
         if (length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
         std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
     }
+    fn deliverSelect(self: *Session, result: backend.Result, formats: []const u16, req: backend.Request, offset: *usize, count: usize, first_delivery: bool, describe_rows: bool) !void {
+        const authority = result.cursor_authority orelse return error.InvalidSqlBackendResponse;
+        var remaining = count;
+        var materialized = first_delivery;
+        while (true) {
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            try req.check();
+            try authority.validate(authority.ptr, scratch.allocator(), self.identity orelse return error.AuthenticationFailed, req, materialized);
+            try req.check();
+            if (describe_rows and materialized and result.columns.len != 0) try self.rowDescription(result.columns, formats);
+            const page = @min(remaining, 256);
+            try self.dataResult(try result.view(offset.*, page), formats);
+            offset.* += page;
+            remaining -= page;
+            if (remaining == 0) break;
+            try self.writer.flush();
+            materialized = false;
+        }
+    }
+
+    fn deliverSimpleResult(self: *Session, result: backend.Result, req: backend.Request) !void {
+        if (result.cursor_authority != null or std.mem.eql(u8, result.command_tag, "SELECT") or std.mem.startsWith(u8, result.command_tag, "SELECT ")) {
+            var offset: usize = 0;
+            try self.deliverSelect(result, &.{}, req, &offset, result.rowCount(), true, true);
+        } else {
+            if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
+            try self.dataResult(result, &.{});
+        }
+        try self.complete(result);
+    }
+
     fn dataResult(self: *Session, result: backend.Result, formats: []const u16) !void {
         const cells = result.cells orelse return self.dataRows(result.columns, formats, result.rows, result.sql_nulls);
         if (cells.width != result.columns.len or result.rows.len != 0 or result.sql_nulls != null) return error.InvalidResult;
@@ -1856,13 +1990,6 @@ fn cloneColumns(alloc: std.mem.Allocator, columns: []const backend.Column) ![]co
     for (result) |*column| column.name = try alloc.dupe(u8, column.name);
     return result;
 }
-fn cachedColumnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or
-        !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier)) return false;
-    return true;
-}
-
 fn columnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) or !std.mem.eql(u8, left.name, right.name)) return false;
@@ -1878,12 +2005,9 @@ test "pgwire result shape fences array element identity across prepared and curs
     try std.testing.expect(!columnsEqual(&int4, &int8));
     try std.testing.expect(!columnsEqual(&int4, &missing));
     try std.testing.expect(!columnsEqual(&int4, &json));
-    try std.testing.expect(cachedColumnsEqual(&int4, &int4));
-    try std.testing.expect(!cachedColumnsEqual(&int4, &int8));
-    try std.testing.expect(!cachedColumnsEqual(&int4, &missing));
     var renamed = int4;
     renamed[0].name = "renamed";
-    try std.testing.expect(cachedColumnsEqual(&int4, &renamed));
+    try std.testing.expect(!columnsEqual(&int4, &renamed));
 }
 
 test "pgwire NUMERIC result identity fences precision scale and unconstrained results" {
@@ -1892,10 +2016,8 @@ test "pgwire NUMERIC result identity fences precision scale and unconstrained re
     changed[0].numeric_modifier.?.scale = 1;
     try std.testing.expect(columnsEqual(&scalar, &scalar));
     try std.testing.expect(!columnsEqual(&scalar, &changed));
-    try std.testing.expect(!cachedColumnsEqual(&scalar, &changed));
     changed[0].numeric_modifier = null;
     try std.testing.expect(!columnsEqual(&scalar, &changed));
-    try std.testing.expect(!cachedColumnsEqual(&scalar, &changed));
 }
 
 test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {
@@ -1905,6 +2027,7 @@ test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {
     try std.testing.expectEqualStrings("22003", sqlstate(error.SqlNumericOutOfRange));
     try std.testing.expectEqualStrings("22021", sqlstate(error.SqlInvalidTextEncoding));
     try std.testing.expectEqualStrings("42P08", sqlstate(error.ConflictingSqlParameterTypes));
+    try std.testing.expectEqualStrings("40001", sqlstate(error.RowPolicyCatalogChanged));
 }
 
 fn sqlstate(err: anyerror) []const u8 {
@@ -1936,7 +2059,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
         error.UnsupportedReadVisibility => "0A000",
         error.ReadRequirementNotReady => "53300",
-        error.ReadSnapshotTooOld => "40001",
+        error.CatalogGenerationChanged, error.RowPolicyCatalogChanged, error.ReadSnapshotTooOld => "40001",
         error.InFailedSqlTransaction => "25P02",
         error.CursorMustBeInTransaction, error.NoActiveSqlTransaction => "25P01",
         error.CursorNotScrollable => "55000",
@@ -1944,7 +2067,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.SqlSubstringError => "22011",
         error.InvalidSqlCharacterCode => "54000",
         error.SqlNotNullViolation => "23502",
-        error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded, error.SettingLimitExceeded => "54000",
+        error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded, error.SettingLimitExceeded, error.RowPolicyLimitExceeded => "54000",
         error.UnknownSetting => "42704",
         error.SettingCatalogChanged => "55000",
         error.UnknownColumn => "42703",

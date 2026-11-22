@@ -292,7 +292,6 @@ pub const KvPool = struct {
     config: KvPoolConfig,
     free_list: std.ArrayListUnmanaged(block.KvBlockId) = .empty,
     blocks: std.ArrayListUnmanaged(KvBlockStorage) = .empty,
-    next_block_id: block.KvBlockId = 0,
     /// Soft cap on the total number of blocks the pool may hold. When set, the
     /// scheduler-side step admission consults `availableBlocks` to gate
     /// admission of additional pending work; the pool itself does not refuse
@@ -360,8 +359,12 @@ pub const KvPool = struct {
             return id;
         }
 
-        const id = self.next_block_id;
-        self.next_block_id += 1;
+        const id = std.math.cast(block.KvBlockId, self.blocks.items.len) orelse return error.KvBlockLimitExceeded;
+        if (id == block.invalid_block_id) return error.KvBlockLimitExceeded;
+        // Reserve every retirement slot before publishing a new block. Valid
+        // release paths can now return storage without allocating or failing.
+        try self.free_list.ensureTotalCapacity(allocator, try std.math.add(usize, self.blocks.items.len, 1));
+        try self.blocks.ensureUnusedCapacity(allocator, 1);
 
         var k_data: []align(4) u8 = &.{};
         errdefer if (k_data.len != 0) allocator.free(k_data);
@@ -379,11 +382,15 @@ pub const KvPool = struct {
 
         // Lazily allocate scratch buffers for dequantization on first block acquire.
         if (self.config.dtype != .f32 and self.read_scratch_k == null) {
-            self.read_scratch_k = try allocator.alloc(f32, self.keyValuesPerToken());
-            self.read_scratch_v = try allocator.alloc(f32, self.valueValuesPerToken());
+            const scratch_k = try allocator.alloc(f32, self.keyValuesPerToken());
+            errdefer allocator.free(scratch_k);
+            const scratch_v = try allocator.alloc(f32, self.valueValuesPerToken());
+            // Publish the pair together, after both allocations succeeded.
+            self.read_scratch_k = scratch_k;
+            self.read_scratch_v = scratch_v;
         }
 
-        try self.blocks.append(allocator, .{
+        self.blocks.appendAssumeCapacity(.{
             .meta = .{
                 .pool_id = self.pool_id,
                 .block_id = id,
@@ -400,11 +407,12 @@ pub const KvPool = struct {
         for (self.blocks.items) |*entry| entry.meta.pool_id = pool_id;
     }
 
-    pub fn release(self: *KvPool, allocator: std.mem.Allocator, id: block.KvBlockId) !void {
+    pub fn release(self: *KvPool, _: std.mem.Allocator, id: block.KvBlockId) !void {
         const entry = self.storageMut(id) orelse return error.InvalidBlockId;
+        if (entry.meta.refcount == 0) return error.InvalidBlockRefcount;
         entry.meta.refcount = 0;
         entry.meta.tokens_written = 0;
-        try self.free_list.append(allocator, id);
+        self.free_list.appendAssumeCapacity(id);
     }
 
     pub fn retain(self: *KvPool, id: block.KvBlockId) !void {
@@ -412,13 +420,13 @@ pub const KvPool = struct {
         entry.meta.refcount += 1;
     }
 
-    pub fn releaseRef(self: *KvPool, allocator: std.mem.Allocator, id: block.KvBlockId) !bool {
+    pub fn releaseRef(self: *KvPool, _: std.mem.Allocator, id: block.KvBlockId) !bool {
         const entry = self.storageMut(id) orelse return error.InvalidBlockId;
         if (entry.meta.refcount == 0) return error.InvalidBlockRefcount;
         entry.meta.refcount -= 1;
         if (entry.meta.refcount > 0) return false;
         entry.meta.tokens_written = 0;
-        try self.free_list.append(allocator, id);
+        self.free_list.appendAssumeCapacity(id);
         return true;
     }
 
@@ -1371,4 +1379,63 @@ test "checked token-pair sizes match runtime layouts and reject overflow" {
             KvDType.f32.bytesForTokenPairChecked(std.math.maxInt(u32), std.math.maxInt(u32)),
         );
     }
+}
+
+test "KV cold acquire retries every allocation failure with contiguous valid storage and scratch pairs" {
+    const a = std.testing.allocator;
+    var reached_success = false;
+    var failures: usize = 0;
+    for (0..32) |failure_index| {
+        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = failure_index });
+        const allocator = failure.allocator();
+        var storage = KvPool.init(.{ .backend = .native, .dtype = .f16, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+        defer storage.deinit(allocator);
+        const id = storage.acquire(allocator) catch |err| recover: {
+            if (err != error.OutOfMemory) return err;
+            failures += 1;
+            try std.testing.expectEqual(@as(usize, 0), storage.blocks.items.len);
+            try std.testing.expect((storage.read_scratch_k == null) == (storage.read_scratch_v == null));
+            failure.fail_index = std.math.maxInt(usize);
+            break :recover try storage.acquire(allocator);
+        };
+        try std.testing.expectEqual(@as(block.KvBlockId, 0), id);
+        const record = storage.storage(id) orelse return error.MissingRetriedKvBlock;
+        try std.testing.expectEqual(id, record.meta.block_id);
+        try std.testing.expect(storage.read_scratch_k != null and storage.read_scratch_v != null);
+        try storage.writeToken(id, 0, 0, &.{ 1, 2 }, &.{ 3, 4 });
+        const row = try storage.readToken(id, 0, 0);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row.k);
+        try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, row.v);
+        try std.testing.expect(try storage.releaseRef(allocator, id));
+        try std.testing.expectEqual(id, try storage.acquire(allocator));
+        try storage.release(allocator, id);
+        if (!failure.has_induced_failure) {
+            reached_success = true;
+            break;
+        }
+    }
+    try std.testing.expect(reached_success and failures != 0);
+}
+
+test "KV grown pool shared references and retirement reuse allocate nothing" {
+    const a = std.testing.allocator;
+    var storage = KvPool.init(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+    defer storage.deinit(a);
+    var ids: [17]block.KvBlockId = undefined;
+    for (&ids) |*id| id.* = try storage.acquire(a);
+    try std.testing.expect(storage.free_list.capacity >= storage.blocks.items.len);
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+    for (ids) |id| {
+        try storage.retain(id);
+        try std.testing.expect(!try storage.releaseRef(failure.allocator(), id));
+        try std.testing.expect(try storage.releaseRef(failure.allocator(), id));
+        try std.testing.expectError(error.InvalidBlockRefcount, storage.releaseRef(failure.allocator(), id));
+    }
+    try std.testing.expect(!failure.has_induced_failure);
+    try std.testing.expectEqual(ids.len, storage.free_list.items.len);
+    for (0..ids.len) |_| {
+        const id = try storage.acquire(failure.allocator());
+        try std.testing.expect(storage.storage(id) != null);
+    }
+    try std.testing.expect(!failure.has_induced_failure);
 }

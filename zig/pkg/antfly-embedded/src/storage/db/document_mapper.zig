@@ -966,6 +966,12 @@ pub const TextProjectionBatchBuilder = struct {
     selected_field: ?[]const u8 = null,
     store_source_columns: bool = false,
     text_docs: std.ArrayListUnmanaged(introducer_mod.TextDocument) = .empty,
+    numeric_coverage_terminals: std.StringHashMapUnmanaged(*NumericCoverageNode) = .empty,
+    numeric_coverage_emitted: std.ArrayListUnmanaged(*NumericCoverageNode) = .empty,
+    numeric_coverage_root: NumericCoverageNode = .{},
+    omitted_text_sources: OmittedTextSources = .empty,
+    numeric_coverage_fields: ?[]const []const u8 = null,
+    numeric_witness_segment_bytes: usize = 0,
 
     pub fn init(
         arena: Allocator,
@@ -1035,12 +1041,25 @@ pub const TextProjectionBatchBuilder = struct {
         else if (self.schema == null and doc.schema_less_fast_projection)
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }
         else
-            try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
+            try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers, &self.omitted_text_sources);
         if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
         const order = if (!has_selected_field) try mappedIndexSortProjection(self.arena, extraction_root, self.schema, extracted.typed_fields) else IndexSortProjection{};
+        const had_numeric_schema = self.numeric_coverage_fields != null;
+        const has_numeric_source = !has_selected_field and doc.root == .object and self.schema != null;
+        const rejections = if (has_numeric_source)
+            try self.numericCoverageRejections(doc.root.object, extracted.typed_fields orelse &.{})
+        else
+            &.{};
+        const shared = self.numeric_coverage_fields orelse &.{};
+        const complete_numeric_fields = if (has_numeric_source) shared else &.{};
+        const new_shared_count = if (had_numeric_schema) 0 else shared.len;
         try self.text_docs.append(self.arena, .{
             .index_sort_values = order.values,
+            .complete_numeric_fields = complete_numeric_fields,
+            .numeric_coverage_rejections = rejections,
+            .numeric_coverage_bytes = new_shared_count * @sizeOf([]const u8) + rejections.len * @sizeOf(introducer_mod.NumericCoverageRejection),
+            .numeric_witness_segment_bytes = if (complete_numeric_fields.len == 0) 0 else self.numeric_witness_segment_bytes,
             .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
             .stored_data = if (self.store_source_columns) "" else doc.stored_data,
@@ -1058,6 +1077,63 @@ pub const TextProjectionBatchBuilder = struct {
             .typed_fields = if (has_selected_field) &.{} else extracted.typed_fields orelse if (doc.typed_source == null) &.{} else null,
             .typed_source = if (has_selected_field) null else if (extracted.typed_fields == null) doc.typed_source else null,
         });
+    }
+
+    fn numericCoverageRejections(
+        self: *TextProjectionBatchBuilder,
+        root: std.json.ObjectMap,
+        projected: []const introducer_mod.TypedFieldValue,
+    ) ![]const introducer_mod.NumericCoverageRejection {
+        const alloc = self.arena;
+        if (self.numeric_coverage_fields == null) {
+            var eligible: std.ArrayList([]const u8) = .empty;
+            for (self.schema.?.exact_fields) |field| {
+                if (!runtime_schema.supportsNumericRangeCoverage(field)) continue;
+                try eligible.append(alloc, field.field);
+                var node = &self.numeric_coverage_root;
+                var components = std.mem.splitScalar(u8, field.field, '.');
+                while (components.next()) |part| {
+                    const child = try node.children.getOrPut(alloc, part);
+                    if (!child.found_existing) {
+                        const end = if (components.index) |next| next - 1 else field.field.len;
+                        const created = try alloc.create(NumericCoverageNode);
+                        created.* = .{ .path = field.field[0..end] };
+                        child.value_ptr.* = created;
+                    }
+                    node = child.value_ptr.*;
+                }
+                node.terminal = true;
+                try self.numeric_coverage_terminals.put(alloc, field.field, node);
+            }
+            const names = try eligible.toOwnedSlice(alloc);
+            self.numeric_coverage_fields = names;
+            self.numeric_witness_segment_bytes = segment_mod.estimateNumericRangeWitnessBytes(names);
+        }
+        if (self.numeric_coverage_fields.?.len == 0) return &.{};
+
+        const emitted = &self.numeric_coverage_emitted;
+        defer {
+            for (emitted.items) |node| node.observed = null;
+            emitted.clearRetainingCapacity();
+        }
+        for (projected) |typed| {
+            const node = self.numeric_coverage_terminals.get(typed.field_name) orelse continue;
+            const duplicate = node.observed != null;
+            if (!duplicate) try emitted.append(alloc, node);
+            const numeric: ?typed_dv.NumericValue = if (duplicate or typed.conflicted or typed.value != .numeric_val)
+                null
+            else
+                typed.value.numeric_val;
+            node.observed = @as(??typed_dv.NumericValue, numeric);
+        }
+
+        var rejected: std.ArrayList(introducer_mod.NumericCoverageRejection) = .empty;
+        try self.numeric_coverage_root.rejectIncomplete(alloc, root, &rejected);
+        // A projected value with no matching source path cannot prove absence.
+        for (emitted.items) |node| {
+            if (node.observed != null) try rejected.append(alloc, .{ .path = node.path, .kind = .field });
+        }
+        return rejected.toOwnedSlice(alloc);
     }
 
     /// Borrow only under a retained column lease. Otherwise promote source
@@ -1380,7 +1456,9 @@ fn appendTextProjectionSourceDoc(
         return;
     }
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena, value, .{});
+    // Preserve decimal tokens so a rounded projection cannot attest exact
+    // source equality merely because the source parser rounded it too.
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, value, .{ .parse_numbers = false });
     const root = parsed.value;
     const stored_projection = try fullTextStoredProjection(arena, root, value, opts);
     try source_docs.append(arena, .{
@@ -1529,6 +1607,7 @@ pub fn splitProjectionDocsEnd(docs: []const introducer_mod.TextDocument, start: 
 
 fn estimateProjectedTextDocBytes(doc: introducer_mod.TextDocument) usize {
     var total: usize = 64 + doc.id.len + @max(doc.stored_data.len, @as(usize, @intCast(doc.stored_source_bytes)));
+    total +|= doc.numericCoverageInputBytes();
     for (doc.text_fields) |field| {
         total +|= 16 + field.field_name.len + field.text.len;
     }
@@ -2729,7 +2808,7 @@ fn extractTextFields(
 ) !ExtractedTextFields {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
     defer parsed.deinit();
-    return try extractTextFieldsFromValue(alloc, parsed.value, text_analysis, schema, observed_field_analyzers);
+    return try extractTextFieldsFromValue(alloc, parsed.value, text_analysis, schema, observed_field_analyzers, null);
 }
 
 fn extractTextFieldsFromValue(
@@ -2738,6 +2817,7 @@ fn extractTextFieldsFromValue(
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+    omitted_sources: ?*OmittedTextSources,
 ) !ExtractedTextFields {
     if (root != .object) return .{ .fields = &.{} };
 
@@ -2767,7 +2847,7 @@ fn extractTextFieldsFromValue(
             null;
 
         if (document_schema) |resolved| {
-            try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers, false);
+            try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers, false, omitted_sources);
         }
         try appendDynamicSchemaTextFields(alloc, &fields, &typed_fields, root, runtime, document_schema, text_analysis, observed_field_analyzers);
         try appendSchemaTypedDocValueFields(alloc, &typed_fields, root, runtime);
@@ -2797,7 +2877,7 @@ pub fn highlightTextFieldsFromValue(
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
 ) ![]const HighlightTextField {
-    return highlightTextFieldsFromValueWithSelectedField(alloc, root, text_analysis, schema, null);
+    return highlightTextFieldsFromValueWithSelectedField(alloc, root, text_analysis, schema, null, null);
 }
 
 /// Keep highlight provenance identical to TextProjectionBatchBuilder, including
@@ -2809,7 +2889,7 @@ pub fn highlightTextFieldsFromValueWithSelectedField(
     schema: ?runtime_schema.TableSchema,
     selected_field: ?[]const u8,
 ) ![]const HighlightTextField {
-    const extracted = if (selected_field) |field| try extractSelectedTextField(alloc, root, field) else try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
+    const extracted = if (selected_field) |field| try extractSelectedTextField(alloc, root, field) else try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null, null);
     var fields = std.ArrayListUnmanaged(HighlightTextField).empty;
     for (extracted.fields) |field| {
         try fields.append(alloc, .{
@@ -2856,12 +2936,38 @@ pub fn compileHighlightRouting(alloc: Allocator, text_analysis: introducer_mod.T
     const documents = try alloc.alloc(HighlightDocumentRoutes, table.full_text_documents.len);
     for (table.full_text_documents, documents) |document, *out| {
         var fields: std.ArrayListUnmanaged(introducer_mod.TextField) = .empty;
-        try appendSchemaTextFields(alloc, &fields, .{ .object = .empty }, table, document, text_analysis, null, true);
+        try appendSchemaTextFields(alloc, &fields, .{ .object = .empty }, table, document, text_analysis, null, true, null);
         const routes = try alloc.alloc(HighlightTextRoute, fields.items.len);
         for (fields.items, routes) |field, *route| route.* = .{ .source_field = field.source_field orelse field.field_name, .indexed_field = field.field_name, .analyzer = introducer_mod.effectiveTextFieldAnalyzer(field, text_analysis) };
         out.* = .{ .fields = routes };
     }
     return documents;
+}
+
+const OmittedTextSources = std.StringHashMapUnmanaged([]const []const u8);
+
+fn omittedTextSourcesAlloc(
+    alloc: Allocator,
+    exact_fields: []const runtime_schema.ExactField,
+    document: runtime_schema.FullTextDocument,
+) ![]const []const u8 {
+    var declared: std.StringHashMapUnmanaged(void) = .empty;
+    defer declared.deinit(alloc);
+    for (document.declared_paths) |path| try declared.put(alloc, path, {});
+    var emitted: std.StringHashMapUnmanaged(void) = .empty;
+    defer emitted.deinit(alloc);
+    for (document.fields) |field| {
+        if (std.mem.eql(u8, field.path, field.emitted_name)) try emitted.put(alloc, field.path, {});
+    }
+    var sources: std.ArrayList([]const u8) = .empty;
+    errdefer sources.deinit(alloc);
+    for (exact_fields) |field| {
+        if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
+        if (!declared.contains(field.source_field) or emitted.contains(field.source_field) or
+            runtime_schema.pathFallsUnderAnyPrefix(document.unindexed_paths, field.source_field)) continue;
+        try sources.append(alloc, field.source_field);
+    }
+    return sources.toOwnedSlice(alloc);
 }
 
 fn appendSchemaTextFields(
@@ -2873,6 +2979,7 @@ fn appendSchemaTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
     metadata_only: bool,
+    omitted_sources: ?*OmittedTextSources,
 ) !void {
     var physical_schema = schema;
     if (document_schema.physical_exact_fields) |rules| physical_schema.exact_fields = rules;
@@ -2917,22 +3024,20 @@ fn appendSchemaTextFields(
             }
         }
     }
-    // A disabled root can still declare separately indexed named subfields.
-    // Its source remains available even though the root emits no postings.
-    for (physical_schema.exact_fields) |field| {
-        if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
-        if (!runtime_schema.containsPath(document_schema.declared_paths, field.source_field) or
-            runtime_schema.pathFallsUnderAnyPrefix(document_schema.unindexed_paths, field.source_field)) continue;
-        // Current ASCH contains the source and the loop above handled it.
-        // Keep this path for epochs emitted by the short-lived omitted-source
-        // producer, without indexing another document type's declarations.
-        if (for (document_schema.fields) |declared| {
-            if (std.mem.eql(u8, declared.path, field.source_field) and std.mem.eql(u8, declared.path, declared.emitted_name)) break true;
-        } else false) continue;
+    // Compatibility for the omitted-source schema producer.
+    const sources = if (omitted_sources) |cache| cached: {
+        if (cache.get(document_schema.name)) |paths| break :cached paths;
+        const paths = try omittedTextSourcesAlloc(alloc, physical_schema.exact_fields, document_schema);
+        errdefer alloc.free(paths);
+        try cache.put(alloc, document_schema.name, paths);
+        break :cached paths;
+    } else try omittedTextSourcesAlloc(alloc, physical_schema.exact_fields, document_schema);
+    defer if (omitted_sources == null) alloc.free(sources);
+    for (sources) |path| {
         var values: std.ArrayListUnmanaged([]const u8) = .empty;
         defer values.deinit(alloc);
-        if (metadata_only) try values.append(alloc, "") else try collectFieldValues(alloc, &values, root, field.source_field);
-        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.source_field, text, physical_schema, text_analysis, observed_field_analyzers);
+        if (metadata_only) try values.append(alloc, "") else try collectFieldValues(alloc, &values, root, path);
+        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, path, text, physical_schema, text_analysis, observed_field_analyzers);
     }
 }
 
@@ -3111,6 +3216,71 @@ fn mappedTypedDocValueFieldAlloc(
     };
 }
 
+const NumericCoverageNode = struct {
+    path: []const u8 = "",
+    terminal: bool = false,
+    observed: ??typed_dv.NumericValue = null,
+    children: std.StringHashMapUnmanaged(*NumericCoverageNode) = .empty,
+
+    fn rejectIncomplete(
+        self: *const NumericCoverageNode,
+        alloc: Allocator,
+        object: std.json.ObjectMap,
+        rejected: *std.ArrayList(introducer_mod.NumericCoverageRejection),
+    ) Allocator.Error!void {
+        for (object.keys(), object.values()) |key, value| {
+            if (self.children.get(key)) |child| {
+                if (child.terminal) {
+                    const observed = child.observed;
+                    child.observed = null;
+                    if (!numericSourceMatchesProjection(value, observed)) {
+                        const equivalent = if (observed orelse null) |emitted|
+                            if (typed_dv.numericValueFromJson(value)) |source|
+                                typed_dv.numericValueAsF64(emitted) == typed_dv.numericValueAsF64(source)
+                            else
+                                false
+                        else
+                            false;
+                        try rejected.append(alloc, .{ .path = child.path, .kind = if (equivalent) .exact_source else .field });
+                    }
+                }
+                if (child.children.count() == 0 or value == .null) continue;
+                if (value == .object)
+                    try child.rejectIncomplete(alloc, value.object, rejected)
+                else
+                    try rejected.append(alloc, .{ .path = child.path, .kind = .descendants });
+            } else if (std.mem.indexOfScalar(u8, key, '.') != null) {
+                // Literal dotted keys can alias the column beneath this object.
+                var node = self;
+                var components = std.mem.splitScalar(u8, key, '.');
+                while (components.next()) |part| {
+                    node = node.children.get(part) orelse break;
+                } else {
+                    try rejected.append(alloc, .{ .path = node.path, .kind = .subtree });
+                }
+            }
+        }
+    }
+};
+
+fn numericSourceMatchesProjection(raw: std.json.Value, observed: ??typed_dv.NumericValue) bool {
+    if (raw == .null) return observed == null;
+    const emitted = (observed orelse return false) orelse return false;
+    if (typed_dv.exactNumericValueFromJson(raw)) |expected| {
+        return typed_dv.compareNumericValues(emitted, expected) == .eq;
+    }
+    if (raw != .number_string or std.mem.indexOfAny(u8, raw.number_string, ".eE") == null) return false;
+    // Compare the preserved decimal token with the exact binary value.
+    // A rounded projection cannot certify the source for standard ranges.
+    var work: @import("../../sql/json_order.zig").Budget = .{};
+    const projected: std.json.Value = switch (emitted) {
+        .f64_val => |v| .{ .float = v },
+        .i64_val => |v| .{ .integer = v },
+        .u64_val => return false,
+    };
+    return (@import("../../sql/json_order.zig").compare(raw, projected, &work, 0) catch return false) == .eq;
+}
+
 const IndexSortProjection = struct { values: []const introducer_mod.NamedSortValue = &.{}, valid: bool = true };
 /// Bind virtual fields to their actual source before certifying semantic NULLs.
 fn mappedIndexSortProjection(a: Allocator, root: std.json.Value, maybe_schema: ?runtime_schema.TableSchema, projected: ?[]const introducer_mod.TypedFieldValue) !IndexSortProjection {
@@ -3176,20 +3346,7 @@ pub fn typedDocValueForMappedFieldAlloc(
             .string => |text| .{ .bytes_val = try alloc.dupe(u8, text) },
             else => null,
         },
-        .numeric => switch (value) {
-            .integer => |number| .{ .numeric_val = .{ .i64_val = number } },
-            .float => |number| if (std.math.isFinite(number)) .{ .numeric_val = .{ .f64_val = number } } else null,
-            .number_string => |number| blk: {
-                if (std.mem.indexOfAny(u8, number, ".eE") == null) {
-                    if (std.fmt.parseInt(i64, number, 10)) |parsed| break :blk .{ .numeric_val = .{ .i64_val = parsed } } else |_| {}
-                    if (std.fmt.parseUnsigned(u64, number, 10)) |parsed| break :blk .{ .numeric_val = .{ .u64_val = parsed } } else |_| {}
-                }
-                const parsed = std.fmt.parseFloat(f64, number) catch return null;
-                if (!std.math.isFinite(parsed)) return null;
-                break :blk .{ .numeric_val = .{ .f64_val = parsed } };
-            },
-            else => null,
-        },
+        .numeric => if (typed_dv.numericValueFromJson(value)) |number| .{ .numeric_val = number } else null,
         .datetime => if (if (value == .string) @import("../../datetime.zig").parseDateTimeToSignedNs(value.string) else @import("../../datetime.zig").rangeNanoseconds(value)) |ns| .{ .datetime_ns = ns } else null,
         .boolean => switch (value) {
             .bool => |boolean| .{ .bool_val = boolean },

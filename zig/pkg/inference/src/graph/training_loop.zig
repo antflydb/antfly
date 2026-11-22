@@ -837,9 +837,10 @@ test "training loop exposes checkpoint summary and timing metrics" {
 
     _ = try loop.step(&g, loss, &cb_val);
 
-    try std.testing.expect(loop.last_step_metrics.runtime_input_build_ns > 0);
+    // A subphase can finish within one monotonic-clock tick and truthfully be zero.
+    try std.testing.expect(loop.last_step_metrics.runtime_input_build_ns <= loop.last_step_metrics.total_ns);
     try std.testing.expect(loop.last_step_metrics.total_ns > 0);
-    try std.testing.expect(loop.last_step_metrics.train_step.checkpoint_ns > 0);
+    try std.testing.expect(loop.last_step_metrics.train_step.checkpoint_ns <= loop.last_step_metrics.total_ns);
     try std.testing.expect(loop.last_step_metrics.checkpoint_summary != null);
     try std.testing.expect(loop.last_step_metrics.flat_param_count == 3);
 }

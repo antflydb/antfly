@@ -183,6 +183,17 @@ static int run_signal_lifetime_smoke(void) {
     snprintf(second_path, sizeof(second_path), "%s/second.aflite.lock", directory);
     remove(first_path);
     remove(second_path);
+    /* The §8 shared lock region (`<db>.aflite-lock`: writer word, reader
+     * slots, cross-process redo watermarks) is a sibling of the primary
+     * file, modeled on SQLite's `-shm`/LMDB's `lock.mdb` -- it retains its
+     * coordination state across an ordinary close the same way the legacy
+     * writer-queue inode below does, and nothing in its own design removes
+     * it there. Both fixture owners are closed and this fixture owns the
+     * entire directory, so it is safe to remove here. */
+    snprintf(first_path, sizeof(first_path), "%s/first.aflite.aflite-lock", directory);
+    snprintf(second_path, sizeof(second_path), "%s/second.aflite.aflite-lock", directory);
+    remove(first_path);
+    remove(second_path);
     /* Writer queues retain their coordination inode across ordinary close.
      * Both fixture owners are closed; remove only the known idle tail so an
      * unexpected live ticket still makes the final directory removal fail. */

@@ -1117,6 +1117,13 @@ pub const Detail = enum(c_int) {
     index_alias_precondition_failed,
     storage_kernel_owner_stale_descriptor,
     object_table_definition_conflict,
+    row_policy_limit_exceeded,
+    decision_not_proposed,
+    pre_dispatch_catalog_generation_changed,
+    transaction_prepare_aborted_unavailable,
+    pre_dispatch_decision_admission_unavailable,
+    model_chunk_empty_video_window,
+    model_chunk_malformed_video_packet,
 };
 
 pub const Status = extern struct {
@@ -1375,6 +1382,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.ChunkWorkingBudgetExceeded => status(.invalid_argument, .model_chunk_working_budget),
         error.ChunkDependencyBudgetExceeded => status(.invalid_argument, .model_chunk_dependency_budget),
         error.ChunkCodedWindowBudgetExceeded => status(.invalid_argument, .model_chunk_coded_window_budget),
+        error.EmptyVideoWindow => status(.invalid_argument, .model_chunk_empty_video_window),
+        error.MalformedVideoPacket => status(.invalid_argument, .model_chunk_malformed_video_packet),
         error.ChunkEventBudgetExceeded => status(.invalid_argument, .model_chunk_event_budget),
         error.RemoteReadBudgetExceeded => status(.invalid_argument, .model_chunk_remote_bytes_budget),
         error.RemoteRequestBudgetExceeded => status(.invalid_argument, .model_chunk_remote_requests_budget),
@@ -1531,6 +1540,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidTablespacePlacementPolicy => status(.invalid_argument, .invalid_tablespace_placement_policy),
         error.CatalogCommandTooLarge => status(.invalid_argument, .catalog_command_too_large),
         error.InvalidCatalogRecord => status(.corrupt, .invalid_catalog_record),
+        error.RowPolicyLimitExceeded => status(.invalid_argument, .row_policy_limit_exceeded),
         error.RowPolicyCatalogChanged => status(.conflict, .row_policy_catalog_changed),
         error.CatalogIdExhausted => status(.internal, .catalog_id_exhausted),
 
@@ -1755,6 +1765,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnknownGroup => status(.not_found, .unknown_group),
         error.TxnNotFound => status(.not_found, .txn_not_found),
         error.Conflict => status(.conflict, .conflict),
+        error.TransactionPrepareAbortedUnavailable => status(.retryable, .transaction_prepare_aborted_unavailable),
+        error.PreDispatchDecisionAdmissionUnavailable => status(.retryable, .pre_dispatch_decision_admission_unavailable),
+        error.PreDispatchCatalogGenerationChanged => status(.conflict, .pre_dispatch_catalog_generation_changed),
+        error.DecisionNotProposed => status(.conflict, .decision_not_proposed),
         error.DecisionConflict => status(.conflict, .decision_conflict),
         error.TableTransitionActive => status(.conflict, .table_transition_active),
         error.SchemaInUse => status(.conflict, .schema_in_use),
@@ -2344,6 +2358,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .model_chunk_working_budget => "ChunkWorkingBudgetExceeded",
         .model_chunk_dependency_budget => "ChunkDependencyBudgetExceeded",
         .model_chunk_coded_window_budget => "ChunkCodedWindowBudgetExceeded",
+        .model_chunk_empty_video_window => "EmptyVideoWindow",
+        .model_chunk_malformed_video_packet => "MalformedVideoPacket",
         .model_chunk_event_budget => "ChunkEventBudgetExceeded",
         .model_chunk_remote_bytes_budget => "RemoteReadBudgetExceeded",
         .model_chunk_remote_requests_budget => "RemoteRequestBudgetExceeded",
@@ -2570,6 +2586,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_tablespace_placement_policy => "InvalidTablespacePlacementPolicy",
         .catalog_command_too_large => "CatalogCommandTooLarge",
         .invalid_catalog_record => "InvalidCatalogRecord",
+        .row_policy_limit_exceeded => "RowPolicyLimitExceeded",
         .row_policy_catalog_changed => "RowPolicyCatalogChanged",
         .catalog_id_exhausted => "CatalogIdExhausted",
 
@@ -2830,6 +2847,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .txn_not_found => "TxnNotFound",
         .conflict => "Conflict",
         .decision_conflict => "DecisionConflict",
+        .transaction_prepare_aborted_unavailable => "TransactionPrepareAbortedUnavailable",
+        .pre_dispatch_decision_admission_unavailable => "PreDispatchDecisionAdmissionUnavailable",
+        .pre_dispatch_catalog_generation_changed => "PreDispatchCatalogGenerationChanged",
+        .decision_not_proposed => "DecisionNotProposed",
         .table_transition_active => "TableTransitionActive",
         .schema_in_use => "SchemaInUse",
         .transaction_too_large => "TransactionTooLarge",
@@ -3383,7 +3404,7 @@ test "system catalog errors retain their stable runtime boundary classification"
     const unavailable = statusFromError(error.SettingAuthorityUnavailable);
     try std.testing.expectEqual(@backingInt(Code.unavailable), unavailable.code);
     try std.testing.expectEqual(error.SettingAuthorityUnavailable, errorFromStatus(unavailable));
-    const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
+    const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted, error.RowPolicyLimitExceeded };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }
 

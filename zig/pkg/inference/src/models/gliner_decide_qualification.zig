@@ -69,7 +69,7 @@ pub const Identity = struct {
 };
 
 pub const QualifiedVariant = enum { decide_deberta, decide_deberta_q8, decide_1b };
-pub const Backend = enum { native, metal, cuda, other };
+pub const Backend = enum { native, metal, cuda, pjrt_cpu_f32, pjrt_cuda_f32, other };
 
 const legacy_weight = FilePin{ .path = "model.safetensors", .size_bytes = 1_945_828_140, .sha256 = "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997" };
 const legacy_q8_encoder = FilePin{ .path = "gliner2-encoder.Q8_0.gguf", .size_bytes = 465_145_600, .sha256 = "8d9bea7df21ab4a8a17333f51f246faab5280159e5751ebbadd81a85ec96c871" };
@@ -221,6 +221,8 @@ pub fn executionBatchPolicy(identity: Identity, backend: Backend) ?ExecutionBatc
         const policy = metalExecutionPolicy(identity) orelse return null;
         return .{ .batch_items = policy.batch_items, .padded_batch_tokens = policy.padded_batch_tokens, .reuse_batch_padding = policy.reuse_batch_padding };
     }
+    if (backend == .cuda and isDecide1B(identity) and identity.inventory.all_f32)
+        return .{ .batch_items = cuda_batch_items, .padded_batch_tokens = 8192 };
     if (backend == .cuda and (isLegacyDecide(identity) or isLegacyDecideQ8(identity)))
         return .{ .batch_items = cuda_batch_items, .padded_batch_tokens = cuda_batch_items * legacy_cuda_limits.sequence_tokens };
     return null;
@@ -241,7 +243,11 @@ test "Decide CUDA execution batches bind both pinned artifacts without changing 
         changed.weight.sha256[0] ^= 1;
         try std.testing.expect(executionBatchPolicy(changed, .cuda) == null);
     }
-    try std.testing.expect(executionBatchPolicy(pinned_fp32_identity, .cuda) == null);
+    const full = executionBatchPolicy(pinned_fp32_identity, .cuda).?;
+    try std.testing.expectEqual(@as(usize, 8), full.batch_items);
+    try std.testing.expectEqual(@as(usize, 8192), full.padded_batch_tokens);
+    try std.testing.expectEqual(@as(usize, 1), full.padded_batch_tokens / 7999);
+    try std.testing.expectEqual(@as(usize, 8), full.padded_batch_tokens / 1024);
 }
 
 /// Conservative admission hint, never an execution or qualification grant.
@@ -265,6 +271,14 @@ test "GLiNER Decide Metal policy binds the dense artifact and keeps admission co
     try std.testing.expect(metalExecutionPolicy(pinned_fp32_identity) == null);
 }
 
+/// This is the marker-classifier execution envelope, distinct from span
+/// extraction's independently qualified 1024-token processor/window profile.
+pub fn decisionSequenceLimit(identity: Identity, backend: Backend) ?u32 {
+    if (backend == .cuda and isDecide1B(identity) and identity.inventory.all_f32)
+        return identity.geometry.max_position_embeddings;
+    return null;
+}
+
 /// Variant-specific limits supplement the legacy native policy. CUDA FP32
 /// request cardinality is checked separately by requireRequestIdentity.
 pub fn requestLimits(identity: Identity) !?RequestLimits {
@@ -280,6 +294,12 @@ pub fn supportsSpanExtraction(identity: Identity) bool {
 
 pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize, sequences: usize, tokens: usize) !void {
     const variant = try require(identity);
+    if (backend == .pjrt_cpu_f32 or backend == .pjrt_cuda_f32) {
+        if (variant != .decide_1b or !identity.inventory.all_f32) return error.UnsupportedGlinerDecisionBackend;
+        if (items != 1 or sequences == 0 or sequences > 64 or tokens == 0 or tokens > 1024) return error.UnsupportedGlinerDecisionGeometry;
+        return;
+    }
+
     // Native and Metal retain the existing request envelope. Metal's physical
     // batches are bounded independently; larger requests use multiple forwards.
     // The processor still enforces per-sequence and per-item split limits.
@@ -287,7 +307,13 @@ pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize
     if (variant == .decide_deberta and backend != .cuda) return;
     if (variant == .decide_deberta_q8) {
         if (backend != .cuda) return error.UnsupportedGlinerDecisionBackend;
-    } else if (variant == .decide_1b and backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
+    } else if (variant == .decide_1b) {
+        switch (backend) {
+            .native, .metal => {},
+            .cuda => if (!identity.inventory.all_f32) return error.UnsupportedGlinerDecisionBackend,
+            else => return error.UnsupportedGlinerDecisionBackend,
+        }
+    }
     const limits = if (variant == .decide_deberta) legacy_cuda_limits else (try requestLimits(identity)).?;
     if ((backend == .cuda and variant != .decide_1b and sequences != items) or items == 0 or items > limits.request_items or sequences == 0 or sequences > limits.prepared_sequences or tokens == 0 or tokens > limits.sequence_tokens)
         return error.UnsupportedGlinerDecisionGeometry;
@@ -464,4 +490,29 @@ test "GLiNER Decide Metal FP32 and Q8 batching preserve split tasks" {
     try std.testing.expectEqualDeep(metalExecutionPolicy(identity).?, metalExecutionPolicy(q8).?);
     q8.weight_companion.?.sha256[0] ^= 1;
     try std.testing.expect(metalExecutionPolicy(q8) == null);
+}
+
+test "Decide marker context and PJRT profiles do not broaden span or quantized qualification" {
+    const identity = pinned_fp32_identity;
+    try std.testing.expectEqual(@as(?u32, 7999), decisionSequenceLimit(identity, .cuda));
+    try std.testing.expectEqual(@as(usize, 1024), (try requestLimits(identity)).?.sequence_tokens);
+    try requireRequestIdentity(identity, .cuda, 1, 64, 1024);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 2, 2, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 65, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 1, 1025));
+    var quantized = identity;
+    quantized.inventory.all_f32 = false;
+    quantized.weight = digestFromPin(decide_1b_q8_encoder);
+    quantized.weight_companion = digestFromPin(decide_1b_q8_head);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequestIdentity(quantized, .cuda, 1, 1, 64));
+    for ([_]Backend{ .pjrt_cpu_f32, .pjrt_cuda_f32 }) |backend| {
+        try requireRequestIdentity(identity, backend, 1, 64, 1024);
+        try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, backend, 2, 2, 64));
+        try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, backend, 1, 1, 1025));
+        try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequestIdentity(pinned_legacy_q8_identity, backend, 1, 1, 64));
+    }
+    var changed = identity;
+    changed.weight.sha256[0] ^= 1;
+    try std.testing.expect(decisionSequenceLimit(changed, .cuda) == null);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, requireRequestIdentity(changed, .pjrt_cpu_f32, 1, 1, 64));
 }

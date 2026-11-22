@@ -104,7 +104,7 @@ pub fn parseBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBa
 }
 /// Reserved graph-owner maintenance namespaces are part of admission, not an
 /// import of the storage key encoder or cleanup executor.
-fn isReservedControlKey(key: []const u8) bool {
+pub fn isReservedControlKey(key: []const u8) bool {
     for ([_][]const u8{
         "\x00\x00__metadata__:graph_owner_replay:v1:",
         "\x00\x00__metadata__:graph_endpoint_cleanup:v1:",
@@ -433,12 +433,22 @@ fn transformOpTypeFromString(op: []const u8) !mutation.TransformOpType {
     return error.InvalidBatchRequest;
 }
 
+test "public batch query and full_text use the same document visibility barrier" {
+    const allocator = std.testing.allocator;
+    var query = try parseBatchRequest(allocator, "{\"sync_level\":\"query\"}");
+    defer query.deinit(allocator);
+    var legacy = try parseBatchRequest(allocator, "{\"sync_level\":\"full_text\"}");
+    defer legacy.deinit(allocator);
+    try std.testing.expectEqual(mutation.SyncLevel.full_text, query.req.sync_level);
+    try std.testing.expectEqual(query.req.sync_level, legacy.req.sync_level);
+}
+
 fn syncLevelFromValue(value: std.json.Value) !mutation.SyncLevel {
     if (value != .string) return error.InvalidBatchRequest;
     const level = value.string;
     if (std.mem.eql(u8, level, "propose")) return .propose;
     if (std.mem.eql(u8, level, "write")) return .write;
-    if (std.mem.eql(u8, level, "full_text")) return .full_text;
+    if (std.mem.eql(u8, level, "query") or std.mem.eql(u8, level, "full_text")) return .full_text;
     if (std.mem.eql(u8, level, "enrichments")) return .enrichments;
     if (std.mem.eql(u8, level, "full_index")) return .full_index;
     return error.InvalidBatchRequest;

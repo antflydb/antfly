@@ -95,6 +95,7 @@ pub const Shared = struct {
     platform_mod: *std.Build.Module,
     objectstore_mod: *std.Build.Module,
     google_mod: *std.Build.Module,
+    tile_mod: *std.Build.Module,
     vector_mod: *std.Build.Module,
     hash_mod: *std.Build.Module,
     hash_bench_mod: *std.Build.Module,
@@ -152,7 +153,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         }
     else
         .{};
-    const target = b.standardTargetOptions(.{ .default_target = default_target });
+    const target = requireCx16(b, b.standardTargetOptions(.{ .default_target = default_target }));
     const optimize = b.standardOptimizeOption(.{});
     const vopr_dep = b.dependency("vopr", .{ .target = target, .optimize = optimize });
     const vopr_mod = vopr_dep.module("vopr");
@@ -553,12 +554,18 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    const tile_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tile/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const vector_mod = b.createModule(.{
         .root_source_file = b.path("lib/vector/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
     vector_mod.addImport("protobuf", protobuf_mod);
+    vector_mod.addImport("antfly_tile", tile_mod);
     const hash_mod = b.createModule(.{
         .root_source_file = b.path("lib/hash/src/mod.zig"),
         .target = target,
@@ -783,7 +790,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     b.modules.put(b.allocator, b.dupe("inference_onnx_graph"), inference_onnx.graph) catch @panic("OOM");
     const inference_pjrt_xla_proto_mod = b.createModule(.{
-        .root_source_file = b.path("lib/pjrt/proto/xla_proto_stub.zig"),
+        .root_source_file = b.path("lib/pjrt/proto/xla_proto.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -872,6 +879,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .skip_openapi = false,
         },
         .shared = .{
+            .tile = tile_mod,
             .build_info_mod = build_info.module,
             .build_info_object = build_info.object,
             .tokenizer_mod = tokenizer.tokenizer,
@@ -1589,6 +1597,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .platform_mod = platform_mod,
         .objectstore_mod = objectstore_mod,
         .google_mod = google_mod,
+        .tile_mod = tile_mod,
         .vector_mod = vector_mod,
         .hash_mod = hash_mod,
         .hash_bench_mod = hash_bench_mod,
@@ -1682,4 +1691,14 @@ pub fn finalizeMediaClients(b: *std.Build, original: AntflyRootImports) AntflyRo
             @field(result.storage_boundary, field) = clients.rewrite(@field(result.storage_boundary, field));
     }
     return result;
+}
+
+/// Lite's cross-process lock region swaps 128-bit words (holder and ticket
+/// slots carry a claim generation beside the pid), so x86_64 builds need
+/// CMPXCHG16B. Every x86_64 CPU since roughly 2008 has it (x86-64-v2 and up).
+fn requireCx16(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.ResolvedTarget {
+    if (target.result.cpu.arch != .x86_64 or std.Target.x86.featureSetHas(target.result.cpu.features, .cx16)) return target;
+    var query = target.query;
+    query.cpu_features_add.addFeature(@backingInt(std.Target.x86.Feature.cx16));
+    return b.resolveTargetQuery(query);
 }

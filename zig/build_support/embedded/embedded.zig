@@ -273,11 +273,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     native_inference_mod.sanitize_thread = antfly_imports.sanitize_thread;
     antfly_imports.configureInference(b, native_inference_mod, link_libc);
-    const native_inference = @import("shared_library.zig").addProviderArchive(
+    const shared_library = @import("shared_library.zig");
+    const inference_compile_rss = shared_library.inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory);
+    const native_inference = shared_library.addProviderArchive(
         b,
         native_inference_mod,
         "antfly-inference-core",
-        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory),
+        shared_library.nativeInferenceCompileMaxRss(b.graph.host.result, target.result, optimize, inference_compile_rss),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;
@@ -533,6 +535,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_model_filters = [_][]const u8{"capi local model "};
     const capi_default_filters = [_][]const u8{
+        "lite write amplification",
         "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",
@@ -594,6 +597,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi graph replacement retains indexed serving edges",
         "capi native resolver maintenance retries",
         "capi native idle maintenance",
+        "capi native refresh during a lane-pinned write does not mark that generation read-only",
         "SQL overlay native pages retain typed cells",
         "capi Lite models_dir loads a real extractor",
         "capi Lite promotion resolves ANN",
@@ -610,6 +614,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite AddIndexJSON registers a graph config",
         "inline resolver replacement",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
+        "batch wire",
     };
     const memory_capi_check = linked_tests.add(b, .{ .name = "memory-capi-check", .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("memory-capi-check", "Compile native memory C ABI persistence tests").dependOn(&memory_capi_check.object.step);
@@ -646,6 +651,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // it once through capi_default_filters.
     b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
         .dependOn(&capiTestRun(b, capi_tests, &.{"storage owner remote content source"}, true).step);
+    b.step("lite-write-amplification", "Run the Lite write-amplification counting harness and print its JSON report")
+        .dependOn(&capiTestRun(b, capi_tests, &.{"lite write amplification"}, true).step);
+    b.step("lite-write-amplification-cpu", "Run the Lite write-amplification CPU-cost harness (allocations/syscalls/CPU time per write) and print its JSON report")
+        .dependOn(&capiTestRun(b, capi_tests, &.{"lite write amplification cpu"}, true).step);
     const run_capi_models = capiTestRun(b, capi_tests, &capi_model_filters, true);
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")

@@ -58344,10 +58344,11 @@ pub const SuccessMessage = struct {
     }
 };
 
-/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
+/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "query": Wait for durable application and document full-text query visibility - "full_text": Compatibility alias for query - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
 pub const SyncLevel = enum {
     propose,
     write,
+    query,
     full_text,
     enrichments,
     full_index,
@@ -58356,6 +58357,7 @@ pub const SyncLevel = enum {
         const s = switch (self) {
             .propose => "propose",
             .write => "write",
+            .query => "query",
             .full_text => "full_text",
             .enrichments => "enrichments",
             .full_index => "full_index",
@@ -58371,6 +58373,7 @@ pub const SyncLevel = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "propose", .propose },
             .{ "write", .write },
+            .{ "query", .query },
             .{ "full_text", .full_text },
             .{ "enrichments", .enrichments },
             .{ "full_index", .full_index },
@@ -61217,6 +61220,60 @@ pub const TransactionStageWriteRequest = struct {
 pub const TransactionStatusResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
+};
+
+/// A classified write failure. An aborted status confirms that the transaction did not commit.
+pub const TransactionWriteError = struct {
+    /// Set to aborted for a confirmed transaction abort.
+    status: ?[]const u8 = null,
+    /// Machine-readable cause, including row_policy_denied and transaction_precommit_aborted.
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// The transaction ID for session commit responses.
+    transaction_id: ?[]const u8 = null,
+    retry_after_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", true },
+        .{ "code", "code", false },
+        .{ "message", "message", false },
+        .{ "retryable", "retryable", false },
+        .{ "transaction_id", "transaction_id", true },
+        .{ "retry_after_ms", "retry_after_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("code");
+        try jw.write(self.code);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        if (self.transaction_id) |value| {
+            try jw.objectField("transaction_id");
+            try jw.write(value);
+        }
+        if (self.retry_after_ms) |value| {
+            try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Speech-to-text provider for the `transcriber` enrichment shorthand. Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording. **Example:** ```yaml name: call_transcripts kind: asset field: recording_url transcriber: provider: antfly model: openai/whisper-base language_code: en timestamps: true ```

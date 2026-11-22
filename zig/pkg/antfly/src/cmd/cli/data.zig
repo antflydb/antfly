@@ -857,6 +857,7 @@ fn parseLoadOptions(args: *std.process.Args.Iterator) LoadOptions {
 fn parseSyncLevel(text: []const u8) ?antfly_client.types.SyncLevel {
     if (std.mem.eql(u8, text, "propose")) return .propose;
     if (std.mem.eql(u8, text, "write")) return .write;
+    if (std.mem.eql(u8, text, "query")) return .query;
     if (std.mem.eql(u8, text, "full_text")) return .full_text;
     if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
     if (std.mem.eql(u8, text, "full_index")) return .full_index;
@@ -872,7 +873,11 @@ fn checkpointSyncLevelMatches(
     configured: ?antfly_client.types.SyncLevel,
 ) bool {
     if (checkpoint_level) |checkpoint| {
-        return std.mem.eql(u8, checkpoint, syncLevelName(effectiveLoadSyncLevel(configured)));
+        const checkpoint_sync = parseSyncLevel(checkpoint) orelse return false;
+        const requested = effectiveLoadSyncLevel(configured);
+        return checkpoint_sync == requested or
+            ((checkpoint_sync == .query or checkpoint_sync == .full_text) and
+                (requested == .query or requested == .full_text));
     }
     // Checkpoint v1 originally encoded an omitted option as null, when the
     // API default was propose. Both propose and the stronger current write
@@ -885,6 +890,7 @@ fn syncLevelName(level: antfly_client.types.SyncLevel) []const u8 {
     return switch (level) {
         .propose => "propose",
         .write => "write",
+        .query => "query",
         .full_text => "full_text",
         .enrichments => "enrichments",
         .full_index => "full_index",

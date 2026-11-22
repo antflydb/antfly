@@ -10013,7 +10013,8 @@ export interface components {
          * @description Response acknowledgment/publication barrier, independent of commit_requires:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
          *     - "write": Wait for durable application to the local key-value store
-         *     - "full_text": Wait for full-text index WAL write
+         *     - "query": Wait for durable application and document full-text query visibility
+         *     - "full_text": Compatibility alias for query
          *     - "enrichments": Wait for this write's enrichment publication
          *     - "full_index": Wait for full-text, enrichment and vector-index publication
          *     A post-commit wait failure never rolls back the source. Terminal background
@@ -10023,7 +10024,7 @@ export interface components {
          * @default propose
          * @enum {string}
          */
-        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "full_index";
+        SyncLevel: "propose" | "write" | "query" | "full_text" | "enrichments" | "full_index";
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
@@ -11695,6 +11696,19 @@ export interface components {
              */
             current_version?: number;
             participant?: components["schemas"]["TransactionConflictParticipant"];
+        };
+        /** @description A classified write failure. An aborted status confirms that the transaction did not commit. */
+        TransactionWriteError: {
+            /** @description Set to aborted for a confirmed transaction abort. */
+            status?: string;
+            /** @description Machine-readable cause, including row_policy_denied and transaction_precommit_aborted. */
+            code: string;
+            message: string;
+            retryable: boolean;
+            /** @description The transaction ID for session commit responses. */
+            transaction_id?: string;
+            /** Format: int64 */
+            retry_after_ms?: number;
         };
         /** @description Result of an OCC transaction commit attempt. */
         TransactionCommitResponse: {
@@ -32559,6 +32573,26 @@ export interface components {
                 "application/json": components["schemas"]["InferenceCapacityError"];
             };
         };
+        /** @description Write permission was denied, or a row policy rejected the transaction. */
+        WriteForbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["TransactionWriteError"] | components["schemas"]["Error"];
+                "text/plain": string;
+            };
+        };
+        /** @description Write admission or preparation is temporarily unavailable. A transaction_precommit_aborted response confirms that the transaction did not commit. */
+        WriteTemporarilyUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["TransactionWriteError"] | components["schemas"]["Error"];
+                "text/plain": string;
+            };
+        };
         /**
          * @description Internal transaction failure. If the response says that the outcome is
          *     unknown, the request may already have committed and the stateless
@@ -34268,26 +34302,20 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Transaction aborted because a predicate, topology fence, or participant state conflicted */
+            /** @description Transaction conflict. Preparation diagnostics are returned as plain text. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
-                };
-            };
-            500: components["responses"]["StatelessTransactionFailure"];
-            /** @description The coordinator was unavailable before a commit decision; retry is safe */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
                     "text/plain": string;
                 };
             };
+            500: components["responses"]["StatelessTransactionFailure"];
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     executeGraphMetricAction: {
@@ -34444,26 +34472,20 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Transaction aborted due to version conflict */
+            /** @description Transaction conflict. Preparation diagnostics are returned as plain text. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
-                };
-            };
-            500: components["responses"]["StatelessTransactionFailure"];
-            /** @description The coordinator was unavailable before a commit decision; retry is safe */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
                     "text/plain": string;
                 };
             };
+            500: components["responses"]["StatelessTransactionFailure"];
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     listTransactionSessions: {
@@ -34803,17 +34825,20 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Session commit conflict */
+            /** @description Session commit conflict. A plain-text response describes a mismatched retry body or table identity. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TransactionSessionCommitResponse"];
+                    "text/plain": string;
                 };
             };
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     abortTransactionSession: {
@@ -36370,6 +36395,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
             /**
              * @description The atomic batch conflicted, the serving replica is fenced, or the
@@ -36387,15 +36413,7 @@ export interface operations {
             };
             429: components["responses"]["DenseRepairBackpressure"];
             500: components["responses"]["StatelessTransactionFailure"];
-            /** @description Write routing, document identity, or the coordinator is temporarily unavailable before a commit decision */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     linearMerge: {
@@ -38354,6 +38372,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Graph write exceeds transaction capacity */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Query capacity or resource budget exhausted */
             429: {
                 headers: {
@@ -39091,8 +39116,9 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["StatelessTransactionFailure"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
                 headers: {
@@ -39100,6 +39126,7 @@ export interface operations {
                 };
                 content?: never;
             };
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     updateNamespaceTableSchema: {

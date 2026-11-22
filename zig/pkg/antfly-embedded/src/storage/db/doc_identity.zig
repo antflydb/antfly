@@ -717,7 +717,7 @@ pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?Do
     return std.mem.readInt(u32, raw[0..4], .big);
 }
 
-fn lookupLiveOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
+pub fn lookupLiveOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
     const key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, doc_id);
     defer alloc.free(key);
     const value = txn.get(key) catch |err| switch (err) {
@@ -944,7 +944,8 @@ pub fn resolvedDocSetForIdsAtGenerationWithPolicyTxn(
     var missing_ordinal_coverage = false;
 
     for (doc_ids) |doc_id| {
-        if (try lookupOrdinalTxn(alloc, mutable_txn, doc_id)) |ordinal| {
+        const mapped = try lookupOrdinalTxn(alloc, mutable_txn, doc_id) orelse try lookupLiveOrdinalTxn(alloc, mutable_txn, doc_id);
+        if (mapped) |ordinal| {
             const state = try lookupStateTxn(mutable_txn, ordinal);
             if (state) |ordinal_state| {
                 const visible = if (generation) |at| ordinal_state.isVisibleAt(at) else ordinal_state.isLive();
@@ -971,12 +972,21 @@ pub fn resolvedDocSetForIdsAtGenerationWithPolicyTxn(
 pub fn fastStatsFromStore(store: *docstore_mod.DocStore) !Stats {
     var txn = try store.beginProbeTxn();
     defer txn.abort();
-    const next = try readNextOrdinalTxn(&txn);
+    return try fastStatsFromTxn(&txn);
+}
+
+/// Same as `fastStatsFromStore`, reading through an already-open probe/read
+/// transaction instead of opening (and aborting) its own. perf/lwa-write-
+/// overhead: lets a mutation's own prep phase share one transaction across
+/// this and its other read-only checks instead of paying a separate overlay
+/// pin/unpin for each.
+pub fn fastStatsFromTxn(txn: anytype) !Stats {
+    const next = try readNextOrdinalTxn(txn);
     var stats = Stats{
         .next_ordinal = next,
         .allocated_ordinals = if (next > 0) next - 1 else 0,
     };
-    if (try readVisibilitySummaryTxn(&txn)) |summary| {
+    if (try readVisibilitySummaryTxn(txn)) |summary| {
         stats.live_ordinals = summary.live_ordinals;
         stats.tombstone_ordinals = summary.tombstone_ordinals;
         stats.max_created_generation = summary.max_created_generation;
@@ -3091,7 +3101,7 @@ fn encodeOrdinalState(state: OrdinalState) [25]u8 {
     return out;
 }
 
-fn decodeOrdinalState(raw: []const u8) !OrdinalState {
+pub fn decodeOrdinalState(raw: []const u8) !OrdinalState {
     if (raw.len != 25) return error.InvalidDocIdentity;
     const state = OrdinalState{
         .canonical_doc_id = std.mem.readInt(u64, raw[0..8], .big),

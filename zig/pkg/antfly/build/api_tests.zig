@@ -747,7 +747,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     api_session_maintenance_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const retained_quota_tests = b.addTest(.{
         .root_module = api_session_maintenance_test_mod,
-        .filters = &.{ "retained quota", "api http server routes table batches through the batch commit hook", "api http client preserves public batch retry safety classifications", "internal routed batch preserves typed validation across the HTTP forwarding hop", "typed routed batch preserves forwarding cancellation and identity conflicts", "httpx antfly reads preserve availability and terminal failures" },
+        .filters = &.{ "httpx multi batch route uses the batch commit hook", "retained quota", "api http server routes table batches through the batch commit hook", "api http client preserves public batch retry safety classifications", "internal routed batch preserves typed validation across the HTTP forwarding hop", "typed routed batch preserves forwarding cancellation and identity conflicts", "httpx antfly reads preserve availability and terminal failures" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-retained-quota-test", "Run retained-effects pressure outcome and retry contracts").dependOn(&addFilteredTestRunArtifact(b, retained_quota_tests).step);
@@ -771,6 +771,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "session maintenance activation follows current range leadership without follower RPCs",
             "api http server serves status using control metadata without diagnostic transfers",
             "transaction commit execution yields through caller io and preserves ownership on cancellation",
+            "durable session limits",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
             "transaction session registry reports status and cleans expired durable sessions",
@@ -1823,7 +1824,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("cypher-transaction-contract-test", "Verify graph transaction staging, receipts and principal identity").dependOn(&addFilteredTestRunArtifact(b, cypher_transaction_contract_tests).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },
+        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids", "SQL session metadata", "replicated session" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
@@ -2340,7 +2341,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     hosted_initial_fk_test_mod.addImport("usermgr_storage", hosted_fk_usermgr_storage);
     const hosted_initial_fk_tests = b.addTest(.{
         .root_module = hosted_initial_fk_test_mod,
-        .filters = &.{ "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations", "mounted initial MATCH PARTIAL publication enforces constraints across restart", "hosted initial FK real services and facade retain all required capabilities" },
+        .filters = &.{ "FK plan batches", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations", "mounted initial MATCH PARTIAL publication enforces constraints across restart", "hosted initial FK real services and facade retain all required capabilities" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-initial-fk-test", "Run mounted hosted initial-FK owner publication regression")
@@ -2371,7 +2372,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "antfly-hosted-initial-fk-recovery",
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("antfly-hosted-initial-fk-recovery", b.graph.host.result, target.result, optimize, 0),
         .root_module = hosted_initial_fk_test_mod,
-        .filters = &.{ "mounted initial", "hosted initial FK real services and facade retain all required capabilities", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations" },
+        .filters = &.{ "mounted initial", "hosted initial FK real services and facade retain all required capabilities", "FK plan batches", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const hosted_fk_drop_test_mod = b.createModule(.{

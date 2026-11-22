@@ -57,6 +57,9 @@ pub const PackedExpertViewEntry = struct {
 
 pub const LazyWeightEntry = struct {
     tensor_ref: tensor_store_mod.LazyTensorRef,
+    /// Immutable checkpoint value identity, shared by transient lookup handles.
+    /// Assigned from execution/source_identity's shared non-recycling namespace.
+    prepared_value_identity: std.atomic.Value(u64) = .init(0),
     quantized_storage: ?QuantizedStorage = null,
     host_loaded: ?@import("../models/weight_source.zig").LoadedWeight = null,
     expert_coord: ?ExpertCoord = null,
@@ -202,7 +205,36 @@ fn mergeLoraPairIntoWeight(base_weight: *LoadedWeight, adapter_a: Tensor, adapte
     );
 }
 
+/// A constructor publishes use authority separately from actual source proof.
+/// Raw and explicitly generic/trainable stores retain copy semantics.
+pub const F32WeightBorrow = enum {
+    copy_only,
+    /// Current loaded bytes must still equal the actual canonical mapped source.
+    canonical_mapped,
+    /// Existing qualified immutable Model-value contract, including owned caches.
+    immutable_model_values,
+};
+
 pub const WeightStore = struct {
+    /// Caller holds the actual store residency lock and Model lifetime. This
+    /// query performs no allocation/Io and grants no authority for foreign tables,
+    /// copied/owned tensors, adapter overlays or unopened mutable shard metadata.
+    pub fn currentMappedF32Borrow(self: *const WeightStore, entry: *const LazyWeightEntry) !bool {
+        if (self.f32_weight_borrow != .canonical_mapped or self.jina_lora_adapter != null or entry.quantize_q8_0 or entry.quantized_storage != null) return false;
+        const loaded = if (entry.host_loaded) |*value| value else return false;
+        const actual = &loaded.tensor;
+        if (loaded.quantized or loaded.quantized_storage != null or actual.dtype != .f32 or actual.owns_data) return false;
+        const store = self.tensor_store orelse return false;
+        const expected = (store.nativeTypedMappedSource(&entry.tensor_ref) catch |err| switch (err) {
+            error.NativeTypedShardNotOpened => return false,
+            else => return err,
+        }) orelse return false;
+        if (expected.dtype != .f32 or actual.data.ptr != expected.data.ptr or actual.data.len != expected.data.len or !std.mem.eql(i64, actual.shape, expected.shape) or !std.mem.eql(u8, actual.name, expected.name)) return false;
+        const actual_mapping = actual.mmap_source_bytes orelse return false;
+        const expected_mapping = expected.mmap_source_bytes orelse return false;
+        return actual_mapping.ptr == expected_mapping.ptr and actual_mapping.len == expected_mapping.len and actual.asFloat32IfAligned() != null;
+    }
+
     scalar_bounds: @import("../models/embedding_gemma2_weight_cache.zig").ScalarBoundsCache = .{},
     allocator: std.mem.Allocator,
     resident_weight_estimate_bytes: usize = 0,
@@ -219,12 +251,10 @@ pub const WeightStore = struct {
     allow_direct_quant: bool = true,
     quant_execution_mode: QuantExecutionMode = .prefer_backend_dense,
     prefer_f32_dense_tensors: bool = false,
-    /// Constructor-only capability for qualified immutable GLiNER inference
-    /// sessions. A request may borrow an aligned F32 host payload while holding
-    /// its LazyWeightEntry pin. Generic and mutable training stores stay false;
-    /// this never authorizes borrowing mutable parameters or retaining a CT
-    /// beyond the request/backend lifetime.
-    allow_immutable_f32_weight_borrow: bool = false,
+    /// Constructor-only read-only use contract. The mapped case additionally
+    /// proves the CURRENT loaded Tensor against its canonical source at lookup;
+    /// it never authorizes borrowing an overlay or mutable generic/training value.
+    f32_weight_borrow: F32WeightBorrow = .copy_only,
     /// Legacy GLiNER may additionally route borrowed weight+bias pairs through
     /// its established MPS slot path. Other immutable-F32 inference sessions
     /// borrow storage without changing their numerical dispatch.
@@ -250,7 +280,7 @@ test "gpu hosted immutable F32 borrowing is disabled for ordinary stores" {
         .prefix = "",
         .lazy_weights = .empty,
     };
-    try std.testing.expect(!store.allow_immutable_f32_weight_borrow);
+    try std.testing.expectEqual(F32WeightBorrow.copy_only, store.f32_weight_borrow);
     try std.testing.expect(!store.prefer_immutable_gliner_f32_mps);
 }
 
@@ -293,6 +323,7 @@ pub fn startPrefetchWorker(data: *WeightStore) !void {
 }
 
 pub fn stopPrefetchWorker(data: *WeightStore) void {
+    if (!data.prefetch_initialized) return;
     data.prefetch.stop();
 }
 
@@ -631,4 +662,22 @@ test "jina lora adapter merges matching safetensors sidecar into loaded base wei
         2.0, 3.5,  5.5,
         4.0, 11.0, 8.0,
     }, base_weight.tensor.asFloat32());
+}
+
+test "GPU cold prefetch teardown never touches an uninitialized queue" {
+    const Probe = struct {
+        fn process(_: *anyopaque, _: *LazyWeightEntry) void {}
+    };
+    var marker: u8 = 0;
+    var store = WeightStore{ .allocator = std.testing.allocator, .prefix = "", .lazy_weights = .empty };
+    // A valid canary makes an accidental access deterministic without reading
+    // undefined bytes. The publication flag deliberately remains false.
+    store.prefetch = @TypeOf(store.prefetch).init(std.testing.allocator, &marker, Probe.process);
+    defer store.prefetch.deinit();
+    store.prefetch.worker_enabled = true;
+    stopPrefetchWorker(&store);
+    stopPrefetchWorker(&store);
+    try std.testing.expect(store.prefetch.worker_enabled);
+    try std.testing.expect(!store.prefetch_initialized);
+    deinitPrefetchQueue(&store);
 }

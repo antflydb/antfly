@@ -40,7 +40,7 @@ const ops = @import("../ops/ops.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const gpt_arch = @import("gpt.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
-const CudaLinearState = if (build_options.enable_cuda) @import("../ops/cuda/lighton_recurrent.zig").State else struct {
+const CudaLinearState = if (build_options.enable_cuda) @import("../ops/cuda/gated_delta.zig").State else struct {
     fn deinit(_: *@This()) void {}
 };
 
@@ -337,7 +337,7 @@ const Forward = struct {
         defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
         // Debug: append the first row's readout hidden state after every layer
         // (raw f32) for layer-by-layer comparison against the reference.
-        const dump_file: ?*std.c.FILE = if (platform.env.getenvZ("ANTFLY_GLIDE_DECODER_DUMP")) |path| std.c.fopen(path, "ab") else null;
+        const dump_file: ?*std.c.FILE = if (comptime !@import("builtin").link_libc) null else if (platform.env.getenvZ("ANTFLY_GLIDE_DECODER_DUMP")) |path| std.c.fopen(path, "ab") else null;
         defer if (dump_file) |file| {
             _ = std.c.fclose(file);
         };

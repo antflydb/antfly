@@ -530,7 +530,7 @@ const MetalDevice = struct {
 
     fn exclusive(tensor: *const Tensor) bool {
         const storage = tensor.device orelse return false;
-        return storage.ref.ref_count == 1;
+        return storage.ref.ref_count.load(.acquire) == 1;
     }
 };
 

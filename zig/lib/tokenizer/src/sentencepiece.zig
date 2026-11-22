@@ -111,6 +111,7 @@ pub const Processor = struct {
     pieces: []const Piece,
     piece_map: std.StringHashMap(i32),
     reserved_map: std.StringHashMap(i32),
+    /// Owns every external token spelling, including aliases of the same ID.
     extra_reserved_map: std.StringHashMap(i32),
     unknown_id: i32,
     byte_fallback: bool,
@@ -118,6 +119,7 @@ pub const Processor = struct {
     special_matcher: PrefixMatcher,
     byte_to_token: [256]?Token,
     id_to_byte: std.AutoHashMap(i32, u8),
+    /// Borrows the preferred decode spelling from extra_reserved_map.
     extra_id_to_text: std.AutoHashMap(i32, []const u8),
     max_vocab_id: i32,
     max_piece_length: usize,
@@ -166,8 +168,8 @@ pub const Processor = struct {
         self.allocator.free(self.pieces);
         self.piece_map.deinit();
         self.reserved_map.deinit();
-        var extra_it = self.extra_id_to_text.iterator();
-        while (extra_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        var extra_it = self.extra_reserved_map.keyIterator();
+        while (extra_it.next()) |key| self.allocator.free(key.*);
         self.extra_reserved_map.deinit();
         self.id_to_byte.deinit();
         self.extra_id_to_text.deinit();
@@ -175,17 +177,70 @@ pub const Processor = struct {
         self.allocator.free(self.unk_surface);
     }
 
+    pub const ExternalSpecialToken = struct { text: []const u8, id: i32 };
+    const ExternalChange = struct { text: []const u8, id: i32, previous_decode: ?[]const u8 };
+
     pub fn addExternalSpecialToken(self: *Processor, token: []const u8, id: i32) !void {
-        if (self.reserved_map.contains(token) or self.piece_map.contains(token) or self.extra_reserved_map.contains(token)) {
-            return;
+        const tokens = [_]ExternalSpecialToken{.{ .text = token, .id = id }};
+        if (try self.externalTokenCapacity(&tokens) == 0) return;
+        var changes: [1]ExternalChange = undefined;
+        try self.installExternalTokens(&tokens, &changes);
+    }
+
+    /// Publish an artifact's complete overlay with one matcher construction.
+    /// On failure the old vocabulary, decode aliases and matcher stay usable.
+    pub fn addExternalSpecialTokens(self: *Processor, tokens: []const ExternalSpecialToken) !void {
+        const capacity = try self.externalTokenCapacity(tokens);
+        if (capacity == 0) return;
+        const changes = try self.allocator.alloc(ExternalChange, capacity);
+        defer self.allocator.free(changes);
+        try self.installExternalTokens(tokens, changes);
+    }
+
+    fn hasSpecialToken(self: *const Processor, token: []const u8) bool {
+        return self.reserved_map.contains(token) or self.piece_map.contains(token) or self.extra_reserved_map.contains(token);
+    }
+
+    fn externalTokenCapacity(self: *const Processor, tokens: []const ExternalSpecialToken) !usize {
+        var count: usize = 0;
+        for (tokens) |token| {
+            if (token.id < 0) return error.InvalidTokenId;
+            if (!self.hasSpecialToken(token.text)) count += 1;
         }
-        const owned = try self.allocator.dupe(u8, token);
-        errdefer self.allocator.free(owned);
-        try self.extra_reserved_map.put(owned, id);
-        errdefer _ = self.extra_reserved_map.remove(owned);
-        try self.extra_id_to_text.put(id, owned);
-        self.max_vocab_id = @max(self.max_vocab_id, id);
+        return count;
+    }
+
+    fn installExternalTokens(self: *Processor, tokens: []const ExternalSpecialToken, changes: []ExternalChange) !void {
+        const capacity = std.math.cast(u32, changes.len) orelse return error.OutOfMemory;
+        try self.extra_reserved_map.ensureUnusedCapacity(capacity);
+        try self.extra_id_to_text.ensureUnusedCapacity(capacity);
+        var installed: usize = 0;
+        errdefer {
+            // Repeated IDs can refer to an earlier insertion in this batch.
+            // Restore them in reverse order before releasing their spellings.
+            while (installed != 0) {
+                installed -= 1;
+                const change = changes[installed];
+                if (change.previous_decode) |previous|
+                    self.extra_id_to_text.putAssumeCapacity(change.id, previous)
+                else
+                    _ = self.extra_id_to_text.remove(change.id);
+                _ = self.extra_reserved_map.remove(change.text);
+                self.allocator.free(change.text);
+            }
+        }
+        var max_vocab_id = self.max_vocab_id;
+        for (tokens) |token| {
+            if (self.hasSpecialToken(token.text)) continue;
+            const owned = try self.allocator.dupe(u8, token.text);
+            changes[installed] = .{ .text = owned, .id = token.id, .previous_decode = self.extra_id_to_text.get(token.id) };
+            installed += 1;
+            self.extra_reserved_map.putAssumeCapacityNoClobber(owned, token.id);
+            self.extra_id_to_text.putAssumeCapacity(token.id, owned);
+            max_vocab_id = @max(max_vocab_id, token.id);
+        }
         try self.rebuildSpecialMatcher();
+        self.max_vocab_id = max_vocab_id;
     }
 
     pub fn setPreserveInlineSpecialsAfterLiteralBos(self: *Processor, enabled: bool) void {
@@ -193,7 +248,6 @@ pub const Processor = struct {
     }
 
     fn rebuildSpecialMatcher(self: *Processor) !void {
-        self.special_matcher.deinit();
         var special_tokens = std.StringHashMap(void).init(self.allocator);
         defer special_tokens.deinit();
 
@@ -211,7 +265,9 @@ pub const Processor = struct {
         while (extra_it.next()) |entry| {
             try special_tokens.put(entry.key_ptr.*, {});
         }
-        self.special_matcher = try PrefixMatcher.initFromMap(self.allocator, &special_tokens);
+        const replacement = try PrefixMatcher.initFromMap(self.allocator, &special_tokens);
+        self.special_matcher.deinit();
+        self.special_matcher = replacement;
     }
 
     pub fn encode(self: *const Processor, allocator: std.mem.Allocator, text: []const u8) ![]Token {
@@ -684,7 +740,7 @@ pub const Processor = struct {
 
     fn vtableVocabSize(ptr: *anyopaque) usize {
         const self: *const Processor = @ptrCast(@alignCast(ptr));
-        return @as(usize, @intCast(self.max_vocab_id + 1));
+        return @intCast(@as(i64, self.max_vocab_id) + 1);
     }
 
     fn vtableDeinit(ptr: *anyopaque) void {
@@ -725,11 +781,15 @@ fn appendByteRunWithReplacement(
 }
 
 fn initFromPieceSpecs(allocator: std.mem.Allocator, pieces_init: []const PieceInit, options: InitOptions) !Processor {
+    if (pieces_init.len > std.math.maxInt(i32)) return error.TooManyPieces;
     var piece_map = std.StringHashMap(i32).init(allocator);
+    errdefer piece_map.deinit();
     var reserved_map = std.StringHashMap(i32).init(allocator);
+    errdefer reserved_map.deinit();
     var special_tokens = std.StringHashMap(void).init(allocator);
     defer special_tokens.deinit();
     var id_to_byte = std.AutoHashMap(i32, u8).init(allocator);
+    errdefer id_to_byte.deinit();
     var byte_to_token: [256]?Token = @splat(null);
     var unk_id: i32 = -1;
     var max_piece_length: usize = 0;
@@ -801,7 +861,8 @@ fn initFromPieceSpecs(allocator: std.mem.Allocator, pieces_init: []const PieceIn
         }
     }
 
-    const matcher = try PrefixMatcher.initFromMap(allocator, &special_tokens);
+    var matcher = try PrefixMatcher.initFromMap(allocator, &special_tokens);
+    errdefer matcher.deinit();
 
     return .{
         .allocator = allocator,
@@ -1282,4 +1343,119 @@ test {
     // Force test discovery for proto.zig so its decode/runtime tests run
     // alongside the sentencepiece tokenizer tests.
     _ = @import("proto.zig");
+}
+
+test "SentencePiece construction releases every partially initialized owner" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var processor = try Processor.initFromPieces(a, &.{
+                .{ .text = "<unk>", .score = 0, .piece_type = 2 },
+                .{ .text = "token", .score = -1, .piece_type = 1 },
+                .{ .text = "<control>", .score = 0, .piece_type = 3 },
+            }, .{});
+            defer processor.deinit();
+            try std.testing.expectEqual(@as(usize, 9), processor.special_matcher.findPrefixLen("<control>tail"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "SentencePiece failed external overlay keeps the published vocabulary and matcher usable" {
+    var reached_success = false;
+    var failures: usize = 0;
+    for (0..256) |offset| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var processor = try Processor.initFromPieces(failing.allocator(), &.{
+            .{ .text = "<unk>", .score = 0, .piece_type = 2 },
+            .{ .text = "token", .score = -1, .piece_type = 1 },
+        }, .{});
+        defer processor.deinit();
+        try processor.addExternalSpecialToken("<old>", 7);
+        failing.fail_index = failing.alloc_index + offset;
+        if (processor.addExternalSpecialToken("<new>", 42)) |_| {
+            try std.testing.expectEqual(@as(?i32, 42), processor.extra_reserved_map.get("<new>"));
+            try std.testing.expectEqual(@as(usize, 5), processor.special_matcher.findPrefixLen("<new>tail"));
+            reached_success = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            try std.testing.expectEqual(@as(i32, 7), processor.max_vocab_id);
+            try std.testing.expectEqual(@as(?i32, 7), processor.extra_reserved_map.get("<old>"));
+            try std.testing.expect(processor.extra_reserved_map.get("<new>") == null);
+            try std.testing.expectEqualStrings("<old>", processor.extra_id_to_text.get(7).?);
+            try std.testing.expect(processor.extra_id_to_text.get(42) == null);
+            try std.testing.expectEqual(@as(usize, 5), processor.special_matcher.findPrefixLen("<old>tail"));
+        }
+    }
+    try std.testing.expect(reached_success and failures != 0);
+}
+
+test "SentencePiece external token aliases retain all spellings and the preferred decode" {
+    const a = std.testing.allocator;
+    var processor = try Processor.initFromPieces(a, &.{
+        .{ .text = "<unk>", .score = 0, .piece_type = 2 },
+        .{ .text = "token", .score = -1, .piece_type = 1 },
+    }, .{});
+    defer processor.deinit();
+    try processor.addExternalSpecialToken("<first>", 42);
+    try processor.addExternalSpecialToken("<second>", 42);
+    try std.testing.expectEqual(@as(?i32, 42), processor.extra_reserved_map.get("<first>"));
+    try std.testing.expectEqual(@as(?i32, 42), processor.extra_reserved_map.get("<second>"));
+    try std.testing.expectEqual(@as(usize, 7), processor.special_matcher.findPrefixLen("<first>tail"));
+    try std.testing.expectEqual(@as(usize, 8), processor.special_matcher.findPrefixLen("<second>tail"));
+    const decoded = try processor.decode(a, &.{42});
+    defer a.free(decoded);
+    try std.testing.expectEqualStrings("<second>", decoded);
+}
+
+test "SentencePiece batched token overlays publish aliases atomically through every allocation failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var processor = try Processor.initFromPieces(a, &.{
+                .{ .text = "<unk>", .score = 0, .piece_type = 2 },
+                .{ .text = "token", .score = -1, .piece_type = 1 },
+            }, .{});
+            defer processor.deinit();
+            try processor.addExternalSpecialToken("<old>", 7);
+            processor.addExternalSpecialTokens(&.{
+                .{ .text = "<alpha>", .id = 42 },
+                .{ .text = "<beta>", .id = 42 },
+                .{ .text = "<gamma>", .id = 43 },
+                .{ .text = "<alpha>", .id = 99 },
+                .{ .text = "<old>", .id = 100 },
+            }) catch |err| {
+                try std.testing.expectEqual(@as(i32, 7), processor.max_vocab_id);
+                try std.testing.expectEqual(@as(usize, 1), processor.extra_reserved_map.count());
+                try std.testing.expectEqual(@as(usize, 1), processor.extra_id_to_text.count());
+                try std.testing.expectEqualStrings("<old>", processor.extra_id_to_text.get(7).?);
+                try std.testing.expectEqual(@as(usize, 5), processor.special_matcher.findPrefixLen("<old>tail"));
+                try std.testing.expectEqual(@as(usize, 0), processor.special_matcher.findPrefixLen("<alpha>tail"));
+                return err;
+            };
+            try std.testing.expectEqual(@as(i32, 43), processor.max_vocab_id);
+            try std.testing.expectEqual(@as(usize, 4), processor.extra_reserved_map.count());
+            try std.testing.expectEqual(@as(usize, 3), processor.extra_id_to_text.count());
+            try std.testing.expectEqualStrings("<beta>", processor.extra_id_to_text.get(42).?);
+            try std.testing.expectEqual(@as(?i32, 42), processor.extra_reserved_map.get("<alpha>"));
+            try std.testing.expectEqual(@as(usize, 7), processor.special_matcher.findPrefixLen("<alpha>tail"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "SentencePiece token metadata preserves the full nonnegative i32 ID range" {
+    const a = std.testing.allocator;
+    var processor = try Processor.initFromPieces(a, &.{
+        .{ .text = "<unk>", .score = 0, .piece_type = 2 },
+        .{ .text = "token", .score = -1, .piece_type = 1 },
+    }, .{});
+    defer processor.deinit();
+    try std.testing.expectError(error.InvalidTokenId, processor.addExternalSpecialTokens(&.{.{ .text = "<invalid>", .id = -1 }}));
+    try std.testing.expectEqual(@as(usize, 0), processor.extra_reserved_map.count());
+    try processor.addExternalSpecialToken("<limit>", std.math.maxInt(i32));
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(i32)) + 1, processor.tokenizer().vocabSize());
+    const decoded = try processor.decode(a, &.{std.math.maxInt(i32)});
+    defer a.free(decoded);
+    try std.testing.expectEqualStrings("<limit>", decoded);
 }
