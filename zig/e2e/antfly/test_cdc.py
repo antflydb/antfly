@@ -3656,3 +3656,94 @@ def test_public_changefeed_expired_cut_requires_resynchronization(start):
             _changefeed_call(client, "DELETE", path)
     finally:
         server.stop()
+
+
+def test_public_changefeed_backpressure_isolated_until_acknowledgment():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            api = server.api_url
+            name = "bounded_feed"
+            _changefeed_call(
+                client, "POST", f"{api}/tables/{name}", json={"num_shards": 1}
+            )
+
+            def subscribe(key):
+                return _changefeed_call(
+                    client,
+                    "POST",
+                    f"{api}/changefeeds",
+                    headers={"Idempotency-Key": key},
+                    json={"tables": [name], "include": "rows"},
+                ).json()
+
+            stalled = subscribe("stalled")
+            active = subscribe("active")
+            stalled_path = f"{api}/changefeeds/{stalled['id']}"
+            active_path = f"{api}/changefeeds/{active['id']}"
+            window = _changefeed_call(client, "GET", stalled_path).json()[
+                "cursor_window"
+            ]
+            rows = {f"row-{i:03d}": {"value": i} for i in range(window + 1)}
+            _changefeed_call(
+                client, "POST", f"{api}/tables/{name}/batch", json={"inserts": rows}
+            )
+            cursor = stalled["cursor"]
+            stalled_keys = set()
+            for _ in range(window):
+                page = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{stalled_path}/events",
+                    params={"after": cursor, "limit": 1},
+                )
+                (event,) = page.json()["events"]
+                stalled_keys.add(event["key"]["value"])
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+
+            blocked = client.get(
+                f"{stalled_path}/events",
+                params={"after": cursor, "limit": 1},
+                timeout=15,
+            )
+            assert blocked.status_code == 429, blocked.text
+            assert blocked.json()["error"] == "changefeed_backpressure"
+
+            active_cursor = active["cursor"]
+            active_keys = set()
+            for _ in range(len(rows)):
+                page = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{active_path}/events",
+                    params={"after": active_cursor},
+                )
+                keys = {event["key"]["value"] for event in page.json()["events"]}
+                assert keys and not (keys & active_keys)
+                active_keys.update(keys)
+                active_cursor = page.headers["Antfly-Changefeed-Cursor"]
+                _changefeed_call(
+                    client, "POST", f"{active_path}/ack", json={"cursor": active_cursor}
+                )
+                if active_keys == rows.keys():
+                    break
+            assert active_keys == rows.keys()
+
+            _changefeed_call(
+                client, "POST", f"{stalled_path}/ack", json={"cursor": cursor}
+            )
+            page = _changefeed_call(
+                client,
+                "GET",
+                f"{stalled_path}/events",
+                params={"after": cursor, "limit": 1},
+            )
+            (event,) = page.json()["events"]
+            assert {event["key"]["value"]} == rows.keys() - stalled_keys
+            assert page.json()["transaction"]["complete"]
+            for path in (active_path, stalled_path):
+                _changefeed_call(client, "DELETE", path)
+    finally:
+        server.stop()
