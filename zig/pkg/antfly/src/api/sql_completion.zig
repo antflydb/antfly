@@ -89,6 +89,14 @@ pub fn reserveJoined(server: *server_mod.ApiHttpServer, completion: *wire.Comple
 // Persist the issuer intent and the target proof before the coordinator may
 // seal its plan. A failed/ambiguous preparation never admits the mutation.
 pub fn prepareTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8) !void {
+    try registerTransaction(server, alloc, completion, id, false);
+}
+
+pub fn observeTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8) !void {
+    try registerTransaction(server, alloc, completion, id, true);
+}
+
+fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8, observe_only: bool) !void {
     const encoded_id = std.fmt.bytesToHex(id, .lower);
     const store = try registrationStore(server);
     for (completion.outcomes.items) |outcome| if (outcome.transaction_id) |old| {
@@ -118,7 +126,10 @@ pub fn prepareTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
     const local_node = if (server.cfg.session_router) |router| router.localNodeId() else 0;
     const target_node = (try server.txn_sessions.getOwnerNodeId(alloc, id)) orelse @import("transactions.zig").sessionOwnerNodeId(id);
     const local = server.txn_sessions.durable_scope == .cluster_shared or target_node == local_node;
-    const reference = if (local) try store.createLocalPreparedRegistration(seed, outcome.*, id) else try store.createPreparedRegistration(seed, outcome.*);
+    const reference = if (local)
+        if (observe_only) try store.createLocalObservedRegistration(seed, outcome.*, id) else try store.createLocalPreparedRegistration(seed, outcome.*, id)
+    else
+        try store.createPreparedRegistration(seed, outcome.*);
     completion.capacity.remaining -= 1;
     completion.execution_owned = true;
     @memcpy(encoded, &std.fmt.bytesToHex(reference, .lower));
@@ -127,7 +138,7 @@ pub fn prepareTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
     if (completion.join_begin == null) completion.join_begin = completion.outcomes.items.len - 1;
     if (local) return;
     const floor = try store.registrationFloor();
-    if (!try ownerAction(server, alloc, .{ .transaction_id = id, .reference_id = reference, .action = .prepare, .managed = true, .retired_through = floor }, true)) return error.CompletionUnavailable;
+    if (!try ownerAction(server, alloc, .{ .transaction_id = id, .reference_id = reference, .action = if (observe_only) .observe else .prepare, .managed = true, .retired_through = floor }, true)) return error.CompletionUnavailable;
     try store.putRegistration(reference, .{ .outcome = .{ .transaction_id = outcome.transaction_id }, .phase = .registered, .prepared = true, .execution_admitted = true });
 }
 fn metadataTarget(input: operation.SQLCompletionOwner) refs.Owner {
@@ -445,7 +456,7 @@ pub fn remaining(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, re
     return .{ .outcomes = try pending.toOwnedSlice(alloc) };
 }
 
-pub const OwnerRequest = struct { transaction_id: [16]u8 = @splat(0), reference_id: [16]u8, action: enum { pin, prepare, quiesce, abandon, status, acknowledge, forget }, consumer_node_id: ?u64 = null, managed: bool = false, retired_through: u64 = 0 };
+pub const OwnerRequest = struct { transaction_id: [16]u8 = @splat(0), reference_id: [16]u8, action: enum { pin, prepare, observe, quiesce, abandon, status, acknowledge, forget }, consumer_node_id: ?u64 = null, managed: bool = false, retired_through: u64 = 0 };
 // The originating node serializes registration, probing, and acknowledgement.
 // Remote stores retain compact retirement checkpoints, so delayed retries cannot
 // recreate acknowledged proofs, including across process restarts.
@@ -552,8 +563,9 @@ pub fn ownerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     return switch (request.action) {
         .forget => try store.changeCompletionReference(request.transaction_id, request.reference_id, false, if (request.managed) request.retired_through else null, .forget),
         .quiesce => if (try store.completionReferenceSettled(request.transaction_id, request.reference_id)) true else store.changeCompletionReference(request.transaction_id, request.reference_id, false, if (request.managed) request.retired_through else null, .quiesce),
-        .prepare, .abandon => store.changeCompletionReference(request.transaction_id, request.reference_id, false, if (request.managed) request.retired_through else null, switch (request.action) {
+        .prepare, .observe, .abandon => store.changeCompletionReference(request.transaction_id, request.reference_id, false, if (request.managed) request.retired_through else null, switch (request.action) {
             .prepare => .prepare,
+            .observe => .observe,
             .quiesce => .quiesce,
             .abandon => .abandon,
             else => unreachable,

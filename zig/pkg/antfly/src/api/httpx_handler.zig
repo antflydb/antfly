@@ -6709,6 +6709,9 @@ pub const AntflyApiHandler = struct {
         limit: usize,
         execution_limits: sql_runtime.Limits = .{},
         completion_io: std.Io,
+        completion: *@import("../pgwire/completion.zig").Completion,
+        completion_alloc: std.mem.Allocator,
+        observation_unavailable: bool = false,
         cache_io: std.Io,
         cache: *sql_plan_cache.Cache,
         done: std.Io.Event = .unset,
@@ -6819,6 +6822,20 @@ pub const AntflyApiHandler = struct {
             defer self.preparation.release();
             self.runChecked() catch |err| {
                 self.failure = err;
+            };
+            if (!self.adapter.reports_existing_commit or self.adapter.context.sql_completion == null) return;
+            const pending = if (self.result) |result| result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required else false;
+            if (!pending and self.failure != error.SqlTransactionOutcomeUnknown) return;
+            const encoded = self.adapter.outcome_transaction_id orelse {
+                self.observation_unavailable = true;
+                return;
+            };
+            const id = distributed_txn.parseTxnIdHex(&encoded) catch {
+                self.observation_unavailable = true;
+                return;
+            };
+            @import("sql_completion.zig").observeTransaction(self.adapter.server, self.completion_alloc, self.completion, id) catch {
+                self.observation_unavailable = true;
             };
         }
 
@@ -7411,6 +7428,8 @@ pub const AntflyApiHandler = struct {
             .limit = @intCast(limit),
             .execution_limits = execution_limits,
             .completion_io = ctx.io,
+            .completion = completion,
+            .completion_alloc = ctx.allocator,
             .cache_io = self.api_server.sqlPlanCacheIo(),
             .cache = self.api_server.sqlPlanCache(),
             .preparation = &preparation,
@@ -7427,18 +7446,15 @@ pub const AntflyApiHandler = struct {
         // hitting an already-canceled sleep and spinning until commit ends.
         job.done.waitUncancelable(ctx.io);
         @import("protected_future.zig").wait(runtime_io, &future);
-        completion.unknown = false;
+        completion.unknown = job.observation_unavailable;
         if (job.failure) |err| {
             if (job.adapter.reports_existing_commit) {
                 const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
                 owned.reports_existing_commit = true;
             }
             const diagnostic = sql_execution.diagnostic(err);
-            if (std.mem.eql(u8, diagnostic.code, "40003")) {
-                if (job.adapter.reports_existing_commit) {
-                    completion.unknown = true;
-                } else completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
-            }
+            if (!job.adapter.reports_existing_commit and std.mem.eql(u8, diagnostic.code, "40003"))
+                completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
             if (std.mem.eql(u8, diagnostic.code, "53300")) try ctx.setHeader("Retry-After", "1");
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
@@ -7460,8 +7476,6 @@ pub const AntflyApiHandler = struct {
         }
         var result = job.result.?;
         defer result.deinit();
-        if (job.adapter.reports_existing_commit and (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required))
-            completion.unknown = true;
         if (!job.adapter.reports_existing_commit and (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required or (result.output.ddl_receipt != null and result.output.ddl_receipt.?.state != .ready))) {
             const ddl = if (result.output.ddl_receipt) |value| try std.json.Stringify.valueAlloc(ctx.allocator, value, .{ .emit_null_optional_fields = false }) else null;
             defer if (ddl) |value| ctx.allocator.free(value);
@@ -15692,8 +15706,8 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         defer observed.deinit();
         try std.testing.expectEqual(@as(u16, 409), observed.status.code);
         const completion = try AntflyApiHandler.requestCompletion(&ctx);
-        try std.testing.expect(completion.unknown);
-        try std.testing.expectEqual(@as(usize, 0), completion.outcomes.items.len);
+        try std.testing.expect(!completion.unknown);
+        try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
     }
     _ = try connections.mutate(&durable, .{ .uncertain = .{ .id = id, .guard = guard } }, principal, node, now_ms);
     var blocked_read = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "SELECT 1");
