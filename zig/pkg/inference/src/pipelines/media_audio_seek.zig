@@ -475,8 +475,8 @@ const WebmFlac = struct {
             var at: usize = if (point) |saved| saved.offset else 0;
             var position = if (point) |saved| saved.sample else extent.first;
             var indexed = position;
-            var buffer: std.ArrayList(u8) = .empty;
-            defer buffer.deinit(scratch);
+            var buffer: CodedFrames = .{};
+            defer buffer.bytes.deinit(scratch);
             while (at < extent.packet.size and position < stop_at) {
                 try control.check();
                 var frame = readFrame(scratch, self.info, input, extent.packet, at, &buffer, .{ .context = work.context, .check_fn = work.check_fn }) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
@@ -505,7 +505,7 @@ const WebmFlac = struct {
                 }
                 position = next;
                 at += frame.consumed;
-                consumeFrame(&buffer, frame.consumed);
+                buffer.consume(frame.consumed);
                 if (at < extent.packet.size and (position >= stop_at or position - indexed >= self.info.sample_rate)) {
                     try self.frame_directory.remember(.{ .block = index, .sample = position, .offset = at }, control);
                     indexed = position;
@@ -522,30 +522,65 @@ const WebmFlac = struct {
         return required;
     }
 
-    fn consumeFrame(buffer: *std.ArrayList(u8), size: usize) void {
-        const leftover = buffer.items.len - size;
-        std.mem.copyForwards(u8, buffer.items[0..leftover], buffer.items[size..]);
-        buffer.items.len = leftover;
-    }
+    const CodedFrames = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        start: usize = 0,
 
-    fn readFrame(a: std.mem.Allocator, info: audio.flac.StreamInfo, input: *media.source.Source, packet: media.webm_audio.Packet, at: usize, buffer: *std.ArrayList(u8), control: media.source.Control) !audio.flac.FrameDecoded {
-        const limit = @min(packet.size - at, if (info.max_frame_size != 0) info.max_frame_size else 16 * 1024 * 1024);
-        var wanted = @min(limit, @max(256, buffer.items.len));
-        while (true) {
-            while (buffer.items.len < wanted) {
-                const size = @min(wanted - buffer.items.len, input.limits.max_read_bytes, input.limits.max_retained_bytes);
-                if (size == 0) return error.ResourceLimitExceeded;
-                var lease = try input.readSparseControlled(packet.offset + at + buffer.items.len, size, control);
-                defer lease.deinit();
-                try buffer.appendSlice(a, lease.bytes);
-            }
-            return audio.flac.decodeFramePrefixAlloc(a, info, buffer.items[0..wanted]) catch |err| {
-                if (err != error.IncompleteFlacFrame) return err;
-                if (wanted == limit) return error.UnsupportedAudioFormat;
-                wanted = @min(limit, wanted *| 2);
-                continue;
-            };
+        fn prefix(self: *const CodedFrames, limit: usize) []const u8 {
+            const bytes = self.bytes.items[self.start..];
+            return bytes[0..@min(limit, bytes.len)];
         }
+
+        fn consume(self: *CodedFrames, size: usize) void {
+            self.start += size;
+            if (self.start == self.bytes.items.len) {
+                self.bytes.clearRetainingCapacity();
+                self.start = 0;
+            }
+        }
+
+        fn room(self: *CodedFrames, a: std.mem.Allocator, needed: usize) !void {
+            if (needed <= self.bytes.capacity - self.start) return;
+            if (self.start != 0) {
+                const remaining = self.bytes.items[self.start..];
+                std.mem.copyForwards(u8, self.bytes.items[0..remaining.len], remaining);
+                self.bytes.items.len = remaining.len;
+                self.start = 0;
+            }
+            try self.bytes.ensureTotalCapacity(a, needed);
+        }
+    };
+
+    const FrameRefill = struct {
+        allocator: std.mem.Allocator,
+        input: *media.source.Source,
+        offset: u64,
+        limit: usize,
+        buffer: *CodedFrames,
+        control: media.source.Control,
+
+        fn refill(raw: *anyopaque, end: usize) ![]const u8 {
+            const self: *FrameRefill = @ptrCast(@alignCast(raw));
+            if (end > self.limit) return error.UnsupportedAudioFormat;
+            var available = self.buffer.prefix(self.limit).len;
+            const wanted = @min(self.limit, @max(end, 256, available *| 2));
+            try self.buffer.room(self.allocator, wanted);
+            while (available < wanted) {
+                const size = @min(wanted - available, self.input.limits.max_read_bytes, self.input.limits.max_retained_bytes);
+                if (size == 0) return error.ResourceLimitExceeded;
+                var lease = try self.input.readSparseControlled(self.offset + available, size, self.control);
+                defer lease.deinit();
+                self.buffer.bytes.appendSliceAssumeCapacity(lease.bytes);
+                available += lease.bytes.len;
+            }
+            return self.buffer.prefix(self.limit);
+        }
+    };
+
+    fn readFrame(a: std.mem.Allocator, info: audio.flac.StreamInfo, input: *media.source.Source, packet: media.webm_audio.Packet, at: usize, buffer: *CodedFrames, control: media.source.Control) !audio.flac.FrameDecoded {
+        const limit = @min(packet.size - at, if (info.max_frame_size != 0) info.max_frame_size else 16 * 1024 * 1024);
+        var refill = FrameRefill{ .allocator = a, .input = input, .offset = packet.offset + at, .limit = limit, .buffer = buffer, .control = control };
+        return audio.flac.decodeFrameRefillAlloc(a, info, buffer.prefix(limit), .{ .context = &refill, .refill = FrameRefill.refill });
     }
 };
 

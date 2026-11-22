@@ -192,7 +192,10 @@ pub const Runner = struct {
         const speaker_identity = if (request.speaker_analysis) |analysis| if (analysis.recipe_id) |recipe| try std.fmt.allocPrint(a, "{s}:speaker-turns:{s}", .{ executor.model.planning_identity, recipe }) else null else null;
         defer if (speaker_identity) |value| a.free(value);
         if (speaker_identity) |value| planning_model.planning_identity = value;
-        const identity = if (request.native_source) |source| try planning.Identity.initPinned(source.identity, mime, request.source_version, planning_model, request.policy) else try planning.Identity.init(bytes, mime, request.source_version, planning_model, request.policy);
+        const base_identity = if (request.native_source) |source| try planning.Identity.initPinned(source.identity, mime, request.source_version, planning_model, request.policy) else try planning.Identity.init(bytes, mime, request.source_version, planning_model, request.policy);
+        // Output execution and masks can change during repair. WebM playback
+        // semantics belong to the source plan, independent of those flags.
+        const identity = if (audio.detectFormatFromMime(mime) == .webm) base_identity.withPlaybackRecipe("webm-audio-playback-v2") else base_identity;
         const start = if (request.continuation) |cursor| try identity.parseContinuation(cursor) else 0;
         var self = Runner{ .allocator = a, .executor = executor, .request = request, .control = control, .sink = sink, .summary = .{ .identity = identity, .start_ordinal = start, .next_ordinal = start }, .pool = .{ .limits = .{ .host_bytes = request.max_working_bytes } } };
         if (request.outputs) |config| {
@@ -1605,6 +1608,25 @@ const Qualification = struct {
         return .{ .context = self, .count_text = count, .embed = embed, .model = .{ .planning_identity = "independent-unit-executor", .context_tokens = 8192 } };
     }
 };
+test "model aware media WebM playback rejects pre-upgrade continuations" {
+    const a = std.testing.allocator;
+    var result = Qualification{};
+    const executor = result.executor();
+    const sink = Sink{ .context = &result, .accept = Qualification.accept };
+    var request = Request{ .input = .{ .binary = .{ .mime_type = "video/webm", .data = "fixture" } } };
+    const legacy = try planning.Identity.init("fixture", "video/webm", "", executor.model, request.policy);
+    var token: [85]u8 = undefined;
+    request.continuation = legacy.cursor(3, &token);
+    try std.testing.expectError(error.StaleChunkContinuation, Runner.init(a, request, executor, .{}, sink));
+    request.continuation = null;
+    const current = try Runner.init(a, request, executor, .{}, sink);
+    try std.testing.expectEqual(legacy.source, current.summary.identity.source);
+    request.continuation = current.summary.identity.cursor(3, &token);
+    request.needs_audio = true;
+    const repair = try Runner.init(a, request, executor, .{}, sink);
+    try std.testing.expectEqual(@as(u64, 3), repair.summary.start_ordinal);
+}
+
 test "model aware media streams text coverage and source-bound continuations without duplicate delivery" {
     const a = std.testing.allocator;
     var result = Qualification{};

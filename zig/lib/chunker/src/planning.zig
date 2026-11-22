@@ -173,6 +173,14 @@ pub const Identity = struct {
         }
         return .{ .source = fingerprint, .plan = plan.finalResult() };
     }
+    pub fn withPlaybackRecipe(self: Identity, recipe: []const u8) Identity {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-chunk-playback-recipe-v1");
+        hash.update(&self.plan);
+        field(&hash, recipe);
+        return .{ .source = self.source, .plan = hash.finalResult() };
+    }
+
     fn field(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
         number(hash, bytes.len);
         hash.update(bytes);

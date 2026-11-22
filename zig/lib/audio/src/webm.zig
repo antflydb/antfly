@@ -1003,11 +1003,7 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
             try timeline.finish();
         },
         .flac => {
-            var native = std.ArrayList(u8).empty;
-            defer native.deinit(a);
-            try native.appendSlice(a, demuxed.codec_private);
-            for (demuxed.access_units) |unit| try native.appendSlice(a, unit);
-            const info = try flac.parseStreamInfo(native.items);
+            const info = try flac.parseStreamInfo(demuxed.codec_private);
             if (try needsFlacTimeline(demuxed, info)) {
                 const declared = std.math.cast(usize, info.total_samples) orelse return error.UnsupportedAudioFormat;
                 const delay = nsToFrames(demuxed.codec_delay_ns, info.sample_rate);
@@ -1021,7 +1017,7 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
                 else
                     .{ .sink = sink, .times = demuxed.access_unit_times_ns, .counts = frames, .rate = info.sample_rate, .channels = info.channels, .delay = delay, .total = std.math.maxInt(usize), .padding = padding, .keep = std.math.maxInt(usize), .unknown_prefix = prefix, .pending = pending };
                 defer if (timeline.pending) |*tail| tail.samples.deinit(a);
-                try flac.visitInterleaved(a, native.items, timeline.consumer());
+                try flac.visitPackets(a, demuxed.codec_private, demuxed.access_units, timeline.consumer());
                 try timeline.finish();
                 return;
             }
@@ -1037,12 +1033,12 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
                         gap -= count;
                     }
                 }
-                try flac.visitInterleaved(a, native.items, sink);
+                try flac.visitPackets(a, demuxed.codec_private, demuxed.access_units, sink);
                 return;
             }
             const count = [_]usize{@intCast(info.total_samples)};
             var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns[0..1], &count, info.sample_rate, info.channels, nsToFrames(demuxed.codec_delay_ns, info.sample_rate), count[0], &.{});
-            try flac.visitInterleaved(a, native.items, timeline.consumer());
+            try flac.visitPackets(a, demuxed.codec_private, demuxed.access_units, timeline.consumer());
             try timeline.finish();
         },
     }
