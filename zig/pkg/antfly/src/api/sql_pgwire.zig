@@ -300,7 +300,7 @@ pub const CatalogReplicationPublication = struct {
         const revisions = try a.alloc(publication_control.Digest, sorted.publications.len);
         var members: std.ArrayList(publication_metadata.Member) = .empty;
         for (sorted.publications, revisions) |name, *revision| {
-            const record = (try port.read(port.ptr, a, database, name, maintenance)) orelse return error.ChangefeedResynchronizationRequired;
+            const record = (try port.readRecord(a, database, name, maintenance)) orelse return error.ChangefeedResynchronizationRequired;
             records[loaded] = record;
             loaded += 1;
             if (!std.meta.eql(record.value.database, database) or !std.mem.eql(u8, record.value.name, name)) return error.ChangefeedCorrupt;
@@ -334,7 +334,7 @@ pub const CatalogReplicationPublication = struct {
         // Two linearizable passes bracket the catalog validation. A revision
         // can only advance, so a match proves the same publication set at it.
         for (sorted.publications, revisions) |name, revision| {
-            var check = (try port.read(port.ptr, a, database, name, maintenance)) orelse return error.ChangefeedResynchronizationRequired;
+            var check = (try port.readRecord(a, database, name, maintenance)) orelse return error.ChangefeedResynchronizationRequired;
             defer check.deinit();
             if (!std.meta.eql(publication_control.hash(check.value), revision)) return error.ChangefeedResynchronizationRequired;
         }
@@ -2606,7 +2606,7 @@ fn executePublication(
     const database_key = publicationDatabaseKey(cut);
     var maintenance = context;
     maintenance.principal = .{ .kind = .internal, .subject = "pg-publication-maintenance" };
-    var previous = try port.read(port.ptr, a, database_key, command.name, maintenance);
+    var previous = try port.readRecord(a, database_key, command.name, maintenance);
     defer if (previous) |*record| record.deinit();
     const old = if (previous) |record| record.value else null;
     if (old) |record| if (!std.meta.eql(record.owner, owner)) return error.Forbidden;
@@ -2625,7 +2625,7 @@ fn executePublication(
     const members = if (command.action == .drop) null else try resolvePublicationMembers(server, a, identity, context, targets, resolved_catalog, cut, previous_members);
     const revision = if (old) |record| record.revision else 0;
     try authority.credential.validate();
-    try port.mutate(port.ptr, a, .{
+    try port.mutateRecord(a, .{
         .expected_revision = revision,
         .expected_catalog_revision = resolved_catalog.revision,
         .next = .{ .database = database_key, .name = command.name, .owner = owner, .revision = std.math.add(u64, revision, 1) catch return error.ProgramLimitExceeded, .members = members },
@@ -3628,7 +3628,7 @@ const GuardedCatalog = struct {
         var context = try self.authority.context();
         const database = try CatalogReplicationSlots.readDatabase(server, a, self.authority.request.database orelse "default", context);
         context.principal = .{ .kind = .internal, .subject = "pg-publication-maintenance" };
-        var record = (try port.read(port.ptr, a, database, name, context)) orelse return .{ .rows = &.{} };
+        var record = (try port.readRecord(a, database, name, context)) orelse return .{ .rows = &.{} };
         defer record.deinit();
         const value = record.value;
         if (!std.meta.eql(value.database, database) or !std.mem.eql(u8, value.name, name)) return error.ChangefeedCorrupt;

@@ -2728,7 +2728,7 @@ pub const MetadataHttpServer = struct {
         var reply: publication.Reply = .{ .group = input.group, .incarnation = input.incarnation, .database = input.database, .name = input.name, .record = null };
         if (input.write) |write| {
             try ctx.setHeader(outcome, routes.Routes.raft_mutation_outcome_unknown);
-            port.mutate(port.ptr, ctx.allocator, write, request) catch |err| switch (err) {
+            port.mutateRecord(ctx.allocator, write, request) catch |err| switch (err) {
                 error.PgPublicationConflict => {
                     try ctx.setHeader(outcome, routes.Routes.raft_mutation_outcome_not_proposed);
                     return ctx.status(409).text("publication revision conflict");
@@ -2738,7 +2738,7 @@ pub const MetadataHttpServer = struct {
             reply.record = write.next;
             try ctx.setHeader(outcome, routes.Routes.raft_mutation_outcome_committed);
         } else {
-            observed = port.read(port.ptr, ctx.allocator, input.database, input.name, request) catch |err| return metadataReadError(ctx, err);
+            observed = port.readRecord(ctx.allocator, input.database, input.name, request) catch |err| return metadataReadError(ctx, err);
             if (observed) |record| reply.record = record.value;
         }
         return ctx.json(reply);

@@ -38,7 +38,7 @@ pub fn metadataContext(request: backend.Request) !Context {
 
 fn temporaryTransportFailure(err: anyerror) bool {
     return switch (err) {
-        error.Canceled, error.Cancelled, error.QueryCanceled, error.DeadlineExceeded, error.ReadUnavailable, error.ConcurrencyUnavailable, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionResetByPeer, error.Timeout => true,
+        error.Canceled, error.Cancelled, error.QueryCanceled, error.DeadlineExceeded, error.ReadUnavailable, error.ReadIndexTimeout, error.StorageReadTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout, error.TopologyChanged, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.ConcurrencyUnavailable, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionResetByPeer, error.Timeout => true,
         else => false,
     };
 }

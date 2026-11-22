@@ -215,6 +215,20 @@ pub const Port = struct {
     ptr: *anyopaque,
     read: *const fn (*anyopaque, A, feed.Digest, []const u8, Context) anyerror!?std.json.Parsed(Record),
     mutate: *const fn (*anyopaque, A, Write, Context) anyerror!void,
+    boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+
+    const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(struct {
+        read: @FieldType(Port, "read"),
+        mutate: @FieldType(Port, "mutate"),
+    });
+
+    pub fn readRecord(self: Port, a: A, database: feed.Digest, name: []const u8, context: Context) !?std.json.Parsed(Record) {
+        return Boundary.callRemote("read", self.boundary_dispatch, self.read, .{ self.ptr, a, database, name, context });
+    }
+
+    pub fn mutateRecord(self: Port, a: A, write: Write, context: Context) !void {
+        return Boundary.callRemote("mutate", self.boundary_dispatch, self.mutate, .{ self.ptr, a, write, context });
+    }
 
     pub fn fromService(svc: anytype) Port {
         const Service = @typeInfo(@TypeOf(svc)).pointer.child;
