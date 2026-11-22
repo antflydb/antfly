@@ -23,6 +23,7 @@ import ctypes
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from html.parser import HTMLParser
+from http.client import HTTPException
 from itertools import groupby
 import json
 import os
@@ -37,7 +38,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from benchmark_corpus import cer, normalize, plain_text
@@ -84,11 +85,16 @@ def profiles():
     ]
 
 
-def read_json(url, body=None, timeout=120):
+def read_json(url, body=None, timeout=120, *, on_submit=None):
     data = None if body is None else json.dumps(body).encode()
     request = Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urlopen(request, timeout=timeout) as result:
-        return json.load(result)
+    if on_submit is not None:
+        on_submit()
+    try:
+        with urlopen(request, timeout=timeout) as result:
+            return json.load(result)
+    except HTTPException as error:
+        raise OSError(f"HTTP protocol error for {request.selector}: {error}") from error
 
 
 def memory_peak(log, label):
@@ -141,21 +147,67 @@ def child_pid(parent):
     return int(children[0]) if len(children) == 1 else None
 
 
+def signal_pass_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def shutdown_pass(proc, record_memory):
+    try:
+        pid = child_pid(proc.pid) if record_memory else proc.pid
+    except OSError:
+        pid = None
+    # Let /usr/bin/time reap the server and write its counters when possible.
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pid = None
+    if pid is None:
+        signal_pass_group(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        signal_pass_group(proc, signal.SIGKILL)
+        proc.wait(timeout=10)
+    else:
+        # The launcher can exit while server descendants still own the listener.
+        signal_pass_group(proc, signal.SIGKILL)
+
+
 def wait_ready(proc, url, alias):
     deadline = time.monotonic() + 120
-    while time.monotonic() < deadline and proc.poll() is None:
+    detail = "no readiness response"
+    while proc.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            read_json(url + "/health", timeout=1)
-            models = read_json(url + "/v1/models", timeout=1)
-            if any(model.get("id") == alias for model in models.get("data", [])):
+            read_json(url + "/health", timeout=min(1, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            models = read_json(url + "/v1/models", timeout=min(1, remaining))
+            entries = models.get("data") if isinstance(models, dict) else None
+            if not isinstance(entries, list) or not all(
+                isinstance(item, dict) for item in entries
+            ):
+                raise ValueError("invalid /v1/models response")
+            if (
+                any(model.get("id") == alias for model in entries)
+                and proc.poll() is None
+            ):
                 return
-        except (URLError, TimeoutError):
-            pass
-        time.sleep(0.2)
-    raise RuntimeError("llama-server failed to become ready")
+            detail = f"/v1/models did not advertise {alias}"
+        except (OSError, ValueError) as error:
+            detail = str(error)
+        time.sleep(max(0, min(0.2, deadline - time.monotonic())))
+    raise RuntimeError(f"llama-server failed to become ready: {detail}")
 
 
-def request_case(url, case, alias, prompt=""):
+def request_case(url, case, alias, prompt="", *, on_submit=None):
     content = [{"type": "image_url", "image_url": {"url": case["uri"]}}]
     if prompt:
         content.append({"type": "text", "text": prompt})
@@ -168,18 +220,19 @@ def request_case(url, case, alias, prompt=""):
     }
     start = time.perf_counter()
     try:
-        reply = read_json(url + "/v1/chat/completions", body)
+        reply = read_json(url + "/v1/chat/completions", body, on_submit=on_submit)
         choice = reply["choices"][0]
         text = choice["message"]["content"] or ""
         finish = choice["finish_reason"]
         if not isinstance(text, str):
             raise ValueError("OCR response content is not text")
     except HTTPError as error:
-        return {
-            "case": case["name"],
-            "http_status": error.code,
-            "message": error.read().decode()[:1500],
-        }
+        with error:
+            try:
+                message = error.read(1500).decode(errors="replace")
+            except (OSError, HTTPException) as body_error:
+                message = f"Could not read error response: {body_error}"
+        return {"case": case["name"], "http_status": error.code, "message": message}
     except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
         return {
             "case": case["name"],
@@ -308,14 +361,106 @@ def grounding_quality_passes(row, case):
     )
 
 
+ACTIVE_MEMORY_PHASES = ("serve", "grounding")
+
+
+def active_slot_tasks(url, expected_slots):
+    slots = read_json(url + "/slots", timeout=1)
+    if (
+        not isinstance(slots, list)
+        or len(slots) != expected_slots
+        or not all(
+            isinstance(slot, dict)
+            and type(slot.get("id")) is int
+            and isinstance(slot.get("is_processing"), bool)
+            and (not slot["is_processing"] or type(slot.get("id_task")) is int)
+            for slot in slots
+        )
+    ):
+        raise ValueError(f"expected {expected_slots} valid llama.cpp slot records")
+    if len({slot["id"] for slot in slots}) != expected_slots:
+        raise ValueError("llama.cpp /slots returned duplicate slot IDs")
+    return {(slot["id"], slot["id_task"]) for slot in slots if slot["is_processing"]}
+
+
+def read_active_memory(read_memory, read_active_tasks):
+    before = read_active_tasks()
+    if not before:
+        return None, 0
+    values = read_memory()
+    # Shared task IDs give a lower bound on occupancy throughout the read.
+    return values, len(before & read_active_tasks()) if values else 0
+
+
+def update_peaks(peaks, values):
+    for key, value in values.items():
+        peaks[key] = max(peaks.get(key, 0), value)
+
+
+def record_phase_sample(
+    peaks, task_peaks, current_phase, read_memory, read_active_tasks
+):
+    phase = current_phase()
+    active = phase[0] in ACTIVE_MEMORY_PHASES
+    if active:
+        values, tasks = read_active_memory(read_memory, read_active_tasks)
+        if not tasks:
+            return
+    else:
+        values = read_memory()
+    if not values or phase != current_phase():
+        return
+    if (
+        active
+        and values.get("rss_bytes", 0) > 0
+        and values.get("physical_footprint_bytes", 0) > 0
+    ):
+        update_peaks(task_peaks.setdefault(phase[0], {}).setdefault(tasks, {}), values)
+    update_peaks(peaks.setdefault(phase[0], {}), values)
+
+
+def missing_memory_phases(peaks, phases):
+    return [
+        phase
+        for phase in phases
+        if any(
+            peaks.get(phase, {}).get(metric, 0) <= 0
+            for metric in ("rss_bytes", "physical_footprint_bytes")
+        )
+    ]
+
+
 def memory_measurement_valid(peaks, phases, peak_rss, peak_footprint):
     return bool(
         peak_rss and peak_rss > 0 and peak_footprint and peak_footprint > 0
-    ) and all(
-        peaks.get(phase, {}).get(metric, 0) > 0
-        for phase in phases
-        for metric in ("rss_bytes", "physical_footprint_bytes")
-    )
+    ) and not missing_memory_phases(peaks, phases)
+
+
+def required_memory_phases(args, grounding_case):
+    phases = [] if args.grounding_only else ["serve"]
+    if grounding_case is not None:
+        phases.append("grounding")
+    return phases
+
+
+def required_memory_occupancy(args, cases, grounding_case, parallel):
+    requested = {}
+    if not args.grounding_only:
+        requested["serve"] = min(parallel, len(cases) * args.rounds)
+    if grounding_case is not None:
+        requested["grounding"] = 1
+    return requested
+
+
+def memory_occupancy_report(task_peaks, required):
+    highest = {phase: max(task_peaks.get(phase, {}), default=0) for phase in required}
+    missing = [phase for phase, count in required.items() if highest[phase] < count]
+    return {
+        "required_verified_tasks_by_phase": required,
+        "max_verified_tasks_by_phase": highest,
+        "sampled_peak_bytes_by_phase_and_minimum_verified_occupancy": task_peaks,
+        "missing_memory_occupancy_phases": missing,
+    }
 
 
 def run_profile(args, cases, grounding_case, size, profile, parallel):
@@ -336,7 +481,14 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
             "peak_rss_bytes": None,
             "peak_physical_footprint_bytes": None,
             "sampled_peak_bytes_by_phase": {},
+            "missing_memory_phases": required_memory_phases(args, grounding_case),
+            **memory_occupancy_report(
+                {}, required_memory_occupancy(args, cases, grounding_case, parallel)
+            ),
             "warm_idle": None,
+            "slot_probe_errors": {},
+            "memory_workload_qualified": False,
+            "memory_error": None,
             "seconds": None,
             "pages_per_second": None,
             "p50_seconds": None,
@@ -344,6 +496,7 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
             "backend_buffer_report": [],
             "grounding": None,
             "startup_error_log": None,
+            "memory_error_log": None,
             "error": str(error),
             "results": [],
         }
@@ -359,15 +512,12 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", args.port))
         port = listener.getsockname()[1]
-    alias = "ocr-" + uuid.uuid4().hex
     command = [
         args.binary,
         "--model",
         str(model),
         "--mmproj",
         str(projector),
-        "--alias",
-        alias,
         "--reasoning",
         "off",
         "--host",
@@ -395,77 +545,221 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
     if profile.image_max_tokens is not None:
         command += ["--image-max-tokens", str(profile.image_max_tokens)]
     url = f"http://127.0.0.1:{port}"
-    phase = "load"
+    timing = run_pass(
+        args, cases, grounding_case, parallel, command, url, record_memory=False
+    )
+    memory = run_pass(
+        args, cases, grounding_case, parallel, command, url, record_memory=True
+    )
+    scored, ok, quality_pages, quality_qualified = score_pass(
+        args, cases, grounding_case, timing.rows, timing.grounding, timing.error
+    )
+    _, _, _, memory_workload_qualified = score_pass(
+        args, cases, grounding_case, memory.rows, memory.grounding, memory.error
+    )
+
+    peak_rss = memory_peak(memory.log, "maximum resident set size")
+    peak_footprint = memory_peak(memory.log, "peak memory footprint")
+    phases = required_memory_phases(args, grounding_case)
+    memory_valid = memory_measurement_valid(
+        memory.sampled_peaks, phases, peak_rss, peak_footprint
+    )
+    occupancy = memory_occupancy_report(
+        memory.task_peaks,
+        required_memory_occupancy(args, cases, grounding_case, parallel),
+    )
+    memory_valid = memory_valid and not occupancy["missing_memory_occupancy_phases"]
+    return {
+        "qualified": quality_qualified and memory_workload_qualified and memory_valid,
+        "quality_qualified": quality_qualified,
+        "memory_measurement_valid": memory_valid,
+        "model": size,
+        "profile": asdict(profile),
+        "parallel": parallel,
+        "artifact_bytes": model.stat().st_size + projector.stat().st_size,
+        "peak_rss_bytes": peak_rss,
+        "peak_physical_footprint_bytes": peak_footprint,
+        "sampled_peak_bytes_by_phase": memory.sampled_peaks,
+        "missing_memory_phases": missing_memory_phases(memory.sampled_peaks, phases),
+        **occupancy,
+        "warm_idle": memory.idle,
+        "slot_probe_errors": memory.slot_probe_errors,
+        "memory_workload_qualified": memory_workload_qualified,
+        "memory_error": memory.error,
+        "seconds": timing.elapsed,
+        "completed_pages": len(ok),
+        "quality_pages": len(quality_pages),
+        "requests": len(timing.rows),
+        "pages_per_second": len(ok) / timing.elapsed if timing.elapsed else None,
+        "p50_seconds": statistics.median(row["seconds"] for row in ok) if ok else None,
+        "mean_cer": statistics.mean(row["cer"] for row in scored) if scored else None,
+        "backend_buffer_report": [
+            line for line in memory.log.splitlines() if "buffer size" in line.lower()
+        ],
+        "grounding": timing.grounding,
+        "error": timing.error,
+        "results": timing.rows,
+        "startup_error_log": timing.log[-3000:] if timing.error else None,
+        "memory_error_log": memory.log[-3000:] if memory.error else None,
+    }
+
+
+@dataclass
+class BenchmarkPass:
+    rows: list[dict]
+    grounding: dict | None
+    elapsed: float | None
+    idle: dict | None
+    sampled_peaks: dict
+    task_peaks: dict
+    slot_probe_errors: dict
+    error: str | None
+    log: str
+
+
+def run_pass(args, cases, grounding_case, parallel, command, url, *, record_memory):
+    alias = "ocr-" + uuid.uuid4().hex
+    command = [*command, "--alias", alias]
+    phase = ("load", 0)
+    phase_changed = threading.Condition()
     sampled_peaks = {}
-    finished = threading.Event()
+    task_peaks = {}
+    slot_probe_errors = {}
+
+    def read_slots():
+        return active_slot_tasks(url, parallel)
+
+    def set_phase(name):
+        nonlocal phase
+        with phase_changed:
+            if phase[0] != name:
+                phase = (name, phase[1] + 1)
+                phase_changed.notify()
+
     rows = []
     idle = None
     elapsed = None
     grounding = None
     failure = None
 
-    with tempfile.TemporaryFile() as log:
-        proc = subprocess.Popen(
-            ["/usr/bin/time", "-l", *command], stdout=log, stderr=log
-        )
+    output = ""
+    try:
+        with tempfile.TemporaryFile() as log:
+            if record_memory:
+                command = ["/usr/bin/time", "-l", *command, "--slots"]
+            else:
+                command = [*command, "--no-slots"]
+            proc = subprocess.Popen(
+                command, stdout=log, stderr=log, start_new_session=True
+            )
 
-        def sample():
-            pid = None
-            while not finished.is_set():
-                pid = pid or child_pid(proc.pid)
-                values = process_memory(pid) if pid else None
-                if values:
-                    peaks = sampled_peaks.setdefault(phase, {})
-                    for key, value in values.items():
-                        peaks[key] = max(peaks.get(key, 0), value)
-                finished.wait(0.10)
+            def sample():
+                pid = None
 
-        sampler = threading.Thread(target=sample)
-        sampler.start()
-        try:
-            wait_ready(proc, url, alias)
-            phase = "warmup"
-            warmup = request_case(url, cases[0], alias)
-            if warmup.get("finish") != "stop":
-                raise RuntimeError(f"Warm-up request failed: {warmup}")
-            pid = child_pid(proc.pid)
-            idle = process_memory(pid) if pid else None
-            if not args.grounding_only:
-                phase = "serve"
-                with ThreadPoolExecutor(max_workers=parallel) as pool:
-                    start = time.perf_counter()
-                    rows = list(
-                        pool.map(
-                            lambda case: request_case(url, case, alias),
-                            cases * args.rounds,
-                        )
-                    )
-                    elapsed = time.perf_counter() - start
-            if grounding_case:
-                phase = "grounding"
-                grounding = request_case(url, grounding_case, alias, "grounding")
-        except (OSError, RuntimeError, ValueError, KeyError) as error:
-            failure = str(error)
-        finally:
-            finished.set()
-            sampler.join()
-            pid = child_pid(proc.pid)
-            if pid:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            try:
-                proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                if pid:
+                def read_memory():
+                    nonlocal pid
+                    pid = pid or child_pid(proc.pid)
+                    return process_memory(pid) if pid else None
+
+                while True:
+                    with phase_changed:
+                        observed = phase
+                        if observed[0] == "finished":
+                            return
                     try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                proc.wait(timeout=10)
-            log.seek(0)
-            output = log.read().decode(errors="replace")
+                        record_phase_sample(
+                            sampled_peaks,
+                            task_peaks,
+                            lambda: phase,
+                            read_memory,
+                            read_slots,
+                        )
+                    except (OSError, ValueError) as error:
+                        entry = slot_probe_errors.setdefault(
+                            observed[0], {"count": 0, "first_error": str(error)}
+                        )
+                        entry["count"] += 1
+                    # Wake on HTTP submission even if the periodic poll just ran.
+                    interval = 0.01 if observed[0] in ACTIVE_MEMORY_PHASES else 0.10
+                    with phase_changed:
+                        phase_changed.wait_for(lambda: phase != observed, interval)
+
+            sampler = threading.Thread(target=sample) if record_memory else None
+            if sampler is not None:
+                sampler.start()
+            try:
+                wait_ready(proc, url, alias)
+                set_phase("warmup")
+                warmup = request_case(url, cases[0], alias)
+                if warmup.get("finish") != "stop":
+                    raise RuntimeError(f"Warm-up request failed: {warmup}")
+                set_phase("idle")
+                if record_memory:
+                    try:
+                        read_slots()
+                    except (OSError, ValueError) as error:
+                        slot_probe_errors["preflight"] = {
+                            "count": 1,
+                            "first_error": str(error),
+                        }
+                        raise RuntimeError(
+                            f"llama.cpp /slots preflight failed: {error}"
+                        ) from error
+                    pid = child_pid(proc.pid)
+                    idle = process_memory(pid) if pid else None
+                serve_submit = (lambda: set_phase("serve")) if record_memory else None
+                grounding_submit = (
+                    (lambda: set_phase("grounding")) if record_memory else None
+                )
+                if not args.grounding_only:
+                    with ThreadPoolExecutor(max_workers=parallel) as pool:
+                        start = time.perf_counter()
+                        rows = list(
+                            pool.map(
+                                lambda case: request_case(
+                                    url, case, alias, on_submit=serve_submit
+                                ),
+                                cases * args.rounds,
+                            )
+                        )
+                        elapsed = time.perf_counter() - start
+                        set_phase("idle")
+                if grounding_case:
+                    grounding = request_case(
+                        url,
+                        grounding_case,
+                        alias,
+                        "grounding",
+                        on_submit=grounding_submit,
+                    )
+                    set_phase("idle")
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
+                failure = str(error)
+            finally:
+                set_phase("finished")
+                if sampler is not None:
+                    sampler.join()
+                shutdown_pass(proc, record_memory)
+                log.seek(0)
+                output = log.read().decode(errors="replace")
+    except (OSError, subprocess.SubprocessError) as error:
+        failure = (
+            str(error) if failure is None else f"{failure}; cleanup failed: {error}"
+        )
+    return BenchmarkPass(
+        rows=rows,
+        grounding=grounding,
+        elapsed=elapsed,
+        idle=idle,
+        sampled_peaks=sampled_peaks,
+        task_peaks=task_peaks,
+        slot_probe_errors=slot_probe_errors,
+        error=failure,
+        log=output,
+    )
+
+
+def score_pass(args, cases, grounding_case, rows, grounding, failure):
     for row, case in zip(rows, cases * args.rounds):
         score_case(row, case)
     if grounding is not None:
@@ -481,43 +775,7 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
         and bool(layout_ok)
         and (args.grounding_only or len(quality_pages) == len(cases) * args.rounds)
     )
-    peak_rss = memory_peak(output, "maximum resident set size")
-    peak_footprint = memory_peak(output, "peak memory footprint")
-    phases = []
-    if not args.grounding_only:
-        phases.append("serve")
-    if grounding_case is not None:
-        phases.append("grounding")
-    memory_valid = memory_measurement_valid(
-        sampled_peaks, phases, peak_rss, peak_footprint
-    )
-    return {
-        "qualified": quality_qualified and memory_valid,
-        "quality_qualified": quality_qualified,
-        "memory_measurement_valid": memory_valid,
-        "model": size,
-        "profile": asdict(profile),
-        "parallel": parallel,
-        "artifact_bytes": model.stat().st_size + projector.stat().st_size,
-        "peak_rss_bytes": peak_rss,
-        "peak_physical_footprint_bytes": peak_footprint,
-        "sampled_peak_bytes_by_phase": sampled_peaks,
-        "warm_idle": idle,
-        "seconds": elapsed,
-        "completed_pages": len(ok),
-        "quality_pages": len(quality_pages),
-        "requests": len(rows),
-        "pages_per_second": len(ok) / elapsed if elapsed else None,
-        "p50_seconds": statistics.median(row["seconds"] for row in ok) if ok else None,
-        "mean_cer": statistics.mean(row["cer"] for row in scored) if scored else None,
-        "backend_buffer_report": [
-            line for line in output.splitlines() if "buffer size" in line.lower()
-        ],
-        "grounding": grounding,
-        "error": failure,
-        "results": rows,
-        "startup_error_log": output[-3000:] if failure else None,
-    }
+    return scored, ok, quality_pages, quality_qualified
 
 
 def main():
@@ -579,6 +837,8 @@ def main():
         "rounds": args.rounds,
         "grounding_case": args.grounding_case if grounding_case else None,
         "grounding_only": args.grounding_only,
+        "active_memory_sampling": "llama.cpp slot probes bracket process samples",
+        "timing_sampling": "separate server process without slot probes",
         "runs": [],
     }
     for size in args.size:
@@ -599,7 +859,19 @@ def main():
                     run["completed_pages"],
                     run["requests"],
                     run["peak_physical_footprint_bytes"],
-                    run["error"] or "",
+                    run["error"] or run["memory_error"] or "",
+                    (
+                        "missing phase samples="
+                        + ",".join(run["missing_memory_phases"])
+                        if run["missing_memory_phases"]
+                        else ""
+                    ),
+                    (
+                        "missing verified occupancy="
+                        + ",".join(run["missing_memory_occupancy_phases"])
+                        if run["missing_memory_occupancy_phases"]
+                        else ""
+                    ),
                     flush=True,
                 )
     if any(not run["qualified"] for run in report["runs"]):
