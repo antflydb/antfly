@@ -268,6 +268,7 @@ fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, com
         }
         const reference = try parseId(outcome.reference_id.?);
         var record = (try store.loadRegistration(alloc, reference)) orelse {
+            if (!(outcome.observation orelse false)) return error.CompletionUnavailable;
             discardOutcome(completion, alloc, index);
             continue;
         };
@@ -288,6 +289,7 @@ fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, com
             } else |_| {}
         }
         if (!try store.joinRegistration(reference)) {
+            if (!(outcome.observation orelse false)) return error.CompletionUnavailable;
             discardOutcome(completion, alloc, index);
             continue;
         }
