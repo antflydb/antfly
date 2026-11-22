@@ -1835,6 +1835,46 @@ checkpoint regardless, so this loses nothing a workload would need.
 
 ### 9.5 Recovery: last durable checkpoint plus a validated log prefix
 
+#### Protected redo files (native formats v12 and v13)
+
+Durable redo commits use two ordered barriers per group. The writer
+appends the existing compact redo records, flushes them, writes a
+checksummed frontier to both copies of the alternate slot, and flushes
+again before acknowledging the group. Each copy is on a separate page
+immediately before the redo extent. Each frontier records the run salt,
+last covered sequence, and end offset. The shared lock region continues
+to supply the fast path for concurrent readers.
+
+A detached writer can resume from a process-local cursor when the active
+extent, run salt, and durable frontier agree with the shared publication
+and its sync proof. It verifies the cursor's boundary record and the new
+suffix. A cursor with missing or conflicting evidence requires a full
+retained-prefix scan before append. Trusted handoff does not reread
+previously verified middle records.
+
+On cold recovery the frontier bounds replay. Unless the disk checkpoint
+has already folded the promised sequence, recovery must reach the
+frontier's sequence, ending offset, and run salt. Later bytes can be
+replaced by the next append. A failed frontier write or flush leaves the
+group outcome unknown. The writer retains the redo bytes and any
+referenced pages and requires reopening before another write.
+
+New durable redo files use v13 and reserve two equal WAL extents.
+A fold can switch to the other extent while readers still need the one
+it is retiring. Reuse requires a checkpoint covering the destination's
+retirement sequence and reader pins at or past that sequence. The reset
+of a reusable destination is included in the folded pages' durability
+barrier. The subsequent durable checkpoint records the selected extent
+and the retirement sequence. The shared lock-region watermark publishes
+that selection with its offsets, and cold recovery reads the selector
+from the checkpoint.
+
+Vacuum constructs a fresh pair of extents and an empty frontier covered
+by its checkpoint. Owners with maintenance enabled schedule the v11 or
+v12 rewrite through the ordinary vacuum admission path, including its
+disk headroom and workspace checks. A manual vacuum can also upgrade a
+legacy file.
+
 Recovery becomes: open the on-disk checkpoint (still the v8/v9 slot
 mechanism's job -- `recoverActiveCheckpoint`, native.zig:15357-15420,
 unchanged in its own slot/manifest validation), then replay the log

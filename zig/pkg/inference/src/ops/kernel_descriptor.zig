@@ -144,7 +144,23 @@ pub const Slice = struct {
         return @import("slice_plan.zig").Plan.init(input.dims[0..rank], starts[0..rank], limits[0..rank], steps[0..rank], input.dims[0..rank]);
     }
 };
-pub const Gather = struct { axis: u8, geometry: kernel_geometry.GatherAxis };
+pub const Gather = struct {
+    axis: u8,
+    geometry: kernel_geometry.GatherAxis,
+
+    pub fn matchesOutput(self: Gather, input: ml.graph.Shape, indices: ml.graph.Shape, output: ml.graph.Shape) bool {
+        const input_dims = input.dims[0..input.rank()];
+        const output_dims = output.dims[0..output.rank()];
+        var expected: [8]i64 = undefined;
+        if (kernel_geometry.gatherShape(input_dims, indices.dims[0..indices.rank()], self.axis, &expected)) |rank| {
+            if (std.mem.eql(i64, expected[0..rank], output_dims)) return true;
+        } else |_| {}
+        // Older graphs explicitly publish a flattened singleton index.
+        if (indices.rank() <= 1 or indices.numElements() != 1) return false;
+        const rank = kernel_geometry.gatherShape(input_dims, &.{1}, self.axis, &expected) catch return false;
+        return std.mem.eql(i64, expected[0..rank], output_dims);
+    }
+};
 /// Cold, value-only geometry authored only by the complete Native decoder.
 /// Generic lower() deliberately never constructs this operation: ordinary
 /// causal attention must preserve its original target route.
@@ -217,6 +233,122 @@ pub const DenseAttentionRows = struct {
 };
 
 pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, add_mul_scalar: struct { scale_before_add: bool = false }, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix, dense_attention_rows: DenseAttentionRows };
+
+pub const HeadMajorAttention = struct {
+    query_rows: u32,
+    key_rows: u32,
+    batch_heads: u32,
+    heads: u32,
+    head_dim: u32,
+    score_scale: f32,
+    key_contract_last: bool,
+    bias_strides: [4]u32,
+    inputs: [4]ml.graph.NodeId,
+    input_shapes: [4]ml.graph.Shape,
+    input_count: usize,
+    covered: [4]ml.graph.NodeId,
+    covered_count: usize,
+};
+
+/// Recognize a unit-scale score dot, optional additive bias, row softmax,
+/// and value dot. Both dots must agree on head-major batch axes.
+pub fn headMajorUnitAttention(graph: *const ml.graph.Graph, output: ml.graph.NodeId) ?HeadMajorAttention {
+    const value_dot = lower(graph, output) orelse return null;
+    if (value_dot.operation != .dot) return null;
+    const pv = value_dot.operation.dot;
+    const rank = value_dot.output_shape.rank();
+    if (rank != 4 or !pv.lhs_contract_last or pv.rhs_contract_last) return null;
+    const dot_node = graph.node(output);
+    const prob_id = dot_node.inputs[0];
+    const softmax = lower(graph, prob_id) orelse return null;
+    if (softmax.operation != .softmax or softmax.operation.softmax.logarithmic) return null;
+    const softmax_input = graph.node(prob_id).inputs[0];
+    const add = graph.node(softmax_input);
+    const biased = add.op == .add or add.op == .fused_elem_add;
+    if (biased and (add.num_inputs != 2 or !add.output_shape.eq(softmax.output_shape))) return null;
+    if (biased) for (add.getInputs()) |input| {
+        if (input == ml.graph.null_node or input >= graph.nodeCount()) return null;
+    };
+    const score_id = if (biased) score: {
+        const a_is_dot = graph.node(add.inputs[0]).op == .dot_general;
+        const b_is_dot = graph.node(add.inputs[1]).op == .dot_general;
+        if (a_is_dot == b_is_dot) return null;
+        break :score add.inputs[@intFromBool(b_is_dot)];
+    } else softmax_input;
+    const scores = lower(graph, score_id) orelse return null;
+    if (scores.operation != .dot or scores.output_shape.rank() != rank or
+        !scores.output_shape.eq(softmax.output_shape)) return null;
+    const qk = scores.operation.dot;
+    if (!qk.lhs_contract_last or qk.batch_count != pv.batch_count or
+        qk.m != pv.m or qk.n != pv.k or qk.k != pv.n) return null;
+    // These exact leading dimensions are checked by each canonical dot plan.
+    for (0..2) |axis| if (scores.output_shape.dims[axis] != value_dot.output_shape.dims[axis]) return null;
+    var result = HeadMajorAttention{
+        .query_rows = @intCast(qk.m),
+        .key_rows = @intCast(qk.n),
+        .batch_heads = @intCast(qk.batch_count),
+        .heads = @intCast(scores.output_shape.dim(1)),
+        .head_dim = @intCast(qk.k),
+        .score_scale = 1.0,
+        .key_contract_last = qk.rhs_contract_last,
+        .bias_strides = @splat(0),
+        .inputs = .{ graph.node(score_id).inputs[0], graph.node(score_id).inputs[1], dot_node.inputs[1], ml.graph.null_node },
+        .input_shapes = .{ scores.input_shapes[0], scores.input_shapes[1], value_dot.input_shapes[1], ml.graph.Shape.scalar(.f32) },
+        .input_count = if (biased) 4 else 3,
+        .covered = if (biased) .{ score_id, softmax_input, prob_id, output } else .{ score_id, prob_id, output, ml.graph.null_node },
+        .covered_count = if (biased) 4 else 3,
+    };
+    if (biased) {
+        const bias_id = if (score_id == add.inputs[0]) add.inputs[1] else add.inputs[0];
+        const bias = graph.node(bias_id).output_shape;
+        if (bias.dtype != .f32 or bias.rank() > 4) return null;
+        var stride: u32 = 1;
+        for (0..bias.rank()) |offset| {
+            const bias_axis = bias.rank() - 1 - offset;
+            const score_axis = 3 - offset;
+            const dim = bias.dims[bias_axis];
+            if (dim == 1) continue;
+            if (dim <= 0 or dim != scores.output_shape.dims[score_axis]) return null;
+            result.bias_strides[score_axis] = stride;
+            stride = std.math.mul(u32, stride, @intCast(dim)) catch return null;
+        }
+        result.inputs[3] = bias_id;
+        result.input_shapes[3] = bias;
+    }
+    return result;
+}
+
+/// An F32 row-major projection whose sole consumer can publish its
+/// activation directly. The route must prove the covered edges are private.
+pub const ProjectionRelu = struct {
+    dot: Descriptor,
+    inputs: [2]ml.graph.NodeId,
+    covered: [3]ml.graph.NodeId,
+    count: usize,
+};
+
+pub fn projectionRelu(graph: *const ml.graph.Graph, output: ml.graph.NodeId) ?ProjectionRelu {
+    const relu_node = graph.node(output);
+    if (relu_node.op != .fused_relu or relu_node.num_inputs != 1 or relu_node.output_shape.dtype != .f32) return null;
+    const source = relu_node.inputs[0];
+    if (source == ml.graph.null_node or source >= graph.nodeCount()) return null;
+    const source_node = graph.node(source);
+    if (!source_node.output_shape.eq(relu_node.output_shape)) return null;
+    const reshaped = source_node.op == .reshape and source_node.num_inputs == 1;
+    const dot_id = if (reshaped) source_node.inputs[0] else source;
+    if (dot_id == ml.graph.null_node or dot_id >= graph.nodeCount()) return null;
+    const dot = lower(graph, dot_id) orelse return null;
+    if (dot.operation != .dot or dot.input_shapes[0].rank() != 2 or dot.input_shapes[1].rank() != 2 or
+        !dot.operation.dot.lhs_contract_last or dot.operation.dot.rhs_contract_last or
+        relu_node.output_shape.numElements() != dot.output_shape.numElements()) return null;
+    const node = graph.node(dot_id);
+    return .{
+        .dot = dot,
+        .inputs = .{ node.inputs[0], node.inputs[1] },
+        .covered = if (reshaped) .{ dot_id, source, output } else .{ dot_id, output, ml.graph.null_node },
+        .count = if (reshaped) 3 else 2,
+    };
+}
 
 /// Value-only semantics for original independent, fused-pair, and grouped QKV
 /// projection heads. It never owns a CT, prepared slot, or execution policy.
@@ -629,12 +761,11 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
             const input = inputShape(graph, id, 0) orelse return null;
             const indices = inputShape(graph, id, 1) orelse return null;
             const geometry = kernel_geometry.GatherAxis.init(std.math.maxInt(u32), input.dims[0..input.rank()], attrs.axis) catch return null;
-            const normalize_indices = indices.rank() > 1 and indices.numElements() == 1;
-            const index_shape: []const i64 = if (normalize_indices) &.{1} else indices.dims[0..indices.rank()];
-            var expected: [8]i64 = undefined;
-            const rank = kernel_geometry.gatherShape(input.dims[0..input.rank()], index_shape, attrs.axis, &expected) catch return null;
-            if (!std.mem.eql(i64, expected[0..rank], shape.dims[0..shape.rank()]) or (geometry.count(@intCast(indices.numElements() orelse return null)) catch return null) != count) return null;
-            break :blk .{ .gather = .{ .axis = attrs.axis, .geometry = geometry } };
+            const index_count = indices.numElements() orelse return null;
+            const gather: Gather = .{ .axis = attrs.axis, .geometry = geometry };
+            if (!gather.matchesOutput(input, indices, shape)) return null;
+            if ((geometry.count(@intCast(index_count)) catch return null) != count) return null;
+            break :blk .{ .gather = gather };
         },
         .add, .fused_elem_add => .{ .binary = .add },
         .sub => .{ .binary = .subtract },
@@ -1001,4 +1132,101 @@ test "shared head normalization rotary descriptor preserves head geometry and pr
     graph.nodeMut(weight).output_shape.dtype = .f32;
     graph.nodeMut(restored).output_shape = ml.graph.Shape.init(.f32, &.{ 3, 128 });
     try std.testing.expect(headNormRope(&graph, output) == null);
+}
+
+test "CUDA gather placement preserves singleton tensor indices" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const table = try builder.parameter("table", ml.graph.Shape.init(.f32, &.{ 32, 4 }));
+    const indices = try builder.parameter("tokens", ml.graph.Shape.init(.i64, &.{ 1, 1 }));
+    const gathered = try builder.gather(table, indices, ml.graph.Shape.init(.f32, &.{ 1, 1, 4 }));
+    const descriptor = lower(&graph, gathered).?;
+    try std.testing.expectEqual(@as(u8, 3), descriptor.output_shape.rank());
+    try std.testing.expect(@import("../graph/cuda_capabilities.zig").decide(.{ .graph = &graph, .node_id = gathered, .op = graph.node(gathered).op }).can_execute);
+    graph.nodeMut(gathered).output_shape = ml.graph.Shape.init(.f32, &.{ 1, 4 });
+    try std.testing.expect(lower(&graph, gathered) != null);
+    graph.nodeMut(gathered).output_shape = ml.graph.Shape.init(.f32, &.{ 4, 1 });
+    try std.testing.expect(lower(&graph, gathered) == null);
+}
+
+test "projection ReLU recognizes a flattened row-major dot and its output reshape" {
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const lhs = try builder.parameter("activation", ml.graph.Shape.init(.f32, &.{ 4, 131 }));
+    const rhs = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{ 131, 259 }));
+    const dot = try builder.matmul(lhs, rhs);
+    const restore = try builder.reshape(dot, ml.graph.Shape.init(.f32, &.{ 2, 2, 259 }));
+    const relu = try builder.relu(restore);
+
+    const direct = projectionRelu(&graph, try builder.relu(dot)).?;
+    try std.testing.expectEqualSlices(ml.graph.NodeId, &.{ lhs, rhs }, &direct.inputs);
+    try std.testing.expectEqual(@as(usize, 2), direct.count);
+    const shaped = projectionRelu(&graph, relu).?;
+    try std.testing.expectEqualSlices(ml.graph.NodeId, &.{ dot, restore, relu }, shaped.covered[0..shaped.count]);
+    try std.testing.expectEqual(@as(usize, 4 * 259), shaped.dot.elements());
+}
+
+test "head-major attention preserves independent query rows and broadcast bias" {
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const query_shape = ml.graph.Shape.init(.f32, &.{ 2, 3, 4, 64 });
+    const key_shape = ml.graph.Shape.init(.f32, &.{ 2, 3, 7, 64 });
+    const q = try builder.parameter("q", query_shape);
+    const k = try builder.parameter("k", key_shape);
+    const v = try builder.parameter("v", key_shape);
+    const bias = try builder.parameter("bias", ml.graph.Shape.init(.f32, &.{ 1, 3, 1, 7 }));
+    const score = try graph.addNode(.{
+        .op = .{ .dot_general = .{
+            .num_contracting = 1,
+            .num_batch = 2,
+            .lhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ 2, 3, 4, 7 }),
+        .inputs = .{ q, k, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 2,
+    });
+    const add_id = try graph.addNode(.{
+        .op = .{ .add = {} },
+        .output_shape = graph.node(score).output_shape,
+        .inputs = .{ bias, score, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 2,
+    });
+    const probability = try builder.softmax(add_id);
+    var attrs = graph.node(score).op.dot_general;
+    attrs.rhs_contracting[0] = 2;
+    const output = try graph.addNode(.{
+        .op = .{ .dot_general = attrs },
+        .output_shape = query_shape,
+        .inputs = .{ probability, v, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 2,
+    });
+    const program = headMajorUnitAttention(&graph, output).?;
+    try std.testing.expectEqual(@as(u32, 4), program.query_rows);
+    try std.testing.expectEqual(@as(u32, 7), program.key_rows);
+    try std.testing.expectEqual(@as(f32, 1), program.score_scale);
+    try std.testing.expectEqual([4]u32{ 0, 7, 0, 1 }, program.bias_strides);
+    try std.testing.expectEqual([4]ml.graph.NodeId{ q, k, v, bias }, program.inputs);
+    try std.testing.expectEqual([4]ml.graph.NodeId{ score, add_id, probability, output }, program.covered);
+    try std.testing.expect(program.key_contract_last);
+
+    const transposed = try builder.transpose(k, &.{ 0, 1, 3, 2 });
+    var alternate_score = graph.node(score).*;
+    alternate_score.inputs[1] = transposed;
+    alternate_score.op.dot_general.rhs_contracting[0] = 2;
+    const transposed_score = try graph.addNode(alternate_score);
+    const transposed_probs = try builder.softmax(transposed_score);
+    var alternate_output = graph.node(output).*;
+    alternate_output.inputs[0] = transposed_probs;
+    const transposed_output = try graph.addNode(alternate_output);
+    const transposed_program = headMajorUnitAttention(&graph, transposed_output).?;
+    try std.testing.expect(!transposed_program.key_contract_last);
+    try std.testing.expectEqual(transposed, transposed_program.inputs[1]);
+    try std.testing.expectEqual(program.key_rows, transposed_program.key_rows);
 }

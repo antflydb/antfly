@@ -119,7 +119,7 @@ pub fn parseCommitRequires(value: std.json.Value) !?CommitRequires {
 pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
     if (std.mem.eql(u8, text, "propose")) return .propose;
     if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
+    if (std.mem.eql(u8, text, "query") or std.mem.eql(u8, text, "full_text")) return .full_text;
     if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
     if (std.mem.eql(u8, text, "full_index")) return .full_index;
     return null;

@@ -29572,6 +29572,7 @@ components:
       enum:
         - propose
         - write
+        - query
         - full_text
         - enrichments
         - full_index
@@ -29583,7 +29584,9 @@ components:
 
         - "write": Wait for durable application to the local key-value store
 
-        - "full_text": Wait for full-text index WAL write
+        - "query": Wait for durable application and document full-text query visibility
+
+        - "full_text": Compatibility alias for query
 
         - "enrichments": Wait for this write's enrichment publication
 
