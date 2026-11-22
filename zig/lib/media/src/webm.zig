@@ -179,6 +179,7 @@ pub const Reader = struct {
             // Packet and cue capacity obey the index limit. The pool admits
             // moving-growth overlap against the request's working budget.
             .limit = limits.max_index_bytes *| 2,
+            .reclaimer = input.reclaimer,
         };
         errdefer memory.reservation.deinit();
         var result = readIndex(memory.allocator(), input, limits, clock, observer) catch |err|
@@ -595,6 +596,10 @@ fn appendBlock(allocator: std.mem.Allocator, scan: *Scan, packets: *std.ArrayLis
             const prefix = header[0..lease.bytes.len];
             @memcpy(prefix, lease.bytes);
             lease.deinit();
+            // The optional index cannot reclaim itself while adding a block.
+            const reclaimer = scan.input.reclaimer;
+            scan.input.reclaimer = null;
+            defer scan.input.reclaimer = reclaimer;
             sink.block(sink.context, scan.input, element, discard, prefix, time, scale);
         }
         return;

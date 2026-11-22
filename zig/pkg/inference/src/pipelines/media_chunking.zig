@@ -512,9 +512,14 @@ pub const Runner = struct {
         defer scope.deinit();
         const identity = std.fmt.bytesToHex(self.summary.identity.source, .lower);
         var source = media.source.Source{ .allocator = self.allocator, .storage = .{ .borrowed = bytes }, .identity = &identity, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .admission_pool = &self.pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
-        var building: ?@import("media_speaker_flights.zig").Registry.Lease = if (self.summary.start_ordinal > 0) try cache.acquireBuild(key, self.control) else null;
+        var hit = cache.get(key);
+        var building: ?@import("media_speaker_flights.zig").Registry.Lease = null;
         defer if (building) |lease| lease.deinit();
-        if (cache.get(key)) |entry| {
+        if (hit == null and self.summary.start_ordinal > 0) {
+            building = try cache.acquireBuild(key, self.control);
+            hit = cache.get(key);
+        }
+        if (hit) |entry| {
             defer cache.release(entry);
             if (building) |lease| lease.deinit();
             building = null;
@@ -875,15 +880,22 @@ pub const Runner = struct {
         };
         const seek_audio = if (audio.detectFormatFromMime(mime)) |format| format == .mp3 or format == .flac or format == .ogg or format == .opus else false;
         const audio_key = if (seek_audio) @import("media_index_cache.zig").Cache.audioKey(&source, self.request.limits.max_index_packets, self.request.max_working_bytes) else null;
-        var audio_build: ?@import("media_speaker_flights.zig").Registry.Lease = if (audio_key) |key| if (self.request.index_cache) |cache| try cache.acquireBuild(key, self.control) else null else null;
+        var audio_build: ?@import("media_speaker_flights.zig").Registry.Lease = null;
         defer if (audio_build) |lease| lease.deinit();
-        if (audio_key) |key| if (self.request.index_cache) |cache| if (cache.get(key)) |entry| {
-            defer cache.release(entry);
-            if (audio_build) |lease| lease.deinit();
-            audio_build = null;
-            var reader = @import("media_audio_seek.zig").Reader{ .index = &entry.data.audio, .source = &source, .control = self.control };
-            try self.soundWindows(reader.provider());
-            return;
+        if (audio_key) |key| if (self.request.index_cache) |cache| {
+            var hit = cache.get(key);
+            if (hit == null and self.request.index_cache_admission != null) {
+                audio_build = try cache.acquireBuild(key, self.control);
+                hit = cache.get(key);
+            }
+            if (hit) |entry| {
+                defer cache.release(entry);
+                if (audio_build) |lease| lease.deinit();
+                audio_build = null;
+                var reader = @import("media_audio_seek.zig").Reader{ .index = &entry.data.audio, .source = &source, .control = self.control };
+                try self.soundWindows(reader.provider());
+                return;
+            }
         };
         if (audio.detectFormatFromMime(mime) == .flac) {
             const Flac = @import("media_flac_seek.zig").Index;
@@ -965,6 +977,24 @@ pub const Runner = struct {
             if (!target.skipsOrdinalWithMask(mask, ordinal)) return true;
         }
         return false;
+    }
+
+    fn pageNeedsAudio(self: *const Runner) bool {
+        if (!self.request.needs_audio) return false;
+        if (self.request.max_chunks == 0) return true;
+        var ordinal = self.summary.start_ordinal;
+        for (0..self.request.max_chunks) |_| {
+            if (self.ordinalNeedsAudio(ordinal)) return true;
+            ordinal = std.math.add(u64, ordinal, 1) catch break;
+        }
+        return false;
+    }
+
+    fn reclaimVideoAudio(raw: *anyopaque) bool {
+        const builder: *media.webm_audio.DirectoryBuilder = @ptrCast(@alignCast(raw));
+        if (builder.failure != null) return false;
+        builder.fail(error.AudioTooLarge);
+        return true;
     }
 
     fn prepareVideoAudio(self: *Runner) !void {
@@ -1083,7 +1113,7 @@ pub const Runner = struct {
             build = null;
             return self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
         }
-        if (webm and self.request.needs_audio and source.storage == .range) {
+        if (webm and source.storage == .range and self.pageNeedsAudio()) {
             const audio_key = Cache.audioKey(source, count, self.request.max_working_bytes);
             const warm_audio = if (audio_key) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
             defer if (warm_audio) |entry| self.request.index_cache.?.release(entry);
@@ -1100,6 +1130,9 @@ pub const Runner = struct {
                     builder.deinit();
                     audio_owner.observed = null;
                 };
+                const previous_reclaimer = source.reclaimer;
+                source.reclaimer = .{ .context = &builder, .release = reclaimVideoAudio };
+                defer source.reclaimer = previous_reclaimer;
                 var reader = try media.webm.Reader.initObserved(self.allocator, source, .{ .max_packets = count, .max_index_bytes = self.request.max_working_bytes }, builder.observer());
                 defer reader.deinit();
                 if (builder.failure) |err| {
@@ -1136,7 +1169,7 @@ pub const Runner = struct {
     fn webmWindowsCached(self: *Runner, reader: *media.webm.Reader, identity: ?[32]u8, build: *?@import("media_speaker_flights.zig").Registry.Lease) !void {
         var indexed = try video.webm_pictures.index(self.allocator, reader, .{ .max_packets = self.request.limits.max_index_packets, .max_pictures = self.request.limits.max_index_packets, .decoder = .{ .av1_all_layers = false, .admission_pool = &self.pool, .control = reader.input.control } });
         defer indexed.deinit();
-        var memory = media.admission.TrackedAllocator{ .backing = self.allocator, .reservation = try self.pool.acquire(.{}), .limit = self.request.max_working_bytes };
+        var memory = media.admission.TrackedAllocator{ .backing = self.allocator, .reservation = try self.pool.acquire(.{}), .limit = self.request.max_working_bytes, .reclaimer = reader.input.reclaimer };
         defer memory.reservation.deinit();
         var timeline = indexed.presentationTimeline(memory.allocator(), reader.input.control) catch |err| return if (err == error.OutOfMemory) memory.denied orelse err else err;
         defer timeline.deinit();
@@ -1147,6 +1180,7 @@ pub const Runner = struct {
         if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.rememberPlanned(std.heap.smp_allocator, key, .{ .webm = reader.* }, admission, .{ .webm = snapshot });
         if (build.*) |lease| lease.deinit();
         build.* = null;
+        reader.input.reclaimer = null;
         try self.webmWindowsSnapshot(reader, &snapshot);
     }
     fn webmWindowsSnapshot(self: *Runner, reader: *media.webm.Reader, snapshot: *const @import("media_index_cache.zig").Cache.WebmSnapshot) !void {
@@ -2006,7 +2040,7 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     audio_request.audio_output_targets = 1 << 1;
     audio_request.audio_output_window_ns[1] = second;
     audio_targets[1].skip_windows = &.{ .{ .ordinal = 1, .sub_index = 0 }, .{ .ordinal = 1, .sub_index = 1 } };
-    const audio_runner = try Runner.init(a, audio_request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+    var audio_runner = try Runner.init(a, audio_request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
     try std.testing.expect(!audio_runner.videoReplayNeeded(1, 1));
     try std.testing.expect(audio_runner.videoReplayNeeded(2, 1));
     const extent = AudioExtent{ .samples = 2, .sample_rate = 1, .start_ns = 0 };
@@ -2015,6 +2049,12 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     audio_targets[1].skip_windows = &.{.{ .ordinal = 0, .sub_index = output_types.Target.Window.all_sub_windows }};
     try std.testing.expect(!audio_runner.ordinalNeedsAudio(0));
     try std.testing.expect(audio_runner.ordinalNeedsAudio(1));
+    audio_runner.request.needs_audio = true;
+    audio_runner.request.max_chunks = 1;
+    audio_runner.summary.start_ordinal = 0;
+    try std.testing.expect(!audio_runner.pageNeedsAudio());
+    audio_runner.request.max_chunks = 2;
+    try std.testing.expect(audio_runner.pageNeedsAudio());
     pictures[1].pts = second;
     var token: [85]u8 = undefined;
     request.continuation = page.summary.identity.cursor(page.summary.next_ordinal, &token);
@@ -2963,6 +3003,15 @@ test "model aware media audio pages reuse admitted indexes and bind only the cur
             try std.testing.expect(cold_read_bytes < 16 * 1024);
             std.debug.print("range FLAC source_bytes={d} cold_page_read_bytes={d} working_budget={d}\n", .{ bytes.len, cold_read_bytes, request.max_working_bytes });
         }
+        var flights: [256]@import("media_speaker_flights.zig").Registry.Lease = undefined;
+        var acquired: usize = 0;
+        defer for (flights[0..acquired]) |flight| flight.deinit();
+        for (&flights, 0..) |*flight, slot| {
+            var key: [32]u8 = @splat(0);
+            key[0] = @intCast(slot);
+            flight.* = try cache.acquireBuild(key, .{});
+            acquired += 1;
+        }
         var cursor: [85]u8 = undefined;
         var resumed = request;
         resumed.continuation = summary.identity.cursor(summary.next_ordinal, &cursor);
@@ -3874,4 +3923,26 @@ test "model aware media preserves a resumed AVC hold as a repeated output slot" 
     const stats = try video.h264.decodeSelected(a, &window.coded.reader, ids, .{ .max_dependency_packets = 2 }, &seen, Frames.accept);
     try std.testing.expectEqual(@as(usize, 2), stats.decoded_packets);
     try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &seen);
+}
+
+test "model aware media video admission can reclaim optional audio geometry" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 128 } };
+    var memory = media.admission.TrackedAllocator{ .backing = a, .reservation = try pool.acquire(.{}), .limit = 128 };
+    defer memory.reservation.deinit();
+    var builder = media.webm_audio.DirectoryBuilder{ .allocator = memory.allocator(), .limits = .{} };
+    defer builder.deinit();
+    try builder.packets.ensureTotalCapacityPrecise(builder.allocator, 2);
+    var source = media.source.Source{
+        .allocator = a,
+        .storage = .{ .borrowed = &(@as([128]u8, @splat(1))) },
+        .identity = "video-admission",
+        .admission_pool = &pool,
+        .reclaimer = .{ .context = &builder, .release = Runner.reclaimVideoAudio },
+    };
+    var lease = try source.readSparse(0, 128);
+    defer lease.deinit();
+    try std.testing.expectEqual(@as(usize, 128), lease.bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), memory.live);
+    try std.testing.expectError(error.AudioTooLarge, builder.borrowDirectory());
 }

@@ -107,6 +107,7 @@ pub const Source = struct {
     limits: Limits = .{},
     control: Control = .{},
     admission_pool: ?*admission.Pool = null,
+    reclaimer: ?admission.Reclaimer = null,
     retained_bytes: usize = 0,
     total_bytes: u64 = 0,
     reads: usize = 0,
@@ -188,7 +189,8 @@ pub const Source = struct {
     fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, mode: ReadMode) !Lease {
         return self.readSpanWithControl(offset, size, size, caller, reclaimer, mode);
     }
-    fn readSpanWithControl(self: *Source, offset: u64, minimum: usize, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, mode: ReadMode) !Lease {
+    fn readSpanWithControl(self: *Source, offset: u64, minimum: usize, size: usize, caller: Control, explicit_reclaimer: ?admission.Reclaimer, mode: ReadMode) !Lease {
+        const reclaimer = explicit_reclaimer orelse self.reclaimer;
         const owner = self.physical orelse self;
         const io = std.Io.Threaded.global_single_threaded.io();
         const controls = ReadControl{ .source = owner.control, .worker = self.control };

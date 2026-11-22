@@ -222,7 +222,25 @@ pub const ReadAhead = struct {
         if (self.window_bytes == 0) return error.InvalidRemoteCacheBudget;
         const cached = self.copyCached(offset, out);
         if (cached >= minimum) return cached;
-        return cached + try self.fillWindow(offset + cached, out[cached..], minimum - cached, control, fill_bytes -| cached);
+        const suffix = out[cached..];
+        const required = minimum - cached;
+        if (cached != 0 and required > self.window_bytes) return cached + try self.readRequired(offset + cached, suffix[0..required], control);
+        return cached + try self.fillWindow(offset + cached, suffix, required, @max(required, fill_bytes -| cached), control);
+    }
+
+    // Required bytes can exceed the cache capacity. Read directly into the
+    // caller's admitted buffer without evicting the existing window.
+    fn readRequired(self: *ReadAhead, offset: u64, out: []u8, control: source.Control) !usize {
+        var done: usize = 0;
+        while (done < out.len) {
+            try control.check();
+            const size: usize = @intCast(@min(out.len - done, self.window_bytes, self.max_bytes -| self.charged_bytes));
+            if (size == 0) return error.RemoteReadBudgetExceeded;
+            const extent = out[done..][0..size];
+            done += try self.fetchAt(offset + done, extent, extent.len, control);
+        }
+        try control.check();
+        return done;
     }
 
     fn copyCached(self: *ReadAhead, offset: u64, out: []u8) usize {
@@ -235,7 +253,7 @@ pub const ReadAhead = struct {
         return cached;
     }
 
-    fn fillWindow(self: *ReadAhead, offset: u64, out: []u8, minimum: usize, control: source.Control, fill_bytes: usize) !usize {
+    fn fillWindow(self: *ReadAhead, offset: u64, out: []u8, minimum: usize, fill_bytes: usize, control: source.Control) !usize {
         if (self.buffer == null) {
             var reservation = if (self.admission_pool) |pool| try pool.acquire(.{ .host_bytes = self.window_bytes }) else @import("admission.zig").Token{};
             errdefer reservation.deinit();
@@ -669,4 +687,31 @@ test "sparse cache overlap fills its suffix in the final source callback" {
     try std.testing.expectEqual(@as(usize, 2), input.reads);
     try std.testing.expectEqual(@as(usize, 2), cache.reads);
     try std.testing.expectEqual(@as(u64, 6), cache.transferred_bytes);
+}
+
+test "normal and oversized sparse overlap complete within one logical read" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            @memcpy(out, "abcdefghij"[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    for ([_]bool{ false, true }) |sparse| {
+        var cache = ReadAhead{
+            .allocator = std.testing.allocator,
+            .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 10 },
+            .window_bytes = 4,
+            .max_bytes = if (sparse) 10 else 8,
+            .max_reads = if (sparse) 3 else 2,
+        };
+        defer cache.deinit();
+        var input = source.Source{ .allocator = std.testing.allocator, .identity = "overlap", .storage = .{ .range = cache.range() }, .limits = .{ .max_reads = 2 } };
+        var first = try input.read(0, 4);
+        first.deinit();
+        var overlap = if (sparse) try input.readSparse(1, 9) else try input.read(1, 7);
+        defer overlap.deinit();
+        try std.testing.expectEqualSlices(u8, if (sparse) "bcdefghij" else "bcdefgh", overlap.bytes);
+        try std.testing.expectEqual(@as(usize, 2), input.reads);
+    }
 }

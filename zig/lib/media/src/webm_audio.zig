@@ -607,7 +607,7 @@ pub const DirectoryBuilder = struct {
 
     fn tracks(context: *anyopaque, bytes: []const u8) void {
         const self: *DirectoryBuilder = @ptrCast(@alignCast(context));
-        self.collectTracks(bytes) catch |err| self.fail(err);
+        if (self.failure == null) self.collectTracks(bytes) catch |err| self.fail(err);
     }
 
     fn collectTracks(self: *DirectoryBuilder, bytes: []const u8) !void {
@@ -649,7 +649,7 @@ pub const DirectoryBuilder = struct {
         return .{ .track = track, .packets = self.packets.items, .padding = self.padding.items, .allocator = self.allocator };
     }
 
-    fn fail(self: *DirectoryBuilder, err: anyerror) void {
+    pub fn fail(self: *DirectoryBuilder, err: anyerror) void {
         self.deinit();
         self.failure = err;
     }
