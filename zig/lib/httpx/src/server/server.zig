@@ -2570,6 +2570,7 @@ pub const Server = struct {
             try ensureDateHeader(self.io, &response);
 
             try sendBuffered(self.allocator, &sock, &response);
+            response.releaseBody();
 
             self.finishRequest();
             request_active = false;
@@ -3508,12 +3509,20 @@ pub const Server = struct {
         try sendBuffered(self.allocator, socket, &resp);
     }
 
-    /// Serializes a response to memory, then sends in a single writeAll call
-    /// to avoid per-header syscalls through the unbuffered SocketWriter.
-    fn sendBuffered(allocator: Allocator, socket: *Socket, resp: *Response) !void {
-        const bytes = try serializeToSlice(allocator, resp);
-        defer allocator.free(bytes);
-        try socket.sendAll(bytes);
+    /// Coalesce small responses into one write and send large bodies directly.
+    fn sendBuffered(allocator: Allocator, socket: anytype, resp: *const Response) !void {
+        var buffer = std.ArrayListUnmanaged(u8).empty;
+        defer buffer.deinit(allocator);
+        const writer = arrayListWriter(&buffer, allocator);
+        const body = resp.body orelse "";
+        if (body.len <= 4096) {
+            try resp.serialize(writer);
+            try socket.sendAll(buffer.items);
+        } else {
+            try resp.serializeHead(writer);
+            try socket.sendAll(buffer.items);
+            try socket.sendAll(body);
+        }
     }
 
     /// RFC 7231 §7.1.1.2: Origin servers MUST send a Date header field
@@ -3734,6 +3743,36 @@ fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
     defer allocator.free(names);
     for (items, 0..) |h, i| names[i] = h.name;
     return std.mem.join(allocator, ", ", names);
+}
+
+test "HTTP/1 sends large buffered bodies directly" {
+    const body: [8192]u8 = @splat('x');
+    var response = Response.init(std.testing.allocator, 200);
+    defer response.deinit();
+    response.body = &body;
+    try response.headers.setContentLength(body.len);
+
+    const Sink = struct {
+        expected_body: []const u8,
+        writes: usize = 0,
+
+        fn sendAll(self: *@This(), bytes: []const u8) !void {
+            switch (self.writes) {
+                0 => try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 8192\r\n\r\n", bytes),
+                1 => {
+                    try std.testing.expectEqual(self.expected_body.len, bytes.len);
+                    try std.testing.expect(bytes.ptr == self.expected_body.ptr);
+                },
+                else => return error.UnexpectedWrite,
+            }
+            self.writes += 1;
+        }
+    };
+    var sink: Sink = .{ .expected_body = &body };
+    var scratch: [512]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    try Server.sendBuffered(fixed.allocator(), &sink, &response);
+    try std.testing.expectEqual(@as(usize, 2), sink.writes);
 }
 
 test "Server initialization" {

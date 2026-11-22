@@ -278,7 +278,7 @@ pub const BatchResult = struct {
     /// Decoded HTTP response body bytes, when the adapter uses HTTP.
     response_body_bytes: ?usize = null,
 
-    pub fn responseBytes(self: BatchResult) usize {
+    pub fn retainedPayloadBytes(self: BatchResult) usize {
         var retained_bytes: usize = 0;
         for (self.items) |item| {
             retained_bytes +|= item.text.len +| item.item_id.len +|
@@ -287,7 +287,11 @@ pub const BatchResult = struct {
                 (if (item.regions_json) |value| value.len else 0) +|
                 (if (item.source_fingerprint) |value| value.len else 0);
         }
-        return @max(retained_bytes, self.response_body_bytes orelse 0);
+        return retained_bytes;
+    }
+
+    pub fn responseBytes(self: BatchResult) usize {
+        return @max(self.retainedPayloadBytes(), self.response_body_bytes orelse 0);
     }
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
