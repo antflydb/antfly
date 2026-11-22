@@ -334,6 +334,25 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     addMacosSdkPaths(b, libantfly_link_mod, target);
     const libantfly = @import("shared_library.zig").addWithStorageOwner(b, libantfly_link_mod, &.{ native_inference, native_enrichment }, native_storage);
     const install_libantfly = libantfly.install;
+    // `zig build lite-mp-bench`, then `zig-out/bin/lite-mp-bench --dir DIR`:
+    // the multi-writer Lite benchmark, linked against the same storage, inference
+    // and enrichment archives as libantfly, so only storage edits recompile.
+    if (native_storage) |storage_owner| {
+        const bench_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/bench/lite_mp_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        antfly_imports.build_info.link(bench_mod);
+        addMacosSdkPaths(b, bench_mod, target);
+        bench_mod.linkLibrary(storage_owner);
+        bench_mod.linkLibrary(native_inference);
+        bench_mod.linkLibrary(native_enrichment);
+        const bench_exe = b.addExecutable(.{ .name = "lite-mp-bench", .root_module = bench_mod });
+        b.step("lite-mp-bench", "Build the multi-writer Lite C API benchmark (zig-out/bin/lite-mp-bench)").dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
+    }
+
     b.addNamedLazyPath("libantfly", libantfly.binary);
     if (native_storage) |owner| {
         const client_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"), .target = target, .optimize = optimize });

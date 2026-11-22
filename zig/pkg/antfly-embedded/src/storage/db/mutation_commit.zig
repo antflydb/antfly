@@ -4400,7 +4400,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // An inline index install still runs on this runtime after the
             // wait. Releasing the lease before it let a same-process reopen
             // retire the generation under work that still held its
-            // resources (8-thread indexed SQLite comparison); hold it.
+            // resources, and corrupted page-shaped values (8-thread indexed
+            // `lite-mp-bench`); hold it.
             const commits_after_wait = (effective_req.sync_level != .write and effective_req.sync_level != .propose) or opts.document_child_range_dispatcher != null;
             if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
