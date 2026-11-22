@@ -1317,6 +1317,9 @@ pub fn isHostedInferenceEndpoint(url: []const u8) bool {
 const hosted_inference_timeout_ms: u64 = 120_000;
 const hosted_ocr_response_bytes: usize = 2 * 1024 * 1024;
 const hosted_ocr_result_bytes: usize = 16 * 1024 * 1024;
+const hosted_extraction_working_bytes: usize = 32 * 1024 * 1024;
+const hosted_extraction_result_bytes: usize = 8 * 1024 * 1024;
+const hosted_extraction_max_windows: usize = 128;
 
 fn hostedInferenceControl(supplied: InferenceExecutionControl) InferenceExecutionControl {
     var control = supplied;
@@ -23856,18 +23859,71 @@ pub const Node = struct {
         return reply;
     }
 
-    fn invokeHostedImagePageTask(
-        result: *?HostedReadOutcome,
-        a: std.mem.Allocator,
+    const HostedReadQueue = struct {
+        allocator: std.mem.Allocator,
         client: *httpx.Client,
-        page: HostedImagePage,
-        cfg: readers_api.Config,
+        pages: []const HostedImagePage,
+        replies: []?readers_api.BatchResult,
+        config: readers_api.Config,
         prompt: ?[]const u8,
         tokens: usize,
+        input_limit: ?usize,
         control: InferenceExecutionControl,
-    ) void {
-        result.* = invokeHostedImagePage(a, client, page, cfg, prompt, tokens, control);
-    }
+        mutex: std.atomic.Mutex = .unlocked,
+        next: usize = 0,
+        result_bytes: usize = 0,
+        failure: ?anyerror = null,
+
+        fn lock(self: *HostedReadQueue) void {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        fn take(self: *HostedReadQueue) ?usize {
+            self.lock();
+            defer self.mutex.unlock();
+            if (self.failure != null or self.next == self.pages.len) return null;
+            const index = self.next;
+            self.next += 1;
+            return index;
+        }
+
+        fn fail(self: *HostedReadQueue, err: anyerror) void {
+            self.lock();
+            defer self.mutex.unlock();
+            if (self.failure == null) self.failure = err;
+        }
+
+        fn accept(self: *HostedReadQueue, index: usize, reply: readers_api.BatchResult) !void {
+            if (reply.items.len != 1) return error.InvalidHostedReaderResponse;
+            if (reply.usage) |usage| {
+                if (self.input_limit) |limit| if (usage.prompt_tokens > limit) return error.InferenceInputTokensExceeded;
+                if (usage.completion_tokens > self.tokens) return error.InvalidReadExecutionReport;
+            } else if (self.input_limit != null) return error.HostedReaderUsageRequired;
+
+            self.lock();
+            defer self.mutex.unlock();
+            self.result_bytes += reply.items[0].text.len;
+            if (self.result_bytes > hosted_ocr_result_bytes) {
+                if (self.failure == null) self.failure = error.HostedReaderOutputTooLarge;
+                return error.HostedReaderOutputTooLarge;
+            }
+            self.replies[index] = reply;
+        }
+
+        fn run(self: *HostedReadQueue) void {
+            while (self.take()) |index| {
+                var reply = invokeHostedImagePage(self.allocator, self.client, self.pages[index], self.config, self.prompt, self.tokens, self.control) catch |err| {
+                    self.fail(err);
+                    return;
+                };
+                self.accept(index, reply) catch |err| {
+                    self.fail(err);
+                    reply.deinit(self.allocator);
+                    return;
+                };
+            }
+        }
+    };
 
     fn readHostedImages(
         self: *Node,
@@ -23936,52 +23992,49 @@ pub const Node = struct {
             }
         }
 
+        const replies = try alloc.alloc(?readers_api.BatchResult, pages.len);
+        @memset(replies, null);
+        defer for (replies) |*slot| {
+            if (slot.*) |*reply| reply.deinit(wire_allocator);
+        };
+        var queue: HostedReadQueue = .{
+            .allocator = wire_allocator,
+            .client = &client,
+            .pages = pages,
+            .replies = replies,
+            .config = cfg,
+            .prompt = body.prompt,
+            .tokens = tokens,
+            .input_limit = self.config.request_limits.max_input_tokens_per_item,
+            .control = control,
+        };
+        {
+            var group = std.Io.Group.init;
+            defer group.cancel(ctx.io);
+            const workers = @min(pages.len, std.math.clamp(@as(usize, cfg.hosted_parallelism), 1, 8));
+            for (1..workers) |_| group.concurrent(ctx.io, HostedReadQueue.run, .{&queue}) catch break;
+            queue.run();
+            group.await(ctx.io) catch |err| return documentFailureResponse(ctx, err);
+        }
+        if (queue.failure) |err| return switch (err) {
+            error.OutOfMemory, error.ReadOutputTruncated, error.DocumentUnresolved, error.Timeout, error.Cancelled, error.Canceled => documentFailureResponse(ctx, err),
+            error.InferenceInputTokensExceeded => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "image tokens exceed the deployment limit" }),
+            error.InvalidReadExecutionReport => ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" }),
+            error.InvalidHostedReaderResponse => ctx.status(502).json(.{ .@"error" = "INVALID_READER_RESPONSE" }),
+            error.HostedReaderUsageRequired => ctx.status(502).json(.{ .@"error" = "READER_USAGE_REQUIRED" }),
+            error.HostedReaderOutputTooLarge => ctx.status(502).json(.{ .@"error" = "READER_OUTPUT_TOO_LARGE" }),
+            else => ctx.status(502).json(.{ .@"error" = "READER_UPSTREAM_FAILED" }),
+        };
         var prompt_tokens: i64 = 0;
         var completion_tokens: i64 = 0;
         var measured = true;
-        var result_bytes: usize = 0;
-        const parallelism = std.math.clamp(@as(usize, cfg.hosted_parallelism), 1, 8);
-        var begin: usize = 0;
-        while (begin < pages.len) : (begin += parallelism) {
-            const end = @min(begin + parallelism, pages.len);
-            var replies: [8]?HostedReadOutcome = @splat(null);
-            defer for (replies[0 .. end - begin]) |*optional| {
-                if (optional.*) |*outcome| {
-                    if (outcome.*) |*reply| reply.deinit(wire_allocator) else |_| {}
-                }
-            };
-            if (end - begin == 1) {
-                replies[0] = invokeHostedImagePage(wire_allocator, &client, pages[begin], cfg, body.prompt, tokens, control);
-            } else {
-                var group = std.Io.Group.init;
-                defer group.cancel(ctx.io);
-                for (pages[begin..end], replies[0 .. end - begin]) |page, *reply| {
-                    group.concurrent(ctx.io, invokeHostedImagePageTask, .{ reply, wire_allocator, &client, page, cfg, body.prompt, tokens, control }) catch {
-                        invokeHostedImagePageTask(reply, wire_allocator, &client, page, cfg, body.prompt, tokens, control);
-                    };
-                }
-                group.await(ctx.io) catch |err| return documentFailureResponse(ctx, err);
-            }
-            for (replies[0 .. end - begin], results[begin..end], begin..) |outcome, *result, index| {
-                const reply = outcome.? catch |err| return switch (err) {
-                    error.OutOfMemory, error.ReadOutputTruncated, error.DocumentUnresolved, error.Timeout, error.Cancelled, error.Canceled => documentFailureResponse(ctx, err),
-                    else => ctx.status(502).json(.{ .@"error" = "READER_UPSTREAM_FAILED" }),
-                };
-                if (reply.items.len != 1) return ctx.status(502).json(.{ .@"error" = "INVALID_READER_RESPONSE" });
-                if (reply.usage) |usage| {
-                    if (self.config.request_limits.max_input_tokens_per_item) |limit|
-                        if (usage.prompt_tokens > limit) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "image tokens exceed the deployment limit" });
-                    if (usage.completion_tokens > tokens) return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
-                    prompt_tokens = std.math.add(i64, prompt_tokens, usage.prompt_tokens) catch return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
-                    completion_tokens = std.math.add(i64, completion_tokens, usage.completion_tokens) catch return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
-                } else {
-                    if (self.config.request_limits.max_input_tokens_per_item != null) return ctx.status(502).json(.{ .@"error" = "READER_USAGE_REQUIRED" });
-                    measured = false;
-                }
-                result_bytes +|= reply.items[0].text.len;
-                if (result_bytes > hosted_ocr_result_bytes) return ctx.status(502).json(.{ .@"error" = "READER_OUTPUT_TOO_LARGE" });
-                result.* = .{ .object = "read", .status = "complete", .index = @intCast(index), .text = try alloc.dupe(u8, reply.items[0].text) };
-            }
+        for (replies, results, 0..) |slot, *result, index| {
+            const reply = slot.?;
+            if (reply.usage) |usage| {
+                prompt_tokens = std.math.add(i64, prompt_tokens, usage.prompt_tokens) catch return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
+                completion_tokens = std.math.add(i64, completion_tokens, usage.completion_tokens) catch return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
+            } else measured = false;
+            result.* = .{ .object = "read", .status = "complete", .index = @intCast(index), .text = reply.items[0].text };
         }
         const usage = checkedHostedReadUsage(prompt_tokens, completion_tokens) catch return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
         return ctx.json(api.ReadResponse{
@@ -26617,6 +26670,10 @@ pub const Node = struct {
         logprobs: bool,
         hosted_extractor: ?@import("antfly_structured").extraction.GeneratorConfig = null,
         hosted_http: ?*httpx.Client = null,
+        hosted_scratch_allocator: ?std.mem.Allocator = null,
+        hosted_units: usize = 0,
+        hosted_reply_bytes: usize = 0,
+        hosted_usage_complete: bool = true,
         fn cancelled(ptr: ?*const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr.?));
             self.control.check() catch |err| return err == error.Cancelled or err == error.Canceled;
@@ -26632,7 +26689,7 @@ pub const Node = struct {
         }
         fn invokeHosted(self: *@This(), output_allocator: std.mem.Allocator, invocation: @import("antfly_structured").Invocation, original: @import("antfly_structured").extraction.GeneratorConfig) !@import("antfly_structured").Reply {
             const c = @import("antfly_structured");
-            var arena = std.heap.ArenaAllocator.init(self.node.allocator);
+            var arena = std.heap.ArenaAllocator.init(self.hosted_scratch_allocator.?);
             defer arena.deinit();
             const a = arena.allocator();
             const format = try std.json.Stringify.valueAlloc(a, .{ .type = "json_schema", .json_schema = .{
@@ -26659,8 +26716,9 @@ pub const Node = struct {
                 &.{};
             const tokens = std.math.cast(i32, original.max_tokens) orelse return error.InvalidMaxTokens;
             const units = Node.estimateGenerateAdmissionUnitsFromShape(body.len, 0, tokens);
-            try self.node.reserveAdmissionUnits(units);
-            defer self.node.releaseSlotUnits(units);
+            const target_units = @max(self.hosted_units, units + admissionUnitsFor(hosted_extraction_working_bytes, read_admission_bytes_per_unit));
+            try self.node.growAdmissionUnits(self.hosted_units, target_units);
+            self.hosted_units = target_units;
             const http = self.hosted_http.?;
             const Cancel = struct {
                 fn requested(raw: *const anyopaque) bool {
@@ -26687,11 +26745,14 @@ pub const Node = struct {
             };
             defer response.deinit();
             if (!response.ok()) return error.ExtractorUpstreamFailed;
+            const response_bytes = response.body orelse return error.InvalidConstrainedOutput;
+            self.hosted_reply_bytes +|= response_bytes.len;
+            if (self.hosted_reply_bytes > hosted_extraction_result_bytes) return error.GeneratedExtractionLimitExceeded;
             const Wire = struct {
                 choices: []const struct { finish_reason: []const u8, message: struct { content: ?[]const u8 = null } },
                 usage: ?struct { prompt_tokens: u64, completion_tokens: u64 } = null,
             };
-            const wire = std.json.parseFromSliceLeaky(Wire, a, response.body orelse return error.InvalidConstrainedOutput, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+            const wire = std.json.parseFromSliceLeaky(Wire, a, response_bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidConstrainedOutput,
             };
@@ -26702,8 +26763,9 @@ pub const Node = struct {
                 if (self.node.config.request_limits.max_input_tokens_per_item) |limit|
                     if (usage.prompt_tokens > limit) return error.InferenceInputTokensExceeded;
                 if (invocation.usage) |observed| observed.record(usage.prompt_tokens, usage.completion_tokens);
-            } else if (self.node.config.request_limits.max_input_tokens_per_item != null) {
-                return error.InvalidExtractorUsage;
+            } else {
+                self.hosted_usage_complete = false;
+                if (self.node.config.request_limits.max_input_tokens_per_item != null) return error.InvalidExtractorUsage;
             }
             if (wire.choices.len != 1 or !std.mem.eql(u8, wire.choices[0].finish_reason, "stop")) return error.InvalidConstrainedOutput;
             const value = c.parseReply(output_allocator, wire.choices[0].message.content orelse return error.InvalidConstrainedOutput) catch |err| switch (err) {
@@ -26792,9 +26854,17 @@ pub const Node = struct {
     }
 
     fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config) ![]u8 {
+        var quota: httpx.QuotaAllocator = .{ .backing = allocator, .limit = hosted_extraction_working_bytes };
+        return self.generatedExtractionBounded(allocator, envelope, control, registered, if (registered != null) &quota else null) catch |err| {
+            if (err == error.OutOfMemory and quota.exceeded) return error.GeneratedExtractionLimitExceeded;
+            return err;
+        };
+    }
+
+    fn generatedExtractionBounded(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config, quota: ?*httpx.QuotaAllocator) ![]u8 {
         const c = @import("antfly_structured");
         const extractor = c.extraction;
-        var arena = std.heap.ArenaAllocator.init(allocator);
+        var arena = std.heap.ArenaAllocator.init(if (quota) |budget| budget.allocator() else allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const inputs = envelope.object.get("inputs") orelse return error.InvalidGeneratedExtractorConfig;
@@ -26831,13 +26901,19 @@ pub const Node = struct {
             owned.deinit();
         };
         const io = self.inferenceIo(a, control.io, &owned_io);
-        var hosted_http: ?httpx.Client = if (registered != null) httpx.Client.init(allocator, io) else null;
+        var hosted_http: ?httpx.Client = if (registered != null) httpx.Client.init(quota.?.allocator(), io) else null;
         defer if (hosted_http) |*client| client.deinit();
         const mode = if (registered != null) @as(c.Output, .json_schema) else blk: {
             const caps = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities, false);
             break :blk try caps.select(config.output, config.probabilities);
         };
-        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs, .hosted_extractor = if (registered != null) config.generator else null, .hosted_http = if (hosted_http) |*client| client else null };
+        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs, .hosted_extractor = if (registered != null) config.generator else null, .hosted_http = if (hosted_http) |*client| client else null, .hosted_scratch_allocator = if (quota) |budget| budget.allocator() else null };
+        if (registered != null) {
+            const retained_units = admissionUnitsFor(quota.?.limit, read_admission_bytes_per_unit);
+            try self.reserveAdmissionUnits(retained_units);
+            backend.hosted_units = retained_units;
+        }
+        defer if (registered != null) self.releaseSlotUnits(backend.hosted_units);
         var validation = extractor.Validation{ .config = config };
         const Combined = struct {
             backend: *StructuredGeneration,
@@ -26857,11 +26933,15 @@ pub const Node = struct {
         };
         var combined = Combined{ .backend = &backend, .validation = &validation };
         const text_control: @import("antfly_extracting").text_processing.Checkpoint = .{ .ptr = &backend, .check_fn = StructuredGeneration.textCheck };
-        const planned = try extractor.planWithControl(a, config, texts, text_control);
+        const planned = try extractor.planWithLimit(a, config, texts, text_control, if (registered != null) hosted_extraction_max_windows else null);
         const instructions = try std.fmt.allocPrint(a, "Extract only entities and relations grounded in each input. Use literal source surface forms. Relations reference entity positions. Set present=false for absent candidates. Never invent offsets or confidence. {s}", .{config.instructions});
-        const generated = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
+        const generated = try c.execute(a, .{ .require_all = registered != null, .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
         const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
-        return std.json.Stringify.valueAlloc(allocator, try extractor.responseValue(a, if (registered != null) envelope.object.get("model").?.string else config.generator.model, inputs.array.items, values, generated), .{});
+        const response = try extractor.responseValueWithUsage(a, if (registered != null) envelope.object.get("model").?.string else config.generator.model, inputs.array.items, values, if (backend.hosted_usage_complete) generated else null);
+        if (registered == null) return std.json.Stringify.valueAlloc(allocator, response, .{});
+        const rendered = try std.json.Stringify.valueAlloc(a, response, .{});
+        if (rendered.len > hosted_extraction_result_bytes) return error.GeneratedExtractionLimitExceeded;
+        return allocator.dupe(u8, rendered);
     }
 
     fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
@@ -49367,21 +49447,21 @@ test "named hosted extractor validates upstream output and advertises its capabi
             try std.testing.expectEqualStrings("json_schema", object.get("response_format").?.object.get("type").?.string);
         }
         fn serve(upstream: *httpx.TestServer) void {
-            for (0..4) |_| upstream.handleOne() catch return;
+            for (0..6) |_| upstream.handleOne() catch return;
         }
     };
     const valid = "{\"items\":[{\"item\":0,\"value\":{\"entities\":[{\"label\":\"invoice_number\",\"text\":\"12345\",\"present\":true}],\"relations\":[]}}]}";
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var routes: [4]httpx.testing_mod.Route = undefined;
-    for (&routes, [4][]const u8{ "stop", "stop", "length", "stop" }, [4][]const u8{ valid, "malformed", valid, valid }, 0..) |*route, finish, content, index| {
+    var routes: [6]httpx.testing_mod.Route = undefined;
+    for (&routes, [6][]const u8{ "stop", "stop", "length", "stop", "stop", "stop" }, [6][]const u8{ valid, "malformed", valid, valid, valid, valid }, 0..) |*route, finish, content, index| {
         route.* = .{
             .method = .POST,
             .path = "/v1/chat/completions",
             .max_uses = 1,
             .assert_request = Fixture.inspect,
-            .respond = .{ .body = try std.json.Stringify.valueAlloc(scratch, .{ .choices = .{.{ .finish_reason = finish, .message = .{ .content = content } }}, .usage = .{ .prompt_tokens = @as(u64, if (index == 3) std.math.maxInt(u64) else 10), .completion_tokens = 10 } }, .{}) },
+            .respond = .{ .body = try std.json.Stringify.valueAlloc(scratch, .{ .choices = .{.{ .finish_reason = finish, .message = .{ .content = if (index == 5) try std.mem.replaceOwned(u8, scratch, content, "\"item\":0", "\"item\":1") else content } }}, .usage = if (index == 5) null else @as(?struct { prompt_tokens: u64, completion_tokens: u64 }, .{ .prompt_tokens = if (index == 3) std.math.maxInt(u64) else 10, .completion_tokens = 10 }) }, .{ .emit_null_optional_fields = false }) },
         };
     }
     var upstream = try httpx.TestServer.start(a, io, &routes);
@@ -49392,7 +49472,7 @@ test "named hosted extractor validates upstream output and advertises its capabi
     try group.concurrent(io, Fixture.serve, .{&upstream});
 
     const config = try std.fmt.allocPrint(scratch,
-        \\{{"method":"generated","generator":{{"provider":"openai","model":"local-extractor","url":"{s}/v1","max_tokens":256}},"schema":{{"entities":["invoice_number"]}},"probabilities":"verdict_only"}}
+        \\{{"method":"generated","generator":{{"provider":"openai","model":"local-extractor","url":"{s}/v1","max_tokens":256}},"schema":{{"entities":["invoice_number"]}},"probabilities":"verdict_only","batch":{{"max_items_per_call":1}}}}
     , .{upstream.baseUrl()});
     const entry = try NamedGeneratedExtractor.parse(scratch, "invoice", try std.json.parseFromSliceLeaky(std.json.Value, scratch, config, .{}));
     var node = try Node.init(a, .{
@@ -49410,7 +49490,7 @@ test "named hosted extractor validates upstream output and advertises its capabi
     const reader_info = listings.value.object.get("readers").?.object.get("readers/ocr").?.object;
     try std.testing.expectEqualStrings("image", reader_info.get("inputs").?.array.items[0].string);
 
-    for ([_]u16{ 503, 200, 502, 502, 502, 400 }, 0..) |status, index| {
+    for ([_]u16{ 503, 200, 502, 502, 502, 400, 200 }, 0..) |status, index| {
         const capacity = node.inference_admission.capacity;
         if (index == 0) try node.reserveAdmissionUnits(capacity);
         defer if (index == 0) node.releaseSlotUnits(capacity);
@@ -49418,6 +49498,8 @@ test "named hosted extractor validates upstream output and advertises its capabi
         defer request.deinit();
         request.body = if (index == 5)
             "{\"model\":\"extractors/invoice\",\"inputs\":[{\"content\":\"Invoice 12345\"}],\"generator\":{}}"
+        else if (index == 2 or index == 6)
+            "{\"model\":\"extractors/invoice\",\"inputs\":[{\"id\":\"receipt\",\"content\":\"Invoice 12345\"},{\"content\":\"Invoice 12345\"}]}"
         else
             "{\"model\":\"extractors/invoice\",\"inputs\":[{\"id\":\"receipt\",\"content\":\"Invoice 12345\"}]}";
         var ctx = httpx.Context.init(a, io, &request);
@@ -49429,6 +49511,7 @@ test "named hosted extractor validates upstream output and advertises its capabi
             var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
             defer parsed.deinit();
             try std.testing.expectEqualStrings("extractors/invoice", parsed.value.object.get("model").?.string);
+            try std.testing.expectEqual(index == 1, parsed.value.object.contains("usage"));
             const result = parsed.value.object.get("data").?.array.items[0].object;
             try std.testing.expectEqualStrings("receipt", result.get("id").?.string);
             try std.testing.expectEqualStrings("12345", result.get("entities").?.array.items[0].object.get("text").?.string);

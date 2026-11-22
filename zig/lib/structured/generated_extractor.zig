@@ -230,6 +230,9 @@ pub fn plan(a: A, config: Config, texts: []const []const u8) !Plan {
     return planWithControl(a, config, texts, null);
 }
 pub fn planWithControl(a: A, config: Config, texts: []const []const u8, control: ?extraction_text.Checkpoint) !Plan {
+    return planWithLimit(a, config, texts, control, null);
+}
+pub fn planWithLimit(a: A, config: Config, texts: []const []const u8, control: ?extraction_text.Checkpoint, max_windows: ?usize) !Plan {
     var windows: std.ArrayList(Window) = .empty;
     var inputs: std.ArrayList([]const u8) = .empty;
     const schema = try std.json.Stringify.valueAlloc(a, config.schema, .{});
@@ -245,6 +248,7 @@ pub fn planWithControl(a: A, config: Config, texts: []const []const u8, control:
             .control = control,
         });
         defer document.deinit();
+        if (max_windows) |limit| if (document.windows.len > limit -| windows.items.len) return error.GeneratedExtractionLimitExceeded;
         for (document.windows) |window| {
             try windows.append(a, .{ .document = doc, .start = window.bytes.start, .end = window.bytes.end });
             try inputs.append(a, text[window.bytes.start..window.bytes.end]);
@@ -465,6 +469,9 @@ pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, p
 /// document outcomes used by embedded producers. No transport may replace a
 /// failed window's cause with a generic output-validation error.
 pub fn responseValue(a: A, model: []const u8, inputs: []const V, outcomes: []const Outcome, execution: c.Result) !V {
+    return responseValueWithUsage(a, model, inputs, outcomes, execution);
+}
+pub fn responseValueWithUsage(a: A, model: []const u8, inputs: []const V, outcomes: []const Outcome, execution: ?c.Result) !V {
     if (inputs.len != outcomes.len) return error.InvalidGeneratedExtractorConfig;
     var data = try c.array(a, &.{});
     for (outcomes, inputs) |outcome, input| {
@@ -477,10 +484,12 @@ pub fn responseValue(a: A, model: []const u8, inputs: []const V, outcomes: []con
     try c.put(a, &response, "schema_version", .{ .integer = 2 });
     try c.put(a, &response, "model", .{ .string = model });
     try c.put(a, &response, "data", data);
-    var usage = c.object();
-    try c.put(a, &usage, "input_tokens", .{ .integer = std.math.cast(i64, execution.input_tokens) orelse return error.InvalidExtractorUsage });
-    try c.put(a, &usage, "output_tokens", .{ .integer = std.math.cast(i64, execution.output_tokens) orelse return error.InvalidExtractorUsage });
-    try c.put(a, &response, "usage", usage);
+    if (execution) |token_usage| {
+        var usage = c.object();
+        try c.put(a, &usage, "input_tokens", .{ .integer = std.math.cast(i64, token_usage.input_tokens) orelse return error.InvalidExtractorUsage });
+        try c.put(a, &usage, "output_tokens", .{ .integer = std.math.cast(i64, token_usage.output_tokens) orelse return error.InvalidExtractorUsage });
+        try c.put(a, &response, "usage", usage);
+    }
     return response;
 }
 

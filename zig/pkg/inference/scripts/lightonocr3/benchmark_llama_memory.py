@@ -28,6 +28,8 @@ from pathlib import Path
 import platform
 import re
 import signal
+import socket
+import uuid
 import statistics
 import subprocess
 import tempfile
@@ -137,23 +139,26 @@ def child_pid(parent):
     return int(children[0]) if len(children) == 1 else None
 
 
-def wait_ready(proc, url):
+def wait_ready(proc, url, alias):
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and proc.poll() is None:
         try:
             read_json(url + "/health", timeout=1)
-            return
+            models = read_json(url + "/v1/models", timeout=1)
+            if any(model.get("id") == alias for model in models.get("data", [])):
+                return
         except (URLError, TimeoutError):
-            time.sleep(0.2)
+            pass
+        time.sleep(0.2)
     raise RuntimeError("llama-server failed to become ready")
 
 
-def request_case(url, case, prompt=""):
+def request_case(url, case, alias, prompt=""):
     content = [{"type": "image_url", "image_url": {"url": case["uri"]}}]
     if prompt:
         content.append({"type": "text", "text": prompt})
     body = {
-        "model": "ocr",
+        "model": alias,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": case["max_new_tokens"],
         "temperature": 0,
@@ -162,26 +167,29 @@ def request_case(url, case, prompt=""):
     start = time.perf_counter()
     try:
         reply = read_json(url + "/v1/chat/completions", body)
+        choice = reply["choices"][0]
+        text = choice["message"]["content"] or ""
+        finish = choice["finish_reason"]
+        if not isinstance(text, str):
+            raise ValueError("OCR response content is not text")
     except HTTPError as error:
         return {
             "case": case["name"],
             "http_status": error.code,
             "message": error.read().decode()[:1500],
         }
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
         return {
             "case": case["name"],
             "seconds": time.perf_counter() - start,
             "error": str(error),
         }
     seconds = time.perf_counter() - start
-    choice = reply["choices"][0]
-    text = choice["message"]["content"] or ""
     return {
         "case": case["name"],
         "prompt": prompt,
         "seconds": seconds,
-        "finish": choice["finish_reason"],
+        "finish": finish,
         "usage": reply.get("usage"),
         "text": text,
     }
@@ -216,6 +224,10 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
         raise FileNotFoundError(
             f"Missing weights for {size}/{profile.name}: {model}, {projector}"
         )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", args.port))
+        port = listener.getsockname()[1]
+    alias = "ocr-" + uuid.uuid4().hex
     command = [
         args.binary,
         "--model",
@@ -223,13 +235,13 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
         "--mmproj",
         str(projector),
         "--alias",
-        "ocr",
+        alias,
         "--reasoning",
         "off",
         "--host",
         "127.0.0.1",
         "--port",
-        str(args.port),
+        str(port),
         "-ngl",
         "99",
         "--parallel",
@@ -250,7 +262,7 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
     ]
     if profile.image_max_tokens is not None:
         command += ["--image-max-tokens", str(profile.image_max_tokens)]
-    url = f"http://127.0.0.1:{args.port}"
+    url = f"http://127.0.0.1:{port}"
     phase = "load"
     sampled_peaks = {}
     finished = threading.Event()
@@ -279,10 +291,10 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
         sampler = threading.Thread(target=sample)
         sampler.start()
         try:
-            wait_ready(proc, url)
+            wait_ready(proc, url, alias)
             phase = "warmup"
-            warmup = request_case(url, cases[0])
-            if "text" not in warmup:
+            warmup = request_case(url, cases[0], alias)
+            if warmup.get("finish") != "stop":
                 raise RuntimeError(f"Warm-up request failed: {warmup}")
             pid = child_pid(proc.pid)
             idle = process_memory(pid) if pid else None
@@ -292,13 +304,14 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
                     start = time.perf_counter()
                     rows = list(
                         pool.map(
-                            lambda case: request_case(url, case), cases * args.rounds
+                            lambda case: request_case(url, case, alias),
+                            cases * args.rounds,
                         )
                     )
                     elapsed = time.perf_counter() - start
             if grounding_case:
                 phase = "grounding"
-                grounding = request_case(url, grounding_case, "grounding")
+                grounding = request_case(url, grounding_case, alias, "grounding")
         except (OSError, RuntimeError, ValueError, KeyError) as error:
             failure = str(error)
         finally:
@@ -327,7 +340,20 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
         score_case(grounding, grounding_case)
     scored = [row for row in rows if "cer" in row]
     ok = [row for row in scored if row["finish"] == "stop" and not row["missing"]]
+    layout_ok = grounding_case is None or (
+        grounding is not None
+        and grounding.get("finish") == "stop"
+        and grounding.get("has_grounding")
+        and not grounding.get("missing")
+        and grounding["grounding_boxes"] == grounding["valid_grounding_boxes"]
+    )
+    qualified = (
+        failure is None
+        and bool(layout_ok)
+        and (args.grounding_only or len(ok) == len(cases) * args.rounds)
+    )
     return {
+        "qualified": qualified,
         "model": size,
         "profile": asdict(profile),
         "parallel": parallel,
@@ -366,7 +392,7 @@ def main():
     parser.add_argument("--profile", nargs="+", choices=[p.name for p in profiles()])
     parser.add_argument("--parallel", nargs="+", type=int, default=[1, 4])
     parser.add_argument("--rounds", type=int, default=2)
-    parser.add_argument("--port", type=int, default=18494)
+    parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--grounding", action="store_true")
     parser.add_argument("--grounding-only", action="store_true")
     parser.add_argument("--grounding-case", default="receipt")
@@ -380,6 +406,8 @@ def main():
     if min(args.parallel) < 1 or args.rounds < 1:
         parser.error("parallel and rounds must be positive")
     cases = json.loads(args.cases.read_text())["cases"]
+    if not cases:
+        parser.error("The corpus must contain at least one case")
     for case in cases:
         image = (args.cases.parent / case["image"]).read_bytes()
         case["uri"] = "data:image/png;base64," + base64.b64encode(image).decode()
@@ -415,13 +443,14 @@ def main():
                     size,
                     parallel,
                     profile.name,
+                    "qualified" if run["qualified"] else "incomplete",
                     run["completed_pages"],
                     run["requests"],
                     run["peak_physical_footprint_bytes"],
                     run["error"] or "",
                     flush=True,
                 )
-    if any(run["error"] for run in report["runs"]):
+    if any(not run["qualified"] for run in report["runs"]):
         raise SystemExit(1)
 
 

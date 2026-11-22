@@ -17,6 +17,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const common_config = @import("antfly_local_sources").common_config;
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const preload_model_spec = @import("../common/preload_model_spec.zig");
 const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
@@ -349,6 +350,10 @@ fn isNamedGeneratedExtractor(value: std.json.Value) bool {
 }
 
 fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Config {
+    return parseRunConfigWithSecrets(alloc, raw, null);
+}
+
+fn parseRunConfigWithSecrets(alloc: std.mem.Allocator, raw: []const u8, store: ?*common_secrets.FileStore) !common_config.Config {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -384,7 +389,7 @@ fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Conf
         try root.put(scratch, "inference", .{ .object = model_config });
     }
     const normalized = try std.json.Stringify.valueAlloc(scratch, parsed.value, .{});
-    var config = try common_config.Config.parseFromSlice(alloc, normalized);
+    var config = try common_config.Config.parseFromSliceWithSecrets(alloc, normalized, store);
     errdefer config.deinit();
     if (preload_value) |entry| {
         var preload_object = std.json.ObjectMap{};
@@ -630,18 +635,29 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     defer extractor_arena.deinit();
     const extractor_alloc = extractor_arena.allocator();
     var generated_extractors: std.ArrayList(inference.server.NamedGeneratedExtractor) = .empty;
+    var secret_store: ?common_secrets.FileStore = null;
+    defer if (secret_store) |*store| store.deinit();
     var loaded_config: ?common_config.Config = if (config_path) |path| blk: {
         const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
         defer alloc.free(raw);
         const tree = try std.json.parseFromSliceLeaky(std.json.Value, extractor_alloc, raw, .{ .allocate = .alloc_always });
+        if (tree == .object) if (tree.object.get("secrets")) |value| {
+            var settings = try common_secrets.parseConfig(alloc, value);
+            defer settings.deinit();
+            secret_store = try common_secrets.FileStore.initConfiguredWithIo(alloc, io, settings.value);
+        };
+        const store = if (secret_store) |*value| value else null;
         if (tree == .object) if (tree.object.get("extractors")) |entries| {
             if (entries != .object) return error.InvalidConfig;
             for (entries.object.keys(), entries.object.values()) |name, value| {
                 if (!isNamedGeneratedExtractor(value)) continue;
-                try generated_extractors.append(extractor_alloc, try inference.server.NamedGeneratedExtractor.parse(extractor_alloc, name, value));
+                var entry = try inference.server.NamedGeneratedExtractor.parse(extractor_alloc, name, value);
+                if (entry.config.generator.api_key) |key|
+                    entry.config.generator.api_key = try common_secrets.resolveReferenceOwned(extractor_alloc, store, key);
+                try generated_extractors.append(extractor_alloc, entry);
             }
         };
-        break :blk parseRunConfig(alloc, raw) catch |err| {
+        break :blk parseRunConfigWithSecrets(alloc, raw, store) catch |err| {
             platform.inference_settings.diagnoseInvalidConfig(alloc, raw);
             return err;
         };
@@ -710,7 +726,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         while (entries.next()) |entry| {
             const reader = entry.value_ptr.*;
             if (reader.provider != .openai) continue;
-            const endpoint = reader.base_url orelse reader.resolvedUrl() orelse return error.InvalidReaderConfig;
+            const endpoint = reader.base_url orelse reader.resolvedUrl() orelse continue;
             if (!inference.server.isHostedInferenceEndpoint(endpoint)) return error.InvalidReaderConfig;
             try image_readers.append(alloc, .{ .name = entry.key_ptr.*, .config = reader });
         }

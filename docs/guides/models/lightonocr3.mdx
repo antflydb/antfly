@@ -134,8 +134,9 @@ zig-out/bin/antfly-inference run --config inference.json
 ```
 
 llama.cpp owns GPU execution in this deployment. The inference-only listener
-defaults to `127.0.0.1:8090`. Configured image readers require an explicit HTTP
-or HTTPS endpoint. Endpoint precedence is `base_url`, then `url`, then
+defaults to `127.0.0.1:8090`. An explicit HTTP or HTTPS endpoint opts an OpenAI reader into hosted alias
+registration. Existing readers that use the shared provider default can coexist
+with these aliases. Endpoint precedence is `base_url`, then `url`, then
 `api_url`. The listener validates the full image batch before sending one
 completion per page. Set `hosted_parallelism` between 1 and 8 to limit the
 number of simultaneous page completions within each request. It defaults to 1,
@@ -190,7 +191,10 @@ Hosted reading and extraction time out after two minutes or the caller's
 shorter deadline. If a deployment sets an input-token limit, the upstream must
 report prompt usage. An extractor call checks the entire upstream batch prompt,
 including schema and instructions, against that limit. This accounting occurs
-after the call because the upstream owns tokenization.
+after the call because the upstream owns tokenization. The response omits usage
+when any upstream call omits its counts. Hosted extraction limits each request
+to 128 planned windows and caps aggregate upstream replies and serialized output
+at 8 MiB each.
 `GET /ai/v1/models` lists the reader under `readers` and the extractor under
 `extractors`, with their accepted input modalities.
 
@@ -221,7 +225,9 @@ independently. It reports warm idle, phase-sampled RSS and physical footprint,
 whole-process peaks, completed pages per second, latency, and OCR checks.
 Process startup is cold within each run. The system file cache is shared across
 runs. The synthetic pages cover small print and tables, with a separate
-grounding probe. They do not establish broad OCR accuracy.
+grounding probe. They do not establish broad OCR accuracy. The harness retains
+reports for incomplete profiles and exits with a nonzero status when a page or
+layout probe fails qualification.
 
 
 ## Read documents during ingestion
