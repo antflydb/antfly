@@ -96,6 +96,25 @@ class FakeInference:
         )
 
 
+class TornWrite:
+    """Write a fragment, then fail once; later writes would corrupt the tail."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.writes = 0
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def write(self, data):
+        self.writes += 1
+        if self.writes == 1:
+            return self.stream.write(data[:8])
+        if self.writes == 2:
+            raise OSError("synthetic partial write")
+        return self.stream.write(data)
+
+
 class PolicyBenchmarkTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -223,6 +242,34 @@ class PolicyBenchmarkTests(unittest.TestCase):
                 row["instance_id"] == "2" for row in report["rows"] if not row["warmup"]
             )
         )
+
+    def test_rewarm_storage_failure_aborts_without_appending_residency_failure(self):
+        fake = FakeInference()
+        # First policy measurement is durable before the second needs rewarming.
+        fake.evict_after_posts = 3
+        argv = self.argv([self.case()])
+        original_append = state.CampaignStore._append
+        torn = None
+
+        def append(store, event):
+            nonlocal torn
+            if event.get("row", {}).get("warmup_reason") == "resident_model_changed":
+                torn = TornWrite(store.journal)
+                store.journal = torn
+            return original_append(store, event)
+
+        with patch.object(state.CampaignStore, "_append", append):
+            with self.assertRaisesRegex(OSError, "synthetic partial write"):
+                self.run_bench(argv, fake)
+        self.assertEqual(torn.writes, 2)
+        report = self.report()
+        self.assertEqual(report["coverage"]["recorded_samples"], 1)
+        self.assertFalse(any(r.get("error_code") for r in report["rows"]))
+        self.assertEqual(len(fake.posts), 4)
+        # Recovery keeps the first measurement and safely removes the torn tail.
+        self.assertEqual(self.run_bench(argv + ["--resume"], fake), 1)
+        self.assertTrue(self.report()["measurement_success"])
+        self.assertEqual(self.report()["coverage"]["recorded_samples"], 2)
 
     def test_worker_restart_during_timed_call_invalidates_measurement(self):
         fake = FakeInference()
@@ -524,6 +571,28 @@ class JournalTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     store.record(self.row())
             self.assertEqual(store.samples, {})
+            with self.assertRaisesRegex(state.StateError, "COMMIT_UNCERTAIN"):
+                store.record(self.row())
+
+    def test_partial_write_poisons_all_further_checkpoint_writes_until_recovery(self):
+        with state.CampaignStore(self.report, self.identity) as store:
+            torn = TornWrite(store.journal)
+            store.journal = torn
+            with self.assertRaisesRegex(OSError, "synthetic partial write"):
+                store.record(self.row())
+            self.assertEqual(store.samples, {})
+            for operation in (
+                lambda: store.record(self.row()),
+                lambda: store.reference("embedding", "cpu", [0.6, 0.8]),
+            ):
+                with self.assertRaisesRegex(state.StateError, "COMMIT_UNCERTAIN"):
+                    operation()
+            self.assertEqual(torn.writes, 2)
+            self.assertEqual(list(store.directory.glob("reference-*.json")), [])
+        with state.CampaignStore(self.report, self.identity, resume=True) as store:
+            self.assertEqual(store.recovered_bytes, 8)
+            store.record(self.row())
+            self.assertEqual(len(store.samples), 1)
 
     def test_atomic_report_projection_is_private_and_contains_no_reference_vectors(
         self,

@@ -289,6 +289,22 @@ def resident_instance(args, endpoint, model):
     return loaded[0]["id"]
 
 
+class ResidencyError(BenchmarkError):
+    """Remote residency failures, distinct from local checkpoint failures."""
+
+
+def sample_resident_instance(args, endpoint, model):
+    try:
+        return resident_instance(args, endpoint, model)
+    except Exception as error:
+        code = (
+            str(error)
+            if isinstance(error, BenchmarkError)
+            else "RESIDENCY_" + type(error).__name__
+        )
+        raise ResidencyError(code) from error
+
+
 def invoke(args, case, endpoint, body, tokens, trial, warmup, expected_instance=None):
     row = dict(
         case=case["id"],
@@ -446,7 +462,9 @@ def run_campaign(args, store, cases, hashes):
                     if key in store.samples:
                         continue
                     try:
-                        current = resident_instance(args, endpoint, case["model"])
+                        current = sample_resident_instance(
+                            args, endpoint, case["model"]
+                        )
                         if current != resident[endpoint]:
                             current = warm_endpoint(
                                 args,
@@ -460,15 +478,15 @@ def run_campaign(args, store, cases, hashes):
                             )
                         if (
                             current is None
-                            or resident_instance(args, endpoint, case["model"])
+                            or sample_resident_instance(args, endpoint, case["model"])
                             != current
                         ):
-                            raise BenchmarkError("RESIDENCY_UNSTABLE_BEFORE_SAMPLE")
+                            raise ResidencyError("RESIDENCY_UNSTABLE_BEFORE_SAMPLE")
                         resident[endpoint] = current
                         row, vector = invoke(
                             args, case, endpoint, body, tokens, trial, False, current
                         )
-                    except Exception as error:
+                    except ResidencyError as error:
                         row, vector = (
                             dict(
                                 case=case["id"],
@@ -478,9 +496,7 @@ def run_campaign(args, store, cases, hashes):
                                 warmup=False,
                                 complete=False,
                                 seconds=0,
-                                error_code=str(error)
-                                if isinstance(error, BenchmarkError)
-                                else "RESIDENCY_" + type(error).__name__,
+                                error_code=str(error),
                             ),
                             None,
                         )

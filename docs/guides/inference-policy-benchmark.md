@@ -141,7 +141,9 @@ The private `<report>.state/` directory is the authoritative checkpoint. An
 exclusive OS lock rejects simultaneous writers before report replay or inference.
 Each measured request and warmup is appended to a checksummed, fsynced journal;
 resume discards only an unterminated tail and rejects committed corruption or
-duplicate measurements. The JSON report is an atomic projection at normal exit
+duplicate measurements. A failed journal commit stops further checkpoint writes
+until the campaign is reopened for recovery; storage errors are never classified
+as model-residency failures, including during rewarming. The JSON report is an atomic projection at normal exit
 or handled interruption, not a per-request rewrite. During execution use stdout
 for progress. Keep the state directory with the report for resume; copying only
 the report is insufficient. Reports from the earlier journal-less format are

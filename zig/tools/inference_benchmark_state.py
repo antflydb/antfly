@@ -63,6 +63,7 @@ class CampaignStore:
         self.epochs = set()
         self.epoch = None
         self.recovered_bytes = 0
+        self.commit_failed = False
 
     def __enter__(self):
         try:
@@ -188,28 +189,40 @@ class CampaignStore:
         else:
             raise StateError("UNKNOWN_JOURNAL_EVENT")
 
+    def _require_writable(self):
+        if self.commit_failed:
+            raise StateError("JOURNAL_COMMIT_UNCERTAIN_REOPEN_TO_RECOVER")
+
     def _append(self, event):
+        self._require_writable()
         # Validate before committing an event that replay could not accept.
         raw = canonical({"record": event, "sha256": checksum(event)}) + b"\n"
         if len(raw) > 4 * 1024 * 1024:
             raise StateError("JOURNAL_RECORD_TOO_LARGE")
         if event["type"] != "identity":
             self._apply(event, validate_only=True)
-        self.journal.seek(0, os.SEEK_END)
-        remaining = memoryview(raw)
-        while remaining:
-            count = self.journal.write(remaining)
-            if not count:
-                raise OSError("JOURNAL_WRITE_FAILED")
-            remaining = remaining[count:]
-        os.fsync(self.journal.fileno())
-        if event["type"] != "identity":
-            self._apply(event)
+        try:
+            self.journal.seek(0, os.SEEK_END)
+            remaining = memoryview(raw)
+            while remaining:
+                count = self.journal.write(remaining)
+                if not count:
+                    raise OSError("JOURNAL_WRITE_FAILED")
+                remaining = remaining[count:]
+            os.fsync(self.journal.fileno())
+            if event["type"] != "identity":
+                self._apply(event)
+        except BaseException:
+            # The tail may contain partial or fully written unacknowledged bytes.
+            # Only recovery on a fresh open can decide what was committed.
+            self.commit_failed = True
+            raise
 
     def record(self, row):
         self._append({"type": "attempt", "row": dict(row, epoch=self.epoch)})
 
     def reference(self, case, endpoint, vector):
+        self._require_writable()
         sha = checksum(vector)
         filename = "reference-" + sha + ".json"
         destination = self.directory / filename
