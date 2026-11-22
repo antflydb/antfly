@@ -2905,7 +2905,8 @@ pub const SessionRegistry = struct {
     reserved_session_count: usize = 0,
     expiry_cursor: ?ParsedSessionExpiryKey = null,
     sql_abort_expiry_cursor: ?ParsedSessionExpiryKey = null,
-    sql_abort_migration_after: ?db_mod.types.TxnId = null,
+    sql_abort_migration_after: ?LegacySqlAbortPage.Position = null,
+    sql_abort_migration_rescan_ns: u64 = 0,
     recovery_index_cursor: ?db_mod.types.TxnId = null,
     recovery_audit_cursor: ?[]u8 = null,
     memory_recovery_scan_offset: usize = 0,
@@ -4936,11 +4937,13 @@ pub const SessionRegistry = struct {
 
     pub fn migrateLegacySqlAbortReceipts(self: *SessionRegistry, alloc: std.mem.Allocator) !void {
         const durable = self.durable orelse return;
+        const now_ns = platform_time.monotonicNs();
         self.mutex.lock();
         const after = self.sql_abort_migration_after;
+        const rescan_ns = self.sql_abort_migration_rescan_ns;
         self.mutex.unlock();
-        const start = if (after) |id| try makeSessionKey(alloc, id) else null;
-        defer if (start) |key| alloc.free(key);
+        if (now_ns < rescan_ns) return;
+        const start = if (after) |*position| position.key[0..position.len] else null;
         var page: LegacySqlAbortPage = .{};
         switch (durable.backend) {
             .docstore => |store| {
@@ -4953,9 +4956,25 @@ pub const SessionRegistry = struct {
             .runtime => |store| {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                var cursor = try txn.openCursor();
-                defer cursor.close();
-                try page.scan(&txn, &cursor, alloc, start);
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                if (txn.readPrefixPage(arena.allocator(), session_prefix, start, connection_prefix_len)) |rows| {
+                    for (rows) |row| {
+                        if (!std.mem.startsWith(u8, row.key, session_prefix)) return error.InvalidTransactionSessionRecord;
+                        try page.recordPosition(row.key);
+                        if (row.value.len == 0) {
+                            if (try LegacySqlAbortPage.terminalConnectionPrefix(&txn, alloc, row.key)) page.addCandidate(row.key);
+                        } else if (LegacySqlAbortPage.isTerminalPrefix(row.value)) {
+                            page.addCandidate(row.key);
+                        }
+                    }
+                    page.more = rows.len == 64;
+                } else |err| {
+                    if (err != error.Unsupported) return err;
+                    var cursor = try txn.openCursor();
+                    defer cursor.close();
+                    try page.scan(&txn, &cursor, alloc, start);
+                }
             },
         }
         for (page.ids[0..page.candidates]) |id| {
@@ -4964,6 +4983,10 @@ pub const SessionRegistry = struct {
             defer stripe.unlock();
             const changed = durable.migrateLegacySqlAbortReceipt(id) catch |err| switch (err) {
                 error.SessionLeaseLost => continue,
+                error.InvalidTransactionSessionRecord, error.InvalidSqlConnection, error.SyntaxError, error.UnexpectedEndOfInput, error.UnexpectedToken => {
+                    std.log.warn("legacy SQL abort row skipped txn_id={x} err={s}", .{ id, @errorName(err) });
+                    continue;
+                },
                 else => return err,
             };
             if (changed) {
@@ -4978,15 +5001,38 @@ pub const SessionRegistry = struct {
         }
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (std.meta.eql(after, self.sql_abort_migration_after))
-            self.sql_abort_migration_after = if (page.scanned == page.ids.len) page.last else null;
+        if (std.meta.eql(after, self.sql_abort_migration_after) and rescan_ns == self.sql_abort_migration_rescan_ns) {
+            self.sql_abort_migration_after = if (page.more) page.last else null;
+            if (!page.more) self.sql_abort_migration_rescan_ns = now_ns +| std.time.ns_per_hour;
+        }
     }
 
     const LegacySqlAbortPage = struct {
         ids: [128]db_mod.types.TxnId = undefined,
         candidates: usize = 0,
         scanned: usize = 0,
-        last: ?db_mod.types.TxnId = null,
+        last: ?Position = null,
+        more: bool = false,
+
+        const Position = struct { key: [512]u8, len: usize };
+
+        fn recordPosition(page: *LegacySqlAbortPage, key: []const u8) !void {
+            if (key.len > 512) return error.InvalidTransactionSessionRecord;
+            var position: Position = .{ .key = @splat(0), .len = key.len };
+            @memcpy(position.key[0..key.len], key);
+            page.last = position;
+            page.scanned += 1;
+        }
+
+        fn addCandidate(page: *LegacySqlAbortPage, key: []const u8) void {
+            page.ids[page.candidates] = distributed_txn.parseTxnIdHex(key[session_prefix.len..]) catch return;
+            page.candidates += 1;
+        }
+
+        fn isTerminalPrefix(bytes: []const u8) bool {
+            const header = (parseConnectionPrefix(bytes) catch return false) orelse return false;
+            return header[0] & 4 != 0;
+        }
 
         fn scan(page: *LegacySqlAbortPage, read: anytype, cursor: *backend_erased.Cursor, alloc: std.mem.Allocator, start: ?[]const u8) !void {
             cursor.setKeysOnly();
@@ -4994,14 +5040,12 @@ pub const SessionRegistry = struct {
             while (entry) |row| : (entry = try cursor.next()) {
                 if (!std.mem.startsWith(u8, row.key, session_prefix)) break;
                 if (start) |key| if (std.mem.eql(u8, row.key, key)) continue;
-                const id = distributed_txn.parseTxnIdHex(row.key[session_prefix.len..]) catch continue;
-                page.scanned += 1;
-                page.last = id;
-                if (try terminalConnectionPrefix(read, alloc, row.key)) {
-                    page.ids[page.candidates] = id;
-                    page.candidates += 1;
+                try page.recordPosition(row.key);
+                if (try terminalConnectionPrefix(read, alloc, row.key)) page.addCandidate(row.key);
+                if (page.scanned == page.ids.len) {
+                    page.more = true;
+                    break;
                 }
-                if (page.scanned == page.ids.len) break;
             }
         }
 
@@ -5017,13 +5061,11 @@ pub const SessionRegistry = struct {
                     error.Unsupported, error.EndOfStream => break :bounded null,
                     else => return err,
                 };
-                const header = (try parseConnectionPrefix(bytes)) orelse return false;
-                break :bounded header;
+                break :bounded isTerminalPrefix(bytes);
             };
-            if (narrow) |header| return header[0] & 4 != 0;
+            if (narrow) |terminal| return terminal;
             const bytes = read.get(key) catch |err| if (err == error.NotFound) return false else return err;
-            const header = (try parseConnectionPrefix(bytes)) orelse return false;
-            return header[0] & 4 != 0;
+            return isTerminalPrefix(bytes);
         }
     };
 
@@ -8843,7 +8885,16 @@ test "distributed txn migrates legacy detached SQL aborts out of live quota" {
     old.commit_execution_started = true;
     try durable.saveForTest(old, null);
     try std.testing.expectError(error.SessionLimitExceeded, registry.begin(a, .{}, 1));
+    const bad_key = try makeSessionKey(a, @splat(4));
+    defer a.free(bad_key);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(bad_key, "{\"c1\":\"bad\"}");
+        try write.commit();
+    }
     try registry.migrateLegacySqlAbortReceipts(a);
+    try std.testing.expect(registry.sql_abort_migration_rescan_ns != 0);
     try std.testing.expect((try durable.load(id)) == null);
     try std.testing.expectEqual(SessionDisposition.aborted, (try registry.getStatusForPrincipal(a, id, "alice")).?.disposition);
     _ = try registry.begin(a, .{}, 1);
