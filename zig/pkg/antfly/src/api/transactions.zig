@@ -1689,29 +1689,33 @@ pub const DurableSessionStore = struct {
 
     const ObservationAck = struct { key: [observation_ack_prefix_len + 16]u8, reference: [16]u8 };
 
-    pub fn reclaimLegacyObservationAcks(self: *DurableSessionStore) !bool {
+    pub fn reclaimLegacyObservationAcks(self: *DurableSessionStore, shared: bool) !bool {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
-        const namespace: Outbox.Namespace = .{ .issuer = self.registration_issuer orelse 0, .observation = true };
-        const producer = switch (self.backend) {
-            .docstore => |store| result: {
-                var txn = try store.beginReadTxn();
-                defer txn.abort();
-                break :result try namespace.producer(&txn, self.alloc, @splat(0));
-            },
-            .runtime => |store| result: {
-                var txn = try store.beginRead();
-                defer txn.abort();
-                break :result try namespace.producer(&txn, self.alloc, @splat(0));
-            },
-        };
-        if (producer.next == 1) return false;
         var prefix_bytes: [observation_ack_prefix_len + 1]u8 = undefined;
-        const first = try std.fmt.bufPrint(&prefix_bytes, "{s}{s}:ack:8", .{ completion_retirement_root, &std.fmt.bytesToHex(producer.id, .lower) });
-        const prefix = first[0..observation_ack_prefix_len];
+        var prefix: []const u8 = completion_retirement_root;
+        var first = prefix;
+        if (!shared) {
+            const namespace: Outbox.Namespace = .{ .issuer = self.registration_issuer orelse 0, .observation = true };
+            const producer = switch (self.backend) {
+                .docstore => |store| result: {
+                    var txn = try store.beginReadTxn();
+                    defer txn.abort();
+                    break :result try namespace.producer(&txn, self.alloc, @splat(0));
+                },
+                .runtime => |store| result: {
+                    var txn = try store.beginRead();
+                    defer txn.abort();
+                    break :result try namespace.producer(&txn, self.alloc, @splat(0));
+                },
+            };
+            if (producer.next == 1) return false;
+            first = try std.fmt.bufPrint(&prefix_bytes, "{s}{s}:ack:8", .{ completion_retirement_root, &std.fmt.bytesToHex(producer.id, .lower) });
+            prefix = first[0..observation_ack_prefix_len];
+        }
         const Scan = struct {
-            producer_id: [8]u8,
+            prefix_len: usize,
             acks: [128]ObservationAck = undefined,
             count: usize = 0,
             inspected: usize = 0,
@@ -1722,18 +1726,20 @@ pub const DurableSessionStore = struct {
                 scan.inspected += 1;
                 if (key.len == observation_ack_prefix_len + 16) candidate: {
                     var reference: [16]u8 = undefined;
-                    reference[0..8].* = scan.producer_id;
+                    const issuer_end = completion_retirement_root.len + 16;
+                    if (!std.mem.eql(u8, key[issuer_end..observation_ack_prefix_len], ":ack:")) break :candidate;
+                    _ = std.fmt.hexToBytes(reference[0..8], key[completion_retirement_root.len..issuer_end]) catch break :candidate;
                     _ = std.fmt.hexToBytes(reference[8..], key[observation_ack_prefix_len..]) catch break :candidate;
                     if (!Outbox.isObservation(reference)) break :candidate;
                     scan.acks[scan.count] = .{ .key = key[0..][0 .. observation_ack_prefix_len + 16].*, .reference = reference };
                     scan.count += 1;
                 }
                 if (scan.inspected < scan.acks.len) return true;
-                scan.next = ObservationAckPosition.after(key, observation_ack_prefix_len);
+                scan.next = ObservationAckPosition.after(key, scan.prefix_len);
                 return false;
             }
         };
-        var scan: Scan = .{ .producer_id = producer.id };
+        var scan: Scan = .{ .prefix_len = prefix.len };
         const after = self.observation_ack_cursor;
         const start = if (after) |*position| position.bytes[0..position.len] else first;
         try self.scanPrefixFromWithContextMode(prefix, start, if (after) |position| position.exclusive else false, &scan, Scan.visit, true);
@@ -1808,8 +1814,8 @@ pub const DurableSessionStore = struct {
         return (try self.lookupSqlCommitDecision(alloc, id, connection, principal, false)).decision;
     }
 
-    pub fn probeSqlCommitDecision(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: []const u8) !SqlCommitProbe {
-        return self.lookupSqlCommitDecision(alloc, id, null, principal, true);
+    pub fn probeSqlCommitDecision(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: ?[32]u8, principal: []const u8) !SqlCommitProbe {
+        return self.lookupSqlCommitDecision(alloc, id, connection, principal, true);
     }
 
     const SqlCommitProbe = struct {
@@ -1852,8 +1858,15 @@ pub const DurableSessionStore = struct {
                         error.Unsupported, error.EndOfStream => break :probe,
                         else => return probe_err,
                     };
-                    const header = (try parseConnectionPrefix(bytes)) orelse try parseSqlPrefix(bytes, sql_field);
+                    const bound = try parseConnectionPrefix(bytes);
+                    const header = bound orelse try parseSqlPrefix(bytes, sql_field);
                     if (header) |payload| {
+                        if (bound != null) {
+                            const expected = connection orelse return .{};
+                            var decoded: [16]u8 = undefined;
+                            _ = std.fmt.hexToBytes(&decoded, &expected) catch return .{};
+                            if (!std.mem.eql(u8, &decoded, payload[49..65])) return .{};
+                        } else if (connection != null) return .{};
                         if (payload[0] & 4 == 0) return .{};
                         if (bounded) {
                             var digest: [32]u8 = undefined;
@@ -12358,4 +12371,35 @@ test "distributed txn expiry scan counts malformed keys and resumes before a can
     defer alloc.free(third.ids);
     try std.testing.expectEqualSlices([16]u8, &.{id}, third.ids);
     try std.testing.expect(third.next_after == null);
+}
+
+test "distributed txn shared acknowledgement sweep reclaims retired observation issuers only" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/shared-observation-ack-sweep" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    const retirement = @import("completion_retirement.zig");
+    const id: [16]u8 = @splat(3);
+    const observed: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 7, 128, 0, 0, 0, 0, 0, 0, 1 };
+    var ordinary = observed;
+    ordinary[8] = 0;
+    const old_key = try completionReferenceKey(alloc, id, observed);
+    defer alloc.free(old_key);
+    const ordinary_key = try completionReferenceKey(alloc, id, ordinary);
+    defer alloc.free(ordinary_key);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try retirement.acknowledge(&write, alloc, DurableSessionStore.completion_retirement_root, observed, old_key);
+        try retirement.acknowledge(&write, alloc, DurableSessionStore.completion_retirement_root, ordinary, ordinary_key);
+        try write.commit();
+    }
+    // The old issuer has no local facade. The sweep does not need its outbox.
+    _ = try durable.reclaimLegacyObservationAcks(true);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(old_key));
+    try std.testing.expectEqualStrings(retirement.marker, try read.get(ordinary_key));
 }

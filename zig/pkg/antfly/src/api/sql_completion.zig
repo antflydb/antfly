@@ -610,8 +610,10 @@ pub fn ownerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     };
 }
 pub fn reclaimLegacyObservationAcks(server: *server_mod.ApiHttpServer) !bool {
-    if (server.txn_sessions.durable == null) return false;
-    return (try registrationStore(server)).reclaimLegacyObservationAcks();
+    const store = server.txn_sessions.durable orelse return false;
+    const shared = server.txn_sessions.durable_scope == .cluster_shared;
+    if (shared and !store.supportsSharedMutations()) return false;
+    return store.reclaimLegacyObservationAcks(shared);
 }
 
 pub fn retireSettledObservations(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize) !void {

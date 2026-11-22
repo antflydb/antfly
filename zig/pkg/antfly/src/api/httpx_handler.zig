@@ -6862,6 +6862,16 @@ pub const AntflyApiHandler = struct {
             return self.reportCommitDecision(txn_id, decision);
         }
 
+        fn replayConnectionCommit(self: *@This(), store: *transactions_api.DurableSessionStore, encoded: []const u8, connection: [32]u8, principal: []const u8) !bool {
+            const id = distributed_txn.parseTxnIdHex(encoded) catch return false;
+            const probe = try store.probeSqlCommitDecision(std.heap.page_allocator, id, connection, principal);
+            if (probe.decision) |decision| return self.reportCommitDecision(id, decision);
+            if (probe.payload == .none) return false;
+            var read = try self.adapter.server.acquireSqlExecution(false);
+            defer read.release();
+            return self.replayCommit(store, encoded, connection, principal);
+        }
+
         fn reportCommitDecision(self: *@This(), txn_id: [16]u8, decision: transactions_api.SqlStoredDecision) !bool {
             self.reportsCommitResult(txn_id);
             const disposition = decision.disposition;
@@ -6910,7 +6920,7 @@ pub const AntflyApiHandler = struct {
                     if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) {
                         if (self.prepared_mode != .statement or self.parameters.len != 0 or
                             !@import("../pgwire/session_commands.zig").isCommit(self.statement) or
-                            !try self.replayCommit(store, supplied, connection_id, resource_principal)) return error.SqlTransactionNotActive;
+                            !try self.replayConnectionCommit(store, supplied, connection_id, resource_principal)) return error.SqlTransactionNotActive;
                         return;
                     };
                     if (connection.state == .uncertain) {
@@ -6926,7 +6936,7 @@ pub const AntflyApiHandler = struct {
                     if (self.adapter.session_id) |supplied| {
                         if (self.prepared_mode != .statement or self.parameters.len != 0 or
                             !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlTransactionNotActive;
-                        if (!try self.replayCommit(store, supplied, connection_id, resource_principal))
+                        if (!try self.replayConnectionCommit(store, supplied, connection_id, resource_principal))
                             return error.SqlTransactionNotActive;
                         return;
                     }
@@ -7075,7 +7085,7 @@ pub const AntflyApiHandler = struct {
             if (compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
                 if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
                     const id = distributed_txn.parseTxnIdHex(supplied) catch return error.SqlTransactionNotActive;
-                    const probe = try store.probeSqlCommitDecision(std.heap.page_allocator, id, resource_principal);
+                    const probe = try store.probeSqlCommitDecision(std.heap.page_allocator, id, null, resource_principal);
                     if (probe.decision) |decision| {
                         _ = try self.reportCommitDecision(id, decision);
                         return;
