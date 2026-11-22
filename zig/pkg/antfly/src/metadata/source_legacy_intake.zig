@@ -51,8 +51,7 @@ pub fn find(a: std.mem.Allocator, txn: anytype, group: u64, table: u64, ordinal:
                 .legacy_gate => if (scope.source_ordinal == ordinal or same_definition) return scope,
                 .recovery => {
                     if (scope.source_ordinal != ordinal or !same_definition or
-                        scope.destination != .native or state.value.retired or !state.value.scope_fencing or !state.value.manifest_retention or
-                        (state.value.pending == null and state.value.artifact_control.?.current == null)) continue;
+                        scope.destination != .native or state.value.retired or !state.value.scope_fencing) continue;
                     if (found != null) return error.SourceBindingConflict;
                     found = scope;
                 },

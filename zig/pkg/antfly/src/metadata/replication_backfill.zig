@@ -1889,6 +1889,73 @@ pub const StreamingReplicationRunner = struct {
         };
     }
 
+    /// Poll one complete transaction against the scoped actor's durable
+    /// frontier. The provider may acknowledge the previous committed cut.
+    pub fn stageScopedStream(
+        self: *StreamingReplicationRunner,
+        service: anytype,
+        admission: @import("../api/source_destination_admission.zig").Admission,
+        table: metadata_table_manager.TableRecord,
+        status: metadata_table_manager.ReplicationSourceStatusRecord,
+        state: @import("source_control.zig").State,
+        context: @import("antfly_local_sources").api_operation.RequestContext,
+    ) !void {
+        const control = @import("source_control.zig");
+        const scope = state.scope orelse return error.SourceBindingConflict;
+        if (state.closing or state.retired or !phaseAllowsStreaming(status.phase)) return;
+        if (!std.meta.eql(scope.provider, try nativeSourceProviderBinding(status)))
+            return error.ReplicationCutoverAuthorityLost;
+        const accepted: ?[]const u8 = if (state.accepted.sequence != 0) state.accepted.checkpoint else null;
+        const resume_cut = accepted orelse checkpointForStreaming(status) orelse return error.ReplicationCutoverAuthorityLost;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var parsed = try parseReplicationSourceConfig(a, table.name, table.replication_sources_json, scope.source_ordinal, self.destination_authorizer);
+        defer parsed.deinit(a);
+        var dsn = try secrets.resolveReferenceWithGenerationOwned(a, self.secret_store, parsed.dsn);
+        defer dsn.deinit(a);
+        var provider = try self.registry.create(a, .{ .kind = .postgres, .dsn = try a.dupe(u8, dsn.value) });
+        defer provider.deinit(a);
+        try self.checkpointWork();
+        try callCheckCutoverAuthority(service, table.replication_sources_json, status);
+        var polled = try provider.pollChanges(a, .{
+            .table = try a.dupe(u8, parsed.postgres_table),
+            .slot_name = try a.dupe(u8, status.slot_name),
+            .publication_name = try a.dupe(u8, status.publication_name),
+            .filter_query_json = if (parsed.publication_filter_json) |value| try a.dupe(u8, value) else null,
+            .checkpoint = try a.dupe(u8, resume_cut),
+            .limit = self.batch_size,
+            .execution_deadline_ns = context.deadline_ns,
+            .expected_provider_identity = status.cutover_provider_identity,
+        });
+        defer polled.deinit(a);
+        try self.checkpointWork();
+        try callCheckCutoverAuthority(service, table.replication_sources_json, status);
+        var transactions: foreign_mod.ReplicationTransactions = .{ .changes = polled.changes };
+        const transaction = (try transactions.next()) orelse &.{};
+        const checkpoint = if (transaction.len != 0) transaction[transaction.len - 1].checkpoint else polled.checkpoint;
+        if (checkpoint.len == 0 or std.mem.eql(u8, checkpoint, resume_cut)) return;
+
+        var plan = source_effects.Plan.init(a, .{});
+        defer plan.deinit();
+        for (transaction) |change| _ = try compileReplicationChange(a, &plan, table.name, change, parsed);
+        const effects = try plan.finish();
+        const requests = try a.alloc(transaction_contract.TableCommitRequest, effects.len);
+        for (effects, requests) |effect, *request| request.* = .{
+            .table_name = effect.table_name,
+            .transforms = effect.transforms,
+            .deletes = effect.deletes,
+        };
+        const payload = try std.json.Stringify.valueAlloc(a, effects, .{});
+        try @import("../api/source_destination_completion.zig").stage(service, admission, a, scope, control.digest(table.replication_sources_json), .{
+            .batch_id = checkpoint,
+            .checkpoint = checkpoint,
+            .expected_checkpoint = accepted,
+            .payload_digest = control.digest(payload),
+            .accepted_at_ns = platform_time.realtimeNs(),
+        }, requests, context);
+    }
+
     fn applyExternal(self: *StreamingReplicationRunner, owner: ExternalStreamDestination, table: metadata_table_manager.TableRecord, source_ordinal: u32, status: ?metadata_table_manager.ReplicationSourceStatusRecord, previous: []const u8, checkpoint: []const u8, changes: []const foreign_mod.ReplicationChange) !void {
         const cutover = status orelse return error.UnsupportedReplicationRoute;
         if (cutover.cutover_authority_id == 0 or cutover.table_id != table.table_id or cutover.source_ordinal != source_ordinal) return error.UnsupportedReplicationRoute;
@@ -2269,7 +2336,7 @@ pub const StreamingReplicationCoordinator = struct {
                         summary.sources_skipped_destination_actor += 1;
                         if (comptime @hasDecl(Service, "recoverNativeReplicationSource")) {
                             const permit_deadline = (try self.runner.workDeadlineNs()) orelse quantum_deadline_ns;
-                            service.recoverNativeReplicationSource(self.alloc, table, @intCast(ordinal), @min(permit_deadline, quantum_deadline_ns)) catch |err| {
+                            service.recoverNativeReplicationSource(self.alloc, &self.runner, table, @intCast(ordinal), @min(permit_deadline, quantum_deadline_ns)) catch |err| {
                                 if (replicationErrorEndsRound(err)) return err;
                                 summary.sources_failed += 1;
                                 std.log.warn("metadata native source recovery deferred table={s} source={d} err={s}", .{ table.name, ordinal, @errorName(err) });
@@ -3668,6 +3735,26 @@ fn hashCutoverConfigBytes(hasher: *std.crypto.hash.sha2.Sha256, value: []const u
     std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .big);
     hasher.update(&encoded_len);
     hasher.update(value);
+}
+
+/// Bind scoped admission to the exact managed slot incarnation as well as
+/// the PostgreSQL instance. A new cutover on the same instance needs a handoff.
+pub fn nativeSourceProviderBinding(status: metadata_table_manager.ReplicationSourceStatusRecord) ![32]u8 {
+    if (status.cutover_intent_id == 0 or status.cutover_authority_id == 0 or
+        status.slot_name.len == 0 or status.publication_name.len == 0 or
+        std.meta.eql(status.cutover_provider_identity, empty_cutover_provider_identity))
+        return error.ReplicationCutoverAuthorityLost;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:scoped-postgres-provider:v1");
+    hash.update(&status.cutover_provider_identity);
+    hash.update(&status.cutover_config_fingerprint);
+    var epoch: [16]u8 = undefined;
+    std.mem.writeInt(u64, epoch[0..8], status.cutover_intent_id, .big);
+    std.mem.writeInt(u64, epoch[8..16], status.cutover_authority_id, .big);
+    hash.update(&epoch);
+    hashCutoverConfigBytes(&hash, status.slot_name);
+    hashCutoverConfigBytes(&hash, status.publication_name);
+    return hash.finalResult();
 }
 
 fn exactCutoverIntentOwnsConfig(
@@ -8315,6 +8402,29 @@ test "metadata replication stream applies configured update and derived delete t
     try std.testing.expect(std.mem.indexOf(u8, after_delete.json, "\"stale\":true") != null);
 }
 
+test "metadata replication stream scopes bind the exact managed cutover" {
+    const record: metadata_table_manager.ReplicationSourceStatusRecord = .{
+        .table_id = 1,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .slot_name = "slot_a",
+        .publication_name = "publication_a",
+        .cutover_intent_id = 1,
+        .cutover_authority_id = 2,
+        .cutover_config_fingerprint = @splat(3),
+        .cutover_provider_identity = @splat(4),
+    };
+    const binding = try nativeSourceProviderBinding(record);
+    var changed = record;
+    changed.cutover_authority_id += 1;
+    try std.testing.expect(!std.meta.eql(binding, try nativeSourceProviderBinding(changed)));
+    changed = record;
+    changed.slot_name = "slot_b";
+    try std.testing.expect(!std.meta.eql(binding, try nativeSourceProviderBinding(changed)));
+    changed.slot_name = "";
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, nativeSourceProviderBinding(changed));
+}
+
 test "metadata replication stream coordinator waits for snapshot completion and resumes checkpoints" {
     const alloc = std.testing.allocator;
 
@@ -8410,7 +8520,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
         pub fn legacyReplicationSourceIntakeAllowed(self: *@This(), _: u64, _: u32, _: [32]u8) !bool {
             return self.legacy_allowed;
         }
-        pub fn recoverNativeReplicationSource(self: *@This(), _: Allocator, table: metadata_table_manager.TableRecord, ordinal: u32, deadline_ns: ?u64) !void {
+        pub fn recoverNativeReplicationSource(self: *@This(), _: Allocator, _: *StreamingReplicationRunner, table: metadata_table_manager.TableRecord, ordinal: u32, deadline_ns: ?u64) !void {
             try std.testing.expect(!self.legacy_allowed);
             try std.testing.expectEqual(self.table.table_id, table.table_id);
             try std.testing.expectEqual(@as(u32, 0), ordinal);

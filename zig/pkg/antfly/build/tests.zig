@@ -399,6 +399,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "replication transactions group opaque checkpoints",
             "postgres libpq parser rejects truncate",
             "postgres libpq parser decodes pgoutput",
+            "postgres libpq poll resumes from durable checkpoint",
         },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

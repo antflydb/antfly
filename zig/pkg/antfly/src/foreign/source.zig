@@ -283,6 +283,7 @@ pub const ReplicationPollParams = struct {
     /// Never set this based only on a configured/provider-visible name.
     reclaim_exact_cutover_slot: bool = false,
     exact_cutover_intent: ?ExactCutoverIntent = null,
+    expected_provider_identity: ?ExactCutoverIntent.ProviderIdentity = null,
 
     pub fn deinit(self: *ReplicationPollParams, alloc: Allocator) void {
         alloc.free(self.table);

@@ -524,6 +524,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     var actor_state = try (source_control.Mutation{ .configure = actor_scope }).apply(actor_alloc, .{});
     actor_state = try (source_control.Mutation{ .bind_checkpoint = checkpoint_authority }).apply(actor_alloc, actor_state);
     actor_state = try (source_control.Mutation{ .enable_scope_fencing = {} }).apply(actor_alloc, actor_state);
+    const initialized_actor = actor_state;
     var actor_pending: source_control.Reservation = .{ .sequence = 1, .batch_id = "one", .checkpoint = "initial", .accepted_at_ns = 11, .payload_digest = @splat(35), .plan_digest = @splat(36), .transaction_id = admission.transaction_id, .destination = .native, .delivery_manifest = "{}" };
     const scope_ref = (try @import("../metadata/source_scope_binding.zig").reference(actor_state, 1, 1)).?;
     const actor_purpose = try actor_pending.inputFingerprint(actor_scope);
@@ -827,21 +828,43 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(.garbage, journal.state.artifact_control.?.current.?.phase);
     try std.testing.expectEqual(publications_before_bound + 2, fake.publishes);
 
+    const artifact_wire = @import("source_plan_operations.zig").wire;
+    const artifact_storage = local.storage_source_plan_storage;
     const ArtifactProbe = struct {
         cut: [32]u8,
         fences: usize = 0,
-        fn execute(ptr: *anyopaque, _: A, _: metadata.CatalogRouteFence, _: []const u8, input: @import("source_plan_operations.zig").wire.ControlRequest, _: Context) !@import("source_plan_operations.zig").wire.ControlReply {
+        begins: usize = 0,
+        allow_upload: bool = false,
+        store: artifact_storage.test_support.Txn = .{},
+
+        fn execute(ptr: *anyopaque, allocator: A, _: metadata.CatalogRouteFence, _: []const u8, input: artifact_wire.ControlRequest, _: Context) !artifact_wire.ControlReply {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expect(input.command.action == .fence);
-            self.fences += 1;
-            return error.SourceOutcomeUnresolved;
+            switch (input.command.action) {
+                .fence => self.fences += 1,
+                .begin => self.begins += 1,
+                else => if (!self.allow_upload) return error.TestUnexpectedResult,
+            }
+            if (!self.allow_upload) return error.SourceOutcomeUnresolved;
+            const index = std.mem.readInt(u64, self.cut[8..16], .little) + 1;
+            std.mem.writeInt(u64, self.cut[8..16], index, .little);
+            var decoded = try artifact_wire.native.fromCommand(allocator, input.command);
+            defer decoded.deinit();
+            const stored = try artifact_wire.control.apply(allocator, &self.store, decoded.request, self.cut);
+            return .{ .request_digest = try input.digest(allocator), .receipt = .{ .term = 1, .index = index }, .outcome = .{ .applied = stored } };
         }
-        fn observe(ptr: *anyopaque, _: A, _: metadata.CatalogRouteFence, _: []const u8, input: @import("source_plan_operations.zig").wire.ObserveRequest, _: Context) !@import("source_plan_operations.zig").wire.control.Observation {
+
+        fn observe(ptr: *anyopaque, allocator: A, _: metadata.CatalogRouteFence, _: []const u8, input: artifact_wire.ObserveRequest, _: Context) !artifact_wire.control.Observation {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return .{ .root = input.query.root, .cut = self.cut, .quota = .{}, .status = .{} };
+            return .{
+                .root = input.query.root,
+                .cut = self.cut,
+                .quota = try artifact_storage.readQuota(&self.store, input.query.root),
+                .status = if (input.query.spec) |spec| try artifact_storage.inspect(allocator, &self.store, input.query.root, spec) else null,
+            };
         }
     };
     var artifact_probe: ArtifactProbe = .{ .cut = artifact_cut };
+    defer artifact_probe.store.deinit();
     var reclaim_admission = actor_admission;
     reclaim_admission.artifacts.observations = .{ .ptr = &artifact_probe, .read_fn = ArtifactProbe.observe };
     reclaim_admission.artifacts.controls = .{ .ptr = &artifact_probe, .execute_fn = ArtifactProbe.execute };
@@ -851,6 +874,29 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(retirement_revision, journal.state.revision);
     try std.testing.expectEqual(@as(usize, 1), artifact_probe.fences);
     try std.testing.expectEqual(.garbage, journal.state.artifact_control.?.current.?.phase);
+
+    journal.state = initialized_actor;
+    journal.lose_reply = true;
+    const source_input: @import("../metadata/source_delivery.zig").Input = .{ .batch_id = "batch", .checkpoint = "lsn:1", .payload_digest = @splat(40), .accepted_at_ns = 50 };
+    const effects: []const @import("distributed_txn.zig").TableCommitRequest = &.{.{ .table_name = "docs", .deletes = &.{"z"} }};
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), source_input, effects, .{}));
+    try std.testing.expectEqual(@as(usize, 0), artifact_probe.begins);
+    const original = journal.state.pending.?;
+    var retry = source_input;
+    retry.accepted_at_ns = 99;
+    try std.testing.expectError(error.SourceOutcomeUnresolved, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), retry, effects, .{}));
+    try std.testing.expectEqual(@as(usize, 1), artifact_probe.begins);
+    try std.testing.expectEqual(original.identity(actor_scope), journal.state.pending.?.identity(actor_scope));
+    try std.testing.expectEqual(@as(u64, 0), journal.state.accepted.sequence);
+    retry.payload_digest[0] ^= 1;
+    try std.testing.expectError(error.SourcePayloadConflict, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), retry, effects, .{}));
+    try std.testing.expectEqual(@as(usize, 1), artifact_probe.begins);
+    artifact_probe.allow_upload = true;
+    try source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), source_input, effects, .{});
+    try std.testing.expectEqual(@as(usize, 2), artifact_probe.begins);
+    try std.testing.expectEqual(.sealed, journal.state.artifact_control.?.current.?.phase);
+    try std.testing.expectEqual(original.identity(actor_scope), journal.state.pending.?.identity(actor_scope));
+    try std.testing.expectEqual(@as(u64, 0), journal.state.accepted.sequence);
 
     fake.state.status = .aborted;
     fake.state.commit_version = 0;

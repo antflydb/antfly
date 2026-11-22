@@ -2300,13 +2300,37 @@ pub const Executor = struct {
         };
     }
 
+    fn logicalLsn(text: []const u8) !u64 {
+        const slash = std.mem.indexOfScalar(u8, text, '/') orelse return error.InvalidReplicationTransaction;
+        const high = std.fmt.parseInt(u32, text[0..slash], 16) catch return error.InvalidReplicationTransaction;
+        const low = std.fmt.parseInt(u32, text[slash + 1 ..], 16) catch return error.InvalidReplicationTransaction;
+        return (@as(u64, high) << 32) | low;
+    }
+
     fn pollChangesAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) !foreign_source.ReplicationPollResult {
         const slot_name = params.slot_name orelse return error.InvalidQueryRequest;
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
         std.log.info("postgres libpq poll begin table={s} slot={s}", .{ params.table, slot_name });
-        const conn = try self.connectCountedFresh(alloc, dsn, params.execution_deadline_ns);
-        defer self.closeCountedConnection(conn);
+        const verify_provider = params.expected_provider_identity != null;
+        const deadline_ns = params.execution_deadline_ns orelse if (verify_provider) platform_time.monotonicNs() +| 5 * std.time.ns_per_s else null;
+        // A qualified poll needs both SQL and replication sockets for identity
+        // verification. Reserve both together to keep the connection budget.
+        const permits: usize = if (verify_provider) 2 else 1;
+        try self.acquireGlobalConnectionPermits(permits, deadline_ns, null);
+        defer self.releaseGlobalConnections(permits);
+        const conn = if (deadline_ns != null)
+            try self.connectFreshWithDeadline(dsn, deadline_ns, null)
+        else
+            (try self.connectFresh(alloc, dsn)) orelse return error.ForeignConnectionFailed;
+        defer self.pqfinish(conn);
         std.log.info("postgres libpq poll connected table={s} slot={s}", .{ params.table, slot_name });
+        if (params.expected_provider_identity) |expected| {
+            const deadline = deadline_ns.?;
+            const replication = try self.connectReplicationFreshWithDeadline(alloc, dsn, deadline);
+            defer self.pqfinish(replication);
+            const actual = try self.identifyExactCutoverProvider(alloc, conn, replication, deadline);
+            if (!std.meta.eql(expected, actual)) return error.ReplicationCutoverAuthorityLost;
+        }
         var observed_checkpoint: ?[]u8 = null;
         errdefer if (observed_checkpoint) |value| alloc.free(value);
         try self.ensurePublicationAlloc(
@@ -2316,33 +2340,36 @@ pub const Executor = struct {
             publication_name,
             params.table,
             params.filter_query_json,
-            params.execution_deadline_ns,
+            deadline_ns,
         );
         if (params.checkpoint) |checkpoint| {
-            if (checkpoint.len > 0 and !try self.logicalReplicationSlotExistsAlloc(
-                alloc,
-                conn,
-                slot_name,
-                params.execution_deadline_ns,
-            )) {
-                return error.ForeignReplicationSlotMissing;
-            }
             if (checkpoint.len > 0) {
+                if (params.expected_provider_identity != null) {
+                    const confirmed = try self.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline_ns);
+                    defer alloc.free(confirmed);
+                    if (confirmed.len == 0) return error.ForeignReplicationSlotMissing;
+                    if (try logicalLsn(confirmed) > try logicalLsn(checkpoint))
+                        return error.ReplicationCutoverAuthorityLost;
+                } else if (!try self.logicalReplicationSlotExistsAlloc(alloc, conn, slot_name, deadline_ns)) {
+                    return error.ForeignReplicationSlotMissing;
+                }
                 const advanced_checkpoint = try self.advanceLogicalReplicationSlotCheckpointAlloc(
                     alloc,
                     conn,
                     slot_name,
                     checkpoint,
-                    params.execution_deadline_ns,
+                    deadline_ns,
                 );
                 observed_checkpoint = advanced_checkpoint;
+                if (params.expected_provider_identity != null and try logicalLsn(checkpoint) != try logicalLsn(advanced_checkpoint))
+                    return error.ReplicationCutoverAuthorityLost;
             }
         } else {
             _ = try self.ensureLogicalReplicationSlotAlloc(
                 alloc,
                 conn,
                 slot_name,
-                params.execution_deadline_ns,
+                deadline_ns,
             );
         }
 
@@ -2364,7 +2391,7 @@ pub const Executor = struct {
             conn,
             alloc,
             prepared,
-            params.execution_deadline_ns,
+            deadline_ns,
             null,
         );
         defer self.pqclear(result);
@@ -7070,6 +7097,21 @@ test "postgres libpq poll resumes from durable checkpoint across multiple transa
         .limit = 16,
     };
     defer second_poll_params.deinit(alloc);
+    const deadline = platform_time.monotonicNs() +| 10 * std.time.ns_per_s;
+    const replication = try executor.connectReplicationFreshWithDeadline(alloc, dsn, deadline);
+    defer executor.pqfinish(replication);
+    const identity = try executor.identifyExactCutoverProvider(alloc, conn, replication, deadline);
+    var wrong_identity = identity;
+    wrong_identity[0] ^= 1;
+    const before_rejection = try executor.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+    defer alloc.free(before_rejection);
+    second_poll_params.expected_provider_identity = wrong_identity;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.pollChangesAlloc(alloc, dsn, second_poll_params));
+    const after_rejection = try executor.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+    defer alloc.free(after_rejection);
+    try std.testing.expectEqualStrings(before_rejection, after_rejection);
+    second_poll_params.expected_provider_identity = identity;
+
     var second_poll = try executor.pollChangesAlloc(alloc, dsn, second_poll_params);
     defer second_poll.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), second_poll.changes.len);
@@ -7078,6 +7120,8 @@ test "postgres libpq poll resumes from durable checkpoint across multiple transa
     try std.testing.expectEqualStrings("platinum", second_poll.changes[0].row.?.object.get("tier").?.string);
     try std.testing.expect(second_poll.checkpoint.len > 0);
     try std.testing.expectEqualStrings(second_poll.changes[0].checkpoint, second_poll.checkpoint);
+    first_poll_params.expected_provider_identity = identity;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.pollChangesAlloc(alloc, dsn, first_poll_params));
 }
 
 test "postgres libpq module compiles" {

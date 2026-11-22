@@ -154,3 +154,123 @@ fn mutate(svc: anytype, a: std.mem.Allocator, scope: source.Scope, catalog_diges
         .mutation = mutation,
     }, context);
 }
+
+/// Persist an exact native plan before uploading its bytes. A replay of the
+/// provider batch can finish an interrupted upload with the original identity.
+pub fn stage(
+    svc: anytype,
+    admission: @import("source_destination_admission.zig").Admission,
+    a: std.mem.Allocator,
+    binding: source.Scope,
+    catalog_digest: source.Digest,
+    input: @import("../metadata/source_delivery.zig").Input,
+    tables: []const @import("distributed_txn.zig").TableCommitRequest,
+    context: Context,
+) !void {
+    const raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
+    defer a.free(raw);
+    var state = try source.parse(a, raw);
+    defer state.deinit();
+    const current = state.value;
+    if (!current.scope_fencing or current.closing or current.retired or
+        !std.meta.eql(current.scope, @as(?source.Scope, binding))) return error.SourceBindingConflict;
+    const authority = current.checkpoint_authority orelse return error.SourceBindingConflict;
+    const ledger = current.artifact_control orelse return error.SourceBindingConflict;
+    const previous: ?[]const u8 = if (current.accepted.sequence == 0) null else current.accepted.checkpoint;
+    if ((previous == null) != (input.expected_checkpoint == null)) return error.SourceCheckpointConflict;
+    if (previous) |checkpoint| if (!std.mem.eql(u8, checkpoint, input.expected_checkpoint.?)) return error.SourceCheckpointConflict;
+
+    const sequence = std.math.add(u64, current.accepted.sequence, 1) catch return error.SourceReceiptExpired;
+    const accepted_at = if (current.pending) |pending| pending.accepted_at_ns else input.accepted_at_ns;
+    const logical: source.LogicalInput = .{
+        .source_sequence = sequence,
+        .batch_id = input.batch_id,
+        .checkpoint = input.checkpoint,
+        .expected_checkpoint = previous,
+        .payload_digest = input.payload_digest,
+        .accepted_at_ns = accepted_at,
+    };
+    const purpose = try source.inputFingerprint(binding, logical);
+    const token = if (current.pending) |pending|
+        (pending.artifact orelse return error.UnsupportedOperation).token()
+    else
+        std.math.add(u64, ledger.next_token, 1) catch return error.SourceReceiptExpired;
+    const scoped = (try @import("../metadata/source_scope_binding.zig").reference(current, sequence, token)) orelse return error.SourceBindingConflict;
+    var txn_id = purpose[0..16].*;
+    if (std.mem.allEqual(u8, &txn_id, 0)) txn_id[15] = 1;
+    if (current.pending) |pending| {
+        if (!std.meta.eql(try pending.inputFingerprint(binding), purpose) or !std.meta.eql(pending.transaction_id, txn_id))
+            return error.SourcePayloadConflict;
+        const record = ledger.current orelse return error.SourcePendingWork;
+        switch (record.phase) {
+            .reserved => {},
+            .sealed => return,
+            else => return error.SourcePendingWork,
+        }
+    } else if (ledger.current != null or current.outstanding.len != 0) return error.SourcePendingWork;
+
+    const checkpoint: @import("antfly_local_sources").storage_source_checkpoint.Command = .{
+        .binding = binding.identity(),
+        .purpose = purpose,
+        .sequence = sequence,
+        .checkpoint = input.checkpoint,
+        .expected_checkpoint = previous,
+        .accepted_at_ns = accepted_at,
+        .receipt_window = 1,
+    };
+    var prepared = try @import("distributed_txn.zig").prepareSourceCommit(a, admission.coordinator, txn_id, accepted_at, tables, .{
+        .authority = authority,
+        .reference = scoped,
+        .checkpoint = checkpoint,
+    }, context);
+    defer prepared.deinit();
+    const route = prepared.routes[prepared.coordinator_index];
+    if (current.pending) |pending| {
+        const record = ledger.current.?;
+        var original = try @import("source_destination_admission.zig").Grant.init(a, binding, pending, record);
+        defer original.deinit();
+        const bytes = try prepared.plan.encodeFrozen(a);
+        defer a.free(bytes);
+        const transfer = try original.manifest.value.transfer(route.fence, admission.artifacts);
+        const stamp = try transfer.seal(a, record, bytes, context);
+        return mutate(svc, a, binding, catalog_digest, current, .{ .seal_artifact = .{ .reservation_digest = record.reservation, .stamp = stamp } }, context);
+    }
+
+    const quota = try admission.artifacts.observations.read(a, route.fence, authority.table_name, .{
+        .version = 1,
+        .source_owner = route.owner,
+        .query = .{ .root = try @import("../data/source_plan_entry.zig").rootFor(route.owner), .minimum_applied_index = 1 },
+    }, context);
+    const commit_version = std.math.add(u64, accepted_at, 1) catch return error.InvalidTxnRecord;
+    var frozen = try @import("source_destination_plan.zig").Frozen.init(a, &prepared.plan, authority, quota, commit_version);
+    defer frozen.deinit();
+    const plan = try frozen.manifest.deliveryPlan(a, frozen.encoded_manifest);
+    try mutate(svc, a, binding, catalog_digest, current, .{ .reserve = .{
+        .sequence = sequence,
+        .batch_id = input.batch_id,
+        .checkpoint = input.checkpoint,
+        .expected_checkpoint = previous,
+        .accepted_at_ns = accepted_at,
+        .payload_digest = input.payload_digest,
+        .plan_digest = plan.digest,
+        .transaction_id = txn_id,
+        .destination = .native,
+        .delivery_manifest = plan.manifest,
+        .artifact = plan.artifact,
+        .retain_manifest = true,
+    } }, context);
+
+    const reserved_raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
+    defer a.free(reserved_raw);
+    var reserved = try source.parse(a, reserved_raw);
+    defer reserved.deinit();
+    if (reserved.value.closing or reserved.value.retired or
+        !std.meta.eql(reserved.value.scope, @as(?source.Scope, binding))) return error.SourceBindingConflict;
+    const pending = reserved.value.pending orelse return error.SourceOutcomeUnresolved;
+    const record = reserved.value.artifact_control.?.current orelse return error.SourceOutcomeUnresolved;
+    if (!std.meta.eql(pending.plan_digest, plan.digest) or !std.meta.eql(record.reservation, pending.identity(binding)))
+        return error.SourceTransactionIdentityConflict;
+    const transfer = try frozen.manifest.transfer(route.fence, admission.artifacts);
+    const stamp = try transfer.seal(a, record, frozen.bytes, context);
+    try mutate(svc, a, binding, catalog_digest, reserved.value, .{ .seal_artifact = .{ .reservation_digest = record.reservation, .stamp = stamp } }, context);
+}

@@ -10806,7 +10806,7 @@ pub const MetadataHttpService = struct {
         return store.legacyReplicationSourceIntakeAllowed(self.alloc, self.metadata_group_id, table_id, ordinal, definition);
     }
 
-    pub fn recoverNativeReplicationSource(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, ordinal: u32, deadline_ns: ?u64) !void {
+    pub fn recoverNativeReplicationSource(self: *MetadataHttpService, a: std.mem.Allocator, runner: *metadata_replication_backfill.StreamingReplicationRunner, table: metadata_table_manager.TableRecord, ordinal: u32, deadline_ns: ?u64) !void {
         try ensureCdcWorkPermit(self);
         const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
         try self.ensureLinearizableReadWithContext(context);
@@ -10823,8 +10823,27 @@ pub const MetadataHttpService = struct {
             .secret = self.internal_service_secret,
             .issuer = self.internal_service_issuer,
         };
+        const raw = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
+        defer a.free(raw);
+        var state = try control.parse(a, raw);
+        defer state.deinit();
+        if (!std.meta.eql(state.value.scope, @as(?control.Scope, scope)) or state.value.retired or !state.value.scope_fencing)
+            return error.SourceBindingConflict;
+        const admission = hosted.sourceAdmission();
+        if (state.value.artifact_control.?.current) |record| {
+            try ensureCdcWorkPermit(self);
+            try @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), context);
+            if (record.phase != .reserved or state.value.closing) return;
+            const after = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
+            defer a.free(after);
+            var latest = try control.parse(a, after);
+            defer latest.deinit();
+            if (latest.value.revision != state.value.revision) return;
+        } else if (state.value.pending != null or state.value.outstanding.len != 0 or state.value.closing) return;
+        const source_status = (try store.getReplicationSourceStatus(a, self.metadata_group_id, scope.table_id, ordinal)) orelse return;
+        defer metadata_table_manager.freeReplicationSourceStatus(a, source_status);
         try ensureCdcWorkPermit(self);
-        try @import("../api/source_destination_completion.zig").recover(self, hosted.sourceAdmission(), a, scope, control.digest(table.replication_sources_json), context);
+        try runner.stageScopedStream(self, admission, table, source_status, state.value, context);
     }
 
     pub fn replicationSourceAuthorityCurrent(

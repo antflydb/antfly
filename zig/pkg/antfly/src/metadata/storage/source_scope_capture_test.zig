@@ -93,7 +93,7 @@ pub fn run(a: A) !void {
     var attempt: [16]u8 = @splat(6);
     std.mem.writeInt(u64, attempt[0..8], 1, .big);
     const pending: control.Reservation = .{ .sequence = 1, .batch_id = "original", .checkpoint = "one", .accepted_at_ns = 10, .payload_digest = @splat(7), .plan_digest = @splat(8), .transaction_id = @splat(9), .destination = .native, .delivery_manifest = "original", .retain_manifest = true, .artifact = .{ .namespace = @splat(10), .binding = source.identity(), .domain = control.artifact_control.domainFor(source.identity()), .attempt = attempt, .bytes = 128, .checksum = @splat(11), .plan_digest = @splat(12) } };
-    try std.testing.expectEqual(null, try store.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition));
+    try std.testing.expectEqualDeep(@as(?control.Scope, source), try store.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition));
     try driver.mutate(.{ .reserve = pending });
     try std.testing.expectEqualDeep(@as(?control.Scope, source), try store.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition));
     try std.testing.expectEqual(null, try store.nativeSourceRecoveryScope(a, group, source.table_id, 0, @splat(99)));
