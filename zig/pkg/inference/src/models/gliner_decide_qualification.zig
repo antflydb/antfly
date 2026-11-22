@@ -307,7 +307,13 @@ pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize
     if (variant == .decide_deberta and backend != .cuda) return;
     if (variant == .decide_deberta_q8) {
         if (backend != .cuda) return error.UnsupportedGlinerDecisionBackend;
-    } else if (variant == .decide_1b and backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
+    } else if (variant == .decide_1b) {
+        switch (backend) {
+            .native, .metal => {},
+            .cuda => if (!identity.inventory.all_f32) return error.UnsupportedGlinerDecisionBackend,
+            else => return error.UnsupportedGlinerDecisionBackend,
+        }
+    }
     const limits = if (variant == .decide_deberta) legacy_cuda_limits else (try requestLimits(identity)).?;
     if ((backend == .cuda and variant != .decide_1b and sequences != items) or items == 0 or items > limits.request_items or sequences == 0 or sequences > limits.prepared_sequences or tokens == 0 or tokens > limits.sequence_tokens)
         return error.UnsupportedGlinerDecisionGeometry;
@@ -490,6 +496,15 @@ test "Decide marker context and PJRT profiles do not broaden span or quantized q
     const identity = pinned_fp32_identity;
     try std.testing.expectEqual(@as(?u32, 7999), decisionSequenceLimit(identity, .cuda));
     try std.testing.expectEqual(@as(usize, 1024), (try requestLimits(identity)).?.sequence_tokens);
+    try requireRequestIdentity(identity, .cuda, 1, 64, 1024);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 2, 2, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 65, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 1, 1025));
+    var quantized = identity;
+    quantized.inventory.all_f32 = false;
+    quantized.weight = digestFromPin(decide_1b_q8_encoder);
+    quantized.weight_companion = digestFromPin(decide_1b_q8_head);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequestIdentity(quantized, .cuda, 1, 1, 64));
     for ([_]Backend{ .pjrt_cpu_f32, .pjrt_cuda_f32 }) |backend| {
         try requireRequestIdentity(identity, backend, 1, 64, 1024);
         try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, backend, 2, 2, 64));

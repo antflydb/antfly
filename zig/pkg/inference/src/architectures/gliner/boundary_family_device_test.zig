@@ -656,13 +656,14 @@ test "GLiNER2.5 multilingual Decide public wire capture Metal resident parity" {
 }
 
 // Each capture keeps its own artifact, token, logit and decoded-output pins.
-// These offline checks gather CUDA evidence without relaxing serving policy.
-test "GLiNER2.5 multilingual v1 frozen CUDA family profiles" {
-    try deviceParity(pipeline.multilingual_family_checkpoints[0], .cuda);
-    try deviceParity(pipeline.multilingual_endpoint_checkpoints[0], .cuda);
-    try deviceParity(pipeline.multilingual_classification_floor_checkpoints[0], .cuda);
-    try deviceParity(pipeline.multilingual_general_classification_checkpoints[0], .cuda);
-    try deviceParity(pipeline.multilingual_general_entity_checkpoints[0], .cuda);
-    try deviceParity(pipeline.multilingual_clean_entity_short_checkpoints[0], .cuda);
-    try deviceParity(pipeline.multilingual_source_word_floor_checkpoints[0], .cuda);
+test "GLiNER2.5 multilingual frozen CUDA family profiles" {
+    inline for (0..pipeline.multilingual_family_checkpoints.len) |i| {
+        try deviceParity(pipeline.multilingual_family_checkpoints[i], .cuda);
+        try deviceParity(pipeline.multilingual_endpoint_checkpoints[i], .cuda);
+        try deviceParity(pipeline.multilingual_classification_floor_checkpoints[i], .cuda);
+        try deviceParity(pipeline.multilingual_general_classification_checkpoints[i], .cuda);
+        try deviceParity(pipeline.multilingual_general_entity_checkpoints[i], .cuda);
+        try deviceParity(pipeline.multilingual_clean_entity_short_checkpoints[i], .cuda);
+        try deviceParity(pipeline.multilingual_source_word_floor_checkpoints[i], .cuda);
+    }
 }

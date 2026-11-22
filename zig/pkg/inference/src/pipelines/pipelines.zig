@@ -123,7 +123,6 @@ test {
     _ = @import("generation.zig");
     _ = @import("chat_context.zig");
     _ = @import("encoder_decoder.zig");
-    _ = @import("seq2seq_decode.zig");
     _ = @import("rewriting.zig");
     _ = @import("rebel.zig");
     _ = @import("reading.zig");

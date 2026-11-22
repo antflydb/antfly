@@ -86,8 +86,6 @@ pub const EncoderDecoderPipeline = struct {
         // Independently owned resource domains need explicit multi-domain
         // scheduling, not an invented credit between unrelated controllers.
         if (enc.controller != dec.controller or enc.backend_class != dec.backend_class) return false;
-        const mul = std.math.mul;
-        const add = std.math.add;
         const input_shape = [_]i64{ @intCast(count), std.math.cast(i64, width) orelse return error.ResourceLimitExceeded };
         var enc_request = try self.encoder.planShapes(&.{
             .{ .name = "input_ids", .dtype = .i64, .shape = &input_shape },
@@ -106,18 +104,7 @@ pub const EncoderDecoderPipeline = struct {
         enc_request.host_preprocess_bytes = enc_request.input_bytes;
         dec_request.host_preprocess_bytes = dec_request.input_bytes;
         const enc_peak = try enc.estimateRequest(enc_request, self.encoder.outputInfo());
-        const incremental = @import("seq2seq_decode.zig");
-        const cache_bytes = if (incremental.qualified(self.decoder)) try incremental.cacheBound(self.decoder, count, self.config.max_length, width) else 0;
-        if (cache_bytes > 0) {
-            dec_request.input_bytes = try add(usize, dec_request.input_bytes, cache_bytes);
-            dec_request.output_kv_bytes = cache_bytes;
-            dec_request.output_bytes = try add(usize, cache_bytes, try mul(usize, count, try add(usize, try mul(usize, self.config.vocab_size, 4), 24)));
-        }
-        var dec_peak = try dec.estimateRequest(dec_request, self.decoder.outputInfo());
-        // Previous cache and replacement coexist. Classify retained input K/V
-        // against the KV ceiling without counting it twice against host memory.
-        dec_peak.host_scratch_bytes -= cache_bytes;
-        dec_peak.host_kv_bytes = try add(usize, dec_peak.host_kv_bytes, cache_bytes);
+        const dec_peak = try @import("../execution/seq2seq_runtime.zig").estimateAdmission(self.decoder, dec, dec_request, count, self.config.max_length, width, self.config.vocab_size);
         // The stage gate covers admission and packing as well as execution:
         // at most one physical workspace per session can be resident. Different
         // encoder/decoder gates may overlap, so retain both physical peaks.
@@ -206,7 +193,7 @@ pub const EncoderDecoderPipeline = struct {
                 try control.update(.executing, @intCast(step), @intCast(max_len));
             const dec_seq_len: usize = output_ids.items.len;
 
-            var row = numerical.step(dec_ids_i64[0..dec_seq_len], null, self.batch_dispatch) catch |err| switch (err) {
+            var row = numerical.step(dec_ids_i64[0..dec_seq_len], step, null, self.batch_dispatch) catch |err| switch (err) {
                 error.InvalidLogitsShape => return error.LogitsSizeMismatch,
                 else => return err,
             };

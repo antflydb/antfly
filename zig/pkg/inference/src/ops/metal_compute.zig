@@ -11444,7 +11444,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
-    const physical_storage_policy: ops.physical_storage.Policy = .{ .allocate = allocatePhysicalRequest, .reservation_bytes = physicalReservationRequest, .mark_admitted = markPhysicalStorageAdmittedOp };
+    const physical_storage_policy: ops.physical_storage.Policy = .{ .minimum_alignment = @alignOf(f32), .allocate = allocatePhysicalRequest, .reservation_bytes = physicalReservationRequest, .mark_admitted = markPhysicalStorageAdmittedOp };
     fn physicalReservationRequest(ctx: *anyopaque, request: ops.physical_storage.Request) anyerror!usize {
         if (request.usage == .ordinary) return physicalStorageReservationBytesOp(ctx, request.byte_size);
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -11597,6 +11597,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const original = &toBuf(lease.tensor).metal_tensor.?;
         try original.uploadBytes(std.mem.sliceAsBytes(input));
     }
+    fn gatherDeviceRowsOp(ctx: *anyopaque, output: CT, sources: []const CT) !void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const target = toBuf(output).metal_tensor orelse return error.InvalidPhysicalTransferSize;
+        if (target.dtype != .f32 or target.physicalLease() == null or target.isReadOnlyPhysical() or sources.len == 0 or sources.len > 8) return error.InvalidPhysicalTransferSize;
+        const destination = target.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
+        var spans: [8]metal_runtime_mod.BufferGatherSource = undefined;
+        var cursor = target.deviceByteOffset();
+        const end = try std.math.add(usize, cursor, target.deviceByteLen());
+        for (sources, spans[0..sources.len]) |source, *span| {
+            const value = toBuf(source).metal_tensor orelse return error.InvalidPhysicalTransferSize;
+            const device = value.deviceHandle() orelse return error.InvalidPhysicalTransferSize;
+            if (device == destination or value.dtype != .f32 or value.deviceByteLen() == 0 or value.deviceByteLen() > end - cursor) return error.InvalidPhysicalTransferSize;
+            span.* = .{ .device = device, .source_offset = value.deviceByteOffset(), .destination_offset = cursor, .length = value.deviceByteLen() };
+            cursor += span.length;
+        }
+        if (cursor != end) return error.InvalidPhysicalTransferSize;
+        if (metal_runtime_mod.termite_metal_buffer_gather(self.provider_impl.raw_decode_runtime, destination, &spans, sources.len) != 0) return error.MetalBufferCopyFailed;
+        for (spans[0..sources.len]) |span| @import("../execution/transfer_audit.zig").deviceCopy(span.length);
+    }
+
     fn copyPhysicalInputOp(_: *anyopaque, destination: CT, source: CT) anyerror!void {
         const target = &toBuf(destination).metal_tensor.?;
         const input = toBuf(source).metal_tensor orelse return error.InvalidPhysicalTransferSize;
@@ -11697,7 +11717,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .context = ctx, .implementation = request.implementation, .requirements = request.requirements, .slot = request.slot, .index_bounds = request.index_bounds, .vtable = &host_input_table };
     }
 
-    const owned_payload_services: @import("kernel_backend.zig").OwnedPayloadServices = .{ .accepts = acceptsPhysicalImplementation, .available = ownedPayloadAvailable, .input = ownedPayloadInput, .route = ownedPayloadRoute };
+    const owned_payload_services: @import("kernel_backend.zig").OwnedPayloadServices = .{ .accepts = acceptsPhysicalImplementation, .available = ownedPayloadAvailable, .input = ownedPayloadInput, .route = ownedPayloadRoute, .region = ownedPayloadRegion };
+    fn ownedPayloadRegion(ctx: *anyopaque, owned: *const @import("../execution/region_route.zig").Owned) bool {
+        if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table) or
+            owned.vtable != &DenseProjectionRegion.table) return false;
+        const self: *const DenseProjectionRegion = @ptrCast(@alignCast(owned.context));
+        if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or self.count < 2 or self.count > 3 or
+            owned.entry_node != self.nodes[0]) return false;
+        const need = owned.requirements;
+        if (need.dispatch_workspace.byte_size != self.scratch_bytes or need.dispatch_workspace.host_byte_size != 0 or
+            need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0) return false;
+        if (owned.covered_nodes.ptr != &self.nodes or owned.covered_nodes.len < self.count or owned.covered_nodes.len > self.nodes.len or
+            owned.input_nodes.ptr != &self.inputs or owned.input_nodes.len != self.count + 1 or
+            need.outputs.ptr != &self.outputs or need.outputs.len != self.count) return false;
+        const pack_request = self.packed_request orelse return owned.policy_key == 1 and self.scratch_bytes == 0 and owned.covered_nodes.len == self.count;
+        if (owned.policy_key != 2 or self.scratch_bytes == 0 or need.dispatch_workspace.alignment != @alignOf(f32) or pack_request.count != self.count) return false;
+        const scope = self.compute.packed_projection_profile orelse return false;
+        const current = scope.packed_request orelse return false;
+        if (!std.meta.eql(pack_request, current) or scope.packed_owner == null or !scope.matchesScope()) return false;
+        const linear: *PreparedDenseLinear = @ptrCast(@alignCast(self.linears[0].context));
+        const layout = pack_request.layout() catch return false;
+        return (layout.outputBytes(linear.descriptor.operation.linear.rows) catch return false) == self.scratch_bytes;
+    }
     fn ownedPayloadAvailable(ctx: *anyopaque) bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         // The provider/runtime link is initialization-owned, never a read of
@@ -11706,6 +11747,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
     fn ownedPayloadInput(ctx: *anyopaque, binding: @import("../execution/kernel_route.zig").Binding, logical: @import("ml").graph.Shape) !bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (binding == .resident) {
+            const resident = binding.resident;
+            if (resident.implementation.context != ctx or !acceptsPhysicalImplementation(resident.implementation.table) or
+                !resident.logical.eq(logical) or logical.dtype != .f32 or resident.planes.len != 1) return false;
+            const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+            const primary = resident.planes[0];
+            const backing = primary.backing orelse return false;
+            const count = logical.numElements() orelse return false;
+            if (count <= 0) return false;
+            const bytes = std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch return false;
+            const desc = primary.descriptor;
+            return primary.role == .primary and desc.shape.eq(logical) and desc.storage == .metal_buffer and
+                desc.current_backend == .metal and desc.resident_backend == .metal and desc.device_id == 0 and
+                desc.quant_format == null and desc.view_source == null and primary.byte_offset == 0 and
+                primary.logical_bytes == bytes and primary.readable_bytes == bytes and
+                backing.kind == .metal and backing.context == @as(*anyopaque, @ptrCast(runtime)) and backing.base != 0;
+        }
         const known = switch (binding) {
             .tensor => |value| value,
             else => return false,
@@ -11815,6 +11873,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// reshape constructor deliberately creates a NEW semantic value identity;
     /// model preparation instead retains this SAME value/version and SDK root.
     /// No host payload, conversion, slot preparation or upload is born here.
+    fn retainableCacheOutput(ctx: *anyopaque, value: CT) ?*const MetalTensor {
+        const source = toBuf(value);
+        if (source.resident_owner != ctx or source.integer_storage or source.lazy_multiply != null or
+            source.mutable_state or bufHasAnyQuantizedStorage(source) or hasHostView(source) or
+            source.logical_view_strides != null or source.view_base_offset != 0 or
+            source.native_dense_bytes != null or source.resident_index_storage != null) return null;
+        return if (source.metal_tensor) |*tensor| tensor else null;
+    }
+
+    fn standaloneOutputBytesOp(ctx: *anyopaque, value: CT) ?usize {
+        const tensor = retainableCacheOutput(ctx, value) orelse return null;
+        return tensor.standaloneOutputBytes();
+    }
+
+    fn pooledOutputStorageOp(ctx: *anyopaque, value: CT) ?*const ops.physical_storage.Lease {
+        const tensor = retainableCacheOutput(ctx, value) orelse return null;
+        if (tensor.deviceByteOffset() != 0 or tensor.deviceHandle() == null) return null;
+        return tensor.physicalLease();
+    }
+
     fn retainImmutableTensorOp(ctx: *anyopaque, value: CT) !?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const source = toBuf(value);
@@ -11918,14 +11996,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (!committed) direct.deinit();
             const owner = try request.allocator.create(PreparedDenseLinear);
             defer if (!committed) request.allocator.destroy(owner);
-            const payload = compute.provider_impl.pinLinearSlotForPersistentUse(slot) catch |err| switch (err) {
+            const index_held = compute.ownsMetadataIndex();
+            const payload = (if (index_held)
+                compute.provider_impl.pinLinearSlotForPersistentUseWithIndexHeld(slot)
+            else
+                compute.provider_impl.pinLinearSlotForPersistentUse(slot)) catch |err| switch (err) {
                 error.QueueFull, error.PreparedSlotUnavailable => return null,
                 else => return err,
             };
             defer if (!committed) if (payload) |pin| pin.release();
             const epoch = compute.provider_impl.privateSlotDeclaration(.linear, slot);
             const declaration = (if (payload) |pin|
-                compute.provider_impl.pinCachedLinearDeclaration(slot, epoch, pin)
+                (if (index_held)
+                    compute.provider_impl.pinCachedLinearDeclarationWithIndexHeld(slot, epoch, pin)
+                else
+                    compute.provider_impl.pinCachedLinearDeclaration(slot, epoch, pin))
             else
                 compute.provider_impl.pinPrivateLinearDeclaration(slot, epoch)) catch |err| switch (err) {
                 error.QueueFull, error.PreparedSlotUnavailable, error.ForeignPreparedSlotOwner => return null,
@@ -12390,7 +12475,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         owner.packed_request = expected;
         owner.scratch_bytes = try (try expected.layout()).outputBytes(semantic.linears[0].operation.linear.rows);
         const items = try request.allocator.alloc(region.Owned, 1);
-        items[0] = .{ .context = owner, .implementation = request.implementation, .key = entry, .policy_key = 2, .covered_nodes = owner.nodes[0..covered_count], .input_nodes = owner.inputs[0 .. owner.count + 1], .entry_node = entry, .requirements = .{ .outputs = owner.outputs[0..owner.count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table };
+        items[0] = .{ .context = owner, .implementation = request.implementation, .key = entry, .policy_key = 2, .covered_nodes = owner.nodes[0..covered_count], .input_nodes = owner.inputs[0 .. owner.count + 1], .entry_node = entry, .requirements = .{ .outputs = owner.outputs[0..owner.count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes, .alignment = @alignOf(f32) }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table };
         transferred = true;
         return .{ .allocator = request.allocator, .items = items };
     }
@@ -17167,6 +17252,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn negateOp(ctx: *anyopaque, a: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (toBuf(a).integer_storage) {
+            const dtype: ops.GraphDType = switch (try tensorDTypeOp(ctx, a)) {
+                inline .i8, .i16, .i32, .i64 => |tag| @field(ops.GraphDType, @tagName(tag)),
+                else => return error.UnsupportedTensorType,
+            };
+            const zero_bits: [8]u8 = @splat(0);
+            const zero = (try fromConstantBytesOp(ctx, zero_bits[0..dtype.byteSize()], dtype, &.{})) orelse return error.UnsupportedTensorType;
+            defer self.computeBackend().free(zero);
+            return self.integerBinary(zero, a, 1);
+        }
         if (try self.tryFlatDeviceUnaryRuntimeOp(a, .negate)) |device_result| return device_result;
         return self.hostFallbackUnary(a, null, .negate);
     }
@@ -18980,6 +19075,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         const rank = resolved_a.len;
 
+        if (kernel_geometry.ConcatAxis.emptyIdentity(resolved_a, resolved_b, axis_index)) |identity| {
+            const source = if (identity == .lhs) a_tensor else b_tensor;
+            const concrete = if (identity == .lhs) resolved_a else resolved_b;
+            var shape: [metal_tensor_mod.max_dims]i32 = undefined;
+            for (shape[0..rank], concrete) |*value, dim| value.* = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+            var retained = try source.retainedView(0, source.deviceByteLen(), shape[0..rank]);
+            errdefer self.retireTemporaryWorkspaceValue(&retained);
+            return try self.ctFromOwnedMetalTensor(retained);
+        }
+
         var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
         const geometry = kernel_geometry.ConcatAxis.init(resolved_a, resolved_b, axis_index, &out_shape) catch return null;
         const a_axis = geometry.a_axis;
@@ -19030,6 +19135,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) ?[]const i64 {
         if (declared_shape.len > scratch.len) return null;
         const elem_count = tensor.elemCount();
+        if (elem_count == 0) {
+            const actual = tensor.shape();
+            if (actual.len != declared_shape.len) return null;
+            var empty = false;
+            for (declared_shape, actual, 0..) |declared, dim, index| {
+                if (dim < 0 or (declared >= 0 and declared != dim)) return null;
+                scratch[index] = dim;
+                empty = empty or dim == 0;
+            }
+            return if (empty) scratch[0..actual.len] else null;
+        }
         if (resolveShapeFromDataLen(declared_shape, elem_count)) |resolved| {
             scratch.* = resolved;
             return scratch[0..declared_shape.len];
@@ -19977,7 +20093,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         },
                     );
                 }
-                if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and bufElemCount(weight_buf) == dim) {
+                if (input_metal.isDevice() and bufElemCount(weight_buf) == dim) {
                     var input_mt = try input_metal.retainedCopy();
                     defer self.retireTemporaryWorkspaceValue(&input_mt);
                     var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
@@ -21888,11 +22004,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.metadata_bytes += bytes;
         plan.host_bytes += bytes;
     }
+    const audio_schedule_bank_limit = 64 * 1024 * 1024;
+
     fn audioTryPrepare(self: *MetalCompute, plan: *audio_tape.Plan) !void {
         if (self.provider_impl.audio_schedule_clock < plan.retry_after) return;
         if (plan.prepared) {
-            if (plan.input_workspace_bytes != 0 or plan.input_workspace_wanted_bytes == 0 or plan.input_workspace_wanted_bytes > 64 * 1024 * 1024 or plan.workspaces.len != plan.count) return;
-            self.audioUpgradeInputWorkspace(plan) catch |err| {
+            const bytes = plan.arena_recipe.workspaceBytes(plan.workspaces.len, plan.count, audio_schedule_bank_limit);
+            if (plan.input_workspace_bytes != 0 or bytes == 0) return;
+            self.audioUpgradeInputWorkspace(plan, bytes) catch |err| {
                 plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
                 plan.retry_delay = @min(@as(u8, 64), plan.retry_delay *| 2);
                 switch (err) {
@@ -21913,25 +22032,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         plan.selection = .{};
         plan.retry_delay = 1;
-        if (plan.input_workspace_wanted_bytes != 0 and plan.input_workspace_bytes == 0) plan.retry_after = self.provider_impl.audio_schedule_clock + 1;
+        if (plan.arena_recipe.workspaceBytes(plan.workspaces.len, plan.count, audio_schedule_bank_limit) != 0 and plan.input_workspace_bytes == 0) plan.retry_after = self.provider_impl.audio_schedule_clock + 1;
     }
 
     /// A refused optional tail can recover without dropping the active output
     /// bank, resetting selection history or invalidating queued old commands.
     /// Stage every quota and view before publishing the complete scratch bank.
-    fn audioUpgradeInputWorkspace(self: *MetalCompute, plan: *audio_tape.Plan) !void {
+    fn audioUpgradeInputWorkspace(self: *MetalCompute, plan: *audio_tape.Plan, bytes: usize) !void {
         var views: [audio_tape.instruction_capacity]?CT = @splat(null);
         var staged = audio_tape.Plan{ .host_bytes = 0, .metadata_bytes = 0, .workspaces = views[0..plan.count] };
         errdefer self.audioUnpreparePlan(&staged);
-        const bank = (try self.audioPlanBuffer(&staged, plan.input_workspace_wanted_bytes, false)) orelse return error.AudioScheduleAdmission;
+        const bank = (try self.audioPlanBuffer(&staged, bytes, false)) orelse return error.AudioScheduleAdmission;
         staged.arena = self.audioPersistentCt(&staged, bank) catch |err| {
             var owned = bank;
             owned.deinit();
             return err;
         };
-        for (plan.nodes[0..plan.count], 0..) |node, i| if (node.inputWorkspaceShape()) |shape| {
-            const bytes = try std.math.mul(usize, try std.math.mul(usize, shape.rows, shape.width), @sizeOf(f32));
-            const view = try bank.retainedView(0, bytes, &.{ @intCast(shape.rows), @intCast(shape.width) });
+        for (plan.nodes[0..plan.count], 0..) |*node, i| if (try plan.arena_recipe.workspaceView(node, .separate)) |region| {
+            const view = try bank.retainedView(region.offset, region.bytes, &region.shape);
             views[i] = self.audioPersistentCt(&staged, view) catch |err| {
                 var owned = view;
                 owned.deinit();
@@ -21943,7 +22061,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         @memcpy(plan.workspaces, views[0..plan.count]);
         plan.input_workspace_bank = staged.arena;
         if (plan.drop_ct == null) plan.drop_ct = staged.drop_ct;
-        plan.input_workspace_bytes = plan.input_workspace_wanted_bytes;
+        plan.input_workspace_bytes = bytes;
         plan.host_bytes = host;
         plan.backend_bytes = backend;
         plan.retry_delay = 1;
@@ -21959,7 +22077,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.host_bytes = plan.metadata_bytes;
         plan.backend_bytes = 0;
         plan.arena_size = 0;
-        plan.input_workspace_wanted_bytes = 0;
+        plan.arena_recipe = .{};
         plan.drop_ct = null;
         plan.prepared = false;
         for (plan.constants[0..plan.constant_count]) |*c| c.required = true;
@@ -22072,12 +22190,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         const recipe = try plan.arenaLayout();
-        plan.input_workspace_wanted_bytes = recipe.input_workspace_bytes;
+        plan.arena_recipe = recipe;
         // Preserve the previous output-bank eligibility and admission fallback.
         // Optional clamp scratch must not evict an otherwise fitting bank.
-        if (recipe.outputs_bytes <= 64 * 1024 * 1024) {
-            var workspace_bytes = if (plan.workspaces.len == plan.count and recipe.input_workspace_bytes <= 64 * 1024 * 1024) recipe.input_workspace_bytes else 0;
-            var bytes = try std.math.add(usize, recipe.outputs_bytes, workspace_bytes);
+        if (recipe.outputs_bytes <= audio_schedule_bank_limit) {
+            var workspace_bytes = recipe.workspaceBytes(plan.workspaces.len, plan.count, audio_schedule_bank_limit);
+            var bytes = if (workspace_bytes != 0) recipe.total_bytes else recipe.outputs_bytes;
             var bank: ?MetalTensor = if (bytes != 0) try self.audioPlanBuffer(plan, bytes, false) else null;
             if (bank == null and workspace_bytes != 0) {
                 workspace_bytes = 0;
@@ -22092,19 +22210,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 };
                 plan.arena_size = bytes;
                 plan.input_workspace_bytes = workspace_bytes;
-                for (plan.nodes[0..plan.count], 0..) |node, i| if (node.arena_offset) |offset| {
+                for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.outputView(node)) |region| {
                     if (plan.outputs.len == 0 or plan.linear_only) continue;
-                    const d = node.outputDimensions().?;
-                    const view = try mt.retainedView(offset, d.rows * d.out_dim * 4, &.{ @intCast(d.rows), @intCast(d.out_dim) });
+                    const view = try mt.retainedView(region.offset, region.bytes, &region.shape);
                     plan.outputs[i] = self.audioPersistentCt(plan, view) catch |err| {
                         var owned = view;
                         owned.deinit();
                         return err;
                     };
                 };
-                if (workspace_bytes != 0) for (plan.nodes[0..plan.count], 0..) |node, i| if (node.inputWorkspaceShape()) |shape| {
-                    const needed = try std.math.mul(usize, try std.math.mul(usize, shape.rows, shape.width), @sizeOf(f32));
-                    const view = try mt.retainedView(recipe.outputs_bytes, needed, &.{ @intCast(shape.rows), @intCast(shape.width) });
+                if (workspace_bytes != 0) for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.workspaceView(node, .combined)) |region| {
+                    const view = try mt.retainedView(region.offset, region.bytes, &region.shape);
                     plan.workspaces[i] = self.audioPersistentCt(plan, view) catch |err| {
                         var owned = view;
                         owned.deinit();
@@ -22394,6 +22510,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
             plan.selection.record(replay, elapsed);
             if (replay) plan.replay_ns = elapsed else plan.eager_ns = elapsed;
+            @import("../execution/runtime_observation.zig").metalSerialWorkspace(replay, .{
+                .planned_output_bytes = plan.arena_recipe.outputs_bytes,
+                .planned_scratch_bytes = plan.arena_recipe.input_workspace_bytes,
+                .arena_backing_bytes = plan.arena_size,
+                .bound_scratch_bytes = plan.input_workspace_bytes,
+                .charged_backend_bytes = plan.backend_bytes,
+            });
             if (stats) std.debug.print("metal_audio_schedule replay={} replays={d} encode_ns={d} encoders={d} arena_bytes={d} input_workspace_bytes={d} backend_bytes={d}\n", .{ replay, plan.replays, elapsed, metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count -| before_encoders, plan.arena_size, plan.input_workspace_bytes, plan.backend_bytes });
             return out;
         }
@@ -40520,11 +40643,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn materializesOutputOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
-        // Contiguous Metal slices already return retained zero-copy views.
-        return descriptor.operation == .slice and supportsAssignedDescriptor(descriptor);
+        // Assigned last-dimension broadcasts write dense output, unlike
+        // the inferred affine view. Contiguous slices retain zero-copy views.
+        return (descriptor.operation == .slice or descriptor.operation == .broadcast) and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -50282,6 +50406,12 @@ test "metal_compute: resident scans and exact mixed integer comparisons" {
     };
     const ints = (try cb.fromInt32Shape(&.{ 16777217, -16777217, 2147483647, -2147483648 }, &.{4})) orelse return error.TestUnexpectedResult;
     defer cb.free(ints);
+    const negated = try cb.primNegate(ints);
+    defer cb.free(negated);
+    try std.testing.expect(MetalCompute.toBuf(negated).metal_tensor.?.isDevice());
+    const negated_bytes = (try cb.exportTensorData(negated, allocator)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(negated_bytes.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ -16777217, 16777217, -2147483647, -2147483648 }), negated_bytes.payload.bytes);
     const integer_scan = (try cb.tryCumulativeSum(ints, 0, false, false)) orelse return error.TestUnexpectedResult;
     defer cb.free(integer_scan);
     const integer_bytes = (try cb.exportTensorData(integer_scan, allocator)) orelse return error.TestUnexpectedResult;
@@ -51795,8 +51925,21 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
         try std.testing.expect(try cb.decoderRuntimeBeginFrame());
         defer cb.decoderRuntimeCancelFrame() catch {};
         var run = Run{ .cb = &cb };
+        var scope: @import("../execution/runtime_observation.zig").KernelScope = .{};
+        scope.begin();
+        defer if (scope.attached) {
+            _ = scope.finish();
+        };
         const result = (try cb.audioExecution(42, &.{ x, y }, &run, Run.call)) orelse try Run.call(&run, &.{ x, y });
         defer cb.free(result);
+        _ = scope.finish();
+        if (request >= 4) {
+            try std.testing.expect(scope.metal_serial_workspace != null);
+            const measured = scope.metal_serial_workspace.?;
+            try std.testing.expectEqual(@as(u64, 1), measured.successful_replays + measured.successful_eager_calls);
+            try std.testing.expect(measured.latest.arena_backing_bytes >= measured.latest.planned_output_bytes);
+            try std.testing.expect(measured.latest.charged_backend_bytes >= measured.latest.arena_backing_bytes);
+        }
         try cb.decoderRuntimeSubmitAndWaitFrame();
         const actual = try cb.toFloat32(result, a);
         defer a.free(actual);
@@ -55016,6 +55159,16 @@ const PreparedDenseRegionFixture = struct {
         const selected = (try pool.prepareRoutesWithProfile(&.{activation}, .select_regions, profile.profile)) orelse return error.MissingPreparedRoutes;
         defer selected.release();
         try std.testing.expectEqual(@as(usize, 1), selected.pool.regions.len);
+        try std.testing.expect(pool.metal_projection_region_candidate);
+        const coverage = selected.pool.completeOwnedPayload() orelse {
+            std.debug.print("Metal assigned row coverage: {any}\n", .{selected.pool.payload_coverage});
+            return error.MissingOwnedPayloadWitness;
+        };
+        try std.testing.expectEqual(.device, coverage.accounting_class);
+        try std.testing.expectEqual(expected.len, coverage.operations);
+        try selected.validateRuntimeInputs(inputs[0..parameter_count], &cb);
+        const wrong = [_]interpreter.RuntimeInput{.{ .node_id = nodes[0], .value = values[1], .source_backend = &cb }};
+        try std.testing.expectError(error.PreparedRegionBindingChanged, selected.validateRuntimeInputs(&wrong, &cb));
         // Raw execution cannot invent payload ownership after admission. Model
         // preparation obtains these claims before its quota handoff as well.
         try std.testing.expectError(error.PreparedRegionClaimRequired, executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_execution_profile = &profile, .output_placement = .producer, .activation_readbacks = .forbidden }));
@@ -55031,6 +55184,14 @@ const PreparedDenseRegionFixture = struct {
         try selected.validateWithClaims(&.{activation}, &claims);
         var result = try executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_claims = &claims, .region_execution_profile = &profile, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
         defer result.deinit(&executable.runtime);
+        if (profile.profile == .synchronous) {
+            try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_slots_reserved);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_bytes_reserved);
+            const regions = result.stats.assigned_regions orelse return error.MissingAssignedRegionObservation;
+            try std.testing.expectEqual(@as(usize, 1), regions.selected);
+            try std.testing.expectEqual(@as(u64, 1), regions.accepted_callbacks);
+            try std.testing.expectEqual(selected.pool.regions[0].owner.covered_nodes.len, regions.covered_callback_nodes);
+        }
         try std.testing.expect(claims.closed);
         // This counter increments at the real Frame.executeRegion seam, and
         // the synchronous executor returns before legacy node/fusion dispatch.

@@ -33,7 +33,6 @@ const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
-const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const tokenizer_mod = @import("inference_tokenizer");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
@@ -2043,14 +2042,6 @@ fn gemma4MtpActiveMaterializeEnabled() bool {
     return decoder_forward.activeMaterializationEnabled();
 }
 
-fn gemma4MtpActiveMaterializeSupported(
-    kind: ops.BackendKind,
-    config: gpt_mod.Config,
-    total_seq_len: usize,
-) bool {
-    return decoder_forward.activeMaterializationSupported(kind, config, total_seq_len);
-}
-
 fn gemma4MtpAcceptBonusDefault(kind: ops.BackendKind) bool {
     return kind != .metal;
 }
@@ -2086,10 +2077,6 @@ fn gemma4MtpDedicatedRuntimeEnabled() bool {
 
 fn gemma4MtpVerifyDeviceResultEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT", false);
-}
-
-fn gemma4MtpMaterializeReplayEnabled() bool {
-    return decoder_forward.materializationReplayEnabled();
 }
 
 /// Fold the correction/bonus materialize forward into the next verify: the
@@ -3678,25 +3665,15 @@ pub const NativeGenerationPipeline = struct {
         const max_tokens = requested_max_tokens;
         const spec_slack: usize = if (use_speculative and config.speculative_k > 0) 1 else 0;
         const max_seq = prompt_token_count + max_tokens + spec_slack;
-        // The server holds the model lock for this owner. Interleaved owners,
-        // compiled execution, speculation, shared prefixes and checkpoints
-        // retain their existing capacity contracts. No process env is mutated.
-        if (comptime build_options.enable_cuda) {
-            if (self.cb.kind() == .cuda and self.cb.execution_owner == 0 and self.execution_lock == null and
-                self.graph_cache == null and self.compiled_partition_backend == null and
-                self.draft_cb == null and !config.speculation_requested and self.prompt_cache == null and
-                !config.prompt_cache_enabled and !native_checkpoint and config.kv_cache_mode == .exact_hybrid and
-                decode_state.isPaged() and decode_state.total_tokens == 0 and decode_state.sequence_id == null and
-                self.kv_dtype == .f16)
-            {
-                decode_state.cuda_request_replay_capacity = try cuda_compute.CudaCompute.configureGemma4RequestReplayCapacity(
-                    &self.cb,
-                    prompt_token_count,
-                    max_tokens,
-                    gemma4DefaultReplayConfigEligible(config, platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE")),
-                );
-            }
-        }
+        try decoder_storage.preparePagedReplay(&self.cb, decode_state, self.kv_dtype, .{
+            .exclusive = self.execution_lock == null,
+            .compiled = self.graph_cache != null or self.compiled_partition_backend != null,
+            .speculative = self.draft_cb != null or config.speculation_requested,
+            .shared_prefix = self.prompt_cache != null or config.prompt_cache_enabled,
+            .checkpoint = native_checkpoint,
+            .exact_history = config.kv_cache_mode == .exact_hybrid,
+            .allow_default = gemma4DefaultReplayConfigEligible(config, false),
+        }, prompt_token_count, max_tokens);
         try decoder_storage.validateSelectedTokenBudget(config.kv_cache_mode == .select_v1, max_seq, config.kv_protected_spans);
         var token_ids = try allocator.alloc(i64, max_seq);
         defer allocator.free(token_ids);
@@ -4953,24 +4930,23 @@ pub const NativeGenerationPipeline = struct {
         }
 
         if (prompt_plan.compiled_whole_model) {
-            const compiled = try prompt_runtime.prepareCompiledPrompt(request);
+            const compiled = try prompt_runtime.prepareCompiledPrompt(request.compiled());
             const prefill_chunk_size = compiled.chunk_rows;
             debugGenerationStage(
                 "executePrefill whole-model fast path seq_len={d} chunk_size={d} ring={}",
                 .{ seq_len, prefill_chunk_size, decode_state.allow_swa_ring },
             );
-            var processed: usize = 0;
-            while (processed < prompt_ids.len) {
-                const chunk_end = @min(prompt_ids.len, processed + prefill_chunk_size);
-                const chunk = prompt_ids[processed..chunk_end];
-                const total_chunk_end = prefilled_tokens + chunk_end;
-                const is_last_chunk = chunk_end == prompt_ids.len;
+            var window = try decoder_prefill.FixedWindow.init(prompt_ids.len, prefilled_tokens, prefill_chunk_size);
+            while (window.next()) |attempt| {
+                const chunk = prompt_ids[attempt.start..attempt.end];
+                const total_chunk_end = attempt.total_end;
+                const is_last_chunk = attempt.final;
                 const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
                 defer phase_timer.finish();
                 const wants_greedy = is_last_chunk and allow_resident_greedy_token and isPureGreedyConfig(config) and config.grammar == null;
                 var compiled_prefill = self.prefillRuntime(decode_state, null);
                 const output = compiled_prefill.runCompiledChunk(.{ .token_ids = chunk, .total_sequence_length = total_chunk_end, .output = if (wants_greedy) .greedy_token else if (is_last_chunk) .last_logits else .kv_only }) catch |err| {
-                    debugGenerationStage("executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}", .{ processed, chunk_end, @errorName(err) });
+                    debugGenerationStage("executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}", .{ attempt.start, attempt.end, @errorName(err) });
                     return err;
                 };
                 if (output.greedy_token != null) {
@@ -4983,7 +4959,6 @@ pub const NativeGenerationPipeline = struct {
                     return .{ .greedy_token = output.greedy_token.? };
                 }
                 if (output.last_logits) |logits| prefill_last_logits = logits;
-                processed = chunk_end;
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);
@@ -5008,15 +4983,7 @@ pub const NativeGenerationPipeline = struct {
                 .leased_plan = if (self.scheduler_lease) |lease| if (lease.prefill_chunk_plan.isAdmitted()) lease.prefill_chunk_plan else null else null,
                 .configured_chunk_rows = config.prefill_chunk_size,
                 .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
-                .default_chunk_rows = if (self.cb.kind() == .metal)
-                    decoder_routes.metalPreparedEmbeddingChunkRows(self.gpt_config, 0) orelse 0
-                else if (comptime build_options.enable_cuda) bounded: {
-                    if (self.cb.kind() == .cuda) {
-                        if (@import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillChunkRows(&self.cb, seq_len, 0)) |rows|
-                            break :bounded rows;
-                    }
-                    break :bounded 0;
-                } else 0,
+                .default_chunk_rows = decoder_prefill.nativeChunkRows(&self.cb, self.gpt_config, seq_len, 0) orelse 0,
                 .selected_kv = config.kv_cache_mode == .select_v1,
                 .checkpoint_resume = self.checkpoint_resume != null,
                 .backend = self.cb.kind(),
@@ -5222,6 +5189,15 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn beginPreparedPrefillTurn(self: *NativeGenerationPipeline, seq_len: usize) !bool {
+        const scheduler = self.scheduler orelse return false;
+        const lease = self.scheduler_lease orelse return false;
+        scheduler.notePrefillProgress(lease, 0, seq_len);
+        const io = self.io orelse return false;
+        try scheduler.awaitTurnControlled(lease, .prefill, io, self.execution_control);
+        return true;
+    }
+
     fn executePreparedMultimodalPrefill(
         self: *NativeGenerationPipeline,
         prepared: *gemma3_mm.PreparedPrompt,
@@ -5231,39 +5207,18 @@ pub const NativeGenerationPipeline = struct {
         config: GenerationConfig,
     ) !PrefillOutput {
         var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(true, false, false, self.execution_lock));
-        var direct_prefill_turn_acquired = false;
-        defer if (direct_prefill_turn_acquired) {
-            self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
-        };
-        const compiled_media = self.compiled_partition_backend == .metal and self.compiled_attachment_target == .whole_model and self.graph_cache != null;
-        var admitted_chunk_rows = config.prefill_chunk_size;
-        if (compiled_media) {
-            if (prepared.attn_or_mask != null or capture_last_hidden) return error.UnsupportedPreparedRows;
-            const plan = try numerical.prepareCompiledPrompt(self.promptRequest(config, seq_len, seq_len, 0, false, capture_last_hidden));
-            admitted_chunk_rows = @min(plan.chunk_rows, 512);
-        }
+        const plan = try numerical.planEmbeddingPrompt(.{
+            .storage = decoderStorageRequest(config),
+            .query_tokens = seq_len,
+            .configured_chunk_rows = config.prefill_chunk_size,
+            .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+            .speculative_k = config.speculative_k,
+            .sampled_ring_qualified = exact_hybrid_sampled_ring_qualification_override,
+        }, prepared.attn_or_mask, capture_last_hidden);
         try numerical.resetRecurrentPrompt();
-        if (self.scheduler) |scheduler| {
-            if (self.scheduler_lease) |lease| {
-                scheduler.notePrefillProgress(lease, 0, seq_len);
-            }
-        }
-
-        if (self.scheduler) |scheduler| {
-            if (self.scheduler_lease) |lease| {
-                if (self.io == null) {
-                    if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
-                } else {
-                    try scheduler.awaitTurnControlled(lease, .prefill, self.io.?, self.execution_control);
-                    direct_prefill_turn_acquired = true;
-                    if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
-                }
-            } else {
-                if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
-            }
-        } else {
-            if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
-        }
+        const direct_prefill_turn_acquired = try self.beginPreparedPrefillTurn(seq_len);
+        defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
+        if (plan.reserve_whole_prompt) try numerical.prepareWholePrompt(seq_len);
 
         if (prepared.input_embeddings == null) return error.InvalidPreparedPrompt;
         const logits = try numerical.runEmbeddingsOwned(.{
@@ -5271,7 +5226,7 @@ pub const NativeGenerationPipeline = struct {
             .token_ids = prepared.ple_token_ids orelse prepared.token_ids,
             .sequence_length = seq_len,
             .output_intent = decoder_routes.prefillOutputIntent(true, !capture_last_hidden and self.draft_cb == null and decoder_routes.shouldUsePreparedPrefillGreedyToken(self.cb.kind(), self.gpt_config, decoderRouteRequest(config), true, self.prefillNeedsHostLogits(config), self.cb.kind() != .cuda or (enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken())), capture_last_hidden),
-            .chunk_rows = admitted_chunk_rows,
+            .chunk_rows = plan.chunk_rows,
             .attention_mask = prepared.attn_or_mask,
         });
         errdefer if (logits.last_logits) |values| self.allocator.free(values);
@@ -5358,26 +5313,9 @@ pub const NativeGenerationPipeline = struct {
             defer self.mergeStepExecutor(&request.executor);
             return hook.run_fn(hook.ptr, &request);
         };
-        var direct_prefill_turn_acquired = false;
+        const direct_prefill_turn_acquired = try self.beginPreparedPrefillTurn(seq_len);
         defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
-        if (self.scheduler) |scheduler| {
-            if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, 0, seq_len);
-        }
-        if (self.scheduler) |scheduler| {
-            if (self.scheduler_lease) |lease| {
-                if (self.io == null) {
-                    try numerical.prepareWholePrompt(seq_len);
-                } else {
-                    try scheduler.awaitTurnControlled(lease, .prefill, self.io.?, self.execution_control);
-                    direct_prefill_turn_acquired = true;
-                    try numerical.prepareWholePrompt(seq_len);
-                }
-            } else {
-                try numerical.prepareWholePrompt(seq_len);
-            }
-        } else {
-            try numerical.prepareWholePrompt(seq_len);
-        }
+        try numerical.prepareWholePrompt(seq_len);
 
         if (prepared.input_embeddings == null) return error.InvalidPreparedPrompt;
         const work_trace = enableGenerationStageDebug();

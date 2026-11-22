@@ -42,6 +42,9 @@ pub const Stats = struct {
     storage_usage: ?accounting.Snapshot = null,
     replay_decision: ReplayDecision = .not_requested,
     dispatches: u64 = 0,
+    region_callbacks: u64 = 0,
+    region_callback_nodes: u64 = 0,
+    assigned_regions: ?@import("stats.zig").AssignedRegions = null,
     transfers: u64 = 0,
     output_copies: u64 = 0,
     transfer_bytes: u64 = 0,
@@ -71,6 +74,7 @@ pub const KernelPlan = struct {
 
 const host_ingress = @import("host_ingress.zig");
 const DeviceInputPlan = struct {
+    index_bounds: ?host_ingress.IndexBounds = null,
     node: NodeId,
     shape: ml.graph.Shape,
     backend_index: usize,
@@ -92,7 +96,7 @@ const HostInputPlan = struct {
 };
 const HostInputStorage = struct { resource: host_ingress.Upload, admission: ?*admission.Reservation, retirement_owner: ?*@import("backing_retirement.zig").BackingOwner = null, private_view: ?CT = null };
 
-const ReplayInput = struct { node: NodeId, shape: ml.graph.Shape, allocation: ?buffers.AllocationId = null, constant: ?[]const f32 = null, constant_index: ?usize = null };
+const ReplayInput = struct { node: NodeId, shape: ml.graph.Shape, allocation: ?buffers.AllocationId = null, constant_index: ?usize = null };
 const ReplayOutput = struct { node: NodeId, allocation: buffers.AllocationId, shape: ml.graph.Shape };
 const ReplayBindingState = struct { weight: ?CT = null, supplied: bool = false, host_direct: bool = false };
 
@@ -182,6 +186,9 @@ pub const Pool = struct {
     native_frame_dispatch: bool = false,
     cuda_frame_dispatch: bool = false,
     metal_frame_dispatch: bool = false,
+    /// Only a canonical single-partition projection head can qualify through its
+    /// synchronous region. The root grants no primitive Frame credit.
+    metal_projection_region_candidate: bool = false,
     coverage_backend: ?ops.ComputeBackend = null,
     payload_coverage: @import("owned_coverage.zig").Coverage = .{ .compatibility = .no_selected_routes },
     route_owner: ?*prepared_routes.PreparedRoutes = null,
@@ -251,6 +258,7 @@ pub const Pool = struct {
                 if (functions.assignedKernelSupported) |supported| if (!supported(backend.ptr, &descriptor)) continue;
                 const workspace = if (backend.vtable.kernels.?.assignedKernelWorkspace) |requirement| try requirement(backend.ptr, &descriptor) else kernels.WorkspaceRequirement{};
                 if (workspace.byte_size % @sizeOf(f32) != 0) return error.InvalidWorkspaceSize;
+                try validateAlignment(workspace.alignment);
                 scratch_requirements[backend_index].byte_size = @max(scratch_requirements[backend_index].byte_size, workspace.byte_size);
                 scratch_requirements[backend_index].alignment = @max(scratch_requirements[backend_index].alignment, workspace.alignment);
                 host_workspace_bytes = @max(host_workspace_bytes, workspace.host_byte_size);
@@ -334,7 +342,9 @@ pub const Pool = struct {
         errdefer allocator.free(workspace_ids);
         @memset(workspace_ids, buffers.invalid_allocation);
         for (owned_backends, scratch_requirements, 0..) |backend, requirement, index| {
-            if (requirement.byte_size != 0) workspace_ids[index] = try plan.addWorkspace(backend.kind(), requirement.byte_size, requirement.alignment);
+            if (requirement.byte_size == 0) continue;
+            try validateDeviceWorkspaceAlignment(backend, requirement.alignment);
+            workspace_ids[index] = try plan.addWorkspace(backend.kind(), requirement.byte_size, requirement.alignment);
         }
         const host_workspace_allocation = if (host_workspace_bytes != 0) try plan.addHostWorkspace(host_workspace_bytes) else buffers.invalid_allocation;
         const reshape_sources = try allocator.alloc(NodeId, graph.nodeCount());
@@ -407,19 +417,21 @@ pub const Pool = struct {
         for (graph.nodes.items, 0..) |node, id| {
             if (self.coverage_reachable) |reachable| if (!reachable[id]) continue;
             if (node.op == .constant) {
-                const attrs = node.op.constant;
-                const elements = node.output_shape.numElements() orelse return;
-                if (node.output_shape.dtype != .f32 or elements <= 0 or attrs.data_len != elements or self.backends[index].vtable.kernels.?.writePhysicalFloat32 == null) return;
-                const bytes = try std.math.mul(usize, attrs.data_len, @sizeOf(f32));
-                if (attrs.data_offset > graph.constant_pool.items.len or bytes > graph.constant_pool.items.len - attrs.data_offset) return error.InvalidShape;
+                if (emptyReplayLiteral(&node)) continue;
+                const store = self.literal_store orelse return;
+                const literal_index = store.node_indices[id];
+                if (literal_index == ml.graph.null_node or store.literals[literal_index].backend_index != index) return;
                 binding_count += 1;
                 continue;
             }
             if (node.op == .parameter) {
                 binding_count += 1;
                 if (node.output_shape.dtype != .f32) {
-                    const host_index = self.hostInputIndex(@intCast(id)) orelse return;
-                    if (self.host_input_plans[host_index].index_bounds == null) return;
+                    const node_id: NodeId = @intCast(id);
+                    if (self.hostInputIndex(node_id) == null) {
+                        const device_index = self.deviceInputIndex(node_id) orelse return;
+                        if (self.device_input_plans[device_index].index_bounds == null) return;
+                    }
                 }
                 var mutable = false;
                 var immutable = false;
@@ -506,7 +518,9 @@ pub const Pool = struct {
             for (graph.outputs.items, self.replay_outputs) |id, *output| {
                 if (output.node != id or !output.shape.eq(graph.node(id).output_shape)) return error.InvalidReplayTemplate;
                 const source = replayOutputSource(graph, id).?;
-                output.allocation = if (self.regionForNode(source) != null)
+                output.allocation = if (emptyReplayLiteral(graph.node(source)))
+                    buffers.invalid_allocation
+                else if (self.regionForNode(source) != null)
                     (plan.slotForNode(source) orelse return error.InvalidShape).allocation
                 else if (self.kernels[source]) |kernel|
                     kernel.output_allocation
@@ -531,14 +545,12 @@ pub const Pool = struct {
         var input_index: usize = 0;
         for (graph.nodes.items, 0..) |node, id| {
             if (self.coverage_reachable) |reachable| if (!reachable[id]) continue;
-            if (node.op != .parameter and node.op != .constant) continue;
+            if ((node.op != .parameter and node.op != .constant) or emptyReplayLiteral(&node)) continue;
             const input = &inputs[input_index];
             input_indices[id] = @intCast(input_index);
             input_index += 1;
             input.* = .{ .node = @intCast(id), .shape = node.output_shape };
             if (node.op == .constant) {
-                const attrs = node.op.constant;
-                input.constant = graph.constantData(attrs.data_offset, attrs.data_len);
                 const store = self.literal_store orelse return error.InvalidLiteralPlan;
                 const literal_index = store.node_indices[id];
                 if (literal_index == ml.graph.null_node or store.literals[literal_index].backend_index != index) return error.InvalidLiteralPlan;
@@ -553,7 +565,14 @@ pub const Pool = struct {
         }
         for (graph.outputs.items, outputs) |id, *output| {
             const source = replayOutputSource(graph, id).?;
-            const allocation = if (self.regionForNode(source) != null) (plan.slotForNode(source) orelse return error.InvalidShape).allocation else if (self.kernels[source]) |kernel| kernel.output_allocation else inputs[input_indices[source]].allocation orelse return error.InvalidShape;
+            const allocation = if (emptyReplayLiteral(graph.node(source)))
+                buffers.invalid_allocation
+            else if (self.regionForNode(source) != null)
+                (plan.slotForNode(source) orelse return error.InvalidShape).allocation
+            else if (self.kernels[source]) |kernel|
+                kernel.output_allocation
+            else
+                inputs[input_indices[source]].allocation orelse return error.InvalidShape;
             output.* = .{ .node = id, .allocation = allocation, .shape = graph.node(id).output_shape };
         }
         self.replay_inputs = inputs;
@@ -562,6 +581,11 @@ pub const Pool = struct {
         self.replay_kernel_count = count;
         self.replay_backend = index;
         self.replay_decision = .warming;
+    }
+
+    fn emptyReplayLiteral(node: *const ml.graph.Node) bool {
+        return node.op == .constant and node.output_shape.dtype == .f32 and
+            node.op.constant.data_len == 0 and node.output_shape.numElements() == 0;
     }
 
     fn replayOutputSource(graph: *const Graph, node_id: NodeId) ?NodeId {
@@ -741,7 +765,7 @@ pub const Pool = struct {
             };
         }
         if (self.replay_backend) |index| for (self.replay_inputs) |input| {
-            if (input.constant != null) continue;
+            if (input.constant_index != null) continue;
             if (input.allocation) |id| try self.addStorageRequirement(seen, index, id, &amounts);
         };
         for (self.host_input_plans) |input| {
@@ -792,7 +816,7 @@ pub const Pool = struct {
     pub fn preparePrivateNativeSourcesConsuming(owner: *?*Pool, immutable_inputs: prepared_routes.InputSource, inputs: prepared_routes.InputSource) !?*prepared_routes.PreparedRoutes {
         const candidate = owner.* orelse return null;
         const backend = candidate.coverage_backend orelse return null;
-        if (backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return null;
+        if (!@import("../ops/native_compute.zig").isCanonicalVTable(backend.vtable)) return null;
         return preparePrivateDecoderSourcesConsuming(owner, immutable_inputs, inputs);
     }
     /// The accepted decoder target supplies source and eager-program proofs;
@@ -805,7 +829,7 @@ pub const Pool = struct {
         if (!@import("dense_decoder_backend.zig").available(&backend)) return null;
         const native = backend.kind() == .native;
         const cuda = backend.kind() == .cuda;
-        if (!self.owns_plan or self.accounting == null or self.payload_coverage == .complete or self.native_frame_dispatch != native or self.cuda_frame_dispatch != cuda or self.metal_frame_dispatch or
+        if (!self.owns_plan or self.accounting == null or self.payload_coverage == .complete or self.native_frame_dispatch != native or self.cuda_frame_dispatch != cuda or self.metal_frame_dispatch or self.metal_projection_region_candidate or
             (!native and !cuda) or self.backends.len != 1 or self.backends[0].vtable != backend.vtable or self.backends[0].ptr != backend.ptr or
             reachable.len != graph.nodeCount() or self.kernels.len != graph.nodeCount() or
             self.frames.items.len != 0 or self.pending_frames != 0 or self.prepared_backings.load(.acquire) or
@@ -902,6 +926,15 @@ pub const Pool = struct {
         if (self.selection == null or node >= self.kernels.len or self.kernels[node] == null or self.plan.slotForNode(node) == null) return .{ .node = node, .allocation = buffers.invalid_allocation, .epoch = if (self.selection) |selected| selected.epoch else 0, .logical = .{}, .writable_bytes = 0 };
         return self.selection.?.output(self, node, bytes);
     }
+    /// Attest the retained bank used by admission and actual dispatch.
+    pub fn workspaceBank(self: *const Pool, backend_index: usize, bytes: usize, alignment: u32) ?buffers.AllocationId {
+        if (bytes == 0 or bytes % @sizeOf(f32) != 0 or backend_index >= self.workspace_allocations.len or backend_index >= self.backends.len) return null;
+        const id = self.workspace_allocations[backend_index];
+        const bank = self.plan.allocationById(id) orelse return null;
+        if (bank.id != id or bank.kind != .workspace or bank.storage == .host_dense or bank.backend != self.backends[backend_index].kind() or bank.byte_size < bytes or bank.alignment < alignment) return null;
+        return id;
+    }
+
     pub fn allocationForNode(self: *const Pool, node: NodeId) ?buffers.AllocationId {
         const slot = self.plan.slotForNode(node) orelse return null;
         return if (self.plan.allocationForSlot(slot.id)) |allocation| allocation.id else null;
@@ -929,9 +962,14 @@ pub const Pool = struct {
         return selected.requirements.primary_alignment;
     }
 
-    fn deviceInputAllocation(self: *const Pool, node: NodeId) ?buffers.AllocationId {
-        for (self.device_input_plans) |input| if (input.node == node) return input.allocation;
+    fn deviceInputIndex(self: *const Pool, node: NodeId) ?usize {
+        for (self.device_input_plans, 0..) |input, index| if (input.node == node) return index;
         return null;
+    }
+
+    fn deviceInputAllocation(self: *const Pool, node: NodeId) ?buffers.AllocationId {
+        const index = self.deviceInputIndex(node) orelse return null;
+        return self.device_input_plans[index].allocation;
     }
     fn prepareDeviceIngress(self: *Pool) !void {
         const selected = if (self.selection) |*value| value else return;
@@ -944,17 +982,18 @@ pub const Pool = struct {
             };
             const slot = self.plan.slotForNode(input.node_id) orelse return error.InvalidDeviceIngressBinding;
             const count = device.logical.numElements() orelse return error.InvalidDeviceIngressBinding;
-            if (device.logical.dtype != .f32 or count <= 0 or !device.logical.eq(slot.desc.shape) or self.hostInputIndex(input.node_id) != null) return error.InvalidDeviceIngressBinding;
+            if ((device.logical.dtype != .f32 and device.logical.dtype != .i32 and device.logical.dtype != .i64) or count <= 0 or !device.logical.eq(slot.desc.shape) or self.hostInputIndex(input.node_id) != null) return error.InvalidDeviceIngressBinding;
             var backend_index: ?usize = null;
             for (self.backends, 0..) |backend, index| {
                 if (backend.kind() != .cuda or backend.ptr != device.implementation.context or @as(*const anyopaque, @ptrCast(backend.vtable)) != device.implementation.table) continue;
                 const functions = backend.vtable.kernels orelse continue;
-                if (!functions.accepts(backend.vtable) or functions.copyPhysicalInput == null or functions.physicalTensorView == null) continue;
+                if (!functions.accepts(backend.vtable) or functions.copyPhysicalInput == null or functions.physicalTensorView == null or
+                    (device.logical.dtype != .f32 and functions.copyPhysicalIndexInput == null)) continue;
                 backend_index = index;
                 break;
             }
             const index = backend_index orelse return error.UnsupportedDeviceIngress;
-            const bytes = try std.math.mul(usize, @intCast(count), @sizeOf(f32));
+            const bytes = try std.math.mul(usize, @intCast(count), device.logical.dtype.byteSize());
             const allocation_id = if (input.node_id < self.replay_input_indices.len and self.replay_input_indices[input.node_id] != ml.graph.null_node)
                 self.replay_inputs[self.replay_input_indices[input.node_id]].allocation orelse return error.InvalidDeviceIngressBinding
             else
@@ -997,7 +1036,7 @@ pub const Pool = struct {
             var allocation: ?buffers.AllocationId = null;
             if (input.node_id < self.replay_input_indices.len) {
                 const i = self.replay_input_indices[input.node_id];
-                if (i != ml.graph.null_node and self.replay_inputs[i].constant == null) {
+                if (i != ml.graph.null_node and self.replay_inputs[i].constant_index == null) {
                     if (self.replay_inputs[i].allocation) |candidate| if (self.plan.allocations[candidate].backend == host.target) {
                         allocation = candidate;
                     };
@@ -1007,13 +1046,22 @@ pub const Pool = struct {
             try plans.append(self.allocator, .{ .node = input.node_id, .shape = host.logical, .backend_index = index, .allocation = allocation.?, .requirements = required, .epoch = selected.epoch });
         }
         self.host_input_plans = try plans.toOwnedSlice(self.allocator);
+    }
+
+    fn prepareInputIndexBounds(self: *Pool) !void {
+        const selected = if (self.selection) |*value| value else return;
         for (selected.routes, 0..) |maybe, node| if (maybe) |owned| if (owned.vtable.host_input_constraint) |query| {
             const kernel = self.kernels[node] orelse return error.InvalidHostIndexBounds;
             for (0..kernel.descriptor.input_count) |input_index| if (query(owned.context, input_index)) |bounds| {
                 if (bounds.extent == 0) return error.InvalidHostIndexBounds;
-                const index = self.hostInputIndex(kernel.inputs[input_index]) orelse return error.MissingPreparedHostIndices;
-                const target = &self.host_input_plans[index];
-                target.index_bounds = if (target.index_bounds) |prior| prior.intersect(bounds) else bounds;
+                const input = kernel.inputs[input_index];
+                const target = if (self.hostInputIndex(input)) |index|
+                    &self.host_input_plans[index].index_bounds
+                else if (self.deviceInputIndex(input)) |index|
+                    &self.device_input_plans[index].index_bounds
+                else
+                    return error.MissingPreparedHostIndices;
+                target.* = if (target.*) |prior| prior.intersect(bounds) else bounds;
             };
         };
     }
@@ -1131,7 +1179,7 @@ pub const Pool = struct {
         const ledger = try accounting.Ledger.create(self.allocator);
         errdefer ledger.release();
         const child = try self.allocator.create(Pool);
-        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .host_workspace_allocator = self.host_workspace_allocator, .root_pool = self };
+        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .metal_projection_region_candidate = self.metal_projection_region_candidate, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .host_workspace_allocator = self.host_workspace_allocator, .root_pool = self };
         if (self.literal_store) |store| {
             store.retain();
             child.literal_store = store;
@@ -1142,7 +1190,7 @@ pub const Pool = struct {
 
     fn prepareVariant(root: *Pool, inputs: []const route.InputBinding, policy: @import("region_route.zig").SelectionPolicy, profile: @import("region_route.zig").ExecutionProfile) !?*prepared_routes.PreparedRoutes {
         var metadata: @import("backend_operation.zig").Scope = .{};
-        if (root.cuda_frame_dispatch or root.metal_frame_dispatch) {
+        if (root.cuda_frame_dispatch or root.metal_frame_dispatch or (root.metal_projection_region_candidate and profile == .synchronous and policy == .select_regions)) {
             const backend = root.coverage_backend orelse return error.MissingPreparedKernelRoute;
             try @import("backend_operation.zig").enterInto(&backend, root.coverage_graph, null, .metadata, &metadata);
         }
@@ -1163,10 +1211,12 @@ pub const Pool = struct {
         try @import("reachable_projection.zig").deactivate(child);
         child.selection = try RouteSelection.createSourceWithAuthority(child, inputs, authority);
         if (policy == .select_regions) try child.prepareRegionsWithAuthority(authority);
+        if (child.metal_projection_region_candidate and child.region_execution_profile == .synchronous and child.regions.len == 1 and authority != null) child.metal_frame_dispatch = true;
         const capture_supported = try child.applyRouteRequirements();
         try child.recomputeHostWorkspace();
         try child.prepareHostIngress();
         try child.prepareDeviceIngress();
+        try child.prepareInputIndexBounds();
         child.selectNativeBorrowedHostInputs();
         // A selected ordinary-only route or region may disable capture while
         // retaining inherited input/output banks for ordinary execution. Only
@@ -1185,6 +1235,7 @@ pub const Pool = struct {
             @import("device_owned_coverage.zig").assess(child, child.coverage_backend.?, authority)
         else
             @import("owned_coverage.zig").assess(child);
+        if (child.metal_projection_region_candidate and child.payload_coverage != .complete) child.metal_frame_dispatch = false;
         const immutable = child.immutable_bindings orelse return error.MissingImmutableKernelBindings;
         // Epoch is identity, not a hash of equivalent metadata. Every cache hit
         // still calls full backend matches and validates its concrete policy.
@@ -1291,12 +1342,12 @@ pub const Pool = struct {
                 try self.growAllocation(auxiliary.allocation, bytes);
             }
         }
-        for (self.replay_outputs) |*output| output.allocation = (self.plan.slotForNode(output.node) orelse return error.InvalidPhysicalAllocation).allocation;
+        for (self.replay_outputs) |*output| {
+            if (output.allocation == buffers.invalid_allocation) continue;
+            output.allocation = (self.plan.slotForNode(output.node) orelse return error.InvalidPhysicalAllocation).allocation;
+        }
     }
 
-    fn prepareRegions(self: *Pool) !void {
-        return self.prepareRegionsWithAuthority(null);
-    }
     fn prepareRegionsWithAuthority(self: *Pool, authority: ?@import("backend_operation.zig").Borrowed) !void {
         if (self.region_execution_profile == .unknown) {
             var ordinary = false;
@@ -1588,22 +1639,34 @@ pub const Pool = struct {
         if (required.byte_size % @sizeOf(f32) != 0) return error.InvalidWorkspaceSize;
         if (required.byte_size != 0) {
             const id = &self.workspace_allocations[backend_index];
-            // Provider banks establish device alignment; assigned-resource
-            // validation checks the actual address before numerical dispatch.
-            if (id.* == buffers.invalid_allocation) id.* = try self.plan.addWorkspace(self.backends[backend_index].kind(), required.byte_size, @min(required.alignment, @alignOf(f32))) else try self.growAllocation(id.*, required.byte_size);
+            const backend = self.backends[backend_index];
+            try validateDeviceWorkspaceAlignment(backend, required.alignment);
+            if (id.* == buffers.invalid_allocation) {
+                id.* = try self.plan.addWorkspace(backend.kind(), required.byte_size, required.alignment);
+            } else {
+                try self.growAllocation(id.*, required.byte_size);
+                const bank = &self.plan.allocations[id.*];
+                bank.alignment = @max(bank.alignment, required.alignment);
+            }
         }
         if (required.host_byte_size != 0) {
             const alignment = std.mem.Alignment.fromByteUnits(host_alignment);
             if (@backingInt(alignment) > @backingInt(self.host_alignment)) self.host_alignment = alignment;
             if (self.host_workspace_allocation == buffers.invalid_allocation) {
-                const rounded = try std.math.add(usize, required.host_byte_size, 3);
-                self.host_workspace_allocation = try self.plan.addHostWorkspace(rounded / 4 * 4);
+                self.host_workspace_allocation = try self.plan.addHostWorkspace(required.host_byte_size);
             } else try self.growAllocation(self.host_workspace_allocation, required.host_byte_size);
         }
     }
 
     fn validateAlignment(value: u32) !void {
         if (value == 0 or !std.math.isPowerOfTwo(value)) return error.InvalidPreparedKernelAlignment;
+    }
+
+    fn validateDeviceWorkspaceAlignment(backend: ops.ComputeBackend, required: u32) !void {
+        // A legacy F32 allocator promises the alignment of the view type.
+        // Greater alignment must come from the exact provider's base policy.
+        const guaranteed = @max(@alignOf(f32), try storage.minimumAlignment(backend));
+        if (required > guaranteed) return error.UnsupportedPhysicalWorkspaceAlignment;
     }
 
     fn applyRouteRequirements(self: *Pool) !bool {
@@ -1624,7 +1687,7 @@ pub const Pool = struct {
             try validateAlignment(required.probe_host_alignment);
             try validateAlignment(required.workspace.alignment);
             try validateAlignment(required.probe_workspace.alignment);
-            if (kind == .native and (required.primary_alignment > @alignOf(u64) or required.workspace.alignment > @alignOf(f32) or required.probe_workspace.alignment > @alignOf(f32))) return error.UnsupportedPhysicalWorkspaceAlignment;
+            if (kind == .native and required.primary_alignment > @alignOf(u64)) return error.UnsupportedPhysicalWorkspaceAlignment;
             try self.growAllocation(kernel.output_allocation, required.primary_bytes);
             const workspace_bytes = @max(required.workspace.byte_size, required.probe_workspace.byte_size);
             if (workspace_bytes % 4 != 0) return error.InvalidWorkspaceSize;
@@ -1656,6 +1719,9 @@ pub const Pool = struct {
             }
             kernel.auxiliaries = auxiliaries;
             if (required.capture != .supported) {
+                if (@import("antfly_platform").env.getenvBool("TERMITE_GRAPH_PARTITION_REPORT")) {
+                    std.debug.print("graph-partition-report CUDA replay rejects route node={d} op={s} profile={x}\n", .{ node, @tagName(kernel.descriptor.operation), required.profile });
+                }
                 capture_supported = false;
                 self.replay_backend = null;
                 self.replay_decision = .unsupported_representation;
@@ -2108,9 +2174,6 @@ pub const Frame = struct {
         };
         for (self.completions) |completion| if (completion) |value| try value.wait();
     }
-    fn deinitAfterWaitWithBoundary(self: *Frame, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
-        self.deinitAfterWaitWithCleanup(.{ .boundary = boundary });
-    }
     fn deinitAfterWaitWithCleanup(self: *Frame, cleanup: @import("cleanup_context.zig").Context) void {
         self.clearNativeProgramViews(cleanup);
         if (cleanup.boundary == null) {
@@ -2384,6 +2447,11 @@ pub const Frame = struct {
         };
         if (self.collect_storage_stats) {
             self.stats.prepared_payload_coverage = self.pool.payload_coverage;
+            self.stats.assigned_regions = .{
+                .selected = self.pool.regions.len,
+                .accepted_callbacks = self.stats.region_callbacks,
+                .covered_callback_nodes = self.stats.region_callback_nodes,
+            };
             if (self.pool.accounting) |ledger| self.stats.storage_usage = ledger.snapshot();
         }
         return self.stats;
@@ -2517,10 +2585,15 @@ pub const Frame = struct {
             };
             const input = source orelse return error.MissingProgramInput;
             if (input.source_backend) |owner| if (owner.ptr != backend.ptr or owner.vtable != backend.vtable) return error.RuntimeInputBackendMismatch;
-            if (try backend.tensorDType(input.value) != .f32) return error.InvalidInputDType;
+            const actual = try backend.tensorDType(input.value);
+            if (!std.mem.eql(u8, @tagName(actual), @tagName(plan.shape.dtype))) return error.InvalidInputDType;
             const shape = try backend.tensorShape(input.value, self.pool.allocator);
             defer self.pool.allocator.free(shape);
             if (!std.mem.eql(i64, shape, plan.shape.dims[0..plan.shape.rank()])) return error.InvalidInputShape;
+            if (plan.index_bounds) |bounds| {
+                const validate = backend.vtable.kernels.?.validatePhysicalIndexInput orelse return error.UnsupportedDeviceIngress;
+                try validate(backend.ptr, input.value, bounds.extent);
+            }
             self.device_bound_inputs[index] = input;
         }
         // All headers are valid before the first allocation or device copy.
@@ -2532,14 +2605,16 @@ pub const Frame = struct {
             const lease = (try self.storageFor(backend, plan.backend_index, plan.allocation)) orelse return error.MissingPhysicalInputStorage;
             try lease.bindAllocationSlot(plan.allocation, plan.epoch, @intCast(self.pool.plan.allocations[plan.allocation].byte_size));
             const target = try self.viewForShape(backend, lease, plan.shape);
-            backend.vtable.kernels.?.copyPhysicalInput.?(backend.ptr, target, input.value) catch |err| {
+            const functions = backend.vtable.kernels.?;
+            const copy = if (plan.shape.dtype == .f32) functions.copyPhysicalInput.? else functions.copyPhysicalIndexInput.?;
+            copy(backend.ptr, target, input.value) catch |err| {
                 backend.free(target);
                 return err;
             };
             self.device_bound_inputs[self.bound_device_input_count] = .{ .node_id = plan.node, .value = target, .source_backend = backend };
             self.bound_device_input_count += 1;
             self.stats.input_copies += 1;
-            self.stats.input_copy_bytes += @intCast(plan.shape.numElements().? * @sizeOf(f32));
+            self.stats.input_copy_bytes += @as(u64, @intCast(plan.shape.numElements().?)) * plan.shape.dtype.byteSize();
         }
         return self.device_bound_inputs[0..self.bound_device_input_count];
     }
@@ -2554,6 +2629,21 @@ pub const Frame = struct {
 
     fn ownsHostInput(self: *const Frame, node: NodeId, value: CT) bool {
         for (self.host_bound_inputs[0..self.bound_host_input_count]) |input| if (input.node_id == node and input.value == value) return true;
+        return false;
+    }
+
+    fn isBoundReplayIngress(self: *const Frame, binding: ReplayInput, value: CT) bool {
+        if (binding.shape.dtype == .f32) return false;
+        const allocation = binding.allocation orelse return false;
+        if (self.pool.hostInputIndex(binding.node)) |index| {
+            const plan = self.pool.host_input_plans[index];
+            // hostProofsCurrent already checked all numeric index constraints.
+            return !plan.borrowed and plan.allocation == allocation and self.ownsHostInput(binding.node, value);
+        }
+        if (self.pool.deviceInputIndex(binding.node)) |index| {
+            const plan = self.pool.device_input_plans[index];
+            return plan.allocation == allocation and plan.index_bounds != null and self.ownsDeviceInput(binding.node, value);
+        }
         return false;
     }
 
@@ -2596,8 +2686,11 @@ pub const Frame = struct {
             const binding = self.pool.replay_inputs[i];
             // Per-node literal overrides retain their ordinary semantics;
             // they must never mutate a shared immutable captured address.
-            if (binding.constant != null) return self.declineReplay(.literal_override);
-            if (!cb.vtable.kernels.?.physicalReplayTensorSupported.?(cb.ptr, input.value) and !self.preparedImmutableReplayInput(cb.*, binding, input)) {
+            if (binding.constant_index != null) return self.declineReplay(.literal_override);
+            if (!self.isBoundReplayIngress(binding, input.value) and !cb.vtable.kernels.?.physicalReplayTensorSupported.?(cb.ptr, input.value) and !self.preparedImmutableReplayInput(cb.*, binding, input)) {
+                if (@import("antfly_platform").env.getenvBool("TERMITE_GRAPH_PARTITION_REPORT")) {
+                    std.debug.print("graph-partition-report CUDA replay rejects binding node={d} dtype={s} immutable={}\n", .{ binding.node, @tagName(binding.shape.dtype), binding.allocation == null });
+                }
                 if (binding.allocation == null) self.replay_disabled = .unsupported_representation;
                 return self.declineReplay(.unsupported_representation);
             }
@@ -2609,7 +2702,7 @@ pub const Frame = struct {
         }
         for (self.pool.replay_inputs, self.binding_states, self.bound_inputs) |binding, state, *input| {
             if (state.supplied) continue;
-            if (binding.constant == null) return self.declineReplay(.incomplete_bindings);
+            if (binding.constant_index == null) return self.declineReplay(.incomplete_bindings);
             input.* = .{ .node_id = binding.node, .value = undefined };
         }
         // Reject unsupported immutable ownership before allocating/copying
@@ -2625,7 +2718,7 @@ pub const Frame = struct {
         var complete = false;
         defer if (!complete) self.releaseReplayInputs();
         for (self.pool.replay_inputs, self.bound_inputs, 0..) |binding, *input, i| {
-            if (binding.constant != null) {
+            if (binding.constant_index != null) {
                 input.value = try self.valueForLiteral(cb, index, binding);
                 input.source_backend = cb;
             } else if (binding.allocation) |allocation_id| {
@@ -2662,8 +2755,27 @@ pub const Frame = struct {
     pub fn releaseReplayInputs(self: *Frame) void {
         const index = self.pool.replay_backend orelse return;
         const cb = self.pool.backends[index];
-        for (self.pool.replay_inputs[0..self.bound_input_count], self.bound_inputs[0..self.bound_input_count], self.binding_states[0..self.bound_input_count]) |binding, input, state| if (binding.allocation != null and binding.constant == null and !state.host_direct) cb.free(input.value);
+        for (self.pool.replay_inputs[0..self.bound_input_count], self.bound_inputs[0..self.bound_input_count], self.binding_states[0..self.bound_input_count]) |binding, input, state| if (binding.allocation != null and binding.constant_index == null and !state.host_direct) cb.free(input.value);
         self.bound_input_count = 0;
+    }
+
+    fn replayBankBound(self: *const Frame, backend: ops.ComputeBackend, id: buffers.AllocationId) bool {
+        const allocation = self.pool.plan.allocationById(id) orelse return false;
+        if (id >= self.storages.len) return false;
+        const lease = self.storages[id] orelse return false;
+        return lease.backend.ptr == backend.ptr and lease.backend.vtable == backend.vtable and
+            allocation.backend == .cuda and lease.byte_size >= allocation.byte_size;
+    }
+
+    fn replayWorkspaceBound(self: *const Frame, backend: ops.ComputeBackend, index: usize, bytes: usize, alignment: u32) bool {
+        if (bytes == 0) return true;
+        const id = self.pool.workspaceBank(index, bytes, alignment) orelse return false;
+        return self.replayBankBound(backend, id);
+    }
+
+    fn replayMissingBanks(self: *Frame) bool {
+        self.stats.replay_decision = .incomplete_bindings;
+        return false;
     }
 
     pub fn beginReplayCapture(self: *Frame) !bool {
@@ -2673,8 +2785,16 @@ pub const Frame = struct {
         const backend = self.pool.backends[index];
         if (self.pool.coverage_reachable) |reachable| if (reachable.len != self.pool.kernels.len) return error.InvalidReachabilityTable;
         for (self.pool.regions, self.region_assigned) |installed, resources| {
-            if (installed.owner.requirements.capture != .supported or
-                (installed.owner.vtable.prepare_assigned != null and resources == null)) return false;
+            const need = installed.owner.requirements;
+            if (need.capture != .supported or installed.backend_index != index) return false;
+            // A successful warm call must have used every captured bank.
+            // Never allocate a missing output or workspace in the recorder.
+            if (installed.owner.vtable.prepare_assigned != null and resources == null) return self.replayMissingBanks();
+            const alignment = @max(need.dispatch_workspace.alignment, need.preparation_workspace.alignment);
+            if (!self.replayWorkspaceBound(backend, index, installed.workspace_bytes, alignment)) return self.replayMissingBanks();
+            for (installed.outputs) |output| {
+                if (!self.replayBankBound(backend, output.slot.allocation)) return self.replayMissingBanks();
+            }
         }
         for (self.pool.kernels, 0..) |maybe, node| if (maybe) |kernel| {
             if (self.pool.coverage_reachable) |reachable| if (!reachable[node]) continue;
@@ -2682,12 +2802,19 @@ pub const Frame = struct {
                 if (installed.owner.requirements.capture != .supported) return false;
                 continue;
             }
-            const allowed = if (self.pool.preparedKernelRoute(@intCast(node))) |owned| owned.requirements.capture == .supported else backend.vtable.kernels.?.physicalReplayKernelSupported.?(backend.ptr, &kernel.descriptor);
-            if (!allowed) {
+            const owned = self.pool.preparedKernelRoute(@intCast(node));
+            const allowed = if (owned) |route_owner| route_owner.requirements.capture == .supported else backend.vtable.kernels.?.physicalReplayKernelSupported.?(backend.ptr, &kernel.descriptor);
+            if (!allowed or kernel.backend_index != index) {
                 self.stats.replay_decision = .unsupported_graph;
                 self.replay_disabled = .unsupported_graph;
                 return false;
             }
+            const alignment = if (owned) |route_owner| @max(route_owner.requirements.workspace.alignment, route_owner.requirements.probe_workspace.alignment) else 1;
+            if (!self.replayBankBound(backend, kernel.output_allocation) or
+                !self.replayWorkspaceBound(backend, index, kernel.workspace_bytes, alignment)) return self.replayMissingBanks();
+            for (kernel.auxiliaries) |maybe_auxiliary| if (maybe_auxiliary) |auxiliary| {
+                if (!self.replayBankBound(backend, auxiliary.allocation)) return self.replayMissingBanks();
+            };
         };
         if (self.replay == null) self.replay = (try self.pool.backends[index].vtable.kernels.?.createPhysicalReplay.?(self.pool.backends[index].ptr)) orelse return false;
         const started = try self.replay.?.begin(self.storages);
@@ -2715,7 +2842,17 @@ pub const Frame = struct {
         self.stats.replay_decision = .captured;
     }
 
-    pub fn replayOutputs(self: *Frame, allocator: std.mem.Allocator) ![]CT {
+    /// The driver can report a launch failure after accepting work. Keep the
+    /// graph and its address banks alive through completion, then retire them.
+    pub fn launchCommittedReplay(self: *Frame) !void {
+        if (!self.replay_ready or self.retired) return error.InvalidPreparedKernelRoute;
+        self.replay.?.launch() catch |err| {
+            self.retired = true;
+            return err;
+        };
+    }
+
+    pub fn replayOutputs(self: *Frame, allocator: std.mem.Allocator, control: ?@import("../execution_control.zig").InferenceExecutionControl) ![]CT {
         if (!self.hostProofsCurrent()) return error.MissingCurrentHostIndexProof;
         const index = self.pool.replay_backend orelse return error.InvalidShape;
         const cb = &self.pool.backends[index];
@@ -2724,15 +2861,22 @@ pub const Frame = struct {
         var initialized: usize = 0;
         errdefer for (outputs[0..initialized]) |output| cb.free(output);
         for (self.pool.replay_outputs, outputs) |binding, *output| {
+            if (binding.allocation == buffers.invalid_allocation) {
+                if (binding.shape.dtype != .f32 or binding.shape.numElements() != 0) return error.InvalidShape;
+                output.* = (try cb.fromConstantBytes(&.{}, .f32, binding.shape.dims[0..binding.shape.rank()])) orelse return error.UnsupportedTensorType;
+                initialized += 1;
+                continue;
+            }
             const allocation = self.storages[binding.allocation] orelse return error.InvalidShape;
             output.* = try self.viewForShape(cb, allocation, binding.shape);
+            initialized += 1;
             if (try self.publishLiteralOutput(cb, binding.node, output.*)) |independent| {
                 cb.free(output.*);
                 output.* = independent;
             }
-            initialized += 1;
         }
-        try self.replay.?.launch();
+        if (control) |active| try active.check();
+        try self.launchCommittedReplay();
         self.stats.graph_replays += 1;
         self.stats.replay_decision = .replayed;
         return outputs;
@@ -2759,7 +2903,7 @@ pub const Frame = struct {
         self.storages[literal.allocation] = result.lease; // Store owns it.
         if (result.fresh) {
             self.stats.allocations += 1;
-            self.stats.allocated_bytes += literal.data.len * 4;
+            self.stats.allocated_bytes += literal.data.len;
         } else self.stats.reused_allocations += 1;
         return result.value;
     }
@@ -2786,7 +2930,7 @@ pub const Frame = struct {
         const lease = self.storages[literal.allocation].?;
         var dimensions: [8]i32 = undefined;
         for (literal.shape.dims[0..literal.shape.rank()], 0..) |dimension, axis| dimensions[axis] = @intCast(dimension);
-        return (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = dimensions[0..literal.shape.rank()], .layout_source = value })) orelse error.UnsupportedPhysicalTensorView;
+        return (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = dimensions[0..literal.shape.rank()], .dtype = literal.shape.dtype, .layout_source = value })) orelse error.UnsupportedPhysicalTensorView;
     }
     pub fn publishLiteralOutput(self: *Frame, cb: *const ops.ComputeBackend, node: NodeId, value: CT) !?CT {
         const store = self.pool.literal_store orelse return null;
@@ -2806,7 +2950,7 @@ pub const Frame = struct {
         const backing = (try self.storageFor(cb, literal.backend_index, publication.allocation)) orelse return null;
         var dimensions: [8]i32 = undefined;
         for (publication.shape.dims[0..publication.shape.rank()], 0..) |dimension, axis| dimensions[axis] = @intCast(dimension);
-        const output = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = backing, .shape = dimensions[0..publication.shape.rank()], .layout_source = value })) orelse return error.UnsupportedPhysicalTensorView;
+        const output = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = backing, .shape = dimensions[0..publication.shape.rank()], .dtype = publication.shape.dtype, .layout_source = value })) orelse return error.UnsupportedPhysicalTensorView;
         errdefer cb.free(output);
         try cb.vtable.kernels.?.copyPhysicalInput.?(cb.ptr, output, value);
         self.stats.output_copies += 1;
@@ -2863,6 +3007,10 @@ pub const Frame = struct {
         const outcome = try installed.owner.dispatch(invocation);
         if (outcome == .declined_before_submission) return error.PreparedRegionDeclined;
         self.stats.dispatches += 1;
+        if (self.collect_storage_stats) {
+            self.stats.region_callbacks += 1;
+            self.stats.region_callback_nodes += installed.owner.covered_nodes.len;
+        }
         if (self.region_claims[index]) |*owned| {
             // Concrete numerical callbacks established independent tickets before
             // encoding on EVERY actual command buffer, including nested flushes.
@@ -2915,7 +3063,12 @@ pub const Frame = struct {
             result.slots[index] = output.slot;
         }
         if (installed.host_workspace_bytes > self.host_workspace.len) return error.PreparedRegionWorkspaceMismatch;
-        if (installed.workspace_bytes != 0 and (installed.workspace_allocation == buffers.invalid_allocation or installed.workspace_allocation >= self.pool.plan.allocations.len or installed.workspace_bytes % @sizeOf(f32) != 0 or installed.workspace_bytes > self.pool.plan.allocations[installed.workspace_allocation].byte_size)) return error.PreparedRegionWorkspaceMismatch;
+        if (installed.workspace_bytes != 0) {
+            const requirements = installed.owner.requirements;
+            const alignment = @max(requirements.dispatch_workspace.alignment, requirements.preparation_workspace.alignment);
+            const workspace = self.pool.workspaceBank(installed.backend_index, installed.workspace_bytes, alignment) orelse return error.PreparedRegionWorkspaceMismatch;
+            if (workspace != installed.workspace_allocation) return error.PreparedRegionWorkspaceMismatch;
+        }
         // No backing allocation, metadata CT, command encoder or driver call may
         // happen until all selected semantic/input/output facts have validated.
         try installed.owner.validate(.{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .policy_key = policy_key, .inputs = facts, .outputs = result.slots[0..installed.outputs.len], .payload_claim = if (self.region_claims[region_index]) |*claim| claim else null });
@@ -2932,7 +3085,6 @@ pub const Frame = struct {
             result.output_count += 1;
         }
         if (installed.workspace_bytes != 0) {
-            if (installed.workspace_allocation == buffers.invalid_allocation or installed.workspace_bytes % @sizeOf(f32) != 0) return error.PreparedRegionWorkspaceMismatch;
             const lease = (try self.storageFor(cb, installed.backend_index, installed.workspace_allocation)) orelse return error.PreparedRegionStorageUnavailable;
             // Scratch owns a real Frame allocation slot, independently of any
             // logical graph output. Bind its canonical full-bank provenance at
@@ -3005,7 +3157,14 @@ pub const Frame = struct {
         const make_alias = functions.createMetadataAlias orelse return error.PreparedMetadataAliasChanged;
         const source = if (alias.source < values.len) values[alias.source] orelse return error.MissingValue else return error.MissingValue;
         const incoming = selection.binding(self.pool, alias.source, selection.inputs.entries);
-        const primary = (try @import("dense_alias.zig").primary(incoming, cb.*, alias.input)) orelse return error.PreparedMetadataAliasChanged;
+        const primary = if (incoming == .imported_device) input: {
+            const allocation = self.pool.deviceInputAllocation(alias.source) orelse return error.PreparedMetadataAliasChanged;
+            if (self.storages[allocation] == null or selection.plane_counts[alias.source] != 1) return error.PreparedMetadataAliasChanged;
+            break :input selection.planes[alias.source][0];
+        } else if (cb.kind() == .cuda and incoming == .tensor and selection.plane_counts[alias.source] == 1)
+            selection.planes[alias.source][0]
+        else
+            (try @import("dense_alias.zig").primary(incoming, cb.*, alias.input)) orelse return error.PreparedMetadataAliasChanged;
         const request = @import("metadata_alias.zig").request(primary, selection.planes[id][0]);
         const result = try make_alias(cb.ptr, source, &request);
         // A faster Metal region/fusion may legitimately own the source
@@ -3058,7 +3217,7 @@ pub const Frame = struct {
         // One fixed metadata call per eligible canonical Native operation.
         // No current operand, attention/cleanup borrow or constructor capability
         // is retained. The same request allocator pays this cold metadata.
-        if (cb.vtable == &@import("../ops/native_compute.zig").vtable_impl) {
+        if (@import("../ops/native_compute.zig").isCanonicalVTable(cb.vtable)) {
             var capacity: usize = 0;
             for (self.pool.kernels, 0..) |maybe, index| if (maybe) |kernel| {
                 const selected = self.pool.preparedKernelRoute(@intCast(index)) orelse continue;
@@ -3197,6 +3356,7 @@ pub const Frame = struct {
         return self.executePreparedProgram(cb, values, id, rope_position, attention);
     }
     pub fn executePreparedProgram(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: *const ops.AttentionContext) !CT {
+        if (comptime @import("build_options").enable_wasm) return error.UnpreparedNativeProgramViews;
         if (self.native_program_views.len == 0 or !@import("dense_decoder_backend.zig").available(cb)) return error.UnpreparedNativeProgramViews;
         if (!self.in_use or self.retired or self.scope_backends != 1) return error.InvalidNativeProgramExecution;
         if (self.native_program_storage_sealed) if (self.nativeProgramCall(id)) |call| {
@@ -3263,7 +3423,7 @@ pub const Frame = struct {
         // exact resources. Its bound call below performs all current input,
         // source/policy, output-authority and alias checks before any write.
         // Keep the allocation-avoiding probe for generic/copied providers.
-        const probe = !cached or cb.vtable != &@import("../ops/native_compute.zig").vtable_impl;
+        const probe = !cached or if (comptime @import("build_options").enable_native) !@import("../ops/native_compute.zig").isCanonicalVTable(cb.vtable) else true;
         if (probe and !try run(cb.ptr, request)) {
             if (selected_route != null) return error.PreparedKernelBindingChanged;
             return null;
@@ -3844,6 +4004,39 @@ test "shared host arena shrinks obsolete kernels while preserving real region pr
     _ = try frame.finish();
 }
 
+test "prepared physical CUDA replay retires the address bank after a launch error" {
+    const Mock = struct {
+        calls: usize = 0,
+        fn begin(_: *anyopaque, _: []const ?*ops.physical_storage.Lease) !bool {
+            unreachable;
+        }
+        fn commit(_: *anyopaque) !void {
+            unreachable;
+        }
+        fn release(_: *anyopaque) void {
+            unreachable;
+        }
+        fn retains(_: *anyopaque, _: *const ops.physical_storage.Lease) bool {
+            unreachable;
+        }
+        fn launch(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.InvalidCudaState;
+        }
+        const table = ops.physical_storage.Replay.VTable{ .begin = begin, .commit = commit, .abort = release, .launch = launch, .retains = retains, .deinit = release };
+    };
+    var mock: Mock = .{};
+    var frame: Frame = undefined;
+    frame.replay = .{ .ptr = &mock, .vtable = &Mock.table };
+    frame.replay_ready = true;
+    frame.retired = false;
+    try std.testing.expectError(error.InvalidCudaState, frame.launchCommittedReplay());
+    try std.testing.expect(frame.retired);
+    try std.testing.expectError(error.InvalidPreparedKernelRoute, frame.launchCommittedReplay());
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+}
+
 test "prepared CUDA step completion waits before host reuse and retains failed boundary" {
     const Probe = struct {
         records: usize = 0,
@@ -4259,17 +4452,17 @@ fn regionOnlyDeclaredStorageCase(a: std.mem.Allocator, covered_primitive: bool) 
         .{ .slot = .{ .node = 2, .allocation = 1, .epoch = 42, .logical = shape, .writable_bytes = 16 } },
     };
     const regions = [_]binding.Installed{.{ .owner = &owner, .key = 7, .backend_index = 0, .epoch = 42, .outputs = &outputs, .workspace_allocation = 2, .workspace_bytes = 24, .host_workspace_bytes = 32 }};
-    const allocations = [_]buffers.PhysicalAllocation{
+    var allocations = [_]buffers.PhysicalAllocation{
         .{ .id = 0, .kind = .tensor, .backend = .native, .storage = .host_f32, .byte_size = 16, .first_use = 0, .last_use = 2, .reusable = true },
         .{ .id = 1, .kind = .tensor, .backend = .native, .storage = .host_f32, .byte_size = 16, .first_use = 0, .last_use = 2, .reusable = true },
-        .{ .id = 2, .kind = .workspace, .backend = .native, .storage = .host_dense, .byte_size = 24, .first_use = 0, .last_use = 2, .reusable = true },
+        .{ .id = 2, .kind = .workspace, .backend = .native, .storage = .host_f32, .byte_size = 24, .alignment = 4, .first_use = 0, .last_use = 2, .reusable = true },
         .{ .id = 3, .kind = .workspace, .backend = .native, .storage = .host_dense, .byte_size = 32, .first_use = 0, .last_use = 2, .reusable = true },
     };
     const descriptor = kernels.Descriptor{ .operation = .{ .unary = .negate }, .output_shape = shape, .input_shapes = .{ shape, undefined, undefined }, .input_count = 1 };
     const primitive = [_]?KernelPlan{.{ .descriptor = descriptor, .inputs = @splat(ml.graph.null_node), .backend_index = 0, .output_allocation = 1, .workspace_bytes = 24 }};
     const backends = [_]ops.ComputeBackend{cb};
     const workspaces = [_]buffers.AllocationId{2};
-    var pool = Pool{ .allocator = a, .regions = @constCast(&regions), .plan = .{ .allocator = a, .slots = &.{}, .node_slots = &.{}, .node_positions = &.{}, .allocations = @constCast(&allocations), .transfers = &.{}, .transfer_index = .empty }, .kernels = if (covered_primitive) @constCast(&primitive) else &.{}, .transfers = &.{}, .backends = @constCast(&backends), .workspace_allocations = @constCast(&workspaces), .host_workspace_allocation = 3 };
+    var pool = Pool{ .allocator = a, .regions = @constCast(&regions), .plan = .{ .allocator = a, .slots = &.{}, .node_slots = &.{}, .node_positions = &.{}, .allocations = &allocations, .transfers = &.{}, .transfer_index = .empty }, .kernels = if (covered_primitive) @constCast(&primitive) else &.{}, .transfers = &.{}, .backends = @constCast(&backends), .workspace_allocations = @constCast(&workspaces), .host_workspace_allocation = 3 };
     const total = try pool.storageRequirement();
     defer a.free(pool.storage_requirement_bounds);
     try std.testing.expectEqual(@as(usize, 88), total.host_scratch_bytes);
@@ -4304,6 +4497,9 @@ fn regionOnlyDeclaredStorageCase(a: std.mem.Allocator, covered_primitive: bool) 
     const current = @import("cleanup_context.zig").Context{ .boundary = &epoch };
     const frame = try Frame.createWithAdmission(&pool, prepared.forDispatch(identity));
     defer frame.deinitWithCleanup(current);
+    allocations[2].alignment = 2;
+    try std.testing.expectError(error.PreparedRegionWorkspaceMismatch, frame.acquireRegionOutputs(&cb, &regions[0], &.{}, 11));
+    allocations[2].alignment = 4;
     var bound = try frame.acquireRegionOutputs(&cb, &regions[0], &.{}, 11);
     var bound_live = true;
     defer if (bound_live) bound.deinit();
