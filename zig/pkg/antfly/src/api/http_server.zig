@@ -4146,6 +4146,7 @@ pub const ApiHttpServer = struct {
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
+    last_sql_abort_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
@@ -5669,6 +5670,9 @@ pub const ApiHttpServer = struct {
                 std.log.warn("expired SQL connection cleanup deferred err={s}", .{@errorName(err)});
             };
         }
+        self.maybeCleanupExpiredSqlAbortReceipts() catch |err| {
+            std.log.warn("SQL abort receipt cleanup deferred err={s}", .{@errorName(err)});
+        };
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
     }
@@ -10233,6 +10237,16 @@ pub const ApiHttpServer = struct {
     pub fn localSessionNodeId(self: *ApiHttpServer) u64 {
         const router = self.cfg.session_router orelse return 0;
         return router.localNodeId();
+    }
+
+    fn maybeCleanupExpiredSqlAbortReceipts(self: *ApiHttpServer) !void {
+        if (self.txn_sessions.durable == null) return;
+        const now_ns = platform_time.realtimeNs();
+        const previous_ns = self.last_sql_abort_cleanup_ns.load(.acquire);
+        if (previous_ns != 0 and now_ns -| previous_ns < std.time.ns_per_min) return;
+        if (self.last_sql_abort_cleanup_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
+        const retention_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
+        _ = try self.txn_sessions.cleanupExpiredSqlAbortReceipts(self.alloc, now_ns -| retention_ns);
     }
 
     fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {

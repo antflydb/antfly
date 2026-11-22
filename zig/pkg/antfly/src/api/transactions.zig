@@ -28,6 +28,7 @@ const platform_time = @import("antfly_platform").time;
 const session_record = @import("../metadata/transaction_session_record.zig");
 const session_prefix = session_record.session_prefix;
 const session_lease_prefix = "\x00\x00__api_txn_session_leases__:";
+const sql_abort_expiry_prefix = "\x00\x00__api_sql_abort_expiry__:";
 const session_expiry_prefix = "\x00\x00__api_txn_session_expiry__:";
 const session_recovery_prefix = "\x00\x00__api_txn_session_recovery__:";
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);
@@ -1038,6 +1039,7 @@ pub const Session = struct {
     last_touched_timestamp: u64,
     sync_level: db_mod.types.SyncLevel,
     staged: ?OwnedTransactionCommitRequest = null,
+    listing_summary_tail: ?[]u8 = null,
     /// Digest of the optional body supplied to the first commit attempt. Once
     /// present, the effective request is sealed in `staged`; retries must carry
     /// the same body (or omit it if the first attempt omitted it).
@@ -1063,6 +1065,38 @@ pub const Session = struct {
     next_savepoint_id: u64 = 1,
     savepoints: std.AutoHashMapUnmanaged(u64, Savepoint) = .empty,
 
+    fn clearListingSummary(self: *Session, alloc: std.mem.Allocator) void {
+        if (self.listing_summary_tail) |json| alloc.free(json);
+        self.listing_summary_tail = null;
+    }
+
+    fn refreshListingSummary(self: *Session, alloc: std.mem.Allocator, limit: ?usize) !void {
+        self.clearListingSummary(alloc);
+        const staged = self.staged orelse return;
+        // Reject a projection up front when staged document bytes alone
+        // already consume the record budget.
+        if (limit) |max| {
+            var remaining = max;
+            for (staged.tables) |table| for (table.batch.writes) |write| {
+                if (write.value.len >= remaining) return;
+                remaining -= write.value.len;
+            };
+            if (remaining <= 32) return;
+        }
+        const tables = try sessionTableDetails(alloc, staged, false);
+        defer {
+            for (tables) |*table| table.deinit(alloc);
+            if (tables.len != 0) alloc.free(tables);
+        }
+        const json = try std.json.Stringify.valueAlloc(alloc, SessionListingSummary{
+            .counts = stagedCounts(self),
+            .tables = tables,
+            .bindings = staged.catalog_bindings.items,
+        }, .{});
+        defer alloc.free(json);
+        self.listing_summary_tail = try encodeListingSummaryBytes(alloc, json);
+    }
+
     pub fn info(self: Session) SessionInfo {
         return .{
             .version = DurableSessionStore.Version.of(self),
@@ -1085,6 +1119,7 @@ pub const Session = struct {
         if (self.sql) |*metadata| metadata.deinit(alloc);
         if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
+        self.clearListingSummary(alloc);
         if (self.execution_plan) |bytes| alloc.free(bytes);
         if (self.terminal_commit) |*terminal| terminal.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.lake_cuts);
@@ -1117,6 +1152,7 @@ pub const Session = struct {
         out.graph_abort_tables = try cloneTableDetails(alloc, self.graph_abort_tables);
         if (self.sql) |metadata| out.sql = try metadata.clone(alloc);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
+        if (self.listing_summary_tail) |json| out.listing_summary_tail = try alloc.dupe(u8, json);
         if (self.execution_plan) |bytes| out.execution_plan = try alloc.dupe(u8, bytes);
         if (self.terminal_commit) |terminal| out.terminal_commit = try terminal.clone(alloc);
         out.lake_cuts = try cloneReadSnapshotMap(alloc, self.lake_cuts);
@@ -1787,10 +1823,18 @@ pub const DurableSessionStore = struct {
             if (retired_through != null) try retirement.acknowledge(txn, self.alloc, "\x00\x00__api_completion_retired__:", reference, key) else try txn.delete(key);
         } else {
             if (refs.items.len >= 4096) return error.SessionLimitExceeded;
-            var session = (try self.loadSessionTxn(txn, id)) orelse return error.SqlTransactionOutcomeUnknown;
-            defer session.deinit(self.alloc);
+            const settled = if (try self.loadSessionTxn(txn, id)) |loaded| live: {
+                var session = loaded;
+                defer session.deinit(self.alloc);
+                break :live sessionCompletionSettled(session) or (mode != .prepare and !session.commit_execution_started);
+            } else receipt: {
+                if (mode == .prepare) return error.SqlTransactionOutcomeUnknown;
+                const result = try readSqlAbortStatus(txn, self.alloc, id, .all);
+                if (result != .found or result.found.disposition != .aborted) return error.SqlTransactionOutcomeUnknown;
+                break :receipt true;
+            };
             try refs.append(self.alloc, reference);
-            try txn.put(key, if (sessionCompletionSettled(session) or (mode != .prepare and !session.commit_execution_started)) "settled-v1" else "pending-v1");
+            try txn.put(key, if (settled) "settled-v1" else "pending-v1");
         }
         if (refs.items.len == 0) {
             try txn.delete(directory);
@@ -1929,7 +1973,7 @@ pub const DurableSessionStore = struct {
             defer self.alloc.free(encoded);
             const receipt_key = try makeSqlAbortReceiptKey(self.alloc, txn_id);
             defer self.alloc.free(receipt_key);
-            const expiry_key = try makeSessionExpiryKey(self.alloc, receipt.last_touched_timestamp, txn_id);
+            const expiry_key = try makeExpiryKey(self.alloc, sql_abort_expiry_prefix, receipt.last_touched_timestamp, txn_id);
             defer self.alloc.free(expiry_key);
             try txn.put(receipt_key, encoded);
             try txn.put(expiry_key, &.{});
@@ -2099,7 +2143,7 @@ pub const DurableSessionStore = struct {
         var receipt = try decodeSessionRecord(self.alloc, id, raw);
         defer receipt.deinit(self.alloc);
         if (receipt.last_touched_timestamp >= cutoff) return false;
-        const expiry_key = try makeSessionExpiryKey(self.alloc, receipt.last_touched_timestamp, id);
+        const expiry_key = try makeExpiryKey(self.alloc, sql_abort_expiry_prefix, receipt.last_touched_timestamp, id);
         defer self.alloc.free(expiry_key);
         try txn.delete(expiry_key);
         try txn.delete(key);
@@ -2355,28 +2399,29 @@ pub const DurableSessionStore = struct {
         return true;
     }
 
-    fn scanExpiredIds(self: *DurableSessionStore, alloc: std.mem.Allocator, after: ?ParsedSessionExpiryKey, cutoff_ns: u64, limit: usize) !struct { ids: []db_mod.types.TxnId, next_after: ?ParsedSessionExpiryKey } {
+    fn scanExpiredIds(self: *DurableSessionStore, alloc: std.mem.Allocator, prefix: []const u8, after: ?ParsedSessionExpiryKey, cutoff_ns: u64, limit: usize) !struct { ids: []db_mod.types.TxnId, next_after: ?ParsedSessionExpiryKey } {
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         errdefer ids.deinit(alloc);
         const Scan = struct {
             allocator: std.mem.Allocator,
+            prefix: []const u8,
             cutoff: u64,
             limit: usize,
             ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
             next_after: ?ParsedSessionExpiryKey = null,
             fn visit(raw: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
-                const parsed = parseSessionExpiryKey(key) orelse return true;
+                const parsed = parseExpiryKey(scan.prefix, key) orelse return true;
                 if (parsed.timestamp >= scan.cutoff or scan.ids.items.len >= scan.limit) return false;
                 try scan.ids.append(scan.allocator, parsed.txn_id);
                 if (scan.ids.items.len == scan.limit) scan.next_after = parsed;
                 return scan.next_after == null;
             }
         };
-        var scan = Scan{ .allocator = alloc, .cutoff = cutoff_ns, .limit = limit, .ids = &ids };
-        const start = if (after) |key| try makeSessionExpiryKey(alloc, key.timestamp, key.txn_id) else null;
+        var scan = Scan{ .allocator = alloc, .prefix = prefix, .cutoff = cutoff_ns, .limit = limit, .ids = &ids };
+        const start = if (after) |key| try makeExpiryKey(alloc, prefix, key.timestamp, key.txn_id) else null;
         defer if (start) |key| alloc.free(key);
-        try self.scanPrefixFromWithContext(session_expiry_prefix, start, &scan, Scan.visit);
+        try self.scanPrefixFromWithContext(prefix, start, &scan, Scan.visit);
         return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = scan.next_after };
     }
 
@@ -2793,6 +2838,7 @@ pub const SessionRegistry = struct {
     connection_sweep_offset: std.atomic.Value(usize) = .init(0),
     reserved_session_count: usize = 0,
     expiry_cursor: ?ParsedSessionExpiryKey = null,
+    sql_abort_expiry_cursor: ?ParsedSessionExpiryKey = null,
     recovery_index_cursor: ?db_mod.types.TxnId = null,
     recovery_audit_cursor: ?[]u8 = null,
     memory_recovery_scan_offset: usize = 0,
@@ -2949,6 +2995,7 @@ pub const SessionRegistry = struct {
         errdefer session.deinit(alloc);
         if (principal) |name| session.principal = try alloc.dupe(u8, name);
         session.staged = try input.clone(alloc);
+        try session.refreshListingSummary(alloc, self.max_record_bytes);
         session.commit_body_digest = try commitBodyDigest(alloc, input);
         session.execution_plan = try encodeExecutionPlan(alloc, tables);
         var max_name: usize = 0;
@@ -3606,6 +3653,7 @@ pub const SessionRegistry = struct {
         // Keep only this session's stripe while doing bounded remote reads;
         // the registry mutex is free and durable lease CAS still precedes publish.
         if (validator) |value| try value.validate(value.ptr, alloc, if (previous) |*old| old else null, &candidate.staged.?, req);
+        try candidate.refreshListingSummary(alloc, self.max_record_bytes);
         touchSession(&candidate);
         try self.persistMutation(candidate, expected, guard);
 
@@ -3714,6 +3762,7 @@ pub const SessionRegistry = struct {
         } else {
             try candidate.staged.?.mergeFrom(alloc, req);
         }
+        try candidate.refreshListingSummary(alloc, self.max_record_bytes);
         touchSession(&candidate);
         try self.persistMutation(candidate, expected, guard);
 
@@ -3785,6 +3834,7 @@ pub const SessionRegistry = struct {
         const staged_copy = try out.clone(alloc);
         if (candidate.staged) |*staged| staged.deinit(alloc);
         candidate.staged = staged_copy;
+        if (extra_req != null) try candidate.refreshListingSummary(alloc, self.max_record_bytes);
         candidate.commit_body_digest = body_digest;
         touchSession(&candidate);
         out.session_version = DurableSessionStore.Version.of(candidate);
@@ -3910,6 +3960,7 @@ pub const SessionRegistry = struct {
             }
             if (candidate.staged) |*staged| staged.deinit(alloc);
             candidate.staged = null;
+            candidate.clearListingSummary(alloc);
             if (candidate.execution_plan) |bytes| alloc.free(bytes);
             candidate.execution_plan = null;
         }
@@ -4402,6 +4453,7 @@ pub const SessionRegistry = struct {
             candidate.staged = staged;
             // Ownership moved into candidate, whose error path releases it.
             staged = .{};
+            try candidate.refreshListingSummary(alloc, self.max_record_bytes);
             const read_snapshots = try cloneReadSnapshotMap(alloc, savepoint.read_snapshots);
             deinitReadSnapshotMap(alloc, &candidate.read_snapshots);
             candidate.read_snapshots = read_snapshots;
@@ -4815,6 +4867,27 @@ pub const SessionRegistry = struct {
         return true;
     }
 
+    pub fn cleanupExpiredSqlAbortReceipts(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
+        const durable = self.durable orelse return 0;
+        self.mutex.lock();
+        const after = self.sql_abort_expiry_cursor;
+        self.mutex.unlock();
+        const page = try durable.scanExpiredIds(alloc, sql_abort_expiry_prefix, after, cutoff_ns, 128);
+        defer alloc.free(page.ids);
+        var removed: usize = 0;
+        for (page.ids) |id| {
+            const expired = durable.expireSqlAbortReceipt(id, cutoff_ns) catch |err| switch (err) {
+                error.SessionLeaseLost => continue,
+                else => return err,
+            };
+            if (expired) removed += 1;
+        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (std.meta.eql(after, self.sql_abort_expiry_cursor)) self.sql_abort_expiry_cursor = page.next_after;
+        return removed;
+    }
+
     pub fn cleanupExpired(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
         var expired_ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         defer expired_ids.deinit(alloc);
@@ -4822,7 +4895,7 @@ pub const SessionRegistry = struct {
             self.mutex.lock();
             const after = self.expiry_cursor;
             self.mutex.unlock();
-            const page = try durable.scanExpiredIds(alloc, after, cutoff_ns, 1024);
+            const page = try durable.scanExpiredIds(alloc, session_expiry_prefix, after, cutoff_ns, 1024);
             expired_ids = .fromOwnedSlice(page.ids);
             self.mutex.lock();
             if (std.meta.eql(after, self.expiry_cursor)) self.expiry_cursor = page.next_after;
@@ -4848,12 +4921,7 @@ pub const SessionRegistry = struct {
             session_lock.lock();
             defer session_lock.unlock();
             // Scanning pinned receipts must not populate the foreground cache.
-            var view = (try self.readSessionAssumeStripe(txn_id)) orelse {
-                if (self.durable) |durable| {
-                    if (try durable.expireSqlAbortReceipt(txn_id, cutoff_ns)) removed_count += 1;
-                }
-                continue;
-            };
+            var view = (try self.readSessionAssumeStripe(txn_id)) orelse continue;
             defer view.deinit();
             const current = view.session;
             if (current.last_touched_timestamp >= cutoff_ns) continue;
@@ -6999,8 +7067,12 @@ fn makeSessionLeaseKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]
 }
 
 fn makeSessionExpiryKey(alloc: std.mem.Allocator, timestamp: u64, txn_id: db_mod.types.TxnId) ![]u8 {
+    return makeExpiryKey(alloc, session_expiry_prefix, timestamp, txn_id);
+}
+
+fn makeExpiryKey(alloc: std.mem.Allocator, prefix: []const u8, timestamp: u64, txn_id: db_mod.types.TxnId) ![]u8 {
     const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
-    return try std.fmt.allocPrint(alloc, "{s}{x:0>16}:{s}", .{ session_expiry_prefix, timestamp, &txn_hex });
+    return try std.fmt.allocPrint(alloc, "{s}{x:0>16}:{s}", .{ prefix, timestamp, &txn_hex });
 }
 
 fn makeSessionRecoveryKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]u8 {
@@ -7023,9 +7095,9 @@ const ParsedSessionExpiryKey = struct {
     txn_id: db_mod.types.TxnId,
 };
 
-fn parseSessionExpiryKey(key: []const u8) ?ParsedSessionExpiryKey {
-    if (!std.mem.startsWith(u8, key, session_expiry_prefix)) return null;
-    const suffix = key[session_expiry_prefix.len..];
+fn parseExpiryKey(prefix: []const u8, key: []const u8) ?ParsedSessionExpiryKey {
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    const suffix = key[prefix.len..];
     if (suffix.len < 18 or suffix[16] != ':') return null;
     return .{
         .timestamp = std.fmt.parseUnsigned(u64, suffix[0..16], 16) catch return null,
@@ -7494,21 +7566,6 @@ fn encodeSessionRecordWithListingLimit(alloc: std.mem.Allocator, session: Sessio
     try appendJsonString(alloc, &out, syncLevelText(session.sync_level));
     try out.appendSlice(alloc, ",\"next_savepoint_id\":");
     try out.print(alloc, "{d}", .{session.next_savepoint_id});
-    const listing_start = out.items.len;
-    if (session.staged) |staged| {
-        const tables = try sessionTableDetails(alloc, staged, false);
-        defer {
-            for (tables) |*table| table.deinit(alloc);
-            if (tables.len != 0) alloc.free(tables);
-        }
-        try out.appendSlice(alloc, ",\"listing_v1\":");
-        try out.print(alloc, "{f}", .{std.json.fmt(SessionListingSummary{
-            .counts = stagedCounts(&session),
-            .tables = tables,
-            .bindings = staged.catalog_bindings.items,
-        }, .{})});
-    }
-    const listing_end = out.items.len;
     try out.appendSlice(alloc, ",\"staged\":");
     if (session.staged) |staged| {
         const encoded = try encodeCommitRequestMode(alloc, staged, true);
@@ -7613,11 +7670,15 @@ fn encodeSessionRecordWithListingLimit(alloc: std.mem.Allocator, session: Sessio
         try out.appendSlice(alloc, point_committed);
         try out.append(alloc, '}');
     }
-    try out.appendSlice(alloc, "]}");
-    if (listing_end != listing_start and out.items.len > listing_limit) {
-        std.mem.copyForwards(u8, out.items[listing_start..], out.items[listing_end..]);
-        out.items.len -= listing_end - listing_start;
+    try out.append(alloc, ']');
+    if (session.listing_summary_tail) |summary| {
+        if (out.items.len +| listing_tail_field.len +| summary.len +| 2 <= listing_limit) {
+            try out.appendSlice(alloc, listing_tail_field);
+            try out.appendSlice(alloc, summary);
+            try out.append(alloc, '"');
+        }
     }
+    try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -7699,6 +7760,35 @@ fn decodeSessionRecordForOwner(alloc: std.mem.Allocator, txn_id: db_mod.types.Tx
     return decodeSessionObject(alloc, txn_id, obj);
 }
 
+const listing_tail_field = ",\"listing_v2\":\"";
+
+/// The newest writer puts this base64 string last. A legacy record ends
+/// in the savepoint array, and nested values cannot end the root object.
+fn listingTailValue(raw: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, raw, "\"}")) return null;
+    const end = raw.len - 2;
+    const start_quote = std.mem.lastIndexOfScalar(u8, raw[0..end], '"') orelse return null;
+    const start = start_quote + 1;
+    if (start < listing_tail_field.len or !std.mem.eql(u8, raw[start - listing_tail_field.len .. start], listing_tail_field)) return null;
+    return raw[start..end];
+}
+
+fn encodeListingSummaryBytes(alloc: std.mem.Allocator, json: []const u8) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try alloc.alloc(u8, encoder.calcSize(json.len));
+    _ = encoder.encode(encoded, json);
+    return encoded;
+}
+
+fn decodeListingSummaryBytes(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(encoded) catch return error.InvalidTransactionSessionRecord;
+    const bytes = try alloc.alloc(u8, size);
+    errdefer alloc.free(bytes);
+    decoder.decode(bytes, encoded) catch return error.InvalidTransactionSessionRecord;
+    return bytes;
+}
+
 fn decodeSessionForListing(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw: []const u8, savepoint_count: *usize, summary: *?std.json.Parsed(SessionListingSummary)) !Session {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -7706,6 +7796,10 @@ fn decodeSessionForListing(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw
     var scanner = std.json.Scanner.initCompleteInput(scratch, raw);
     defer scanner.deinit();
     if (try scanner.next() != .object_begin) return error.InvalidTransactionSessionRecord;
+    if (listingTailValue(raw)) |encoded| {
+        const bytes = try decodeListingSummaryBytes(scratch, encoded);
+        summary.* = try std.json.parseFromSlice(SessionListingSummary, alloc, bytes, .{ .allocate = .alloc_always });
+    }
     var object: std.json.ObjectMap = .empty;
     var has_current_kind = false;
     while (true) {
@@ -7720,7 +7814,12 @@ fn decodeSessionForListing(alloc: std.mem.Allocator, id: db_mod.types.TxnId, raw
             std.mem.eql(u8, key, "c1")) has_current_kind = true;
         const entry = try object.getOrPut(scratch, key);
         if (entry.found_existing) return error.InvalidTransactionSessionRecord;
-        if (std.mem.eql(u8, key, "listing_v1")) {
+        if (std.mem.eql(u8, key, "listing_v2")) {
+            if (summary.* == null) return error.InvalidTransactionSessionRecord;
+            try scanner.skipValue();
+            entry.value_ptr.* = .null;
+        } else if (std.mem.eql(u8, key, "listing_v1")) {
+            if (summary.* != null) return error.InvalidTransactionSessionRecord;
             const value = try std.json.innerParse(std.json.Value, scratch, &scanner, .{
                 .allocate = .alloc_if_needed,
                 .max_value_len = raw.len,
@@ -7823,6 +7922,18 @@ fn decodeSessionObject(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, obj
         session.begin_timestamp;
     if (obj.get("staged")) |staged_value| {
         if (staged_value != .null) session.staged = try parseStoredCommitValue(alloc, staged_value);
+    }
+    if (session.staged != null) {
+        if (obj.get("listing_v2")) |summary| {
+            if (summary != .string) return error.InvalidTransactionSessionRecord;
+            session.listing_summary_tail = try alloc.dupe(u8, summary.string);
+        } else if (obj.get("listing_v1")) |summary| {
+            if (summary == .object) {
+                const json = try std.json.Stringify.valueAlloc(alloc, summary, .{});
+                defer alloc.free(json);
+                session.listing_summary_tail = try encodeListingSummaryBytes(alloc, json);
+            }
+        }
     }
     if (obj.get("commit_body_digest")) |digest_value| {
         switch (digest_value) {

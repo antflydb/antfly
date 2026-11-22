@@ -655,8 +655,11 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
         try std.testing.expectEqual(@as(u64, 0), disposition.lease_expires_at);
         try std.testing.expect((try registry.getStatusForPrincipal(alloc, txn_id, "bob")) == null);
         try std.testing.expect((try store.load(txn_id)) == null);
+        const reference: [16]u8 = @splat(digit);
+        try store.pinCompletion(txn_id, reference);
+        try std.testing.expect(try store.completionReferenceSettled(txn_id, reference));
     }
-    try std.testing.expectEqual(@as(usize, 2), try registry.cleanupExpired(alloc, std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(usize, 2), try registry.cleanupExpiredSqlAbortReceipts(alloc, std.math.maxInt(u64)));
 }
 
 test "HTTP connection reconciles a durable aborted coordinator decision" {
