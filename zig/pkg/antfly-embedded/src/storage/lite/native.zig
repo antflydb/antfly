@@ -21432,6 +21432,15 @@ pub const NativeFile = struct {
         return self.activeCheckpoint();
     }
 
+    pub fn reconcilePublicationUncertaintyForRead(self: *NativeFile) !void {
+        if (!self.checkpoint_publication_uncertain) return;
+        // A scoped reader is not a participant in writer admission. A
+        // process can hold the lease on behalf of a different store.
+        if (self.header.protected_redo and self.writer_lock_file == null)
+            return error.OutcomeReconciliationRequired;
+        try self.reconcilePublicationUncertainty();
+    }
+
     /// Resolves a `checkpoint_publication_uncertain` latch in-process, without
     /// a close+reopen, by re-reading the on-disk slot the failed publish
     /// targeted (`uncertain_slot`) and comparing it against the checkpoint
@@ -40984,6 +40993,7 @@ test "lite redo checkpoint reconciliation rejects a superseding lease publicatio
         first.redo.?.writer.capacity = first.redo.?.writer.tail;
         first.test_fail_redo_visibility = error.InputOutput;
         try std.testing.expectError(error.OutcomeUnknown, first.allocatePage("uncertain"));
+        try std.testing.expectError(error.OutcomeReconciliationRequired, first.reconcilePublicationUncertaintyForRead());
         const pinned = try first.borrowRepairLease(io);
         defer pinned.close(io);
         lease.close();

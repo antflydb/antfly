@@ -4305,7 +4305,7 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
-        if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
+        if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertaintyForRead();
         return self.file.getCatalogRecordAlloc(a, key);
     }
 
@@ -7647,7 +7647,7 @@ pub const Txn = struct {
         if (store.read_outcome_unknown) {
             if (store.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             store.read_mutex.unlock(io);
-            const reconciled = store.file.reconcilePublicationUncertainty();
+            const reconciled = store.file.reconcilePublicationUncertaintyForRead();
             store.read_mutex.lockUncancelable(io);
             try reconciled;
         }
