@@ -171,9 +171,11 @@ fixed. Active pgoutput sessions renew their one-hour history lease before
 it expires. Disconnected slots remain subject to their recorded expiry.
 
 An event that cannot fit in the 16 MiB HTTP page limit returns
-`409 changefeed_event_too_large` without advancing the cursor. Re-enroll and
-resynchronize using a narrower field selection or `keys_and_versions` for
-oversized row images. If the event fits a larger page, the server returns
+`409 changefeed_event_too_large` without advancing the cursor. Use a narrower field selection or `keys_and_versions` when re-enrolling
+for oversized row images. Native snapshot bootstrap pins up to 8 MiB of
+physical row and schema data per root. An oversized bootstrap returns
+`409 changefeed_bootstrap_too_large`. For larger roots, use a separately
+coordinated baseline and enroll a streaming feed with `start: now`. If the event fits a larger page, the server returns
 `429 changefeed_backpressure` and the same cursor can be retried with a
 larger byte limit.
 

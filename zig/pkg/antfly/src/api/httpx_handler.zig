@@ -5186,6 +5186,7 @@ pub const AntflyApiHandler = struct {
             error.ChangefeedResynchronizationRequired, error.ChangefeedCursorExpired, error.ChangefeedLeaseExpired, error.HistoryResynchronizationRequired, error.TopologyChanged, error.WalSnapshotExpired, error.WalRetentionRetired, error.LakeSnapshotRetired, error.LakeWalCoverageGap, error.LakeOverlayCoverageUnavailable => return jsonErrorResponse(ctx, 409, "changefeed_resynchronization_required"),
             error.ChangefeedConflict, error.MetadataMutationOutcomeUnknown, error.WalRetentionPositionRegressed => return jsonErrorResponse(ctx, 409, "changefeed_retry_required"),
             error.ChangefeedEventTooLarge => return jsonErrorResponse(ctx, 409, "changefeed_event_too_large"),
+            error.ChangefeedBootstrapTooLarge => return jsonErrorResponse(ctx, 409, "changefeed_bootstrap_too_large"),
             error.ChangefeedBackpressure, error.HistoryTooLarge, error.WalRetentionQuota => return jsonErrorResponse(ctx, 429, "changefeed_backpressure"),
             error.ChangefeedCapabilityUnsupported => return jsonErrorResponse(ctx, 501, "changefeed_capability_unsupported"),
             error.ReadUnavailable, error.ReadIndexTimeout, error.StorageReadTemporarilyUnavailable, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DeadlineExceeded, error.LakeSnapshotReadLeaseExpired, error.WalCommitContended, error.WalVisibilityUnavailable => return jsonErrorResponse(ctx, 503, "changefeed_unavailable"),

@@ -3820,11 +3820,11 @@ def test_public_changefeed_oversized_update_requires_narrower_projection():
                 )
                 assert response.ok, response.text
 
-            def subscribe(key, fields=None, start="now"):
+            def subscribe(key, fields=None):
                 definition = {
                     "tables": ["feed_large_event"],
                     "include": "rows",
-                    "start": start,
+                    "start": "now",
                 }
                 if fields is not None:
                     definition["selectors"] = [
@@ -3852,16 +3852,32 @@ def test_public_changefeed_oversized_update_requires_narrower_projection():
             assert "Antfly-Changefeed-Cursor" not in rejected.headers
             _changefeed_call(client, "DELETE", full_path)
 
-            narrowed = subscribe("large-narrowed", ["label"], "snapshot_then_changes")
+            too_large_bootstrap = client.post(
+                feeds,
+                headers={"Idempotency-Key": "large-bootstrap"},
+                json={
+                    "tables": ["feed_large_event"],
+                    "start": "snapshot_then_changes",
+                },
+                timeout=30,
+            )
+            assert too_large_bootstrap.status_code == 409, too_large_bootstrap.text
+            assert (
+                too_large_bootstrap.json()["error"] == "changefeed_bootstrap_too_large"
+            )
+
+            narrowed = subscribe("large-narrowed", ["label"])
             narrow_path = f"{feeds}/{narrowed['id']}"
-            snapshot = _changefeed_call(
+            write("next")
+            page = _changefeed_call(
                 client,
                 "GET",
                 f"{narrow_path}/events",
                 params={"after": narrowed["cursor"]},
             )
-            (event,) = snapshot.json()["events"]
-            assert event["after"] == {"label": "after"}
+            (event,) = page.json()["events"]
+            assert event["before"] == {"label": "after"}
+            assert event["after"] == {"label": "next"}
             _changefeed_call(client, "DELETE", narrow_path)
     finally:
         server.stop()

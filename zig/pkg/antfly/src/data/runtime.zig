@@ -1348,6 +1348,7 @@ const RaftTableApplyStateMachine = struct {
         HistoryCheckpointConflict,
         HistoryFull,
         HistoryPreparedTransactionsPresent,
+        HistoryTooLarge,
         SourceOutcomeUnresolved,
         InvalidSourceAdmission,
         SourceReceiptExpired,
@@ -1379,6 +1380,7 @@ const RaftTableApplyStateMachine = struct {
                 error.HistoryCheckpointConflict => .HistoryCheckpointConflict,
                 error.HistoryFull => .HistoryFull,
                 error.HistoryPreparedTransactionsPresent => .HistoryPreparedTransactionsPresent,
+                error.HistoryTooLarge => .HistoryTooLarge,
                 error.SourceOutcomeUnresolved => .SourceOutcomeUnresolved,
                 error.InvalidSourceAdmission => .InvalidSourceAdmission,
                 error.SourceReceiptExpired => .SourceReceiptExpired,
@@ -1448,6 +1450,7 @@ const RaftTableApplyStateMachine = struct {
                 .HistoryCheckpointConflict => error.HistoryCheckpointConflict,
                 .HistoryFull => error.HistoryFull,
                 .HistoryPreparedTransactionsPresent => error.HistoryPreparedTransactionsPresent,
+                .HistoryTooLarge => error.HistoryTooLarge,
                 .SourceOutcomeUnresolved => error.SourceOutcomeUnresolved,
                 .InvalidSourceAdmission => error.InvalidSourceAdmission,
                 .SourceReceiptExpired => error.SourceReceiptExpired,
@@ -2108,7 +2111,10 @@ const RaftTableApplyStateMachine = struct {
         };
         switch (outcome) {
             .applied => {},
-            .rejected => |reason| self.recordApplyFailure(group_id, index, term, ExpectedApplyFailure.fromError(reason.asError()).?),
+            .rejected => |reason| {
+                const failure = ExpectedApplyFailure.fromError(reason.asError()) orelse return error.InvalidHistoryControlWire;
+                self.recordApplyFailure(group_id, index, term, failure);
+            },
             // The marker proves application, not its old result. Require the
             // proposer to recover the live lease rather than reporting success.
             .superseded => self.recordApplyFailure(group_id, index, term, .SourceOutcomeUnresolved),

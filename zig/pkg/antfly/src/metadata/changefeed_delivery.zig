@@ -149,15 +149,26 @@ pub fn pull(svc: anytype, adapter: anytype, a: A, id: control.Id, before: contro
 /// This commits only the client ACK. A separate owner reconciliation propagates
 /// observed metadata progress to roots and performs bounded physical GC.
 pub fn acknowledge(svc: anytype, adapter: anytype, a: A, id: control.Id, cursor: control.Digest, request: anytype) !control.Parsed {
-    var before = try load(svc, a, id, request);
-    defer before.deinit();
-    _ = try active(adapter, before.value, request);
-    try mutate(svc, a, before.value, .{ .acknowledge = cursor }, request);
-    var observed = try load(svc, a, id, request);
-    errdefer observed.deinit();
-    _ = try active(adapter, observed.value, request);
-    if (observed.value.epoch != before.value.epoch or !equal(observed.value.acknowledged_cursor, cursor)) return error.MetadataMutationOutcomeUnknown;
-    return observed;
+    for (0..4) |_| {
+        var before = try load(svc, a, id, request);
+        defer before.deinit();
+        _ = try active(adapter, before.value, request);
+        mutate(svc, a, before.value, .{ .acknowledge = cursor }, request) catch |err| switch (err) {
+            error.ChangefeedConflict => continue,
+            error.MetadataMutationOutcomeUnknown => {},
+            else => return err,
+        };
+        var observed = try load(svc, a, id, request);
+        errdefer observed.deinit();
+        _ = try active(adapter, observed.value, request);
+        if (observed.value.epoch != before.value.epoch or !equal(observed.value.authority, before.value.authority))
+            return error.ChangefeedResynchronizationRequired;
+        if (equal(observed.value.acknowledged_cursor, cursor)) return observed;
+        if (observed.value.acknowledged_delivery > before.value.acknowledged_delivery)
+            return error.ChangefeedCursorExpired;
+        observed.deinit();
+    }
+    return error.MetadataMutationOutcomeUnknown;
 }
 
 const TestRequest = struct {
@@ -278,8 +289,10 @@ test "feed delivery recovers lost metadata reply by replaying exact issued paylo
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, pull(&svc, &adapter, a, initial.value.id, cursor, .{}, TestRequest{}));
     adapter.tamper = false;
     try std.testing.expectError(error.ChangefeedBackpressure, pull(&svc, &adapter, a, initial.value.id, cursor, .{ .bytes = 1 }, TestRequest{}));
+    svc.lose_ack = true;
     var acknowledged = try acknowledge(&svc, &adapter, a, initial.value.id, recovered.cursor, TestRequest{});
     defer acknowledged.deinit();
+    svc.lose_ack = false;
     try std.testing.expectEqual(@as(u64, 1), acknowledged.value.roots[0].acknowledged.sequence);
     try std.testing.expectEqual(@as(u64, 0), acknowledged.value.roots[0].reclaimed_through);
     try std.testing.expectError(error.ChangefeedCursorExpired, pull(&svc, &adapter, a, initial.value.id, cursor, .{}, TestRequest{}));

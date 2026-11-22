@@ -198,33 +198,7 @@ fn executeIceberg(client: *config.Client, a: A, selection: Selection, limits: ?d
     var acknowledged = try delivery.acknowledge(client, &scheduler, a, selection.id, selection.after, request);
     defer acknowledged.deinit();
     const confirmed = acknowledged.value;
-    if (confirmed.phase == .bootstrap and confirmed.bootstrapComplete()) {
-        try change(client, a, confirmed, .{ .finish_verified_bootstrap = .{ .proof = try confirmed.bootstrapCompletionProof() } }, request);
-    }
-    if (confirmed.pendingCatalogAcknowledgment() != null) {
-        const owner = CatalogFeedOwner.local(policy.api);
-        try settleCatalogAcknowledgment(client, a, confirmed, owner, request);
-    }
-    if (native_factory) |factory| {
-        var refreshed = try load(client, a, confirmed.id, request);
-        defer refreshed.deinit();
-        const live = refreshed.value;
-        if (live.epoch != confirmed.epoch or !same(live.authority, confirmed.authority)) return error.ChangefeedResynchronizationRequired;
-        if (live.phase == .streaming) {
-            var driver: RootPolicy(Policy) = .{ .access = policy.*, .io = policy.api.inferenceIo(), .source = factory.source, .allocator = a };
-            for (live.roots) |item| {
-                if (item.released or isIcebergRoot(live.definition.?, item.namespace)) continue;
-                if (item.snapshot != null and !item.snapshot_released) {
-                    try releaseStreamingSnapshot(client, &driver, a, live, try factory.captured.findInstalled(item), request);
-                    break;
-                }
-            }
-            for (live.roots) |item| {
-                if (item.released or isIcebergRoot(live.definition.?, item.namespace)) continue;
-                _ = try source_api.flushAcknowledged(client, &driver, a, live, try factory.captured.findInstalled(item), request);
-            }
-        }
-    }
+    try finishAcknowledgedBootstrap(client, a, confirmed, request);
     return .{ .acknowledged = confirmed.acknowledged_cursor };
 }
 
@@ -763,32 +737,25 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         return .{ .page = try delivery.pull(&client, &provider, a, selection.id, selection.after, bounds, internal) };
     var confirmed = try delivery.acknowledge(&client, &provider, a, selection.id, selection.after, internal);
     defer confirmed.deinit();
-    var driver_policy: RootPolicy(Policy) = .{ .access = policy, .io = api.inferenceIo(), .source = source, .allocator = a };
-    var active = confirmed.value;
-    var cutover: ?control.Parsed = null;
-    defer if (cutover) |*parsed| parsed.deinit();
-    if (active.phase == .bootstrap) {
-        if (!active.bootstrapComplete())
-            return .{ .acknowledged = active.acknowledged_cursor };
-        try change(&client, a, active, .{ .finish_verified_bootstrap = .{ .proof = try active.bootstrapCompletionProof() } }, internal);
-        cutover = try load(&client, a, selection.id, internal);
-        active = cutover.?.value;
-        if (active.phase != .streaming or active.epoch != confirmed.value.epoch or !same(active.acknowledged_cursor, selection.after))
-            return error.MetadataMutationOutcomeUnknown;
-    }
-    for (active.roots) |item| {
-        if (item.released) continue;
-        const root = try captured.findInstalled(item);
-        if (item.snapshot == null or item.snapshot_released) continue;
-        try releaseStreamingSnapshot(&client, &driver_policy, a, active, root, internal);
-        break; // Maintenance resumes any remaining releases against fresh metadata.
-    }
-    for (active.roots) |item| {
-        if (item.released) continue;
-        const root = try captured.findInstalled(item);
-        _ = try source_api.flushAcknowledged(&client, &driver_policy, a, active, root, internal);
-    }
+    try finishAcknowledgedBootstrap(&client, a, confirmed.value, internal);
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
+}
+
+fn finishAcknowledgedBootstrap(client: *config.Client, a: A, confirmed: control.State, request: Context) !void {
+    if (confirmed.phase != .bootstrap or !confirmed.bootstrapComplete()) return;
+    change(client, a, confirmed, .{ .finish_verified_bootstrap = .{ .proof = try confirmed.bootstrapCompletionProof() } }, request) catch |err| switch (err) {
+        error.ChangefeedConflict, error.MetadataMutationOutcomeUnknown => {
+            var observed = try load(client, a, confirmed.id, request);
+            defer observed.deinit();
+            if (observed.value.epoch != confirmed.epoch or !same(observed.value.authority, confirmed.authority))
+                return error.ChangefeedResynchronizationRequired;
+            // A racing maintenance owner may already have finished this cut.
+            // If it hasn't, the committed ACK keeps the cut eligible for retry.
+            if (observed.value.phase != .streaming and observed.value.phase != .bootstrap)
+                return error.ChangefeedResynchronizationRequired;
+        },
+        else => return err,
+    };
 }
 
 pub fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, parsed: *control.Parsed, cursor: control.Digest, request: Context) !void {
@@ -1243,6 +1210,18 @@ fn createMetadataEventFeed(a: A, policy: *Policy, meta: config.Port, key: []cons
     return error.MetadataMutationOutcomeUnknown;
 }
 
+fn enrollPublicRoot(client: *config.Client, policy: *RootPolicy(Policy), a: A, state: control.State, route: source_api.Root, policy_revision: u64, request: Context) !void {
+    source_api.enrollRoot(client, policy, a, state, route, policy_revision, request) catch |err| {
+        if (err != error.HistoryTooLarge) return err;
+        var observed = try load(client, a, state.id, request);
+        defer observed.deinit();
+        const current = observed.value;
+        if (current.epoch != state.epoch or !same(current.authority, state.authority)) return error.ChangefeedResynchronizationRequired;
+        if (current.phase == .enrolling) try change(client, a, current, .{ .reset = .quota }, request);
+        return error.ChangefeedBootstrapTooLarge;
+    };
+}
+
 fn createIceberg(a: A, policy: *Policy, meta: config.Port, key: []const u8, definition: control.Definition, lease_seconds: u64, factory: ?RoutedFactory, request: Context) !Created {
     try policy.authorize(.{ .definition = definition }, request);
     const api = policy.api;
@@ -1314,6 +1293,7 @@ fn createIceberg(a: A, policy: *Policy, meta: config.Port, key: []const u8, defi
             } }, request);
             continue;
         }
+        if (state.phase == .reset_required and state.reset_reason == .quota) return error.ChangefeedBootstrapTooLarge;
         if (state.phase != .enrolling) return error.ChangefeedResynchronizationRequired;
         if (state.roots.len == 0) {
             try change(&client, a, state, .{ .plan_roots = plans.items }, request);
@@ -1329,7 +1309,7 @@ fn createIceberg(a: A, policy: *Policy, meta: config.Port, key: []const u8, defi
                     if (table.table_id == route.fence.table_id) break table;
                 } else return error.ChangefeedResynchronizationRequired;
                 var native_policy: RootPolicy(Policy) = .{ .access = policy.*, .io = api.inferenceIo(), .source = provider.source, .allocator = a };
-                try source_api.enrollRoot(&client, &native_policy, a, state, route, selected.policy_revision, request);
+                try enrollPublicRoot(&client, &native_policy, a, state, route, selected.policy_revision, request);
                 continue;
             }
         }
@@ -1601,6 +1581,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
             } }, internal);
             continue;
         }
+        if (state.phase == .reset_required and state.reset_reason == .quota) return error.ChangefeedBootstrapTooLarge;
         if (state.phase != .enrolling) return error.ChangefeedResynchronizationRequired;
         if (state.roots.len == 0) {
             const plans = try captured.initialPlans(scratch);
@@ -1615,7 +1596,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
             const table = for (tables) |table| {
                 if (table.table_id == route.fence.table_id) break table;
             } else return error.ChangefeedResynchronizationRequired;
-            try source_api.enrollRoot(&client, &policy, a, state, route, table.policy_revision, internal);
+            try enrollPublicRoot(&client, &policy, a, state, route, table.policy_revision, internal);
             continue;
         }
         if (state.roots.len == 1) {
