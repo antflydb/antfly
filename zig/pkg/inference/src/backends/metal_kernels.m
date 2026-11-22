@@ -56184,6 +56184,10 @@ int termite_metal_decode_runtime_gemm_f32_device(
     }
 }
 
+int termite_metal_decode_runtime_dot_general_2d_f32_ready(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL && runtime->dot_general_2d_f32_pipeline != nil;
+}
+
 int termite_metal_decode_runtime_dot_general_2d_f32_device(
     termite_metal_decode_runtime *runtime,
     void *lhs_handle,

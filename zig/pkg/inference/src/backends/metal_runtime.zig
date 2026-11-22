@@ -23276,6 +23276,7 @@ pub extern fn termite_metal_decode_runtime_transpose_f32_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_dot_general_2d_f32_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_dot_general_2d_f32_device(
     runtime: ?*RawMetalDecodeRuntime,
     lhs_handle: ?*anyopaque,

@@ -11933,7 +11933,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return switch (descriptor.operation) {
             // Slot-prepared linears, dot vendor schedules, and data-dependent
             // gathers need separate provider contracts.
-            .linear, .dot, .gather => false,
+            .linear, .gather => false,
+            .dot => |dot| (dot.m < 8 or dot.n < 128 or dot.k < 128) and
+                metal_runtime.termite_metal_decode_runtime_dot_general_2d_f32_ready(self.provider_impl.raw_decode_runtime) != 0,
             .norm => |norm| norm.kind == .rms and !disableRuntimeElementwise() and
                 descriptor.input_shapes[0].eq(descriptor.output_shape) and
                 (!(self.require_f32_linears and norm.dim % 4 == 0 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) or
@@ -12966,7 +12968,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (out_buf.integer_storage or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
         const out_tensor = out_buf.metal_tensor orelse return error.InvalidTensorShape;
         if (!out_tensor.isDevice() or out_tensor.dtype != .f32 or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
-        if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .rope) {
+        if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope) {
             for (request.inputs) |source| {
                 const tensor = toBuf(source).metal_tensor.?;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;

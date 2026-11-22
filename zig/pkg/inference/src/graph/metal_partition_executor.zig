@@ -1600,6 +1600,7 @@ pub const MetalPartitionExecutor = struct {
     pub fn attestOwnedFrameDispatch(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32) !bool {
         if (!ownsPartition(actual, graph, backend) or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return false;
         const self: *MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
+        var saw_dot = false;
         for (nodes) |id| {
             if (id >= reachable.len) return false;
             if (!reachable[id]) continue;
@@ -1629,7 +1630,13 @@ pub const MetalPartitionExecutor = struct {
             // the route separately verifies its exact specialized pipeline.
             const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
             if (descriptor) |value| switch (value.operation) {
-                .linear, .dot, .gather => return false,
+                .linear, .gather => return false,
+                .dot => {
+                    // A terminal standalone dot cannot be subsumed by a
+                    // neighboring projection or grouped head schedule.
+                    if (saw_dot or std.mem.indexOfScalar(NodeId, graph.outputs.items, id) == null) return false;
+                    saw_dot = true;
+                },
                 .norm => |norm| if (norm.kind != .rms) return false,
                 else => {},
             } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
