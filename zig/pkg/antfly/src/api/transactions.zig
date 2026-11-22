@@ -10869,7 +10869,7 @@ test "SQL session metadata for a retained reader checks the shared session and l
     const packed_session = try encodeSessionRecord(a, attached);
     defer a.free(packed_session);
     var lifecycle_prefix = PrefixOnly{ .prefix = packed_session[0..connection_prefix_len] };
-    const lifecycle = (try durable.connectionLifecycleTxn(&lifecycle_prefix, id)).?;
+    const lifecycle = (try durable.connectionLifecycleTxn(&lifecycle_prefix, id, false)).?;
     try std.testing.expectEqualDeep(DurableSessionStore.Version.of(attached), lifecycle.version);
     try std.testing.expectEqual(attached.connection_id, lifecycle.connection_id);
     try std.testing.expect(!lifecycle.terminal);
