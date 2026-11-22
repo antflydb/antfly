@@ -600,6 +600,9 @@ const FdEntry = struct {
     identity: file_identity.NativeFileIdentity,
     fd: std.posix.fd_t,
     refs: usize = 0,
+    // An open after a path race may duplicate this process's fd for the
+    // inode. POSIX releases its record locks if either descriptor closes.
+    spare_descriptors: ?*FdEntry = null,
     /// Liveness slot indices *this process* has already claimed through
     /// some `Region` handle sharing this entry. `fcntl` locks are
     /// process-scoped, not per-claim: a second same-process attempt to
@@ -628,6 +631,8 @@ const FdEntry = struct {
 // appropriate here the same way it is in `inode_lock.zig`'s own `open`.
 var fd_registry_mutex: Io.Mutex = .init;
 var fd_registry: std.AutoHashMapUnmanaged(file_identity.NativeFileIdentity, *FdEntry) = .empty;
+// An fd whose identity could not be read may belong to any live entry.
+var unidentified_descriptors: ?*FdEntry = null;
 
 /// Resolves `db_path` to an absolute, symlink-resolved path before
 /// `openSized` derives its own `<db_path>.aflite-lock` sidecar name from
@@ -696,20 +701,48 @@ fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
             return entry;
         }
     } else |err| if (err != error.FileNotFound) return RegionError.RegionUnavailable;
-    // Opened read-write, close-on-exec so a forked-and-exec'd child never
-    // inherits a stale mapping/lock-backing descriptor. Created here, not
-    // by a separate open: this process holds no fd on the file yet.
-    const raw_fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600) catch return RegionError.RegionUnavailable;
-    errdefer _ = std.posix.system.close(raw_fd);
-    const identity = file_identity.nativeFileIdentity(raw_fd) catch return RegionError.RegionUnavailable;
     const page = std.heap.page_allocator;
-    const entry = page.create(FdEntry) catch return RegionError.RegionUnavailable;
-    entry.* = .{ .identity = identity, .fd = raw_fd, .refs = 1 };
-    fd_registry.put(page, identity, entry) catch {
-        page.destroy(entry);
+    // Reserve memory before opening a descriptor we might be unable to
+    // close without dropping another handle's process-scoped locks.
+    fd_registry.ensureUnusedCapacity(page, 1) catch return RegionError.RegionUnavailable;
+    const pending = page.create(FdEntry) catch return RegionError.RegionUnavailable;
+    const raw_fd = std.posix.openat(std.posix.AT.FDCWD, region_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600) catch {
+        page.destroy(pending);
         return RegionError.RegionUnavailable;
     };
-    return entry;
+    return registerOpenedProcessFd(pending, raw_fd);
+}
+
+// Caller holds fd_registry_mutex and has reserved one free registry slot.
+fn registerOpenedProcessFd(pending: *FdEntry, raw_fd: std.posix.fd_t) RegionError!*FdEntry {
+    pending.* = .{ .identity = undefined, .fd = raw_fd, .refs = 1 };
+    const identity = file_identity.nativeFileIdentity(raw_fd) catch {
+        if (fd_registry.count() == 0) {
+            closeSpareDescriptors(pending);
+        } else {
+            pending.spare_descriptors = unidentified_descriptors;
+            unidentified_descriptors = pending;
+        }
+        return RegionError.RegionUnavailable;
+    };
+    pending.identity = identity;
+    if (fd_registry.get(identity)) |entry| {
+        pending.spare_descriptors = entry.spare_descriptors;
+        entry.spare_descriptors = pending;
+        entry.refs += 1;
+        return entry;
+    }
+    fd_registry.putAssumeCapacity(identity, pending);
+    return pending;
+}
+
+fn closeSpareDescriptors(head: ?*FdEntry) void {
+    var next = head;
+    while (next) |descriptor| {
+        next = descriptor.spare_descriptors;
+        _ = std.posix.system.close(descriptor.fd);
+        std.heap.page_allocator.destroy(descriptor);
+    }
 }
 
 /// Drops this process's reference to `entry`, actually closing its fd
@@ -724,6 +757,11 @@ fn releaseProcessFd(io: Io, entry: *FdEntry) void {
     if (entry.refs == 0) {
         _ = std.posix.system.close(entry.fd);
         _ = fd_registry.remove(entry.identity);
+        closeSpareDescriptors(entry.spare_descriptors);
+        if (fd_registry.count() == 0) {
+            closeSpareDescriptors(unidentified_descriptors);
+            unidentified_descriptors = null;
+        }
         entry.claimed_slots.deinit(std.heap.page_allocator);
         std.heap.page_allocator.destroy(entry);
     }
@@ -3435,6 +3473,42 @@ test "shared lock region: reader slots are visible across a second handle" {
 // child), since that's the only way to actually observe whether a
 // liveness byte is still held (the self-slot guard in `isSlotDead` means
 // this same process can never usefully probe its own slots).
+test "shared lock region: post-open identity collision retains the registered descriptor" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const path = try std.fs.path.join(a, &.{ buf[0..dir_len], "descriptor-collision.lock" });
+    defer a.free(path);
+
+    const first = try acquireProcessFd(io, path);
+    defer releaseProcessFd(io, first);
+    const attached = attach: {
+        fd_registry_mutex.lockUncancelable(io);
+        defer fd_registry_mutex.unlock(io);
+        try fd_registry.ensureUnusedCapacity(std.heap.page_allocator, 1);
+        const pending = try std.heap.page_allocator.create(FdEntry);
+        const duplicate = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch |err| {
+            std.heap.page_allocator.destroy(pending);
+            return err;
+        };
+        break :attach try registerOpenedProcessFd(pending, duplicate);
+    };
+    {
+        defer releaseProcessFd(io, attached);
+        try std.testing.expect(attached == first);
+    }
+
+    fd_registry_mutex.lockUncancelable(io);
+    defer fd_registry_mutex.unlock(io);
+    try std.testing.expect(fd_registry.get(first.identity).? == first);
+    const spare = first.spare_descriptors orelse return error.MissingSpareDescriptor;
+    try std.testing.expectEqual(first.identity, try file_identity.nativeFileIdentity(spare.fd));
+    try std.testing.expectEqual(@as(usize, 1), first.refs);
+}
+
 test "shared lock region: closing one of two same-process handles does not drop the other's liveness lock" {
     if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;

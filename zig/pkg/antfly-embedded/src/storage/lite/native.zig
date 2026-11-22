@@ -10892,14 +10892,20 @@ pub const NativeFile = struct {
         const sidecar = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return error.OutcomeReconciliationRequired;
         defer sidecar.close(io);
         const identity = sidecarIdentity(sidecar) orelse return error.OutcomeReconciliationRequired;
-        own_sidecar_locks.mutex.lockUncancelable(io);
-        defer own_sidecar_locks.mutex.unlock(io);
-        const lease = own_sidecar_locks.held.get(identity) orelse return error.OutcomeReconciliationRequired;
-        // The registered owner closes its descriptor only after removing
-        // the registration. The duplicate keeps its flock if it closes.
-        const descriptor = std.c.fcntl(lease.file.handle, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
-        if (descriptor < 0) return error.OutcomeReconciliationRequired;
-        return .{ .handle = descriptor, .flags = lease.file.flags };
+        const borrowed: std.Io.File = duplicate: {
+            own_sidecar_locks.mutex.lockUncancelable(io);
+            defer own_sidecar_locks.mutex.unlock(io);
+            const lease = own_sidecar_locks.held.get(identity) orelse return error.OutcomeReconciliationRequired;
+            // The registered owner removes its token before closing. The
+            // duplicate keeps the flock throughout the identity check.
+            const descriptor = std.c.fcntl(lease.file.handle, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
+            if (descriptor < 0) return error.OutcomeReconciliationRequired;
+            break :duplicate .{ .handle = descriptor, .flags = lease.file.flags };
+        };
+        errdefer borrowed.close(io);
+        const current = storage_file_identity.nativePathIdentity(self.path) catch return error.OutcomeReconciliationRequired;
+        if (!std.meta.eql(self.dataIdentity(), @as(?inode_lock.FileIdentity, current))) return error.OutcomeReconciliationRequired;
+        return borrowed;
     }
 
     fn holdSidecarReadFence(self: *NativeFile, io: std.Io) union(enum) { held: std.Io.File, own, absent, busy } {
