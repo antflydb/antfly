@@ -17576,6 +17576,9 @@ pub const DataServer = struct {
         };
         try self.requireReplicatedTransitionActionActive(source_group_id);
         phase = "destination completion checkpoint";
+        std.log.debug("split completion history policy transition_id={} destination_group_id={} inherited={}", .{
+            transition_id, destination_group_id, history_policy != null,
+        });
         try self.replicateSplitDestinationCheckpoint(
             destination_group_id,
             table_contract.table_name,

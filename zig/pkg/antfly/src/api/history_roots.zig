@@ -382,7 +382,11 @@ pub const Source = struct {
         } } };
         const observed = try self.controls.execute(a, successor.fence, successor.table_name, inspect, context);
         if (!observed.confirmed()) return error.RaftBatchWriteOutcomeUnknown;
-        if (observed.outcome.? == .rejected) return observed.outcome.?.rejected.asError();
+        if (observed.outcome.? == .rejected) {
+            const err = observed.outcome.?.rejected.asError();
+            std.log.debug("split successor history control rejected phase=inspect_policy group={} err={s}", .{ successor.fence.route.group_id, @errorName(err) });
+            return err;
+        }
         const policy = observed.outcome.?.applied.policy orelse return error.HistoryCorrupt;
         const command: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .enroll = .{
             .namespace = root.storageNamespace(),
@@ -404,7 +408,11 @@ pub const Source = struct {
         } } };
         const enrolled = try self.controls.execute(a, successor.fence, successor.table_name, command, context);
         if (!enrolled.confirmed()) return error.RaftBatchWriteOutcomeUnknown;
-        if (enrolled.outcome.? == .rejected) return enrolled.outcome.?.rejected.asError();
+        if (enrolled.outcome.? == .rejected) {
+            const err = enrolled.outcome.?.rejected.asError();
+            std.log.debug("split successor history control rejected phase=enroll group={} err={s}", .{ successor.fence.route.group_id, @errorName(err) });
+            return err;
+        }
         const consumer = enrolled.outcome.?.applied.consumer orelse return error.HistoryCorrupt;
         if (consumer.start != 0 or consumer.policy_revision != table.policy_revision or
             !std.mem.eql(u8, &consumer.id, &command.command.enroll.consumer))
