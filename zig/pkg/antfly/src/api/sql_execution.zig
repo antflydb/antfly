@@ -3671,9 +3671,11 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
                 const lose_ack = self.lose_ack_at == self.writes;
                 if (lose_ack and !self.apply_lost_write) return error.TestLostAcknowledgement;
                 var write = try self.store.beginWrite();
-                errdefer write.abort();
+                var active = true;
+                defer if (active) write.abort();
                 const applied = try records.apply(&write, std.testing.allocator, group, bytes);
                 try write.commit();
+                active = false;
                 if (lose_ack) return error.TestLostAcknowledgement;
                 return applied;
             }
