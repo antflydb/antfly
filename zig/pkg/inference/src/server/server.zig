@@ -49519,7 +49519,7 @@ test "named hosted extractor validates upstream output and advertises its capabi
     try group.concurrent(io, Fixture.serve, .{&upstream});
 
     const config = try std.fmt.allocPrint(scratch,
-        \\{{"method":"generated","generator":{{"provider":"openai","model":"local-extractor","url":null,"api_url":"{s}/v1","max_tokens":256}},"schema":{{"entities":["invoice_number"]}},"probabilities":"verdict_only","batch":{{"max_items_per_call":1}}}}
+        \\{{"method":"generated","generator":{{"provider":"openai","model":"local-extractor","api_url":"{s}/v1","max_tokens":256}},"schema":{{"entities":["invoice_number"]}},"probabilities":"verdict_only","batch":{{"max_items_per_call":1}}}}
     , .{upstream.baseUrl()});
     const entry = try NamedGeneratedExtractor.parse(scratch, "invoice", try std.json.parseFromSliceLeaky(std.json.Value, scratch, config, .{}));
     var node = try Node.init(a, .{
