@@ -142,6 +142,16 @@ pub const Participant = struct {
 };
 /// Frozen before prepare. The final commit version is chosen only after votes;
 /// it must not be guessed or folded into the source admission fingerprint.
+/// The physical owner key orders equal storage namespaces by Raft group.
+pub fn ownerLessThan(left: RoutedOwner, right: RoutedOwner) bool {
+    return switch (std.mem.order(u8, &left.namespace, &right.namespace)) {
+        .lt => true,
+        .gt => false,
+        .eq => left.group_id < right.group_id,
+    };
+}
+
+pub const physical_participant_version = 4;
 pub const Admission = struct {
     version: u16 = 1,
     transaction_id: [16]u8,
@@ -158,24 +168,30 @@ pub const Admission = struct {
         try self.validate();
         if (encoded_admission_bytes > max_bytes) return error.HistoryTooLarge;
         var certificate: u64 = 4096;
-        for (self.participants) |participant| certificate += @as(u64, if (self.version == 3) 4096 else if (self.version == 2) 768 else 512) + 6 * @as(u64, @intCast(participant.locator.len)) + 2048;
+        for (self.participants) |participant| certificate += @as(u64, if (self.version >= 3) 4096 else if (self.version == 2) 768 else 512) + 6 * @as(u64, @intCast(participant.locator.len)) + 2048;
         if (certificate > max_bytes) return error.HistoryTooLarge;
         return certificate + encoded_admission_bytes + 128;
     }
     pub fn validate(self: Admission) !void {
-        if ((self.version != 1 and self.version != 2 and self.version != 3) or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
+        if ((self.version < 1 or self.version > physical_participant_version) or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
         for (self.participants, 0..) |participant, i| {
             try participant.validate();
             if (self.version == 1) {
                 // Legacy hashes never authenticated an input digest.
                 if (participant.input_digest != null) return error.InvalidTxnRecord;
             } else if (participant.input_digest == null or !nonzero(participant.input_digest.?)) return error.InvalidTxnRecord;
-            if (self.version == 3) {
+            if (self.version >= 3) {
                 const owner = participant.routed_owner orelse return error.InvalidTxnRecord;
                 try owner.validate();
                 if (!same(owner.namespace, participant.namespace) or !same(owner.digest(), participant.owner_fence)) return error.InvalidTxnRecord;
             } else if (participant.routed_owner != null) return error.InvalidTxnRecord;
-            if (i != 0 and std.mem.order(u8, &self.participants[i - 1].namespace, &participant.namespace) != .lt) return error.InvalidTxnRecord;
+            if (i == 0) continue;
+            const previous = self.participants[i - 1];
+            const ordered = if (self.version == physical_participant_version)
+                ownerLessThan(previous.routed_owner.?, participant.routed_owner.?)
+            else
+                std.mem.order(u8, &previous.namespace, &participant.namespace) == .lt;
+            if (!ordered) return error.InvalidTxnRecord;
         }
         _ = self.findFenced(self.coordinator_namespace, self.coordinator_fence) orelse return error.InvalidTxnRecord;
     }
@@ -187,7 +203,11 @@ pub const Admission = struct {
             switch (std.mem.order(u8, &self.participants[mid].namespace, &namespace)) {
                 .lt => low = mid + 1,
                 .gt => high = mid,
-                .eq => return self.participants[mid],
+                .eq => {
+                    if ((mid > 0 and same(self.participants[mid - 1].namespace, namespace)) or
+                        (mid + 1 < self.participants.len and same(self.participants[mid + 1].namespace, namespace))) return null;
+                    return self.participants[mid];
+                },
             }
         }
         return null;
@@ -207,19 +227,24 @@ pub const Admission = struct {
         try self.validate();
         return self.find(namespace) orelse error.InvalidParticipant;
     }
-    pub fn requireRoutedOwner(self: Admission, owner: RoutedOwner) !void {
+    pub fn memberForOwner(self: Admission, owner: RoutedOwner) !Participant {
         try self.validate();
         try owner.validate();
         if (self.version < 2) return error.ChangefeedCapabilityUnsupported;
-        if (self.findFenced(owner.namespace, owner.digest()) != null) return;
-        if (self.find(owner.namespace) == null) return error.InvalidParticipant;
-        return error.TopologyChanged;
+        if (self.findFenced(owner.namespace, owner.digest())) |participant| return participant;
+        for (self.participants) |participant| {
+            if (same(participant.namespace, owner.namespace)) return error.TopologyChanged;
+        }
+        return error.InvalidParticipant;
+    }
+    pub fn requireRoutedOwner(self: Admission, owner: RoutedOwner) !void {
+        _ = try self.memberForOwner(owner);
     }
     /// Recovery may use this identity only with its original authoritative
     /// route fence and retained native evidence; it is not a fresh owner lease.
     pub fn recoveryOwner(self: Admission, namespace: Namespace) !RoutedOwner {
         try self.validate();
-        if (self.version != 3) return error.ChangefeedCapabilityUnsupported;
+        if (self.version < 3) return error.ChangefeedCapabilityUnsupported;
         return (try self.member(namespace)).routed_owner.?;
     }
     /// `encoded_input` must be the canonical private PREPARE encoding captured
@@ -239,6 +264,7 @@ pub const Admission = struct {
     pub fn digest(self: Admission) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
         sha.update(switch (self.version) {
+            physical_participant_version => "antfly:transaction-completion-admission:v4",
             3 => "antfly:transaction-completion-admission:v3",
             2 => "antfly:transaction-completion-admission:v2",
             else => "antfly:transaction-completion-admission:v1",
@@ -307,6 +333,7 @@ pub const Manifest = struct {
     pub fn digest(self: Manifest) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
         sha.update(switch (self.version) {
+            physical_participant_version => "antfly:transaction-completion-manifest:v4",
             3 => "antfly:transaction-completion-manifest:v3",
             2 => "antfly:transaction-completion-manifest:v2",
             else => "antfly:transaction-completion-manifest:v1",
@@ -378,17 +405,8 @@ pub const Resolution = struct {
     }
     pub fn validate(self: Resolution, manifest: Manifest) !void {
         try manifest.validate();
-        var low: usize = 0;
-        var high = manifest.participants.len;
-        while (low < high) {
-            const mid = low + (high - low) / 2;
-            switch (std.mem.order(u8, &manifest.participants[mid].namespace, &self.namespace)) {
-                .lt => low = mid + 1,
-                .gt => high = mid,
-                .eq => return self.validateBound(manifest.digest(), manifest.commit_version, manifest.participants[mid]),
-            }
-        }
-        return error.InvalidTxnRecord;
+        const participant = manifest.admission().findFenced(self.namespace, self.owner_fence) orelse return error.InvalidTxnRecord;
+        return self.validateBound(manifest.digest(), manifest.commit_version, participant);
     }
     fn validateBound(self: Resolution, manifest_digest: Digest, commit_version: u64, participant: Participant) !void {
         try self.validateStructural();
@@ -478,6 +496,8 @@ pub const Certificate = struct {
             while (resolution_index < self.resolutions.len and std.mem.order(u8, &self.resolutions[resolution_index].namespace, &namespace) == .lt) : (resolution_index += 1) {}
             effect.* = null;
             if (resolution_index < self.resolutions.len and same(self.resolutions[resolution_index].namespace, namespace)) {
+                if (resolution_index + 1 < self.resolutions.len and same(self.resolutions[resolution_index + 1].namespace, namespace))
+                    return error.InvalidTxnRecord;
                 effect.* = switch (self.resolutions[resolution_index].outcome) {
                     .effects => |value| value,
                     .no_effect => null,
@@ -491,7 +511,7 @@ pub const Certificate = struct {
         if (namespaces.len == 0 or namespaces.len > max_projection_roots or groups.len != namespaces.len or effects.len != namespaces.len)
             return error.InvalidTxnRecord;
         try self.validate();
-        if (self.manifest.version != 3) return error.ChangefeedCapabilityUnsupported;
+        if (self.manifest.version < 3) return error.ChangefeedCapabilityUnsupported;
         for (namespaces, groups, effects, 0..) |namespace, group, *effect, index| {
             if (!nonzero(namespace) or (group != 0 and std.mem.indexOfScalar(u64, groups[0..index], group) != null))
                 return error.InvalidTxnRecord;
@@ -786,4 +806,47 @@ test "completion admission v3 retains authenticated original owners through rest
     const old_bytes = try encodeAdmission(a, admission);
     defer a.free(old_bytes);
     try std.testing.expect(std.mem.indexOf(u8, old_bytes, "routed_owner") == null);
+}
+
+test "physical completion retains two participants that share a document namespace" {
+    const a = std.testing.allocator;
+    const left: RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 7, .group_id = 9, .topology_epoch = 4 };
+    var right = left;
+    right.group_id = 10;
+    const members = [_]Participant{
+        .{ .namespace = left.namespace, .owner_fence = left.digest(), .input_digest = @splat(4), .roles = Roles.effects, .locator = "left", .routed_owner = left },
+        .{ .namespace = right.namespace, .owner_fence = right.digest(), .input_digest = @splat(5), .roles = Roles.guards, .locator = "right", .routed_owner = right },
+    };
+    var admission: Admission = .{ .version = 3, .transaction_id = @splat(6), .admission_digest = @splat(7), .coordinator_namespace = right.namespace, .coordinator_fence = right.digest(), .participants = &members };
+    try std.testing.expectError(error.InvalidTxnRecord, admission.validate());
+    admission.version = physical_participant_version;
+    const encoded = try encodeAdmission(a, admission);
+    defer a.free(encoded);
+    var retained = try parseAdmission(a, encoded);
+    defer retained.deinit();
+    const recovered = retained.value.admission;
+    try std.testing.expectEqual(right, (try recovered.coordinatorMember()).routed_owner.?);
+    try std.testing.expectEqual(left, (try recovered.memberForOwner(left)).routed_owner.?);
+    try std.testing.expectError(error.InvalidParticipant, recovered.member(left.namespace));
+
+    const manifest = try recovered.manifest(100);
+    var position: Digest = @splat(0);
+    std.mem.writeInt(u64, position[0..8], 2, .little);
+    position[31] = 2;
+    const resolutions = [_]Resolution{
+        .{ .namespace = left.namespace, .owner_fence = left.digest(), .manifest_digest = manifest.digest(), .commit_version = 100, .source_position = position, .outcome = .{ .effects = .{ .sequence = 9, .frame_digest = @splat(12) } } },
+        .{ .namespace = right.namespace, .owner_fence = right.digest(), .manifest_digest = manifest.digest(), .commit_version = 100, .source_position = position, .outcome = .{ .no_effect = noEffectProof(manifest, right.namespace, position) } },
+    };
+    try resolutions[0].validate(manifest);
+    try resolutions[1].validate(manifest);
+    const certificate: Certificate = .{ .manifest = manifest, .resolutions = &resolutions };
+    var projected: [2]?Effects = undefined;
+    try certificate.projectPhysicalEffects(&.{ right.namespace, left.namespace }, &.{ right.group_id, left.group_id }, &projected);
+    try std.testing.expectEqualDeep([2]?Effects{ null, resolutions[0].outcome.effects }, projected);
+    try std.testing.expectError(error.InvalidTxnRecord, certificate.projectEffects(&.{left.namespace}, projected[0..1]));
+
+    admission.participants = &.{ members[1], members[0] };
+    try std.testing.expectError(error.InvalidTxnRecord, admission.validate());
+    admission.participants = &.{ members[0], members[0] };
+    try std.testing.expectError(error.InvalidTxnRecord, admission.validate());
 }
