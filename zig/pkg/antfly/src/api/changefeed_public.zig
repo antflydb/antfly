@@ -858,7 +858,6 @@ pub fn stageVisibleMerges(client: *config.Client, a: A, source: source_api.Sourc
     var snapshot = try source.catalog.adminSnapshot();
     defer source.catalog.freeAdminSnapshot(&snapshot);
     for (snapshot.merge_transitions) |merge| {
-        if (merge.phase != .cutover_pending and merge.phase != .finalizing) continue;
         const donor = for (state.roots) |root| {
             const physical = root.physical orelse continue;
             if (physical.group_id == merge.donor_group_id and root.merge_drain == null and root.split_handoff == null and root.pending_control == null)

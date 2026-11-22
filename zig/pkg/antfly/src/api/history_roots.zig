@@ -324,11 +324,14 @@ pub const Source = struct {
     }
 
     pub fn prepareMergeDrain(self: Source, a: A, captured: *const Captured, state: control.State, stored: control.Root, merge: @import("../metadata/transition_state.zig").MergeTransitionRecord, context: Context) !?control.Mutation {
+        // The persisted catalog phase can lag the data-side finalization.
+        // Only the donor's ordered cut can authorize a drain.
+        if (merge.rollback_reason != null or merge.phase == .rolling_back or merge.phase == .rolled_back or merge.phase == .finalized) return null;
         const donor = try captured.findInstalled(stored);
         const physical = stored.physical orelse return error.ChangefeedResynchronizationRequired;
         const contract = merge.table_contract;
         const identity = donor.fence.route.identity_namespace;
-        if ((merge.phase != .cutover_pending and merge.phase != .finalizing) or merge.transition_id == 0 or
+        if (merge.transition_id == 0 or
             merge.donor_group_id != physical.group_id or contract.table_id != identity.table_id or
             contract.source_identity.shard_id != identity.shard_id or contract.source_identity.range_id != identity.range_id or
             !std.mem.eql(u8, contract.table_name, donor.table_name))
@@ -977,6 +980,17 @@ pub const test_support = if (@import("builtin").is_test) struct {
         const planned_child = planned.roots[try planned.rootIndex(child_cursor)];
         try std.testing.expectEqual(child.namespace, planned_child.storageNamespace());
         try std.testing.expectEqual(child_cursor, (try physical.findInstalled(planned_child)).namespace);
+        var merge: @import("../metadata/transition_state.zig").MergeTransitionRecord = .{
+            .transition_id = 21,
+            .donor_group_id = 72,
+            .receiver_group_id = 71,
+            .phase = .prepare,
+            .table_contract = .{ .table_id = 7, .table_name = "zeta", .source_identity = .{ .shard_id = 70, .range_id = 11 } },
+        };
+        // Even with a stale catalog phase, the drain must reach the cut port.
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, split_fixture.source().prepareMergeDrain(a, &physical, planned, planned_child, merge, .{}));
+        merge.phase = .rolled_back;
+        try std.testing.expect((try split_fixture.source().prepareMergeDrain(a, &physical, planned, planned_child, merge, .{})) == null);
         const stored: control.Root = .{ .namespace = parent.namespace, .ownership_epoch = 1, .grant_sequence = 2, .physical = parent.physicalIdentity() };
         var transition: SplitTransition = .{
             .transition_id = 19,
