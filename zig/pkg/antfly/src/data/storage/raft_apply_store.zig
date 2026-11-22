@@ -1724,7 +1724,12 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
-        try self.waitForGenerationPreparationLocked(shard, group_id);
+        // This callback runs on the Raft progress owner. Keep the committed
+        // entry queued while the generation publisher finishes outside Raft.
+        self.requireTransitionReadyLocked(shard, group_id) catch |err| switch (err) {
+            error.SplitSourceProjectionNotReady => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
         self.writeBatchLocked(shard, group_id, commit_index, entries_bytes) catch |err| {
             if (!builtin.is_test and err == error.ConflictingDataApplyBatch) {
                 self.logConflictingBatch(shard, group_id, commit_index, entries_bytes);
@@ -5405,9 +5410,19 @@ test "data raft apply store transition reads fail fast during generation staging
     });
     const watermark = (try store.latestBatch(313)) orelse return error.MissingDataBatch;
 
+    const committed = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 2,
+        .entry_type = .normal,
+        .data = @constCast(""),
+    }});
+    defer std.testing.allocator.free(committed);
+    const next: raft_state_machine.ApplyBatch = .{ .group_id = 313, .commit_index = 2, .entries_bytes = committed };
+
     try store.beginGenerationPreparation(313);
     var preparation_active = true;
     defer if (preparation_active) store.cancelGenerationPreparation(313);
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, store.snapshotBuilder().applyBatch(next));
     try std.testing.expectError(error.SplitSourceProjectionNotReady, store.latestBatchForTransition(313));
     try std.testing.expectError(error.SplitSourceProjectionNotReady, store.observeSplitControl(std.testing.allocator, 313));
     try std.testing.expectError(error.SplitSourceProjectionNotReady, store.reconcileGroupSnapshotAtRootIncarnation(
@@ -5420,6 +5435,8 @@ test "data raft apply store transition reads fail fast during generation staging
     ));
     store.cancelGenerationPreparation(313);
     preparation_active = false;
+    try store.snapshotBuilder().applyBatch(next);
+    try std.testing.expectEqual(@as(u64, 2), (try store.latestBatch(313)).?.commit_index);
 
     var observation = try store.observeSplitControl(std.testing.allocator, 313);
     defer observation.deinit(std.testing.allocator);
