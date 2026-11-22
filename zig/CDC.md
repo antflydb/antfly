@@ -47,8 +47,14 @@ previous slot's history and spool cleanup completes. The new consistent LSN
 is higher than any LSN assigned to the previous slot. Bootstrap the consumer
 from the new slot and its consistent cut.
 Publications advertise `pubtruncate=false` and reject requests to publish
-TRUNCATE. Where Antfly SQL TRUNCATE is supported, it replaces the table
-generation and invalidates the previous binding.
+TRUNCATE. Submit SQL TRUNCATE through a SQL endpoint that owns durable
+generation coordination. In a cluster with separate metadata and data nodes,
+use the metadata coordinator's SQL API. After the truncate job publishes the
+empty table generation, old publication and slot bindings require
+resynchronization. Drop the old slot, recreate the publication, and bootstrap
+from a new slot on the replacement table. The old name becomes available after
+metadata confirms that its former table generation is gone and spool cleanup
+completes.
 Run these cases from the `zig` directory.
 
 ```sh

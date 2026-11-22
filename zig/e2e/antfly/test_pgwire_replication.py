@@ -970,6 +970,86 @@ def test_pg_recvlogical_resume_after_restart(
                 sql(
                     "CREATE PUBLICATION truncates FOR TABLE smoke WITH (publish = 'truncate')"
                 )
+            with pytest.raises(
+                AssertionError, match="0A000.*durable generation coordinator"
+            ):
+                sql("TRUNCATE TABLE smoke")
+
+            coordinator = f"{server.metadata_admin_url}/db/v1"
+            truncate = requests.post(
+                f"{coordinator}/sql",
+                json={"statement": "TRUNCATE TABLE smoke"},
+                timeout=20,
+            )
+            assert truncate.status_code == 202, truncate.text
+            receipt = truncate.json()["ddl_receipt"]
+            assert receipt["state"] == "pending"
+
+            def truncate_published():
+                job = requests.get(
+                    f"{coordinator}/restore/jobs/{receipt['restore_job_id']}",
+                    timeout=5,
+                )
+                job.raise_for_status()
+                phase = job.json()["phase"]
+                assert phase not in ("failed", "canceled"), job.text
+                return phase == "succeeded"
+
+            assert wait_until(truncate_published, timeout_s=60), server.debug_logs()
+
+            def empty_generation_readable():
+                count = subprocess.run(
+                    [
+                        psql,
+                        *connection,
+                        "-XAt",
+                        "-v",
+                        "VERBOSITY=verbose",
+                        "-c",
+                        "SELECT count(*) FROM smoke",
+                    ],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                if count.returncode != 0:
+                    assert "ERROR:  53300:" in count.stderr, count.stderr
+                    return False
+                assert count.stdout.strip() == "0"
+                return True
+
+            assert wait_until(empty_generation_readable, timeout_s=30)
+            discarded = tmp_path / "truncated-generation.bin"
+            invalidated = subprocess.run(
+                stream_command(discarded),
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            assert invalidated.returncode != 0
+            assert "ChangefeedResynchronizationRequired" in invalidated.stderr
+            assert not discarded.exists() or not discarded.read_bytes()
+            slot("--drop-slot")
+            sql("DROP PUBLICATION changes")
+            sql("CREATE PUBLICATION changes FOR TABLE smoke")
+            recreation_errors.clear()
+            assert wait_until(recreate_slot, timeout_s=60), sorted(recreation_errors)
+            replacement = tmp_path / "replacement-generation.bin"
+            with stream(replacement) as reader:
+                sql(
+                    "INSERT INTO smoke (id, content) VALUES (18, 'post-truncate-generation')",
+                    retry_uncommitted=True,
+                )
+                assert wait_until(
+                    lambda: (
+                        reader.poll() is None
+                        and replacement.exists()
+                        and b"post-truncate-generation" in replacement.read_bytes()
+                    ),
+                    timeout_s=25,
+                )
         slot("--drop-slot")
         assert catalog_slot() == []
         sql("DROP PUBLICATION changes")

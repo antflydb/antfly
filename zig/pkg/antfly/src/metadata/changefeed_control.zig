@@ -29,6 +29,7 @@ pub const provider_history_protocol_version: u16 = 125;
 pub const physical_history_protocol_version: u16 = 126;
 pub const shared_namespace_plan_protocol_version: u16 = 127;
 pub const slot_recreation_protocol_version: u16 = 133;
+pub const retired_slot_root_protocol_version: u16 = 134;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -717,10 +718,12 @@ pub const Mutation = union(enum) {
     reset: Reset,
     close,
     release_root: struct { namespace: Namespace, ownership_epoch: u64, proof: Digest },
+    retire_absent_slot_root: Namespace,
     finish_close,
     restart: struct { definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
     pub fn requiredProtocol(self: Mutation) u16 {
         switch (self) {
+            .retire_absent_slot_root => return retired_slot_root_protocol_version,
             .recreate_slot => return slot_recreation_protocol_version,
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
@@ -748,6 +751,7 @@ pub const Mutation = union(enum) {
 
     pub fn validate(self: Mutation) !void {
         switch (self) {
+            .retire_absent_slot_root => |namespace| if (!nz(namespace)) return error.InvalidChangefeed,
             .recreate_slot => |value| {
                 try value.definition.validate();
                 try slotDefinition(value.definition);
@@ -1469,6 +1473,22 @@ pub const Mutation = union(enum) {
                 if (state.roots[index].released) return state;
                 const roots = try a.dupe(Root, state.roots);
                 roots[index].released = true;
+                next.roots = roots;
+            },
+            .retire_absent_slot_root => |namespace| {
+                // The metadata apply store must certify the table ID is absent
+                // in the same transaction as this state transition.
+                if ((state.phase != .closing and state.phase != .reset_required) or state.slot == null) return error.ChangefeedConflict;
+                const index = try state.rootIndex(namespace);
+                if (state.roots[index].released) return state;
+                const roots = try a.dupe(Root, state.roots);
+                const root = &roots[index];
+                root.pending_control = null;
+                root.split_handoff = null;
+                root.split_grant_sequence = null;
+                root.split_consumer_epoch = null;
+                root.snapshot_released = root.snapshot != null;
+                root.released = true;
                 next.roots = roots;
             },
             .finish_close => {

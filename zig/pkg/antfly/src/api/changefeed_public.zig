@@ -1818,7 +1818,23 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
         }
     }
     var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .closing = true };
-    if (try retireOne(&client, &policy, a, state, request)) return;
+    if (retireOne(&client, &policy, a, state, request) catch |err| {
+        if (err != error.ChangefeedResynchronizationRequired or state.slot == null) return err;
+        const owner = catalog_owner orelse return err;
+        var snapshot = (try owner.source.linearizableSnapshot(request)) orelse return err;
+        defer owner.source.freeAdminSnapshot(&snapshot);
+        for (state.roots) |root| {
+            if (root.released) continue;
+            const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
+            for (snapshot.tables) |table| {
+                if (table.table_id == table_id) break;
+            } else {
+                try change(&client, a, state, .{ .retire_absent_slot_root = root.namespace }, request);
+                return;
+            }
+        }
+        return err;
+    }) return;
     if (spool_registry) |storage| if (state.slot) |slot| {
         if (slot.spool.records.len != 0) {
             const cleanup = @import("../metadata/pg_spool_cleanup.zig");

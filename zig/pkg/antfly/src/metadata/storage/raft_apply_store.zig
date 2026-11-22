@@ -15981,6 +15981,10 @@ pub const RaftApplyStore = struct {
         const authority = if (try stagingGet(txn, authority_key)) |raw| try changefeed_control.parseAuthority(a, raw) else null;
         if (authority) |current| if (!std.mem.eql(u8, &current.incarnation, &write.authority)) return;
         const sequence = if (authority) |current| std.math.add(u64, current.sequence, 1) catch return error.ChangefeedCorrupt else 1;
+        if (write.mutation == .retire_absent_slot_root) {
+            const table_id = std.mem.readInt(u64, write.mutation.retire_absent_slot_root[0..8], .big);
+            if (try stagingGet(txn, try tableKeyForGroup(&buffer, group_id, table_id)) != null) return;
+        }
         const next = write.apply(a, before, sequence) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return,
@@ -15988,7 +15992,7 @@ pub const RaftApplyStore = struct {
         if (next.revision == before.revision) return;
         // New definitions must bind live table incarnations. Cleanup/reset of
         // an older feed remains possible after its tables have been retired.
-        if (write.mutation == .create or write.mutation == .restart) {
+        if (write.mutation == .create or write.mutation == .restart or write.mutation == .recreate_slot) {
             for (next.definition.?.tables) |binding| {
                 const table_bytes = (try stagingGet(txn, try tableKeyForGroup(&buffer, group_id, binding.table_id))) orelse return;
                 const table = try decodeTableRecord(a, table_bytes);
@@ -48391,6 +48395,18 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
     try std.testing.expectEqual(@as(u64, 0), cleaned.value.slot.?.spool.charged_bytes);
     try std.testing.expectEqual(@as(u64, 2), cleaned.value.slot.?.spool.next_id);
     try std.testing.expectEqual(@as(u64, 1), cleaned.value.slot.?.spool.collected_through);
+    try h.mutate(.close);
+    try h.mutate(.{ .retire_absent_slot_root = namespace });
+    var still_live = try h.read();
+    defer still_live.deinit();
+    try std.testing.expect(!still_live.value.roots[0].released);
+    try h.apply(.{ .remove_table = .{ .table_id = table.table_id, .expected_transition_generation = 0 } });
+    try h.mutate(.{ .retire_absent_slot_root = namespace });
+    try h.mutate(.finish_close);
+    var retired = try h.read();
+    defer retired.deinit();
+    try std.testing.expectEqual(changefeed_control.Phase.deleted, retired.value.phase);
+    try std.testing.expectEqual(@as(u64, 101), retired.value.slot.?.next_lsn);
 }
 
 test "metadata source control artifact debt survives reopening and keeps table retention until storage reclamation" {
