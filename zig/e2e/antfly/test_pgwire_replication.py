@@ -196,11 +196,11 @@ def test_pg_recvlogical_resume_after_restart(
             for fields in (line.split("|") for line in result)
         ]
 
-    def stream_command(output):
+    def stream_command(output, name="smoke_slot"):
         return [
             client,
             *connection,
-            "--slot=smoke_slot",
+            f"--slot={name}",
             "--start",
             "--no-loop",
             "--status-interval=1",
@@ -216,9 +216,9 @@ def test_pg_recvlogical_resume_after_restart(
         ]
 
     @contextmanager
-    def stream(output, *, expect_disconnect=False):
+    def stream(output, *, expect_disconnect=False, name="smoke_slot"):
         with output.with_suffix(".log").open("wb") as log:
-            reader = subprocess.Popen(stream_command(output), env=env, stderr=log)
+            reader = subprocess.Popen(stream_command(output, name), env=env, stderr=log)
             try:
                 yield reader
             except Exception as exc:
@@ -387,7 +387,10 @@ def test_pg_recvlogical_resume_after_restart(
     try:
         if not cross_node:
             check_catalog_discovery()
-        sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
+        sql(
+            "CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT, "
+            "computed BIGINT GENERATED ALWAYS AS (id + 314159265) STORED)"
+        )
         if multi_table:
             sql("CREATE TABLE smoke_other (id BIGINT PRIMARY KEY, content TEXT)")
         if export_snapshot:
@@ -435,7 +438,8 @@ def test_pg_recvlogical_resume_after_restart(
                 "-v",
                 "ON_ERROR_STOP=1",
                 "-c",
-                "SELECT a.attname, t.typname, a.attnum, a.attnotnull, pg_catalog.pg_get_expr(d.adbin,d.adrelid) "
+                "SELECT a.attname, t.typname, a.attnum, a.attnotnull, a.attgenerated, "
+                "pg_catalog.pg_get_expr(d.adbin,d.adrelid) "
                 "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
                 "JOIN pg_catalog.pg_type t ON a.atttypid = t.oid "
                 "LEFT JOIN pg_catalog.pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
@@ -445,7 +449,11 @@ def test_pg_recvlogical_resume_after_restart(
             env=env,
             timeout=40,
         ).splitlines()
-        assert columns == ["id|int8|1|t|", "content|text|2|f|"]
+        assert columns == [
+            "id|int8|1|t||",
+            "content|text|2|f||",
+            "computed|int8|3|f|s|",
+        ]
         assert names == ["public|smoke|r|"]
         sql(
             "CREATE TABLE catalog_key_order (first_key BIGINT, second_key TEXT, "
@@ -603,7 +611,8 @@ def test_pg_recvlogical_resume_after_restart(
             insert = (
                 "INSERT INTO smoke (id, content) VALUES (7, 'retained-stream-smoke')"
             )
-            markers = [b"retained-stream-smoke"]
+            # pgoutput text tuple field for the stored generated value of id 7.
+            markers = [b"retained-stream-smoke", b"t\x00\x00\x00\x09314159272"]
             if multi_table:
                 sql(
                     "BEGIN",
@@ -870,11 +879,10 @@ def test_pg_recvlogical_resume_after_restart(
                     )
                     expect_markers([b"after-merge"], floor)
                     assert all(marker not in resumed.read_bytes() for marker in markers)
+        active_slot = "smoke_slot"
         if not export_snapshot and not multi_table and not cross_node:
-            # Change the replica identity after the slot persisted its
-            # immutable binding. Old images cannot use the new contract.
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
-            rejected_output = tmp_path / "rejected.bin"
+            rejected_output = tmp_path / "rejected-identity.bin"
             rejected = subprocess.run(
                 stream_command(rejected_output),
                 env=env,
@@ -885,8 +893,40 @@ def test_pg_recvlogical_resume_after_restart(
             assert rejected.returncode != 0
             assert "ChangefeedResynchronizationRequired" in rejected.stderr
             assert not rejected_output.exists() or not rejected_output.read_bytes()
-        slot("--drop-slot")
-        assert catalog_slot() == []
+            slot("--drop-slot")
+            assert catalog_slot() == []
+            sql("DROP PUBLICATION changes")
+            sql("CREATE PUBLICATION changes FOR TABLE smoke")
+            active_slot = "after_identity"
+            slot("--create-slot", "--plugin=pgoutput", name=active_slot)
+            sql("INSERT INTO smoke (id, content) VALUES (16, 'pre-schema-value')")
+            sql("ALTER TABLE smoke ADD COLUMN additional TEXT")
+            evolved = tmp_path / "evolved.bin"
+            with stream(evolved, name=active_slot) as reader:
+                sql(
+                    "INSERT INTO smoke (id, content, additional) "
+                    "VALUES (17, 'post-schema-content', 'post-schema-added-value')"
+                )
+                assert wait_until(
+                    lambda: (
+                        reader.poll() is None
+                        and evolved.exists()
+                        and b"post-schema-added-value" in evolved.read_bytes()
+                    ),
+                    timeout_s=25,
+                )
+                payload = evolved.read_bytes()
+                assert (
+                    payload.index(b"pre-schema-value")
+                    < payload.index(b"additional\x00")
+                    < payload.index(b"post-schema-added-value")
+                )
+            with pytest.raises(AssertionError, match="42601"):
+                sql(
+                    "CREATE PUBLICATION truncates FOR TABLE smoke WITH (publish = 'truncate')"
+                )
+        slot("--drop-slot", name=active_slot)
+        assert catalog_slot(name=active_slot) == []
         sql("DROP PUBLICATION changes")
         assert catalog_publication() == []
     except Exception:

@@ -31,6 +31,9 @@ end-to-end suite. Single-table and two-table cases cover feedback, restart,
 resume, and slot drop. The exported-snapshot cases read pre-cut rows using
 `psql` and verify that `pg_recvlogical` receives the post-cut changes. The
 two-table cases also exercise transaction rollback and rollback to savepoint.
+The stream-only case verifies a stored generated value and replays rows from
+before and after adding a nullable column, with relation metadata for the
+schema that encoded each retained row.
 The cross-node case kills a data node mid-stream, verifies the confirmed LSN
 on a surviving node, and streams a later commit with stock `pg_recvlogical`.
 The topology case uses the same slot through a live range split and merge. It
@@ -38,10 +41,12 @@ verifies writes to both split participants, confirmed LSN advancement, and
 continuation after the merge and serving-node failover. These fixtures use
 three metadata nodes and three data nodes on a single host.
 Changing replica identity invalidates the old slot binding and returns a
-resynchronization error before streaming. Schema changes require the
-publication and slot to be created for the new relation definition.
-Publications advertise `pubtruncate=false`. Antfly SQL TRUNCATE replaces the
-table generation and invalidates the previous binding.
+resynchronization error before streaming. Recreate the publication and use a
+fresh slot name when the publication binding changes. Dropped names remain
+reserved by the durable slot record.
+Publications advertise `pubtruncate=false` and reject requests to publish
+TRUNCATE. Where Antfly SQL TRUNCATE is supported, it replaces the table
+generation and invalidates the previous binding.
 Run these cases from the `zig` directory.
 
 ```sh
