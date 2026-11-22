@@ -8304,7 +8304,11 @@ pub const DB = struct {
         try metadata_writes.append(self.alloc, .{ .key = range_state_mod.range_key, .value = range_value });
         if (identity) |entry| try metadata_writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
         const history_cut_key = history.SplitCut.key(transition.transition_id, transition.attempt_epoch);
-        if (history_cut != null) try metadata_writes.append(self.alloc, .{ .key = &history_cut_key, .value = &history_cut.? });
+        const history_successor_key = history.SplitCut.successorKey(transition.destination_group_id, history.frame.digest(transition.split_key));
+        if (history_cut != null) {
+            try metadata_writes.append(self.alloc, .{ .key = &history_cut_key, .value = &history_cut.? });
+            try metadata_writes.append(self.alloc, .{ .key = &history_successor_key, .value = &history_cut.? });
+        }
         if (replication_lsn) |lsn| try metadata_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_marker_buf));
         if (replication_payload) |payload| {
             const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
@@ -27361,7 +27365,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("orderedSplitHistoryCut", .{ self, request, minimum_applied_index });
         if (self.isClosed()) return error.StorageUnavailable;
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-        if (minimum_applied_index == 0 or request.transition == 0 or request.attempt == 0 or request.successor_group == 0)
+        if (minimum_applied_index == 0 or !request.validSelector())
             return error.InvalidHistoryAdmission;
         const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
         if (!std.mem.eql(u8, &namespace, &request.namespace) or request.root_generation != self.core.root_generation)
@@ -27370,7 +27374,11 @@ pub const DB = struct {
         defer txn.abort();
         _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
         const applied = try orderedHistoryReadCut(&txn, minimum_applied_index);
-        const cut = (try SplitHistoryCut.load(&txn, request.transition, request.attempt)) orelse return null;
+        const observed = if (request.bySuccessor())
+            try SplitHistoryCut.loadSuccessor(&txn, request.successor_group, request.boundary)
+        else
+            try SplitHistoryCut.load(&txn, request.transition, request.attempt);
+        const cut = observed orelse return null;
         if (!request.matches(cut)) return error.HistoryResynchronizationRequired;
         if (cut.index > applied.index or cut.term > applied.term) return error.HistoryCorrupt;
         return cut;
@@ -162449,6 +162457,16 @@ test "db split finalization records the predecessor committed history frontier t
     };
     const routed = (try db.orderedSplitHistoryCut(request, second_entry.index)).?;
     try std.testing.expectEqual(entry.index, routed.index);
+    var successor_request = request;
+    successor_request.transition = 0;
+    successor_request.attempt = 0;
+    const retired = (try db.orderedSplitHistoryCut(successor_request, second_entry.index)).?;
+    try std.testing.expectEqual(routed.encode(), retired.encode());
+    successor_request.successor_group = second_split.destination_group_id;
+    try std.testing.expectEqual(null, try db.orderedSplitHistoryCut(successor_request, second_entry.index));
+    successor_request.boundary = history.frame.digest(second_split.split_key);
+    const second_retired = (try db.orderedSplitHistoryCut(successor_request, second_entry.index)).?;
+    try std.testing.expectEqual(second_entry.index, second_retired.index);
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedSplitHistoryCut(request, second_entry.index + 1));
     request.successor_group += 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedSplitHistoryCut(request, second_entry.index));

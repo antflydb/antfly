@@ -254,6 +254,55 @@ pub const Source = struct {
             .expected_table_binding = predecessor.table_binding,
         }, context);
         const cut = try self.readSplitCut(a, predecessor, qualified.owner.root_generation, split, context);
+        return splitHandoff(stored, physical, successor, cut);
+    }
+
+    /// The reconciler may retire the transition before a consumer observes
+    /// its routes. A published successor and a matching ordered predecessor
+    /// cut together still qualify the handoff.
+    pub fn prepareRetiredSplitHandoff(self: Source, a: A, captured: *const Captured, state: control.State, stored: control.Root, context: Context) !?control.Mutation {
+        const physical = stored.physical orelse return null;
+        if (stored.released or stored.split_handoff != null or stored.merge_drain != null) return null;
+        const predecessor = captured.findInstalled(stored) catch |err| switch (err) {
+            error.ChangefeedResynchronizationRequired => return null,
+            else => return err,
+        };
+        const port = self.split_cut orelse return error.ChangefeedCapabilityUnsupported;
+        const owners = self.artifact_owners orelse return error.ChangefeedCapabilityUnsupported;
+        var generation: ?u64 = null;
+        for (captured.roots) |successor| {
+            if (!std.mem.eql(u8, &successor.namespace, &stored.storageNamespace()) or
+                successor.fence.route.group_id == physical.group_id) continue;
+            const successor_identity = successor.physicalIdentity().?;
+            for (state.roots) |root| {
+                if (std.meta.eql(root.physical, @as(?control.PhysicalRoot, successor_identity))) break;
+                if (root.split_handoff) |handoff| if (std.meta.eql(handoff.successor, successor_identity)) break;
+            } else {
+                const index = captured.session.group_indexes.get(successor_identity.group_id) orelse return error.TopologyChanged;
+                const boundary = captured.session.snapshot.value.ranges[index].start_key;
+                if (boundary.len == 0) continue;
+                if (generation == null) {
+                    const qualified = try owners.read(a, predecessor.fence, predecessor.table_name, .{
+                        .version = 1,
+                        .expected_table_binding = predecessor.table_binding,
+                    }, context);
+                    generation = qualified.owner.root_generation;
+                }
+                const cut = (try port.read(a, predecessor.fence, predecessor.table_name, .{
+                    .namespace = stored.storageNamespace(),
+                    .transition = 0,
+                    .attempt = 0,
+                    .successor_group = successor_identity.group_id,
+                    .root_generation = generation.?,
+                    .boundary = @import("antfly_local_sources").storage_committed_history.frame.digest(boundary),
+                }, context)) orelse continue;
+                return splitHandoff(stored, physical, successor, cut);
+            }
+        }
+        return null;
+    }
+
+    fn splitHandoff(stored: control.Root, physical: control.PhysicalRoot, successor: Root, cut: SplitCut) control.Mutation {
         return .{ .stage_split_handoff = .{
             .namespace = stored.namespace,
             .ownership_epoch = stored.ownership_epoch,

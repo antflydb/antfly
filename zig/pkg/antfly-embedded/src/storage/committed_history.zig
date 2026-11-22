@@ -53,6 +53,27 @@ pub const SplitCut = struct {
         return cut;
     }
 
+    const successor_key_prefix = legacy_key ++ "_successor:";
+    pub const SuccessorKey = [successor_key_prefix.len + 8 + 32]u8;
+
+    pub fn successorKey(group: u64, boundary: [32]u8) SuccessorKey {
+        var raw: SuccessorKey = undefined;
+        raw[0..successor_key_prefix.len].* = successor_key_prefix.*;
+        std.mem.writeInt(u64, raw[successor_key_prefix.len..][0..8], group, .big);
+        raw[successor_key_prefix.len + 8 ..][0..32].* = boundary;
+        return raw;
+    }
+
+    pub fn loadSuccessor(txn: anytype, group: u64, boundary: [32]u8) !?SplitCut {
+        const raw = txn.get(&successorKey(group, boundary)) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        const cut = try decode(raw);
+        if (cut.successor_group != group or !std.mem.eql(u8, &cut.boundary, &boundary)) return error.HistoryCorrupt;
+        return cut;
+    }
+
     pub const Request = struct {
         namespace: frame.Namespace,
         transition: u64,
@@ -61,10 +82,18 @@ pub const SplitCut = struct {
         root_generation: u64,
         boundary: [32]u8,
 
+        pub fn bySuccessor(self: Request) bool {
+            return self.transition == 0 and self.attempt == 0;
+        }
+
+        pub fn validSelector(self: Request) bool {
+            return self.successor_group != 0 and (self.bySuccessor() or (self.transition != 0 and self.attempt != 0));
+        }
+
         pub fn matches(self: Request, cut: SplitCut) bool {
             return cut.term != 0 and cut.index != 0 and cut.reclaimed <= cut.latest and
                 std.mem.eql(u8, &self.namespace, &cut.namespace) and
-                self.transition == cut.transition and self.attempt == cut.attempt and
+                (self.bySuccessor() or (self.transition == cut.transition and self.attempt == cut.attempt)) and
                 self.successor_group == cut.successor_group and self.root_generation == cut.root_generation and
                 std.mem.eql(u8, &self.boundary, &cut.boundary);
         }

@@ -28,7 +28,7 @@ fn Contract(comptime Cut: type) type {
         pub const max_bytes = wire.max_read_bytes;
         fn validTopology(input: wire.Request) bool {
             if (comptime Cut == local.storage_committed_history.SplitCut)
-                return input.transition != 0 and input.attempt != 0 and input.successor_group != 0;
+                return input.validSelector();
             return input.transition != 0 and input.receiver_group != 0;
         }
 

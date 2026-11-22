@@ -831,6 +831,10 @@ pub fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Sourc
                         break;
                 } else return error.TopologyChanged;
             }
+            for (state.roots) |root| {
+                if (try source.prepareRetiredSplitHandoff(a, routes, state, root, request)) |recovered|
+                    break :candidate recovered;
+            }
             return error.ChangefeedResynchronizationRequired;
         };
         try change(client, a, state, mutation, request);
