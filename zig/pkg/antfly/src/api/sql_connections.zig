@@ -47,9 +47,8 @@ pub fn load(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, 
 }
 
 /// Repair only outcomes that the durable transaction registry can prove. A
-/// beginning ID has never escaped in an HTTP response: clearing its fence
-/// first makes a concurrent creator fail binding, then an unexecuted session
-/// can be removed. An uncertain commit remains fenced until a terminal
+/// beginning ID has never escaped in an HTTP response. Retire an existing
+/// unexecuted session and its beginning fence in one transaction. An uncertain commit remains fenced until a terminal
 /// decision is visible; a missing record is never interpreted as an abort.
 pub fn loadReconciled(
     store: *transactions.DurableSessionStore,
@@ -60,50 +59,53 @@ pub fn loadReconciled(
     owner_node_id: u64,
     now_ms: u64,
 ) !Owned {
-    return loadReconciledAt(store, registry, alloc, id, principal, owner_node_id, now_ms);
+    var owned = try load(store, alloc, id, principal, owner_node_id, now_ms);
+    errdefer owned.deinit();
+    if (!try reconcile(store, registry, owned.value, now_ms, null)) return owned;
+    const result = try load(store, alloc, id, principal, owner_node_id, now_ms);
+    owned.deinit();
+    return result;
 }
 
-fn loadReconciledAt(
-    store: *transactions.DurableSessionStore,
-    registry: *transactions.SessionRegistry,
-    alloc: std.mem.Allocator,
-    id: [32]u8,
-    principal: []const u8,
-    owner_node_id: u64,
-    authority_ms: u64,
-) !Owned {
-    var owned = try load(store, alloc, id, principal, owner_node_id, authority_ms);
-    var owns_parsed = true;
-    errdefer if (owns_parsed) owned.deinit();
-    const txn_id = owned.value.active_txn orelse return owned;
-    const state = owned.value.state;
-    if (state == .idle) return owned;
-    var session = try registry.getSqlState(alloc, txn_id);
-    defer if (session) |*value| value.deinit(alloc);
+fn reconcile(store: *transactions.DurableSessionStore, registry: *transactions.SessionRegistry, connection: record.Record, authority_ms: u64, expiry_cutoff_ms: ?u64) !bool {
+    const id = connection.id;
+    const owner_node_id = connection.owner_node_id;
+    const principal = connection.principal;
+    if (expiry_cutoff_ms) |cutoff| if (connection.expires_at_ms > cutoff) return false;
+    const txn_id = connection.active_txn orelse return false;
+    const state = connection.state;
+    if (state == .idle) return false;
+    const session = try store.connectionLifecycle(txn_id);
     if (session) |value| {
         if (!std.meta.eql(value.connection_id, @as(?[32]u8, id))) return error.InvalidSqlConnection;
     }
     if (state == .beginning) {
         if (session) |value| {
-            if (value.execution_started or value.terminal != null or value.terminal_abort) return error.SqlConnectionBusy;
+            if ((expiry_cutoff_ms == null and value.version.owner != owner_node_id) or value.version.executing or value.terminal) return error.SqlConnectionBusy;
+            registry.rollbackConnectionBeforeExecution(txn_id, id, value.version, if (expiry_cutoff_ms) |cutoff| .{ .expired = .{ .state = .beginning, .cutoff_ms = cutoff } } else .beginning) catch |err| switch (err) {
+                error.SessionLeaseLost, error.SqlTransactionOutcomeUnknown => return false,
+                else => return err,
+            };
+        } else {
+            _ = mutate(store, .{ .abort_begin = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
+                error.SqlConnectionBusy => return false,
+                else => return err,
+            };
         }
-        // A racing BEGIN must bind the exact still-beginning ID before it
-        // responds. After this CAS succeeds it cannot return a session ID.
-        _ = mutate(store, .{ .abort_begin = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
-            error.SqlConnectionBusy => return owned,
-            else => return err,
-        };
-        _ = registry.removeBeforeExecution(alloc, txn_id);
     } else if (session) |value| {
-        if (value.terminal == null and !value.terminal_abort) return owned;
-        _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
-            error.SqlConnectionBusy => return owned,
+        if (!value.terminal) {
+            const cutoff = expiry_cutoff_ms orelse return false;
+            if ((state != .active and state != .uncertain) or value.version.executing) return false;
+            registry.rollbackConnectionBeforeExecution(txn_id, id, value.version, .{ .expired = .{ .state = state, .cutoff_ms = cutoff } }) catch |err| switch (err) {
+                error.SessionLeaseLost, error.SqlTransactionOutcomeUnknown => return false,
+                else => return err,
+            };
+        } else _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
+            error.SqlConnectionBusy => return false,
             else => return err,
         };
-    } else return owned;
-    owned.deinit();
-    owns_parsed = false;
-    return load(store, alloc, id, principal, owner_node_id, authority_ms);
+    } else return false;
+    return true;
 }
 
 /// Admission-time bounded GC. The directory is capped at 128 entries, and
@@ -129,14 +131,23 @@ pub fn reconcileExpired(
         },
     };
     defer alloc.free(entries);
+    var expired: usize = 0;
     for (entries) |entry| {
         if (entry.expires_at_ms > now_ms) continue;
-        var prior = switch (store.backend) {
+        entries[expired] = entry;
+        expired += 1;
+    }
+    if (expired == 0) return;
+    const batch = @min(expired, 8);
+    const start = registry.connection_sweep_offset.fetchAdd(batch, .monotonic) % expired;
+    for (0..batch) |offset| {
+        const entry = entries[(start + offset) % expired];
+        const observed: ?Owned = switch (store.backend) {
             .docstore => |backend| blk: {
                 var txn = try backend.beginReadTxn();
                 defer txn.abort();
                 break :blk record.loadTxn(&txn, alloc, &entry.id) catch |err| switch (err) {
-                    error.SqlConnectionNotFound => continue,
+                    error.SqlConnectionNotFound => null,
                     else => return err,
                 };
             },
@@ -144,18 +155,33 @@ pub fn reconcileExpired(
                 var txn = try backend.beginRead();
                 defer txn.abort();
                 break :blk record.loadTxn(&txn, alloc, &entry.id) catch |err| switch (err) {
-                    error.SqlConnectionNotFound => continue,
+                    error.SqlConnectionNotFound => null,
                     else => return err,
                 };
             },
         };
+        var prior = observed orelse {
+            _ = mutate(store, .{ .expire = .{ .id = entry.id, .cutoff_ms = now_ms } }, "", 0, 0) catch |err| switch (err) {
+                error.SqlConnectionBusy, error.SqlConnectionChanged, error.SqlConnectionNotFound => continue,
+                else => return err,
+            };
+            return;
+        };
         defer prior.deinit();
-        if (prior.value.state == .idle) continue;
-        var reconciled = loadReconciledAt(store, registry, alloc, entry.id, prior.value.principal, prior.value.owner_node_id, 0) catch |err| switch (err) {
+        if (prior.value.expires_at_ms > now_ms) continue;
+        if (prior.value.state != .idle) {
+            const changed = reconcile(store, registry, prior.value, 0, now_ms) catch |err| switch (err) {
+                error.SqlConnectionBusy, error.SqlConnectionChanged, error.SqlConnectionNotFound => continue,
+                else => return err,
+            };
+            if (!changed) continue;
+        }
+        _ = mutate(store, .{ .expire = .{ .id = entry.id, .cutoff_ms = now_ms } }, prior.value.principal, prior.value.owner_node_id, 0) catch |err| switch (err) {
             error.SqlConnectionBusy, error.SqlConnectionChanged, error.SqlConnectionNotFound => continue,
             else => return err,
         };
-        reconciled.deinit();
+        return; // One free slot is sufficient for this admission.
+
     }
 }
 
@@ -182,13 +208,24 @@ pub const Action = union(enum) {
     create: record.Record,
     discard: [32]u8,
     close: [32]u8,
+    expire: struct { id: [32]u8, cutoff_ms: u64 },
     begin: struct { id: [32]u8, expected_revision: u64, txn_id: [16]u8 },
     abort_begin: struct { id: [32]u8, txn_id: [16]u8 },
     bind: struct { id: [32]u8, txn_id: [16]u8 },
-    uncertain: struct { id: [32]u8, txn_id: [16]u8 },
+    uncertain: struct { id: [32]u8, guard: transactions.Mutation },
     terminal: struct { id: [32]u8, txn_id: [16]u8 },
     overlay: struct { id: [32]u8, expected_revision: u64, entries: []const settings.OverlayEntry },
 };
+
+pub fn create(store: *transactions.DurableSessionStore, registry: *transactions.SessionRegistry, value: record.Record, now_ms: u64) !void {
+    const action: Action = .{ .create = value };
+    _ = mutate(store, action, value.principal, value.owner_node_id, now_ms) catch |err| {
+        if (err != error.SqlWriteCapacityUnavailable) return err;
+        try reconcileExpired(store, registry, store.alloc, now_ms);
+        _ = try mutate(store, action, value.principal, value.owner_node_id, now_ms);
+        return;
+    };
+}
 
 pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !usize {
     const mutation = store.mutationMutex();
@@ -211,6 +248,32 @@ pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principa
             break :blk result;
         },
     };
+}
+
+fn removeDirectoryEntry(txn: anytype, alloc: std.mem.Allocator, id: [32]u8, cutoff: ?u64) !void {
+    const raw = try txn.get(directory_key);
+    var directory = try std.json.parseFromSlice(Directory, alloc, raw, .{ .allocate = .alloc_always });
+    defer directory.deinit();
+    if (directory.value.entries.len > max_connections) return error.InvalidSqlConnection;
+    var retained: [max_connections]Entry = undefined;
+    var count: usize = 0;
+    var found = false;
+    for (directory.value.entries) |entry| {
+        if (std.mem.eql(u8, &entry.id, &id)) {
+            if (cutoff) |ms| if (entry.expires_at_ms > ms) return error.SqlConnectionChanged;
+            found = true;
+            continue;
+        }
+        retained[count] = entry;
+        count += 1;
+    }
+    if (!found) {
+        if (cutoff != null) return;
+        return error.InvalidSqlConnection;
+    }
+    const encoded = try std.json.Stringify.valueAlloc(alloc, Directory{ .entries = retained[0..count] }, .{});
+    defer alloc.free(encoded);
+    try txn.put(directory_key, encoded);
 }
 
 fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !usize {
@@ -237,34 +300,12 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         var directory = try std.json.parseFromSlice(Directory, alloc, raw, .{ .allocate = .alloc_always });
         defer directory.deinit();
         if (directory.value.entries.len > max_connections) return error.InvalidSqlConnection;
+        const prior = directory.value.entries;
+        for (prior) |entry| if (std.mem.eql(u8, &entry.id, &value.id)) return error.SqlConnectionAlreadyExists;
+        if (prior.len == max_connections) return error.SqlWriteCapacityUnavailable;
         var entries: [max_connections]Entry = undefined;
-        var count: usize = 0;
-        for (directory.value.entries) |entry| {
-            if (std.mem.eql(u8, &entry.id, &value.id)) return error.SqlConnectionAlreadyExists;
-            if (entry.expires_at_ms <= now_ms) {
-                const old_key = try record.key(&entry.id);
-                var previous = record.loadTxn(txn, alloc, &entry.id) catch |err| switch (err) {
-                    error.SqlConnectionNotFound => null,
-                    else => return err,
-                };
-                if (previous) |*owned| {
-                    defer owned.deinit();
-                    // Never collect an expired connection while a transaction
-                    // could still have an uncertain commit decision.
-                    if (owned.value.state != .idle) {
-                        entries[count] = entry;
-                        count += 1;
-                        continue;
-                    }
-                    _ = try prepared.discardConnectionTxn(txn, alloc, entry.id);
-                    try txn.delete(&old_key);
-                }
-                continue;
-            }
-            entries[count] = entry;
-            count += 1;
-        }
-        if (count == max_connections) return error.SqlWriteCapacityUnavailable;
+        @memcpy(entries[0..prior.len], prior);
+        var count = prior.len;
         entries[count] = .{ .id = value.id, .expires_at_ms = value.expires_at_ms };
         count += 1;
         const encoded = try std.json.Stringify.valueAlloc(alloc, Directory{ .entries = entries[0..count] }, .{});
@@ -276,6 +317,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
     const id: [32]u8 = switch (action) {
         .create => unreachable,
         .discard, .close => |value| value,
+        .expire => |value| value.id,
         .begin => |value| value.id,
         .abort_begin => |value| value.id,
         .bind => |value| value.id,
@@ -283,12 +325,24 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         .terminal => |value| value.id,
         .overlay => |value| value.id,
     };
-    var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, now_ms);
+    var owned = loadTxn(txn, alloc, id, principal, owner_node_id, now_ms) catch |err| {
+        if (err != error.SqlConnectionNotFound or action != .expire) return err;
+        // A missing legacy record may still occupy a directory slot. Confirm
+        // absence separately because requireOwner also masks principal mismatch.
+        const key = try record.key(&id);
+        _ = txn.get(&key) catch |get_err| {
+            if (get_err != error.NotFound) return get_err;
+            try removeDirectoryEntry(txn, alloc, id, action.expire.cutoff_ms);
+            return 0;
+        };
+        return err;
+    };
     defer owned.deinit();
     var next = owned.value;
     return switch (action) {
         .create => unreachable,
-        .discard, .close => blk: {
+        .discard, .close, .expire => blk: {
+            if (action == .expire and next.expires_at_ms > action.expire.cutoff_ms) return error.SqlConnectionChanged;
             if (next.state != .idle) return error.SqlConnectionBusy;
             const removed = try prepared.discardConnectionTxn(txn, alloc, id);
             if (action == .discard) {
@@ -301,26 +355,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             } else {
                 const connection_key = try record.key(&id);
                 try txn.delete(&connection_key);
-                // Remove the exact directory entry as part of this commit.
-                const raw = try txn.get(directory_key);
-                var directory = try std.json.parseFromSlice(Directory, alloc, raw, .{ .allocate = .alloc_always });
-                defer directory.deinit();
-                if (directory.value.entries.len > max_connections) return error.InvalidSqlConnection;
-                var retained: [max_connections]Entry = undefined;
-                var count: usize = 0;
-                var found = false;
-                for (directory.value.entries) |entry| {
-                    if (std.mem.eql(u8, &entry.id, &id)) {
-                        found = true;
-                        continue;
-                    }
-                    retained[count] = entry;
-                    count += 1;
-                }
-                if (!found) return error.InvalidSqlConnection;
-                const encoded = try std.json.Stringify.valueAlloc(alloc, Directory{ .entries = retained[0..count] }, .{});
-                defer alloc.free(encoded);
-                try txn.put(directory_key, encoded);
+                try removeDirectoryEntry(txn, alloc, id, null);
             }
             break :blk removed;
         },
@@ -336,6 +371,11 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         },
         .abort_begin => |binding| blk: {
             if (next.state != .beginning or !std.mem.eql(u8, &next.active_txn.?, &binding.txn_id)) return error.SqlConnectionBusy;
+            if (try store.loadSessionTxn(txn, binding.txn_id)) |present| {
+                var session = present;
+                defer session.deinit(store.alloc);
+                return error.SqlConnectionBusy;
+            }
             next.state = .idle;
             next.active_txn = null;
             try record.putTxn(txn, alloc, next);
@@ -348,7 +388,9 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             break :blk 0;
         },
         .uncertain => |binding| blk: {
-            if (next.state != .active or !std.mem.eql(u8, &next.active_txn.?, &binding.txn_id)) return error.SqlConnectionBusy;
+            if (next.state != .active or !std.mem.eql(u8, &next.active_txn.?, &binding.guard.id)) return error.SqlConnectionBusy;
+            if (binding.guard.owner != owner_node_id) return error.SessionLeaseLost;
+            try binding.guard.checkLeaseTxn(alloc, txn);
             next.state = .uncertain;
             try record.putTxn(txn, alloc, next);
             break :blk 0;
@@ -357,9 +399,10 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             if ((next.state != .active and next.state != .uncertain) or
                 !std.mem.eql(u8, &next.active_txn.?, &binding.txn_id)) return error.SqlConnectionBusy;
             var session = (try store.loadSessionTxn(txn, binding.txn_id)) orelse return error.SqlTransactionOutcomeUnknown;
-            defer session.deinit(alloc);
+            defer session.deinit(store.alloc);
+            // Recovery can transfer the session lease while the connection retains its owner.
             if (session.connection_id == null or !std.mem.eql(u8, &session.connection_id.?, &id) or
-                session.owner_node_id != owner_node_id or !std.mem.eql(u8, session.principal orelse "", principal))
+                !std.mem.eql(u8, session.principal orelse "", principal))
                 return error.SqlTransactionOutcomeUnknown;
             if (session.terminal_commit == null and !session.terminal_abort) return error.SqlTransactionOutcomeUnknown;
             if (session.terminal_commit != null and session.terminal_abort) return error.InvalidTransactionSessionRecord;
@@ -415,7 +458,7 @@ test "HTTP connection DISCARD fences only its prepared resources and active owne
     try attached.value.verifyExecutionSession(&attached_hex);
     try std.testing.expectError(error.SqlTransactionNotActive, attached.value.verifyExecutionSession(null));
     try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .discard = alice }, "alice", 7, 2));
-    _ = try mutate(&store, .{ .uncertain = .{ .id = alice, .txn_id = @splat(3) } }, "alice", 7, 2);
+    _ = try mutate(&store, .{ .uncertain = .{ .id = alice, .guard = .{ .id = @splat(3), .owner = 7, .tenure = null } } }, "alice", 7, 2);
     try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .discard = alice }, "alice", 7, 2));
     var aborted_session: transactions.Session = .{
         .txn_id = @splat(3),
@@ -431,7 +474,7 @@ test "HTTP connection DISCARD fences only its prepared resources and active owne
         .sql = .{ .database = try alloc.dupe(u8, "main"), .namespace = try alloc.dupe(u8, "public"), .isolation = .read_committed, .mode = .read_write },
     };
     defer aborted_session.deinit(alloc);
-    try store.save(aborted_session, null);
+    try store.saveForTest(aborted_session, null);
     _ = try mutate(&store, .{ .terminal = .{ .id = alice, .txn_id = @splat(3) } }, "alice", 7, 2);
     try std.testing.expectEqual(@as(usize, 2), try mutate(&store, .{ .discard = alice }, "alice", 7, 2));
     try std.testing.expectError(error.SqlPreparedNotFound, prepared.loadForConnection(&store, alloc, &alice_plan, "alice", 7, 2, alice));
@@ -461,18 +504,54 @@ test "HTTP connection recovers a durable pre-response BEGIN fence without an esc
     defer fenced.deinit();
     try std.testing.expectEqual(record.State.beginning, fenced.value.state);
     try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .discard = id }, "alice", 7, 2));
-    var recovered = try loadReconciled(&store, &registry, alloc, id, "alice", 7, 2);
+    _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
+    var recovered = try loadReconciled(&store, &registry, std.heap.page_allocator, id, "alice", 7, 2);
     defer recovered.deinit();
     try std.testing.expectEqual(record.State.idle, recovered.value.state);
     try std.testing.expect(recovered.value.active_txn == null);
     try std.testing.expectEqual(@as(usize, 0), try mutate(&store, .{ .discard = id }, "alice", 7, 2));
 
+    try std.testing.expectError(error.SqlConnectionChanged, registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id));
+    try std.testing.expect((try registry.getSqlState(alloc, txn_id)) == null);
+
     // Expired non-idle roots must not occupy the bounded directory forever.
     const replacement: [32]u8 = @splat('d');
-    _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 2, .txn_id = txn_id } }, "alice", 7, 2);
+    var current = try load(&store, alloc, id, "alice", 7, 2);
+    defer current.deinit();
+    _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = current.value.revision, .txn_id = txn_id } }, "alice", 7, 2);
+    _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
+    try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .abort_begin = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2));
     try reconcileExpired(&store, &registry, alloc, 1001);
+    try std.testing.expect((try registry.getSqlState(alloc, txn_id)) == null);
     _ = try mutate(&store, .{ .create = .{ .id = replacement, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 2000, .database = "main", .namespace = "public" } }, "alice", 7, 1001);
     try std.testing.expectError(error.SqlConnectionNotFound, load(&store, alloc, id, "alice", 7, 2));
+}
+
+test "HTTP connection recovers an expired slot only on capacity pressure" {
+    const a = std.testing.allocator;
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var native = try backend.runtimeStore(a, .{ .name = "sql-connection-pressure" });
+    defer native.deinit();
+    var store = transactions.DurableSessionStore.initRuntime(a, &native);
+    var registry = transactions.SessionRegistry.init(&store);
+    defer registry.deinit(a);
+    var value: record.Record = .{ .id = @splat('0'), .principal = "alice", .owner_node_id = 7, .expires_at_ms = 2, .database = "main", .namespace = "public" };
+    try create(&store, &registry, value, 1);
+    const expired_id = value.id;
+    const txn_id = transactions.newSessionTxnId(7);
+    _ = try mutate(&store, .{ .begin = .{ .id = value.id, .expected_revision = 1, .txn_id = txn_id } }, "alice", 7, 1);
+    _ = try registry.beginForPrincipalWithSettingsAndId(a, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, value.id, txn_id);
+    value.expires_at_ms = 100;
+    for (1..max_connections) |index| {
+        value.id = std.fmt.bytesToHex(std.mem.toBytes(@as(u128, index)), .lower);
+        try create(&store, &registry, value, 3);
+    }
+    try std.testing.expect((try store.connectionLifecycle(txn_id)) != null);
+    value.id = @splat('f');
+    try create(&store, &registry, value, 3);
+    try std.testing.expect((try store.connectionLifecycle(txn_id)) == null);
+    try std.testing.expectError(error.SqlConnectionNotFound, load(&store, a, expired_id, "alice", 7, 1));
 }
 
 test "HTTP connection keeps a referenced durable transaction through session GC" {
@@ -482,16 +561,24 @@ test "HTTP connection keeps a referenced durable transaction through session GC"
     var native = try backend.runtimeStore(alloc, .{ .name = "sql-connection-gc-test" });
     defer native.deinit();
     var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
-    var registry = transactions.SessionRegistry.init(&store);
+    const leases = transactions.SessionLeaseStore.initFromDurable(&store);
+    var registry = transactions.SessionRegistry.initWithLeaseTtl(&store, leases, 60 * std.time.ns_per_s);
+    registry.durable_scope = .cluster_shared;
     defer registry.deinit(alloc);
     const id: [32]u8 = @splat('e');
     const txn_id = transactions.newSessionTxnId(7);
     _ = try mutate(&store, .{ .create = .{ .id = id, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 1);
     _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 1, .txn_id = txn_id } }, "alice", 7, 2);
-    _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
+    const begun = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
     _ = try mutate(&store, .{ .bind = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2);
+    const original = try registry.mutation(alloc, txn_id, 7);
+    const status = (try registry.getStatus(alloc, txn_id)).?;
+    _ = try registry.renewOwnedLeases(7, status.lease_expires_at + std.time.ns_per_ms);
+    try std.testing.expectError(error.SessionLeaseLost, registry.retireBeforeExecution(alloc, original, begun.version, true));
+    try std.testing.expectError(error.SessionLeaseLost, registry.retireBeforeExecution(alloc, original, begun.version, false));
+    try std.testing.expectError(error.SessionLeaseLost, mutate(&store, .{ .uncertain = .{ .id = id, .guard = original } }, "alice", 7, 2));
     store.fail_writes_for_test = true;
-    try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackConnectionBeforeExecution(alloc, txn_id, id));
+    try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackConnectionBeforeExecution(txn_id, id, begun.version, .active));
     store.fail_writes_for_test = false;
     var still_active = try load(&store, alloc, id, "alice", 7, 2);
     try std.testing.expectEqual(record.State.active, still_active.value.state);
@@ -502,11 +589,73 @@ test "HTTP connection keeps a referenced durable transaction through session GC"
     direct_route_details.deinit(alloc);
     var retained = (try registry.getSqlState(alloc, txn_id)) orelse return error.TestExpectedEqual;
     retained.deinit(alloc);
-    try registry.rollbackConnectionBeforeExecution(alloc, txn_id, id);
-    var idle = try load(&store, alloc, id, "alice", 7, 2);
-    defer idle.deinit();
-    try std.testing.expectEqual(record.State.idle, idle.value.state);
+    try std.testing.expectError(error.SqlTransactionOutcomeUnknown, registry.rollbackConnectionBeforeExecution(txn_id, id, begun.version, .beginning));
+    try reconcileExpired(&store, &registry, alloc, 999);
+    var unexpired = try load(&store, alloc, id, "alice", 7, 999);
+    try std.testing.expectEqual(record.State.active, unexpired.value.state);
+    unexpired.deinit();
+    // Reconcile from a second registry while a foreground stage holds a clone
+    // of the retiring session and its own local stripe.
+    const Race = struct {
+        store: *transactions.DurableSessionStore,
+        registry: *transactions.SessionRegistry,
+        fn expire(ptr: *anyopaque, a: std.mem.Allocator, _: ?*const transactions.OwnedTransactionCommitRequest, _: *transactions.OwnedTransactionCommitRequest, _: *const transactions.OwnedTransactionCommitRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try reconcileExpired(self.store, self.registry, a, 1000);
+        }
+    };
+    var sweeper = transactions.SessionRegistry.initWithLeaseTtl(&store, leases, 60 * std.time.ns_per_s);
+    sweeper.durable_scope = .cluster_shared;
+    defer sweeper.deinit(alloc);
+    var race = Race{ .store = &store, .registry = &sweeper };
+    try std.testing.expectError(error.SessionLeaseLost, registry.stageValidated(alloc, try registry.mutation(alloc, txn_id, 7), &.{}, .{ .ptr = &race, .validate = Race.expire }));
+    try std.testing.expectEqual(@as(usize, 0), try registry.renewOwnedLeases(7, std.math.maxInt(u64)));
+    try std.testing.expect((try leases.load(alloc, txn_id)) == null);
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.cloneSqlStaged(alloc, txn_id));
+    try std.testing.expectError(error.SqlConnectionNotFound, load(&store, alloc, id, "alice", 7, 2));
     try std.testing.expect((try registry.getSqlState(alloc, txn_id)) == null);
+}
+
+test "HTTP connection reconciles expired uncertain attempts that never started execution" {
+    const alloc = std.testing.allocator;
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var native = try backend.runtimeStore(alloc, .{ .name = "sql-connection-uncertain-test" });
+    defer native.deinit();
+    var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
+    var registry = transactions.SessionRegistry.initWithLeaseTtl(&store, transactions.SessionLeaseStore.initFromDurable(&store), 60 * std.time.ns_per_s);
+    registry.durable_scope = .cluster_shared;
+    defer registry.deinit(alloc);
+
+    for ([_]bool{ false, true }, [_]u8{ 'a', 'b' }) |request_persisted, digit| {
+        const id: [32]u8 = @splat(digit);
+        const txn_id = transactions.newSessionTxnId(7);
+        _ = try mutate(&store, .{ .create = .{ .id = id, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 1);
+        _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 1, .txn_id = txn_id } }, "alice", 7, 2);
+        _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
+        _ = try mutate(&store, .{ .bind = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2);
+        const guard = try registry.mutation(alloc, txn_id, 7);
+        if (request_persisted) {
+            var session = (try store.load(txn_id)).?;
+            defer session.deinit(alloc);
+            session.commit_body_digest = @splat(4);
+            try store.saveForTest(session, null);
+        }
+        if (request_persisted) _ = try mutate(&store, .{ .uncertain = .{ .id = id, .guard = guard } }, "alice", 7, 2);
+        try reconcileExpired(&store, &registry, alloc, 999);
+        var pending = try load(&store, alloc, id, "alice", 7, 999);
+        defer pending.deinit();
+        try std.testing.expectEqual(if (request_persisted) record.State.uncertain else .active, pending.value.state);
+        try reconcileExpired(&store, &registry, alloc, 1000);
+        try std.testing.expectError(error.SqlConnectionNotFound, load(&store, alloc, id, "alice", 7, 2));
+        const disposition = (try registry.getStatusForPrincipal(alloc, txn_id, "alice")).?;
+        try std.testing.expectEqual(transactions.SessionDisposition.aborted, disposition.disposition);
+        try std.testing.expectEqual(@as(u64, 0), disposition.lease_expires_at);
+        try std.testing.expect((try registry.getStatusForPrincipal(alloc, txn_id, "bob")) == null);
+        var receipt = (try store.load(txn_id)).?;
+        defer receipt.deinit(alloc);
+        try std.testing.expect(receipt.terminal_abort and receipt.staged == null and receipt.execution_plan == null);
+    }
 }
 
 test "HTTP connection reconciles a durable aborted coordinator decision" {
@@ -536,8 +685,18 @@ test "HTTP connection reconciles a durable aborted coordinator decision" {
         .sql = .{ .database = try alloc.dupe(u8, "main"), .namespace = try alloc.dupe(u8, "public"), .isolation = .read_committed, .mode = .read_write },
     };
     defer session.deinit(alloc);
-    try store.save(session, null);
-    _ = (try registry.recordTerminalAbort(alloc, txn_id)) orelse return error.TestExpectedEqual;
+    try store.saveForTest(session, null);
+    registry.durable_scope = .cluster_shared;
+    try std.testing.expect(try registry.adopt(alloc, txn_id, 7));
+    var recovery = transactions.SessionRegistry.init(&store);
+    defer recovery.deinit(alloc);
+    recovery.durable_scope = .cluster_shared;
+    try std.testing.expect(try recovery.adopt(alloc, txn_id, 8));
+    try reconcileExpired(&store, &registry, alloc, 1001);
+    var executing = try load(&store, alloc, id, "alice", 7, 2);
+    try std.testing.expectEqual(record.State.active, executing.value.state);
+    executing.deinit();
+    _ = (try recovery.recordTerminalAbort(alloc, txn_id)) orelse return error.TestExpectedEqual;
     var proved = (try registry.getSqlState(alloc, txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(proved.terminal_abort);
     proved.deinit(alloc);
@@ -594,13 +753,13 @@ test "HTTP connection publishes only committed nonlocal settings on terminal pro
     defer session.deinit(alloc);
     try session.setting_committed.append(alloc, .{ .identity = .{ .id = 17, .generation = 1 }, .value = .{ .integer = 5 } });
     try session.setting_active.append(alloc, .{ .identity = .{ .id = 17, .generation = 1 }, .value = .{ .integer = 9 } });
-    try store.save(session, null);
+    try store.saveForTest(session, null);
     try std.testing.expectError(error.SqlTransactionOutcomeUnknown, mutate(&store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2));
     var still_active = try load(&store, alloc, id, "alice", 7, 2);
     try std.testing.expectEqual(record.State.active, still_active.value.state);
     still_active.deinit();
     session.terminal_commit = .{ .status = .committed };
-    try store.save(session, null);
+    try store.saveForTest(session, null);
     _ = try mutate(&store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2);
     var committed = try load(&store, alloc, id, "alice", 7, 2);
     defer committed.deinit();

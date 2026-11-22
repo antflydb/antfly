@@ -236,6 +236,18 @@ pub const Cursor = struct {
         if (self.vtable.set_keys_only) |set| set(self.ptr);
     }
 
+    /// Count borrowed keys on this snapshot without retaining or copying values.
+    pub fn countPrefix(self: *Cursor, prefix: []const u8) !u64 {
+        self.setKeysOnly();
+        var row = try self.seekAtOrAfter(prefix);
+        var count: u64 = 0;
+        while (row) |entry| : (row = try self.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            count += 1;
+        }
+        return count;
+    }
+
     pub fn start(self: *Cursor, options: backend_types.CursorOptions) !?Entry {
         return switch (options.start) {
             .first => switch (options.order) {
@@ -261,6 +273,7 @@ pub const ReadScope = struct {
     const VTable = struct {
         get_ranges_many: ?*const fn (*anyopaque, []const RangeRequest) anyerror!void = null,
         get_ranges: ?*const fn (*anyopaque, []const u8, []const ValueRange, [][]const u8) anyerror!void = null,
+        probe_prefix: ?*const fn (*anyopaque, []const u8, usize) anyerror![]const u8 = null,
         get_range: ?*const fn (*anyopaque, []const u8, u64, usize) anyerror![]const u8 = null,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
@@ -304,6 +317,12 @@ pub const ReadScope = struct {
     pub fn supportsRange(self: *const @This()) bool {
         return self.vtable.get_range != null;
     }
+    /// Read a bounded prefix without requiring a full-value compatibility read.
+    pub fn probePrefix(self: *@This(), key: []const u8, length: usize) ![]const u8 {
+        if (self.vtable.probe_prefix) |probe| return BoundaryAbi.call("probe_prefix", self.boundary_dispatch, probe, .{ self.ptr, key, length });
+        return self.getRange(key, 0, length);
+    }
+
     pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
         const read_range = self.vtable.get_range orelse return error.Unsupported;
         return BoundaryAbi.call("get_range", self.boundary_dispatch, read_range, .{ self.ptr, key, offset, length });
@@ -453,6 +472,11 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRanges(key, ranges, output);
         }
+        fn probePrefix(ptr: *anyopaque, key: []const u8, length: usize) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.probePrefix(key, length);
+        }
+
         fn getRange(ptr: *anyopaque, key: []const u8, offset: u64, length: usize) anyerror![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRange(key, offset, length);
@@ -546,7 +570,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .probe_prefix = if (@hasDecl(@TypeOf(handle), "probePrefix")) State.probePrefix else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
@@ -595,6 +619,8 @@ pub const ReadTxn = struct {
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
+        read_prefix_page: ?*const fn (*anyopaque, Allocator, []const u8, ?[]const u8, usize) anyerror![]Entry = null,
+        count_prefix: ?*const fn (*anyopaque, []const u8) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -607,6 +633,20 @@ pub const ReadTxn = struct {
     pub fn decodedResultsNamespace(self: *const ReadTxn) ?[]const u8 {
         if (!self.canReuseDecodedResults()) return null;
         return if (self.vtable.decoded_results_namespace) |get_namespace| get_namespace(self.ptr) else null;
+    }
+
+    /// Up to 64 rows, after an exclusive continuation, from this snapshot.
+    /// Keys and bounded value prefixes are allocated by the caller.
+    pub fn readPrefixPage(self: *ReadTxn, alloc: Allocator, prefix: []const u8, after: ?[]const u8, value_prefix_len: usize) ![]Entry {
+        const read = self.vtable.read_prefix_page orelse return error.Unsupported;
+        return BoundaryAbi.call("read_prefix_page", self.boundary_dispatch, read, .{ self.ptr, alloc, prefix, after, value_prefix_len });
+    }
+
+    pub fn countPrefix(self: *ReadTxn, prefix: []const u8) !u64 {
+        if (self.vtable.count_prefix) |count| return BoundaryAbi.call("count_prefix", self.boundary_dispatch, count, .{ self.ptr, prefix });
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        return cursor.countPrefix(prefix);
     }
 
     pub fn abort(self: *ReadTxn) void {
@@ -815,6 +855,7 @@ pub const WriteTxn = struct {
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
         contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
+        count_prefix: ?*const fn (*anyopaque, []const u8) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -824,6 +865,13 @@ pub const WriteTxn = struct {
     pub fn putIndexCatalogBatch(self: *WriteTxn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
         const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
         try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
+    }
+
+    pub fn countPrefix(self: *WriteTxn, prefix: []const u8) !u64 {
+        if (self.vtable.count_prefix) |count| return BoundaryAbi.call("count_prefix", self.boundary_dispatch, count, .{ self.ptr, prefix });
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        return cursor.countPrefix(prefix);
     }
 
     pub fn abort(self: *WriteTxn) void {

@@ -1308,6 +1308,107 @@ pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
 /// linked/direct execution as well as HTTP and discovery; zero is invalid.
 pub const RequestLimits = platform.resource_policy.InferenceRequestLimits;
 
+pub fn isHostedInferenceEndpoint(url: []const u8) bool {
+    const parsed = std.Uri.parse(url) catch return false;
+    return (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) and
+        parsed.host != null and parsed.user == null and parsed.password == null and parsed.query == null and parsed.fragment == null;
+}
+
+const hosted_inference_timeout_ms: u64 = 120_000;
+const hosted_ocr_response_bytes: usize = 2 * 1024 * 1024;
+const hosted_ocr_result_bytes: usize = 16 * 1024 * 1024;
+const hosted_ocr_retained_reply_bytes: usize = 32 * 1024 * 1024;
+const hosted_ocr_response_body_bytes: usize = 32 * 1024 * 1024;
+const hosted_ocr_initial_response_units: usize = 1;
+const hosted_extraction_working_bytes: usize = 32 * 1024 * 1024;
+const hosted_extraction_result_bytes: usize = 8 * 1024 * 1024;
+const hosted_extraction_max_windows: usize = 128;
+
+fn accountHostedUpstreamReply(total: *usize, bytes: usize, limit: usize) !void {
+    if (bytes > limit -| total.*) return error.ExtractorUpstreamOutputTooLarge;
+    total.* += bytes;
+}
+
+fn hostedJsonSize(response: anytype) u64 {
+    var scratch: [1024]u8 = undefined;
+    var counter = std.Io.Writer.Discarding.init(&scratch);
+    std.json.Stringify.value(response, .{}, &counter.writer) catch unreachable;
+    return counter.fullCount();
+}
+
+fn serializeSizedJson(allocator: std.mem.Allocator, response: anytype, bytes: usize) ![]u8 {
+    const result = try allocator.alloc(u8, bytes);
+    errdefer allocator.free(result);
+    var writer: std.Io.Writer = .fixed(result);
+    try std.json.Stringify.value(response, .{}, &writer);
+    return result;
+}
+
+fn serializeHostedExtraction(allocator: std.mem.Allocator, response: std.json.Value, output_limit: usize) ![]u8 {
+    const bytes = hostedJsonSize(response);
+    if (bytes > output_limit) return error.ExtractorResponseTooLarge;
+    return serializeSizedJson(allocator, response, @intCast(bytes));
+}
+
+fn hostedOcrResponseUnits(body_size: u64, reply_bytes: usize, media_bytes: usize, capacity: usize) !struct { response: usize, peak: usize } {
+    if (body_size > hosted_ocr_response_body_bytes) return error.HostedReaderOutputTooLarge;
+    const bytes: usize = @intCast(body_size);
+    const peak = admissionUnitsFor(bytes +| reply_bytes +| media_bytes, read_admission_bytes_per_unit);
+    if (capacity != 0 and peak > capacity) return error.HostedReaderOutputTooLarge;
+    return .{ .response = admissionUnitsFor(bytes, read_admission_bytes_per_unit), .peak = peak };
+}
+
+fn hostedReadTokens(requested: ?i64, configured: ?i64, ceiling: usize) !usize {
+    if (try validateReadMaxTokens(requested)) |tokens| {
+        if (tokens > ceiling) return error.HostedReadTokenLimitExceeded;
+        return tokens;
+    }
+    return @min((try validateReadMaxTokens(configured)) orelse 4096, ceiling);
+}
+
+fn hostedInferenceControl(supplied: InferenceExecutionControl) InferenceExecutionControl {
+    var control = supplied;
+    const deadline = platform.time.monotonicNs() +| hosted_inference_timeout_ms * std.time.ns_per_ms;
+    control.deadline_ns = @min(control.deadline_ns orelse deadline, deadline);
+    return control;
+}
+
+fn checkedHostedReadUsage(prompt: i64, completion: i64) !api.GenerateUsage {
+    return .{
+        .prompt_tokens = prompt,
+        .completion_tokens = completion,
+        .total_tokens = std.math.add(i64, prompt, completion) catch return error.InvalidReadExecutionReport,
+    };
+}
+
+pub const NamedImageReader = struct { name: []const u8, config: readers_api.Config };
+
+pub const NamedGeneratedExtractor = struct {
+    name: []const u8,
+    config: @import("antfly_structured").extraction.Config,
+
+    pub fn explicitEndpointField(generator: std.json.Value) ?[]const u8 {
+        if (generator != .object) return null;
+        for ([_][]const u8{ "url", "api_url" }) |field| {
+            if (generator.object.get(field)) |value| if (value != .null) return field;
+        }
+        return null;
+    }
+
+    pub fn parse(a: std.mem.Allocator, name: []const u8, value: std.json.Value) !NamedGeneratedExtractor {
+        const config = try std.json.parseFromValueLeaky(@import("antfly_structured").extraction.Config, a, value, .{ .allocate = .alloc_always });
+        try config.validate();
+        const generator_value = value.object.get("generator").?;
+        if (name.len == 0 or config.generator.provider != .openai or explicitEndpointField(generator_value) == null or !isHostedInferenceEndpoint(config.generator.url) or
+            config.probabilities != .verdict_only or (config.output != .auto and config.output != .json_schema) or
+            config.generator.tools_json != null or config.generator.tool_choice_json != null or config.generator.rate_limit != null or
+            config.generator.max_completion_tokens != null or config.generator.response_format_json != null or config.generator.reasoning_effort != null or
+            config.generator.connection_id != null or config.generator.logprobs)
+            return error.InvalidGeneratedExtractorConfig;
+        return .{ .name = name, .config = config };
+    }
+};
+
 pub const NodeConfig = struct {
     /// Fixed before model/client creation; CUDA requires explicit device and
     /// allocator capacities. F32 remains the default qualification profile.
@@ -1318,6 +1419,8 @@ pub const NodeConfig = struct {
     pjrt_decoder_cache: ?bool = null,
     pjrt_gemm: @import("../execution/precision.zig").Gemm = .provider_default,
     audio_readers: []const transcribing_api.NamedConfig = &.{},
+    image_readers: []const NamedImageReader = &.{},
+    generated_extractors: []const NamedGeneratedExtractor = &.{},
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -4692,6 +4795,15 @@ pub const Node = struct {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
         try config.request_limits.validate();
+        for (config.image_readers) |reader| {
+            _ = validateReadMaxTokens(reader.config.max_tokens) catch return error.InvalidHostedReaderTokenBudget;
+        }
+        for (config.generated_extractors) |extractor| {
+            const tokens = std.math.cast(i32, extractor.config.generator.max_tokens) orelse return error.InvalidHostedExtractorTokenBudget;
+            if (tokens <= 0) return error.InvalidHostedExtractorTokenBudget;
+            if (config.request_limits.max_output_tokens_per_item) |limit|
+                if (tokens > limit) return error.InvalidHostedExtractorTokenBudget;
+        }
         if (config.pjrt_extraction_batch_size == 0 or config.pjrt_extraction_batch_size > 8) return error.InvalidPjrtBatch;
         if (config.pjrt_media_bucket_rows > 256) return error.InvalidPjrtBucket;
         try config.cooperative_execution.validate();
@@ -23174,7 +23286,7 @@ pub const Node = struct {
     /// Read spans reader/ASR/generator storage. Other operations retain their
     /// own task namespace and may intentionally share a model identifier.
     pub fn documentDefinition(self: *Node, a: std.mem.Allocator, name: []const u8, operation: document_contract.Operation) !?[]const u8 {
-        if (self.hostedAudioReader(name) != null) return null;
+        if (self.hostedAudioReader(name) != null or self.hostedImageReader(name) != null) return null;
         if (std.mem.eql(u8, name, "antfly/native-document") or std.fs.path.isAbsolute(name)) return null;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*owned| owned.deinit();
@@ -23739,6 +23851,376 @@ pub const Node = struct {
         return self.readDocumentsJsonWithControl(a, raw, supplied_control);
     }
 
+    fn hostedImageReader(self: *const Node, model: []const u8) ?readers_api.Config {
+        const prefix = "readers/";
+        if (!std.mem.startsWith(u8, model, prefix)) return null;
+        for (self.config.image_readers) |reader| {
+            if (std.mem.eql(u8, reader.name, model[prefix.len..])) return reader.config;
+        }
+        return null;
+    }
+
+    const HostedImagePage = struct {
+        bytes: []const u8,
+        mime: []const u8,
+        original_uri: []const u8,
+        downloaded: ?scraping.DownloadedContent = null,
+
+        fn wirePrefix(self: HostedImagePage, buffer: *[128]u8) ![]const u8 {
+            return std.fmt.bufPrint(buffer, "data:{s};base64,", .{self.mime});
+        }
+    };
+
+    fn hostedOcrDispatchBytes(page: HostedImagePage, json_overhead: usize) usize {
+        const owned_uri_bytes = if (page.bytes.len == 0)
+            0
+        else
+            std.base64.standard.Encoder.calcSize(page.bytes.len) +| 128;
+        const uri_json_bytes = if (owned_uri_bytes == 0)
+            std.math.cast(usize, hostedJsonSize(page.original_uri)) orelse std.math.maxInt(usize)
+        else
+            owned_uri_bytes +| 2;
+        // Allow the allocating JSON writer to hold its prior and grown
+        // buffers at once, in addition to the generated data URI.
+        return owned_uri_bytes +| ((uri_json_bytes +| json_overhead) *| 3);
+    }
+
+    fn hostedOcrDispatchPlan(costs: []usize, max_workers: usize, available_bytes: usize) struct { workers: usize, bytes: usize } {
+        // Dequeued pages vary in size. Reserve for the largest set that can
+        // be in flight at once, independent of completion order.
+        std.mem.sort(usize, costs, {}, std.sort.desc(usize));
+        var bytes: usize = 0;
+        var workers: usize = 0;
+        for (costs[0..max_workers]) |cost| {
+            if (cost > available_bytes - bytes) break;
+            bytes += cost;
+            workers += 1;
+        }
+        return .{ .workers = workers, .bytes = bytes };
+    }
+
+    const HostedReadOutcome = anyerror!readers_api.BatchResult;
+
+    fn invokeHostedImagePage(
+        a: std.mem.Allocator,
+        client: *httpx.Client,
+        page: HostedImagePage,
+        cfg: readers_api.Config,
+        prompt: ?[]const u8,
+        tokens: usize,
+        control: InferenceExecutionControl,
+        stopped: *const std.atomic.Value(bool),
+    ) HostedReadOutcome {
+        try control.check();
+        if (stopped.load(.acquire)) return error.Cancelled;
+        const encoder = std.base64.standard.Encoder;
+        var owned_uri: ?[]u8 = null;
+        defer if (owned_uri) |value| a.free(value);
+        const uri = if (page.bytes.len == 0) page.original_uri else blk: {
+            var buffer: [128]u8 = undefined;
+            const prefix = try page.wirePrefix(&buffer);
+            const encoded = try a.alloc(u8, prefix.len + encoder.calcSize(page.bytes.len));
+            owned_uri = encoded;
+            @memcpy(encoded[0..prefix.len], prefix);
+            _ = encoder.encode(encoded[prefix.len..], page.bytes);
+            break :blk encoded;
+        };
+        const Cancel = struct {
+            control: *const InferenceExecutionControl,
+            stopped: *const std.atomic.Value(bool),
+
+            fn requested(raw: *const anyopaque) bool {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                if (self.stopped.load(.acquire)) return true;
+                self.control.check() catch return true;
+                return false;
+            }
+        };
+        const cancellation = Cancel{ .control = &control, .stopped = stopped };
+        var reply = readers_api.readWithConfigReported(a, client, cfg, .{
+            .images = &.{uri},
+            .prompt = prompt,
+            .max_tokens = @intCast(tokens),
+            .max_response_bytes = hosted_ocr_response_bytes,
+        }, .{
+            .image_first = true,
+            .cancellation = httpx.CancellationToken.fromCallback(&cancellation, Cancel.requested),
+            .timeout_ms = @max(1, (control.deadline_ns.? -| platform.time.monotonicNs()) / std.time.ns_per_ms),
+        }) catch |err| {
+            try control.check();
+            return err;
+        };
+        errdefer reply.deinit(a);
+        try control.check();
+        return reply;
+    }
+
+    const HostedReadQueue = struct {
+        allocator: std.mem.Allocator,
+        client: *httpx.Client,
+        pages: []const HostedImagePage,
+        replies: []?readers_api.BatchResult,
+        config: readers_api.Config,
+        prompt: ?[]const u8,
+        tokens: usize,
+        input_limit: ?usize,
+        control: InferenceExecutionControl,
+        mutex: std.atomic.Mutex = .unlocked,
+        next: usize = 0,
+        result_bytes: usize = 0,
+        retained_reply_bytes: usize = 0,
+        retained_reply_limit: usize,
+        failure: ?anyerror = null,
+        stopped: std.atomic.Value(bool) = .init(false),
+
+        fn lock(self: *HostedReadQueue) void {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        fn take(self: *HostedReadQueue) ?usize {
+            self.lock();
+            defer self.mutex.unlock();
+            if (self.failure != null or self.next == self.pages.len) return null;
+            const index = self.next;
+            self.next += 1;
+            return index;
+        }
+
+        fn fail(self: *HostedReadQueue, err: anyerror) void {
+            self.lock();
+            defer self.mutex.unlock();
+            self.recordFailureLocked(err);
+        }
+
+        fn recordFailureLocked(self: *HostedReadQueue, err: anyerror) void {
+            if (self.failure == null) self.failure = err;
+            self.stopped.store(true, .release);
+        }
+
+        fn accept(self: *HostedReadQueue, index: usize, reply: readers_api.BatchResult) !void {
+            if (reply.items.len != 1) return error.InvalidHostedReaderResponse;
+            if (reply.usage) |usage| {
+                if (self.input_limit) |limit| if (usage.prompt_tokens > limit) return error.InferenceInputTokensExceeded;
+                if (usage.completion_tokens > self.tokens) return error.InvalidReadExecutionReport;
+            } else if (self.input_limit != null) return error.HostedReaderUsageRequired;
+
+            self.lock();
+            defer self.mutex.unlock();
+            if (self.failure != null) return error.Cancelled;
+            const text_bytes = self.result_bytes +| reply.items[0].text.len;
+            const reply_bytes = self.retained_reply_bytes +| reply.retainedPayloadBytes() +| @sizeOf(readers_api.Result);
+            if (text_bytes > hosted_ocr_result_bytes or reply_bytes > self.retained_reply_limit) {
+                self.recordFailureLocked(error.HostedReaderOutputTooLarge);
+                return error.HostedReaderOutputTooLarge;
+            }
+            self.result_bytes = text_bytes;
+            self.retained_reply_bytes = reply_bytes;
+            self.replies[index] = reply;
+        }
+
+        fn run(self: *HostedReadQueue) void {
+            while (self.take()) |index| {
+                var reply = invokeHostedImagePage(self.allocator, self.client, self.pages[index], self.config, self.prompt, self.tokens, self.control, &self.stopped) catch |err| {
+                    self.fail(err);
+                    return;
+                };
+                self.accept(index, reply) catch |err| {
+                    self.fail(err);
+                    reply.deinit(self.allocator);
+                    return;
+                };
+            }
+        }
+    };
+
+    fn readHostedImages(
+        self: *Node,
+        ctx: *httpx.Context,
+        body: api.ReadRequest,
+        cfg: readers_api.Config,
+        tokens: usize,
+        attachments: []const httpx.attachment_envelope.Attachment,
+        indexes: []const ?usize,
+        admission: ReadRequestAdmission,
+        inline_source_bytes: usize,
+        reserved_units: *usize,
+        transferred_units: *usize,
+        supplied: InferenceExecutionControl,
+    ) !httpx.Response {
+        const control = hostedInferenceControl(supplied);
+        const images = body.images.?;
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const results = try alloc.alloc(api.ReadObject, images.len);
+        var batch_bytes: usize = 0;
+        var decoded = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
+        if (self.config.request_limits.max_decoded_pixels_per_batch) |limit|
+            decoded.max_pixels = @min(decoded.max_pixels, std.math.cast(usize, limit) orelse std.math.maxInt(usize));
+        const pages = try alloc.alloc(HostedImagePage, images.len);
+        var prepared: usize = 0;
+        var live_media_bytes = inline_source_bytes;
+        defer for (pages[0..prepared]) |*page| {
+            if (page.downloaded) |*item| item.deinit(ctx.allocator);
+        };
+        for (images, indexes, pages) |image, attachment_index, *page| {
+            if (attachment_index) |i| {
+                page.* = .{ .bytes = attachments[i].data, .mime = attachments[i].mime_type, .original_uri = "" };
+            } else {
+                const item = downloadReadBatchContentForRequest(self, ctx.allocator, image.url, admission.byte_cap, batch_bytes, .{
+                    .io = ctx.io,
+                    .control = control,
+                }) catch |err| return documentFailureResponse(ctx, err);
+                page.* = .{ .bytes = item.data, .mime = item.content_type, .original_uri = image.url, .downloaded = item };
+            }
+            prepared += 1;
+            const bytes = page.bytes;
+            const mime = page.mime;
+            batch_bytes +|= bytes.len;
+            if (batch_bytes > admission.byte_cap) return documentFailureResponse(ctx, error.ReadBatchTooLarge);
+            decoded.addImage(bytes) catch |err| return readImageErrorResponse(ctx, err);
+            validateEncodedImageMime(mime, bytes) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
+            page.mime = image_pipeline.mimeEssenceForEncoded(bytes) orelse
+                return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia);
+            const units = @max(reserved_units.*, decoded.requiredUnits() +| hosted_ocr_initial_response_units);
+            if (try self.growSlotUnits(ctx, reserved_units.*, units)) |response| return response;
+            reserved_units.* = units;
+            var prefix_buffer: [128]u8 = undefined;
+            const prefix = try page.wirePrefix(&prefix_buffer);
+            if (std.mem.startsWith(u8, page.original_uri, prefix)) {
+                if (page.downloaded) |*item| item.deinit(ctx.allocator);
+                page.downloaded = null;
+                page.bytes = &.{};
+            }
+            if (page.downloaded) |item| live_media_bytes +|= item.data.len +| item.content_type.len;
+        }
+
+        const capacity = self.inference_admission.capacity;
+        var workers = @min(pages.len, std.math.clamp(@as(usize, cfg.hosted_parallelism), 1, 8));
+        var wire_budget: usize = 0;
+        if (capacity != 0) {
+            const prompt_size = hostedJsonSize(body.prompt orelse cfg.prompt orelse "");
+            const model_size = hostedJsonSize(cfg.model orelse "");
+            const json_overhead = (std.math.cast(usize, prompt_size +| model_size) orelse std.math.maxInt(usize)) +| 4096;
+            var dispatch_costs: [max_read_batch_images]usize = undefined;
+            const costs = dispatch_costs[0..pages.len];
+            var largest_outbound: usize = 0;
+            // Receive and parse allocations share the same hard live-byte
+            // quota as request construction. This allowance sizes the
+            // reservation and the quota enforces its actual use.
+            const receive_allowance = hosted_ocr_response_bytes * 3;
+            for (pages, costs) |page, *cost| {
+                const outbound = hostedOcrDispatchBytes(page, json_overhead);
+                largest_outbound = @max(largest_outbound, outbound);
+                cost.* = outbound +| receive_allowance;
+            }
+            const available = (capacity *| read_admission_bytes_per_unit) -| live_media_bytes;
+            const plan = hostedOcrDispatchPlan(costs, workers, available);
+            const planned_bytes = if (plan.workers == 0) blk: {
+                // One worker may fit with a smaller reply. Give it the
+                // remaining budget and let the allocator enforce the limit.
+                if (largest_outbound >= available) return documentFailureResponse(ctx, error.ReadBatchTooLarge);
+                workers = 1;
+                break :blk available;
+            } else blk: {
+                workers = plan.workers;
+                break :blk plan.bytes;
+            };
+            const target_units = @max(reserved_units.*, admissionUnitsFor(live_media_bytes +| planned_bytes, read_admission_bytes_per_unit));
+            if (target_units != reserved_units.*) {
+                if (try self.growSlotUnits(ctx, reserved_units.*, target_units)) |response| return response;
+                reserved_units.* = target_units;
+            }
+            wire_budget = (self.inference_admission.capacityUnits(reserved_units.*) *| read_admission_bytes_per_unit) -| live_media_bytes;
+        }
+
+        const wire_backing = platform.allocator.processAllocator(std.heap.smp_allocator);
+        var wire_quota: httpx.QuotaAllocator = .{ .backing = wire_backing, .limit = wire_budget };
+        const wire_allocator = if (capacity == 0) wire_backing else wire_quota.allocator();
+        const replies = try alloc.alloc(?readers_api.BatchResult, pages.len);
+        @memset(replies, null);
+        defer for (replies) |*slot| {
+            if (slot.*) |*reply| reply.deinit(wire_allocator);
+        };
+        var queue: HostedReadQueue = .{
+            .allocator = wire_allocator,
+            .client = undefined,
+            .pages = pages,
+            .replies = replies,
+            .config = cfg,
+            .prompt = body.prompt,
+            .tokens = tokens,
+            .input_limit = self.config.request_limits.max_input_tokens_per_item,
+            .retained_reply_limit = hosted_ocr_retained_reply_bytes,
+            .control = control,
+        };
+        {
+            var client = httpx.Client.init(wire_allocator, ctx.io);
+            defer client.deinit();
+            queue.client = &client;
+            var group = std.Io.Group.init;
+            defer group.cancel(ctx.io);
+            for (1..workers) |_| group.concurrent(ctx.io, HostedReadQueue.run, .{&queue}) catch break;
+            queue.run();
+            group.await(ctx.io) catch |err| return documentFailureResponse(ctx, err);
+        }
+        if (queue.failure) |err| return switch (err) {
+            error.OutOfMemory => if (wire_quota.exceeded)
+                ctx.status(502).json(.{ .@"error" = "READER_WORKING_LIMIT_EXCEEDED" })
+            else
+                documentFailureResponse(ctx, err),
+            error.ReadOutputTruncated, error.DocumentUnresolved, error.Timeout, error.Cancelled, error.Canceled => documentFailureResponse(ctx, err),
+            error.InferenceInputTokensExceeded => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "image tokens exceed the deployment limit" }),
+            error.InvalidReadExecutionReport => ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" }),
+            error.InvalidHostedReaderResponse => ctx.status(502).json(.{ .@"error" = "INVALID_READER_RESPONSE" }),
+            error.HostedReaderUsageRequired => ctx.status(502).json(.{ .@"error" = "READER_USAGE_REQUIRED" }),
+            error.HostedReaderOutputTooLarge => ctx.status(502).json(.{ .@"error" = "READER_OUTPUT_TOO_LARGE" }),
+            else => ctx.status(502).json(.{ .@"error" = "READER_UPSTREAM_FAILED" }),
+        };
+        // Workers are done with the media. Drop owned downloads before
+        // allocating the response. Inline data and attachments remain borrowed.
+        for (pages) |*page| {
+            if (page.downloaded) |*item| item.deinit(ctx.allocator);
+            page.downloaded = null;
+        }
+        var prompt_tokens: i64 = 0;
+        var completion_tokens: i64 = 0;
+        var measured = true;
+        for (replies, results, 0..) |slot, *result, index| {
+            const reply = slot.?;
+            if (reply.usage) |usage| {
+                prompt_tokens = std.math.add(i64, prompt_tokens, usage.prompt_tokens) catch return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
+                completion_tokens = std.math.add(i64, completion_tokens, usage.completion_tokens) catch return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
+            } else measured = false;
+            result.* = .{ .object = "read", .status = "complete", .index = @intCast(index), .text = reply.items[0].text };
+        }
+        const usage = checkedHostedReadUsage(prompt_tokens, completion_tokens) catch return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
+        const result: api.ReadResponse = .{
+            .object = "list",
+            .model = body.model,
+            .data = results,
+            .usage = if (measured) usage else null,
+        };
+        const body_size = hostedJsonSize(result);
+        const response_units = hostedOcrResponseUnits(body_size, if (capacity == 0) queue.retained_reply_bytes else wire_quota.live, inline_source_bytes, capacity) catch
+            return ctx.status(502).json(.{ .@"error" = "READER_OUTPUT_TOO_LARGE" });
+        // Dispatch has torn down. Grow only for the live serialization
+        // peak, which already includes the HTTP body we will transfer.
+        if (response_units.peak > reserved_units.*) {
+            if (try self.growSlotUnits(ctx, reserved_units.*, response_units.peak)) |response| return response;
+            reserved_units.* = response_units.peak;
+        }
+        try ctx.setHeader("content-type", "application/json");
+        const units = self.inference_admission.capacityUnits(response_units.response);
+        const owned = try serializeSizedJson(ctx.allocator, result, @intCast(body_size));
+        _ = ctx.response.bodyOwned(ctx.allocator, owned);
+        var response = try ctx.response.build();
+        errdefer response.deinit();
+        response.body_allocator = try self.hostedResponseOwner(ctx.allocator, ctx.allocator, units);
+        transferred_units.* = units;
+        return response;
+    }
+
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var admission_failure = AdmissionFailureScope{};
         try admission_failure.bind(ctx);
@@ -23771,6 +24253,14 @@ pub const Node = struct {
             const envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch null;
             if (envelope) |parsed_document| {
                 defer parsed_document.deinit();
+                if (parsed_document.value == .object) if (parsed_document.value.object.get("model")) |model| {
+                    if (model == .string and self.hostedImageReader(model.string) != null) {
+                        const object = parsed_document.value.object;
+                        const retaining = if (object.get("retain_artifact")) |value| value == .bool and value.bool else false;
+                        if (!object.contains("images") or retaining)
+                            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "configured image readers accept images without artifact retention" });
+                    }
+                };
                 if (parsed_document.value == .object) {
                     const object = parsed_document.value.object;
                     const forms = @as(usize, @intFromBool(object.contains("images"))) + @intFromBool(object.contains("documents")) + @intFromBool(object.contains("audio"));
@@ -23853,6 +24343,20 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "'max_tokens' must be between 1 and 8192",
             });
+        const hosted_reader = self.hostedImageReader(body.model);
+        if (hosted_reader) |cfg| {
+            if (body.retain_artifact orelse false)
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "configured image readers do not retain artifacts" });
+            self.config.request_limits.validateItemCount(body.images.?.len) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
+            max_tokens = hostedReadTokens(body.max_tokens, cfg.max_tokens, self.config.request_limits.max_output_tokens_per_item orelse 8192) catch |err| {
+                const message = if (err == error.HostedReadTokenLimitExceeded)
+                    "'max_tokens' exceeds the deployment limit"
+                else
+                    "'max_tokens' must be between 1 and 8192";
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = message });
+            };
+        }
         const inline_source_cap = readInlineSourceByteCap(self);
         var inline_source_bytes: usize = 0;
         for ((body.images orelse @as([]const api.ImageURL, &.{})), attachment_indexes) |image, attachment_index| {
@@ -23876,11 +24380,20 @@ pub const Node = struct {
             }
         }
         const admission = readRequestAdmission(self, (body.images orelse @as([]const api.ImageURL, &.{})).len, inline_source_bytes, max_tokens);
-        if (try self.acquireSlotUnits(ctx, admission.units)) |resp| return resp;
-        var reserved_units = admission.units;
-        defer self.releaseSlotUnits(reserved_units);
+        // Keep the response allowance separate from the image decode budget.
+        const initial_units = if (hosted_reader != null) admission.units +| hosted_ocr_initial_response_units else admission.units;
+        if (try self.acquireSlotUnits(ctx, initial_units)) |resp| return resp;
+        var reserved_units = initial_units;
+        var transferred_units: usize = 0;
+        defer {
+            const remaining = self.inference_admission.capacityUnits(reserved_units) - transferred_units;
+            if (remaining != 0) self.releaseSlotUnits(remaining);
+        }
         self.metrics.incRequest("read");
         defer self.metrics.decActive();
+
+        if (hosted_reader) |cfg|
+            return self.readHostedImages(ctx, body, cfg, max_tokens.?, attachments, attachment_indexes, admission, inline_source_bytes, &reserved_units, &transferred_units, execution_control);
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
@@ -25902,12 +26415,35 @@ pub const Node = struct {
             var public_envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, request_json, .{ .duplicate_field_behavior = .@"error" }) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "body must be a valid extraction request" });
             defer public_envelope.deinit();
+            if (public_envelope.value == .object) if (public_envelope.value.object.get("model")) |model| {
+                if (model == .string and std.mem.startsWith(u8, model.string, "extractors/")) {
+                    const name = model.string["extractors/".len..];
+                    for (self.config.generated_extractors) |entry| {
+                        if (!std.mem.eql(u8, entry.name, name)) continue;
+                        if (uses_attachment_envelope) return extractionDirectFailureResponse(ctx, error.InvalidGeneratedExtractorConfig);
+                        for (public_envelope.value.object.keys()) |key| {
+                            if (!std.mem.eql(u8, key, "model") and !std.mem.eql(u8, key, "inputs") and !std.mem.eql(u8, key, "schema_version"))
+                                return extractionDirectFailureResponse(ctx, error.InvalidGeneratedExtractorConfig);
+                        }
+                        self.metrics.incRequest("extract");
+                        defer self.metrics.decActive();
+                        const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, hostedInferenceControl(execution_control), entry.config) catch |err| switch (err) {
+                            error.InvalidConstrainedOutput, error.ExtractorUpstreamFailed, error.InvalidExtractorUsage, error.ExtractorUpstreamOutputTooLarge => return ctx.status(502).json(.{ .@"error" = @errorName(err) }),
+                            error.ExtractorResponseTooLarge => return ctx.status(500).json(.{ .@"error" = "EXTRACTION_RESPONSE_TOO_LARGE" }),
+                            error.HostedExtractionWorkingLimitExceeded => return ctx.status(500).json(.{ .@"error" = "EXTRACTION_WORKING_LIMIT_EXCEEDED" }),
+                            else => return extractionDirectFailureResponse(ctx, err),
+                        };
+                        _ = ctx.response.bodyOwned(output.owner, output.bytes);
+                        try ctx.setHeader("content-type", "application/json");
+                        return ctx.response.build();
+                    }
+                }
+            };
             if (public_envelope.value == .object) if (public_envelope.value.object.get("method")) |method| {
                 if (method != .string or !std.mem.eql(u8, method.string, "generated") or uses_attachment_envelope) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Unsupported extraction method or media" });
-                const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, execution_control) catch |err| return extractionDirectFailureResponse(ctx, err);
-                defer ctx.allocator.free(output);
+                const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, execution_control, null) catch |err| return extractionDirectFailureResponse(ctx, err);
+                _ = ctx.response.bodyOwned(output.owner, output.bytes);
                 try ctx.setHeader("content-type", "application/json");
-                _ = ctx.response.body(output);
                 return ctx.response.build();
             };
             if (execution_control.document_store.configured() or (self.isDocumentOperation(ctx.allocator, public_envelope.value, .extract) catch |err| return documentFailureResponse(ctx, err))) {
@@ -26325,6 +26861,12 @@ pub const Node = struct {
         generator: std.json.Value,
         model: []const u8,
         logprobs: bool,
+        hosted_extractor: ?@import("antfly_structured").extraction.GeneratorConfig = null,
+        hosted_http: ?*httpx.Client = null,
+        hosted_scratch_allocator: ?std.mem.Allocator = null,
+        hosted_units: usize = 0,
+        hosted_reply_bytes: usize = 0,
+        hosted_usage_complete: bool = true,
         fn cancelled(ptr: ?*const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr.?));
             self.control.check() catch |err| return err == error.Cancelled or err == error.Canceled;
@@ -26338,10 +26880,108 @@ pub const Node = struct {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             try self.control.check();
         }
+        fn invokeHosted(self: *@This(), output_allocator: std.mem.Allocator, invocation: @import("antfly_structured").Invocation, original: @import("antfly_structured").extraction.GeneratorConfig) !@import("antfly_structured").Reply {
+            const c = @import("antfly_structured");
+            var arena = std.heap.ArenaAllocator.init(self.hosted_scratch_allocator.?);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const format = try std.json.Stringify.valueAlloc(a, .{ .type = "json_schema", .json_schema = .{
+                .name = "antfly_output",
+                .strict = true,
+                .schema = invocation.schema,
+            } }, .{});
+            const schema = try std.json.Stringify.valueAlloc(a, invocation.schema, .{});
+            const system = try std.fmt.allocPrint(a, "Return one structured result per input. Preserve item IDs. JSON schema: {s}", .{schema});
+            const messages = try c.evidenceMessages(a, invocation, system, true);
+            const body = try c.chatRequestJsonWithOptionsAlloc(a, original.model, messages, .openai_compatible, .{
+                .response_format_json = format,
+                .max_tokens = original.max_tokens,
+                .temperature = original.temperature,
+                .top_p = original.top_p,
+                .top_k = original.top_k,
+                .frequency_penalty = original.frequency_penalty,
+                .presence_penalty = original.presence_penalty,
+            });
+            const url = try std.fmt.allocPrint(a, "{s}/chat/completions", .{std.mem.trimEnd(u8, original.url, "/")});
+            const headers: []const [2][]const u8 = if (original.api_key) |key|
+                &.{.{ "Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{key}) }}
+            else
+                &.{};
+            const tokens = std.math.cast(i32, original.max_tokens) orelse return error.InvalidMaxTokens;
+            const units = Node.estimateGenerateAdmissionUnitsFromShape(body.len, 0, tokens);
+            const target_units = self.hosted_units +| units;
+            const admission = &self.node.inference_admission;
+            const dispatch_units = admission.incrementalUnits(self.hosted_units, target_units);
+            try self.node.growAdmissionUnits(self.hosted_units, target_units);
+            defer if (dispatch_units != 0) self.node.releaseSlotUnits(dispatch_units);
+            const http = self.hosted_http.?;
+            const Cancel = struct {
+                fn requested(raw: *const anyopaque) bool {
+                    const current: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                    current.check() catch return true;
+                    return false;
+                }
+            };
+            var response = http.post(url, .{
+                .json = body,
+                .headers = headers,
+                .max_response_size = 1024 * 1024,
+                .cancellation = httpx.CancellationToken.fromCallback(&self.control, Cancel.requested),
+                .timeout_ms = if (self.control.deadline_ns) |deadline| @max(1, (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms) else null,
+                .max_retries = 0,
+                .follow_redirects = false,
+                .cookies_enabled = false,
+            }) catch |err| {
+                try self.control.check();
+                return switch (err) {
+                    error.OutOfMemory, error.Timeout, error.Cancelled, error.Canceled => err,
+                    error.ResponseTooLarge => error.ExtractorUpstreamOutputTooLarge,
+                    else => error.ExtractorUpstreamFailed,
+                };
+            };
+            defer response.deinit();
+            if (!response.ok()) return error.ExtractorUpstreamFailed;
+            const response_bytes = response.body orelse return error.InvalidConstrainedOutput;
+            try accountHostedUpstreamReply(&self.hosted_reply_bytes, response_bytes.len, hosted_extraction_result_bytes);
+            const Wire = struct {
+                choices: []const struct { finish_reason: []const u8, message: struct {
+                    content: ?[]const u8 = null,
+                    refusal: ?[]const u8 = null,
+                    tool_calls: ?[]const std.json.Value = null,
+                } },
+                usage: ?struct { prompt_tokens: u64, completion_tokens: u64 } = null,
+            };
+            const wire = std.json.parseFromSliceLeaky(Wire, a, response_bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidConstrainedOutput,
+            };
+            try self.control.check();
+            if (wire.usage) |usage| {
+                if (std.math.cast(i64, usage.prompt_tokens) == null or usage.completion_tokens > original.max_tokens)
+                    return error.InvalidExtractorUsage;
+                if (self.node.config.request_limits.max_input_tokens_per_item) |limit|
+                    if (usage.prompt_tokens > limit) return error.InferenceInputTokensExceeded;
+                if (invocation.usage) |observed| observed.record(usage.prompt_tokens, usage.completion_tokens);
+            } else {
+                self.hosted_usage_complete = false;
+                if (self.node.config.request_limits.max_input_tokens_per_item != null) return error.InvalidExtractorUsage;
+            }
+            if (wire.choices.len != 1 or !std.mem.eql(u8, wire.choices[0].finish_reason, "stop")) return error.InvalidConstrainedOutput;
+            const message = wire.choices[0].message;
+            if (message.refusal) |refusal| if (refusal.len != 0) return error.InvalidConstrainedOutput;
+            if (message.tool_calls) |calls| if (calls.len != 0) return error.InvalidConstrainedOutput;
+            const value = c.parseReply(output_allocator, message.content orelse return error.InvalidConstrainedOutput) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidConstrainedOutput,
+            };
+            return .{ .value = value, .input_tokens = if (wire.usage) |usage| usage.prompt_tokens else 0, .output_tokens = if (wire.usage) |usage| usage.completion_tokens else 0 };
+        }
+
         fn invoke(ptr: *anyopaque, a: std.mem.Allocator, invocation: @import("antfly_structured").Invocation) !@import("antfly_structured").Reply {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const c = @import("antfly_structured");
             try self.control.check();
+            if (self.hosted_extractor) |cfg| return self.invokeHosted(a, invocation, cfg);
             var body = c.object();
             try c.put(a, &body, "model", .{ .string = self.model });
             try c.put(a, &body, "stream", .{ .bool = false });
@@ -26415,17 +27055,62 @@ pub const Node = struct {
         return caps;
     }
 
-    fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl) ![]u8 {
+    const GeneratedExtractionBody = struct {
+        bytes: []u8,
+        owner: std.mem.Allocator,
+    };
+
+    // The HTTP response owns both the buffer and its remaining admission
+    // charge. All response teardown paths free through this allocator.
+    const HostedResponseBodyOwner = struct {
+        node: *Node,
+        backing: std.mem.Allocator,
+        units: usize,
+
+        const vtable: std.mem.Allocator.VTable = .{
+            .alloc = std.mem.Allocator.noAlloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        };
+
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+            const self: *HostedResponseBodyOwner = @ptrCast(@alignCast(raw));
+            const backing = self.backing;
+            backing.rawFree(bytes, alignment, return_address);
+            self.node.releaseSlotUnits(self.units);
+            backing.destroy(self);
+        }
+    };
+
+    fn hostedResponseOwner(self: *Node, backing: std.mem.Allocator, owner_allocator: std.mem.Allocator, units: usize) !std.mem.Allocator {
+        if (units == 0) return backing;
+        const owner = try owner_allocator.create(HostedResponseBodyOwner);
+        owner.* = .{ .node = self, .backing = backing, .units = units };
+        return .{ .ptr = owner, .vtable = &HostedResponseBodyOwner.vtable };
+    }
+
+    fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config) !GeneratedExtractionBody {
+        var quota: httpx.QuotaAllocator = .{ .backing = allocator, .limit = hosted_extraction_working_bytes };
+        return self.generatedExtractionBounded(allocator, envelope, control, registered, if (registered != null) &quota else null) catch |err| {
+            if (err == error.OutOfMemory and quota.exceeded) return error.HostedExtractionWorkingLimitExceeded;
+            return err;
+        };
+    }
+
+    fn generatedExtractionBounded(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config, quota: ?*httpx.QuotaAllocator) !GeneratedExtractionBody {
         const c = @import("antfly_structured");
         const extractor = c.extraction;
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-        var config_value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, envelope, .{}), .{ .allocate = .alloc_always });
-        const inputs = config_value.object.fetchSwapRemove("inputs") orelse return error.InvalidGeneratedExtractorConfig;
-        if (inputs.value != .array or inputs.value.array.items.len == 0 or inputs.value.array.items.len > 128) return error.InvalidGeneratedExtractorConfig;
-        const texts = try a.alloc([]const u8, inputs.value.array.items.len);
-        for (texts, inputs.value.array.items) |*text, input| {
+        const inputs = envelope.object.get("inputs") orelse return error.InvalidGeneratedExtractorConfig;
+        if (inputs != .array or inputs.array.items.len == 0 or inputs.array.items.len > 128) return error.InvalidGeneratedExtractorConfig;
+        if (registered != null) {
+            try self.config.request_limits.validateItemCount(inputs.array.items.len);
+            if (self.config.request_limits.max_output_tokens_per_item) |limit|
+                if (registered.?.generator.max_tokens > limit) return error.InvalidMaxTokens;
+        }
+        var text_storage: [128][]const u8 = undefined;
+        const texts = text_storage[0..inputs.array.items.len];
+        for (texts, inputs.array.items) |*text, input| {
             if (input != .object or input.object.count() > 2) return error.InvalidGeneratedExtractorConfig;
             for (input.object.keys()) |key| if (!std.mem.eql(u8, key, "content") and !std.mem.eql(u8, key, "id")) return error.InvalidGeneratedExtractorConfig;
             if (input.object.get("id")) |id| if (id != .string or id.string.len == 0 or id.string.len > 1024 or !std.unicode.utf8ValidateSlice(id.string)) return error.InvalidGeneratedExtractorConfig;
@@ -26433,21 +27118,43 @@ pub const Node = struct {
             if (content != .string or content.string.len > 1024 * 1024) return error.InvalidGeneratedExtractorConfig;
             text.* = content.string;
         }
-        if (config_value.object.fetchSwapRemove("schema_version")) |version| if (version.value != .integer or version.value.integer != 2) return error.InvalidGeneratedExtractorConfig;
-        const raw_config = try std.json.Stringify.valueAlloc(a, config_value, .{});
-        var parsed = try extractor.parse(a, raw_config);
-        defer parsed.deinit();
-        const config = parsed.value;
+        if (envelope.object.get("schema_version")) |version| if (version != .integer or version.integer != 2) return error.InvalidGeneratedExtractorConfig;
+        const retained_units = if (quota) |budget| admissionUnitsFor(budget.limit, read_admission_bytes_per_unit) else 0;
+        if (quota != null) try self.reserveAdmissionUnits(retained_units);
+        var transferred_units: usize = 0;
+        // Register this before scratch owners so they free memory before
+        // another request can acquire the returned units.
+        defer if (quota != null) {
+            const remaining = self.inference_admission.capacityUnits(retained_units) - transferred_units;
+            if (remaining != 0) self.releaseSlotUnits(remaining);
+        };
+        var arena = std.heap.ArenaAllocator.init(if (quota) |budget| budget.allocator() else allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var parsed: ?std.json.Parsed(extractor.Config) = null;
+        var generator: std.json.Value = .null;
+        defer if (parsed) |*value| value.deinit();
+        const config = registered orelse blk: {
+            var fields = try envelope.object.clone(a);
+            _ = fields.swapRemove("inputs");
+            _ = fields.swapRemove("schema_version");
+            generator = fields.get("generator") orelse .null;
+            parsed = try extractor.parse(a, try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = fields }, .{}));
+            break :blk parsed.?.value;
+        };
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |value| {
             var owned = value;
             owned.deinit();
         };
         const io = self.inferenceIo(a, control.io, &owned_io);
-        const generator = config_value.object.get("generator").?;
-        const caps = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities, false);
-        const mode = try caps.select(config.output, config.probabilities);
-        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs };
+        var hosted_http: ?httpx.Client = if (registered != null) httpx.Client.init(quota.?.allocator(), io) else null;
+        defer if (hosted_http) |*client| client.deinit();
+        const mode = if (registered != null) @as(c.Output, .json_schema) else blk: {
+            const caps = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities, false);
+            break :blk try caps.select(config.output, config.probabilities);
+        };
+        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs, .hosted_extractor = if (registered != null) config.generator else null, .hosted_units = retained_units, .hosted_http = if (hosted_http) |*client| client else null, .hosted_scratch_allocator = if (quota) |budget| budget.allocator() else null };
         var validation = extractor.Validation{ .config = config };
         const Combined = struct {
             backend: *StructuredGeneration,
@@ -26467,11 +27174,36 @@ pub const Node = struct {
         };
         var combined = Combined{ .backend = &backend, .validation = &validation };
         const text_control: @import("antfly_extracting").text_processing.Checkpoint = .{ .ptr = &backend, .check_fn = StructuredGeneration.textCheck };
-        const planned = try extractor.planWithControl(a, config, texts, text_control);
+        const planned = extractor.planWithLimit(a, config, texts, text_control, if (registered != null) hosted_extraction_max_windows else null) catch |err| {
+            if (registered == null) return err;
+            if (err == error.OutOfMemory and quota.?.exceeded) return error.GeneratedExtractionLimitExceeded;
+            return switch (err) {
+                error.BoundaryTextLimitExceeded,
+                error.InvalidLongDocumentLimits,
+                error.LongDocumentWindowingRequired,
+                error.LongDocumentWindowLimitExceeded,
+                error.LongDocumentWorkLimitExceeded,
+                => error.GeneratedExtractionLimitExceeded,
+                error.InvalidUtf8 => error.InvalidGeneratedExtractorConfig,
+                else => err,
+            };
+        };
         const instructions = try std.fmt.allocPrint(a, "Extract only entities and relations grounded in each input. Use literal source surface forms. Relations reference entity positions. Set present=false for absent candidates. Never invent offsets or confidence. {s}", .{config.instructions});
-        const generated = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
+        const generated = try c.execute(a, .{ .require_all = registered != null, .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
         const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
-        return std.json.Stringify.valueAlloc(allocator, try extractor.responseValue(a, config.generator.model, inputs.value.array.items, values, generated), .{});
+        const response = try extractor.responseValueWithUsage(a, if (registered != null) envelope.object.get("model").?.string else config.generator.model, inputs.array.items, values, if (backend.hosted_usage_complete) generated else null);
+        if (registered == null) return .{ .bytes = try std.json.Stringify.valueAlloc(allocator, response, .{}), .owner = allocator };
+        try backend.control.check();
+        // QuotaAllocator charges the buffer to the live working set. It adds
+        // no allocation header, so the response can free it through the backing
+        // allocator after the quota and its HTTP client leave scope.
+        const output_allocator = quota.?.allocator();
+        const bytes = try serializeHostedExtraction(output_allocator, response, hosted_extraction_result_bytes);
+        errdefer output_allocator.free(bytes);
+        const units = self.inference_admission.capacityUnits(admissionUnitsFor(bytes.len, read_admission_bytes_per_unit));
+        const owner = try self.hostedResponseOwner(allocator, output_allocator, units);
+        transferred_units = units;
+        return .{ .bytes = bytes, .owner = owner };
     }
 
     fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
@@ -27813,8 +28545,29 @@ pub const Node = struct {
                 continue;
             }
             var model_count: usize = 0;
+            var alias_arena = std.heap.ArenaAllocator.init(a);
+            defer alias_arena.deinit();
             var listed_model_names = std.StringHashMapUnmanaged(void).empty;
             defer listed_model_names.deinit(a);
+
+            if (listing_scope == null and std.mem.eql(u8, task, "readers")) {
+                for (self.config.image_readers) |entry| {
+                    const alias = try std.fmt.allocPrint(alias_arena.allocator(), "readers/{s}", .{entry.name});
+                    try appendConfiguredTaskModel(&body, a, &model_count, alias, &.{"image"}, &.{"ocr"});
+                    try listed_model_names.put(a, alias, {});
+                }
+            }
+            if (listing_scope == null and std.mem.eql(u8, task, "extractors")) {
+                for (self.config.generated_extractors) |entry| {
+                    const alias = try std.fmt.allocPrint(alias_arena.allocator(), "extractors/{s}", .{entry.name});
+                    const capabilities: []const []const u8 = if (entry.config.schema.object.contains("relations"))
+                        &.{ "extraction", "entities", "relations", "json_schema" }
+                    else
+                        &.{ "extraction", "entities", "json_schema" };
+                    try appendConfiguredTaskModel(&body, a, &model_count, alias, &.{"text"}, capabilities);
+                    try listed_model_names.put(a, alias, {});
+                }
+            }
 
             // Add built-in chunkers
             if (std.mem.eql(u8, task, "chunkers")) {
@@ -30949,6 +31702,16 @@ fn appendModelMetadata(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allo
         try buf.appendSlice(allocator, manifest.qualified_limits_json);
     }
     try buf.append(allocator, '}');
+}
+
+fn appendConfiguredTaskModel(body: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, count: *usize, alias: []const u8, inputs: []const []const u8, capabilities: []const []const u8) !void {
+    if (count.* != 0) try body.append(a, ',');
+    try jsonEncodeString(body, a, alias);
+    try body.append(a, ':');
+    const info = try std.json.Stringify.valueAlloc(a, .{ .inputs = inputs, .capabilities = capabilities, .invocable = true }, .{});
+    defer a.free(info);
+    try body.appendSlice(a, info);
+    count.* += 1;
 }
 
 fn appendModelInfo(
@@ -38226,13 +38989,23 @@ test "audio read registerAiRoutesOn excludes Traditional ML predictor routes" {
     try std.testing.expect(!server.hasRoute(.get, ai_api_prefix ++ "/predictors"));
 }
 
-test "root operational routes stay outside inference API prefix" {
+test "inference listener publishes both API namespaces and root operational routes" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
-    try node.registerRootOperationalRoutes(&server);
+    try node.registerHttpRoutes(&server);
+
+    inline for (.{ ai_api_prefix, public_api_prefix }) |prefix| {
+        inline for (.{ "/chat/completions", "/chunk", "/decisions", "/dictate", "/embed", "/embeddings", "/extract", "/generate", "/read", "/rerank", "/transcription/sessions" }) |suffix| {
+            try std.testing.expect(server.hasRoute(.post, prefix ++ suffix));
+        }
+    }
+    try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/predict"));
 
     try std.testing.expect(server.hasRoute(.get, "/healthz"));
     try std.testing.expect(server.hasRoute(.get, "/readyz"));
@@ -48913,6 +49686,486 @@ fn documentFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     const name = @errorName(err);
     const status: u16 = if (err == error.DocumentArtifactNotFound or err == error.ModelNotFound) 404 else if (err == error.DocumentArtifactExpired) 410 else if (err == error.DocumentModelRevisionMismatch) 409 else if (err == error.DocumentUnresolved) 422 else if (err == error.DocumentBudgetExhausted or err == error.Timeout) 504 else if (err == error.RemoteDocumentModelDenied) 403 else if (err == error.CloudflareRateLimited) 429 else if (std.mem.indexOf(u8, name, "Limit") != null or err == error.DocumentOutputTooLarge) 413 else if (std.mem.startsWith(u8, name, "Cloudflare") or err == error.InvalidCloudflareResponse) 502 else 400;
     return ctx.status(status).json(.{ .@"error" = name, .message = "Document operation could not satisfy its input, capability, evidence, or execution contract" });
+}
+
+test "hosted extraction aggregate and rendered limits are independent" {
+    const a = std.testing.allocator;
+    var total: usize = 0;
+    try accountHostedUpstreamReply(&total, 5, 8);
+    try accountHostedUpstreamReply(&total, 3, 8);
+    try std.testing.expectError(error.ExtractorUpstreamOutputTooLarge, accountHostedUpstreamReply(&total, 1, 8));
+    try std.testing.expectEqual(@as(usize, 8), total);
+
+    const response: std.json.Value = .{ .string = "a\nb" };
+    try std.testing.expectError(error.ExtractorResponseTooLarge, serializeHostedExtraction(a, response, 5));
+    var quota: httpx.QuotaAllocator = .{ .backing = a, .limit = 5 };
+    try std.testing.expectError(error.OutOfMemory, serializeHostedExtraction(quota.allocator(), response, 6));
+    try std.testing.expect(quota.exceeded);
+    quota.limit = 6;
+    const output = try serializeHostedExtraction(quota.allocator(), response, 6);
+    defer a.free(output);
+    try std.testing.expectEqualStrings("\"a\\nb\"", output);
+}
+
+test "hosted reader default narrows to deployment without clamping overrides" {
+    try std.testing.expectEqual(@as(usize, 2048), try hostedReadTokens(null, 4096, 2048));
+    try std.testing.expectEqual(@as(usize, 512), try hostedReadTokens(512, 4096, 2048));
+    try std.testing.expectError(error.HostedReadTokenLimitExceeded, hostedReadTokens(4096, null, 2048));
+    try std.testing.expectError(error.InvalidHostedReaderTokenBudget, Node.init(std.testing.allocator, .{
+        .image_readers = &.{.{ .name = "ocr", .config = .{ .provider = .openai, .max_tokens = 8193 } }},
+    }));
+}
+
+test "hosted reader endpoints and usage fail closed" {
+    try std.testing.expect(isHostedInferenceEndpoint("http://127.0.0.1:8090/v1/"));
+    try std.testing.expect(!isHostedInferenceEndpoint("file:///private/path"));
+    try std.testing.expect(!isHostedInferenceEndpoint("https://user:pass@example.org/v1"));
+    try std.testing.expect(!isHostedInferenceEndpoint("https://example.org/v1?query=1"));
+    try std.testing.expectError(error.InvalidReadExecutionReport, checkedHostedReadUsage(std.math.maxInt(i64), 1));
+    try std.testing.expectEqual(@as(i64, 30), (try checkedHostedReadUsage(10, 20)).total_tokens);
+}
+
+test "named hosted extractor validates upstream output and advertises its capabilities" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fixture = struct {
+        fn inspect(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, req.body, .{});
+            defer parsed.deinit();
+            const object = parsed.value.object;
+            try std.testing.expectEqualStrings("local-extractor", object.get("model").?.string);
+            try std.testing.expectEqualStrings("json_schema", object.get("response_format").?.object.get("type").?.string);
+        }
+        fn serve(upstream: *httpx.TestServer) void {
+            for (0..9) |_| upstream.handleOne() catch return;
+        }
+    };
+    const valid = "{\"items\":[{\"item\":0,\"value\":{\"entities\":[{\"label\":\"invoice_number\",\"text\":\"12345\",\"present\":true}],\"relations\":[]}}]}";
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var routes: [9]httpx.testing_mod.Route = undefined;
+    for (routes[0..8], [8][]const u8{ "stop", "stop", "length", "stop", "stop", "stop", "stop", "stop" }, [8][]const u8{ valid, "malformed", valid, valid, valid, valid, valid, valid }, 0..) |*route, finish, content, index| {
+        const message = .{
+            .content = if (index == 5) try std.mem.replaceOwned(u8, scratch, content, "\"item\":0", "\"item\":1") else content,
+            .refusal = if (index == 6) @as(?[]const u8, "declined") else null,
+            .tool_calls = if (index == 7) @as(?[1]struct { id: []const u8 }, .{.{ .id = "unexpected" }}) else null,
+        };
+        route.* = .{
+            .method = .POST,
+            .path = "/v1/chat/completions",
+            .max_uses = 1,
+            .assert_request = Fixture.inspect,
+            .respond = .{ .body = try std.json.Stringify.valueAlloc(scratch, .{ .choices = .{.{ .finish_reason = finish, .message = message }}, .usage = if (index == 5) null else @as(?struct { prompt_tokens: u64, completion_tokens: u64 }, .{ .prompt_tokens = if (index == 3) std.math.maxInt(u64) else 10, .completion_tokens = 10 }) }, .{ .emit_null_optional_fields = false }) },
+        };
+    }
+    const oversized_reply = try scratch.alloc(u8, 1024 * 1024 + 1);
+    @memset(oversized_reply, ' ');
+    routes[8] = .{
+        .method = .POST,
+        .path = "/v1/chat/completions",
+        .max_uses = 1,
+        .assert_request = Fixture.inspect,
+        .respond = .{ .body = oversized_reply },
+    };
+    var upstream = try httpx.TestServer.start(a, io, &routes);
+    defer upstream.deinit();
+    upstream.max_request_bytes = 64 * 1024;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&upstream});
+
+    const config = try std.fmt.allocPrint(scratch,
+        \\{{"method":"generated","generator":{{"provider":"openai","model":"local-extractor","api_url":"{s}/v1","max_tokens":256}},"schema":{{"entities":["invoice_number"]}},"probabilities":"verdict_only","batch":{{"max_items_per_call":1}}}}
+    , .{upstream.baseUrl()});
+    const entry = try NamedGeneratedExtractor.parse(scratch, "invoice", try std.json.parseFromSliceLeaky(std.json.Value, scratch, config, .{}));
+    try std.testing.expectError(error.InvalidHostedExtractorTokenBudget, Node.init(a, .{
+        .generated_extractors = &.{entry},
+        .request_limits = .{ .max_output_tokens_per_item = 128 },
+    }));
+    var oversized = entry;
+    oversized.config.generator.max_tokens = @as(i64, std.math.maxInt(i32)) + 1;
+    try std.testing.expectError(error.InvalidHostedExtractorTokenBudget, Node.init(a, .{ .generated_extractors = &.{oversized} }));
+    var node = try Node.init(a, .{
+        .generated_extractors = &.{entry},
+        .max_work_units = 32,
+        .image_readers = &.{.{ .name = "ocr", .config = .{ .provider = .openai, .model = "local-reader" } }},
+    });
+    defer node.deinit();
+    const catalog = try node.listModelsJsonAlloc(a, io);
+    defer a.free(catalog);
+    var listings = try std.json.parseFromSlice(std.json.Value, a, catalog, .{});
+    defer listings.deinit();
+    const extractor_info = listings.value.object.get("extractors").?.object.get("extractors/invoice").?.object;
+    try std.testing.expectEqualStrings("text", extractor_info.get("inputs").?.array.items[0].string);
+    const reader_info = listings.value.object.get("readers").?.object.get("readers/ocr").?.object;
+    try std.testing.expectEqualStrings("image", reader_info.get("inputs").?.array.items[0].string);
+
+    for ([_]u16{ 503, 200, 502, 502, 502, 400, 200, 502, 502, 502 }, 0..) |status, index| {
+        const capacity = node.inference_admission.capacity;
+        if (index == 0) try node.reserveAdmissionUnits(capacity);
+        defer if (index == 0) node.releaseSlotUnits(capacity);
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        request.body = if (index == 5)
+            "{\"model\":\"extractors/invoice\",\"inputs\":[{\"content\":\"Invoice 12345\"}],\"generator\":{}}"
+        else if (index == 2 or index == 6)
+            "{\"model\":\"extractors/invoice\",\"inputs\":[{\"id\":\"receipt\",\"content\":\"Invoice 12345\"},{\"content\":\"Invoice 12345\"}]}"
+        else
+            "{\"model\":\"extractors/invoice\",\"inputs\":[{\"id\":\"receipt\",\"content\":\"Invoice 12345\"}]}";
+        var ctx = httpx.Context.init(a, io, &request);
+        defer ctx.deinit();
+        var response = try node.extractJSON(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(status, response.status.code);
+        if (index == 9) {
+            var rejected = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer rejected.deinit();
+            try std.testing.expectEqualStrings("ExtractorUpstreamOutputTooLarge", rejected.value.object.get("error").?.string);
+        }
+        if (status == 200) {
+            // The handler has finished, but HTTP still owns the response bytes.
+            try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightUnits());
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("extractors/invoice", parsed.value.object.get("model").?.string);
+            try std.testing.expectEqual(index == 1, parsed.value.object.contains("usage"));
+            const result = parsed.value.object.get("data").?.array.items[0].object;
+            try std.testing.expectEqualStrings("receipt", result.get("id").?.string);
+            try std.testing.expectEqualStrings("12345", result.get("entities").?.array.items[0].object.get("text").?.string);
+            response.releaseBody();
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+        }
+    }
+}
+
+test "hosted image reader budgets the largest concurrent dispatch buffers" {
+    var costs = [_]usize{ 2, 7, 5, 1 };
+    const full = Node.hostedOcrDispatchPlan(&costs, 3, 14);
+    try std.testing.expectEqual(@as(usize, 3), full.workers);
+    try std.testing.expectEqual(@as(usize, 14), full.bytes);
+    const reduced = Node.hostedOcrDispatchPlan(&costs, 3, 11);
+    try std.testing.expectEqual(@as(usize, 1), reduced.workers);
+    try std.testing.expectEqual(@as(usize, 7), reduced.bytes);
+    const impossible = Node.hostedOcrDispatchPlan(&costs, 3, 6);
+    try std.testing.expectEqual(@as(usize, 0), impossible.workers);
+    const page: Node.HostedImagePage = .{ .bytes = "123", .mime = "image/png", .original_uri = "" };
+    try std.testing.expect(Node.hostedOcrDispatchBytes(page, 4096) > 4096 + 2 * std.base64.standard.Encoder.calcSize(page.bytes.len));
+}
+
+test "hosted image reader reuses its live quota across dispatch and reply retention" {
+    const reply_size = @sizeOf(readers_api.Result) + 8;
+    var quota: httpx.QuotaAllocator = .{ .backing = std.testing.allocator, .limit = 1024 + reply_size };
+    const a = quota.allocator();
+    const outgoing = try a.alloc(u8, 1024);
+    const items = try a.alloc(readers_api.Result, 1);
+    var reply: readers_api.BatchResult = .{ .items = items, .execution = undefined };
+    items[0] = .{ .text = try a.dupe(u8, "response") };
+    defer reply.deinit(a);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 1));
+    a.free(outgoing);
+
+    var replies: [1]?readers_api.BatchResult = @splat(null);
+    const pages: [1]Node.HostedImagePage = undefined;
+    var queue: Node.HostedReadQueue = .{
+        .allocator = a,
+        .client = undefined,
+        .pages = &pages,
+        .replies = &replies,
+        .config = undefined,
+        .prompt = null,
+        .tokens = 1,
+        .input_limit = null,
+        .control = .{},
+        .retained_reply_limit = hosted_ocr_retained_reply_bytes,
+    };
+    try queue.accept(queue.take().?, reply);
+    try std.testing.expectEqual(reply_size, queue.retained_reply_bytes);
+    try std.testing.expectEqual(reply_size, quota.live);
+    const next = try a.alloc(u8, 1024);
+    a.free(next);
+}
+
+test "hosted image reader stops dispatch when retained metadata exceeds its limit" {
+    var replies: [3]?readers_api.BatchResult = @splat(null);
+    const pages: [3]Node.HostedImagePage = undefined;
+    var items = [_]readers_api.Result{.{ .text = "x", .regions_json = "[123]" }};
+    const reply: readers_api.BatchResult = .{ .items = &items, .execution = undefined };
+    const reply_bytes = @sizeOf(readers_api.Result) + reply.retainedPayloadBytes();
+    var queue: Node.HostedReadQueue = .{
+        .allocator = std.testing.allocator,
+        .client = undefined,
+        .pages = &pages,
+        .replies = &replies,
+        .config = undefined,
+        .prompt = null,
+        .tokens = 1,
+        .input_limit = null,
+        .control = .{},
+        .retained_reply_limit = reply_bytes * 2 - 1,
+    };
+    try queue.accept(queue.take().?, reply);
+    try std.testing.expectError(error.HostedReaderOutputTooLarge, queue.accept(queue.take().?, reply));
+    try std.testing.expectEqual(reply_bytes, queue.retained_reply_bytes);
+    try std.testing.expect(replies[1] == null and queue.take() == null);
+    try std.testing.expect(queue.stopped.load(.acquire));
+}
+
+test "hosted image reader response size respects finite work capacity" {
+    const one_unit = read_admission_bytes_per_unit;
+    const exact = try hostedOcrResponseUnits(one_unit - 2, 1, 1, 1);
+    try std.testing.expectEqual(@as(usize, 1), exact.response);
+    try std.testing.expectEqual(@as(usize, 1), exact.peak);
+    try std.testing.expectError(error.HostedReaderOutputTooLarge, hostedOcrResponseUnits(one_unit - 1, 1, 1, 1));
+    const overlap = try hostedOcrResponseUnits(one_unit - 1, 1, 1, 2);
+    try std.testing.expectEqual(@as(usize, 1), overlap.response);
+    try std.testing.expectEqual(@as(usize, 2), overlap.peak);
+    const unlimited = try hostedOcrResponseUnits(hosted_ocr_response_body_bytes, one_unit, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), unlimited.response);
+    try std.testing.expectEqual(@as(usize, 3), unlimited.peak);
+    try std.testing.expectError(error.HostedReaderOutputTooLarge, hostedOcrResponseUnits(hosted_ocr_response_body_bytes + 1, 0, 0, 0));
+}
+
+test "hosted image reader routes the inference API alias to chat completions" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fixture = struct {
+        fn inspect(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, req.body, .{});
+            defer parsed.deinit();
+            const body = parsed.value.object;
+            try std.testing.expectEqualStrings("lighton-ocr", body.get("model").?.string);
+            try std.testing.expectEqual(@as(i64, 16), body.get("max_tokens").?.integer);
+            const parts = body.get("messages").?.array.items[0].object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), parts.len);
+            try std.testing.expectEqualStrings("grounding", parts[1].object.get("text").?.string);
+            try std.testing.expectEqualStrings("image_url", parts[0].object.get("type").?.string);
+        }
+
+        fn serve(server: *httpx.TestServer) void {
+            for (0..2) |_| server.handleOne() catch return;
+        }
+    };
+    var upstream = try httpx.TestServer.start(a, io, &.{.{
+        .method = .POST,
+        .path = "/v1/chat/completions",
+        .assert_request = Fixture.inspect,
+        .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"Invoice 12345\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}" },
+    }});
+    defer upstream.deinit();
+    upstream.max_request_bytes = 128 * 1024;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&upstream});
+    const base_url = try std.fmt.allocPrint(a, "{s}/v1", .{upstream.baseUrl()});
+    defer a.free(base_url);
+    var node = try Node.init(a, .{
+        .request_limits = .{ .max_output_tokens_per_item = 16 },
+        .image_readers = &.{.{ .name = "ocr", .config = .{
+            .provider = .openai,
+            .model = "lighton-ocr",
+            .base_url = base_url,
+            .prompt = "",
+            .max_tokens = 4096,
+            .hosted_parallelism = 2,
+        } }},
+    });
+    defer node.deinit();
+    const image = @embedFile("../models/testdata/lightonocr3/invoice.png");
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try a.alloc(u8, encoder.calcSize(image.len));
+    defer a.free(encoded);
+    _ = encoder.encode(encoded, image);
+    const body = try std.fmt.allocPrint(a, "{{\"model\":\"readers/ocr\",\"prompt\":\"grounding\",\"images\":[{{\"url\":\"data:image/png;base64,{s}\"}},{{\"url\":\"data:image/png;base64,{s}\"}}]}}", .{ encoded, encoded });
+    defer a.free(body);
+    const invalid_batch = try std.fmt.allocPrint(a, "{{\"model\":\"readers/ocr\",\"images\":[{{\"url\":\"data:image/png;base64,{s}\"}},{{\"url\":\"data:image/png;base64,AA==\"}}]}}", .{encoded});
+    defer a.free(invalid_batch);
+    {
+        var invalid = try httpx.Request.init(a, .POST, "/ai/v1/read");
+        defer invalid.deinit();
+        invalid.body = invalid_batch;
+        var invalid_ctx = httpx.Context.init(a, io, &invalid);
+        defer invalid_ctx.deinit();
+        var rejected = try node.readImages(&invalid_ctx);
+        defer rejected.deinit();
+        try std.testing.expect(rejected.status.code >= 400);
+        try std.testing.expectEqual(@as(usize, 0), upstream.routeHitCount(0));
+    }
+    {
+        const capacity = node.inference_admission.capacity;
+        try node.reserveAdmissionUnits(capacity);
+        defer node.releaseSlotUnits(capacity);
+        const override = try std.fmt.allocPrint(a, "{{\"model\":\"readers/ocr\",\"max_tokens\":17,\"images\":[{{\"url\":\"data:image/png;base64,{s}\"}}]}}", .{encoded});
+        defer a.free(override);
+        var invalid = try httpx.Request.init(a, .POST, "/ai/v1/read");
+        defer invalid.deinit();
+        invalid.body = override;
+        var ctx = httpx.Context.init(a, io, &invalid);
+        defer ctx.deinit();
+        var rejected = try node.readImages(&ctx);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+        try std.testing.expectEqual(@as(usize, 0), upstream.routeHitCount(0));
+    }
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const reply = try std.json.parseFromSlice(api.ReadResponse, a, response.body.?, .{});
+    defer reply.deinit();
+    try std.testing.expectEqualStrings("readers/ocr", reply.value.model);
+    try std.testing.expectEqualStrings("Invoice 12345", reply.value.data[0].text);
+    try std.testing.expectEqual(@as(usize, 2), reply.value.data.len);
+    try std.testing.expectEqual(@as(i64, 1), reply.value.data[1].index);
+    try std.testing.expectEqual(@as(i64, 16), reply.value.usage.?.total_tokens);
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightUnits());
+    response.releaseBody();
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "hosted image reader reuses its serialization reservation under saturation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const page_count = 9;
+    const Fixture = struct {
+        fn serve(server: *httpx.TestServer) void {
+            for (0..page_count) |_| server.handleOne() catch return;
+        }
+    };
+
+    // Escaped text makes the final body exceed one unit while keeping each
+    // upstream response under the per-page wire limit.
+    const prefix = "{\"choices\":[{\"message\":{\"content\":\"";
+    const suffix = "\"},\"finish_reason\":\"stop\"}]}";
+    const escaped_bytes = 2 * 960 * 1024;
+    const upstream_body = try a.alloc(u8, prefix.len + escaped_bytes + suffix.len);
+    defer a.free(upstream_body);
+    @memcpy(upstream_body[0..prefix.len], prefix);
+    @memset(upstream_body[prefix.len..][0..escaped_bytes], '\\');
+    @memcpy(upstream_body[prefix.len + escaped_bytes ..], suffix);
+    try std.testing.expect(upstream_body.len < hosted_ocr_response_bytes);
+
+    var upstream = try httpx.TestServer.start(a, io, &.{.{
+        .method = .POST,
+        .path = "/v1/chat/completions",
+        .respond = .{ .body = upstream_body },
+    }});
+    defer upstream.deinit();
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&upstream});
+
+    const base_url = try std.fmt.allocPrint(a, "{s}/v1", .{upstream.baseUrl()});
+    defer a.free(base_url);
+    const request_units = page_count + hosted_ocr_initial_response_units;
+    const competing_units = 1;
+    var node = try Node.init(a, .{
+        .max_work_units = request_units + competing_units,
+        .image_readers = &.{.{ .name = "ocr", .config = .{
+            .provider = .openai,
+            .model = "lighton-ocr",
+            .base_url = base_url,
+            .prompt = "",
+            .max_tokens = 16,
+        } }},
+    });
+    defer node.deinit();
+    try node.reserveAdmissionUnits(competing_units);
+    defer node.releaseSlotUnits(competing_units);
+
+    const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC";
+    const images: [page_count]api.ImageURL = @splat(.{ .url = image });
+    const body = try std.json.Stringify.valueAlloc(a, .{ .model = "readers/ocr", .images = images }, .{});
+    defer a.free(body);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, page_count), upstream.routeHitCount(0));
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const body_units = admissionUnitsFor(response.body.?.len, read_admission_bytes_per_unit);
+    try std.testing.expectEqual(@as(usize, 2), body_units);
+    try std.testing.expectEqual(competing_units + body_units, node.inference_admission.inFlightUnits());
+    response.releaseBody();
+    try std.testing.expectEqual(@as(usize, competing_units), node.inference_admission.inFlightUnits());
+}
+
+test "hosted image reader releases admission after upstream parsing exhausts the quota" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fixture = struct {
+        fn serve(server: *httpx.TestServer) void {
+            for (0..2) |_| server.handleOne() catch return;
+        }
+    };
+
+    // Keep the HTTP body below the wire limit while forcing the JSON
+    // parser to allocate more than the deployment's single work unit.
+    const prefix = "{\"choices\":[{\"message\":{\"content\":\"receipt\"},\"finish_reason\":\"stop\"}],\"usage\":{\"padding\":[";
+    const suffix = "0]}}";
+    const padding = 1600 * 1024;
+    const upstream_body = try a.alloc(u8, prefix.len + padding + suffix.len);
+    defer a.free(upstream_body);
+    @memcpy(upstream_body[0..prefix.len], prefix);
+    for (0..padding / 2) |i| {
+        upstream_body[prefix.len + i * 2] = '0';
+        upstream_body[prefix.len + i * 2 + 1] = ',';
+    }
+    @memcpy(upstream_body[prefix.len + padding ..], suffix);
+    try std.testing.expect(upstream_body.len < hosted_ocr_response_bytes);
+
+    var upstream = try httpx.TestServer.start(a, io, &.{.{
+        .method = .POST,
+        .path = "/v1/chat/completions",
+        .respond = .{ .body = upstream_body },
+    }});
+    defer upstream.deinit();
+    upstream.max_request_bytes = 128 * 1024;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&upstream});
+
+    const base_url = try std.fmt.allocPrint(a, "{s}/v1", .{upstream.baseUrl()});
+    defer a.free(base_url);
+    var node = try Node.init(a, .{
+        .max_work_units = 1,
+        .image_readers = &.{.{ .name = "ocr", .config = .{
+            .provider = .openai,
+            .model = "lighton-ocr",
+            .base_url = base_url,
+            .prompt = "",
+            .max_tokens = 16,
+            .hosted_parallelism = 1,
+        } }},
+    });
+    defer node.deinit();
+
+    const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC";
+    const body = "{\"model\":\"readers/ocr\",\"images\":[{\"url\":\"" ++ image ++ "\"},{\"url\":\"" ++ image ++ "\"}]}";
+
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 502), response.status.code);
+    const payload = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer payload.deinit();
+    try std.testing.expectEqualStrings("READER_WORKING_LIMIT_EXCEEDED", payload.value.object.get("error").?.string);
+    try std.testing.expectEqual(@as(usize, 1), upstream.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try node.reserveAdmissionUnits(1);
+    node.releaseSlotUnits(1);
 }
 
 test "audio read rejects mixed inputs and unsupported options before model admission" {
