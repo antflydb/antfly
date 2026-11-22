@@ -1191,6 +1191,10 @@ pub const Detail = enum(c_int) {
     pre_dispatch_decision_admission_unavailable,
     model_chunk_empty_video_window,
     model_chunk_malformed_video_packet,
+    session_write_not_leader_before_proposal,
+    session_write_out_of_memory_before_proposal,
+    session_write_unavailable_before_proposal,
+    session_write_outcome_unknown,
 };
 
 pub const Status = extern struct {
@@ -2141,6 +2145,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.RowFilterNotFound => status(.not_found, .row_filter_not_found),
         error.SavepointLimitExceeded => status(.unavailable, .savepoint_limit_exceeded),
         error.SessionLeaseLost => status(.conflict, .session_lease_lost),
+        error.SessionWriteNotLeaderBeforeProposal => status(.retryable, .session_write_not_leader_before_proposal),
+        error.SessionWriteOutOfMemoryBeforeProposal => status(.out_of_memory, .session_write_out_of_memory_before_proposal),
+        error.SessionWriteUnavailableBeforeProposal => status(.unavailable, .session_write_unavailable_before_proposal),
+        error.SessionWriteOutcomeUnknown => status(.conflict, .session_write_outcome_unknown),
         error.SessionLimitExceeded => status(.unavailable, .session_limit_exceeded),
         error.SessionRecordTooLarge => status(.invalid_argument, .session_record_too_large),
         error.StaleIndexRepairControl => status(.conflict, .stale_index_repair_control),
@@ -3216,6 +3224,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .row_filter_not_found => "RowFilterNotFound",
         .savepoint_limit_exceeded => "SavepointLimitExceeded",
         .session_lease_lost => "SessionLeaseLost",
+        .session_write_not_leader_before_proposal => "SessionWriteNotLeaderBeforeProposal",
+        .session_write_out_of_memory_before_proposal => "SessionWriteOutOfMemoryBeforeProposal",
+        .session_write_unavailable_before_proposal => "SessionWriteUnavailableBeforeProposal",
+        .session_write_outcome_unknown => "SessionWriteOutcomeUnknown",
         .session_limit_exceeded => "SessionLimitExceeded",
         .session_record_too_large => "SessionRecordTooLarge",
         .stale_index_repair_control => "StaleIndexRepairControl",

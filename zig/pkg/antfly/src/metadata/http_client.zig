@@ -579,9 +579,16 @@ pub const MetadataHttpClient = struct {
         // Translate the remaining budget once into the executor's platform
         // clock. The request's absolute deadline may use a borrowed test clock.
         const transport_budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() +| @as(u64, timeout) * std.time.ns_per_ms, .cancellation = &signal };
-        var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = wire_limit, .cancellation = &signal, .delivery_tracker = &delivery }, transport_budget, .at_most_once) catch |err| {
-            if (mutates and (err == error.ReallocationOutcomeUnknown or err == error.MetadataMutationOutcomeUnknown or delivery.load() != .not_sent)) return error.MetadataMutationOutcomeUnknown;
-            return err;
+        const policy: RetryPolicy = if (mutates) .at_most_once else .replay_safe;
+        var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = wire_limit, .cancellation = &signal, .delivery_tracker = &delivery }, transport_budget, policy) catch |err| {
+            if (mutates) {
+                if (err == error.ReallocationOutcomeUnknown or err == error.MetadataMutationOutcomeUnknown or delivery.load() != .not_sent) return error.MetadataMutationOutcomeUnknown;
+                return err;
+            }
+            return switch (err) {
+                error.ReallocationOutcomeUnknown, error.MetadataMutationOutcomeUnknown, error.Timeout, error.ConnectionTimedOut, error.ConnectionRefused, error.ConnectionResetByPeer, error.BrokenPipe, error.EndOfStream, error.HttpConnectionClosing => error.ReadUnavailable,
+                else => err,
+            };
         };
         defer response.deinit(self.alloc);
         var outcome_count: usize = 0;
@@ -2915,6 +2922,34 @@ fn consumerTests() type {
                 );
                 try std.testing.expectEqual(@as(usize, 1), executor.attempts);
             }
+        }
+
+        test "metadata http client replays fenced catalog reads after transport loss" {
+            const Executor = struct {
+                calls: usize = 0,
+                recover: bool = true,
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    if (self.calls == 1 or !self.recover) return error.ConnectionResetByPeer;
+                    return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+                }
+            };
+            var executor: Executor = .{};
+            var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+            const endpoint = @import("../api/changefeed_metadata.zig").path;
+            const uri = "http://127.0.0.1:9000";
+            var reply = try client.accessFencedCatalog(struct {}, uri, endpoint, 4096, false, null, .{}, .{});
+            reply.deinit();
+            try std.testing.expectEqual(@as(usize, 2), executor.calls);
+
+            executor = .{ .recover = false };
+            try std.testing.expectError(error.ReadUnavailable, client.accessFencedCatalog(struct {}, uri, endpoint, 4096, false, null, .{}, .{}));
+
+            executor = .{};
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessFencedCatalog(struct {}, uri, endpoint, 4096, true, null, .{}, .{}));
+            try std.testing.expectEqual(@as(usize, 1), executor.calls);
         }
 
         test "metadata http client does not replay schema mutations after ambiguous transport failures" {

@@ -29673,11 +29673,13 @@ const RemoteMetadataSource = struct {
             try request.ensureActive();
             try ensureBudgetActive(budget);
             const index = (first + attempt) % self.base_uris.len;
+            var attempt_request = request;
+            if (!mutation) attempt_request.deadline_ns = catalogRoutingAttemptDeadline(self.awakeNs(), request.deadline_ns.?, attempts - attempt);
             var client = self.metadataClient(a);
-            var reply = input.send(&client, self.base_uris[index], request) catch |err| {
+            var reply = input.send(&client, self.base_uris[index], attempt_request) catch |err| {
                 if (mutation) return err;
                 try request.ensureActive();
-                if (err == error.OutOfMemory or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded) return err;
+                if (err == error.OutOfMemory or err == error.Canceled or err == error.Cancelled) return err;
                 last_error = err;
                 continue;
             };
