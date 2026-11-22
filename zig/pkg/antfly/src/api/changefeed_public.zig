@@ -1212,7 +1212,7 @@ fn createMetadataEventFeed(a: A, policy: *Policy, meta: config.Port, key: []cons
 
 fn enrollPublicRoot(client: *config.Client, policy: *RootPolicy(Policy), a: A, state: control.State, route: source_api.Root, policy_revision: u64, request: Context) !void {
     source_api.enrollRoot(client, policy, a, state, route, policy_revision, request) catch |err| {
-        if (err != error.HistoryTooLarge) return err;
+        if (err != error.HistoryTooLarge or state.definition.?.start != .snapshot_then_changes) return err;
         var observed = try load(client, a, state.id, request);
         defer observed.deinit();
         const current = observed.value;
@@ -1220,6 +1220,11 @@ fn enrollPublicRoot(client: *config.Client, policy: *RootPolicy(Policy), a: A, s
         if (current.phase == .enrolling) try change(client, a, current, .{ .reset = .quota }, request);
         return error.ChangefeedBootstrapTooLarge;
     };
+}
+
+fn oversizedBootstrap(state: control.State) bool {
+    return state.phase == .reset_required and state.reset_reason == .quota and
+        state.definition.?.start == .snapshot_then_changes and same(state.cut, @splat(0));
 }
 
 fn createIceberg(a: A, policy: *Policy, meta: config.Port, key: []const u8, definition: control.Definition, lease_seconds: u64, factory: ?RoutedFactory, request: Context) !Created {
@@ -1293,7 +1298,7 @@ fn createIceberg(a: A, policy: *Policy, meta: config.Port, key: []const u8, defi
             } }, request);
             continue;
         }
-        if (state.phase == .reset_required and state.reset_reason == .quota) return error.ChangefeedBootstrapTooLarge;
+        if (oversizedBootstrap(state)) return error.ChangefeedBootstrapTooLarge;
         if (state.phase != .enrolling) return error.ChangefeedResynchronizationRequired;
         if (state.roots.len == 0) {
             try change(&client, a, state, .{ .plan_roots = plans.items }, request);
@@ -1581,7 +1586,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
             } }, internal);
             continue;
         }
-        if (state.phase == .reset_required and state.reset_reason == .quota) return error.ChangefeedBootstrapTooLarge;
+        if (oversizedBootstrap(state)) return error.ChangefeedBootstrapTooLarge;
         if (state.phase != .enrolling) return error.ChangefeedResynchronizationRequired;
         if (state.roots.len == 0) {
             const plans = try captured.initialPlans(scratch);
