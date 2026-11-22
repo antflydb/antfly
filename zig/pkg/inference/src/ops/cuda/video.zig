@@ -24,6 +24,7 @@ const context = @import("context.zig");
 const driver = @import("driver.zig");
 const ops = @import("../ops.zig");
 const cuda = @import("cuda_compute.zig");
+const has_nvdec_backend = build_options.enable_cuda and builtin.os.tag == .linux;
 
 const Callback = *const fn (*anyopaque, u64, u32, u32, u32, i64, u32, u32, u32, u32) callconv(.c) c_int;
 extern fn antfly_nvdec_open(*?*anyopaque, ?*anyopaque, *anyopaque, Callback) c_int;
@@ -149,7 +150,7 @@ fn probeSequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes:
     return error.InvalidVideoGeometry;
 }
 pub fn cachedSequenceMatches(ctx: *const context.CudaContext, sequence: Sequence) bool {
-    if (comptime builtin.os.tag != .linux) return false;
+    if (comptime !has_nvdec_backend) return false;
     const decoder = ctx.video_decoder_cache orelse return false;
     return antfly_nvdec_sequence_matches(decoder, &sequence) != 0;
 }
@@ -206,7 +207,7 @@ fn releaseDecoder(raw: *anyopaque) callconv(.c) void {
 /// action; callback sees this context only during this synchronous call.
 pub fn closeCachedDecoderWithCleanup(ctx: *context.CudaContext, current: @import("../../execution/cleanup_context.zig").Context) !void {
     const decoder = ctx.video_decoder_cache orelse return;
-    if (comptime builtin.os.tag != .linux) return error.UnsupportedCachedVideoDecoder;
+    if (comptime !has_nvdec_backend) return error.UnsupportedCachedVideoDecoder;
     if (ctx.video_decoder_release != closeDecoderOwned or ctx.video_callback_cleanup != null) return error.UnsupportedCachedVideoDecoder;
     try ctx.video_cache_budget.validateCleanup(current);
     try ctx.makeCurrent();
@@ -233,7 +234,7 @@ pub const DetachedDecoder = struct {
             if (ctx.video_cache_budget.bytes != 0 or ctx.video_cache_budget.quota.hasLease() or ctx.video_cache_budget.physical != null) return error.InvalidCacheRetirementState;
             return;
         };
-        if (comptime builtin.os.tag != .linux) return error.UnsupportedCachedVideoDecoder;
+        if (comptime !has_nvdec_backend) return error.UnsupportedCachedVideoDecoder;
         if (ctx.video_decoder_release != closeDecoderOwned) return error.UnsupportedCachedVideoDecoder;
         if (antfly_nvdec_retirement_ready(decoder, ctx, releaseDecoder) == 0) return error.EmbeddingStageBusy;
     }
@@ -241,7 +242,7 @@ pub const DetachedDecoder = struct {
         std.debug.assert(self.handle == null and self.budget.bytes == 0);
         try ready(ctx);
         const decoder = ctx.video_decoder_cache orelse return;
-        if (comptime builtin.os.tag != .linux) return error.UnsupportedCachedVideoDecoder;
+        if (comptime !has_nvdec_backend) return error.UnsupportedCachedVideoDecoder;
         if (antfly_nvdec_detach_budget(decoder, ctx, releaseDecoder, self, released) == 0) return error.CacheRetirementChanged;
         self.handle = decoder;
         self.budget = ctx.video_cache_budget;
@@ -252,7 +253,7 @@ pub const DetachedDecoder = struct {
     }
     pub fn clearRetired(self: *DetachedDecoder, ctx: *context.CudaContext) !void {
         const decoder = self.handle orelse return;
-        if (comptime builtin.os.tag != .linux) return error.UnsupportedCachedVideoDecoder;
+        if (comptime !has_nvdec_backend) return error.UnsupportedCachedVideoDecoder;
         std.debug.assert(!self.budget.quota.hasLease());
         try ctx.makeCurrent();
         if (antfly_nvdec_close_checked(decoder) != 0) return error.VideoDecoderRetirementFailed;

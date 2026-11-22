@@ -348,7 +348,9 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     // the shared physical owner. Mach-O also permits this dependency order.
     if (options.native_storage) |owner| antfly_main.root_module.linkLibrary(owner);
 
-    if (runtime_artifact_role) |role| {
+    const additional_role = if (runtime_artifact_role == .inference) null else runtime_artifact_role;
+    for ([_]?RuntimeArtifactRole{ .inference, additional_role }) |maybe_role| {
+        const role = maybe_role orelse continue;
         const role_options = b.addOptions();
         role_options.addOption(RuntimeArtifactRole, "role", role);
 
@@ -403,8 +405,12 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             setStripRecursively(role_mod, &visited);
         }
         const install_role = b.addInstallArtifact(role_exe, .{});
-        const role_step = b.step("runtime-artifact", "Build and install one focused server runtime artifact");
-        role_step.dependOn(&install_role.step);
+        if (role == .inference) {
+            b.step("inference-artifact", "Build and install the inference-only Antfly executable").dependOn(&install_role.step);
+        }
+        if (runtime_artifact_role == role) {
+            b.step("runtime-artifact", "Build and install one focused server runtime artifact").dependOn(&install_role.step);
+        }
     }
     if (strip) {
         var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
