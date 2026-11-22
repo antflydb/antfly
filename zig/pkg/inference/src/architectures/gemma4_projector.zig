@@ -320,7 +320,7 @@ pub const ProjectedVideo = struct {
 /// CUDA memory. Only timestamp/count metadata is retained on the host.
 // Model RGB rescaling and planar patch interpretation belong to the adapter;
 // bicubic resize and tensor-layout operations remain provider primitives.
-fn prepareResidentRgbPatches(compute: anytype, rgb: CT, width: u32, height: u32, target_width: u32, target_height: u32) !CT {
+pub fn prepareResidentRgbPatches(compute: anytype, rgb: CT, width: u32, height: u32, target_width: u32, target_height: u32) !CT {
     const cb = compute.computeBackend();
     const centered = try compute.preprocessEmbeddingGemma2ResidentRgb(rgb, width, height, target_width, target_height);
     defer cb.free(centered);

@@ -3903,7 +3903,7 @@ test "imported ONNX CUDA assigned graph captures and replays with changing publi
     var competing = try impl.executable.run(a, .{ .runtime_inputs = &public_inputs, .output_placement = .producer });
     defer competing.deinit(&impl.executable.runtime);
     try std.testing.expectEqual(@as(usize, 2), pool.frames.items.len);
-    for (pool.replay_inputs) |binding| if (binding.constant != null) {
+    for (pool.replay_inputs) |binding| if (binding.constant_index != null) {
         const allocation = binding.allocation.?;
         try std.testing.expect(pool.frames.items[0].storages[allocation].? == pool.frames.items[1].storages[allocation].?);
         try std.testing.expect(pool.literal_store.?.owners[binding.constant_index.?].lease.? == pool.frames.items[0].storages[allocation].?);

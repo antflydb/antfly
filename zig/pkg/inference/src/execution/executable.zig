@@ -2714,12 +2714,6 @@ test "prepared CUDA host ingress keeps one upload through graph capture and repl
     const ingress = [_]@import("host_ingress.zig").Input{.{ .node_id = x, .value = &input }};
     // Cold immutable initialization is measured separately from mutable ingress.
     // This optimized graph legitimately retains one shared scalar ReLU literal.
-    for (program.graph.nodes.items, 0..) |node, id| {
-        const live = routes.pool.coverage_reachable.?[id];
-        const replay_index = routes.pool.replay_input_indices[id];
-        const literal = if (replay_index != @import("ml").graph.null_node) routes.pool.replay_inputs[replay_index].constant != null else false;
-        std.debug.print("CUDA_REPLAY_IR id={d} op={s} inputs={any} vjp={d} reachable={} route={} literal={}\n", .{ id, @tagName(node.op), node.getInputs(), node.vjp_alternate, live, routes.pool.preparedKernelRoute(@intCast(id)) != null, literal });
-    }
     {
         const d2d = context.cuda.stats.d2d_bytes;
         var audit = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };

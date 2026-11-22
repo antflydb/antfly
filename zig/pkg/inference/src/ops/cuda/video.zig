@@ -1686,7 +1686,7 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
             };
             compute.capability_profile = .gemma4;
             const gemma_before = cb.trainingRuntimeStats();
-            const gemma = try compute.preprocessGemma4ResidentRgb(resident_rgb, width, height, size[0], size[1]);
+            const gemma = try @import("../../architectures/gemma4_projector.zig").prepareResidentRgbPatches(&compute, resident_rgb, width, height, size[0], size[1]);
             defer cb.free(gemma);
             compute.capability_profile = .embedding_gemma2;
             try std.testing.expectEqual(gemma_before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
@@ -1694,8 +1694,11 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
             defer a.free(gemma_actual);
             for (0..size[1] / 16) |gy| for (0..size[0] / 16) |gx| for (0..16) |py| for (0..16) |px| for (0..3) |c| {
                 const index = ((gy * (size[0] / 16) + gx) * 3 + c) * 256 + py * 16 + px;
-                const expected = reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px];
-                try std.testing.expectApproxEqAbs(expected, gemma_actual[index], 1e-7);
+                const normalized = reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px];
+                const byte: u8 = @intFromFloat(@round(normalized * 255));
+                const centered_bits = std.mem.readInt(u16, source_bits[@as(usize, byte) * 2 ..][0..2], .little);
+                const centered: f32 = @bitCast(@as(u32, centered_bits) << 16);
+                try std.testing.expectEqual(centered * 0.5 + 0.5, gemma_actual[index]);
             };
         }
     };
