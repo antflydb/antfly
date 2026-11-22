@@ -69,6 +69,7 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
         error.InvalidCreateTableRequest,
         error.InvalidTableStorageSettings,
         error.ObjectTablePlacementUnsupported,
+        error.ExternalTableReplicationSourcesUnsupported,
         error.RelationalStorageUnavailable,
         error.VectorStoreRequiresLocalSingleShardTable,
         error.ImmutableTableStorageSettings,
@@ -424,6 +425,9 @@ pub fn schemaUpdateRequestErrorMessage(err: anyerror, body: []const u8) []const 
 }
 
 pub fn createTableRequestErrorMessage(err: anyerror, body: []const u8) []const u8 {
+    if (err == error.ExternalTableReplicationSourcesUnsupported) {
+        return tables_api.external_table_replication_sources_error_message;
+    }
     if (err == error.CreateTableShardCountOutOfRange) {
         return tables_api.table_initial_ranges_error_message;
     }
@@ -2696,4 +2700,15 @@ test "PDF embedding input public contract rejects sparse consumers" {
     const text = try std.mem.replaceOwned(u8, a, pdf, "pdf_page_images", "text");
     defer a.free(text);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, text);
+}
+
+test "create table rejects replication sources for an external binding with default storage" {
+    const a = std.testing.allocator;
+    const schema = "{\"schema\":{\"storage_mode\":\"relational\",\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"uri\":\"s3://lake/events\",\"table_id\":\"events\",\"write_policy\":\"read_only\"}}";
+    const sources = ",\"replication_sources\":[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"events\"}]}";
+    try std.testing.expectError(error.ExternalTableReplicationSourcesUnsupported, parseCreateTableRequest(a, schema ++ sources));
+    var external = try parseCreateTableRequest(a, schema ++ ",\"replication_sources\":[]}");
+    defer external.deinit(a);
+    var native = try parseCreateTableRequest(a, "{" ++ sources[1..]);
+    defer native.deinit(a);
 }

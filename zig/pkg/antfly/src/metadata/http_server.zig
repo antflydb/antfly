@@ -3909,6 +3909,7 @@ pub const MetadataHttpServer = struct {
             error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
             error.ObjectTablePlacementUnsupported => return ctx.status(400).text("object tables do not accept num_shards or replication sources"),
+            error.ExternalTableReplicationSourcesUnsupported => return ctx.status(400).text(tables_api.external_table_replication_sources_error_message),
             error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => return ctx.status(400).text("vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => return ctx.status(400).text(tables_api.table_initial_ranges_error_message),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),

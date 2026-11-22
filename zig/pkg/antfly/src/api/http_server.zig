@@ -23699,6 +23699,7 @@ pub const ApiHttpServer = struct {
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
             error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
             error.ObjectTablePlacementUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object tables do not accept num_shards or replication sources"),
+            error.ExternalTableReplicationSourcesUnsupported => try contextual_operations.textAlloc(self.alloc, 400, tables_api.external_table_replication_sources_error_message),
             error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => try contextual_operations.textAlloc(self.alloc, 400, "vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
             error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),

@@ -9790,6 +9790,7 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("initial foreign key generations require coordinated parent-owner publication; create the table without foreign keys, then add them through a schema update");
                 },
                 error.ObjectTablePlacementUnsupported => return textResponse(ctx, 400, "object tables do not accept num_shards or replication sources"),
+                error.ExternalTableReplicationSourcesUnsupported => return textResponse(ctx, 400, tables_api.external_table_replication_sources_error_message),
                 error.HACatalogReplicationSourcesUnsupported => return respondJsonErrorBody(ctx, 400, ha_catalog_replication_sources_unsupported_body),
                 error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
                     _ = ctx.status(400);
