@@ -163,7 +163,9 @@ Three fields on the source control how a row becomes a document.
 "key_template": "{{tenant_id}}:{{user_id}}"
 ```
 
-**`publication_filter`** is a PostgreSQL 15+ row filter, applied only when Antfly creates the publication. Changing it later does not alter an existing publication.
+Use PostgreSQL replica identity columns in a custom key, or set `REPLICA IDENTITY FULL` so Antfly can recover the old key for updates and deletes.
+
+**`publication_filter`** is a PostgreSQL 15+ row filter. Antfly applies it when creating the publication and checks that an existing publication has the same predicate when binding the source. This check creates a comparison publication in a rolled-back transaction, so the source role needs `CREATE` on the database and ownership of the published table. To change a bound predicate, configure a new matching publication and rebind the source.
 
 **`on_update`** replaces passthrough with explicit transforms for inserts and updates. Column references resolve to the row; literals are set every time:
 
