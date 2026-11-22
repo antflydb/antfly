@@ -898,6 +898,7 @@ pub const Capture = struct {
     enabled: bool = false,
     control: bool = false,
     touched_primary: bool = false,
+    capture_rows: bool = true,
     staging: bool = false,
     poisoned: bool = false,
     namespace: frame.Namespace = @splat(0),
@@ -949,6 +950,7 @@ pub const Capture = struct {
         const completion_admission = std.mem.startsWith(u8, key, completion.admission_prefix);
         const resolution_request = std.mem.startsWith(u8, key, completion.resolution_request_prefix);
         const primary = keys.isStoredDocumentRowKey(key);
+        if (primary and !self.capture_rows) return;
         const schema_change = std.mem.eql(u8, key, keys.public_schema_json_key);
         if (!primary and !intent and !schema_change and !completion_admission and !resolution_request) return;
         if (primary) self.touched_primary = true;

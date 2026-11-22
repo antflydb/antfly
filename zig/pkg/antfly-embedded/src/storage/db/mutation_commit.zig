@@ -3083,12 +3083,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const store_write_start_ns = monotonicTimeNs();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
-            const store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default)
+            var store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default)
                 opts.store_batch_options
             else if (self.bulkSessionActive())
                 .{ .mode = .bulk_ingest, .defer_commit_flush = true }
             else
                 .{};
+            if (req.split_replication != null or req.merge_replication != null)
+                store_batch_options.capture_committed_rows = false;
             var replication_applied_lsn_value_buf: [replication_applied_lsn_value_len]u8 = undefined;
             if (opts.replication_applied_lsn_marker) |lsn| {
                 if (lsn != 0) {

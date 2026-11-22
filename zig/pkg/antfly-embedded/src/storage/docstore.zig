@@ -2541,6 +2541,7 @@ pub const DocStore = struct {
             .payload_session = payload_session,
             .alloc = self.alloc,
             .columnar_owner = self,
+            .history = .{ .capture_rows = options.capture_committed_rows },
             .runtime = try self.runtime_store.beginBatchWithOptions(options),
             .unordered_bulk_append_puts = options.mode == .bulk_ingest and self.runtime_store.capabilities().unordered_bulk_append_puts,
         };
@@ -4615,6 +4616,12 @@ test "docstore committed history captures initial and final images atomically ac
         try txn.commit();
     }
     {
+        var batch = try store.beginWriteBatchWithOptions(.{ .capture_committed_rows = false });
+        errdefer batch.abort();
+        try batch.put(a, "copied");
+        try batch.commit();
+    }
+    {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(a, "intermediate");
@@ -4656,7 +4663,7 @@ test "docstore committed history captures initial and final images atomically ac
         try std.testing.expectEqualStrings(if (sequence == 1) "schema-one" else "schema-two", header.value.schema_after.?);
         const first = (try reader.next(scratch)).?;
         try std.testing.expectEqualSlices(u8, a, first.key);
-        try std.testing.expectEqualStrings(if (sequence == 1) "original" else "replacement", first.before.?);
+        try std.testing.expectEqualStrings(if (sequence == 1) "copied" else "replacement", first.before.?);
         try std.testing.expectEqualStrings(if (sequence == 1) "replacement" else "final", first.after.?);
         const second = (try reader.next(scratch)).?;
         try std.testing.expectEqualSlices(u8, b, second.key);
