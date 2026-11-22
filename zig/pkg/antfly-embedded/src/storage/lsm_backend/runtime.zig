@@ -10061,6 +10061,7 @@ test "lsm bounded merge cursor spills inactive persisted block" {
     cursor.boundPersistedRunBlockResidency();
 
     const run_source = cursor.runSourceOffset();
+    _ = try cursor.runForSource(run_source);
     cursor.positions[run_source] = 0;
     cursor.source_entries[run_source] = .{
         .namespace_name = "docs",
@@ -10081,6 +10082,7 @@ test "lsm bounded merge cursor spills inactive persisted block" {
     try std.testing.expectEqual(@as(?usize, null), cursor.source_block_indices[run_source]);
     try std.testing.expectEqualStrings("replay:1", cursor.source_key_copies[run_source].?);
     try std.testing.expectEqual(@as(usize, 0), cursor.source_entries[run_source].?.value.len);
+    try std.testing.expectEqual(@as(?usize, "payload".len), cursor.source_entries[run_source].?.logical_value_len);
 }
 
 test "graph metric batch presence uses directory backed runs without a flat projection" {
