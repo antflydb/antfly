@@ -609,6 +609,11 @@ pub fn ownerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
         .acknowledge => if (request.managed) store.managedCompletion(request.transaction_id, request.reference_id, true, request.retired_through) else store.acknowledgeCompletion(request.transaction_id, request.reference_id),
     };
 }
+pub fn reclaimLegacyObservationAcks(server: *server_mod.ApiHttpServer) !bool {
+    if (server.txn_sessions.durable == null) return false;
+    return (try registrationStore(server)).reclaimLegacyObservationAcks();
+}
+
 pub fn retireSettledObservations(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize) !void {
     if (server.txn_sessions.durable == null) return;
     const store = try registrationStore(server);

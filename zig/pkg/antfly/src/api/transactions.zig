@@ -1226,6 +1226,7 @@ pub const DurableSessionStore = struct {
 
     // Captured before this store allocates its first reference. Only earlier
     // references can belong to a dead process; never sweep a live collector.
+    observation_ack_cursor: ?ObservationAckPosition = null,
     registration_recovery_before: ?u64 = null,
     registration_locks: [64]std.atomic.Mutex = @splat(.unlocked),
     sql_abort_proof_position: ?SqlAbortProofPosition = null,
@@ -1681,6 +1682,89 @@ pub const DurableSessionStore = struct {
         return removed;
     }
 
+    const completion_retirement_root = "\x00\x00__api_completion_retired__:";
+    const completion_reference_root = "\x00\x00__api_completion_reference__:";
+    const observation_ack_prefix_len = completion_retirement_root.len + 16 + ":ack:".len;
+    const ObservationAckPosition = IndexPosition(observation_ack_prefix_len + 16);
+
+    pub fn reclaimLegacyObservationAcks(self: *DurableSessionStore) !bool {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        var next: ?ObservationAckPosition = null;
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                if (try self.reclaimLegacyObservationAcksTxn(&txn, &next)) try txn.commit() else txn.abort();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                if (try self.reclaimLegacyObservationAcksTxn(&txn, &next)) try txn.commit() else txn.abort();
+            },
+        }
+        self.observation_ack_cursor = next;
+        return next != null;
+    }
+
+    fn reclaimLegacyObservationAcksTxn(self: *DurableSessionStore, txn: anytype, next: *?ObservationAckPosition) !bool {
+        const namespace: Outbox.Namespace = .{ .issuer = self.registration_issuer orelse 0, .observation = true };
+        const producer = try namespace.producer(txn, self.alloc, @splat(0));
+        if (producer.next == 1) return false;
+        var prefix_bytes: [observation_ack_prefix_len]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&prefix_bytes, "{s}{s}:ack:", .{ completion_retirement_root, &std.fmt.bytesToHex(producer.id, .lower) });
+        const Ack = struct { key: [observation_ack_prefix_len + 16]u8, reference: [16]u8 };
+        var acks: [128]Ack = undefined;
+        var count: usize = 0;
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            cursor.setKeysOnly();
+            const after = self.observation_ack_cursor;
+            const start = if (after) |*position| position.bytes[0..position.len] else prefix;
+            var row = try cursor.seekAtOrAfter(start);
+            var inspected: usize = 0;
+            while (row) |entry| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (after) |position| if (position.exclusive and std.mem.eql(u8, entry.key, start)) continue;
+                inspected += 1;
+                if (entry.key.len == prefix.len + 16) candidate: {
+                    var reference: [16]u8 = undefined;
+                    reference[0..8].* = producer.id;
+                    _ = std.fmt.hexToBytes(reference[8..], entry.key[prefix.len..]) catch break :candidate;
+                    if (!Outbox.isObservation(reference)) break :candidate;
+                    acks[count] = .{ .key = entry.key[0..][0 .. observation_ack_prefix_len + 16].*, .reference = reference };
+                    count += 1;
+                }
+                if (inspected == acks.len) {
+                    next.* = ObservationAckPosition.after(entry.key, prefix.len);
+                    break;
+                }
+            }
+        }
+        // A legacy acknowledgement atomically removed the directory member.
+        // The marker and this index are its only remaining target-side rows.
+        const marker = @import("completion_retirement.zig").marker;
+        var changed = false;
+        for (acks[0..count]) |ack| {
+            const target = txn.get(&ack.key) catch |err| if (err == error.NotFound) continue else return err;
+            const reference_hex = std.fmt.bytesToHex(ack.reference, .lower);
+            if (target.len != completion_reference_root.len + 65 or
+                !std.mem.startsWith(u8, target, completion_reference_root) or
+                target[completion_reference_root.len + 32] != ':' or
+                !std.mem.endsWith(u8, target, &reference_hex)) continue;
+            const target_key = target[0..][0 .. completion_reference_root.len + 65].*;
+            if (txn.get(&target_key)) |value| {
+                if (!std.mem.eql(u8, value, marker)) continue;
+                try txn.delete(&target_key);
+            } else |err| if (err != error.NotFound) return err;
+            try txn.delete(&ack.key);
+            changed = true;
+        }
+        return changed;
+    }
+
     const SqlAbortProofPosition = IndexPosition(sql_abort_proof_prefix.len + 32);
 
     fn reclaimSqlAbortProofsTxn(txn: anytype, cursor: anytype, previous: ?SqlAbortProofPosition, next_position: *?SqlAbortProofPosition) !usize {
@@ -1709,21 +1793,31 @@ pub const DurableSessionStore = struct {
     }
 
     pub fn sqlCommitDecisionStatus(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: ?[32]u8, principal: []const u8) !?SqlStoredDecision {
+        return (try self.lookupSqlCommitDecision(alloc, id, connection, principal, false)).decision;
+    }
+
+    pub fn probeSqlCommitDecision(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: []const u8) !SqlCommitProbe {
+        return self.lookupSqlCommitDecision(alloc, id, null, principal, true);
+    }
+
+    const SqlCommitProbe = struct { decision: ?SqlStoredDecision = null, terminal_payload: bool = false };
+
+    fn lookupSqlCommitDecision(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: ?[32]u8, principal: []const u8, bounded: bool) !SqlCommitProbe {
         return switch (self.backend) {
             .docstore => |store| result: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                break :result try self.sqlCommitDecisionStatusTxn(&txn, alloc, id, connection, principal);
+                break :result try self.sqlCommitDecisionStatusTxn(&txn, alloc, id, connection, principal, bounded);
             },
             .runtime => |store| result: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                break :result try self.sqlCommitDecisionStatusTxn(&txn, alloc, id, connection, principal);
+                break :result try self.sqlCommitDecisionStatusTxn(&txn, alloc, id, connection, principal, bounded);
             },
         };
     }
 
-    fn sqlCommitDecisionStatusTxn(self: *DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: ?[32]u8, principal: []const u8) !?SqlStoredDecision {
+    fn sqlCommitDecisionStatusTxn(self: *DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: ?[32]u8, principal: []const u8, bounded: bool) !SqlCommitProbe {
         const key = try makeSqlAbortReceiptKey(alloc, id);
         defer alloc.free(key);
         var receipt = if (txn.get(key)) |raw|
@@ -1739,17 +1833,25 @@ pub const DurableSessionStore = struct {
                     };
                     defer scope.close();
                     const bytes = scope.probePrefix(session_key, connection_prefix_len) catch |probe_err| switch (probe_err) {
-                        error.NotFound => return null,
+                        error.NotFound => return .{},
                         error.Unsupported, error.EndOfStream => break :probe,
                         else => return probe_err,
                     };
                     const header = (try parseConnectionPrefix(bytes)) orelse try parseSqlPrefix(bytes, sql_field);
-                    if (header) |payload| if (payload[0] & 4 == 0) return null;
+                    if (header) |payload| {
+                        if (payload[0] & 4 == 0) return .{};
+                        if (bounded) {
+                            var digest: [32]u8 = undefined;
+                            std.crypto.hash.sha2.Sha256.hash(principal, &digest, .{});
+                            return .{ .terminal_payload = std.mem.eql(u8, &digest, payload[9..41]) };
+                        }
+                    }
                 }
-                var session = (try self.loadSessionTxn(txn, id)) orelse return null;
+                if (bounded) return .{};
+                var session = (try self.loadSessionTxn(txn, id)) orelse return .{};
                 if (session.sql == null or session.graph_receipt) {
                     session.deinit(self.alloc);
-                    return null;
+                    return .{};
                 }
                 break :live session;
             },
@@ -1757,8 +1859,8 @@ pub const DurableSessionStore = struct {
         };
         defer receipt.deinitOwned();
         if (!std.meta.eql(receipt.connection_id, connection) or
-            !std.mem.eql(u8, receipt.principal orelse "", principal) or (receipt.terminal_commit == null and !receipt.terminal_abort)) return null;
-        return .{ .disposition = sessionDisposition(receipt), .abort_acknowledgement = receipt.sql_abort_acknowledgement };
+            !std.mem.eql(u8, receipt.principal orelse "", principal) or (receipt.terminal_commit == null and !receipt.terminal_abort)) return .{};
+        return .{ .decision = .{ .disposition = sessionDisposition(receipt), .abort_acknowledgement = receipt.sql_abort_acknowledgement } };
     }
 
     fn sqlAbortReceiptAcceptsLatePin(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId) !bool {
@@ -5728,10 +5830,10 @@ pub const SessionRegistry = struct {
         return removed.count();
     }
 
-    pub fn hasTaggedSqlCleanupBacklog(self: *SessionRegistry) bool {
+    pub fn hasSessionCleanupBacklog(self: *SessionRegistry, tagged_only: bool) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.tagged_sql_expiry_cursor != null;
+        return if (tagged_only) self.tagged_sql_expiry_cursor != null else self.expiry_cursor != null;
     }
 
     fn cleanupExpiredMode(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {

@@ -6859,6 +6859,10 @@ pub const AntflyApiHandler = struct {
         fn replayCommit(self: *@This(), store: *transactions_api.DurableSessionStore, encoded: []const u8, connection: ?[32]u8, principal: []const u8) !bool {
             const txn_id = distributed_txn.parseTxnIdHex(encoded) catch return false;
             const decision = (try store.sqlCommitDecisionStatus(std.heap.page_allocator, txn_id, connection, principal)) orelse return false;
+            return self.reportCommitDecision(txn_id, decision);
+        }
+
+        fn reportCommitDecision(self: *@This(), txn_id: [16]u8, decision: transactions_api.SqlStoredDecision) !bool {
             self.reportsCommitResult(txn_id);
             const disposition = decision.disposition;
             if (disposition == .aborted) if (decision.abort_acknowledgement.diagnostic()) |err| return err;
@@ -7069,7 +7073,17 @@ pub const AntflyApiHandler = struct {
             }
             if (compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
                 if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
-                    if (try self.replayCommit(store, supplied, null, resource_principal)) return;
+                    const id = distributed_txn.parseTxnIdHex(supplied) catch return error.SqlTransactionNotActive;
+                    const probe = try store.probeSqlCommitDecision(std.heap.page_allocator, id, resource_principal);
+                    if (probe.decision) |decision| {
+                        _ = try self.reportCommitDecision(id, decision);
+                        return;
+                    }
+                    if (probe.terminal_payload) {
+                        var read = try self.adapter.server.acquireSqlExecution(false);
+                        defer read.release();
+                        if (try self.replayCommit(store, supplied, null, resource_principal)) return;
+                    }
                 };
             }
             self.is_write = switch (compiled.statement) {
@@ -7089,7 +7103,7 @@ pub const AntflyApiHandler = struct {
             var execution_limits = self.execution_limits;
             execution_limits.result_rows = self.limit;
             self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
-                if (err == error.SqlTransactionNotActive and compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
+                if ((err == error.SqlTransactionNotActive or (err == error.SqlTransactionOutcomeUnknown and self.adapter.reports_existing_commit)) and compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
                     if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
                         if (try self.replayCommit(store, supplied, null, resource_principal)) return;
                     };
@@ -15811,6 +15825,23 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     const completions = @import("sql_completion.zig");
     try completions.retireSettledObservations(&server, alloc, 8);
     try std.testing.expect((try durable.loadRegistration(alloc, reference)) == null);
+    _ = try completions.reclaimLegacyObservationAcks(&server);
+    {
+        var read = try native.beginRead();
+        defer read.abort();
+        const proof_key = try std.fmt.allocPrint(alloc, "\x00\x00__api_completion_reference__:{s}:{s}", .{
+            &std.fmt.bytesToHex(txn_id, .lower),
+            &std.fmt.bytesToHex(reference, .lower),
+        });
+        defer alloc.free(proof_key);
+        const ack_key = try std.fmt.allocPrint(alloc, "\x00\x00__api_completion_retired__:{s}:ack:{s}", .{
+            &std.fmt.bytesToHex(reference[0..8].*, .lower),
+            &std.fmt.bytesToHex(reference[8..16].*, .lower),
+        });
+        defer alloc.free(ack_key);
+        try std.testing.expectError(error.NotFound, read.get(proof_key));
+        try std.testing.expectError(error.NotFound, read.get(ack_key));
+    }
     var retained = (try durable.loadRegistration(alloc, corrupt_reference)).?;
     defer retained.deinit();
     const reference_hex = std.fmt.bytesToHex(reference, .lower);

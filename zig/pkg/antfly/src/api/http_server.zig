@@ -4147,6 +4147,7 @@ pub const ApiHttpServer = struct {
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
+    sql_observation_ack_backlog: bool = false,
     last_sql_abort_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
@@ -10250,6 +10251,12 @@ pub const ApiHttpServer = struct {
         const previous_ns = self.last_sql_abort_cleanup_ns.load(.acquire);
         const periodic = previous_ns == 0 or now_ns -| previous_ns >= std.time.ns_per_min;
         if (periodic and self.last_sql_abort_cleanup_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
+        if (periodic or self.sql_observation_ack_backlog) {
+            self.sql_observation_ack_backlog = @import("sql_completion.zig").reclaimLegacyObservationAcks(self) catch |err| retry: {
+                std.log.warn("legacy SQL observation acknowledgement cleanup deferred err={s}", .{@errorName(err)});
+                break :retry true;
+            };
+        }
         const retention_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
         if (periodic or self.txn_sessions.durable_scope == .cluster_shared) self.txn_sessions.migrateLegacySqlAbortReceipts(self.alloc) catch |err| {
             std.log.warn("legacy SQL abort receipt migration deferred err={s}", .{@errorName(err)});
@@ -10273,7 +10280,7 @@ pub const ApiHttpServer = struct {
         const interval_ns = self.cfg.session_cleanup_interval_ns orelse if (tagged_sql_only) std.time.ns_per_min else ttl_ns;
         const previous_ns = self.last_session_cleanup_ns.load(.acquire);
         const periodic = previous_ns == 0 or now_ns -| previous_ns >= interval_ns;
-        if (!periodic and !(tagged_sql_only and self.txn_sessions.hasTaggedSqlCleanupBacklog())) return;
+        if (!periodic and !self.txn_sessions.hasSessionCleanupBacklog(tagged_sql_only)) return;
         if (periodic) self.last_session_cleanup_ns.store(now_ns, .release);
         _ = if (tagged_sql_only)
             try self.txn_sessions.cleanupExpiredTaggedSqlDecisions(self.alloc, now_ns -| ttl_ns)
