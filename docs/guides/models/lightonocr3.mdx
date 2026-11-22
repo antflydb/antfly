@@ -137,8 +137,9 @@ llama.cpp owns GPU execution in this deployment. The inference-only listener
 defaults to `127.0.0.1:8090`. Configured image readers require an explicit HTTP
 or HTTPS endpoint. Endpoint precedence is `base_url`, then `url`, then
 `api_url`. The listener validates the full image batch before sending one
-completion per page. Set `hosted_parallelism` between 1 and 8 to match the
-upstream's available slots. It defaults to 1, and results retain input order.
+completion per page. Set `hosted_parallelism` between 1 and 8 to limit the
+number of simultaneous page completions within each request. It defaults to 1,
+and results retain input order.
 These aliases accept `images` without artifact retention.
 For a standalone database deployment, enable
 [public inference](/docs/reference/inference-gateway#public-execution-policy)

@@ -162,6 +162,12 @@ def request_case(url, case, prompt=""):
             "http_status": error.code,
             "message": error.read().decode()[:1500],
         }
+    except (OSError, ValueError) as error:
+        return {
+            "case": case["name"],
+            "seconds": time.perf_counter() - start,
+            "error": str(error),
+        }
     seconds = time.perf_counter() - start
     choice = reply["choices"][0]
     text = choice["message"]["content"] or ""
@@ -262,7 +268,9 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
         try:
             wait_ready(proc, url)
             phase = "warmup"
-            request_case(url, cases[0])
+            warmup = request_case(url, cases[0])
+            if "text" not in warmup:
+                raise RuntimeError(f"Warm-up request failed: {warmup}")
             pid = child_pid(proc.pid)
             idle = process_memory(pid) if pid else None
             if not args.grounding_only:
@@ -387,7 +395,9 @@ def main():
                     continue
                 run = run_profile(args, cases, grounding_case, size, profile, parallel)
                 report["runs"].append(run)
-                args.output.write_text(json.dumps(report, indent=2) + "\n")
+                pending_output = args.output.with_name(args.output.name + ".tmp")
+                pending_output.write_text(json.dumps(report, indent=2) + "\n")
+                pending_output.replace(args.output)
                 print(
                     size,
                     parallel,
