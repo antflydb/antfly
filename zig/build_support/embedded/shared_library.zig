@@ -30,14 +30,17 @@ pub fn inferenceCompileMaxRss(os: std.Target.Os.Tag, shared: bool, measured_darw
 }
 
 pub fn nativeInferenceCompileMaxRss(host: std.Target, target: std.Target, optimize: std.lang.Optimize, fallback: u64) u64 {
-    if (host.os.tag == .linux and host.cpu.arch == .aarch64 and
-        target.os.tag == .linux and target.cpu.arch == .aarch64 and target.abi == .gnu and
-        optimize == .fast)
-    {
-        // Zig 0.17 native GB10 ReleaseFast measured 33,131,999,232 bytes.
-        return @max(fallback, 36 * 1024 * 1024 * 1024);
-    }
-    return fallback;
+    if (host.os.tag != .linux or host.cpu.arch != .aarch64 or
+        target.os.tag != .linux or target.cpu.arch != .aarch64 or target.abi != .gnu)
+        return fallback;
+    // Zig 0.17 on DGX Spark measured 15,156,547,584 bytes in Debug
+    // and 33,131,999,232 bytes in ReleaseFast.
+    const measured_gib: u64 = switch (optimize) {
+        .debug => 17,
+        .fast => 36,
+        else => return fallback,
+    };
+    return @max(fallback, measured_gib * 1024 * 1024 * 1024);
 }
 
 test "qualified inference core keeps peak margin and fits beside API compilation" {
