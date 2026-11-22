@@ -1075,6 +1075,13 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
     defer cache.deinit();
     source.storage.range.immutable_binding = @splat(42);
     cache.remember(std.heap.smp_allocator, Cache.audioKey(&source, 1024, 64 * 1024).?, .{ .audio = track.seek.? }, admission);
+    {
+        const entry = cache.get(Cache.audioKey(&source, 1024, 64 * 1024).?).?;
+        try std.testing.expectEqual(@as(usize, 0), Cache.reclaim(&cache, Cache.max_bytes));
+        var pinned = @import("media_chunking_audio_source.zig").Track.fromCachedAudio(a, &source, .{}, &cache, entry);
+        defer pinned.deinit();
+        try std.testing.expectEqual(baseline.samples(), pinned.provider().samples);
+    }
     var flights: [256]@import("media_speaker_flights.zig").Registry.Lease = undefined;
     var acquired: usize = 0;
     defer for (flights[0..acquired]) |flight| flight.deinit();

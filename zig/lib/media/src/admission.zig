@@ -36,6 +36,28 @@ pub const Pool = struct {
     used: Resources = .{},
     high_water: Resources = .{},
     locked: std.atomic.Value(bool) = .init(false),
+    reclaim_lock: std.atomic.Mutex = .unlocked,
+    reclaimer: ?Reclaimer = null,
+
+    /// The callback may release reservations from this pool. Clearing it
+    /// waits for a running callback before the caller retires its context.
+    pub fn setReclaimer(self: *Pool, value: ?Reclaimer) void {
+        while (!self.reclaim_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.reclaim_lock.unlock();
+        self.reclaimer = value;
+    }
+
+    fn reclaim(self: *Pool, requested: Resources, existing_host_bytes: u64) bool {
+        if (requested.host_bytes > self.limits.host_bytes or requested.device_bytes > self.limits.device_bytes or requested.commands > self.limits.commands) return false;
+        const growth = requested.host_bytes -| existing_host_bytes;
+        if (growth == 0) return false;
+        while (!self.reclaim_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.reclaim_lock.unlock();
+        const reclaimer = self.reclaimer orelse return false;
+        // Another video worker may already have reclaimed the optional data.
+        if (growth <= self.limits.host_bytes -| self.snapshot().host_bytes) return true;
+        return reclaimer.release(reclaimer.context);
+    }
     fn lock(self: *Pool) void {
         while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
     }
@@ -45,6 +67,12 @@ pub const Pool = struct {
     /// Atomic across all dimensions; denial mutates no counters. The caller can
     /// retry through its scheduler, retaining its original cancellation deadline.
     pub fn acquire(self: *Pool, requested: Resources) !Token {
+        return self.acquireOnce(requested) catch |err| {
+            if (!self.reclaim(requested, 0)) return err;
+            return self.acquireOnce(requested);
+        };
+    }
+    fn acquireOnce(self: *Pool, requested: Resources) !Token {
         self.lock();
         defer self.unlock();
         inline for (@typeInfo(Resources).@"struct".field_names) |name| {
@@ -68,6 +96,13 @@ pub const Token = struct {
     /// Replace this reservation atomically. Growth denial retains the original
     /// token; shrinking releases only bytes whose owner has already freed them.
     pub fn resize(self: *Token, requested: Resources) !void {
+        self.resizeOnce(requested) catch |err| {
+            const pool = self.pool orelse return err;
+            if (!pool.reclaim(requested, self.resources.host_bytes)) return err;
+            return self.resizeOnce(requested);
+        };
+    }
+    fn resizeOnce(self: *Token, requested: Resources) !void {
         const pool = self.pool orelse {
             self.resources = requested;
             return;

@@ -15961,7 +15961,8 @@ pub const Node = struct {
             };
             try request.limits.validate();
             const maximum = request.limits.remote_fetched_bytes;
-            var cache = media.remote.ReadAhead{ .allocator = transport_allocator, .upstream = .{ .context = remote, .read_at = Range.read, .length = reference.length, .accepts_full_read_size = true }, .window_bytes = @intCast(@min(request.limits.remote_cache_bytes, security.max_download_size_bytes orelse 100 * 1024 * 1024)), .max_bytes = maximum, .max_reads = request.limits.remote_requests };
+            const max_range: usize = @intCast(@min(std.math.maxInt(usize), security.max_download_size_bytes orelse 100 * 1024 * 1024));
+            var cache = media.remote.ReadAhead{ .allocator = transport_allocator, .upstream = .{ .context = remote, .read_at = Range.read, .length = reference.length, .accepts_full_read_size = true }, .max_request_bytes = max_range, .window_bytes = @min(request.limits.remote_cache_bytes, max_range), .max_bytes = maximum, .max_reads = request.limits.remote_requests };
             defer cache.deinit();
             var identity_hash = std.crypto.hash.sha2.Sha256.init(.{});
             identity_hash.update("antfly-pinned-range-resource-v1");

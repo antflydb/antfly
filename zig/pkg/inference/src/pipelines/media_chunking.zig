@@ -964,6 +964,7 @@ pub const Runner = struct {
     const VideoAudio = struct {
         source: *media.source.Source,
         observed: ?struct { builder: *media.webm_audio.DirectoryBuilder, memory: *media.admission.TrackedAllocator } = null,
+        warm: ?*@import("media_index_cache.zig").Cache.Entry = null,
         track: ?@import("media_chunking_audio_source.zig").Track = null,
         frames: @import("media_chunking_audio.zig").FrameCheckpointSession = .{},
     };
@@ -1001,7 +1002,13 @@ pub const Runner = struct {
         const owner = self.video_audio orelse return;
         if (owner.track != null or self.audio_failure != null) return;
         const Track = @import("media_chunking_audio_source.zig").Track;
-        const track = if (owner.observed) |observed|
+        // Video producers may use the pool until the preparation join. The
+        // synchronized detach gives the audio consumer exclusive ownership.
+        if (owner.observed != null) self.pool.setReclaimer(null);
+        const track = if (owner.warm) |entry| warm: {
+            owner.warm = null;
+            break :warm Track.fromCachedAudio(self.allocator, owner.source, self.control, self.request.index_cache.?, entry);
+        } else if (owner.observed) |observed|
             Track.initObservedWebm(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission, observed.builder, observed.memory.live)
         else
             Track.initCached(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission);
@@ -1025,6 +1032,7 @@ pub const Runner = struct {
         self.video_audio = null;
         self.audio_provider = null;
         if (owner.track) |*track| track.deinit();
+        if (owner.warm) |entry| self.request.index_cache.?.release(entry);
     }
 
     fn isWebmPrefix(bytes: []const u8) bool {
@@ -1115,9 +1123,8 @@ pub const Runner = struct {
         }
         if (webm and source.storage == .range and self.pageNeedsAudio()) {
             const audio_key = Cache.audioKey(source, count, self.request.max_working_bytes);
-            const warm_audio = if (audio_key) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
-            defer if (warm_audio) |entry| self.request.index_cache.?.release(entry);
-            if (warm_audio == null) {
+            audio_owner.warm = if (audio_key) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
+            if (audio_owner.warm == null) {
                 var memory = media.admission.TrackedAllocator{ .backing = self.allocator, .reservation = try self.pool.acquire(.{}), .limit = self.request.max_working_bytes };
                 defer memory.reservation.deinit();
                 const read_limit = @min(source.limits.max_read_bytes, source.limits.max_retained_bytes);
@@ -1180,7 +1187,10 @@ pub const Runner = struct {
         if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.rememberPlanned(std.heap.smp_allocator, key, .{ .webm = reader.* }, admission, .{ .webm = snapshot });
         if (build.*) |lease| lease.deinit();
         build.* = null;
+        const reclaimer = reader.input.reclaimer;
         reader.input.reclaimer = null;
+        self.pool.setReclaimer(reclaimer);
+        defer self.pool.setReclaimer(null);
         try self.webmWindowsSnapshot(reader, &snapshot);
     }
     fn webmWindowsSnapshot(self: *Runner, reader: *media.webm.Reader, snapshot: *const @import("media_index_cache.zig").Cache.WebmSnapshot) !void {
@@ -3933,16 +3943,11 @@ test "model aware media video admission can reclaim optional audio geometry" {
     var builder = media.webm_audio.DirectoryBuilder{ .allocator = memory.allocator(), .limits = .{} };
     defer builder.deinit();
     try builder.packets.ensureTotalCapacityPrecise(builder.allocator, 2);
-    var source = media.source.Source{
-        .allocator = a,
-        .storage = .{ .borrowed = &(@as([128]u8, @splat(1))) },
-        .identity = "video-admission",
-        .admission_pool = &pool,
-        .reclaimer = .{ .context = &builder, .release = Runner.reclaimVideoAudio },
-    };
-    var lease = try source.readSparse(0, 128);
-    defer lease.deinit();
-    try std.testing.expectEqual(@as(usize, 128), lease.bytes.len);
+    pool.setReclaimer(.{ .context = &builder, .release = Runner.reclaimVideoAudio });
+    defer pool.setReclaimer(null);
+    var video_window = try pool.acquire(.{ .host_bytes = 1 });
+    defer video_window.deinit();
+    try video_window.resize(.{ .host_bytes = 128 });
     try std.testing.expectEqual(@as(usize, 0), memory.live);
     try std.testing.expectError(error.AudioTooLarge, builder.borrowDirectory());
 }

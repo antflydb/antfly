@@ -111,6 +111,8 @@ pub const ObjectRange = struct {
 pub const ReadAhead = struct {
     allocator: std.mem.Allocator,
     upstream: source.Range,
+    /// Optional explicit upper bound for direct upstream requests.
+    max_request_bytes: ?usize = null,
     window_bytes: usize = 256 * 1024,
     max_bytes: u64 = 64 * 1024 * 1024,
     max_reads: usize = 100_000,
@@ -231,11 +233,14 @@ pub const ReadAhead = struct {
     // Required bytes can exceed the cache capacity. Read directly into the
     // caller's admitted buffer without evicting the existing window.
     fn readRequired(self: *ReadAhead, offset: u64, out: []u8, control: source.Control) !usize {
+        if (out.len > self.max_bytes -| self.charged_bytes) return error.RemoteReadBudgetExceeded;
+        const limit = self.max_request_bytes orelse if (self.upstream.accepts_full_read_size) out.len else self.window_bytes;
+        if (limit == 0) return error.RemoteReadBudgetExceeded;
+        if (1 + (out.len - 1) / limit > self.max_reads -| self.reads) return error.RemoteRequestBudgetExceeded;
         var done: usize = 0;
         while (done < out.len) {
             try control.check();
-            const size: usize = @intCast(@min(out.len - done, self.window_bytes, self.max_bytes -| self.charged_bytes));
-            if (size == 0) return error.RemoteReadBudgetExceeded;
+            const size = @min(out.len - done, limit);
             const extent = out[done..][0..size];
             done += try self.fetchAt(offset + done, extent, extent.len, control);
         }
@@ -713,5 +718,38 @@ test "normal and oversized sparse overlap complete within one logical read" {
         defer overlap.deinit();
         try std.testing.expectEqualSlices(u8, if (sparse) "bcdefghij" else "bcdefgh", overlap.bytes);
         try std.testing.expectEqual(@as(usize, 2), input.reads);
+    }
+}
+
+test "oversized overlap uses one admitted provider request and rejects a known byte deficit" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            @memcpy(out, "abcdefghij"[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    for ([_]u64{ 9, 10 }) |budget| {
+        var cache = ReadAhead{
+            .allocator = std.testing.allocator,
+            .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 10 },
+            .window_bytes = 4,
+            .max_request_bytes = 6,
+            .max_bytes = budget,
+            .max_reads = 2,
+        };
+        defer cache.deinit();
+        var input = source.Source{ .allocator = std.testing.allocator, .identity = "overlap", .storage = .{ .range = cache.range() }, .limits = .{ .max_reads = 2 } };
+        var first = try input.read(0, 4);
+        first.deinit();
+        if (budget == 9) {
+            try std.testing.expectError(error.RemoteReadBudgetExceeded, input.readSparse(1, 9));
+            try std.testing.expectEqual(@as(usize, 1), cache.reads);
+        } else {
+            var overlap = try input.readSparse(1, 9);
+            defer overlap.deinit();
+            try std.testing.expectEqualSlices(u8, "bcdefghij", overlap.bytes);
+            try std.testing.expectEqual(@as(usize, 2), cache.reads);
+        }
     }
 }

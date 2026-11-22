@@ -213,12 +213,20 @@ pub const Track = struct {
     pub fn init(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, max_bytes: usize, max_packets: usize) !Track {
         return initCached(a, source, control, max_bytes, max_packets, null, null);
     }
+    /// Take ownership of an existing cache pin.
+    pub fn fromCachedAudio(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, cache: *@import("media_index_cache.zig").Cache, entry: *@import("media_index_cache.zig").Cache.Entry) Track {
+        return .{ .allocator = a, .control = control, .cache = cache, .cached = entry, .seek_reader = .{ .index = &entry.data.audio, .source = source, .control = control } };
+    }
+
     pub fn initObservedWebm(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, max_bytes: usize, max_packets: usize, cache: ?*@import("media_index_cache.zig").Cache, admission: ?@import("media_index_cache.zig").Cache.Admission, builder: *media.webm_audio.DirectoryBuilder, directory_bytes: usize) !Track {
         var self = Track{ .allocator = a, .cache = cache, .control = control };
         errdefer self.deinit();
         try control.check();
         const identity = @import("media_index_cache.zig").Cache.audioKey(source, max_packets, max_bytes);
         if (self.bindCached(source, null, identity)) return self;
+        const flight = if (admission != null) if (identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null else null;
+        defer if (flight) |lease| lease.deinit();
+        if (flight != null and self.bindCached(source, null, identity)) return self;
         const check = control.imageWorkControl();
         const scope = audio.work_control.Scope.enter(.{ .context = check.context, .check_fn = check.check_fn });
         defer scope.deinit();
@@ -259,7 +267,7 @@ pub const Track = struct {
         const identity = @import("media_index_cache.zig").Cache.aacKey(source, max_packets, max_bytes);
         const audio_identity = @import("media_index_cache.zig").Cache.audioKey(source, max_packets, max_bytes);
         if (self.bindCached(source, identity, audio_identity)) return self;
-        const flight = if (admission != null) if (identity orelse audio_identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null else null;
+        const flight = if (admission != null) if (audio_identity orelse identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null else null;
         defer if (flight) |lease| lease.deinit();
         if (flight != null and self.bindCached(source, identity, audio_identity)) return self;
         if (source.length() < 4) return error.UnsupportedAudioFormat;
