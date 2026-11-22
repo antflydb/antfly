@@ -20596,20 +20596,21 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     const input_bytes = cache_base.input_bytes;
     if (input_bytes > 128 * 1024 * 1024) return null;
-    var canonical: [20]CT = undefined;
-    var canonical_count: usize = 0;
-    defer for (canonical[0..canonical_count]) |ct| freeTensor(self, ct);
-    for (inputs, spans) |ct, span| {
-        const t = tensorFromCt(ct);
-        const alias = try borrowModelConstant(self, t);
-        tensorFromCt(alias).buffer.len = span.bytes;
-        canonical[canonical_count] = alias;
-        canonical_count += 1;
-    }
     const base_key = cache_base.key;
     const plan_cleanup: CacheCleanup = .{ .boundary = if (self.ctx.prepared_cache_funding) |funding| funding.boundary else null };
     const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
     if (entry.disabled) return null;
+    var canonical: [20]CT = undefined;
+    var canonical_count: usize = 0;
+    defer for (canonical[0..canonical_count]) |ct| freeTensor(self, ct);
+    if (!entry.warmed or entry.owner == null) {
+        for (inputs, spans) |ct, span| {
+            const alias = try borrowModelConstant(self, tensorFromCt(ct));
+            tensorFromCt(alias).buffer.len = span.bytes;
+            canonical[canonical_count] = alias;
+            canonical_count += 1;
+        }
+    }
     if (!entry.warmed) {
         const out = try run(context, canonical[0..canonical_count]);
         entry.warmed = true;
