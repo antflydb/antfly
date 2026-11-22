@@ -1503,7 +1503,7 @@ pub const DurableSessionStore = struct {
                 defer self.alloc.free(receipt);
                 if (txn.get(receipt)) |_| {
                     return error.CypherWriteRequestAlreadyUsed;
-                } else |err| if (err != error.NotFound) return err;
+                } else |receipt_err| if (receipt_err != error.NotFound) return receipt_err;
                 const directory = try completionDirectoryKey(self.alloc, session.txn_id);
                 defer self.alloc.free(directory);
                 _ = txn.get(directory) catch |missing| switch (missing) {
