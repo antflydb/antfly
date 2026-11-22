@@ -2924,7 +2924,7 @@ fn consumerTests() type {
             }
         }
 
-        test "metadata http client replays fenced catalog reads after transport loss" {
+        test "metadata changefeed state transport replays fenced reads after transport loss" {
             const Executor = struct {
                 calls: usize = 0,
                 recover: bool = true,
