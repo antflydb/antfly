@@ -6822,6 +6822,26 @@ pub const AntflyApiHandler = struct {
             };
         }
 
+        fn replayCommit(self: *@This(), store: *transactions_api.DurableSessionStore, encoded: []const u8, connection: ?[32]u8, principal: []const u8) !bool {
+            const txn_id = distributed_txn.parseTxnIdHex(encoded) catch return false;
+            const disposition = (try store.sqlCommitDecisionStatus(std.heap.page_allocator, txn_id, connection, principal)) orelse return false;
+            self.reportsCommitResult(txn_id);
+            self.result = try sql_runtime.Result.empty(std.heap.page_allocator, if (disposition == .aborted) "ROLLBACK" else "COMMIT");
+            self.result.?.output.mutation_outcome = switch (disposition) {
+                .committed => .committed,
+                .committed_pending => .committed_pending,
+                .committed_repair_required => .committed_repair_required,
+                .aborted => null,
+                .active, .outcome_unknown => unreachable,
+            };
+            return true;
+        }
+
+        fn reportsCommitResult(self: *@This(), txn_id: db_mod.types.TxnId) void {
+            self.adapter.reports_existing_commit = true;
+            self.adapter.outcome_transaction_id = std.fmt.bytesToHex(txn_id, .lower);
+        }
+
         fn runChecked(self: *@This()) !void {
             try self.adapter.context.ensureActive();
             const prepared = @import("sql_prepared.zig");
@@ -6861,13 +6881,8 @@ pub const AntflyApiHandler = struct {
                     if (self.adapter.session_id) |supplied| {
                         if (self.prepared_mode != .statement or self.parameters.len != 0 or
                             !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlTransactionNotActive;
-                        const txn_id = distributed_txn.parseTxnIdHex(supplied) catch return error.SqlTransactionNotActive;
-                        const committed = (try store.connectionCommitDecision(std.heap.page_allocator, txn_id, connection_id, resource_principal)) orelse
+                        if (!try self.replayCommit(store, supplied, connection_id, resource_principal))
                             return error.SqlTransactionNotActive;
-                        self.adapter.reports_existing_commit = true;
-                        self.adapter.outcome_transaction_id = std.fmt.bytesToHex(txn_id, .lower);
-                        self.result = try sql_runtime.Result.empty(std.heap.page_allocator, if (committed) "COMMIT" else "ROLLBACK");
-                        if (committed) self.result.?.output.mutation_outcome = .committed;
                         return;
                     }
                     self.adapter.setting_overlay = connection.overlay;
@@ -7028,6 +7043,11 @@ pub const AntflyApiHandler = struct {
             var execution_limits = self.execution_limits;
             execution_limits.result_rows = self.limit;
             self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
+                if (err == error.SqlTransactionNotActive and compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
+                    if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
+                        if (try self.replayCommit(store, supplied, null, resource_principal)) return;
+                    };
+                }
                 self.failure = err;
                 return;
             };
@@ -7429,7 +7449,7 @@ pub const AntflyApiHandler = struct {
         }
         var result = job.result.?;
         defer result.deinit();
-        if (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required or (result.output.ddl_receipt != null and result.output.ddl_receipt.?.state != .ready)) {
+        if (!job.adapter.reports_existing_commit and (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required or (result.output.ddl_receipt != null and result.output.ddl_receipt.?.state != .ready))) {
             const ddl = if (result.output.ddl_receipt) |value| try std.json.Stringify.valueAlloc(ctx.allocator, value, .{ .emit_null_optional_fields = false }) else null;
             defer if (ddl) |value| ctx.allocator.free(value);
             completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, ddl);
@@ -15550,6 +15570,29 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         const status = (try server.txn_sessions.getStatusForPrincipal(alloc, failed_id, "connection_alice")).?;
         try std.testing.expectEqual(transactions_api.SessionDisposition.aborted, status.disposition);
         try std.testing.expect(!try durable.completionSettled(failed_id));
+    }
+
+    {
+        var begin = try Route.call(alloc, &handler, alice_auth, .sql, null, "{\"statement\":\"BEGIN ISOLATION LEVEL READ COMMITTED\"}");
+        defer begin.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), begin.status);
+        var begun = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, begin.body, .{});
+        defer begun.deinit();
+        const encoded = begun.value.session_id.?;
+        const id = try distributed_txn.parseTxnIdHex(encoded);
+        var identity = try server.authenticateRequest(.{ .authorization = alice_auth });
+        defer identity.deinit(alloc);
+        try std.testing.expect((try server.authorizedTransactionMutation(id, identity)) == null);
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .session_id = encoded }, .{});
+        defer alloc.free(body);
+        for ([_]Route.Kind{ .sql, .fenced_sql }) |kind| {
+            var reply = try Route.call(alloc, &handler, alice_auth, kind, null, body);
+            defer reply.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 200), reply.status);
+            var committed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, reply.body, .{});
+            defer committed.deinit();
+            try std.testing.expectEqualStrings(encoded, committed.value.transaction_id.?);
+        }
     }
 
     const prepare_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SELECT current_setting('app.limit')", .connection_id = connection_id }, .{});

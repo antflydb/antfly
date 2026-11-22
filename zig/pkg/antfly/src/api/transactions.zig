@@ -30,6 +30,7 @@ const session_prefix = session_record.session_prefix;
 const session_lease_prefix = "\x00\x00__api_txn_session_leases__:";
 const sql_abort_proof_prefix = "\x00\x00__api_txn_completion__:";
 const sql_legacy_pin_fence_key = "\x00\x00__api_sql_legacy_pin_fence__";
+const tagged_sql_expiry_prefix = "\x00\x00__api_sql_terminal_expiry__:";
 const sql_abort_expiry_prefix = "\x00\x00__api_sql_abort_expiry__:";
 const session_expiry_prefix = "\x00\x00__api_txn_session_expiry__:";
 const session_recovery_prefix = "\x00\x00__api_txn_session_recovery__:";
@@ -819,6 +820,7 @@ pub const SessionTableDetail = struct {
 };
 
 pub const SessionDetails = struct {
+    prepared_completion_only: bool = false,
     graph_receipt: bool = false,
     status: SessionStatus,
     connection_id: ?[32]u8 = null,
@@ -1195,6 +1197,7 @@ pub const DurableSessionStore = struct {
     // references can belong to a dead process; never sweep a live collector.
     registration_recovery_before: ?u64 = null,
     registration_locks: [64]std.atomic.Mutex = @splat(.unlocked),
+    sql_abort_proof_position: ?SqlAbortProofPosition = null,
     fail_writes_for_test: bool = false,
     fail_lease_transition_after_session_write_for_test: bool = false,
 
@@ -1453,6 +1456,7 @@ pub const DurableSessionStore = struct {
         }, .{});
         defer self.alloc.free(lease_value);
         if (expected) |version| {
+            if (session.prepared_completion_only) try self.deleteTaggedSqlExpiryKeyTxn(txn, session.txn_id, version.touched);
             const old_expiry_key = try makeSessionExpiryKey(self.alloc, version.touched, session.txn_id);
             defer self.alloc.free(old_expiry_key);
             txn.delete(old_expiry_key) catch |err| switch (err) {
@@ -1466,6 +1470,7 @@ pub const DurableSessionStore = struct {
         try self.preserveCompletionTxn(txn, session, false);
         try txn.put(session_key, session_value);
         try txn.put(expiry_key, &.{});
+        try self.putTaggedSqlExpiryTxn(txn, session);
         if (sessionNeedsRecovery(session)) {
             try setSessionRecoveryIndexTxn(self, txn, session);
         } else if (previous_needs_recovery) {
@@ -1604,7 +1609,8 @@ pub const DurableSessionStore = struct {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
-        return switch (self.backend) {
+        var next_position: ?SqlAbortProofPosition = null;
+        const removed = switch (self.backend) {
             .docstore => |store| result: {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
@@ -1615,7 +1621,7 @@ pub const DurableSessionStore = struct {
                 const count = scan: {
                     var cursor = try txn.openPhysicalKeyCursorAdapter();
                     defer cursor.close();
-                    break :scan try reclaimSqlAbortProofsTxn(&txn, &cursor);
+                    break :scan try reclaimSqlAbortProofsTxn(&txn, &cursor, self.sql_abort_proof_position, &next_position);
                 };
                 if (count != 0) try txn.commit() else txn.abort();
                 break :result count;
@@ -1630,54 +1636,83 @@ pub const DurableSessionStore = struct {
                 const count = scan: {
                     var cursor = try txn.openCursor();
                     defer cursor.close();
-                    break :scan try reclaimSqlAbortProofsTxn(&txn, &cursor);
+                    break :scan try reclaimSqlAbortProofsTxn(&txn, &cursor, self.sql_abort_proof_position, &next_position);
                 };
                 if (count != 0) try txn.commit() else txn.abort();
                 break :result count;
             },
         };
-    }
-
-    fn reclaimSqlAbortProofsTxn(txn: anytype, cursor: anytype) !usize {
-        const key_len = sql_abort_proof_prefix.len + 32;
-        var keys: [128][key_len]u8 = undefined;
-        var count: usize = 0;
-        cursor.setKeysOnly();
-        var next = try cursor.seekAtOrAfter(sql_abort_proof_prefix);
-        while (next) |entry| : (next = try cursor.next()) {
-            if (!std.mem.startsWith(u8, entry.key, sql_abort_proof_prefix)) break;
-            if (entry.key.len != key_len or !std.mem.eql(u8, try txn.get(entry.key), "settled-v1")) continue;
-            keys[count] = entry.key[0..key_len].*;
-            count += 1;
-            if (count == keys.len) break;
-        }
-        // Finish the cursor walk before staging any deletes on its transaction.
-        var removed: usize = 0;
-        for (keys[0..count]) |key| {
-            const value = try txn.get(&key);
-            if (!std.mem.eql(u8, value, "settled-v1")) continue;
-            try txn.delete(&key);
-            removed += 1;
-        }
+        self.sql_abort_proof_position = next_position;
         return removed;
     }
 
-    pub fn connectionCommitDecision(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: [32]u8, principal: []const u8) !?bool {
+    const SqlAbortProofPosition = struct {
+        bytes: [sql_abort_proof_prefix.len + 33]u8 = undefined,
+        len: usize,
+        exclusive: bool,
+
+        fn after(key: []const u8) ?SqlAbortProofPosition {
+            var position: SqlAbortProofPosition = .{
+                .len = @min(key.len, sql_abort_proof_prefix.len + 33),
+                .exclusive = key.len <= sql_abort_proof_prefix.len + 32,
+            };
+            @memcpy(position.bytes[0..position.len], key[0..position.len]);
+            if (position.exclusive) return position;
+            // All longer keys sharing this prefix are malformed. Jump past
+            // that run without skipping any fixed-width marker.
+            var end = position.len;
+            while (end > sql_abort_proof_prefix.len) {
+                end -= 1;
+                if (position.bytes[end] == 255) continue;
+                position.bytes[end] += 1;
+                position.len = end + 1;
+                return position;
+            }
+            return null;
+        }
+    };
+
+    fn reclaimSqlAbortProofsTxn(txn: anytype, cursor: anytype, previous: ?SqlAbortProofPosition, next_position: *?SqlAbortProofPosition) !usize {
+        const key_len = sql_abort_proof_prefix.len + 32;
+        var keys: [128][key_len]u8 = undefined;
+        var count: usize = 0;
+        var inspected: usize = 0;
+        cursor.setKeysOnly();
+        const start = if (previous) |*position| position.bytes[0..position.len] else sql_abort_proof_prefix;
+        var next = try cursor.seekAtOrAfter(start);
+        while (next) |entry| : (next = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, sql_abort_proof_prefix)) break;
+            if (previous) |position| if (position.exclusive and std.mem.eql(u8, entry.key, start)) continue;
+            inspected += 1;
+            if (entry.key.len == key_len and std.mem.eql(u8, try txn.get(entry.key), "settled-v1")) {
+                keys[count] = entry.key[0..key_len].*;
+                count += 1;
+            }
+            if (count == keys.len or inspected == 256) {
+                next_position.* = SqlAbortProofPosition.after(entry.key);
+                break;
+            }
+        }
+        for (keys[0..count]) |key| try txn.delete(&key);
+        return count;
+    }
+
+    pub fn sqlCommitDecisionStatus(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: ?[32]u8, principal: []const u8) !?SessionDisposition {
         return switch (self.backend) {
             .docstore => |store| result: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                break :result try self.connectionCommitDecisionTxn(&txn, alloc, id, connection, principal);
+                break :result try self.sqlCommitDecisionStatusTxn(&txn, alloc, id, connection, principal);
             },
             .runtime => |store| result: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                break :result try self.connectionCommitDecisionTxn(&txn, alloc, id, connection, principal);
+                break :result try self.sqlCommitDecisionStatusTxn(&txn, alloc, id, connection, principal);
             },
         };
     }
 
-    fn connectionCommitDecisionTxn(self: *DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: [32]u8, principal: []const u8) !?bool {
+    fn sqlCommitDecisionStatusTxn(self: *DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: ?[32]u8, principal: []const u8) !?SessionDisposition {
         const key = try makeSqlAbortReceiptKey(alloc, id);
         defer alloc.free(key);
         var receipt = if (txn.get(key)) |raw|
@@ -1686,11 +1721,10 @@ pub const DurableSessionStore = struct {
             error.NotFound => (try self.loadSessionTxn(txn, id)) orelse return null,
             else => return err,
         };
-        // loadSessionTxn and the detached decoder must use the same allocator.
         defer receipt.deinitOwned();
-        if (!std.meta.eql(receipt.connection_id, @as(?[32]u8, connection)) or
-            !std.mem.eql(u8, receipt.principal orelse "", principal) or !sessionCompletionSettled(receipt)) return null;
-        return receipt.terminal_commit != null;
+        if (!std.meta.eql(receipt.connection_id, connection) or
+            !std.mem.eql(u8, receipt.principal orelse "", principal) or (receipt.terminal_commit == null and !receipt.terminal_abort)) return null;
+        return sessionDisposition(receipt);
     }
 
     fn sqlAbortReceiptAcceptsLatePin(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId) !bool {
@@ -2323,6 +2357,24 @@ pub const DurableSessionStore = struct {
             return error.SqlConnectionChanged;
     }
 
+    fn deleteTaggedSqlExpiryKeyTxn(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId, timestamp: u64) !void {
+        const key = try makeExpiryKey(self.alloc, tagged_sql_expiry_prefix, timestamp, id);
+        defer self.alloc.free(key);
+        txn.delete(key) catch |err| if (err != error.NotFound) return err;
+    }
+
+    fn clearTaggedSqlExpiryTxn(self: *DurableSessionStore, txn: anytype, session: Session) !void {
+        if (session.prepared_completion_only and sessionCompletionSettled(session) and sessionCanExpire(session))
+            try self.deleteTaggedSqlExpiryKeyTxn(txn, session.txn_id, session.last_touched_timestamp);
+    }
+
+    fn putTaggedSqlExpiryTxn(self: *DurableSessionStore, txn: anytype, session: Session) !void {
+        if (!session.prepared_completion_only or !sessionCompletionSettled(session) or !sessionCanExpire(session)) return;
+        const key = try makeExpiryKey(self.alloc, tagged_sql_expiry_prefix, session.last_touched_timestamp, session.txn_id);
+        defer self.alloc.free(key);
+        try txn.put(key, &.{});
+    }
+
     fn putSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, value: []const u8, session: Session, options: SaveOptions) !void {
         if (options.creating) try self.requireBeginningConnection(txn, session);
         var previous_needs_recovery = false;
@@ -2342,6 +2394,7 @@ pub const DurableSessionStore = struct {
                 (previous.execution_plan != null and !(previous.graph_receipt and session.graph_receipt and session.terminal_abort and session.execution_plan == null) and !optionalStringsEqual(previous.execution_plan, session.execution_plan)))
                 return error.TransactionCommitSealed;
             previous_needs_recovery = sessionNeedsRecovery(previous);
+            try self.clearTaggedSqlExpiryTxn(txn, previous);
             const old_expiry_key = try makeSessionExpiryKey(self.alloc, previous.last_touched_timestamp, session.txn_id);
             defer self.alloc.free(old_expiry_key);
             txn.delete(old_expiry_key) catch |err| switch (err) {
@@ -2377,6 +2430,7 @@ pub const DurableSessionStore = struct {
         try self.preserveCompletionTxn(txn, session, false);
         try txn.put(key, value);
         try txn.put(expiry_key, &.{});
+        try self.putTaggedSqlExpiryTxn(txn, session);
         if (sessionNeedsRecovery(session)) {
             try setSessionRecoveryIndexTxn(self, txn, session);
         } else if (previous_needs_recovery) {
@@ -2475,6 +2529,7 @@ pub const DurableSessionStore = struct {
             error.NotFound => {},
             else => return err,
         };
+        try self.clearTaggedSqlExpiryTxn(txn, previous);
         try updateSessionCount(txn, false, null);
         try txn.delete(key);
         try self.clearSessionLeaseTxn(txn, txn_id);
@@ -3130,6 +3185,7 @@ pub const SessionRegistry = struct {
     connection_sweep_offset: std.atomic.Value(usize) = .init(0),
     reserved_session_count: usize = 0,
     expiry_cursor: ?ParsedSessionExpiryKey = null,
+    tagged_sql_expiry_cursor: ?ParsedSessionExpiryKey = null,
     sql_abort_expiry_cursor: ?ParsedSessionExpiryKey = null,
     sql_abort_migration_lock: AtomicMutex = .{},
     sql_abort_migration_after: std.ArrayList(u8) = .empty,
@@ -4931,6 +4987,7 @@ pub const SessionRegistry = struct {
     fn projectDetails(alloc: std.mem.Allocator, session: *const Session, status: SessionStatus, projection: DetailsProjection, summary: ?SessionListingSummary) !SessionDetails {
         var details: SessionDetails = .{
             .graph_receipt = session.graph_receipt,
+            .prepared_completion_only = session.prepared_completion_only,
             .status = status,
             .connection_id = session.connection_id,
             .tables = &.{},
@@ -5327,12 +5384,13 @@ pub const SessionRegistry = struct {
         defer expired_ids.deinit(alloc);
         if (self.durable) |durable| {
             self.mutex.lock();
-            const after = self.expiry_cursor;
+            const cursor = if (tagged_sql_only) &self.tagged_sql_expiry_cursor else &self.expiry_cursor;
+            const after = cursor.*;
             self.mutex.unlock();
-            const page = try durable.scanExpiredIds(alloc, session_expiry_prefix, after, cutoff_ns, 1024);
+            const page = try durable.scanExpiredIds(alloc, if (tagged_sql_only) tagged_sql_expiry_prefix else session_expiry_prefix, after, cutoff_ns, 1024);
             expired_ids = .fromOwnedSlice(page.ids);
             self.mutex.lock();
-            if (std.meta.eql(after, self.expiry_cursor)) self.expiry_cursor = page.next_after;
+            if (std.meta.eql(after, cursor.*)) cursor.* = page.next_after;
             self.mutex.unlock();
         } else {
             self.mutex.lock();

@@ -14532,7 +14532,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn directTransactionRouteEligible(details: transactions_api.SessionDetails, read_only: bool) bool {
-        return read_only or (details.connection_id == null and !details.graph_receipt);
+        return read_only or (details.connection_id == null and !details.graph_receipt and !details.prepared_completion_only);
     }
 
     pub fn listAuthorizedTransactionSessions(
