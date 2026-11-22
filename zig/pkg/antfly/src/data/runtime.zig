@@ -2652,7 +2652,7 @@ const RaftTableApplyStateMachine = struct {
 
 fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
     if (req.split_transition) |transition| return transition.kind == .finalize;
-    if (req.merge_source_transition != null) return false;
+    if (req.merge_source_transition) |transition| return transition.kind == .finalize;
     if (req.split_checkpoint) |checkpoint| {
         if (checkpoint.kind == .source_ack and
             req.writes.len == 0 and req.deletes.len == 0 and req.transforms.len == 0 and
@@ -2685,7 +2685,7 @@ fn needsDenseRepairWritePreflight(req: antfly.db.types.BatchRequest) bool {
     // Authenticated merge copy commands carry the destination's exact
     // transition identity and are checked again by ordered apply. Public
     // writer acquisition cannot succeed while the receiver fence is held.
-    if (req.relational_topology == null) return req.merge_replication == null;
+    if (req.relational_topology == null) return req.merge_replication == null and req.merge_source_transition == null;
     return req.row_policy_principal_proof.len != 0 or req.row_policy_database.len != 0 or
         req.row_policy_admitted_at_seconds != 0 or req.schema_version != null or
         req.relational_schema_version != null or req.relational_integrity_generation_set != null or
@@ -13176,6 +13176,8 @@ pub const DataServer = struct {
     pub fn requiredRaftBatchProtocolVersion(alloc: std.mem.Allocator, req: antfly.db.types.BatchRequest) !u16 {
         if (req.split_checkpoint) |checkpoint| if (checkpoint.history_policy != null)
             return @import("../common/data_raft_protocol.zig").batch_split_history_seed_protocol_version;
+        if (req.merge_source_transition) |transition| if (transition.kind == .finalize)
+            return @import("../common/data_raft_protocol.zig").batch_merge_history_cut_protocol_version;
         if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(alloc, req)) |required| return required;
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
@@ -19412,13 +19414,22 @@ pub const DataServer = struct {
         const store = self.localTransitionApplyStore() orelse
             return error.MissingMergeSourceStore;
         var observation = try deriveReplicatedMergeObservation(self.alloc, store, record);
-        if (record.phase != .finalized and observation.donor.phase == .finalized and observation.receiver.phase == .finalized and
-            !try self.mergeHistoryRetirementReady(record.donor_group_id, record.receiver_group_id, record.transition_id, record.table_contract))
-        {
-            observation.donor.phase = .cutover_ready;
-            observation.receiver.phase = .cutover_ready;
-            observation.donor.cutover_ready = true;
-            observation.receiver.cutover_ready = true;
+        if (record.phase != .finalized and observation.donor.phase == .finalized and observation.receiver.phase == .finalized) {
+            var ready = try self.mergeHistoryRetirementReady(record.donor_group_id, record.receiver_group_id, record.transition_id, record.table_contract);
+            if (ready and try transitionHasCoordinatedConstraints(self.alloc, record.table_contract)) {
+                // A retired history grant can unblock observation between
+                // finalize calls. Do not publish cutover until a finalize
+                // call has released the receiver's durable integrity fence.
+                var status = try self.readRelationalTopologyValue(IntegrityTopologyStatus, self.alloc, record.receiver_group_id, record.table_contract.table_name, record.transition_id, 1, "status");
+                defer status.deinit();
+                ready = status.value.fence == null;
+            }
+            if (!ready) {
+                observation.donor.phase = .cutover_ready;
+                observation.receiver.phase = .cutover_ready;
+                observation.donor.cutover_ready = true;
+                observation.receiver.cutover_ready = true;
+            }
         }
         return observation;
     }
@@ -19737,8 +19748,11 @@ pub const DataServer = struct {
                 op.allow_doc_identity_reassignment,
                 op.table_contract,
             )) {
+                // Report the completed physical step so metadata can expose
+                // finalizing while the donor is still routed. Observation
+                // keeps the transition nonterminal until history drains.
                 if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
-                    return error.TransitionOperationBusy;
+                    return;
                 try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
                 return;
             }
@@ -19806,7 +19820,7 @@ pub const DataServer = struct {
                 op.table_contract,
             );
             if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
-                return error.TransitionOperationBusy;
+                return;
             try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
@@ -40199,7 +40213,7 @@ fn consumerTests() type {
                     .split_key = "doc:m",
                 },
             }));
-            try std.testing.expect(!batchRequiresDocumentDbApply(.{
+            try std.testing.expect(batchRequiresDocumentDbApply(.{
                 .merge_source_transition = .{
                     .kind = .finalize,
                     .transition_id = 7001,
@@ -40228,7 +40242,7 @@ fn consumerTests() type {
                 },
             }));
             try std.testing.expectEqual(
-                data_raft_batch.merge_transition_protocol_version,
+                @import("../common/data_raft_protocol.zig").batch_merge_history_cut_protocol_version,
                 try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{
                     .merge_source_transition = .{
                         .kind = .finalize,

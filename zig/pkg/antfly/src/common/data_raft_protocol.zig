@@ -42,7 +42,9 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// predicates. Activate once per membership, before admitting these payloads.
 /// Version 55 distinguishes physical participants that share a storage namespace.
 pub const batch_physical_completion_protocol_version: u16 = 55;
-pub const batch_protocol_version: u16 = batch_physical_completion_protocol_version;
+/// Version 56 includes the native committed-history cut in merge finalization.
+pub const batch_merge_history_cut_protocol_version: u16 = 56;
+pub const batch_protocol_version: u16 = batch_merge_history_cut_protocol_version;
 pub const batch_split_origin_enrollment_protocol_version: u16 = 54;
 pub const batch_split_history_seed_protocol_version: u16 = 53;
 
