@@ -251,7 +251,10 @@ pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principa
 }
 
 fn removeDirectoryEntry(txn: anytype, alloc: std.mem.Allocator, id: [32]u8, cutoff: ?u64) !void {
-    const raw = try txn.get(directory_key);
+    const raw = txn.get(directory_key) catch |err| switch (err) {
+        error.NotFound => return alloc.alloc(Entry, 0),
+        else => return err,
+    };
     var directory = try std.json.parseFromSlice(Directory, alloc, raw, .{ .allocate = .alloc_always });
     defer directory.deinit();
     if (directory.value.entries.len > max_connections) return error.InvalidSqlConnection;
@@ -628,6 +631,7 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
     registry.max_sessions = 1;
     defer registry.deinit(alloc);
 
+    try reconcileExpired(&store, &registry, alloc, 1);
     for ([_]bool{ false, true }, [_]u8{ 'a', 'b' }) |request_persisted, digit| {
         const id: [32]u8 = @splat(digit);
         const txn_id = transactions.newSessionTxnId(7);
