@@ -10243,13 +10243,15 @@ pub const ApiHttpServer = struct {
         if (self.txn_sessions.durable == null) return;
         const now_ns = platform_time.realtimeNs();
         const previous_ns = self.last_sql_abort_cleanup_ns.load(.acquire);
-        if (previous_ns != 0 and now_ns -| previous_ns < std.time.ns_per_min) return;
-        if (self.last_sql_abort_cleanup_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
+        const periodic = previous_ns == 0 or now_ns -| previous_ns >= std.time.ns_per_min;
+        if (!periodic and !self.txn_sessions.hasSqlReceiptCleanupBacklog()) return;
+        if (periodic and self.last_sql_abort_cleanup_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
         const retention_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
-        self.txn_sessions.migrateLegacySqlAbortReceipts(self.alloc) catch |err| {
+        if (periodic) self.txn_sessions.migrateLegacySqlAbortReceipts(self.alloc) catch |err| {
             std.log.warn("legacy SQL abort receipt migration deferred err={s}", .{@errorName(err)});
         };
         _ = try self.txn_sessions.cleanupExpiredSqlAbortReceipts(self.alloc, now_ns -| retention_ns);
+        if (!periodic) return;
         if (self.cfg.deployment_mode == .standalone and self.txn_sessions.durable_scope == .node_local and
             self.cfg.session_executor == null and self.cfg.hot_standby_mutation_policy_source == null and self.mutationBackgroundExecutionPermitted())
         {
@@ -10259,13 +10261,18 @@ pub const ApiHttpServer = struct {
     }
 
     fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
-        const ttl_ns = self.cfg.session_ttl_ns orelse return;
+        const tagged_sql_only = self.cfg.session_ttl_ns == null;
+        if (tagged_sql_only and self.txn_sessions.durable_scope != .cluster_shared) return;
+        const ttl_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
         const now_ns = platform_time.realtimeNs();
-        const interval_ns = self.cfg.session_cleanup_interval_ns orelse ttl_ns;
+        const interval_ns = self.cfg.session_cleanup_interval_ns orelse if (tagged_sql_only) std.time.ns_per_min else ttl_ns;
         const previous_ns = self.last_session_cleanup_ns.load(.acquire);
         if (previous_ns != 0 and now_ns -| previous_ns < interval_ns) return;
         self.last_session_cleanup_ns.store(now_ns, .release);
-        _ = try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
+        _ = if (tagged_sql_only)
+            try self.txn_sessions.cleanupExpiredTaggedSqlDecisions(self.alloc, now_ns -| ttl_ns)
+        else
+            try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
     }
 
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {

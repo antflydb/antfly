@@ -6858,7 +6858,18 @@ pub const AntflyApiHandler = struct {
                     self.adapter.session_id = &self.connection_session_hex;
                     self.adapter.setting_overlay = &.{};
                 } else {
-                    if (self.adapter.session_id != null) return error.SqlTransactionNotActive;
+                    if (self.adapter.session_id) |supplied| {
+                        if (self.prepared_mode != .statement or self.parameters.len != 0 or
+                            !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlTransactionNotActive;
+                        const txn_id = distributed_txn.parseTxnIdHex(supplied) catch return error.SqlTransactionNotActive;
+                        const committed = (try store.connectionCommitDecision(std.heap.page_allocator, txn_id, connection_id, resource_principal)) orelse
+                            return error.SqlTransactionNotActive;
+                        self.adapter.reports_existing_commit = true;
+                        self.adapter.outcome_transaction_id = std.fmt.bytesToHex(txn_id, .lower);
+                        self.result = try sql_runtime.Result.empty(std.heap.page_allocator, if (committed) "COMMIT" else "ROLLBACK");
+                        if (committed) self.result.?.output.mutation_outcome = .committed;
+                        return;
+                    }
                     self.adapter.setting_overlay = connection.overlay;
                 }
             }
@@ -7362,7 +7373,7 @@ pub const AntflyApiHandler = struct {
             };
         };
         var job = SQLJob{
-            .adapter = .{ .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .adapter = .{ .durable_http_session = true, .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
             .prepared_mode = mode,
             .prepared_id = prepared_id,
@@ -15508,6 +15519,14 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
                 const status = (try server.txn_sessions.getStatusForPrincipal(alloc, committed_id, "connection_alice")).?;
                 try std.testing.expectEqual(transactions_api.SessionDisposition.committed, status.disposition);
                 try std.testing.expect(!try durable.completionSettled(committed_id));
+                const retry_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .connection_id = connection_id, .session_id = result.value.transaction_id.? }, .{});
+                defer alloc.free(retry_body);
+                var retry = try Route.call(alloc, &handler, alice_auth, .fenced_sql, null, retry_body);
+                defer retry.deinit(alloc);
+                try std.testing.expectEqual(@as(u16, 200), retry.status);
+                var replayed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, retry.body, .{});
+                defer replayed.deinit();
+                try std.testing.expectEqualStrings(result.value.transaction_id.?, replayed.value.transaction_id.?);
             }
             if (step.value) |value| try std.testing.expectEqualStrings(value, result.value.rows[0][0].string);
         }

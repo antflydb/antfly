@@ -175,6 +175,7 @@ pub const Adapter = struct {
     target: ?system_catalog.Target = null,
     outcome_transaction_id: ?[32]u8 = null,
     reports_existing_commit: bool = false,
+    durable_http_session: bool = false,
     session_id: ?[]const u8 = null,
     /// Durable idle HTTP connection identity, never an alias for session_id.
     connection_id: ?[32]u8 = null,
@@ -325,7 +326,7 @@ pub const Adapter = struct {
             });
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
-        var owner = session_api.Adapter{ .admitted = self.admitted_mutation, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay, .begin_prepared_completion_only = self.connection_id != null };
+        var owner = session_api.Adapter{ .admitted = self.admitted_mutation, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay, .begin_prepared_completion_only = self.durable_http_session and self.server.txn_sessions.durable != null };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (inherited) |state| {
             if (!std.mem.eql(u8, state.metadata.database, session.scope.database) or !std.mem.eql(u8, state.metadata.namespace, session.scope.namespace)) return error.SqlTransactionNotActive;

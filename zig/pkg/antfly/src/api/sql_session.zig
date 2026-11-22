@@ -227,7 +227,9 @@ pub const Adapter = struct {
             // A committed decision must not turn into an apparent retryable
             // error merely because detachment failed. Retain the fence for
             // recovery; the caller still receives the proven decision.
-            self.connectionMutation(scope, action) catch {};
+            if (self.connectionMutation(scope, action)) |_| {
+                if (action == .terminal) self.registry.evictDetachedSqlSession(id);
+            } else |_| {}
         }
         return result;
     }

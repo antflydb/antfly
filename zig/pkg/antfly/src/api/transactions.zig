@@ -1646,18 +1646,51 @@ pub const DurableSessionStore = struct {
         var next = try cursor.seekAtOrAfter(sql_abort_proof_prefix);
         while (next) |entry| : (next = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, sql_abort_proof_prefix)) break;
-            if (entry.key.len != key_len) return error.InvalidTransactionSessionRecord;
+            if (entry.key.len != key_len or !std.mem.eql(u8, try txn.get(entry.key), "settled-v1")) continue;
             keys[count] = entry.key[0..key_len].*;
             count += 1;
             if (count == keys.len) break;
         }
         // Finish the cursor walk before staging any deletes on its transaction.
+        var removed: usize = 0;
         for (keys[0..count]) |key| {
             const value = try txn.get(&key);
-            if (!std.mem.eql(u8, value, "settled-v1")) return error.InvalidTransactionSessionRecord;
+            if (!std.mem.eql(u8, value, "settled-v1")) continue;
             try txn.delete(&key);
+            removed += 1;
         }
-        return count;
+        return removed;
+    }
+
+    pub fn connectionCommitDecision(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: [32]u8, principal: []const u8) !?bool {
+        return switch (self.backend) {
+            .docstore => |store| result: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                break :result try self.connectionCommitDecisionTxn(&txn, alloc, id, connection, principal);
+            },
+            .runtime => |store| result: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                break :result try self.connectionCommitDecisionTxn(&txn, alloc, id, connection, principal);
+            },
+        };
+    }
+
+    fn connectionCommitDecisionTxn(self: *DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: [32]u8, principal: []const u8) !?bool {
+        const key = try makeSqlAbortReceiptKey(alloc, id);
+        defer alloc.free(key);
+        var receipt = if (txn.get(key)) |raw|
+            try decodeSqlTerminalReceipt(alloc, id, raw)
+        else |err| switch (err) {
+            error.NotFound => (try self.loadSessionTxn(txn, id)) orelse return null,
+            else => return err,
+        };
+        // loadSessionTxn and the detached decoder must use the same allocator.
+        defer receipt.deinitOwned();
+        if (!std.meta.eql(receipt.connection_id, @as(?[32]u8, connection)) or
+            !std.mem.eql(u8, receipt.principal orelse "", principal) or !sessionCompletionSettled(receipt)) return null;
+        return receipt.terminal_commit != null;
     }
 
     fn sqlAbortReceiptAcceptsLatePin(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId) !bool {
@@ -2032,7 +2065,7 @@ pub const DurableSessionStore = struct {
         return std.mem.eql(u8, bytes, "settled-v1");
     }
 
-    fn delete(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, expected: Version, cutoff: ?u64, guard: ?Mutation) !void {
+    fn delete(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, expected: Version, cutoff: ?u64, guard: ?Mutation, sql_commit: ?bool) !void {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
@@ -2043,13 +2076,13 @@ pub const DurableSessionStore = struct {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                try deleteSessionAndExpiryTxn(self, &txn, key, txn_id, expected, cutoff, guard);
+                try deleteSessionAndExpiryTxn(self, &txn, key, txn_id, expected, cutoff, guard, sql_commit);
                 try txn.commit();
             },
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                try deleteSessionAndExpiryTxn(self, &txn, key, txn_id, expected, cutoff, guard);
+                try deleteSessionAndExpiryTxn(self, &txn, key, txn_id, expected, cutoff, guard, sql_commit);
                 try txn.commit();
             },
         }
@@ -2124,19 +2157,7 @@ pub const DurableSessionStore = struct {
             // The uncertain-state update may itself have lost its acknowledgement.
             // Keep the abort proof for either state and release the connection
             // and lease in the same fenced storage transaction.
-            var receipt: Session = .{
-                .txn_id = txn_id,
-                .owner_node_id = session.owner_node_id,
-                .principal = session.principal,
-                .connection_id = session.connection_id,
-                .prepared_completion_only = session.prepared_completion_only,
-                .begin_timestamp = session.begin_timestamp,
-                .last_touched_timestamp = session.last_touched_timestamp,
-                .sync_level = session.sync_level,
-                .commit_execution_started = true,
-                .terminal_abort = !commit_settings,
-                .terminal_commit = if (commit_settings) .{ .status = .committed } else null,
-            };
+            var receipt = sqlCommitDecision(session, commit_settings);
             touchSession(&receipt);
             if (!separate_receipt and !session.prepared_completion_only) {
                 const encoded = try encodeSessionRecord(self.alloc, receipt);
@@ -2150,6 +2171,36 @@ pub const DurableSessionStore = struct {
         } else {
             try self.deleteLoadedSessionTxn(txn, key, session, expected, null, guard);
         }
+    }
+
+    fn sqlCommitDecision(session: Session, committed: bool) Session {
+        return .{
+            .txn_id = session.txn_id,
+            .owner_node_id = session.owner_node_id,
+            .principal = session.principal,
+            .connection_id = session.connection_id,
+            .prepared_completion_only = session.prepared_completion_only,
+            .begin_timestamp = session.begin_timestamp,
+            .last_touched_timestamp = session.last_touched_timestamp,
+            .sync_level = session.sync_level,
+            .commit_execution_started = true,
+            .terminal_abort = !committed,
+            .terminal_commit = if (committed) .{ .status = .committed } else null,
+        };
+    }
+
+    pub fn compactDetachedSqlSessionTxn(self: *DurableSessionStore, txn: anytype, session: Session) !void {
+        if (!session.prepared_completion_only or !sessionCompletionSettled(session) or !sessionCanExpire(session)) return;
+        const key = try makeSessionKey(self.alloc, session.txn_id);
+        defer self.alloc.free(key);
+        try self.deleteLoadedSessionTxn(txn, key, session, Version.of(session), null, null);
+        try self.putSqlCommitDecision(txn, session, session.terminal_commit != null);
+    }
+
+    fn putSqlCommitDecision(self: *DurableSessionStore, txn: anytype, session: Session, committed: bool) !void {
+        var receipt = sqlCommitDecision(session, committed);
+        touchSession(&receipt);
+        try self.putSqlAbortReceipt(txn, receipt);
     }
 
     fn putSqlAbortReceipt(self: *DurableSessionStore, txn: anytype, receipt: Session) !void {
@@ -2333,31 +2384,42 @@ pub const DurableSessionStore = struct {
         }
     }
 
-    fn expireSqlAbortReceipt(self: *DurableSessionStore, id: db_mod.types.TxnId, cutoff: u64) !bool {
+    fn expireSqlAbortReceiptPage(self: *DurableSessionStore, ids: []const db_mod.types.TxnId, cutoff: u64) !usize {
+        if (ids.len == 0) return 0;
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
-        switch (self.backend) {
-            .docstore => |store| {
+        return switch (self.backend) {
+            .docstore => |store| result: {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                if (!try self.expireSqlAbortReceiptTxn(&txn, id, cutoff)) {
-                    txn.abort();
-                    return false;
-                }
-                try txn.commit();
+                const count = try self.expireSqlAbortReceiptPageTxn(&txn, ids, cutoff);
+                if (count != 0) try txn.commit() else txn.abort();
+                break :result count;
             },
-            .runtime => |store| {
+            .runtime => |store| result: {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                if (!try self.expireSqlAbortReceiptTxn(&txn, id, cutoff)) {
-                    txn.abort();
-                    return false;
-                }
-                try txn.commit();
+                const count = try self.expireSqlAbortReceiptPageTxn(&txn, ids, cutoff);
+                if (count != 0) try txn.commit() else txn.abort();
+                break :result count;
             },
+        };
+    }
+
+    fn expireSqlAbortReceiptPageTxn(self: *DurableSessionStore, txn: anytype, ids: []const db_mod.types.TxnId, cutoff: u64) !usize {
+        var count: usize = 0;
+        for (ids) |id| {
+            const expired = self.expireSqlAbortReceiptTxn(txn, id, cutoff) catch |err| switch (err) {
+                error.InvalidTransactionSessionRecord => {
+                    std.log.warn("invalid SQL terminal receipt retained txn_id={x}", .{id});
+                    continue;
+                },
+                else => return err,
+            };
+            if (expired) count += 1;
         }
-        return true;
+        return count;
     }
 
     fn expireSqlAbortReceiptTxn(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId, cutoff: u64) !bool {
@@ -2378,11 +2440,12 @@ pub const DurableSessionStore = struct {
         return true;
     }
 
-    fn deleteSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId, expected: Version, cutoff: ?u64, guard: ?Mutation) !void {
+    fn deleteSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId, expected: Version, cutoff: ?u64, guard: ?Mutation, sql_commit: ?bool) !void {
         const raw = txn.get(key) catch |err| if (err == error.NotFound) return error.SessionLeaseLost else return err;
         var previous = try decodeSessionRecord(self.alloc, txn_id, raw);
         defer previous.deinit(self.alloc);
         try self.deleteLoadedSessionTxn(txn, key, previous, expected, cutoff, guard);
+        if (sql_commit) |committed| if (previous.prepared_completion_only) try self.putSqlCommitDecision(txn, previous, committed);
     }
 
     fn deleteLoadedSessionTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, previous: Session, expected: Version, cutoff: ?u64, guard: ?Mutation) !void {
@@ -5238,25 +5301,28 @@ pub const SessionRegistry = struct {
         self.mutex.unlock();
         const page = try durable.scanExpiredIds(alloc, sql_abort_expiry_prefix, after, cutoff_ns, 128);
         defer alloc.free(page.ids);
-        var removed: usize = 0;
-        for (page.ids) |id| {
-            const expired = durable.expireSqlAbortReceipt(id, cutoff_ns) catch |err| switch (err) {
-                error.SessionLeaseLost => continue,
-                error.InvalidTransactionSessionRecord => {
-                    std.log.warn("invalid SQL abort receipt retained txn_id={x} err={s}", .{ id, @errorName(err) });
-                    continue;
-                },
-                else => return err,
-            };
-            if (expired) removed += 1;
-        }
+        const removed = try durable.expireSqlAbortReceiptPage(page.ids, cutoff_ns);
         self.mutex.lock();
         defer self.mutex.unlock();
         if (std.meta.eql(after, self.sql_abort_expiry_cursor)) self.sql_abort_expiry_cursor = page.next_after;
         return removed;
     }
 
+    pub fn hasSqlReceiptCleanupBacklog(self: *SessionRegistry) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.sql_abort_expiry_cursor != null;
+    }
+
     pub fn cleanupExpired(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
+        return self.cleanupExpiredMode(alloc, cutoff_ns, false);
+    }
+
+    pub fn cleanupExpiredTaggedSqlDecisions(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
+        return self.cleanupExpiredMode(alloc, cutoff_ns, true);
+    }
+
+    fn cleanupExpiredMode(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64, tagged_sql_only: bool) !usize {
         var expired_ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         defer expired_ids.deinit(alloc);
         if (self.durable) |durable| {
@@ -5293,6 +5359,7 @@ pub const SessionRegistry = struct {
             defer view.deinit();
             const current = view.session;
             if (current.last_touched_timestamp >= cutoff_ns) continue;
+            if (tagged_sql_only and (!current.prepared_completion_only or !sessionCompletionSettled(current))) continue;
             // The HTTP connection is the durable owner of this transaction.
             // Deleting its terminal record before an exact detach succeeds
             // would turn an uncertain connection into unrecoverable quota
@@ -5326,6 +5393,18 @@ pub const SessionRegistry = struct {
 
     pub fn finishSqlCommitBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, guard: Mutation, expected: DurableSessionStore.Version, commit_settings: bool) !bool {
         return self.removeMode(alloc, guard.id, true, commit_settings, .commit, expected, guard);
+    }
+
+    pub fn evictDetachedSqlSession(self: *SessionRegistry, id: db_mod.types.TxnId) void {
+        const stripe = self.sessionLock(id);
+        stripe.lock();
+        defer stripe.unlock();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.sessions.fetchRemove(id)) |old| {
+            var session = old.value;
+            session.deinitOwned();
+        }
     }
 
     pub fn rollbackConnectionBeforeExecution(self: *SessionRegistry, txn_id: db_mod.types.TxnId, connection_id: [32]u8, expected: DurableSessionStore.Version, condition: DurableSessionStore.DetachCondition) !void {
@@ -5362,7 +5441,9 @@ pub const SessionRegistry = struct {
             try durable.deleteAndDetachConnection(txn_id, connection_id, commit_settings, expected, condition, guard, false);
         } else {
             if (before_execution_only and (current.commit_execution_started or current.terminal_commit != null or current.terminal_abort)) return false;
-            try self.deletePersistent(txn_id, expected, null, guard);
+            if (condition == .commit and current.prepared_completion_only and self.durable != null) {
+                try self.durable.?.delete(txn_id, expected, null, guard, commit_settings);
+            } else try self.deletePersistent(txn_id, expected, null, guard);
         }
         self.releaseLease(txn_id, current.owner_node_id) catch {};
         self.mutex.lock();
@@ -5438,7 +5519,7 @@ pub const SessionRegistry = struct {
 
     fn deletePersistent(self: *SessionRegistry, txn_id: db_mod.types.TxnId, expected: DurableSessionStore.Version, cutoff: ?u64, guard: ?Mutation) !void {
         if (self.durable) |durable| {
-            try durable.delete(txn_id, expected, cutoff, guard);
+            try durable.delete(txn_id, expected, cutoff, guard, null);
         }
     }
 
@@ -7774,10 +7855,11 @@ fn decodeSqlTerminalReceipt(alloc: std.mem.Allocator, id: db_mod.types.TxnId, ra
     };
     errdefer receipt.deinit(alloc);
     if (receipt.terminal_abort and receipt.terminal_commit == null and DurableSessionStore.isLegacySqlAbortReceipt(receipt)) return receipt;
-    const terminal = receipt.terminal_commit orelse return error.InvalidTransactionSessionRecord;
-    if (!receipt.prepared_completion_only or receipt.connection_id == null or receipt.sql != null or receipt.staged != null or
-        receipt.terminal_abort or !sessionCompletionSettled(receipt) or terminal.coordinator_group_id != null)
+    if (!receipt.prepared_completion_only or receipt.sql != null or receipt.staged != null or !sessionCompletionSettled(receipt))
         return error.InvalidTransactionSessionRecord;
+    if (receipt.terminal_commit) |commit| {
+        if (receipt.terminal_abort or commit.coordinator_group_id != null) return error.InvalidTransactionSessionRecord;
+    }
     return receipt;
 }
 
@@ -9457,9 +9539,9 @@ test "distributed txn expired publisher cannot overwrite an adopted execution pl
     try std.testing.expect(!try next.adoptIfLeaseExpired(a, id, 10, nextTxnTimestamp()));
     try std.testing.expect(try next.adoptIfLeaseExpired(a, id, 10, nextTxnTimestamp() + 2 * std.time.ns_per_s));
     try std.testing.expect(!(old.retireBeforeExecution(a, old_guard, staged.session_version.?, false) catch false));
-    try std.testing.expectError(error.SessionLeaseLost, durable.delete(id, staged.session_version.?, std.math.maxInt(u64), null));
+    try std.testing.expectError(error.SessionLeaseLost, durable.delete(id, staged.session_version.?, std.math.maxInt(u64), null, null));
     const adopted = next.getInfo(id).?;
-    try std.testing.expectError(error.SessionLeaseLost, durable.delete(id, adopted.version, adopted.version.touched, null));
+    try std.testing.expectError(error.SessionLeaseLost, durable.delete(id, adopted.version, adopted.version.touched, null, null));
     var winner = (try next.sealExecutionPlan(a, try next.mutation(a, id, 10), &.{.{ .table_name = "docs" }})).?;
     defer winner.deinit();
     try std.testing.expect(winner.firstAttempt());

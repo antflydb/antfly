@@ -100,10 +100,13 @@ fn reconcile(store: *transactions.DurableSessionStore, registry: *transactions.S
                 error.SessionLeaseLost, error.SqlTransactionOutcomeUnknown => return false,
                 else => return err,
             };
-        } else _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
-            error.SqlConnectionBusy => return false,
-            else => return err,
-        };
+        } else {
+            _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
+                error.SqlConnectionBusy => return false,
+                else => return err,
+            };
+            registry.evictDetachedSqlSession(txn_id);
+        }
     } else return false;
     return true;
 }
@@ -414,6 +417,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             next.revision += 1;
             if (session.terminal_commit != null) next.overlay = session.setting_committed.items;
             try record.putTxn(txn, alloc, next);
+            try store.compactDetachedSqlSessionTxn(txn, session);
             break :blk 0;
         },
         .overlay => |change| blk: {
