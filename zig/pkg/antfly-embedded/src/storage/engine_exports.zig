@@ -601,6 +601,10 @@ fn setSplitDeltaFinalSeq(self: *DB, seq: u64) engine.Outcome(void) {
     return .{ .value = self.setSplitDeltaFinalSeq(seq) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn importContextMergeState(self: *DB, donor: *DB, byte_range: types.ByteRange) engine.Outcome(void) {
+    return .{ .value = self.importContextMergeState(donor, byte_range) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn mergeArtifactsPage(self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) engine.Outcome([]types.BatchWrite) {
     return .{ .value = self.mergeArtifactsPage(alloc, byte_range, after_key) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

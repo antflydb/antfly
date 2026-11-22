@@ -249,6 +249,64 @@ fn copyContextSplitState(alloc: Allocator, source: *docstore_mod.DocStore, dest:
     try deleteKeysWithPrefixFromStore(alloc, dest, &outbox_index);
 }
 
+/// Context dependency state a range merge brings from its donor for the
+/// documents in `byte_range` (the same bounds `mergeDocumentsPage` copies):
+/// per-document dependency state, lineage history and change shadows,
+/// their subscription/impact/debounce hints and publish intents, every
+/// unapplied inbox notice and spec-wide pivot (the receiver applies them to
+/// the dependents in its own range), unjournaled rebuild intents, and
+/// generated-record crash markers. The donor keeps and delivers its own
+/// outbox. If the donor's shadows were not complete for the receiver's field
+/// set, the receiver's completion marker is dropped so its writes notify
+/// spec-wide until backfill covers the merged rows.
+pub fn copyContextMergeState(alloc: Allocator, donor: *docstore_mod.DocStore, receiver: *docstore_mod.DocStore, byte_range: types.ByteRange) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    {
+        const lower = try internal_keys.documentRangeLowerAlloc(a, byte_range.start);
+        const upper = if (byte_range.end.len > 0) try internal_keys.documentRangeUpperAlloc(a, byte_range.end) else null;
+        var txn = try donor.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var next = try cursor.seekAtOrAfter(lower);
+        while (next) |row| : (next = try cursor.next()) {
+            if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
+            const kind = context_dependency_store.docScopedKind(row.key) orelse continue;
+            if (kind != context_dependency_store.state_kind and kind != context_dependency_store.history_kind and kind != @import("enrichment/context_notices.zig").shadow_kind) continue;
+            try writes.append(a, .{ .key = try a.dupe(u8, row.key), .value = try a.dupe(u8, row.value) });
+        }
+    }
+    var reader = try context_dependency_db.StoreReader.init(donor);
+    defer reader.deinit();
+    var plan = context_dependency_store.Plan.init(a);
+    _ = try context_dependency_store.copyHintsForRange(a, reader.reader(), &plan, byte_range.start, byte_range.end);
+    for (plan.puts.items) |e| try writes.append(a, .{ .key = e.key, .value = e.value });
+    const rebuild_intents = context_dependency_store.familyPrefix(@import("enrichment/context_dependency_command.zig").rebuild_family);
+    for ([_][]const u8{ &rebuild_intents, context_dependency_db.pending_prefix }) |prefix| {
+        for (try donor.scanPrefix(a, prefix)) |row| try writes.append(a, .{ .key = row.key, .value = row.value });
+    }
+    var start: usize = 0;
+    while (start < writes.items.len) {
+        const end = @min(writes.items.len, start + 4096);
+        try receiver.putBatch(writes.items[start..end], &.{});
+        start = end;
+    }
+    const donor_complete = donor.get(a, context_dependency_db.shadows_complete_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const receiver_complete = receiver.get(a, context_dependency_db.shadows_complete_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const same = if (donor_complete) |d| (if (receiver_complete) |r| std.mem.eql(u8, d, r) else true) else receiver_complete == null;
+    if (!same) try receiver.putBatch(&.{}, &.{context_dependency_db.shadows_complete_key});
+}
+
 fn contextNowMs() u64 {
     return @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
 }
@@ -24061,6 +24119,15 @@ pub const DB = struct {
     /// such as `_edges` or explicit embeddings by itself. Copy the authoritative
     /// document-scoped store rows and live graph projection before cutover so a
     /// successful merge cannot publish primary data with incomplete indexes.
+    /// Bring the donor's context dependency state for `byte_range` into this
+    /// receiver (range-merge coordinators that copy documents page by page).
+    pub fn importContextMergeState(self: *DB, donor: *DB, byte_range: types.ByteRange) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("importContextMergeState", .{ self, donor, byte_range });
+        try copyContextMergeState(self.alloc, donor.core.store, self.core.store, byte_range);
+        self.context_rebuild_intents_pending.store(true, .release);
+        self.context_inbox_pending.store(true, .release);
+    }
+
     pub fn importMergeRangeFromTransitionDonor(
         self: *DB,
         donor: *DB,
@@ -24375,6 +24442,11 @@ pub const DB = struct {
         {
             const raw_writes = try rawStoreWritesAlloc(self.alloc, derived_writes.items);
             defer self.alloc.free(raw_writes);
+            // Context dependency state for the merged documents travels with
+            // their artifacts, before the snapshot becomes durable.
+            try copyContextMergeState(self.alloc, donor.core.store, self.core.store, byte_range);
+            self.context_rebuild_intents_pending.store(true, .release);
+            self.context_inbox_pending.store(true, .release);
             try self.core.store.putBatch(raw_writes, stale_artifact_keys.items);
             primary_published = true;
             self.local_execution.graph_merge_import_recovery_pending.store(true, .release);
@@ -139076,6 +139148,57 @@ test "db replicated merge rollback pages graph-only physical owner" {
     const due = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, due);
     try std.testing.expectEqual(@as(usize, 0), due.len);
+}
+
+test "range merge carries context dependency state for the donor range" {
+    const alloc = std.testing.allocator;
+    var donor_tmp = try TestDirectory.init("db-context-merge-donor");
+    defer donor_tmp.cleanup();
+    var receiver_tmp = try TestDirectory.init("db-context-merge-receiver");
+    defer receiver_tmp.cleanup();
+    var donor = try DB.open(alloc, donor_tmp.path(), .{ .start_optional_runtimes = false });
+    defer donor.close();
+    var receiver = try DB.open(alloc, receiver_tmp.path(), .{ .start_optional_runtimes = false });
+    defer receiver.close();
+    const store = context_dependency_store;
+    var keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (keys.items) |k| alloc.free(k);
+        keys.deinit(alloc);
+    }
+    // In range: state, history, a subscription hint. Out of range: doc:zz.
+    try keys.append(alloc, try store.stateKeyAlloc(alloc, "doc:m", "brief"));
+    try keys.append(alloc, try store.historyKeyAlloc(alloc, "doc:m", "brief", 1));
+    try keys.append(alloc, try store.subscriptionKeyAlloc(alloc, @splat(1), @splat(2), "brief", "doc:m"));
+    try keys.append(alloc, try store.stateKeyAlloc(alloc, "doc:zz", "brief"));
+    try keys.append(alloc, try store.subscriptionKeyAlloc(alloc, @splat(1), @splat(2), "brief", "doc:zz"));
+    const inbox = try @import("enrichment/context_dependency_command.zig").inboxKeyAlloc(alloc, "notice");
+    defer alloc.free(inbox);
+    const writes = try alloc.alloc(docstore_mod.KVPair, keys.items.len + 1);
+    defer alloc.free(writes);
+    for (keys.items, writes[0..keys.items.len]) |k, *w| w.* = .{ .key = k, .value = "v" };
+    writes[keys.items.len] = .{ .key = inbox, .value = "notice" };
+    try donor.core.store.putBatch(writes, &.{});
+    try receiver.core.store.put(context_dependency_db.shadows_complete_key, "digest");
+
+    try copyContextMergeState(alloc, donor.core.store, receiver.core.store, .{ .start = "doc:a", .end = "doc:z" });
+    const has = struct {
+        fn f(db: *DB, key: []const u8) !bool {
+            const value = db.core.store.get(std.testing.allocator, key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            std.testing.allocator.free(value);
+            return true;
+        }
+    }.f;
+    for (keys.items[0..3]) |k| try std.testing.expect(try has(&receiver, k));
+    for (keys.items[3..]) |k| try std.testing.expect(!try has(&receiver, k));
+    // Unapplied inbox notices travel; the receiver applies them to its range.
+    try std.testing.expect(try has(&receiver, inbox));
+    // The donor had no completion marker: the receiver's is dropped so its
+    // writes notify spec-wide until backfill covers the merged rows.
+    try std.testing.expect(!try has(&receiver, context_dependency_db.shadows_complete_key));
 }
 
 test "db direct merge import rebinds graph ttl artifact and rebuilds deadline" {

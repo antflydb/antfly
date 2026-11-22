@@ -1719,6 +1719,33 @@ pub fn liveDependentsAlloc(alloc: Allocator, reader: Reader, spec: Digest, tuple
     return try out.toOwnedSlice(alloc);
 }
 
+/// Kind byte following the document component of a document-scoped key
+/// (`user_namespace`, escaped document key, terminator, kind), or null for
+/// any other key. Dependency state, lineage history, and change shadows are
+/// document-scoped; documents and their artifacts use other kinds.
+pub fn docScopedKind(key: []const u8) ?u8 {
+    if (key.len < 4 or key[0] != user_namespace) return null;
+    var i: usize = 1;
+    while (i + 1 < key.len) {
+        if (key[i] == 0) {
+            if (key[i + 1] == 0) return if (i + 2 < key.len) key[i + 2] else null;
+            i += 2;
+        } else i += 1;
+    }
+    return null;
+}
+
+test "document-scoped kinds follow the escaped document key" {
+    const alloc = testing.allocator;
+    const state = try stateKeyAlloc(alloc, "doc\x00a", "brief");
+    defer alloc.free(state);
+    try testing.expectEqual(@as(?u8, state_kind), docScopedKind(state));
+    const history = try historyKeyAlloc(alloc, "d", "brief", 3);
+    defer alloc.free(history);
+    try testing.expectEqual(@as(?u8, history_kind), docScopedKind(history));
+    try testing.expectEqual(@as(?u8, null), docScopedKind(&familyPrefix(subscription_family)));
+}
+
 /// Copy subscription and impact hints for documents in `[lower, upper)` from
 /// `source` into `plan` (for a split destination or restore target). Hints
 /// are a pure function of document-scoped state, so copying the subset of

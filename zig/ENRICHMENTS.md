@@ -1145,6 +1145,14 @@ dependency state, and only a group's leader plans changes to it.
   the owner returns its plans and pending deliveries, and the data server
   proposes them, delivers, and acknowledges by content outside any owner
   call (plans that went stale meanwhile are no-ops and are re-planned).
+- Range merges bring the donor's context state for the merged documents
+  with their rows and artifacts: per-document dependency state, lineage
+  history and change shadows, their subscription, impact and debounce hints
+  and publish intents, every unapplied inbox notice and spec-wide pivot,
+  unjournaled rebuild intents, and generated-record crash markers. The donor
+  keeps and delivers its own outbox. If the donor's shadows were not complete
+  for the receiver's field set, the receiver drops its completion marker and
+  notifies spec-wide until backfill covers the merged rows.
 - Splits carry the replicated topology, the shadow-completion marker,
   generated-record crash intents, the delivered-notice inbox (each group
   applies a notice to the dependents in its own range), and publish
@@ -1222,12 +1230,6 @@ read, like a definer-rights view.
 - Impact traversal follows same-document chains; it does not walk into
   other tables' consumers of a dependent artifact (cross-table invalidation
   itself does propagate through `_artifacts` sources).
-- Range merges: splits carry context state, but a merge imports the donor's
-  documents without its dependency families (states, subscriptions,
-  shadows, inbox), so artifacts of merged-in documents stop being
-  invalidated until they are rebuilt. Merging ranges of tables with context
-  dependents needs a dependency import (or a rebuild of the merged-in
-  dependents) before it is safe.
 - TTL: expiry notifies when TTL cleanup deletes the row, not at the
   expiry instant; until then an artifact built from the expired row stays
   `current`.

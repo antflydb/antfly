@@ -1076,6 +1076,9 @@ pub const MergeCoordinator = struct {
                 .start = donor_range.start,
                 .end = donor_range.end,
             });
+            // Context dependency state (per-document freshness, lineage,
+            // shadows, hints, unapplied inbox) moves with the documents.
+            try self.receiver.db.importContextMergeState(lease.db, .{ .start = donor_range.start, .end = donor_range.end });
         } else {
             var donor_db_options = self.donor_db_options;
             donor_db_options.open_mode = .query_readonly;
@@ -1088,6 +1091,7 @@ pub const MergeCoordinator = struct {
                 .start = donor_range.start,
                 .end = donor_range.end,
             });
+            try self.receiver.db.importContextMergeState(&donor_db, .{ .start = donor_range.start, .end = donor_range.end });
         }
 
         // Publish the watermark only after both documents and artifacts are

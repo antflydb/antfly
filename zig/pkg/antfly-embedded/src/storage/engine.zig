@@ -475,6 +475,7 @@ pub const VTable = struct {
     updateRange: *const fn (self: *DB, byte_range: types.ByteRange) Outcome(void),
     setSplitDeltaFinalSeq: *const fn (self: *DB, seq: u64) Outcome(void),
     mergeArtifactsPage: *const fn (self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) Outcome([]types.BatchWrite),
+    importContextMergeState: *const fn (self: *DB, donor: *DB, byte_range: types.ByteRange) Outcome(void),
     alignOrderedArtifactCatalog: *const fn (self: *DB, command: @import("db/artifact_inventory.zig").Command, configs: []const types.IndexConfig, context: @import("db/artifact_reconcile_intent.zig").Context) Outcome(void),
     advanceOrderedArtifactInitialBuild: *const fn (self: *DB, configs: []const types.IndexConfig, context: @import("db/artifact_reconcile_intent.zig").Context) Outcome(void),
     reconcileArtifactDeleteIndex: *const fn (self: *DB, name: []const u8, context: @import("db/artifact_reconcile_intent.zig").Context) Outcome(bool),
