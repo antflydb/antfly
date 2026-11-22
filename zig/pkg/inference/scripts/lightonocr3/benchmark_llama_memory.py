@@ -84,9 +84,11 @@ def profiles():
     ]
 
 
-def read_json(url, body=None, timeout=120):
+def read_json(url, body=None, timeout=120, *, on_submit=None):
     data = None if body is None else json.dumps(body).encode()
     request = Request(url, data=data, headers={"Content-Type": "application/json"})
+    if on_submit is not None:
+        on_submit()
     with urlopen(request, timeout=timeout) as result:
         return json.load(result)
 
@@ -155,7 +157,7 @@ def wait_ready(proc, url, alias):
     raise RuntimeError("llama-server failed to become ready")
 
 
-def request_case(url, case, alias, prompt=""):
+def request_case(url, case, alias, prompt="", *, on_submit=None):
     content = [{"type": "image_url", "image_url": {"url": case["uri"]}}]
     if prompt:
         content.append({"type": "text", "text": prompt})
@@ -168,7 +170,7 @@ def request_case(url, case, alias, prompt=""):
     }
     start = time.perf_counter()
     try:
-        reply = read_json(url + "/v1/chat/completions", body)
+        reply = read_json(url + "/v1/chat/completions", body, on_submit=on_submit)
         choice = reply["choices"][0]
         text = choice["message"]["content"] or ""
         finish = choice["finish_reason"]
@@ -312,19 +314,33 @@ def record_phase_sample(peaks, current_phase, read_memory):
     phase = current_phase()
     values = read_memory()
     if values and phase == current_phase():
-        phase_peaks = peaks.setdefault(phase, {})
+        phase_peaks = peaks.setdefault(phase[0], {})
         for key, value in values.items():
             phase_peaks[key] = max(phase_peaks.get(key, 0), value)
+
+
+def missing_memory_phases(peaks, phases):
+    return [
+        phase
+        for phase in phases
+        if any(
+            peaks.get(phase, {}).get(metric, 0) <= 0
+            for metric in ("rss_bytes", "physical_footprint_bytes")
+        )
+    ]
 
 
 def memory_measurement_valid(peaks, phases, peak_rss, peak_footprint):
     return bool(
         peak_rss and peak_rss > 0 and peak_footprint and peak_footprint > 0
-    ) and all(
-        peaks.get(phase, {}).get(metric, 0) > 0
-        for phase in phases
-        for metric in ("rss_bytes", "physical_footprint_bytes")
-    )
+    ) and not missing_memory_phases(peaks, phases)
+
+
+def required_memory_phases(args, grounding_case):
+    phases = [] if args.grounding_only else ["serve"]
+    if grounding_case is not None:
+        phases.append("grounding")
+    return phases
 
 
 def run_profile(args, cases, grounding_case, size, profile, parallel):
@@ -345,6 +361,7 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
             "peak_rss_bytes": None,
             "peak_physical_footprint_bytes": None,
             "sampled_peak_bytes_by_phase": {},
+            "missing_memory_phases": required_memory_phases(args, grounding_case),
             "warm_idle": None,
             "seconds": None,
             "pages_per_second": None,
@@ -404,9 +421,17 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
     if profile.image_max_tokens is not None:
         command += ["--image-max-tokens", str(profile.image_max_tokens)]
     url = f"http://127.0.0.1:{port}"
-    phase = "load"
+    phase = ("load", 0)
+    phase_changed = threading.Condition()
     sampled_peaks = {}
-    finished = threading.Event()
+
+    def set_phase(name):
+        nonlocal phase
+        with phase_changed:
+            if phase[0] != name:
+                phase = (name, phase[1] + 1)
+                phase_changed.notify()
+
     rows = []
     idle = None
     elapsed = None
@@ -426,41 +451,54 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
                 pid = pid or child_pid(proc.pid)
                 return process_memory(pid) if pid else None
 
-            while not finished.is_set():
+            while True:
+                with phase_changed:
+                    observed = phase
+                    if observed[0] == "finished":
+                        return
                 record_phase_sample(sampled_peaks, lambda: phase, read_memory)
-                finished.wait(0.10)
+                # Wake on HTTP submission even if the periodic poll just ran.
+                interval = 0.01 if observed[0] in ("serve", "grounding") else 0.10
+                with phase_changed:
+                    phase_changed.wait_for(lambda: phase != observed, interval)
 
         sampler = threading.Thread(target=sample)
         sampler.start()
         try:
             wait_ready(proc, url, alias)
-            phase = "warmup"
+            set_phase("warmup")
             warmup = request_case(url, cases[0], alias)
             if warmup.get("finish") != "stop":
                 raise RuntimeError(f"Warm-up request failed: {warmup}")
-            phase = "idle"
+            set_phase("idle")
             pid = child_pid(proc.pid)
             idle = process_memory(pid) if pid else None
             if not args.grounding_only:
                 with ThreadPoolExecutor(max_workers=parallel) as pool:
-                    phase = "serve"
                     start = time.perf_counter()
                     rows = list(
                         pool.map(
-                            lambda case: request_case(url, case, alias),
+                            lambda case: request_case(
+                                url, case, alias, on_submit=lambda: set_phase("serve")
+                            ),
                             cases * args.rounds,
                         )
                     )
                     elapsed = time.perf_counter() - start
-                    phase = "idle"
+                    set_phase("idle")
             if grounding_case:
-                phase = "grounding"
-                grounding = request_case(url, grounding_case, alias, "grounding")
-                phase = "idle"
+                grounding = request_case(
+                    url,
+                    grounding_case,
+                    alias,
+                    "grounding",
+                    on_submit=lambda: set_phase("grounding"),
+                )
+                set_phase("idle")
         except (OSError, RuntimeError, ValueError, KeyError) as error:
             failure = str(error)
         finally:
-            finished.set()
+            set_phase("finished")
             sampler.join()
             pid = child_pid(proc.pid)
             if pid:
@@ -496,11 +534,7 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
     )
     peak_rss = memory_peak(output, "maximum resident set size")
     peak_footprint = memory_peak(output, "peak memory footprint")
-    phases = []
-    if not args.grounding_only:
-        phases.append("serve")
-    if grounding_case is not None:
-        phases.append("grounding")
+    phases = required_memory_phases(args, grounding_case)
     memory_valid = memory_measurement_valid(
         sampled_peaks, phases, peak_rss, peak_footprint
     )
@@ -515,6 +549,7 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
         "peak_rss_bytes": peak_rss,
         "peak_physical_footprint_bytes": peak_footprint,
         "sampled_peak_bytes_by_phase": sampled_peaks,
+        "missing_memory_phases": missing_memory_phases(sampled_peaks, phases),
         "warm_idle": idle,
         "seconds": elapsed,
         "completed_pages": len(ok),
@@ -613,6 +648,12 @@ def main():
                     run["requests"],
                     run["peak_physical_footprint_bytes"],
                     run["error"] or "",
+                    (
+                        "missing phase samples="
+                        + ",".join(run["missing_memory_phases"])
+                        if run["missing_memory_phases"]
+                        else ""
+                    ),
                     flush=True,
                 )
     if any(not run["qualified"] for run in report["runs"]):

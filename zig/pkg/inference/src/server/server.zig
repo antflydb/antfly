@@ -26963,9 +26963,6 @@ pub const Node = struct {
     fn generatedExtractionBounded(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config, quota: ?*httpx.QuotaAllocator) !GeneratedExtractionBody {
         const c = @import("antfly_structured");
         const extractor = c.extraction;
-        var arena = std.heap.ArenaAllocator.init(if (quota) |budget| budget.allocator() else allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
         const inputs = envelope.object.get("inputs") orelse return error.InvalidGeneratedExtractorConfig;
         if (inputs != .array or inputs.array.items.len == 0 or inputs.array.items.len > 128) return error.InvalidGeneratedExtractorConfig;
         if (registered != null) {
@@ -26973,7 +26970,8 @@ pub const Node = struct {
             if (self.config.request_limits.max_output_tokens_per_item) |limit|
                 if (registered.?.generator.max_tokens > limit) return error.InvalidMaxTokens;
         }
-        const texts = try a.alloc([]const u8, inputs.array.items.len);
+        var text_storage: [128][]const u8 = undefined;
+        const texts = text_storage[0..inputs.array.items.len];
         for (texts, inputs.array.items) |*text, input| {
             if (input != .object or input.object.count() > 2) return error.InvalidGeneratedExtractorConfig;
             for (input.object.keys()) |key| if (!std.mem.eql(u8, key, "content") and !std.mem.eql(u8, key, "id")) return error.InvalidGeneratedExtractorConfig;
@@ -26983,6 +26981,18 @@ pub const Node = struct {
             text.* = content.string;
         }
         if (envelope.object.get("schema_version")) |version| if (version != .integer or version.integer != 2) return error.InvalidGeneratedExtractorConfig;
+        const retained_units = if (quota) |budget| admissionUnitsFor(budget.limit, read_admission_bytes_per_unit) else 0;
+        if (quota != null) try self.reserveAdmissionUnits(retained_units);
+        var transferred_units: usize = 0;
+        // Register this before scratch owners so they free memory before
+        // another request can acquire the returned units.
+        defer if (quota != null) {
+            const remaining = self.inference_admission.capacityUnits(retained_units) - transferred_units;
+            if (remaining != 0) self.releaseSlotUnits(remaining);
+        };
+        var arena = std.heap.ArenaAllocator.init(if (quota) |budget| budget.allocator() else allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
         var parsed: ?std.json.Parsed(extractor.Config) = null;
         var generator: std.json.Value = .null;
         defer if (parsed) |*value| value.deinit();
@@ -27006,17 +27016,7 @@ pub const Node = struct {
             const caps = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities, false);
             break :blk try caps.select(config.output, config.probabilities);
         };
-        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs, .hosted_extractor = if (registered != null) config.generator else null, .hosted_http = if (hosted_http) |*client| client else null, .hosted_scratch_allocator = if (quota) |budget| budget.allocator() else null };
-        if (registered != null) {
-            const retained_units = admissionUnitsFor(quota.?.limit, read_admission_bytes_per_unit);
-            try self.reserveAdmissionUnits(retained_units);
-            backend.hosted_units = retained_units;
-        }
-        var transferred_units: usize = 0;
-        defer if (registered != null) {
-            const remaining = self.inference_admission.capacityUnits(backend.hosted_units) - transferred_units;
-            if (remaining != 0) self.releaseSlotUnits(remaining);
-        };
+        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs, .hosted_extractor = if (registered != null) config.generator else null, .hosted_units = retained_units, .hosted_http = if (hosted_http) |*client| client else null, .hosted_scratch_allocator = if (quota) |budget| budget.allocator() else null };
         var validation = extractor.Validation{ .config = config };
         const Combined = struct {
             backend: *StructuredGeneration,

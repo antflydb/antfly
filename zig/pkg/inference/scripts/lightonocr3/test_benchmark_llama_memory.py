@@ -24,7 +24,9 @@ from benchmark_llama_memory import (
     Profile,
     grounding_quality_passes,
     memory_measurement_valid,
+    missing_memory_phases,
     quality_passes,
+    read_json,
     record_phase_sample,
     run_profile,
     score_case,
@@ -86,7 +88,7 @@ class QualificationTest(unittest.TestCase):
 
     def test_setup_failure_records_a_result_row(self):
         profile = Profile("bf16")
-        args = SimpleNamespace(models_dir=Path("."))
+        args = SimpleNamespace(models_dir=Path("."), grounding_only=False)
         for failure in (FileNotFoundError("weights"), OSError("address in use")):
             with (
                 self.subTest(failure=failure),
@@ -96,22 +98,47 @@ class QualificationTest(unittest.TestCase):
             self.assertFalse(row["qualified"])
             self.assertEqual(row["error"], str(failure))
             self.assertEqual(row["results"], [])
+            self.assertEqual(row["missing_memory_phases"], ["serve"])
             self.assertEqual(row["parallel"], 4)
 
     def test_memory_sample_crossing_a_phase_transition_is_discarded(self):
         peaks = {}
-        phase = "warmup"
+        phase = ("idle", 1)
         metrics = {"rss_bytes": 100, "physical_footprint_bytes": 70}
 
         def read_across_transition():
             nonlocal phase
-            phase = "serve"
+            phase = ("idle", 3)
             return metrics
 
         record_phase_sample(peaks, lambda: phase, read_across_transition)
         self.assertEqual(peaks, {})
         record_phase_sample(peaks, lambda: phase, lambda: metrics)
-        self.assertEqual(peaks, {"serve": metrics})
+        self.assertEqual(peaks, {"idle": metrics})
+
+    def test_memory_phase_starts_at_http_submission(self):
+        calls = []
+
+        def open_request(request, **kwargs):
+            calls.append("open")
+            self.assertEqual(request.data, b'{"image": "encoded"}')
+            raise OSError("request failed")
+
+        with patch("benchmark_llama_memory.urlopen", side_effect=open_request):
+            with self.assertRaises(OSError):
+                read_json(
+                    "http://localhost",
+                    {"image": "encoded"},
+                    on_submit=lambda: calls.append("submit"),
+                )
+        self.assertEqual(calls, ["submit", "open"])
+
+    def test_reports_missing_active_phase_and_incomplete_counters(self):
+        peaks = {"serve": {"rss_bytes": 100}, "grounding": {}}
+        self.assertEqual(
+            missing_memory_phases(peaks, ["serve", "grounding"]),
+            ["serve", "grounding"],
+        )
 
     def test_memory_qualification_requires_lifetime_and_active_phase_counters(self):
         metrics = {"rss_bytes": 100, "physical_footprint_bytes": 70}
