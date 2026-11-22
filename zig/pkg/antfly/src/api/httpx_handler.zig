@@ -6825,7 +6825,8 @@ pub const AntflyApiHandler = struct {
             };
             if (!self.adapter.reports_existing_commit or self.adapter.context.sql_completion == null) return;
             const pending = if (self.result) |result| result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required else false;
-            if (!pending and self.failure != error.SqlTransactionOutcomeUnknown) return;
+            const uncertain = if (self.failure) |err| err == error.SqlTransactionOutcomeUnknown else false;
+            if (!pending and !uncertain) return;
             const encoded = self.adapter.outcome_transaction_id orelse {
                 self.observation_unavailable = true;
                 return;
