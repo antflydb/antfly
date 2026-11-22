@@ -152,6 +152,43 @@ uncertainty, live borrows, and an index with inline publications in flight
 that another process merged away). Other index kinds join as they move to
 level-0 records.
 
+## Sparse vector index (next)
+
+Today (`sparse/sparse.zig`) every incremental write, inline or replayed
+(`stageIncrementalMutations`), read-modify-writes the document's forward,
+reverse, incarnation and tombstone records, the last posting chunk and meta
+of every term it touches (every chunk of every old term on an overwrite),
+and all four `meta/*` counters, which `persistSparseCounters` writes as
+absolute values from process memory: the bug class full-text had. The
+inline publication (`InlineSparsePublication`) holds the apply mutex from
+prepare through the fsync and install, and excludes deletes and overwrites.
+
+What already fits: immutable posting segments with a doc map
+(`tryBulkAppend`), queries that union segments with chunk streams
+(`collectStreams`), and bounded segment compaction. What does not: postings
+are keyed by a `u32` doc number that an overwrite reuses, with liveness by a
+per-document incarnation counter, so a stale posting cannot be told from a
+current one without that read-modify-write.
+
+Plan, in order:
+
+1. Version every sparse copy (`DocVersion`), with the same `docmap`/`dead`
+   tip namespaces and `resolveVersionsAlloc`; replace incarnations by
+   versions for versioned indexes, migrating on open like full-text format 2.
+2. Inline writes and replay windows write one level-0 record (doc-number
+   sorted postings plus a version column, the segment encoding) and a
+   resolver; no posting chunk, term meta or counter is written per write.
+   Document counts are derived at merge; doc numbers come from the identity
+   ordinal or are reserved at the tip.
+3. Queries add level-0 streams; liveness is "version not dead".
+4. Compaction folds level-0 records into segments under a merge resolution
+   (inputs checked at the tip, dropped versions pruned), bounded per turn.
+5. `SparseIndex.refreshFromTip` reloads the mirror and dead set; a sparse
+   branch in `IndexManager.refreshIndexScopeFromTip`.
+
+Lake physical blocks and locators stay off the inline path until they are
+decided at the tip.
+
 ## Crash and consistency invariants
 
 - A write's index records share its native commit; an acknowledged write is

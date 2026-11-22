@@ -17296,14 +17296,14 @@ pub const IndexManager = struct {
         refreshed,
         /// No index here can refresh it in place: reopen the runtime.
         reopen,
-        /// No full-text index here owns it (another database's, or an
-        /// index kind that does not refresh in place).
+        /// No index here that refreshes in place owns it (another
+        /// database's, or a kind that does not refresh in place).
         not_loaded,
     };
 
     /// Refreshes the loaded index whose native-catalog scope is `scope`
-    /// from the file, under that index's apply guard. Only versioned
-    /// full-text indexes refresh in place so far.
+    /// from the file, under that index's apply guard. Versioned full-text
+    /// and sparse indexes refresh in place; other kinds reopen.
     pub fn refreshIndexScopeFromTip(self: *IndexManager, scope: []const u8) !ScopeRefresh {
         const name = name: {
             self.catalog_mutex.lockShared();
@@ -17314,6 +17314,13 @@ pub const IndexManager = struct {
                 if (!entry.persistent.versioned) return .reopen;
                 break :name try self.alloc.dupe(u8, entry.config.name);
             }
+            for (self.sparse_indexes.items) |*entry| {
+                const owned = entry.index.nativeCatalogScope() orelse continue;
+                if (!std.mem.eql(u8, owned, scope)) continue;
+                const name = try self.alloc.dupe(u8, entry.config.name);
+                defer self.alloc.free(name);
+                return self.refreshSparseIndexFromTipCatalogLocked(name);
+            }
             return .not_loaded;
         };
         defer self.alloc.free(name);
@@ -17321,6 +17328,18 @@ pub const IndexManager = struct {
         defer guard.unlock();
         const entry = self.textIndexEntry(name) orelse return .reopen;
         entry.persistent.refreshFromTip() catch |err| switch (err) {
+            error.UnsupportedRefresh => return .reopen,
+            else => return err,
+        };
+        return .refreshed;
+    }
+
+    /// Caller holds the catalog shared; this takes the index's own mutex.
+    fn refreshSparseIndexFromTipCatalogLocked(self: *IndexManager, name: []const u8) !ScopeRefresh {
+        const entry = self.sparseIndex(name) orelse return .reopen;
+        self.lockAtomicWithBackoff(entry.apply_mutex);
+        defer entry.apply_mutex.unlock();
+        entry.index.refreshFromTip() catch |err| switch (err) {
             error.UnsupportedRefresh => return .reopen,
             else => return err,
         };

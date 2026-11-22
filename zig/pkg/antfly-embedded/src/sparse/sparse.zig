@@ -2762,6 +2762,36 @@ pub const SparseIndex = struct {
         return result;
     }
 
+    /// Brings this process's view up to the index as committed, after
+    /// another process committed under its scope: reloads the
+    /// native-catalog mirror (every query and write reads through it) and
+    /// the counters. Caller holds the index's apply guard, which an inline
+    /// publication holds until it installs.
+    pub fn refreshFromTip(self: *SparseIndex) !void {
+        const backend = switch (self.owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        try backend.reloadMirror();
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        const Counter = struct {
+            fn read(read_txn: anytype, tag: u8, fallback: u64) !u64 {
+                const data = read_txn.get(metaKey(tag)) catch |err| switch (err) {
+                    error.NotFound => return fallback,
+                    else => return err,
+                };
+                return if (data.len >= 8) std.mem.readInt(u64, data[0..8], .little) else fallback;
+            }
+        };
+        // Counters another process advanced only move forward here, so an
+        // id this process handed out is never reused.
+        self.next_doc_num = @max(self.next_doc_num, try Counter.read(&txn, meta_next_doc_num, 0));
+        self.next_segment_id = @max(self.next_segment_id, try Counter.read(&txn, meta_next_segment_id, 1));
+        self.doc_count = try Counter.read(&txn, meta_doc_count, 0);
+        self.term_count = try Counter.read(&txn, meta_term_count, 0);
+    }
+
     pub fn close(self: *SparseIndex) void {
         self.store.deinit();
         self.owner.close(self.alloc);
@@ -10456,4 +10486,45 @@ test "external lake bounded WAL native sparse construction cancels inside bulk d
     };
     try std.testing.expectError(error.Canceled, index.batchWithOptions(&input, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true }));
     try std.testing.expect(probe.checks >= 3);
+}
+
+// Another process's writes and deletes reach this process's index through
+// `refreshFromTip`, without reopening it.
+test "sparse index refreshes another writer's commits from the tip" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "refresh-from-tip");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+    const options: SparseIndexOptions = .{ .backend = .native_catalog, .main_native_catalog_sink = test_sink.sink() };
+    var writer = try SparseIndex.open(alloc, path, options);
+    defer writer.close();
+    var reader = try SparseIndex.open(alloc, path, options);
+    defer reader.close();
+
+    const query: SparseVector = .{ .indices = &.{3}, .values = &.{1} };
+    try writer.batch(&.{.{ .doc_id = "doc-1", .vec = .{ .indices = &.{ 3, 7 }, .values = &.{ 1.5, 2.5 } } }}, &.{});
+    {
+        const hits = try reader.search(alloc, &query, 10);
+        defer SparseIndex.freeResults(alloc, hits);
+        try std.testing.expectEqual(@as(usize, 0), hits.len);
+    }
+    try reader.refreshFromTip();
+    {
+        const hits = try reader.search(alloc, &query, 10);
+        defer SparseIndex.freeResults(alloc, hits);
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("doc-1", hits[0].doc_id);
+    }
+    try std.testing.expectEqual(writer.doc_count, reader.doc_count);
+    try std.testing.expectEqual(writer.next_doc_num, reader.next_doc_num);
+
+    try writer.batch(&.{}, &.{"doc-1"});
+    try reader.refreshFromTip();
+    const hits = try reader.search(alloc, &query, 10);
+    defer SparseIndex.freeResults(alloc, hits);
+    try std.testing.expectEqual(@as(usize, 0), hits.len);
+    try std.testing.expectEqual(@as(u64, 0), reader.doc_count);
 }

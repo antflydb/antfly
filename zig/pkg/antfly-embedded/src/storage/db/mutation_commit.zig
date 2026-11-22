@@ -4397,13 +4397,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // lease. Once released, another process (or another instance on
             // this inode) can write, and this runtime's in-memory index state
             // would then be stale.
-            // An index write published inline has nothing left to commit:
-            // its install is memory-only, decided by versions, so another
-            // writer landing meanwhile cannot make it wrong. Keep the lease
-            // only when derived work still has to commit after the wait.
-            const derived_work_after_wait = effective_req.sync_level != .write and effective_req.sync_level != .propose and
-                !((effective_req.sync_level == .full_text or effective_req.sync_level == .full_index) and sync_targets.all_indexes.len == 0);
-            const commits_after_wait = derived_work_after_wait or opts.document_child_range_dispatcher != null;
+            // An inline publication's install still runs on this runtime
+            // after the wait; nothing pins the generation once the lease is
+            // released, so a same-process reopen could retire and close it
+            // under the install. Keep the lease until that is pinned.
+            const commits_after_wait = (effective_req.sync_level != .write and effective_req.sync_level != .propose) or opts.document_child_range_dispatcher != null;
             if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
