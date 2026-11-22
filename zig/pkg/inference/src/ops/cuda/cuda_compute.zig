@@ -47201,13 +47201,16 @@ const PreparedCudaProjection = struct {
                 .f32_direct => {
                     if (graphMatmulPortableNow(self.compute, g.rows, g.width, g.columns)) {
                         try launchGraphPortableMatmul(self.compute, output, input.buffer, weight.buffer, g.rows, g.width, g.columns);
-                    } else if (self.compute.debug_cuda_graph_capture_active) {
+                    } else if (p.workspace_bytes != 0) {
                         const workspace = try self.scratch(invocation);
                         if (workspace.ptr == 0) return error.MissingAssignedWorkspace;
                         const layout = try @import("libraries.zig").F32StridedBatchedLayout.packedRowMajor(1, g.rows, g.width, g.columns, false, false);
                         try self.compute.ctx.makeCurrent();
                         try self.compute.graph_blas.?.singleF32WithWorkspace(self.compute.ctx.stream, @ptrFromInt(output.ptr), @ptrFromInt(weight.buffer.ptr), @ptrFromInt(input.buffer.ptr), layout, @ptrFromInt(workspace.ptr), workspace.len);
-                    } else try launchGraphVendorMatmul(self.compute, output, input.buffer, weight.buffer, g.rows, g.width, g.columns);
+                    } else {
+                        if (self.compute.debug_cuda_graph_capture_active) return error.MissingAssignedWorkspace;
+                        try launchGraphVendorMatmul(self.compute, output, input.buffer, weight.buffer, g.rows, g.width, g.columns);
+                    }
                 },
                 .f32 => try self.compute.kernels.launchLinearF32(&self.compute.ctx, output, input.buffer, linear_weight, g.rows, g.width, g.columns),
                 .f32_tiled => try self.compute.kernels.launchLinearF32Tiled(&self.compute.ctx, output, input.buffer, linear_weight, g.rows, g.width, g.columns),
