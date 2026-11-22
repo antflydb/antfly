@@ -1321,6 +1321,9 @@ test "model aware media transport retains vector provenance and rejects incomple
 
 fn remoteChunkFailure(code: []const u8) anyerror {
     if (ChunkPage.Terminal.fromCode(code)) |terminal| return terminal.failure();
+    inline for (.{ error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded }) |err| {
+        if (std.mem.eql(u8, code, @errorName(err))) return err;
+    }
     if (std.mem.eql(u8, code, "StaleChunkContinuation") or std.mem.eql(u8, code, "SourceVersionChanged")) return error.StaleChunkContinuation;
     if (std.mem.eql(u8, code, "EmbeddingIdentityMismatch")) return error.EmbeddingIdentityMismatch;
     return error.ChunkRequestFailed;
@@ -1419,6 +1422,8 @@ test "model aware media pages preserve continuation coverage and partial output 
     for (std.meta.tags(ChunkPage.Terminal)) |terminal| {
         try std.testing.expectEqual(terminal.failure(), remoteChunkFailure(@errorName(terminal.failure())));
     }
+    try std.testing.expectEqual(error.RemoteReadBudgetExceeded, remoteChunkFailure("RemoteReadBudgetExceeded"));
+    try std.testing.expectEqual(error.RemoteRequestBudgetExceeded, remoteChunkFailure("RemoteRequestBudgetExceeded"));
     const terminal_body = try std.mem.replaceOwned(u8, a, model_page_fixture, "\"status\":\"complete\"", "\"status\":\"failed\",\"source_complete\":false,\"error\":{\"code\":\"ChunkCodedWindowBudgetExceeded\",\"message\":\"unreplayable next window\"}");
     defer a.free(terminal_body);
     var terminal_page = try parseModelChunkPage(a, terminal_body, cfg);

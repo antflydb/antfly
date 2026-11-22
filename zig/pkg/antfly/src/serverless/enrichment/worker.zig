@@ -1544,12 +1544,16 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
                 const page_end = @min(first +| config.max_chunks, cached_rows.len);
                 // Whole-window proofs avoid opening audio at all. Reserve room
                 // for every proof before adding individual reusable receipts.
+                var whole_ordinals: u64 = 0;
                 for (page_start..page_end) |ordinal| {
-                    if (!needsServerlessOutput(target.*, cached_rows[ordinal].outputs, current_identities))
+                    if (!needsServerlessOutput(target.*, cached_rows[ordinal].outputs, current_identities)) {
+                        whole_ordinals |= @as(u64, 1) << @as(u6, @intCast(ordinal - page_start));
                         try skips.append(scratch, .{ .ordinal = ordinal, .sub_index = media_outputs.Target.Window.all_sub_windows });
+                    }
                 }
                 for (page_start..page_end) |ordinal| {
                     if (skips.items.len == 4096) break;
+                    if ((whole_ordinals >> @as(u6, @intCast(ordinal - page_start))) & 1 != 0) continue;
                     for (cached_rows[ordinal].outputs) |value| {
                         if (skips.items.len < 4096 and std.mem.eql(u8, value.name, target.name) and std.mem.eql(u8, value.recipe_id, current_recipe) and value.reusable()) try skips.append(scratch, .{ .ordinal = ordinal, .sub_index = value.sub_index });
                     }
@@ -1563,7 +1567,10 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         var page = chunking.inference.chunkPageWithProvider(a, config, input.?, self.model_chunk_provider) catch |err| {
             // The failed page acknowledged no rows. Publish through the prior cursor.
             if (pages == 0 or position == null) return err;
-            page_terminal = @import("inference_chunker").types.ChunkPage.Terminal.fromError(err) orelse return err;
+            switch (err) {
+                error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded => pending_outputs = true,
+                else => page_terminal = @import("inference_chunker").types.ChunkPage.Terminal.fromError(err) orelse return err,
+            }
             break;
         };
         defer page.deinit(a);
@@ -3702,7 +3709,7 @@ test "model aware media serverless chunks use the shared paged provider and reta
         calls: usize = 0,
         first_calls: usize = 0,
         fail_second: bool = false,
-        terminal_second: bool = false,
+        second_error: ?anyerror = null,
         terminal_first: bool = false,
         fn page(ptr: *anyopaque, alloc: Allocator, _: []const u8, input: chunking.inference.RemoteInput, cfg: chunking.types.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!chunking.inference.ChunkPage {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -3717,7 +3724,7 @@ test "model aware media serverless chunks use the shared paged provider and reta
             }
             if (executing and ordinal == 0) self.first_calls += 1;
             if (executing and ordinal == 1 and self.fail_second) return error.ChunkRequestFailed;
-            if (executing and ordinal == 1 and self.terminal_second) return error.MalformedVideoPacket;
+            if (executing and ordinal == 1) if (self.second_error) |err| return err;
             const id = try std.fmt.allocPrint(alloc, "{s}:{d}", .{ "1111111111111111111111111111111111111111111111111111111111111111", ordinal });
             defer alloc.free(id);
             const chunks = try alloc.alloc(chunking.inference.RemoteChunk, 1);
@@ -3806,7 +3813,7 @@ test "model aware media serverless chunks use the shared paged provider and reta
     try std.testing.expectEqual(@as(usize, 1), fake.first_calls);
 
     worker.media_page_limit = 0;
-    fake.terminal_second = true;
+    fake.second_error = error.MalformedVideoPacket;
     const grouped = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"version_kind\":\"s3_version_id\",\"length\":100}}", 2, .require_model);
     defer a.free(grouped.body.?);
     var grouped_body = try std.json.parseFromSlice(std.json.Value, a, grouped.body.?, .{});
@@ -3815,6 +3822,17 @@ test "model aware media serverless chunks use the shared paged provider and reta
     try std.testing.expectEqual(@as(usize, 1), grouped_body.value.object.get("chunk_embeddings").?.array.items.len);
     try std.testing.expectEqualStrings("MalformedVideoPacket", group_state.get("chunk_embeddings_terminal_error").?.string);
     try std.testing.expectEqual(@as(i64, 1), group_state.get("chunk_embeddings_cursor").?.object.get("ordinal").?.integer);
+
+    fake.second_error = error.RemoteRequestBudgetExceeded;
+    const quota_limited = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"version_kind\":\"s3_version_id\",\"length\":100}}", 2, .require_model);
+    defer a.free(quota_limited.body.?);
+    var quota_body = try std.json.parseFromSlice(std.json.Value, a, quota_limited.body.?, .{});
+    defer quota_body.deinit();
+    const quota_state = quota_body.value.object.get("_enrichment").?.object;
+    try std.testing.expectEqual(@as(usize, 1), quota_body.value.object.get("chunk_embeddings").?.array.items.len);
+    try std.testing.expect(quota_state.get("chunk_embeddings_pending").?.bool);
+    try std.testing.expect(!quota_state.contains("chunk_embeddings_terminal_error"));
+    try std.testing.expectEqual(@as(i64, 1), quota_state.get("chunk_embeddings_cursor").?.object.get("ordinal").?.integer);
 }
 
 test "model aware media serverless enrichment stages preserve independent outputs and metadata" {
