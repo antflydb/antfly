@@ -27,6 +27,15 @@ pub const Codec = enum {
 /// itself is owned and must be freed via `deinit`.
 pub const BlockPadding = struct { first: usize, end: usize, ns: i64 };
 
+pub fn playbackGap(time_ns: u64, delay: usize, rate: u32, cursor: usize) usize {
+    const wanted = sampleCount(time_ns, rate) -| delay;
+    return if (wanted > cursor +| @max(1, rate / 1000)) wanted - cursor else 0;
+}
+
+pub fn sampleCount(ns: u64, rate: u32) usize {
+    return std.math.cast(usize, @as(u128, ns) * rate / std.time.ns_per_s) orelse std.math.maxInt(usize);
+}
+
 pub const DemuxedAudio = struct {
     codec: Codec,
     channels: u16,
