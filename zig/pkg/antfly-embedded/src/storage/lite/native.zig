@@ -6953,9 +6953,8 @@ pub const NativeFile = struct {
     file: std.Io.File,
     writer_lock_file: ?std.Io.File = null,
     sidecar_registration: ?SidecarRegistration = null,
-    lifetime_writer_region: ?shared_lock_region.Region = null,
+    lifetime_writer_region: ?*shared_lock_region.Region = null,
     lifetime_writer_claimed: bool = false,
-    lifetime_writer_mapping_attempted: bool = false,
     lifetime_writer_observed: ?shared_lock_region.Region.WriterAdmissionState = null,
     /// The embedded connection layer holds the path lease around complete calls.
     externally_locked: bool = false,
@@ -7646,7 +7645,7 @@ pub const NativeFile = struct {
                     if (!inode_lock.isRegionUnusable(err)) return err;
                     break :region_blk null;
                 };
-                result.reader_fence = try coordinator.registerFull(file, region, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
+                result.reader_fence = try coordinator.registerFull(file, region, result.dataIdentity() orelse return error.InvalidTransactionState, result.metadataReuseFrontier(), result.headerFingerprint());
             }
             errdefer if (result.reader_fence) |fence| opts.reader_coordinator.?.unregister(fence);
             const blocks_exclusive = if (result.reader_fence) |fence| fence.slot == null else true;
@@ -10160,7 +10159,7 @@ pub const NativeFile = struct {
     /// A lightweight serving-runtime probe. It can establish equality
     /// with a view already verified by this handle. New or ambiguous
     /// disk state goes through the ordinary recovery path.
-    pub fn unchangedProtectedRedoTip(self: *NativeFile, io: std.Io) !?std.Io.File.INode {
+    pub fn unchangedProtectedRedoTip(self: *NativeFile, io: std.Io) !?inode_lock.FileIdentity {
         const redo = self.redo orelse return null;
         if (!self.header.protected_redo or self.durable_header != null or
             self.checkpoint_publication_uncertain or self.redo_frontier_uncertain) return null;
@@ -10201,10 +10200,10 @@ pub const NativeFile = struct {
                 frontier = ((try slots.readSequence(self.file, io, sequence)) orelse return null).frontier;
             }
         }
-        if (slot.commit_sequence == sequence) return if (std.meta.eql(slot, current)) stat.inode else null;
+        if (slot.commit_sequence == sequence) return if (std.meta.eql(slot, current)) named else null;
         if (frontier.sequence != sequence or frontier.end_offset != redo.writer.tail or
             redo.writer.salt != frontier.generation) return null;
-        return stat.inode;
+        return named;
     }
 
     fn refreshFencedRedoFromDisk(self: *NativeFile, io: std.Io) !bool {
@@ -10594,19 +10593,15 @@ pub const NativeFile = struct {
         self.sidecar_registration = registration;
     }
 
-    fn claimLifetimeWriterRegion(self: *NativeFile, io: std.Io) void {
-        if (self.writer_lock_file == null or self.lifetime_writer_claimed or !self.header.protected_redo or self.no_sync) return;
+    fn claimLifetimeWriterRegion(self: *NativeFile, region: *shared_lock_region.Region) void {
+        if (self.writer_lock_file == null or !self.header.protected_redo or self.no_sync) return;
         const registration = self.sidecar_registration orelse return;
+        if (self.lifetime_writer_region != region) self.releaseLifetimeWriterRegion();
+        if (self.lifetime_writer_claimed) return;
 
-        // Keep the mapping after contention so publishing only samples
-        // atomics until admission changes. Never wait for a holder that
-        // may itself be waiting for this writer's flock.
-        if (self.lifetime_writer_region == null) {
-            if (self.lifetime_writer_mapping_attempted) return;
-            self.lifetime_writer_mapping_attempted = true;
-            self.lifetime_writer_region = shared_lock_region.Region.open(std.heap.page_allocator, io, self.path) catch return;
-        }
-        const region = &self.lifetime_writer_region.?;
+        // The inode entry owns the mapping. Admission uses only its
+        // atomics and never opens a second region on the commit path.
+        self.lifetime_writer_region = region;
         const state = region.writerAdmissionState();
         if (self.lifetime_writer_observed) |previous| {
             if (std.meta.eql(previous, state)) return;
@@ -10614,22 +10609,19 @@ pub const NativeFile = struct {
         self.lifetime_writer_observed = state;
         if (state.holder != 0 or state.head != state.tail) return;
         if (!region.tryAcquireWriterFair(antfly_platform.process.currentId() orelse 0)) {
-            // An intervening claim can disappear before we sample again.
             self.lifetime_writer_observed = null;
             return;
         }
         self.lifetime_writer_claimed = true;
-        noteOwnSidecarWriterClaim(io, registration, region.writerClaim());
+        noteOwnSidecarWriterClaim(self.runtimeIo(), registration, region.writerClaim());
     }
 
     fn releaseLifetimeWriterRegion(self: *NativeFile) void {
-        self.lifetime_writer_mapping_attempted = false;
-        const region = if (self.lifetime_writer_region) |*held| held else return;
+        const region = self.lifetime_writer_region orelse return;
         if (self.lifetime_writer_claimed) {
             noteOwnSidecarWriterClaim(self.runtimeIo(), self.sidecar_registration, null);
             region.releaseWriter();
         }
-        region.close();
         self.lifetime_writer_region = null;
         self.lifetime_writer_claimed = false;
         self.lifetime_writer_observed = null;
@@ -11852,8 +11844,7 @@ pub const NativeFile = struct {
         errdefer reader.close();
         reader.page_cache_policy = .metadata_only;
         reader.allocator_cancel_token = cancel;
-        if (!std.meta.eql(self.header, reader.header) or
-            (try self.file.stat(self.runtime())).inode != (try reader.file.stat(reader.runtime())).inode) return error.EnrichmentWaitCanceled;
+        if (!std.meta.eql(self.header, reader.header) or !self.sameDataFile(reader)) return error.EnrichmentWaitCanceled;
         self.allocator_verification_base = self.header;
         return reader;
     }
@@ -11899,7 +11890,7 @@ pub const NativeFile = struct {
         errdefer reader.close();
         reader.reader_pin_entry = entry;
         reader.reader_pin_sequence = guard_sequence;
-        const inode = (try reader.file.stat(reader.runtime())).inode;
+        const identity = reader.dataIdentity() orelse return error.EnrichmentWaitCanceled;
         // §9.7a: a redo-log file's *inactive* checkpoint slot is never
         // synchronized once `enableRedoLog` bootstraps it -- ordinary
         // diverted commits and `publishCheckpoint`'s own redo branch only
@@ -11957,7 +11948,7 @@ pub const NativeFile = struct {
             reader_slot.redo_folded_through = 0;
             break :blk std.meta.eql(self_slot, reader_slot);
         } else std.meta.eql(self.header, reader.header);
-        if ((self.durable_header == null and !headers_equivalent) or inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentWaitCanceled;
+        if ((self.durable_header == null and !headers_equivalent) or !std.meta.eql(self.dataIdentity(), @as(?inode_lock.FileIdentity, identity))) return error.EnrichmentWaitCanceled;
         reader.header = self.header;
         if (coordinated) {
             // Same self-conflict `acquireReaderFence` guards against:
@@ -11973,7 +11964,7 @@ pub const NativeFile = struct {
             // A full-graph snapshot reader always retains metadata, region
             // slot or not -- `registerFull` handles both uniformly now,
             // regardless of `indexed_reclamation`.
-            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, try self.regionForInode(), inode, reader.metadataReuseFrontier(), self.headerFingerprint());
+            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, try self.regionForInode(), identity, reader.metadataReuseFrontier(), self.headerFingerprint());
         }
         return reader;
     }
@@ -12395,7 +12386,7 @@ pub const NativeFile = struct {
     fn publishRedoLogState(self: *NativeFile) void {
         const redo = if (self.redo) |*r| r else return;
         const region = (self.regionForInode() catch null) orelse return;
-        self.claimLifetimeWriterRegion(self.runtimeIo());
+        self.claimLifetimeWriterRegion(region);
         if (self.inode_lock_ref.load(.acquire)) |entry| _ = entry.self_published_durable_sequence.fetchMax(redo.durable_sequence, .acq_rel);
         region.publishReadyLogStateForClaim(.{
             .checkpoint_sequence = redo.checkpoint_sequence,
@@ -12451,7 +12442,7 @@ pub const NativeFile = struct {
             self.reader_fence = null;
         }
         if (self.reader_coordinator) |coordinator| {
-            self.reader_fence = try coordinator.registerEpoch(self.file, try self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
+            self.reader_fence = try coordinator.registerEpoch(self.file, try self.regionForInode(), self.dataIdentity() orelse return error.InvalidTransactionState, sequence, owner.headerFingerprint(), false);
         }
         errdefer if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         // Only a fence that actually got a live region slot (`Fence
@@ -12486,7 +12477,7 @@ pub const NativeFile = struct {
     /// the file exclusively, such as a read inside an open write.
     pub fn acquireReaderRegionFence(self: *NativeFile, sequence: u64, owner: *NativeFile) !void {
         const coordinator = self.reader_coordinator orelse return;
-        const fence = try coordinator.registerEpoch(self.file, try self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
+        const fence = try coordinator.registerEpoch(self.file, try self.regionForInode(), self.dataIdentity() orelse return error.InvalidTransactionState, sequence, owner.headerFingerprint(), false);
         if (self.reader_fence) |stale| coordinator.unregister(stale);
         self.reader_fence = fence;
     }
@@ -12519,8 +12510,8 @@ pub const NativeFile = struct {
             // resolves to, and `self.file`'s own inode never changes for
             // this NativeFile's lifetime, so comparing the two still
             // catches the same case the old open-and-compare did.
-            const current = std.Io.Dir.cwd().statFile(self.runtime(), self.path, .{}) catch return error.EnrichmentSourceChanged;
-            if (current.inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentSourceChanged;
+            const current = storage_file_identity.nativePathIdentity(self.path) catch return error.EnrichmentSourceChanged;
+            if (!std.meta.eql(self.dataIdentity(), @as(?inode_lock.FileIdentity, current))) return error.EnrichmentSourceChanged;
         }
         // `caller` (not a fixed literal) so the permanent debug-outstanding
         // dump in inode_lock.zig names the actual call site -- beginReaderWindow
@@ -12545,8 +12536,8 @@ pub const NativeFile = struct {
             self.reader_window_depth += 1;
             return true;
         }
-        const inode = (try self.file.stat(self.runtime())).inode;
-        const frontier = coordinator.beginWithMetadata(inode, self.headerFingerprint(), self.free_pages_verified, try self.regionForInode());
+        const identity = self.dataIdentity() orelse return error.InvalidTransactionState;
+        const frontier = coordinator.beginWithMetadata(identity, self.headerFingerprint(), self.free_pages_verified, try self.regionForInode());
         errdefer coordinator.end();
         self.reader_window_previous_frontier = self.minimum_reader_sequence;
         if (frontier.data) |sequence| self.minimum_reader_sequence = @min(self.minimum_reader_sequence orelse sequence, sequence);
@@ -22829,9 +22820,12 @@ pub const NativeFile = struct {
         // Capture fallible notification inputs before any checkpoint I/O.
         // Cancellation during publication must propagate without a second,
         // cancelable stat turning unwind into a process abort.
-        const publication_inode: ?u64 = if (self.reader_coordinator != null) (try self.file.stat(self.runtime())).inode else null;
+        const publication_identity = if (self.reader_coordinator != null)
+            self.dataIdentity() orelse return error.InvalidTransactionState
+        else
+            null;
         const previous_tip = self.headerFingerprint();
-        defer if (self.reader_coordinator) |coordinator| coordinator.published(publication_inode.?, previous_tip, self.headerFingerprint(), self.checkpoint_publication_uncertain);
+        defer if (self.reader_coordinator) |coordinator| coordinator.published(publication_identity.?, previous_tip, self.headerFingerprint(), self.checkpoint_publication_uncertain);
         defer self.notifyPublication();
         // perf/lwa-rollback-clobber (#1216): capture what this swap is
         // about to discard so a failure anywhere below (a redo append/
@@ -23557,6 +23551,7 @@ pub const NativeFile = struct {
         try prepared.preparePrivatePublication(self.path);
         try renameFilePath(io, prepared.path, self.path);
         self.releaseLifetimeWriterRegion();
+        prepared.releaseLifetimeWriterRegion();
 
         std.mem.swap(std.Io.File, &self.file, &prepared.file);
         // `self.file` now holds the fd `prepared` had open on its own
@@ -41175,16 +41170,18 @@ test "lite redo lifetime writer keeps its mapping while a fair claimant holds th
     defer if (waiter_claimed) waiter.releaseWriter();
     try std.testing.expect(waiter_claimed);
 
-    writer.claimLifetimeWriterRegion(io);
+    const mapped = (try writer.regionForInode()).?;
+    writer.claimLifetimeWriterRegion(mapped);
+    try std.testing.expect(writer.lifetime_writer_region.? == mapped);
     const mapping = writer.lifetime_writer_region.?.mapping.ptr;
     try std.testing.expect(!writer.lifetime_writer_claimed);
-    writer.claimLifetimeWriterRegion(io);
+    writer.claimLifetimeWriterRegion(mapped);
     try std.testing.expectEqual(mapping, writer.lifetime_writer_region.?.mapping.ptr);
     try std.testing.expect(!writer.lifetime_writer_claimed);
 
     waiter.releaseWriter();
     waiter_claimed = false;
-    writer.claimLifetimeWriterRegion(io);
+    writer.claimLifetimeWriterRegion(mapped);
     try std.testing.expectEqual(mapping, writer.lifetime_writer_region.?.mapping.ptr);
     try std.testing.expect(writer.lifetime_writer_claimed);
 }

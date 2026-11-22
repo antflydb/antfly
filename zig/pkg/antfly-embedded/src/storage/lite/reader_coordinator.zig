@@ -52,7 +52,7 @@ pub const Coordinator = struct {
     windows: usize = 0,
     registration_batches: usize = 0,
 
-    known: ?struct { inode: u64, tip: [32]u8 } = null,
+    known: ?struct { identity: inode_lock.FileIdentity, tip: [32]u8 } = null,
 
     /// A stable compatibility shim: external callers (`capi/lite_connection
     /// .zig`'s `withReadRegistrationBatch`, and the `PathWriterLock
@@ -97,7 +97,7 @@ pub const Coordinator = struct {
 
     pub const Fence = struct {
         file: std.Io.File,
-        inode: u64,
+        identity: inode_lock.FileIdentity,
         sequence: u64,
         captured_at_ns: i96 = 0,
         /// Full graph scans (snapshots, allocator verification) also
@@ -145,14 +145,14 @@ pub const Coordinator = struct {
     }
     /// The descriptor already holds its kernel shared lock. Registration may
     /// wait for a writer, which then treats this unregistered lock as external.
-    pub fn register(self: *Coordinator, file: std.Io.File, region: ?*shared_lock_region.Region, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerEpoch(file, region, inode, sequence, tip, false);
+    pub fn register(self: *Coordinator, file: std.Io.File, region: ?*shared_lock_region.Region, identity: inode_lock.FileIdentity, sequence: u64, tip: [32]u8) !*Fence {
+        return self.registerEpoch(file, region, identity, sequence, tip, false);
     }
-    pub fn registerFull(self: *Coordinator, file: std.Io.File, region: ?*shared_lock_region.Region, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerEpoch(file, region, inode, sequence, tip, true);
+    pub fn registerFull(self: *Coordinator, file: std.Io.File, region: ?*shared_lock_region.Region, identity: inode_lock.FileIdentity, sequence: u64, tip: [32]u8) !*Fence {
+        return self.registerEpoch(file, region, identity, sequence, tip, true);
     }
-    pub fn registerInodeOnly(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerEpoch(file, null, inode, sequence, tip, false);
+    pub fn registerInodeOnly(self: *Coordinator, file: std.Io.File, identity: inode_lock.FileIdentity, sequence: u64, tip: [32]u8) !*Fence {
+        return self.registerEpoch(file, null, identity, sequence, tip, false);
     }
     /// Claims a region reader slot and pins it at `sequence` (and, if
     /// `metadata`, pins the slot's metadata companion too), or registers an
@@ -161,7 +161,7 @@ pub const Coordinator = struct {
     /// `region`: typically the current region for this inode, or `null`
     /// when it is unusable for this open (`inode_lock.isRegionUnusable`) or
     /// simply doesn't apply (no registry entry at all).
-    pub fn registerEpoch(self: *Coordinator, file: std.Io.File, region: ?*shared_lock_region.Region, inode: u64, sequence: u64, tip: [32]u8, metadata: bool) !*Fence {
+    pub fn registerEpoch(self: *Coordinator, file: std.Io.File, region: ?*shared_lock_region.Region, identity: inode_lock.FileIdentity, sequence: u64, tip: [32]u8, metadata: bool) !*Fence {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var slot: ?u32 = null;
@@ -195,7 +195,7 @@ pub const Coordinator = struct {
             // release the very slot just found sharable here before this
             // call gets to alias it.
             for (self.readers.items) |existing| {
-                if (existing.region == r and existing.inode == inode and existing.slot != null and
+                if (existing.region == r and std.meta.eql(existing.identity, identity) and existing.slot != null and
                     existing.sequence == sequence and !existing.poisoned)
                 {
                     slot = existing.slot;
@@ -223,11 +223,11 @@ pub const Coordinator = struct {
         // The shared lock may have blocked physical reuse before registration,
         // while an external writer promoted retirement. A delayed old reader
         // must never become eligible merely by arriving after that detection.
-        const stale = slot == null and if (self.known) |known| known.inode != inode or !std.mem.eql(u8, &known.tip, &tip) else false;
-        fence.* = .{ .file = file, .inode = inode, .sequence = sequence, .captured_at_ns = std.Io.Clock.awake.now(self.io).nanoseconds, .metadata = metadata, .poisoned = stale, .inode_only = slot == null, .region = if (slot != null) region else null, .slot = slot };
+        const stale = slot == null and if (self.known) |known| !std.meta.eql(known.identity, identity) or !std.mem.eql(u8, &known.tip, &tip) else false;
+        fence.* = .{ .file = file, .identity = identity, .sequence = sequence, .captured_at_ns = std.Io.Clock.awake.now(self.io).nanoseconds, .metadata = metadata, .poisoned = stale, .inode_only = slot == null, .region = if (slot != null) region else null, .slot = slot };
         try self.readers.append(self.allocator, fence);
         _ = self.references.fetchAdd(1, .monotonic);
-        if (self.known == null) self.known = .{ .inode = inode, .tip = tip };
+        if (self.known == null) self.known = .{ .identity = identity, .tip = tip };
         return fence;
     }
     pub fn unregister(self: *Coordinator, fence: *Fence) void {
@@ -271,8 +271,8 @@ pub const Coordinator = struct {
     /// The path-writer lease must enclose this entire window, including
     /// restoration after exclusive reuse. Do not retain mutex across caller
     /// allocations: reclaiming an idle artifact may unregister its descriptor.
-    pub fn begin(self: *Coordinator, inode: u64, tip: [32]u8, reuse: bool, region: ?*shared_lock_region.Region) ?u64 {
-        return self.beginWithMetadata(inode, tip, reuse, region).data;
+    pub fn begin(self: *Coordinator, identity: inode_lock.FileIdentity, tip: [32]u8, reuse: bool, region: ?*shared_lock_region.Region) ?u64 {
+        return self.beginWithMetadata(identity, tip, reuse, region).data;
     }
     pub const Frontier = struct { data: ?u64 = null, metadata: ?u64 = null };
     pub const ReaderStats = struct {
@@ -285,7 +285,7 @@ pub const Coordinator = struct {
     /// `region` is optional purely so a caller with no live region handy
     /// (e.g. a status probe that hasn't opened one) still gets the
     /// in-process (inode-only) contribution rather than erroring.
-    pub fn readerStats(self: *Coordinator, inode: u64, region: ?*shared_lock_region.Region) ReaderStats {
+    pub fn readerStats(self: *Coordinator, identity: inode_lock.FileIdentity, region: ?*shared_lock_region.Region) ReaderStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var result: ReaderStats = .{};
@@ -294,7 +294,7 @@ pub const Coordinator = struct {
             result.frontier.data = r.minimumPinnedSequence();
             result.frontier.metadata = r.minimumMetadataPinnedSequence();
         }
-        for (self.readers.items) |fence| if (fence.inode == inode) {
+        for (self.readers.items) |fence| if (std.meta.eql(fence.identity, identity)) {
             result.count += 1;
             result.poisoned += @intFromBool(fence.poisoned);
             // A region-backed fence's contribution is already counted by
@@ -310,31 +310,31 @@ pub const Coordinator = struct {
         return result;
     }
 
-    /// `region` is the current region for `inode` (or `null` if
+    /// `region` is the current region for `identity` (or `null` if
     /// unavailable); passed in rather than stored on the `Coordinator`
     /// because one coordinator's lifetime can outlive a vacuum generation
     /// swap, which can hand a later call a different region than an
     /// earlier one saw for what is, by inode, a different file underneath
     /// the same logical database.
-    pub fn beginWithMetadata(self: *Coordinator, inode: u64, tip: [32]u8, reuse: bool, region: ?*shared_lock_region.Region) Frontier {
+    pub fn beginWithMetadata(self: *Coordinator, identity: inode_lock.FileIdentity, tip: [32]u8, reuse: bool, region: ?*shared_lock_region.Region) Frontier {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.windows += 1;
         if (self.known) |known| {
-            if (known.inode != inode or !std.mem.eql(u8, &known.tip, &tip)) {
-                for (self.readers.items) |fence| if (fence.inode == inode and !fence.hasEpoch()) {
+            if (!std.meta.eql(known.identity, identity) or !std.mem.eql(u8, &known.tip, &tip)) {
+                for (self.readers.items) |fence| if (std.meta.eql(fence.identity, identity) and !fence.hasEpoch()) {
                     fence.poisoned = true;
                 };
             }
         }
-        self.known = .{ .inode = inode, .tip = tip };
+        self.known = .{ .identity = identity, .tip = tip };
         var frontier: Frontier = .{};
         if (region) |r| {
             frontier.data = r.minimumPinnedSequence();
             frontier.metadata = r.minimumMetadataPinnedSequence();
         }
         var can_suspend = reuse;
-        for (self.readers.items) |fence| if (fence.inode == inode and !fence.hasEpoch()) {
+        for (self.readers.items) |fence| if (std.meta.eql(fence.identity, identity) and !fence.hasEpoch()) {
             // Only an inode-only fence needs an in-process contribution
             // here -- a region-backed one was already counted above, by
             // any process, not just this one.
@@ -342,7 +342,7 @@ pub const Coordinator = struct {
             if (fence.metadata) frontier.metadata = @min(frontier.metadata orelse fence.retentionSequence(), fence.retentionSequence());
             can_suspend = can_suspend and !fence.poisoned;
         };
-        if (can_suspend and self.windows == 1) for (self.readers.items) |fence| if (fence.inode == inode and !fence.hasEpoch()) {
+        if (can_suspend and self.windows == 1) for (self.readers.items) |fence| if (std.meta.eql(fence.identity, identity) and !fence.hasEpoch()) {
             fence.file.unlock(self.io);
             fence.suspended = true;
         };
@@ -379,18 +379,18 @@ pub const Coordinator = struct {
     /// Fence readers captured before an unrecognized publication, then admit
     /// newly captured readers against this authoritative tip. Waiting until a
     /// writer window begins would poison those fresh readers too.
-    pub fn observeCurrent(self: *Coordinator, inode: u64, tip: [32]u8) void {
-        self.published(inode, tip, tip, false);
+    pub fn observeCurrent(self: *Coordinator, identity: inode_lock.FileIdentity, tip: [32]u8) void {
+        self.published(identity, tip, tip, false);
     }
 
-    pub fn published(self: *Coordinator, inode: u64, previous_tip: [32]u8, tip: [32]u8, uncertain: bool) void {
+    pub fn published(self: *Coordinator, identity: inode_lock.FileIdentity, previous_tip: [32]u8, tip: [32]u8, uncertain: bool) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const changed = if (self.known) |known| known.inode != inode or !std.mem.eql(u8, &known.tip, &previous_tip) else false;
-        if (uncertain or changed) for (self.readers.items) |fence| if (fence.inode == inode and !fence.hasEpoch()) {
+        const changed = if (self.known) |known| !std.meta.eql(known.identity, identity) or !std.mem.eql(u8, &known.tip, &previous_tip) else false;
+        if (uncertain or changed) for (self.readers.items) |fence| if (std.meta.eql(fence.identity, identity) and !fence.hasEpoch()) {
             fence.poisoned = true;
         };
-        self.known = .{ .inode = inode, .tip = tip };
+        self.known = .{ .identity = identity, .tip = tip };
     }
 };
 
@@ -398,7 +398,7 @@ const RegistrationFixture = struct {
     tmp: std.testing.TmpDir,
     path: []u8,
     data: std.Io.File,
-    inode: u64,
+    identity: inode_lock.FileIdentity,
     region: shared_lock_region.Region,
     coordinator: Coordinator,
     const Reader = struct {
@@ -421,7 +421,7 @@ const RegistrationFixture = struct {
         const data = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true });
         errdefer data.close(std.testing.io);
         const region = try shared_lock_region.Region.open(std.testing.allocator, std.testing.io, path);
-        return .{ .tmp = tmp, .path = path, .data = data, .inode = (try data.stat(std.testing.io)).inode, .region = region, .coordinator = Coordinator.init(std.testing.allocator, std.testing.io) };
+        return .{ .tmp = tmp, .path = path, .data = data, .identity = try @import("../lsm_backend/storage_io.zig").nativeFileIdentity(data.handle), .region = region, .coordinator = Coordinator.init(std.testing.allocator, std.testing.io) };
     }
     fn deinit(self: *RegistrationFixture) void {
         self.coordinator.deinit();
@@ -434,7 +434,7 @@ const RegistrationFixture = struct {
         const file = try std.Io.Dir.cwd().openFile(std.testing.io, self.path, .{});
         errdefer file.close(std.testing.io);
         try file.lock(std.testing.io, .shared);
-        const fence = self.coordinator.registerEpoch(file, &self.region, self.inode, sequence, @splat(0), metadata) catch |err| {
+        const fence = self.coordinator.registerEpoch(file, &self.region, self.identity, sequence, @splat(0), metadata) catch |err| {
             file.unlock(std.testing.io);
             return err;
         };
@@ -444,7 +444,7 @@ const RegistrationFixture = struct {
         const file = try std.Io.Dir.cwd().openFile(std.testing.io, self.path, .{});
         errdefer file.close(std.testing.io);
         try file.lock(std.testing.io, .shared);
-        const fence = self.coordinator.registerInodeOnly(file, self.inode, sequence, @splat(0)) catch |err| {
+        const fence = self.coordinator.registerInodeOnly(file, self.identity, sequence, @splat(0)) catch |err| {
             file.unlock(std.testing.io);
             return err;
         };
@@ -465,7 +465,7 @@ test "lite reader registration claims a region slot per reader and the frontier 
     try std.testing.expect(second.fence.?.slot != null);
     try std.testing.expect(first.fence.?.slot != second.fence.?.slot);
     try std.testing.expectEqual(@as(?u64, 10), fixture.region.minimumPinnedSequence());
-    try std.testing.expectEqual(@as(?u64, 10), fixture.coordinator.readerStats(fixture.inode, &fixture.region).frontier.data);
+    try std.testing.expectEqual(@as(?u64, 10), fixture.coordinator.readerStats(fixture.identity, &fixture.region).frontier.data);
 
     first.close();
     try std.testing.expectEqual(@as(?u64, 30), fixture.region.minimumPinnedSequence());
@@ -483,7 +483,7 @@ test "lite reader registration metadata pin is independent of the data frontier"
     defer full.close();
     try std.testing.expectEqual(@as(?u64, 10), fixture.region.minimumPinnedSequence());
     try std.testing.expectEqual(@as(?u64, 10), fixture.region.minimumMetadataPinnedSequence());
-    try std.testing.expectEqual(@as(?u64, 10), fixture.coordinator.readerStats(fixture.inode, &fixture.region).frontier.metadata);
+    try std.testing.expectEqual(@as(?u64, 10), fixture.coordinator.readerStats(fixture.identity, &fixture.region).frontier.metadata);
 
     full.close();
     try std.testing.expectEqual(@as(?u64, 20), fixture.region.minimumPinnedSequence());
@@ -497,7 +497,7 @@ test "lite reader window restores inode-only fences past the writer's parked exc
     defer fallback.close();
     const entry = try inode_lock.open(std.testing.io, fixture.path);
     defer inode_lock.unref(entry, std.testing.io);
-    _ = fixture.coordinator.beginWithMetadata(fixture.inode, @splat(0), true, null);
+    _ = fixture.coordinator.beginWithMetadata(fixture.identity, @splat(0), true, null);
     try std.testing.expect(fallback.fence.?.suspended);
     // The writer's reuse grant; its release leaves the kernel lock parked.
     const held = try inode_lock.acquire(entry, std.testing.io, .exclusive, false, false, "test");
@@ -519,7 +519,7 @@ test "lite reader registration falls back to inode-only fencing when no region i
     // alone, exactly as `writer_queue.zig`'s pre-region posture.
     try std.testing.expectEqual(@as(?u64, null), fixture.region.minimumPinnedSequence());
     try std.testing.expect(!try fixture.data.tryLock(std.testing.io, .exclusive));
-    try std.testing.expectEqual(@as(?u64, 20), fixture.coordinator.readerStats(fixture.inode, &fixture.region).frontier.data);
+    try std.testing.expectEqual(@as(?u64, 20), fixture.coordinator.readerStats(fixture.identity, &fixture.region).frontier.data);
 }
 
 // perf/lwa-reader-fence-share: `docstore.zig`'s `Store.pinInitializedReadGeneration`
@@ -543,7 +543,7 @@ test "lite reader registration shares one region slot across same-process fences
     defer std.testing.allocator.free(path);
     const data = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true });
     defer data.close(std.testing.io);
-    const inode = (try data.stat(std.testing.io)).inode;
+    const identity = try @import("../lsm_backend/storage_io.zig").nativeFileIdentity(data.handle);
     var region = try shared_lock_region.Region.openSized(std.testing.allocator, std.testing.io, path, 1);
     defer region.close();
     var coordinator = Coordinator.init(std.testing.allocator, std.testing.io);
@@ -551,14 +551,14 @@ test "lite reader registration shares one region slot across same-process fences
 
     const file_a = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
     try file_a.lock(std.testing.io, .shared);
-    const fence_a = try coordinator.registerEpoch(file_a, &region, inode, 10, @splat(0), false);
+    const fence_a = try coordinator.registerEpoch(file_a, &region, identity, 10, @splat(0), false);
     try std.testing.expect(fence_a.slot != null);
 
     // Same inode, same region, the identical sequence -- shares `fence_a`'s
     // slot rather than needing the table's only other one.
     const file_b = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
     try file_b.lock(std.testing.io, .shared);
-    const fence_b = try coordinator.registerEpoch(file_b, &region, inode, 10, @splat(0), true);
+    const fence_b = try coordinator.registerEpoch(file_b, &region, identity, 10, @splat(0), true);
     try std.testing.expectEqual(fence_a.slot, fence_b.slot);
     try std.testing.expectEqual(@as(?u64, 10), region.minimumMetadataPinnedSequence());
 
@@ -567,7 +567,7 @@ test "lite reader registration shares one region slot across same-process fences
     // silently grow its capacity.
     const file_c = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
     try file_c.lock(std.testing.io, .shared);
-    const fence_c = try coordinator.registerEpoch(file_c, &region, inode, 30, @splat(0), false);
+    const fence_c = try coordinator.registerEpoch(file_c, &region, identity, 30, @splat(0), false);
     try std.testing.expect(fence_c.slot == null);
     try std.testing.expect(fence_c.inode_only);
 
@@ -587,6 +587,24 @@ test "lite reader registration shares one region slot across same-process fences
     file_c.close(std.testing.io);
 }
 
+test "lite reader frontier excludes an equal inode on another device" {
+    var fixture = try RegistrationFixture.init();
+    defer fixture.deinit();
+    var reader = try fixture.readerWithoutRegion(10);
+    defer reader.close();
+    const replacement: inode_lock.FileIdentity = .{
+        .device = fixture.identity.device ^ 1,
+        .inode = fixture.identity.inode,
+    };
+
+    const frontier = fixture.coordinator.beginWithMetadata(replacement, @splat(0), true, null);
+    defer fixture.coordinator.end();
+    try std.testing.expect(frontier.data == null);
+    try std.testing.expectEqual(@as(u64, 0), fixture.coordinator.readerStats(replacement, null).count);
+    try std.testing.expectEqual(@as(?u64, 10), fixture.coordinator.readerStats(fixture.identity, null).frontier.data);
+    try std.testing.expect(!reader.fence.?.suspended);
+}
+
 test "lite reader registration begin/end windows combine region and inode-only frontiers and poison stale inode-only fences" {
     var fixture = try RegistrationFixture.init();
     defer fixture.deinit();
@@ -595,7 +613,7 @@ test "lite reader registration begin/end windows combine region and inode-only f
     var inode_only = try fixture.readerWithoutRegion(25);
     defer inode_only.close();
 
-    const frontier = fixture.coordinator.beginWithMetadata(fixture.inode, @splat(0), false, &fixture.region);
+    const frontier = fixture.coordinator.beginWithMetadata(fixture.identity, @splat(0), false, &fixture.region);
     defer fixture.coordinator.end();
     try std.testing.expectEqual(@as(?u64, 15), frontier.data);
     try std.testing.expect(!inode_only.fence.?.poisoned);
@@ -604,7 +622,7 @@ test "lite reader registration begin/end windows combine region and inode-only f
     // inode (region-backed ones are unaffected -- their protection
     // doesn't depend on the coordinator's own notion of "known tip" at
     // all).
-    fixture.coordinator.published(fixture.inode, @splat(0), @splat(0), true);
+    fixture.coordinator.published(fixture.identity, @splat(0), @splat(0), true);
     try std.testing.expect(inode_only.fence.?.poisoned);
     try std.testing.expect(!region_backed.fence.?.poisoned);
 }

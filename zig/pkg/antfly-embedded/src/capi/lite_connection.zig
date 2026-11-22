@@ -2546,8 +2546,8 @@ pub const Owner = struct {
             if (fast_only and !can_reuse) return null;
             if (can_reuse and current.lane_pins.load(.acquire) == 0) {
                 if (file.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
-                if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |inode| {
-                    self.reader_coordinator.observeCurrent(inode, file.headerFingerprint());
+                if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |identity| {
+                    self.reader_coordinator.observeCurrent(identity, file.headerFingerprint());
                     if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                         try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                     return current;
@@ -2560,14 +2560,14 @@ pub const Owner = struct {
             });
             defer recovered_probe.close();
             const probe = &recovered_probe;
-            const probe_inode = (try probe.file.stat(probe.runtime())).inode;
+            const probe_identity = probe.dataIdentity() orelse return error.InvalidTransactionState;
             if (self.redo_recovery_cursor) |saved| {
-                if (!std.meta.eql(probe.dataIdentity(), @as(@TypeOf(probe.dataIdentity()), saved.identity))) self.redo_recovery_cursor = null;
+                if (!std.meta.eql(probe_identity, saved.identity)) self.redo_recovery_cursor = null;
             }
             if (probe.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
             // Establish the fenced tip before opening any new read pins.
             // Existing readers of an unknown peer publication remain poisoned.
-            self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
+            self.reader_coordinator.observeCurrent(probe_identity, probe.headerFingerprint());
             const same_inode = probe.sameDataFile(file);
             // Under the redo log, an ordinary commit advances the logical
             // commit sequence (`NativeFile.committedSequence()`, whose own

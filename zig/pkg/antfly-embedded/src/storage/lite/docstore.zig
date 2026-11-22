@@ -4280,7 +4280,7 @@ pub const Store = struct {
         try std.testing.expect(!store.file.header.indexed_reclamation);
         try store.file.putDocument("alpha", "one");
 
-        const inode = (try store.file.file.stat(std.testing.io)).inode;
+        const identity = store.file.dataIdentity().?;
         const region = (try store.file.regionForInode()).?;
         try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
 
@@ -4292,7 +4292,7 @@ pub const Store = struct {
         // two live fences on the one inode -- the open-time one
         // (never released) and the window one `acquireReaderFence`
         // installed over it.
-        try std.testing.expectEqual(@as(u64, 1), coordinator.readerStats(inode, region).count);
+        try std.testing.expectEqual(@as(u64, 1), coordinator.readerStats(identity, region).count);
         read.abort();
         aborted = true;
         // The bug: before the fix, the leaked open-time fence kept this
@@ -5007,7 +5007,7 @@ pub const Store = struct {
         }
         status.allocator_work = self.file.allocator_work;
         if (self.file.reader_coordinator) |coordinator| {
-            const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode, try self.file.regionForInode());
+            const readers = coordinator.readerStats(self.file.dataIdentity() orelse return error.InvalidTransactionState, try self.file.regionForInode());
             status.coordinated_reader_count = readers.count;
             status.poisoned_coordinated_readers = readers.poisoned;
             status.oldest_coordinated_reader_age_ms = readers.oldest_age_ms;

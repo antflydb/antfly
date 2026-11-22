@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     const data = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
     defer data.close(io);
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    const inode = (try data.stat(io)).inode;
+    const identity = try @import("../lsm_backend/storage_io.zig").nativeFileIdentity(data.handle);
     var region = try shared_lock_region.Region.open(a, io, path);
     defer region.close();
     var owner = Coordinator.init(a, io);
@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
                 const file = try std.Io.Dir.cwd().openFile(io, path, .{});
                 defer file.close(io);
                 try file.lock(io, .shared);
-                const fence = try owner.registerEpoch(file, &region, inode, 1, @splat(0), false);
+                const fence = try owner.registerEpoch(file, &region, identity, 1, @splat(0), false);
                 owner.unregister(fence);
             }
             if (batch) |scope| scope.end();
