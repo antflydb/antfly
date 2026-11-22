@@ -285,7 +285,9 @@ pub const Runner = struct {
         var output_payload = payload;
         var borrowed_audio: ?@import("media_chunking_audio.zig").Lease = null;
         defer if (borrowed_audio) |*lease| lease.deinit(self.allocator);
-        if (payload == .video and self.request.needs_audio) {
+        const video_needs_audio = payload == .video and self.request.needs_audio and self.ordinalNeedsAudio(ordinal);
+        if (video_needs_audio) {
+            try self.prepareVideoAudio();
             output_payload.video.audio_failure = self.audio_failure;
             if (self.audio_provider) |provider| {
                 const start: u128 = @intCast(descriptor.coordinates.start_ns orelse return error.InvalidChunkCoordinates);
@@ -316,7 +318,7 @@ pub const Runner = struct {
             }
         }
         if (self.request.execute_outputs) {
-            if (self.request.speaker_analysis) |analysis| if (analysis.ensure) |ensure| {
+            if (payload != .video or (video_needs_audio and self.audio_provider != null)) if (self.request.speaker_analysis) |analysis| if (analysis.ensure) |ensure| {
                 if (item.descriptor.coordinates.start_ns) |start| try ensure(analysis.context, output_arena.allocator(), start, item.descriptor.coordinates.end_ns.?, false);
             };
             if (self.request.output_executor) |consumer| item.outputs = try consumer.execute(consumer.context, output_arena.allocator(), output_payload, descriptor, item.context, result, item.failure, self.request.allow_partial);
@@ -888,28 +890,20 @@ pub const Runner = struct {
         track: ?@import("media_chunking_audio_source.zig").Track = null,
     };
 
-    fn pageNeedsAudio(self: *const Runner, initial: planning.Temporal) !bool {
+    fn ordinalNeedsAudio(self: *const Runner, ordinal: u64) bool {
         const config = self.request.outputs orelse return true;
         if (self.request.audio_output_targets == 0) return true;
-        var cursor = initial;
-        try cursor.seekVideo(self.summary.start_ordinal -| self.ordinal);
-        var count: usize = 0;
-        while (self.request.max_chunks == 0 or count < self.request.max_chunks) : (count += 1) {
-            const shape = (try cursor.next()) orelse break;
-            try self.control.check();
-            const ordinal = try std.math.add(u64, self.ordinal, shape.ordinal);
-            for (config.targets, 0..) |target, index| {
-                if (!target.execute or self.request.audio_output_targets & (@as(u16, 1) << @as(u4, @intCast(index))) == 0) continue;
-                const mask = if (self.request.output_masks) |masks| masks[index] else null;
-                if (!target.skipsOrdinalWithMask(mask, ordinal)) return true;
-            }
+        for (config.targets, 0..) |target, index| {
+            if (!target.execute or self.request.audio_output_targets & (@as(u16, 1) << @as(u4, @intCast(index))) == 0) continue;
+            const mask = if (self.request.output_masks) |masks| masks[index] else null;
+            if (!target.skipsOrdinalWithMask(mask, ordinal)) return true;
         }
         return false;
     }
 
-    fn prepareVideoAudio(self: *Runner, cursor: planning.Temporal) !void {
+    fn prepareVideoAudio(self: *Runner) !void {
         const owner = self.video_audio orelse return;
-        if (!try self.pageNeedsAudio(cursor)) return;
+        if (owner.track != null or self.audio_failure != null) return;
         owner.track = @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission) catch |err| {
             if (abort(err) and err != error.AudioTooLarge) return err;
             self.audio_failure = err;
@@ -1297,19 +1291,22 @@ pub const Runner = struct {
                     known[index] = true;
                 }
                 if (slot.failure) |err| {
-                    if (count == 0 or videoTerminal(err) == null) return err;
+                    if (count == 0 or !deferVideoWindowFailure(err)) return err;
                     break;
                 }
                 if (!slot.initialized) self.prepareVideoSlot(source, slot, true) catch |err| {
                     if (count == 0) return err;
-                    if (videoTerminal(err) != null) {
+                    if (deferVideoWindowFailure(err)) {
                         slot.failure = err;
                     } else if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return err;
                     break;
                 };
                 slot.payload.video.ahead = slot.ahead;
                 self.cacheVideoPreflight(slot) catch |err| {
-                    if (count == 0 or !@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return err;
+                    if (count == 0) return err;
+                    if (deferVideoWindowFailure(err)) {
+                        slot.failure = err;
+                    } else if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return err;
                     break;
                 };
                 if (slot.measured) |*measured| if (measured.video_plan) |*plan| {
@@ -1342,7 +1339,7 @@ pub const Runner = struct {
             var payloads: [2]Payload = undefined;
             for (payloads[0..count], 0..) |*payload, i| payload.* = slots[(active + i) % slots.len].payload;
             const outputs: ?[]Output = if (count > 1) self.executor.embed_video_batch.?(self.executor.context, self.allocator, payloads[0..count]) catch |err| blk: {
-                if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err) and err != error.BatchIncompatible and (!self.request.allow_partial or abort(err))) return err;
+                if (!videoPageReadPressure(err) and !@import("embedding_gemma2.zig").videoSpeculationPressure(err) and err != error.BatchIncompatible and (!self.request.allow_partial or abort(err))) return err;
                 schedule.join();
                 // A following producer cannot remain active while an earlier
                 // dependency span is replayed against the shared source/codec.
@@ -1398,9 +1395,14 @@ pub const Runner = struct {
         if (owner) |state| state.continuation.session = self.executor.video_session;
         const source = VideoSource{ .bytes = bytes, .reader = reader, .origin = origin, .timescale = timescale, .owner = owner, .webm = webm };
         var cursor = try self.videoCursor(duration);
-        try self.prepareVideoAudio(cursor);
         const base = self.ordinal;
         self.emitVideoWindows(source, &cursor) catch |err| {
+            if (self.request.max_chunks != 0 and self.summary.emitted != 0 and videoPageReadPressure(err)) {
+                // The next request has fresh source quotas. Resume at the
+                // last sink acknowledgment, even if preparation ran ahead.
+                self.stopped = true;
+                return;
+            }
             const terminal = videoTerminal(err) orelse return err;
             self.summary.page_terminal = terminal;
             return terminal.failure();
@@ -1423,6 +1425,14 @@ pub const Runner = struct {
                 }
             };
         }
+    }
+
+    fn videoPageReadPressure(err: anyerror) bool {
+        return err == error.RemoteReadBudgetExceeded or err == error.RemoteRequestBudgetExceeded;
+    }
+
+    fn deferVideoWindowFailure(err: anyerror) bool {
+        return videoTerminal(err) != null or videoPageReadPressure(err);
     }
 
     fn videoTerminal(err: anyerror) ?chunker.types.ChunkPage.Terminal {
@@ -1579,6 +1589,39 @@ test "model aware media video windows use original MP4 and WebM timing and stop 
     try std.testing.expect((try runner.run()).complete);
     try std.testing.expect(result.kinds[@backingInt(planning.Kind.video)] >= 2);
 }
+test "model aware media remote video pressure preserves acknowledged coverage" {
+    const a = std.testing.allocator;
+    const Pressure = struct {
+        fn embed(raw: *anyopaque, alloc: std.mem.Allocator, payload: Payload) !Output {
+            if (payload.video.ordinal == 1) return error.RemoteRequestBudgetExceeded;
+            return Qualification.embed(raw, alloc, payload);
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const Payload) ![]Output {
+            return error.RemoteRequestBudgetExceeded;
+        }
+    };
+    for ([_]bool{ false, true }) |batched| {
+        var result = Qualification{};
+        var executor = result.executor();
+        executor.embed = Pressure.embed;
+        if (batched) executor.embed_video_batch = Pressure.batch;
+        var runner = try Runner.init(a, .{
+            .input = .{ .binary = .{ .mime_type = "video/quicktime", .data = @embedFile("../testdata/video/mjpeg-vfr.mov") } },
+            .policy = .{ .window_ns = 500 * std.time.ns_per_ms, .step_ns = 250 * std.time.ns_per_ms },
+            .max_chunks = 3,
+        }, executor, .{}, .{ .context = &result, .accept = Qualification.accept });
+        const prefix = try runner.run();
+        try std.testing.expectEqualSlices(u64, &.{0}, result.ordinals[0..result.seen]);
+        try std.testing.expectEqual(@as(u64, 1), prefix.next_ordinal);
+        try std.testing.expect(!prefix.source_complete and prefix.page_terminal == null);
+        var token: [85]u8 = undefined;
+        var resumed = runner.request;
+        resumed.continuation = prefix.identity.cursor(prefix.next_ordinal, &token);
+        runner = try Runner.init(a, resumed, executor, .{}, .{ .context = &result, .accept = Qualification.accept });
+        try std.testing.expectError(error.RemoteRequestBudgetExceeded, runner.run());
+    }
+}
 test "model aware media WebM page suppresses a warm-only next ordinal" {
     const a = std.testing.allocator;
     const second = std.time.ns_per_s;
@@ -1671,10 +1714,8 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     try std.testing.expect(!try audio_runner.audioReplayNeeded(1, extent));
     try std.testing.expect(try audio_runner.audioReplayNeeded(2, extent));
     audio_targets[1].skip_windows = &.{.{ .ordinal = 0, .sub_index = output_types.Target.Window.all_sub_windows }};
-    var page_audio = audio_runner;
-    page_audio.request.max_chunks = 64;
-    try std.testing.expect(!try page_audio.pageNeedsAudio(try page_audio.videoCursor(second)));
-    try std.testing.expect(try page_audio.pageNeedsAudio(try page_audio.videoCursor(2 * second)));
+    try std.testing.expect(!audio_runner.ordinalNeedsAudio(0));
+    try std.testing.expect(audio_runner.ordinalNeedsAudio(1));
     pictures[1].pts = second;
     var token: [85]u8 = undefined;
     request.continuation = page.summary.identity.cursor(page.summary.next_ordinal, &token);

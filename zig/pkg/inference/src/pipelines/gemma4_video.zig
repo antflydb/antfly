@@ -399,7 +399,7 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
         .observer = .{ .context = &observer, .accept = Observer.accept },
         .sampling = sampling,
         .pool = &pool,
-        .inspection_scope = &inspection,
+        .inspection_scope = scope,
     }) catch |err| return inputError(err);
     if (admission.session) |session| if (session.backend() == .pjrt) return @import("../execution/media_projection.zig").companionVideoFrames(session, cb, a, frames.prepared, timestamps, replay_bytes, control);
     return frames.project(timestamps, replay_bytes);
