@@ -1847,11 +1847,37 @@ pub const DurableSessionStore = struct {
         join: [16]u8,
         retire_local: struct { reference: [16]u8, transaction_id: [16]u8 },
     };
+    fn observationRegistrationPrefix(self: *const DurableSessionStore, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__sql_completion_observation__:{x:0>16}:", .{self.registration_issuer orelse 0});
+    }
+
     fn observationRegistrationKey(self: *const DurableSessionStore, id: [16]u8, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "\x00\x00__sql_completion_observation__:{x:0>16}:{s}", .{
-            self.registration_issuer orelse 0,
-            &std.fmt.bytesToHex(id, .lower),
-        });
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try self.observationRegistrationPrefix(&prefix_buf);
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, &std.fmt.bytesToHex(id, .lower) });
+    }
+
+    fn readObservationReference(txn: anytype, key: []const u8) !?[16]u8 {
+        const value = txn.get(key) catch |err| if (err == error.NotFound) return null else return err;
+        if (value.len != 16) return error.InvalidTransactionSessionRecord;
+        return value[0..16].*;
+    }
+
+    fn existingObservationReference(self: *DurableSessionStore, id: [16]u8) !?[16]u8 {
+        var buf: [128]u8 = undefined;
+        const key = try self.observationRegistrationKey(id, &buf);
+        return switch (self.backend) {
+            .docstore => |store| result: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                break :result try readObservationReference(&txn, key);
+            },
+            .runtime => |store| result: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                break :result try readObservationReference(&txn, key);
+            },
+        };
     }
 
     fn removeObservedRegistrationTxn(self: *DurableSessionStore, txn: anytype, id: [16]u8, reference: [16]u8) !void {
@@ -1989,6 +2015,10 @@ pub const DurableSessionStore = struct {
         return self.registrationMutation(.{ .create = .{ .seed = seed, .outcome = outcome, .reserved = true, .prepared = true, .local_transaction_id = id } });
     }
     pub fn createLocalObservedRegistration(self: *DurableSessionStore, seed: [8]u8, outcome: @import("../pgwire/completion.zig").Outcome, id: [16]u8) ![16]u8 {
+        if (try self.existingObservationReference(id)) |reference| {
+            self.releaseRegistrations(1);
+            return reference;
+        }
         return self.registrationMutation(.{ .create = .{ .seed = seed, .outcome = outcome, .reserved = true, .prepared = true, .local_transaction_id = id, .observe_only = true } });
     }
 
@@ -2024,14 +2054,6 @@ pub const DurableSessionStore = struct {
         };
     }
     pub fn registrationRecoveryPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize) !Outbox.RecoveryPage {
-        return self.scanRegistrationPage(alloc, after, limit, false);
-    }
-
-    pub fn observationRetirementPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize) !Outbox.RecoveryPage {
-        return self.scanRegistrationPage(alloc, after, limit, true);
-    }
-
-    fn scanRegistrationPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize, current: bool) !Outbox.RecoveryPage {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
@@ -2040,18 +2062,45 @@ pub const DurableSessionStore = struct {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
                 if (self.registration_recovery_before == null) self.registration_recovery_before = (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next;
-                const before = if (current) (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next else self.registration_recovery_before.?;
-                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, before, after, limit);
+                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
             },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
                 if (self.registration_recovery_before == null) self.registration_recovery_before = (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next;
-                const before = if (current) (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next else self.registration_recovery_before.?;
-                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, before, after, limit);
+                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
             },
         };
     }
+    pub const ObservationIndexEntry = struct { transaction_id: [16]u8, reference: [16]u8 };
+
+    pub fn observationRetirementPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: ?[16]u8, limit: usize) ![]ObservationIndexEntry {
+        var entries: std.ArrayList(ObservationIndexEntry) = .empty;
+        errdefer entries.deinit(alloc);
+        if (limit == 0) return entries.toOwnedSlice(alloc);
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try self.observationRegistrationPrefix(&prefix_buf);
+        var key_buf: [128]u8 = undefined;
+        const start = if (after) |id| try self.observationRegistrationKey(id, &key_buf) else null;
+        const Scan = struct {
+            alloc: std.mem.Allocator,
+            entries: *std.ArrayList(ObservationIndexEntry),
+            prefix_len: usize,
+            limit: usize,
+
+            fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
+                const scan: *@This() = @ptrCast(@alignCast(raw));
+                if (value.len != 16) return error.InvalidTransactionSessionRecord;
+                const id = distributed_txn.parseTxnIdHex(key[scan.prefix_len..]) catch return error.InvalidTransactionSessionRecord;
+                try scan.entries.append(scan.alloc, .{ .transaction_id = id, .reference = value[0..16].* });
+                return scan.entries.items.len < scan.limit;
+            }
+        };
+        var scan = Scan{ .alloc = alloc, .entries = &entries, .prefix_len = prefix.len, .limit = limit };
+        try self.scanPrefixFromWithContext(prefix, start, &scan, Scan.visit);
+        return entries.toOwnedSlice(alloc);
+    }
+
     pub fn registrationFloor(self: *DurableSessionStore) !u64 {
         return switch (self.backend) {
             .docstore => |store| blk: {

@@ -15732,6 +15732,31 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     defer diagnostic.deinit();
     try std.testing.expectEqualStrings("40003", diagnostic.value.code);
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(txn_id, .lower), diagnostic.value.transaction_id.?);
+
+    const observations = try durable.observationRetirementPage(alloc, null, 8);
+    defer alloc.free(observations);
+    try std.testing.expectEqual(@as(usize, 1), observations.len);
+    const reference = observations[0].reference;
+    _ = (try server.txn_sessions.recordTerminalAbort(alloc, txn_id)).?;
+    var registration = (try durable.loadRegistration(alloc, reference)).?;
+    defer registration.deinit();
+    registration.value.phase = .acknowledging;
+    try durable.putRegistration(reference, registration.value);
+    try std.testing.expect(try durable.managedCompletion(txn_id, reference, true, try durable.registrationFloor()));
+
+    const completions = @import("sql_completion.zig");
+    try completions.retireSettledObservations(&server, alloc, 8);
+    try std.testing.expect((try durable.loadRegistration(alloc, reference)) == null);
+    const reference_hex = std.fmt.bytesToHex(reference, .lower);
+    const observed_outcome: @import("../pgwire/completion.zig").Outcome = .{
+        .reference_id = &reference_hex,
+        .registration_node_id = node,
+        .observation = true,
+    };
+    try std.testing.expect(try completions.settled(&server, alloc, .{ .outcomes = &.{observed_outcome} }, .{}));
+    var ordinary_outcome = observed_outcome;
+    ordinary_outcome.observation = null;
+    try std.testing.expect(!try completions.settled(&server, alloc, .{ .outcomes = &.{ordinary_outcome} }, .{}));
 }
 
 test "httpx SQL malformed catalog requests fail before publication" {

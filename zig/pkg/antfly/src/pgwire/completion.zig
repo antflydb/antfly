@@ -16,7 +16,7 @@
 // Completion witnesses describe durable owners; they never authorize replay.
 const std = @import("std");
 pub const max_outcomes = 64;
-pub const Outcome = struct { reference_id: ?[]const u8 = null, registration_node_id: ?u64 = null, registration_pending: bool = false, transaction_id: ?[]const u8 = null, ddl_receipt_json: ?[]const u8 = null };
+pub const Outcome = struct { observation: ?bool = null, reference_id: ?[]const u8 = null, registration_node_id: ?u64 = null, registration_pending: bool = false, transaction_id: ?[]const u8 = null, ddl_receipt_json: ?[]const u8 = null };
 pub const Receipt = struct { version: u8 = 12, unknown: bool = false, outcomes: []const Outcome = &.{} };
 pub const Completion = struct {
     unknown: bool = false,
@@ -81,7 +81,7 @@ pub const Completion = struct {
         };
     }
     pub fn encode(self: Completion, alloc: std.mem.Allocator) ![]u8 {
-        return std.json.Stringify.valueAlloc(alloc, Receipt{ .unknown = self.unknown, .outcomes = self.outcomes.items }, .{});
+        return std.json.Stringify.valueAlloc(alloc, Receipt{ .unknown = self.unknown, .outcomes = self.outcomes.items }, .{ .emit_null_optional_fields = false });
     }
     pub fn deinit(self: *Completion, alloc: std.mem.Allocator) void {
         if (self.capacity.release) |release| release(self.capacity.context.?, self.capacity.remaining);
