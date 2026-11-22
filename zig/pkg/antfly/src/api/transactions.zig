@@ -8563,7 +8563,7 @@ test "distributed txn listing summary preserves status, table permissions and a 
     defer registry.deinit(a);
     const id: db_mod.types.TxnId = @splat(6);
     _ = try registry.beginForPrincipalWithSettingsAndId(a, .{}, 1, "alice", &.{}, null, id);
-    var staged = try parseCommitRequest(a, "{\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"value\":1}}}}}");
+    var staged = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"value\":1}}}}}");
     defer staged.deinit(a);
     _ = (try registry.stage(a, try registry.mutation(a, id, 1), &staged)).?;
     _ = (try registry.createSavepoint(a, try registry.mutation(a, id, 1))).?;
