@@ -783,21 +783,28 @@ pub const CatalogRetainedStream = struct {
         };
 
         fn reclaimHistory(self: *PublicationWorker, selected: CleanupRegistry) !void {
+            var phase: enum { read_state, authorize, capture, stage_split, stage_merge, renew_feed, progress_merge, progress_split, renew_roots, reclaim_roots } = .read_state;
+            errdefer std.log.debug("logical slot history maintenance failed phase={s}", .{@tagName(phase)});
             const host = self.host;
             var client: @import("changefeed_metadata.zig").Client = .{ .port = host.service.* };
             const bytes = try client.readChangefeedState(allocator, host.id, self.context);
             defer allocator.free(bytes);
             var observed = try control.parse(allocator, bytes);
             defer observed.deinit();
+            phase = .authorize;
             try selected.authorizeCleanup(observed.value, self.context);
             const feed_api = @import("changefeed_public.zig");
+            phase = .capture;
             var captured = try self.source.capturePhysical(allocator, observed.value.definition.?, self.context);
             defer captured.deinit();
+            phase = .stage_split;
             try feed_api.stageVisibleSplits(&client, allocator, self.source, &captured, &observed, observed.value.acknowledged_cursor, self.context);
+            phase = .stage_merge;
             try feed_api.stageVisibleMerges(&client, allocator, self.source, &captured, &observed, observed.value.acknowledged_cursor, self.context);
             const state = observed.value;
             const now = try selected.policy.nowSeconds(self.context);
             if (state.expires_at -| now <= history_lease_seconds / 2) {
+                phase = .renew_feed;
                 const definition = state.definition orelse return error.ChangefeedResynchronizationRequired;
                 try client.mutateChangefeedState(allocator, .{
                     .id = state.id,
@@ -814,16 +821,20 @@ pub const CatalogRetainedStream = struct {
             }
             const renew = host.verified_history_expiry != state.expires_at;
             const reclaim = state.acknowledged_delivery != 0 and host.collected_history_delivery != state.acknowledged_delivery;
+            phase = .progress_merge;
             try feed_api.progressMergeDrain(&client, allocator, self.source, &captured, state, state.acknowledged_cursor, self.context);
+            phase = .progress_split;
             try feed_api.progressSplitSuccessor(&client, allocator, self.source, &captured, state, state.acknowledged_cursor, self.context);
             if (!renew and !reclaim) return;
             var history_policy: HistoryPolicy = .{ .source = self.source, .selected = selected, .io = selected.policy.io };
+            phase = .renew_roots;
             if (renew) {
                 for (state.roots) |root| {
                     if (!root.released) try @import("history_roots.zig").renewRoot(&client, &history_policy, allocator, state, try captured.findInstalled(root), self.context);
                 }
                 host.verified_history_expiry = state.expires_at;
             }
+            phase = .reclaim_roots;
             if (!reclaim) return;
             for (state.roots) |root| {
                 if (root.released or root.acknowledged.sequence == root.start) continue;
@@ -852,7 +863,10 @@ pub const CatalogRetainedStream = struct {
             self.reclaimHistory(cleanup_registry) catch |err| {
                 if (!publicationRetryable(err)) return err;
             };
-            const cleanup = try @import("../metadata/pg_spool_cleanup.zig").cleanup(host.service, cleanup_registry, allocator, host.id, .{}, self.context);
+            const cleanup = @import("../metadata/pg_spool_cleanup.zig").cleanup(host.service, cleanup_registry, allocator, host.id, .{}, self.context) catch |err| {
+                std.log.debug("logical slot spool cleanup failed err={s}", .{@errorName(err)});
+                return err;
+            };
             switch (cleanup.status) {
                 .checkpointed, .collected => return,
                 .idle, .waiting, .retained => {},
@@ -864,7 +878,10 @@ pub const CatalogRetainedStream = struct {
                 .source = self.source,
                 .byte_limit = @import("history_page_operations.zig").pages.max_source_bytes,
             };
-            _ = try upload.drive(host.service, host.registry, &transaction, allocator, host.id, self.session, .{ .require_shared = host.config.require_shared }, self.context);
+            _ = upload.drive(host.service, host.registry, &transaction, allocator, host.id, self.session, .{ .require_shared = host.config.require_shared }, self.context) catch |err| {
+                std.log.debug("logical slot spool publication failed err={s}", .{@errorName(err)});
+                return err;
+            };
         }
 
         fn deinit(self: *PublicationWorker) void {
