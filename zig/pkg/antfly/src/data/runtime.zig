@@ -1988,12 +1988,11 @@ const RaftTableApplyStateMachine = struct {
         history_commit_time_ns: ?i64,
         exact_prepare: bool,
     ) !void {
-        const required_protocol = if (exact_prepare)
-            data_raft_batch.exact_prepare_protocol_version
-        else if (history_commit_time_ns != null)
+        const protocol = @import("../common/data_raft_protocol.zig");
+        const required_protocol = if (history_commit_time_ns != null)
             @import("history_clock_entry.zig").required_protocol_version
         else
-            try @import("../common/data_raft_protocol.zig").completionProtocolVersion(self.alloc, req);
+            protocol.withExactEnvelopeFloor(try protocol.completionProtocolVersion(self.alloc, req), exact_prepare);
         if (required_protocol) |required| {
             if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
             const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
@@ -14739,10 +14738,11 @@ pub const DataServer = struct {
             return error.OnlineMergeArtifactCatalogUncoordinated;
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
-        const minimum_protocol_version = if (@import("antfly_local_sources").api_internal_batch.requiresExactPrepareProtocol(req))
-            data_raft_batch.exact_prepare_protocol_version
-        else
-            try requiredRaftBatchProtocolVersion(alloc, req);
+        const protocol = @import("../common/data_raft_protocol.zig");
+        const minimum_protocol_version = protocol.withExactEnvelopeFloor(
+            try requiredRaftBatchProtocolVersion(alloc, req),
+            @import("antfly_local_sources").api_internal_batch.requiresExactPrepareProtocol(req),
+        ).?;
         var required_protocol_version = minimum_protocol_version;
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
         const completion_command = @import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req);

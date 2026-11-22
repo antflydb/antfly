@@ -2492,7 +2492,8 @@ pub const RaftApplyStore = struct {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;
         }
-        if (try @import("../../common/data_raft_protocol.zig").completionProtocolVersion(alloc, decoded.batch.req)) |required| {
+        const protocol = @import("../../common/data_raft_protocol.zig");
+        if (protocol.withExactEnvelopeFloor(try protocol.completionProtocolVersion(alloc, decoded.batch.req), decoded.exact_prepare)) |required| {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
             try operations.append(alloc, .{ .require_batch_protocol = required });
         }

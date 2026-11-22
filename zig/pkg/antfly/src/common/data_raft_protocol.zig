@@ -130,6 +130,14 @@ fn isNonhistoryProducer(value: anytype) bool {
     if (comptime !@hasField(@TypeOf(value), "completion_owner")) return false;
     return value.completion_owner == null;
 }
+/// The wire envelope and the decoded mutation each establish a floor.
+pub fn withExactEnvelopeFloor(mutation_floor: ?u16, exact_envelope: bool) ?u16 {
+    return if (exact_envelope)
+        @max(mutation_floor orelse 0, batch_exact_prepare_protocol_version)
+    else
+        mutation_floor;
+}
+
 pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anytype) !?u16 {
     if (comptime @hasField(@TypeOf(request), "source_producer")) {
         if (request.source_producer != .unlabelled) return batch_row_producer_protocol_version;
@@ -316,6 +324,8 @@ test "data raft ordered history ordinary producer requires its own activation fl
         .completion_admission = "{\"admission\":{\"version\":4}}",
     } } };
     try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), try completionProtocolVersion(std.testing.allocator, begin));
+    try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), withExactEnvelopeFloor(try completionProtocolVersion(std.testing.allocator, begin), true));
+    try std.testing.expectEqual(@as(?u16, batch_exact_prepare_protocol_version), withExactEnvelopeFloor(42, true));
     const publish: Request = .{ .transaction = .{ .publish_completion = .{
         .certificate = "{\"certificate\":{\"manifest\":{\"version\":4}}}",
     } } };
