@@ -128,6 +128,8 @@ pub const Control = struct {
         if (self.check_fn) |f| try f(self.context);
     }
 };
+pub const webm_playback_recipe = "webm-audio-playback-v2";
+
 pub const Identity = struct {
     source: [32]u8,
     plan: [32]u8,

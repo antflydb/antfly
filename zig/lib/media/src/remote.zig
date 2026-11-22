@@ -119,7 +119,7 @@ pub const ReadAhead = struct {
     sparse_pressure: u2 = 0,
     sparse_miss: ?u64 = null,
     pub fn range(self: *ReadAhead) source.Range {
-        return .{ .context = self, .read_at = readAt, .sparse_read_at = readSparseAt, .isolated_read_at = readIsolatedAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
+        return .{ .context = self, .read_at = readAt, .sparse_read_at = readSparseAt, .sparse_read_preferring = readSparsePreferring, .isolated_read_at = readIsolatedAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
     }
     pub fn deinit(self: *ReadAhead) void {
         if (self.buffer) |bytes| self.allocator.free(bytes);
@@ -131,12 +131,16 @@ pub const ReadAhead = struct {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
         self.sparse_pressure = 0;
         self.sparse_miss = null;
-        return self.readWindow(offset, out, control, self.window_bytes);
+        return self.readWindow(offset, out, out.len, control, self.window_bytes);
     }
     fn readSparseAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
+        return readSparsePreferring(context, offset, out, out.len, control);
+    }
+
+    fn readSparsePreferring(context: *anyopaque, offset: u64, out: []u8, minimum: usize, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
         // Cache hits provide no evidence about upstream request density.
-        if (out.len == 0 or self.cachedPrefix(offset, out.len) != 0) return self.readWindow(offset, out, control, 0);
+        if (out.len == 0 or self.cachedPrefix(offset, out.len) != 0) return self.readWindow(offset, out, minimum, control, 0);
         const requests_left = self.max_reads -| self.reads;
         const bytes_left = self.max_bytes -| self.charged_bytes;
         const source_left = self.upstream.length -| offset;
@@ -162,14 +166,14 @@ pub const ReadAhead = struct {
         else
             0;
         const fill = @min(self.window_bytes, @max(256, out.len, dense));
-        return self.readWindow(offset, out, control, @intCast(fill));
+        return self.readWindow(offset, out, minimum, control, @intCast(fill));
     }
     fn readIsolatedAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
         try control.check();
         if (offset > self.upstream.length or out.len > self.upstream.length - offset) return error.UnexpectedEndOfSource;
         if (out.len == 0) return 0;
-        if (self.cachedPrefix(offset, out.len) != 0) return self.readWindow(offset, out, control, 0);
+        if (self.cachedPrefix(offset, out.len) != 0) return self.readWindow(offset, out, out.len, control, 0);
         const size: usize = @intCast(@min(out.len, self.max_bytes -| self.charged_bytes));
         if (size == 0) return error.RemoteReadBudgetExceeded;
         return self.fetchAt(offset, out[0..size], control);
@@ -194,7 +198,7 @@ pub const ReadAhead = struct {
         return @min(count, self.valid - @as(usize, @intCast(offset - self.start)));
     }
 
-    fn readWindow(self: *ReadAhead, offset: u64, out: []u8, control: source.Control, fill_bytes: usize) !usize {
+    fn readWindow(self: *ReadAhead, offset: u64, out: []u8, minimum: usize, control: source.Control, fill_bytes: usize) !usize {
         try control.check();
         if (offset > self.upstream.length or out.len > self.upstream.length - offset) return error.UnexpectedEndOfSource;
         if (out.len == 0) return 0;
@@ -224,7 +228,7 @@ pub const ReadAhead = struct {
         if (!append) self.start = offset;
         errdefer self.valid = retained;
         var wanted = retained + fetch;
-        const required = retained + @min(out.len, fetch);
+        const required = retained + @min(minimum, fetch);
         while (self.valid < wanted) {
             try control.check();
             if (self.reads >= self.max_reads) {
@@ -251,6 +255,7 @@ pub const ReadAhead = struct {
                 return err;
             };
             self.valid += n;
+            if (minimum < out.len and self.valid >= required) break;
         }
         try control.check();
         const n = @min(out.len, self.valid - retained);
@@ -568,4 +573,25 @@ test "immutable snapshot bindings separate object version kind and length throug
     object.length = 16;
     object.version_kind = .s3_version_id;
     try std.testing.expect(!std.mem.eql(u8, &initial, &(try object.range()).immutable_binding.?));
+}
+
+test "preferred sparse demand survives a byte cap or a final short reply" {
+    const Provider = struct {
+        fn read(_: *anyopaque, _: u64, out: []u8, _: source.Control) !usize {
+            const count = @min(2, out.len);
+            @memset(out[0..count], 42);
+            return count;
+        }
+    };
+    for ([_]u64{ 2, 512 }) |max_bytes| {
+        var marker: u8 = 0;
+        var cache = ReadAhead{ .allocator = std.testing.allocator, .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 512, .accepts_full_read_size = true }, .max_bytes = max_bytes, .max_reads = 1 };
+        defer cache.deinit();
+        var input = source.Source{ .allocator = std.testing.allocator, .identity = "preferred-tail", .storage = .{ .range = cache.range() } };
+        var tail = try input.readSparsePreferring(0, 2, 256, .{});
+        defer tail.deinit();
+        try std.testing.expectEqualSlices(u8, &.{ 42, 42 }, tail.bytes);
+        try std.testing.expectEqual(@as(usize, 1), cache.reads);
+        try std.testing.expectEqual(@as(u64, 2), cache.transferred_bytes);
+    }
 }

@@ -65,6 +65,8 @@ pub const Range = struct {
     /// A provider that transferred a prefix can report it as a short read.
     read_at: *const fn (*anyopaque, u64, []u8, Control) anyerror!usize,
     sparse_read_at: ?*const fn (*anyopaque, u64, []u8, Control) anyerror!usize = null,
+    /// Accept optional output capacity beyond a caller's required prefix.
+    sparse_read_preferring: ?*const fn (*anyopaque, u64, []u8, usize, Control) anyerror!usize = null,
     isolated_read_at: ?*const fn (*anyopaque, u64, []u8, Control) anyerror!usize = null,
     length: u64,
 };
@@ -160,7 +162,25 @@ pub const Source = struct {
     pub fn readIsolated(self: *Source, offset: u64, size: usize) !Lease {
         return self.readWithControl(offset, size, .{}, null, .isolated);
     }
-    fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, mode: enum { normal, sparse, isolated }) !Lease {
+    /// Satisfy the required prefix and accept extra bytes delivered in the
+    /// same read. Optional fill must never require a follow-up call.
+    pub fn readSparsePreferring(self: *Source, offset: u64, required: usize, preferred: usize, control: Control) !Lease {
+        if (required > preferred) return error.InvalidSourceRead;
+        if (offset > self.length() or required > self.length() - offset) return error.UnexpectedEndOfSource;
+        const limits = self.remaining();
+        const size: usize = if (limits.max_reads <= 1) required else @intCast(@max(required, @min(preferred, self.length() - offset, limits.max_read_bytes, limits.max_retained_bytes, limits.max_total_bytes)));
+        return self.readSpanWithControl(offset, required, size, control, null, .sparse) catch |err| {
+            if (size == required or (err != error.ResourceLimitExceeded and err != error.OutOfMemory)) return err;
+            return self.readSparseControlled(offset, required, control);
+        };
+    }
+
+    const ReadMode = enum { normal, sparse, isolated };
+
+    fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, mode: ReadMode) !Lease {
+        return self.readSpanWithControl(offset, size, size, caller, reclaimer, mode);
+    }
+    fn readSpanWithControl(self: *Source, offset: u64, minimum: usize, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, mode: ReadMode) !Lease {
         const owner = self.physical orelse self;
         const io = std.Io.Threaded.global_single_threaded.io();
         const controls = ReadControl{ .source = owner.control, .worker = self.control };
@@ -223,17 +243,26 @@ pub const Source = struct {
         errdefer a.free(owned);
         if (serial) try owner.provider_gate.lock(control);
         defer if (serial) owner.provider_gate.unlock();
-        while (done < size) {
+        var target = size;
+        while (done < minimum) {
             try control.check();
             if (first_call_used) try self.chargeCall(owner);
             first_call_used = true;
-            const n = try read_at(range.context, offset + done, owned[done..], control);
+            const read_result = if (mode == .sparse and range.sparse_read_preferring != null and target > minimum)
+                range.sparse_read_preferring.?(range.context, offset + done, owned[done..target], minimum - done, control)
+            else
+                read_at(range.context, offset + done, owned[done..target], control);
+            const n = read_result catch |err| {
+                if (err != error.RemoteReadBudgetExceeded or target == minimum) return err;
+                target = minimum;
+                continue;
+            };
             if (n == 0) return error.UnexpectedEndOfSource;
-            if (n > size - done) return error.InvalidSourceRead;
+            if (n > target - done) return error.InvalidSourceRead;
             done += n;
         }
         try control.check();
-        return .{ .bytes = owned, .source = self, .owned = owned, .reservation = reservation };
+        return .{ .bytes = owned[0..done], .source = self, .owned = owned, .reservation = reservation };
     }
     /// Range adapters may share the backing allocator with the original callbacks.
     /// Coordinate their buffers, scratch and lease releases with the physical source.
@@ -359,7 +388,7 @@ pub const Lease = struct {
     pub fn deinit(self: *Lease) void {
         if (self.source) |s| {
             if (self.owned) |owned| s.rangeAllocator().free(owned);
-            s.releaseBytes(self.bytes.len);
+            s.releaseBytes(if (self.owned) |owned| owned.len else self.bytes.len);
         }
         self.reservation.deinit();
         self.* = .{ .bytes = &.{}, .source = null };
@@ -658,4 +687,26 @@ test "serial range callbacks can allocate and release scratch through the source
     var lease = try source.read(0, 1);
     defer lease.deinit();
     try std.testing.expectEqual(@as(u8, 42), lease.bytes[0]);
+}
+
+test "preferred sparse reads keep a short reply and account for its owned allocation" {
+    const a = std.testing.allocator;
+    const Provider = struct {
+        fn read(_: *anyopaque, _: u64, out: []u8, _: Control) !usize {
+            const count = @min(3, out.len);
+            @memset(out[0..count], 99);
+            return count;
+        }
+    };
+    var owner: u8 = 0;
+    var source = Source{ .allocator = a, .identity = "preferred-prefix", .storage = .{ .range = .{ .context = &owner, .read_at = Provider.read, .length = 16 } } };
+    {
+        var lease = try source.readSparsePreferring(0, 2, 8, .{});
+        defer lease.deinit();
+        try std.testing.expectEqualSlices(u8, &.{ 99, 99, 99 }, lease.bytes);
+        try std.testing.expectEqual(@as(usize, 1), source.reads);
+        try std.testing.expectEqual(@as(u64, 3), source.total_bytes);
+        try std.testing.expectEqual(@as(usize, 8), source.retained_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
 }

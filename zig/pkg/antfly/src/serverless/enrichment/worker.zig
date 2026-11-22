@@ -786,7 +786,7 @@ pub const SparseEnricher = struct {
         defer self.alloc.free(json);
         var parsed = try std.json.parseFromSlice(media_audit.Witness, self.alloc, json, .{});
         defer parsed.deinit();
-        if (parsed.value.format != 1) return false;
+        if (parsed.value.format != media_audit.witness_format) return false;
         for (parsed.value.sources) |source| if (std.mem.eql(u8, source.field, self.model_chunk_field)) {
             const recipe = try self.mediaRecipe(source.digest, cfg.pipeline_version);
             return generations.matches(parsed.arena.allocator(), parsed.value.document, &recipe, cfg.pipeline_version, self.model_chunker.?.outputs_json.len == 0);

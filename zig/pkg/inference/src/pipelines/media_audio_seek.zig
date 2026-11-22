@@ -564,11 +564,18 @@ const WebmFlac = struct {
             if (end > self.limit) return error.UnsupportedAudioFormat;
             var available = self.buffer.prefix(self.limit).len;
             const wanted = @min(self.limit, @max(end, 256, available *| 2));
-            try self.buffer.room(self.allocator, wanted);
-            while (available < wanted) {
-                const size = @min(wanted - available, self.input.limits.max_read_bytes, self.input.limits.max_retained_bytes);
-                if (size == 0) return error.ResourceLimitExceeded;
-                var lease = try self.input.readSparseControlled(self.offset + available, size, self.control);
+            while (available < end) {
+                const limits = self.input.remaining();
+                const cap = @min(limits.max_read_bytes, limits.max_retained_bytes, limits.max_total_bytes);
+                if (cap == 0 or limits.max_reads == 0) return error.ResourceLimitExceeded;
+                const required = @min(end - available, cap);
+                var preferred = if (limits.max_reads == 1) required else @min(wanted - available, cap);
+                self.buffer.room(self.allocator, available + preferred) catch |err| {
+                    if (err != error.OutOfMemory or preferred == required) return err;
+                    preferred = required;
+                    try self.buffer.room(self.allocator, available + required);
+                };
+                var lease = try self.input.readSparsePreferring(self.offset + available, required, preferred, self.control);
                 defer lease.deinit();
                 self.buffer.bytes.appendSliceAssumeCapacity(lease.bytes);
                 available += lease.bytes.len;
@@ -1314,4 +1321,27 @@ test "model aware media unknown FLAC duration does not read the tail before the 
     defer last.deinit(a);
     try std.testing.expectEqual(@as(usize, 256), last.pcm.samples.len);
     try std.testing.expectEqual(@as(?usize, end), provider.final_samples.?(provider.context));
+}
+
+test "model aware media FLAC refill preserves the final footer under source and wire quota" {
+    const a = std.testing.allocator;
+    const Transport = struct {
+        fn read(_: *anyopaque, _: u64, out: []u8, _: media.source.Control) !usize {
+            if (out.len > 2) return error.RemoteReadBudgetExceeded;
+            @memcpy(out, &[_]u8{ 0x12, 0x34 });
+            return out.len;
+        }
+    };
+    for ([_]bool{ false, true }) |wire_quota| {
+        var context: u8 = 0;
+        var source = media.source.Source{ .allocator = a, .identity = "flac-footer", .storage = .{ .range = .{ .context = &context, .read_at = Transport.read, .length = 512 } } };
+        if (!wire_quota) source.limits.max_total_bytes = 2;
+        var buffer: WebmFlac.CodedFrames = .{};
+        defer buffer.bytes.deinit(a);
+        try buffer.bytes.appendNTimes(a, 0, 250);
+        var input = WebmFlac.FrameRefill{ .allocator = a, .input = &source, .offset = 0, .limit = 512, .buffer = &buffer, .control = .{} };
+        const prefix = try WebmFlac.FrameRefill.refill(&input, 252);
+        try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34 }, prefix[250..]);
+        try std.testing.expectEqual(@as(u64, 2), source.total_bytes);
+    }
 }

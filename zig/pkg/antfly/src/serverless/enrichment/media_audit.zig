@@ -22,6 +22,7 @@ const outputs = @import("inference_chunker").outputs;
 const Allocator = std.mem.Allocator;
 pub const max_bytes = 16 * 1024;
 pub const Source = struct { field: []const u8, digest: [32]u8 };
+pub const witness_format = 2;
 pub const Witness = struct { format: u8 = 1, sources: []const Source, document: std.json.Value };
 
 pub fn sourceDigest(a: Allocator, value: std.json.Value) ![32]u8 {
@@ -39,7 +40,9 @@ pub fn recipe(a: Allocator, config: chunking.types.Config, field: []const u8, di
     defer a.free(canonical);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("serverless-media-recipe-v2");
-    for ([_][]const u8{ canonical, field, &digest }) |part| {
+    // The witness carries only a source digest. Include the playback
+    // revision here so even the no-provider audit path sees upgrades.
+    for ([_][]const u8{ canonical, field, &digest, @import("inference_chunker").planning.webm_playback_recipe }) |part| {
         var length: [8]u8 = undefined;
         std.mem.writeInt(u64, &length, part.len, .little);
         hash.update(&length);
@@ -156,7 +159,7 @@ pub fn buildAlloc(a: Allocator, body: []const u8) !?[]u8 {
         try sources.append(scratch, .{ .field = field.key_ptr.*, .digest = try sourceDigest(a, field.value_ptr.*) });
     }
     if (sources.items.len == 0) return null;
-    const json = try std.json.Stringify.valueAlloc(a, Witness{ .sources = sources.items, .document = compact }, .{});
+    const json = try std.json.Stringify.valueAlloc(a, Witness{ .format = witness_format, .sources = sources.items, .document = compact }, .{});
     if (json.len > max_bytes) {
         a.free(json);
         return null;
@@ -187,6 +190,7 @@ test "serverless media audit witnesses require all receipts and exclude remote s
     try std.testing.expect(witness.len < max_bytes);
     var decoded = try std.json.parseFromSlice(Witness, a, witness, .{});
     defer decoded.deinit();
+    try std.testing.expectEqual(witness_format, decoded.value.format);
     try std.testing.expectEqual(@as(usize, 1), decoded.value.sources.len);
     try std.testing.expectEqualStrings("clip", decoded.value.sources[0].field);
     var state = parsed.value.object.get("_enrichment").?;
