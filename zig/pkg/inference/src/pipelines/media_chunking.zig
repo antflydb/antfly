@@ -38,7 +38,16 @@ pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { ordinal: ?u64 = null, replay_required: bool = true, metadata_pictures: []const usize = &.{}, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { ordinal: ?u64 = null, replay_required: bool = true, metadata_pictures: []const usize = &.{}, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, masked_audio: ?AudioExtent = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+};
+pub const AudioExtent = struct {
+    samples: usize,
+    sample_rate: u32,
+    start_ns: i64,
+
+    pub fn windows(self: AudioExtent, max_ns: i64) output_types.AudioWindows {
+        return .{ .samples = self.samples, .sample_rate = self.sample_rate, .max_ns = max_ns, .parent_start_ns = self.start_ns };
+    }
 };
 pub const Preflight = struct { video_plan: ?@import("embedding_gemma2_video.zig").Plan = null, input_tokens: usize, picture_count: ?u32 = null, selected_pictures: ?[]const u64 = null, picture_basis: ?planning.PictureBasis = null };
 pub const Output = struct { vector: []f32, input_tokens: usize };
@@ -79,6 +88,7 @@ pub const Request = struct {
     output_masks: ?[]const output_types.Target.Mask = null,
     /// Resolved audio consumers work from the audio plane even in video windows.
     audio_output_targets: u16 = 0,
+    audio_output_window_ns: [16]i64 = @splat(0),
     output_executor: ?OutputExecutor = null,
     transcribe_boundary: bool = false,
     audio_boundary: bool = false,
@@ -281,14 +291,23 @@ pub const Runner = struct {
                 const end: u128 = @intCast(descriptor.coordinates.end_ns orelse return error.InvalidChunkCoordinates);
                 const first = std.math.cast(usize, @divFloor(start * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)) orelse return error.InvalidChunkCoordinates;
                 const last = std.math.cast(usize, @divFloor(end * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)) orelse return error.InvalidChunkCoordinates;
-                borrowed_audio = if (first >= provider.samples) .{ .pcm = .{ .samples = &.{}, .sample_rate = provider.sample_rate } } else provider.read(provider.context, self.allocator, first, @min(last, provider.samples)) catch |err| blk: {
-                    if (abort(err)) return err;
-                    output_payload.video.audio_failure = err;
-                    break :blk null;
+                const extent = AudioExtent{
+                    .samples = @min(last, provider.samples) -| first,
+                    .sample_rate = provider.sample_rate,
+                    .start_ns = std.math.cast(i64, @divFloor(@as(u128, first) * std.time.ns_per_s, provider.sample_rate)) orelse return error.InvalidChunkCoordinates,
                 };
-                if (borrowed_audio) |lease| {
-                    output_payload.video.audio = lease.pcm;
-                    output_payload.video.audio_start_ns = std.math.cast(i64, @divFloor(@as(u128, first) * std.time.ns_per_s, provider.sample_rate)) orelse return error.InvalidChunkCoordinates;
+                if (extent.samples != 0 and !try self.audioReplayNeeded(ordinal, extent)) {
+                    output_payload.video.masked_audio = extent;
+                } else {
+                    borrowed_audio = if (extent.samples == 0) .{ .pcm = .{ .samples = &.{}, .sample_rate = provider.sample_rate } } else provider.read(provider.context, self.allocator, first, first + extent.samples) catch |err| blk: {
+                        if (abort(err)) return err;
+                        output_payload.video.audio_failure = err;
+                        break :blk null;
+                    };
+                    if (borrowed_audio) |lease| {
+                        output_payload.video.audio = lease.pcm;
+                        output_payload.video.audio_start_ns = extent.start_ns;
+                    }
                 }
             }
         }
@@ -1042,12 +1061,29 @@ pub const Runner = struct {
         // execution is an optimization for these cold-replayable windows.
         const window = &planned.window.?;
         const replay_required = !selective or self.videoReplayNeeded(ordinal, window.count);
+        if (replay_required and window.replay.packet_stop - window.replay.restart.packet > self.request.limits.max_dependency_packets)
+            return error.ChunkDependencyBudgetExceeded;
         if (replay_required and window.cold_bytes > limit) return error.ChunkReplayUnavailable;
         window.replay.coded_bytes = limit;
+        window.replay.max_packets = self.request.limits.max_dependency_packets;
         return .{ .input = planned, .replay_required = replay_required };
     }
     fn outputWants(self: *const Runner, target: output_types.Target, index: usize, ordinal: u64, sub_index: u32) bool {
         return target.wantsWithMask(if (self.request.output_masks) |masks| masks[index] else null, ordinal, sub_index);
+    }
+
+    fn audioReplayNeeded(self: *const Runner, ordinal: u64, extent: AudioExtent) !bool {
+        const config = self.request.outputs orelse return true;
+        if (self.request.audio_output_targets == 0) return true;
+        for (config.targets, 0..) |target, index| {
+            if (!target.execute or self.request.audio_output_targets & (@as(u16, 1) << @as(u4, @intCast(index))) == 0) continue;
+            if (target.skip_windows.len == 0 or self.request.audio_output_window_ns[index] == 0) return true;
+            var windows = extent.windows(self.request.audio_output_window_ns[index]);
+            while (try windows.next()) |window| {
+                if (self.outputWants(target, index, ordinal, window.sub_index)) return true;
+            }
+        }
+        return false;
     }
 
     fn boundaryWants(self: *const Runner, ordinal: u64) bool {
@@ -1341,7 +1377,13 @@ pub const Runner = struct {
         if (try next.next()) |shape| {
             var slot = VideoSlot{ .shape = shape };
             self.prepareVideoSlot(source, &slot, false) catch |err| {
-                self.summary.page_terminal = videoTerminal(err) orelse return err;
+                if (videoTerminal(err)) |terminal| {
+                    self.summary.page_terminal = terminal;
+                } else switch (err) {
+                    // A subsequent page gets fresh source and admission budgets.
+                    error.ResourceLimitExceeded, error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded, error.ChunkWorkingBudgetExceeded => {},
+                    else => if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return err,
+                }
             };
         }
     }
@@ -1526,6 +1568,12 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     try page.webmWindowsSnapshot(&reader, &snapshot);
     try std.testing.expectEqual(@as(usize, 1), page.summary.emitted);
     try std.testing.expectEqual(chunker.types.ChunkPage.Terminal.coded_window_budget_exceeded, page.summary.page_terminal.?);
+    var packet_limited = request;
+    packet_limited.limits.max_coded_window_bytes = 6;
+    packet_limited.limits.max_dependency_packets = 1;
+    var packet_page = try Runner.init(a, packet_limited, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+    try packet_page.webmWindowsSnapshot(&reader, &snapshot);
+    try std.testing.expectEqual(chunker.types.ChunkPage.Terminal.dependency_window_budget_exceeded, packet_page.summary.page_terminal.?);
     var exact_request = request;
     exact_request.validate_next_video_page = false;
     var exact = try Runner.init(a, exact_request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
@@ -1569,7 +1617,7 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     try gap.webmWindowsSnapshot(&reader, &gap_snapshot);
     try std.testing.expectEqual(@as(usize, 3), gap_seen);
     try std.testing.expect(gap.summary.page_terminal == null);
-    const audio_targets = [_]output_types.Target{
+    var audio_targets = [_]output_types.Target{
         masked_request.outputs.?.targets[0],
         .{ .name = "waveform", .model = "test", .kind = .classify },
     };
@@ -1577,9 +1625,14 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     audio_request.outputs.?.targets = &audio_targets;
     audio_request.execute_outputs = true;
     audio_request.audio_output_targets = 1 << 1;
+    audio_request.audio_output_window_ns[1] = second;
+    audio_targets[1].skip_windows = &.{ .{ .ordinal = 1, .sub_index = 0 }, .{ .ordinal = 1, .sub_index = 1 } };
     const audio_runner = try Runner.init(a, audio_request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
     try std.testing.expect(!audio_runner.videoReplayNeeded(1, 1));
     try std.testing.expect(audio_runner.videoReplayNeeded(2, 1));
+    const extent = AudioExtent{ .samples = 2, .sample_rate = 1, .start_ns = 0 };
+    try std.testing.expect(!try audio_runner.audioReplayNeeded(1, extent));
+    try std.testing.expect(try audio_runner.audioReplayNeeded(2, extent));
     pictures[1].pts = second;
     var token: [85]u8 = undefined;
     request.continuation = page.summary.identity.cursor(page.summary.next_ordinal, &token);
@@ -1657,6 +1710,28 @@ test "model aware media packet windows validate the next coded budget without co
     try std.testing.expectEqual(@as(u64, 1), runner.summary.next_ordinal);
     try std.testing.expectEqual(chunker.types.ChunkPage.Terminal.coded_window_budget_exceeded, runner.summary.page_terminal.?);
     try std.testing.expectEqual(@as(u64, 0), source.total_bytes);
+
+    const Pressure = struct {
+        source: *media.source.Source,
+        seen: usize = 0,
+        fn limit(_: ?*const anyopaque) !void {
+            return error.RemoteRequestBudgetExceeded;
+        }
+        fn accept(raw: *anyopaque, item: Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 0), item.descriptor.ordinal);
+            self.seen += 1;
+            self.source.control = .{ .check_fn = limit };
+        }
+    };
+    var pressure = Pressure{ .source = &source };
+    var capped = try Runner.init(a, request, result.executor(), .{}, .{ .context = &pressure, .accept = Pressure.accept });
+    var capped_owner = try @import("media_chunking_video.zig").Owner.init(a, &reader, &capped.pool, request.limits);
+    defer capped_owner.deinit();
+    try capped.videoWindows(&.{}, &reader, try capped_owner.durationNs(), capped_owner.origin, reader.track.timescale, &capped_owner, null);
+    try std.testing.expectEqual(@as(usize, 1), pressure.seen);
+    try std.testing.expectEqual(@as(u64, 1), capped.summary.next_ordinal);
+    try std.testing.expect(capped.summary.page_terminal == null);
 }
 
 test "model aware media inline AV1 MP4 uses the visible picture timeline and honors packet ceilings" {

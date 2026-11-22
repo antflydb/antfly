@@ -15762,7 +15762,12 @@ pub const Node = struct {
             var masks: [16]lib_chunker.outputs.Target.Mask = undefined;
             for (outputs_config.targets, masks[0..outputs_config.targets.len], 0..) |output, *mask, index| {
                 mask.* = try lib_chunker.outputs.Target.Mask.compile(mask_arena.allocator(), output);
-                if (consumers.resolved[index].uses_audio) request.audio_output_targets |= @as(u16, 1) << @as(u4, @intCast(index));
+                const resolved = consumers.resolved[index];
+                if (resolved.uses_audio) {
+                    request.audio_output_targets |= @as(u16, 1) << @as(u4, @intCast(index));
+                    request.audio_output_window_ns[index] = resolved.max_audio_ns;
+                    request.needs_audio = request.needs_audio or (request.execute_outputs and output.execute and resolved.failure == null);
+                }
             }
             request.output_masks = masks[0..outputs_config.targets.len];
             consumers.masks = request.output_masks;
@@ -15777,11 +15782,6 @@ pub const Node = struct {
             for (outputs_config.targets) |output| needs_speakers = needs_speakers or (output.execute and output.hasDiarization());
             if ((needs_speakers and request.execute_outputs) or request.policy.audio_speaker_turns) request.speaker_analysis = .{ .context = &consumers, .prepare = MediaOutputExecution.prepareSpeakers, .ensure = MediaOutputExecution.ensureSpeakers, .samples = MediaOutputExecution.speakerSamples, .checkpoint = MediaOutputExecution.checkpointSpeakers, .close = MediaOutputExecution.closeSpeakers, .boundary = if (request.policy.audio_speaker_turns) MediaOutputExecution.speakerBoundary else null, .recipe_id = if (request.policy.audio_speaker_turns) &consumers.resolved[try consumers.boundaryIndex()].recipe_id else null };
             request.audio_boundary = request.transcribe_boundary or consumers.resolved[try consumers.boundaryIndex()].uses_audio;
-            for (consumers.resolved[0..consumers.initialized]) |value| if (value.uses_audio and value.failure == null) {
-                request.needs_audio = true;
-                break;
-            };
-
             if (request.transcribe_boundary or !boundary.execute) request.execute = false;
             return self.chunkAndEmbedAdmitted(a, io, supplied, request, .{ .model = boundary.model, .model_identity = boundary.model_identity, .task_type = if (boundary.kind == .diarize) "DIARIZE" else if (boundary.kind == .transcribe) "TRANSCRIBE" else boundary.task_type, .dimensions = boundary.dimensions }, sink);
         };
@@ -51481,7 +51481,9 @@ const MediaOutputExecution = struct {
             }
             var selected_payload = payload;
             var audio_start = descriptor.coordinates.start_ns;
+            var masked_audio: ?chunks.AudioExtent = null;
             if (payload == .video and resolved.uses_audio) {
+                masked_audio = payload.video.masked_audio;
                 if (payload.video.audio_failure) |err| {
                     if (!allow_partial and target.required) return err;
                     var value = base;
@@ -51493,7 +51495,7 @@ const MediaOutputExecution = struct {
                 if (payload.video.audio) |pcm| {
                     selected_payload = .{ .pcm = pcm };
                     audio_start = payload.video.audio_start_ns;
-                } else {
+                } else if (masked_audio == null) {
                     if (!allow_partial and target.required) return error.NoAudioTrack;
                     var value = base;
                     value.status = .failed;
@@ -51519,8 +51521,9 @@ const MediaOutputExecution = struct {
                 try results.append(a, value);
                 continue;
             }
-            if (selected_payload == .pcm) {
-                var windows = outputs.AudioWindows{ .samples = selected_payload.pcm.samples.len, .sample_rate = selected_payload.pcm.sample_rate, .max_ns = resolved.max_audio_ns, .parent_start_ns = audio_start orelse return error.InvalidChunkCoordinates };
+            if (selected_payload == .pcm or masked_audio != null) {
+                const extent = masked_audio orelse chunks.AudioExtent{ .samples = selected_payload.pcm.samples.len, .sample_rate = selected_payload.pcm.sample_rate, .start_ns = audio_start orelse return error.InvalidChunkCoordinates };
+                var windows = extent.windows(resolved.max_audio_ns);
                 while (try windows.next()) |window| {
                     var value = base;
                     value.sub_index = window.sub_index;
@@ -51531,6 +51534,7 @@ const MediaOutputExecution = struct {
                         try results.append(a, value);
                         continue;
                     }
+                    if (masked_audio != null) return error.InvalidChunkOutput;
                     self.run(a, target, resolved, .{ .pcm = .{ .samples = selected_payload.pcm.samples[window.first..window.last], .sample_rate = selected_payload.pcm.sample_rate } }, &value) catch |err| {
                         if (chunks.abort(err) or (!allow_partial and target.required)) return err;
                         value.status = .failed;

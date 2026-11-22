@@ -1519,7 +1519,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
                         break;
                     }
                 }
-                if (first >= cached_rows.len) target.execute = true;
+                if (first +| config.max_chunks > cached_rows.len) target.execute = true;
                 var skips = std.ArrayList(media_outputs.Target.Window).empty;
                 const current_recipe = for (current_identities) |identity| {
                     if (std.mem.eql(u8, identity.name, target.name)) break identity.recipe_id;

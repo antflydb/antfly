@@ -51,7 +51,9 @@ pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8, control: Control
     const media_control = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
     if (bytes.len > video.packet_sampling.reference_max_input_bytes) return error.VideoInputTooLarge;
     if (media.transport_stream.isTransportStream(bytes)) {
-        return clockAllowance(try media.transport_stream.probeSampleClock(a, bytes, .{ .max_bytes = video.packet_sampling.reference_max_input_bytes, .max_packets = video.mp4_coded.limits.max_samples }, media_control));
+        // TS has no independent clock table. Reserve the bounded frame
+        // allowance and let the execution index measure the exact timeline.
+        return token_allowance;
     }
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = inspection_bytes } };
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-prompt-clock", .control = media_control, .admission_pool = &pool, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };

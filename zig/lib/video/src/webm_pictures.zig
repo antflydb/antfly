@@ -50,9 +50,10 @@ pub const ReplayBudget = struct {
     restart: Restart,
     packet_stop: usize,
     coded_bytes: usize,
+    max_packets: usize = std.math.maxInt(usize),
 
     pub fn fits(self: ReplayBudget, indexed: Index, reader: *const media.webm.Reader, start: Restart, stop: usize, control: media.source.Control) !bool {
-        if (start.packet >= stop or stop > self.packet_stop) return false;
+        if (start.packet >= stop or stop > self.packet_stop or stop - start.packet > self.max_packets) return false;
         const payload = try indexed.packetBytes(reader.packets, start.packet, stop, control);
         const seed = if (start.sequence) |span| span.size else 0;
         return payload <= self.coded_bytes and seed <= self.coded_bytes - payload;
