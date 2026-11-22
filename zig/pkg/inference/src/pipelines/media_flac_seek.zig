@@ -141,8 +141,9 @@ pub const Owner = struct {
                 if (part.bytes.len == 0) return error.IncompleteAudioStream;
                 buffer.appendSliceAssumeCapacity(part.bytes);
             }
-            return audio.flac.decodeFrameAlloc(a, self.info, buffer.items) catch |err| {
-                if (err != error.UnsupportedAudioFormat or size == limit or known_size != null) return err;
+            return audio.flac.decodeFramePrefixAlloc(a, self.info, buffer.items) catch |err| {
+                if (err != error.IncompleteFlacFrame) return err;
+                if (size == limit or known_size != null) return error.UnsupportedAudioFormat;
                 size = @min(limit, size *| 2);
                 continue;
             };

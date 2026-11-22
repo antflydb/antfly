@@ -274,7 +274,7 @@ pub fn parseStreamInfoBlock(payload: []const u8) !StreamInfo {
 /// Frame coordinates from a CRC-validated native header.
 pub fn frameStart(info: StreamInfo, bytes: []const u8) !u64 {
     var reader = BitReader.init(bytes);
-    const header = try parseFrameHeader(&reader, info);
+    const header = parseFrameHeader(&reader, info) catch |err| return if (err == error.IncompleteFlacFrame) error.UnsupportedAudioFormat else err;
     const size = reader.bit_offset / 8;
     if (size >= bytes.len or crc8(bytes[0..size]) != bytes[size]) return error.UnsupportedAudioFormat;
     if (header.variable_block_size) return header.number;
@@ -283,11 +283,17 @@ pub fn frameStart(info: StreamInfo, bytes: []const u8) !u64 {
 }
 
 pub fn decodeFrameAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, bytes: []const u8) !FrameDecoded {
+    return decodeFramePrefixAlloc(allocator, stream_info, bytes) catch |err| return if (err == error.IncompleteFlacFrame) error.UnsupportedAudioFormat else err;
+}
+
+/// Decodes one frame from a possibly partial prefix. Only exhaustion of the
+/// input is retryable; syntax and CRC failures are definitive.
+pub fn decodeFramePrefixAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, bytes: []const u8) !FrameDecoded {
     var reader = BitReader.init(bytes);
     const header = try parseFrameHeader(&reader, stream_info);
 
     const header_without_crc_len = reader.bit_offset / 8;
-    if (header_without_crc_len >= bytes.len) return error.UnsupportedAudioFormat;
+    if (header_without_crc_len >= bytes.len) return error.IncompleteFlacFrame;
     const expected_header_crc = bytes[header_without_crc_len];
     const actual_header_crc = crc8(bytes[0..header_without_crc_len]);
     if (expected_header_crc != actual_header_crc) return error.UnsupportedAudioFormat;
@@ -311,7 +317,7 @@ pub fn decodeFrameAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, b
 
     try reader.alignToByteAndValidateZero();
     const footer_offset = reader.bit_offset / 8;
-    if (footer_offset + 2 > bytes.len) return error.UnsupportedAudioFormat;
+    if (footer_offset + 2 > bytes.len) return error.IncompleteFlacFrame;
     const expected_footer_crc = readU16(bytes[footer_offset .. footer_offset + 2]);
     const actual_footer_crc = crc16(bytes[0..footer_offset]);
     if (expected_footer_crc != actual_footer_crc) return error.UnsupportedAudioFormat;
@@ -745,7 +751,8 @@ const BitReader = struct {
     }
 
     fn readBits(self: *BitReader, comptime T: type, count: usize) !T {
-        if (count > @bitSizeOf(T) or self.bit_offset + count > self.bytes.len * 8) return error.UnsupportedAudioFormat;
+        if (count > @bitSizeOf(T)) return error.UnsupportedAudioFormat;
+        if (count > self.bytes.len * 8 -| self.bit_offset) return error.IncompleteFlacFrame;
         var value: u64 = 0;
         for (0..count) |_| {
             const byte = self.bytes[self.bit_offset / 8];
@@ -763,7 +770,7 @@ const BitReader = struct {
     }
 
     fn skipBits(self: *BitReader, count: usize) !void {
-        if (self.bit_offset + count > self.bytes.len * 8) return error.UnsupportedAudioFormat;
+        if (count > self.bytes.len * 8 -| self.bit_offset) return error.IncompleteFlacFrame;
         self.bit_offset += count;
     }
 
@@ -785,6 +792,20 @@ test "FLAC STREAMINFO rejects a missing sample rate" {
     var info: [34]u8 = @splat(0);
     std.mem.writeInt(u64, info[10..18], (@as(u64, 15) << 36) | 1, .big);
     try std.testing.expectError(error.UnsupportedAudioFormat, parseStreamInfoBlock(&info));
+}
+
+test "FLAC frame probes separate incomplete input from definitive corruption" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/codec-corpus/tone-stereo.flac");
+    const parsed = try parseStream(bytes);
+    const coded = bytes[parsed.data_offset..];
+    var frame = try decodeFrameAlloc(a, parsed.stream_info, coded);
+    defer frame.deinit();
+    try std.testing.expectError(error.IncompleteFlacFrame, decodeFramePrefixAlloc(a, parsed.stream_info, coded[0 .. frame.consumed - 1]));
+    const corrupt = try a.dupe(u8, coded[0..frame.consumed]);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeFramePrefixAlloc(a, parsed.stream_info, corrupt));
 }
 
 test "parse checked-in flac streaminfo" {
