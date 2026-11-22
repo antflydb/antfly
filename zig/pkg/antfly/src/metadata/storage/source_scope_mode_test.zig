@@ -167,6 +167,8 @@ pub fn run(a: A) !void {
     }
     var applying = snapshot_status;
     applying.phase = control.native_bootstrap_applying_phase;
+    applying.updated_at_ms = 100;
+    applying.pending_snapshot_page = .{ .end_offset = 1, .checkpoint = "snapshot_keyset:[42]", .payload_digest = @splat(55), .final = true };
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
         .catalog_digest = actor.catalog,
         .record = applying,
@@ -191,11 +193,69 @@ pub fn run(a: A) !void {
         .catalog_digest = actor.catalog,
         .record = invalid_replacement,
     } });
+    var reissued = applying;
+    reissued.updated_at_ms = 200;
+    reissued.pending_snapshot_page.?.payload_digest = @splat(56);
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = reissued,
+    } });
+    {
+        const saved = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, saved);
+        try std.testing.expectEqual(applying.updated_at_ms, saved.updated_at_ms);
+        try std.testing.expectEqual(applying.pending_snapshot_page.?.payload_digest, saved.pending_snapshot_page.?.payload_digest);
+    }
+    const history_job: @import("antfly_local_sources").storage_history_recovery_wire.Request = .{
+        .owner = authority.owner,
+        .transaction_id = try control.nativeSnapshotPageId(applying, applying.snapshot_offset),
+        .admission_digest = @splat(91),
+        .coordinator_locator = "checkpoint",
+        .resolution_timestamp_ns = applying.updated_at_ms * std.time.ns_per_ms + 1,
+    };
+    const job_bytes = try std.json.Stringify.valueAlloc(a, history_job, .{});
+    defer a.free(job_bytes);
+    var armed = applying;
+    armed.pending_snapshot_page.?.recovery_job = job_bytes;
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = armed,
+    } });
+    {
+        const saved = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, saved);
+        try std.testing.expectEqualStrings(job_bytes, saved.pending_snapshot_page.?.recovery_job);
+    }
+    var wrong_page = applying;
+    wrong_page.pending_snapshot_page = null;
+    wrong_page.phase = control.native_bootstrap_prepared_phase;
+    wrong_page.snapshot_offset = 1;
+    wrong_page.checkpoint = "snapshot_keyset:[43]";
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = wrong_page,
+        .completed_page = @splat(55),
+    } });
+    wrong_page.checkpoint = "snapshot_keyset:[42]";
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = wrong_page,
+        .completed_page = @splat(56),
+    } });
+    {
+        const saved = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, saved);
+        try std.testing.expectEqual(@as(u64, 0), saved.snapshot_offset);
+        try std.testing.expectEqualStrings("snapshot_keyset:[42]", saved.pending_snapshot_page.?.checkpoint);
+    }
     applying.snapshot_offset = 1;
+    applying.phase = control.native_bootstrap_prepared_phase;
+    applying.pending_snapshot_page = null;
     applying.checkpoint = "snapshot_keyset:[42]";
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
         .catalog_digest = actor.catalog,
         .record = applying,
+        .completed_page = @splat(55),
     } });
     publication_status.snapshot_offset = applying.snapshot_offset;
     publication_status.checkpoint = applying.checkpoint;
@@ -209,6 +269,34 @@ pub fn run(a: A) !void {
     try store.applyStandaloneCommand(group, decoded);
     snapshot_status.phase = "cutover_prepared";
     try store.applyStandaloneCommand(group, .{ .upsert_replication_source_status = snapshot_status });
+    try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
+    {
+        var pending_cleanup = try actor.read();
+        defer pending_cleanup.deinit();
+        try std.testing.expect(pending_cleanup.value.native_bootstrap_checkpoint == null);
+        const saved = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, saved);
+        try std.testing.expectEqualStrings(job_bytes, saved.snapshot_cleanup_job);
+    }
+    store.deinit();
+    opened = false;
+    store = try Store.init(a, .{ .root_dir = path });
+    opened = true;
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = publication_status,
+        .released_page = @splat(98),
+    } });
+    {
+        const saved = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, saved);
+        try std.testing.expectEqualStrings(job_bytes, saved.snapshot_cleanup_job);
+    }
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = publication_status,
+        .released_page = control.digest(job_bytes),
+    } });
     try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
     store.deinit();
     opened = false;

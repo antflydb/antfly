@@ -1399,6 +1399,24 @@ pub const ReplicationSourceStatusRecord = struct {
     retired_slot_name: []const u8 = "",
     retired_publication_name: []const u8 = "",
     updated_at_ms: u64 = 0,
+    /// Published before the page can reach the destination transaction path.
+    pending_snapshot_page: ?SnapshotPage = null,
+    snapshot_cleanup_job: []const u8 = "",
+    pub const SnapshotPage = struct {
+        end_offset: u64,
+        checkpoint: []const u8,
+        payload_digest: [32]u8,
+        final: bool = false,
+        recovery_job: []const u8 = "",
+
+        pub fn eql(left: ?SnapshotPage, right: ?SnapshotPage) bool {
+            const a = left orelse return right == null;
+            const b = right orelse return false;
+            return a.end_offset == b.end_offset and a.final == b.final and std.mem.eql(u8, a.checkpoint, b.checkpoint) and
+                std.mem.eql(u8, &a.payload_digest, &b.payload_digest) and
+                std.mem.eql(u8, a.recovery_job, b.recovery_job);
+        }
+    };
 };
 
 pub const ShuffleJoinLeaseRecord = struct {
@@ -2561,6 +2579,19 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
     errdefer alloc.free(retired_slot_name);
     const retired_publication_name = try alloc.dupe(u8, record.retired_publication_name);
     errdefer alloc.free(retired_publication_name);
+    const cleanup = try alloc.dupe(u8, record.snapshot_cleanup_job);
+    errdefer alloc.free(cleanup);
+    const pending = if (record.pending_snapshot_page) |page| blk: {
+        const checkpoint_copy = try alloc.dupe(u8, page.checkpoint);
+        errdefer alloc.free(checkpoint_copy);
+        break :blk ReplicationSourceStatusRecord.SnapshotPage{
+            .end_offset = page.end_offset,
+            .payload_digest = page.payload_digest,
+            .final = page.final,
+            .checkpoint = checkpoint_copy,
+            .recovery_job = try alloc.dupe(u8, page.recovery_job),
+        };
+    } else null;
     return .{
         .table_id = record.table_id,
         .source_ordinal = record.source_ordinal,
@@ -2589,11 +2620,18 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .retired_cutover_authority_id = record.retired_cutover_authority_id,
         .retired_slot_name = retired_slot_name,
         .retired_publication_name = retired_publication_name,
+        .snapshot_cleanup_job = cleanup,
+        .pending_snapshot_page = pending,
         .updated_at_ms = record.updated_at_ms,
     };
 }
 
 pub fn freeReplicationSourceStatus(alloc: std.mem.Allocator, record: ReplicationSourceStatusRecord) void {
+    if (record.pending_snapshot_page) |page| {
+        alloc.free(page.checkpoint);
+        alloc.free(page.recovery_job);
+    }
+    alloc.free(record.snapshot_cleanup_job);
     alloc.free(record.source_kind);
     alloc.free(record.external_table);
     alloc.free(record.cutover_mode);

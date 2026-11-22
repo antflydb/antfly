@@ -10743,13 +10743,135 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
 
-    pub fn publishNativeReplicationBootstrapDurable(self: *MetadataHttpService, sources_json: []const u8, record: metadata_table_manager.ReplicationSourceStatusRecord, deadline_ns: ?u64) !void {
+    pub fn releaseNativeReplicationSnapshotPage(
+        self: *MetadataHttpService,
+        a: std.mem.Allocator,
+        catalog_json: []const u8,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+        deadline_ns: ?u64,
+    ) !void {
+        try ensureCdcWorkPermit(self);
+        const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
+        try self.ensureLinearizableReadWithContext(context);
+        try self.replicationSourceAuthorityCurrent(catalog_json, record);
+        var job = try @import("antfly_local_sources").storage_history_recovery_wire.decode(a, record.snapshot_cleanup_job);
+        defer job.deinit();
+        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        var router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+        var hosted: @import("../api/hosted_completion.zig").Hosted = .{
+            .catalog = catalog,
+            .router = router.router(),
+            .executor = self.raft.host.http_host.request_executor,
+            .secret = self.internal_service_secret,
+            .issuer = self.internal_service_issuer,
+        };
+        try hosted.coordinator().recovery.releaseRetained(a, job.value, context);
+        try ensureCdcWorkPermit(self);
+        const control = @import("source_control.zig");
+        var cleared = record;
+        cleared.snapshot_cleanup_job = "";
+        const command: metadata_storage.TransitionCommand = .{ .publish_native_replication_bootstrap = .{
+            .catalog_digest = control.digest(catalog_json),
+            .record = cleared,
+            .released_page = control.digest(record.snapshot_cleanup_job),
+        } };
+        const receipt = try self.proposeTransitionCommandWithReceipt(command);
+        try self.waitForTransitionAppliedWithContext(receipt, context);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const observed = (try store.getReplicationSourceStatus(a, self.metadata_group_id, record.table_id, record.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(a, observed);
+        if (std.mem.eql(u8, observed.snapshot_cleanup_job, record.snapshot_cleanup_job))
+            return error.SourceOutcomeUnresolved;
+    }
+
+    pub fn recoverNativeReplicationSnapshotPage(
+        self: *MetadataHttpService,
+        a: std.mem.Allocator,
+        catalog_json: []const u8,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+        deadline_ns: ?u64,
+    ) !void {
+        try ensureCdcWorkPermit(self);
+        const page = record.pending_snapshot_page orelse return;
+        if (page.recovery_job.len == 0) return;
+        const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
+        try self.ensureLinearizableReadWithContext(context);
+        try self.replicationSourceAuthorityCurrent(catalog_json, record);
+        var job = try @import("antfly_local_sources").storage_history_recovery_wire.decode(a, page.recovery_job);
+        defer job.deinit();
+        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        var router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+        var hosted: @import("../api/hosted_completion.zig").Hosted = .{
+            .catalog = catalog,
+            .router = router.router(),
+            .executor = self.raft.host.http_host.request_executor,
+            .secret = self.internal_service_secret,
+            .issuer = self.internal_service_issuer,
+        };
+        if (try hosted.coordinator().recovery.runRetained(a, job.value, context) != .complete) return;
+        var progressed = record;
+        if (page.final) progressed.phase = @import("source_control.zig").native_bootstrap_prepared_phase;
+        progressed.snapshot_offset = page.end_offset;
+        progressed.checkpoint = page.checkpoint;
+        progressed.pending_snapshot_page = null;
+        progressed.updated_at_ms = @max(record.updated_at_ms, platform_time.realtimeNs() / std.time.ns_per_ms);
+        try self.publishNativeReplicationBootstrapDurable(catalog_json, progressed, page.payload_digest, deadline_ns);
+    }
+
+    pub fn commitNativeReplicationSnapshotPage(
+        self: *MetadataHttpService,
+        a: std.mem.Allocator,
+        catalog_json: []const u8,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+        transaction_id: [16]u8,
+        begin_ns: u64,
+        requests: []const @import("../api/distributed_txn.zig").TableCommitRequest,
+        sync: @import("antfly_local_sources").storage_db_selected_root.db.types.SyncLevel,
+        deadline_ns: ?u64,
+    ) !void {
+        try ensureCdcWorkPermit(self);
+        const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
+        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        var router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+        var hosted: @import("../api/hosted_completion.zig").Hosted = .{
+            .catalog = catalog,
+            .router = router.router(),
+            .executor = self.raft.host.http_host.request_executor,
+            .secret = self.internal_service_secret,
+            .issuer = self.internal_service_issuer,
+            .provision_policy = true,
+        };
+        const coordinator = hosted.coordinator();
+        var prepared = try @import("../api/distributed_txn.zig").prepareRetainedCommit(a, coordinator, transaction_id, begin_ns, requests, context);
+        defer prepared.deinit();
+        const commit_version = try std.math.add(u64, begin_ns, 1);
+        const job: @import("antfly_local_sources").storage_history_recovery_wire.Request = .{
+            .owner = try prepared.plan.admission.coordinatorOwner(),
+            .transaction_id = transaction_id,
+            .admission_digest = prepared.plan.admission.digest(),
+            .coordinator_locator = prepared.plan.participants[prepared.coordinator_index].locator,
+            .resolution_timestamp_ns = commit_version,
+        };
+        try job.validate();
+        const encoded = try std.json.Stringify.valueAlloc(a, job, .{});
+        defer a.free(encoded);
+        var armed = record;
+        if (armed.pending_snapshot_page == null) return error.SourcePendingWork;
+        armed.pending_snapshot_page.?.recovery_job = encoded;
+        try self.publishNativeReplicationBootstrapDurable(catalog_json, armed, null, deadline_ns);
+        try ensureCdcWorkPermit(self);
+        const outcome = try coordinator.commitPrepared(a, &prepared, commit_version, sync, context);
+        if (outcome.propagation_pending or outcome.visibility_pending) return error.SourceOutcomeUnresolved;
+    }
+
+    pub fn publishNativeReplicationBootstrapDurable(self: *MetadataHttpService, sources_json: []const u8, record: metadata_table_manager.ReplicationSourceStatusRecord, completed_page: ?[32]u8, deadline_ns: ?u64) !void {
         try ensureCdcWorkPermit(self);
         const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
         try context.ensureActive();
         const command: metadata_storage.TransitionCommand = .{ .publish_native_replication_bootstrap = .{
             .catalog_digest = @import("source_control.zig").digest(sources_json),
             .record = record,
+            .completed_page = completed_page,
         } };
         try ensureCoordinatedDecoderWithContext(self, command, context);
         const receipt = try self.proposeTransitionCommandWithReceipt(command);
@@ -10760,11 +10882,15 @@ pub const MetadataHttpService = struct {
         if (!replicationCutoverAuthorityMatches(observed, record) or
             !std.mem.eql(u8, observed.phase, record.phase) or observed.snapshot_offset != record.snapshot_offset or
             !std.mem.eql(u8, observed.prepared_checkpoint, record.prepared_checkpoint) or
+            (std.mem.eql(u8, record.phase, @import("source_control.zig").native_bootstrap_applying_phase) and observed.updated_at_ms != record.updated_at_ms) or
+            !metadata_table_manager.ReplicationSourceStatusRecord.SnapshotPage.eql(observed.pending_snapshot_page, record.pending_snapshot_page) or
             !std.mem.eql(u8, observed.checkpoint, record.checkpoint) or
             observed.retired_cutover_authority_id != record.retired_cutover_authority_id or
             !std.mem.eql(u8, observed.retired_slot_name, record.retired_slot_name) or
             !std.mem.eql(u8, observed.retired_publication_name, record.retired_publication_name))
             return error.ReplicationCutoverAuthorityLost;
+        if (completed_page != null and observed.snapshot_cleanup_job.len != 0)
+            try self.releaseNativeReplicationSnapshotPage(self.alloc, sources_json, observed, deadline_ns);
         try context.ensureActive();
     }
 

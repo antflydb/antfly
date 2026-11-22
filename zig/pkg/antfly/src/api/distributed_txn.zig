@@ -1616,6 +1616,33 @@ pub fn prepareSourceCommit(
     return prepared;
 }
 
+pub fn prepareRetainedCommit(
+    a: std.mem.Allocator,
+    coordinator: @import("completion_admission.zig").Coordinator,
+    transaction_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    tables: []const TableCommitRequest,
+    context: @import("antfly_local_sources").api_operation.RequestContext,
+) !@import("completion_admission.zig").Prepared {
+    var participants = try routeCommitParticipants(a, coordinator.recovery.catalog, tables);
+    defer {
+        for (participants.items) |*participant| participant.deinit(a);
+        participants.deinit(a);
+    }
+    const inputs = try a.alloc(@import("completion_admission.zig").Input, participants.items.len);
+    defer a.free(inputs);
+    for (participants.items, inputs) |*participant, *input| input.* = .{
+        .table_name = participant.table_name,
+        .group_id = participant.group_id,
+        .topology_epoch = participant.topology_epoch,
+        .intent = participant.intentRequest(),
+    };
+    var result = (try coordinator.prepare(a, transaction_id, begin_timestamp, inputs, context)) orelse
+        return error.ChangefeedCapabilityUnsupported;
+    result.plan.retain_terminal = true;
+    return result;
+}
+
 fn executeMultiTableCommitOnce(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,

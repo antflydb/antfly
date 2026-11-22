@@ -202,14 +202,14 @@ pub const SnapshotBackfillRunner = struct {
     lifecycle_hook: ?ReplicationLifecycleHook = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 
-    fn publishNativeSnapshotStatus(self: *SnapshotBackfillRunner, sink: anytype, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+    fn publishNativeSnapshotStatus(self: *SnapshotBackfillRunner, sink: anytype, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, completed_page: ?[32]u8) !void {
         if (!self.protected_native_bootstrap) return callUpsertStatus(sink, record);
         const Sink = switch (@typeInfo(@TypeOf(sink))) {
             .pointer => |pointer| pointer.child,
             else => @TypeOf(sink),
         };
         if (comptime @hasDecl(Sink, "publishNativeReplicationBootstrapDurable")) {
-            return sink.publishNativeReplicationBootstrapDurable(table.replication_sources_json, record, try self.workDeadlineNs());
+            return sink.publishNativeReplicationBootstrapDurable(table.replication_sources_json, record, completed_page, try self.workDeadlineNs());
         }
         return error.UnsupportedDurableReplicationStatusSink;
     }
@@ -423,7 +423,7 @@ pub const SnapshotBackfillRunner = struct {
         var external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
         defer if (external) |*binding| binding.deinit(self.alloc);
         if (self.protected_native_bootstrap) {
-            if (external != null or start_offset != 0) return error.UnsupportedReplicationRoute;
+            if (external != null or start_offset != 0 or self.batch_size == 0) return error.UnsupportedReplicationRoute;
             parsed.require_exact_cutover = true;
         }
         const lake_owner = if (external) |binding| blk: {
@@ -693,7 +693,7 @@ pub const SnapshotBackfillRunner = struct {
                 var record = ctx.record;
                 record.cutover_provider_identity = provider_identity;
                 if (ctx.runner.protected_native_bootstrap) {
-                    try ctx.runner.publishNativeSnapshotStatus(ctx.status_sink, ctx.table, record);
+                    try ctx.runner.publishNativeSnapshotStatus(ctx.status_sink, ctx.table, record, null);
                 } else {
                     try requireLegacyOwnership(ctx.status_sink, ctx.alloc, ctx.table, ctx.record.source_ordinal);
                     try callClaimCutoverStatusDurable(
@@ -972,7 +972,7 @@ pub const SnapshotBackfillRunner = struct {
             .cutover_provider_identity = progress_cutover_provider_identity.*,
             .updated_at_ms = ioNowMillis(self.io),
         };
-        try self.publishNativeSnapshotStatus(status_sink, table, prepared_status);
+        try self.publishNativeSnapshotStatus(status_sink, table, prepared_status, null);
         try self.reachLifecycle(
             .provider_prepared,
             table.table_id,
@@ -989,7 +989,7 @@ pub const SnapshotBackfillRunner = struct {
 
         var bulk_ingest_tables: std.ArrayListUnmanaged([]const u8) = .empty;
         defer bulk_ingest_tables.deinit(self.alloc);
-        if (lake_owner == null) try beginBackfillBulkIngestWindow(self.alloc, self.write_source, table.name, parsed, &bulk_ingest_tables);
+        if (lake_owner == null and !self.protected_native_bootstrap) try beginBackfillBulkIngestWindow(self.alloc, self.write_source, table.name, parsed, &bulk_ingest_tables);
         if (lake_owner != null and (prepared_snapshot == null or effective_start_offset != 0 or snapshot_order_fields.len == 0)) return error.ReplicationExactCutoverRequired;
         var lake_pages: std.ArrayList([32]u8) = .empty;
         defer lake_pages.deinit(self.alloc);
@@ -997,6 +997,22 @@ pub const SnapshotBackfillRunner = struct {
         const lake_catalog = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog;
         errdefer abortBackfillBulkIngestWindow(self.write_source, bulk_ingest_tables.items);
 
+        const PageSink = struct {
+            sink: @TypeOf(status_sink),
+            catalog: []const u8,
+            record: metadata_table_manager.ReplicationSourceStatusRecord,
+            deadline_ns: ?u64,
+
+            fn commit(raw: *anyopaque, a: Allocator, id: db_mod.types.TxnId, begin_ns: u64, requests: []const transaction_contract.TableCommitRequest, sync: db_mod.types.SyncLevel) !void {
+                const page: *@This() = @ptrCast(@alignCast(raw));
+                try page.sink.commitNativeReplicationSnapshotPage(a, page.catalog, page.record, id, begin_ns, requests, sync, page.deadline_ns);
+            }
+        };
+        var hosted_page: PageSink = undefined;
+        const Sink = switch (@typeInfo(@TypeOf(status_sink))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(status_sink),
+        };
         var quantum_exhausted = false;
         while (true) {
             try self.checkpointWork();
@@ -1027,7 +1043,7 @@ pub const SnapshotBackfillRunner = struct {
                     try self.alloc.dupe(u8, value)
                 else
                     null,
-                .limit = self.batch_size,
+                .limit = if (self.protected_native_bootstrap) try std.math.add(usize, self.batch_size, 1) else self.batch_size,
                 .offset = if (snapshot_order_fields.len > 0)
                     0
                 else
@@ -1062,11 +1078,13 @@ pub const SnapshotBackfillRunner = struct {
                 progress_cutover_provider_identity.*,
             );
 
-            if (result.rows.len == 0) break;
+            const final_page = self.protected_native_bootstrap and result.rows.len <= self.batch_size;
+            const rows = result.rows[0..@min(result.rows.len, self.batch_size)];
+            if (rows.len == 0) break;
             const next_snapshot_checkpoint = if (snapshot_order_fields.len > 0)
                 try snapshotKeysetCheckpointForRowAlloc(
                     self.alloc,
-                    result.rows[result.rows.len - 1],
+                    rows[rows.len - 1],
                     snapshot_order_fields,
                 )
             else
@@ -1080,21 +1098,48 @@ pub const SnapshotBackfillRunner = struct {
                 );
             }
 
-            if (self.protected_native_bootstrap and std.mem.eql(u8, phase_snapshot, control.native_bootstrap_snapshot_phase)) {
-                // Persist the possibility of destination effects before
-                // dispatch, even if a crash prevents recording page progress.
+            var completed_page: ?[32]u8 = null;
+            const page_transaction = if (self.protected_native_bootstrap) blk: {
+                // Persist the exact page boundary before dispatch. Recovery
+                // can correlate the retained decision without the export.
+                const end_offset = try std.math.add(usize, summary.final_offset, rows.len);
                 var applying = prepared_status;
                 applying.phase = control.native_bootstrap_applying_phase;
+                applying.snapshot_offset = @intCast(summary.final_offset);
+                applying.checkpoint = if (progress_snapshot_checkpoint.items.len > 0)
+                    progress_snapshot_checkpoint.items
+                else
+                    prepared_status.checkpoint;
                 applying.updated_at_ms = ioNowMillis(self.io);
-                try self.publishNativeSnapshotStatus(status_sink, table, applying);
+                const encoded_rows = try std.json.Stringify.valueAlloc(self.alloc, rows, .{});
+                defer self.alloc.free(encoded_rows);
+                applying.pending_snapshot_page = .{
+                    .end_offset = @intCast(end_offset),
+                    .payload_digest = control.digest(encoded_rows),
+                    .final = final_page,
+                    .checkpoint = next_snapshot_checkpoint orelse checkpointSlice(end_offset),
+                };
+                completed_page = applying.pending_snapshot_page.?.payload_digest;
+                try self.publishNativeSnapshotStatus(status_sink, table, applying, null);
                 phase_snapshot = applying.phase;
                 try self.checkpointWork();
-            }
+                var transaction = try SnapshotPageTransaction.init(prepared_status, summary.final_offset, applying.updated_at_ms);
+                if (comptime @hasDecl(Sink, "commitNativeReplicationSnapshotPage")) {
+                    hosted_page = .{
+                        .sink = status_sink,
+                        .catalog = table.replication_sources_json,
+                        .record = applying,
+                        .deadline_ns = try self.workDeadlineNs(),
+                    };
+                    transaction.hosted = .{ .ptr = &hosted_page, .commit = PageSink.commit };
+                }
+                break :blk transaction;
+            } else null;
 
             if (lake_owner) |owner| {
-                if (result.rows.len > lake_catalog.row_commit.max_bootstrap_rows - summary.final_offset) return error.LakeWriteTooLarge;
+                if (rows.len > lake_catalog.row_commit.max_bootstrap_rows - summary.final_offset) return error.LakeWriteTooLarge;
                 const stage_page = owner.stage_snapshot_page orelse return error.UnsupportedReplicationRoute;
-                for (result.rows) |row| {
+                for (rows) |row| {
                     const encoded = try std.json.Stringify.valueAlloc(self.alloc, row, .{});
                     defer self.alloc.free(encoded);
                     if (encoded.len > lake_catalog.types.max_commit_bytes - lake_bytes) return error.LakeWriteTooLarge;
@@ -1106,12 +1151,21 @@ pub const SnapshotBackfillRunner = struct {
                     .previous_checkpoint = null,
                     .checkpoint = prepared_checkpoint,
                     .changes = &.{},
-                    .snapshot_rows = result.rows,
+                    .snapshot_rows = rows,
                     .deadline_ns = try self.workDeadlineNs(),
                 });
                 try lake_pages.append(self.alloc, page);
+            } else if (self.protected_native_bootstrap and (parsed.has_update_transforms or parsed.has_routes)) {
+                // Retain one native transaction per page across all routed
+                // effects. A participant crash cannot apply a page prefix.
+                const changes = try self.alloc.alloc(foreign_mod.ReplicationChange, rows.len);
+                defer self.alloc.free(changes);
+                for (rows, changes) |row, *change| {
+                    change.* = .{ .op = .insert, .checkpoint = "", .row = row };
+                }
+                _ = try applyReplicationTransaction(self.alloc, self.write_source, table.name, changes, parsed, cdc_snapshot_window_sync_level, page_transaction);
             } else if (parsed.has_update_transforms or parsed.has_routes) {
-                for (result.rows) |row| {
+                for (rows) |row| {
                     try self.checkpointWork();
                     try checkProgressCutoverAuthority(
                         if (self.protected_native_bootstrap) phase_snapshot else null,
@@ -1137,10 +1191,16 @@ pub const SnapshotBackfillRunner = struct {
                     try self.checkpointWork();
                 }
             } else {
-                const writes = try rowsToBatchWritesAlloc(self.alloc, result.rows, parsed.key_template);
+                const writes = try rowsToBatchWritesAlloc(self.alloc, rows, parsed.key_template);
                 defer freeBatchWritesOwned(self.alloc, writes);
 
-                try applyReplicationSnapshotRowsRequired(self.alloc, self.write_source, table.name, writes, cdc_snapshot_window_sync_level);
+                if (page_transaction) |transaction| {
+                    try transaction.commit(self.alloc, self.write_source, &.{.{
+                        .table_name = table.name,
+                        .source_producer = .legacy_cdc,
+                        .writes = writes,
+                    }}, cdc_snapshot_window_sync_level);
+                } else try applyReplicationSnapshotRowsRequired(self.alloc, self.write_source, table.name, writes, cdc_snapshot_window_sync_level);
                 try self.checkpointWork();
             }
 
@@ -1148,7 +1208,7 @@ pub const SnapshotBackfillRunner = struct {
                 .snapshot_batch_applied,
                 table.table_id,
                 source_ordinal,
-                @intCast(summary.final_offset + result.rows.len),
+                @intCast(summary.final_offset + rows.len),
                 progress_cutover_authority_id.*,
                 if (next_snapshot_checkpoint) |checkpoint| checkpoint else "",
             );
@@ -1175,9 +1235,9 @@ pub const SnapshotBackfillRunner = struct {
                 progress_cutover_config_fingerprint.*,
                 progress_cutover_provider_identity.*,
             );
-            summary.rows_applied += result.rows.len;
+            summary.rows_applied += rows.len;
             summary.batches_applied += 1;
-            summary.final_offset += result.rows.len;
+            summary.final_offset += rows.len;
             if (lake_owner == null) progress_offset.* = summary.final_offset;
             if (next_snapshot_checkpoint) |checkpoint| {
                 try replaceProgressSlice(
@@ -1203,6 +1263,7 @@ pub const SnapshotBackfillRunner = struct {
             }
 
             if (lake_owner == null) {
+                const updated_at_ms = ioNowMillis(self.io);
                 try self.publishNativeSnapshotStatus(status_sink, table, .{
                     .table_id = table.table_id,
                     .source_ordinal = source_ordinal,
@@ -1211,7 +1272,7 @@ pub const SnapshotBackfillRunner = struct {
                     .cutover_mode = cutover_mode,
                     .slot_name = effective_slot_name,
                     .publication_name = effective_publication_name,
-                    .phase = phase_snapshot,
+                    .phase = if (final_page) phase_complete else phase_snapshot,
                     .checkpoint = progress_snapshot_checkpoint.items,
                     .snapshot_offset = @intCast(summary.final_offset),
                     .prepared_checkpoint = prepared_checkpoint,
@@ -1228,8 +1289,8 @@ pub const SnapshotBackfillRunner = struct {
                     .cutover_authority_id = progress_cutover_authority_id.*,
                     .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
                     .cutover_provider_identity = progress_cutover_provider_identity.*,
-                    .updated_at_ms = ioNowMillis(self.io),
-                });
+                    .updated_at_ms = updated_at_ms,
+                }, completed_page);
                 try self.reachLifecycle(
                     .snapshot_checkpoint_persisted,
                     table.table_id,
@@ -1241,7 +1302,12 @@ pub const SnapshotBackfillRunner = struct {
             }
             try self.checkpointWork();
 
-            if (result.rows.len < self.batch_size) break;
+            if (final_page) {
+                try self.reachLifecycle(.cutover_prepared, table.table_id, source_ordinal, @intCast(summary.final_offset), progress_cutover_authority_id.*, prepared_checkpoint);
+                summary.snapshot_complete = true;
+                return summary;
+            }
+            if (rows.len < self.batch_size) break;
             if (snapshot_order_fields.len > 0 and
                 prepared_snapshot == null and
                 self.quantum_deadline_ns != null and
@@ -1359,7 +1425,7 @@ pub const SnapshotBackfillRunner = struct {
             .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
             .cutover_provider_identity = progress_cutover_provider_identity.*,
             .updated_at_ms = ioNowMillis(self.io),
-        });
+        }, null);
         try self.reachLifecycle(
             .cutover_prepared,
             table.table_id,
@@ -1676,6 +1742,30 @@ pub const SnapshotBackfillCoordinator = struct {
                 summary.sources_considered += 1;
                 const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal));
                 const control = @import("source_control.zig");
+                if (comptime @hasDecl(Service, "releaseNativeReplicationSnapshotPage")) {
+                    if (existing) |record| {
+                        if (record.snapshot_cleanup_job.len != 0) {
+                            service.releaseNativeReplicationSnapshotPage(self.alloc, table.replication_sources_json, record, try self.runner.workDeadlineNs()) catch |err| {
+                                if (replicationErrorEndsRound(err)) return err;
+                                summary.sources_failed += 1;
+                                std.log.warn("metadata cdc snapshot cleanup pending table={s} source={d} err={s}", .{ table.name, ordinal, @errorName(err) });
+                            };
+                            continue;
+                        }
+                    }
+                }
+                if (comptime @hasDecl(Service, "recoverNativeReplicationSnapshotPage")) {
+                    if (existing) |record| {
+                        if (std.mem.eql(u8, record.phase, control.native_bootstrap_applying_phase) and record.pending_snapshot_page != null) {
+                            service.recoverNativeReplicationSnapshotPage(self.alloc, table.replication_sources_json, record, try self.runner.workDeadlineNs()) catch |err| {
+                                if (replicationErrorEndsRound(err)) return err;
+                                summary.sources_failed += 1;
+                                std.log.warn("metadata cdc snapshot page recovery pending table={s} source={d} err={s}", .{ table.name, ordinal, @errorName(err) });
+                            };
+                            continue;
+                        }
+                    }
+                }
                 const resume_protected = if (existing) |record|
                     @hasDecl(Service, "publishNativeReplicationBootstrapDurable") and
                         control.nativeBootstrapCanReplaceExport(record.phase) and
@@ -2242,7 +2332,7 @@ pub const StreamingReplicationRunner = struct {
                     .delete => applied.deletes_applied += 1,
                 };
                 break :blk applied;
-            } else try applyReplicationTransaction(self.alloc, self.write_source, table.name, transaction, parsed, cdc_apply_sync_level);
+            } else try applyReplicationTransaction(self.alloc, self.write_source, table.name, transaction, parsed, cdc_apply_sync_level, null);
             for (transaction) |member| {
                 try self.reachLifecycle(
                     .stream_change_applied,
@@ -2798,6 +2888,27 @@ fn rowsToBatchWritesAlloc(
     return writes;
 }
 
+const SnapshotPageTransaction = struct {
+    id: db_mod.types.TxnId,
+    begin_ns: u64,
+
+    hosted: ?struct {
+        ptr: *anyopaque,
+        commit: *const fn (*anyopaque, Allocator, db_mod.types.TxnId, u64, []const transaction_contract.TableCommitRequest, db_mod.types.SyncLevel) anyerror!void,
+    } = null,
+
+    fn init(cutover: metadata_table_manager.ReplicationSourceStatusRecord, row_offset: usize, begin_ms: u64) !SnapshotPageTransaction {
+        const begin_ns = try std.math.mul(u64, begin_ms, std.time.ns_per_ms);
+        if (begin_ns == 0) return error.InvalidTxnRecord;
+        return .{ .id = try @import("source_control.zig").nativeSnapshotPageId(cutover, row_offset), .begin_ns = begin_ns };
+    }
+
+    fn commit(self: SnapshotPageTransaction, a: Allocator, writer: table_writes_api.TableWriteSource, requests: []const transaction_contract.TableCommitRequest, sync_level: db_mod.types.SyncLevel) !void {
+        if (self.hosted) |owner| return owner.commit(owner.ptr, a, self.id, self.begin_ns, requests, sync_level);
+        try requireReplicationCommitComplete(try writer.commitTransactionWithId(a, self.id, self.begin_ns, requests, sync_level));
+    }
+};
+
 /// Snapshot rows use the same atomic destination contract as stream effects.
 /// Hosted writers therefore qualify/provision every root and finish retained
 /// completion before the snapshot cursor can be persisted. Raw batch fallback
@@ -2827,7 +2938,7 @@ fn applyReplicationChange(
     parsed: ParsedReplicationSourceConfig,
     sync_level: db_mod.types.SyncLevel,
 ) !ReplicationApplySummary {
-    return applyReplicationTransaction(alloc, write_source, table_name, &.{change}, parsed, sync_level);
+    return applyReplicationTransaction(alloc, write_source, table_name, &.{change}, parsed, sync_level, null);
 }
 
 /// Compile all final destination effects before the first destination mutation.
@@ -2840,6 +2951,7 @@ fn applyReplicationTransaction(
     changes: []const foreign_mod.ReplicationChange,
     parsed: ParsedReplicationSourceConfig,
     sync_level: db_mod.types.SyncLevel,
+    page: ?SnapshotPageTransaction,
 ) !ReplicationApplySummary {
     var plan = source_effects.Plan.init(alloc, .{});
     defer plan.deinit();
@@ -2859,7 +2971,7 @@ fn applyReplicationTransaction(
         .transforms = effect.transforms,
         .deletes = effect.deletes,
     };
-    try requireReplicationCommitComplete(try write_source.commitBatch(alloc, requests, sync_level));
+    if (page) |transaction| try transaction.commit(alloc, write_source, requests, sync_level) else try requireReplicationCommitComplete(try write_source.commitBatch(alloc, requests, sync_level));
     return summary;
 }
 
@@ -4759,7 +4871,10 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
-    var db = try db_mod.DB.open(alloc, path, .{});
+    var db = try db_mod.DB.open(alloc, path, .{
+        .identity_namespace = .{ .table_id = 11, .shard_id = 1, .range_id = 1 },
+        .online_source_authority = .native,
+    });
     defer {
         db.close();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -4889,6 +5004,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             self: *@This(),
             _: []const u8,
             record: metadata_table_manager.ReplicationSourceStatusRecord,
+            _: ?[32]u8,
             _: ?u64,
         ) !void {
             try std.testing.expect(@import("source_control.zig").isNativeBootstrapPhase(record.phase));
@@ -4935,14 +5051,14 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
         .alloc = alloc,
         .registry = &registry,
         .write_source = write_source.source(),
-        .batch_size = 1,
+        .batch_size = 2,
         .protected_native_bootstrap = true,
     };
 
     const native_table: metadata_table_manager.TableRecord = .{
         .table_id = 11,
         .name = "docs",
-        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\",\"on_update\":[{\"op\":\"$set\",\"path\":\"source\",\"value\":\"snapshot\"}]}]",
     };
 
     const Interrupt = struct {
@@ -4959,7 +5075,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     _ = try runner.runTableSourceFromStatus(&status_sink, native_table, 0, 0, interrupted_native);
     try std.testing.expectEqual(@as(usize, 2), FakeExecutor.exact_cutover_calls);
     try std.testing.expectEqual(@as(usize, 0), FakeExecutor.prepare_calls);
-    try std.testing.expectEqual(@as(usize, 3), FakeExecutor.snapshot_query_calls);
+    try std.testing.expectEqual(@as(usize, 1), FakeExecutor.snapshot_query_calls);
     try std.testing.expectEqualStrings("lsn:exact", status_sink.records.items[status_sink.records.items.len - 1].prepared_checkpoint);
     try std.testing.expectEqualStrings("exported_snapshot", status_sink.records.items[status_sink.records.items.len - 1].cutover_mode);
     const final_status = status_sink.records.items[status_sink.records.items.len - 1];
@@ -4969,8 +5085,16 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[resumed_index + 2].snapshot_offset);
     try std.testing.expectEqualStrings(control.native_bootstrap_applying_phase, status_sink.records.items[resumed_index + 3].phase);
     try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[resumed_index + 3].snapshot_offset);
+    try std.testing.expect(status_sink.records.items[resumed_index + 3].pending_snapshot_page.?.final);
     try std.testing.expectEqual(@as(u64, 2), final_status.snapshot_offset);
+    var first = (try db.lookup(alloc, "doc:1", .{})) orelse return error.TestUnexpectedResult;
+    defer first.deinit(alloc);
+    var second = (try db.lookup(alloc, "doc:2", .{})) orelse return error.TestUnexpectedResult;
+    defer second.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, first.json, "\"source\":\"snapshot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.json, "\"source\":\"snapshot\"") != null);
     runner.protected_native_bootstrap = false;
+    runner.batch_size = 1;
     try std.testing.expect(final_status.cutover_intent_id != 0);
     try std.testing.expect(final_status.cutover_authority_id != interrupted_native.cutover_authority_id);
     try std.testing.expect(!std.mem.eql(
@@ -7645,14 +7769,14 @@ test "metadata replication stream compiles route leave enter and key changes as 
     };
     var destination: Destination = .{};
     const writer: table_writes_api.TableWriteSource = .{ .ptr = &destination, .supports_transaction_producers = true, .vtable = &.{ .batch = Destination.batch, .commit_batch = Destination.commit } };
-    const summary = try applyReplicationTransaction(a, writer, "source", &.{change}, config, .write);
+    const summary = try applyReplicationTransaction(a, writer, "source", &.{change}, config, .write, null);
     try std.testing.expectEqual(@as(usize, 1), summary.writes_applied);
     try std.testing.expectEqual(@as(usize, 1), summary.deletes_applied);
     try std.testing.expectEqual(@as(usize, 1), destination.calls);
     const unsupported: table_writes_api.TableWriteSource = .{ .ptr = &destination, .vtable = &.{ .batch = Destination.batch } };
-    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, applyReplicationTransaction(a, unsupported, "source", &.{change}, config, .write));
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, applyReplicationTransaction(a, unsupported, "source", &.{change}, config, .write, null));
     change.before_complete = false;
-    try std.testing.expectError(error.ReplicationProjectionIncomplete, applyReplicationTransaction(a, writer, "source", &.{change}, config, .write));
+    try std.testing.expectError(error.ReplicationProjectionIncomplete, applyReplicationTransaction(a, writer, "source", &.{change}, config, .write, null));
     try std.testing.expectEqual(@as(usize, 1), destination.calls);
 }
 
@@ -7681,7 +7805,7 @@ test "metadata replication stream rejects a later invalid member without applyin
         .{ .op = .insert, .checkpoint = @constCast("commit"), .row = first.value },
         .{ .op = .insert, .checkpoint = @constCast("commit"), .row = invalid.value },
     };
-    try std.testing.expectError(error.InvalidArgument, applyReplicationTransaction(a, source.source(), "docs", &changes, config, .write));
+    try std.testing.expectError(error.InvalidArgument, applyReplicationTransaction(a, source.source(), "docs", &changes, config, .write, null));
     var result = (try db.lookup(a, "a", .{})).?;
     defer result.deinit(a);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, result.json, .{});
@@ -8506,6 +8630,10 @@ test "metadata replication stream scopes bind the exact managed cutover" {
         .cutover_config_fingerprint = @splat(3),
         .cutover_provider_identity = @splat(4),
     };
+    const page = try SnapshotPageTransaction.init(record, 0, 50);
+    try std.testing.expectEqualDeep(page, try SnapshotPageTransaction.init(record, 0, 50));
+    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), page.begin_ns);
+    try std.testing.expect(!std.meta.eql(page.id, (try SnapshotPageTransaction.init(record, 1, 50)).id));
     const binding = try nativeSourceProviderBinding(record);
     var changed = record;
     changed.cutover_authority_id += 1;

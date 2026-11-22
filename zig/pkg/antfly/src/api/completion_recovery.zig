@@ -83,6 +83,30 @@ pub const Recovery = struct {
         const locator = local.api_local_transaction_contract.parseParticipantRef(job.coordinator_locator) orelse return error.InvalidParticipant;
         return self.runBound(a, job.owner, fence, locator.table_name, job.transaction_id, job, null, context);
     }
+    /// Release only a completed transaction whose owning cursor is durable.
+    pub fn releaseRetained(self: Recovery, a: A, job: local.storage_history_recovery_wire.Request, original: Context) !void {
+        try job.validate();
+        var context = try original.platformDeadline();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
+        try self.checkpoint(context);
+        var budget = self.catalog.budget(null);
+        budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        budget.cancellation = context.cancellation;
+        var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
+        defer session.deinit();
+        const fence = try routeRetainedOwner(&session, job.owner, job.coordinator_locator, budget, context);
+        const locator = local.api_local_transaction_contract.parseParticipantRef(job.coordinator_locator) orelse return error.InvalidParticipant;
+        const query: decision_ops.Request = .{ .version = 1, .owner = job.owner, .transaction_id = job.transaction_id, .minimum_applied_index = 1 };
+        var observed = try self.decisions.read(a, fence, locator.table_name, query, context);
+        defer observed.deinit();
+        try observed.value.validate(query.binding());
+        const decision = observed.value.decision orelse return;
+        if (!std.mem.eql(u8, &decision.admission.digest, &job.admission_digest)) return error.SourceTransactionIdentityConflict;
+        if (decision.record.status != .committed) return error.SourceOutcomeUnresolved;
+        try self.checkpoint(context);
+        try self.participants.acknowledgeRetainedCoordinator(a, job.owner, fence, job.coordinator_locator, job.transaction_id, context);
+    }
+
     fn runBound(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, job: ?local.storage_history_recovery_wire.Request, source_expected: ?SourceExpectation, original: Context) !Outcome {
         var scope = try publication_ops.Scope.init(coordinator_fence, original);
         const context = scope.context();
@@ -250,6 +274,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         resolves: usize = 0,
         publishes: usize = 0,
         acknowledgments: usize = 0,
+        expect_coordinator_release: bool = false,
         lose_publication: bool = false,
         suppress_resolution: bool = false,
         state: decision_ops.wire.Record = .{ .status = .committed, .begin_timestamp = 10, .created_at_ns = 11, .commit_version = 20, .finalized_at_ns = 20, .prepared = true, .intents_resolved = true, .digest = @splat(7) },
@@ -384,6 +409,11 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                     }
                     try std.testing.expectEqualSlices(u8, &self.admission.transaction_id, &value.txn_id);
                     const coordinator = self.admission.coordinator_namespace;
+                    if (self.expect_coordinator_release) {
+                        try std.testing.expectEqual(@as(usize, 1), value.participants.len);
+                        try std.testing.expectEqualStrings((try self.admission.member(coordinator)).locator, value.participants[0]);
+                        return {};
+                    }
                     const expected_count: usize = if (self.state.retain_terminal) 1 else 2;
                     try std.testing.expectEqual(expected_count, value.participants.len);
                     const follower = self.admission.participants[if (std.mem.eql(u8, &coordinator, &self.admission.participants[0].namespace)) 1 else 0];
@@ -430,6 +460,22 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(@as(usize, 3), fake.publishes);
     try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
     try std.testing.expectEqual(@as(usize, 4), fake.publishes);
+    var page_job: local.storage_history_recovery_wire.Request = .{
+        .owner = owners[0],
+        .transaction_id = admission.transaction_id,
+        .admission_digest = admission.digest(),
+        .coordinator_locator = members[0].locator,
+        .resolution_timestamp_ns = 20,
+    };
+    const before_release = fake.acknowledgments;
+    page_job.admission_digest[0] ^= 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, recovery.releaseRetained(a, page_job, .{}));
+    try std.testing.expectEqual(before_release, fake.acknowledgments);
+    page_job.admission_digest = admission.digest();
+    fake.expect_coordinator_release = true;
+    try recovery.releaseRetained(a, page_job, .{});
+    fake.expect_coordinator_release = false;
+    try std.testing.expectEqual(before_release + 1, fake.acknowledgments);
     fake.resolved[1] = false;
     fake.published = .{ false, false };
     fake.suppress_resolution = true;

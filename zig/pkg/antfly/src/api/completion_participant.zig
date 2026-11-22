@@ -153,6 +153,13 @@ pub const Port = struct {
         if (count != 0) try self.acknowledgeParticipants(a, owner, fence, locator.table_name, admission.transaction_id, pending[0..count], context, scope.deadline_ns);
     }
 
+    pub fn acknowledgeRetainedCoordinator(self: Port, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, locator_bytes: []const u8, transaction_id: types.TxnId, original: operation.RequestContext) !void {
+        const locator = local.api_local_transaction_contract.parseParticipantRef(locator_bytes) orelse return error.InvalidParticipant;
+        try validateParticipantFence(owner, locator.group_id, fence);
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        try self.acknowledgeParticipants(a, owner, fence, locator.table_name, transaction_id, &.{locator_bytes}, scope.context(), scope.deadline_ns);
+    }
+
     fn acknowledgeParticipants(self: Port, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, table: []const u8, txn_id: types.TxnId, participants: []const []const u8, context: operation.RequestContext, deadline_ns: u64) !void {
         return self.writeRequest(a, fence, owner, table, .{ .sync_level = .write, .transaction = .{ .acknowledge_many = .{ .txn_id = txn_id, .participants = participants } } }, context, deadline_ns);
     }

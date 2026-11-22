@@ -802,6 +802,21 @@ pub fn nativeSourceProviderBinding(status: anytype) ![32]u8 {
     return hash.finalResult();
 }
 
+pub fn nativeSnapshotPageId(cutover: anytype, row_offset: u64) ![16]u8 {
+    const provider = try nativeSourceProviderBinding(cutover);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:native-postgres-snapshot-page:v1");
+    hash.update(&provider);
+    var value: [8]u8 = undefined;
+    for ([_]u64{ cutover.table_id, cutover.source_ordinal, row_offset }) |number| {
+        std.mem.writeInt(u64, &value, number, .big);
+        hash.update(&value);
+    }
+    var id = hash.finalResult()[0..16].*;
+    if (std.mem.allEqual(u8, &id, 0)) id[15] = 1;
+    return id;
+}
+
 fn hashField(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     var length: [8]u8 = undefined;
     std.mem.writeInt(u64, &length, bytes.len, .little);
