@@ -1823,7 +1823,9 @@ test "external lake filesystem WAL group commit folds pending transactions into 
     var provider: changes.Provider(@TypeOf(schemas), @TypeOf(visibility)) = .{ .namespace = namespace, .binding = binding, .options = options, .metadata = last, .schemas = schemas, .policy = &policy };
     const prepared_page = try provider.prepare(a, feed_state, initial, .{ .events = 1 }, .{});
     try std.testing.expectEqual(@as(u64, 3), prepared_page.advances[0].position.sequence);
-    try std.testing.expectEqual(@as(u32, 1), prepared_page.advances[0].position.event);
+    try std.testing.expectEqual(@as(u32, 1), prepared_page.events);
+    // A v3 provider position encodes the raw WAL ordinal and a visibility bit.
+    try std.testing.expectEqual(@as(u32, 3), prepared_page.advances[0].position.event);
     var receipt: feed_control.Delivery = .{ .sequence = 1, .before = initial, .cursor = @splat(0), .authority = prepared_page.proof, .issued_at = 101, .advances = prepared_page.advances, .provider_context = prepared_page.provider_context };
     receipt.cursor = receipt.identity(feed_state.id, feed_state.epoch);
     feed_state = try (feed_control.Mutation{ .issue = receipt }).apply(a, feed_state, .{ .incarnation = authority, .sequence = 5 });
