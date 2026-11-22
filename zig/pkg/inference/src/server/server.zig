@@ -1321,6 +1321,34 @@ const hosted_extraction_working_bytes: usize = 32 * 1024 * 1024;
 const hosted_extraction_result_bytes: usize = 8 * 1024 * 1024;
 const hosted_extraction_max_windows: usize = 128;
 
+fn accountHostedUpstreamReply(total: *usize, bytes: usize, limit: usize) !void {
+    if (bytes > limit -| total.*) return error.ExtractorUpstreamOutputTooLarge;
+    total.* += bytes;
+}
+
+fn serializeHostedExtraction(allocator: std.mem.Allocator, response: std.json.Value, output_limit: usize, working_available: usize) ![]u8 {
+    // Size before allocating so the response owns one exact-size buffer.
+    var scratch: [1024]u8 = undefined;
+    var counter = std.Io.Writer.Discarding.init(&scratch);
+    std.json.Stringify.value(response, .{}, &counter.writer) catch unreachable;
+    const bytes = std.math.cast(usize, counter.fullCount()) orelse return error.ExtractorResponseTooLarge;
+    if (bytes > output_limit) return error.ExtractorResponseTooLarge;
+    if (bytes > working_available) return error.HostedExtractionWorkingLimitExceeded;
+    const result = try allocator.alloc(u8, bytes);
+    errdefer allocator.free(result);
+    var writer: std.Io.Writer = .fixed(result);
+    std.json.Stringify.value(response, .{}, &writer) catch unreachable;
+    return result;
+}
+
+fn hostedReadTokens(requested: ?i64, configured: ?i64, ceiling: usize) !usize {
+    if (try validateReadMaxTokens(requested)) |tokens| {
+        if (tokens > ceiling) return error.HostedReadTokenLimitExceeded;
+        return tokens;
+    }
+    return @min((try validateReadMaxTokens(configured)) orelse 4096, ceiling);
+}
+
 fn hostedInferenceControl(supplied: InferenceExecutionControl) InferenceExecutionControl {
     var control = supplied;
     const deadline = platform.time.monotonicNs() +| hosted_inference_timeout_ms * std.time.ns_per_ms;
@@ -4750,6 +4778,9 @@ pub const Node = struct {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
         try config.request_limits.validate();
+        for (config.image_readers) |reader| {
+            _ = validateReadMaxTokens(reader.config.max_tokens) catch return error.InvalidHostedReaderTokenBudget;
+        }
         for (config.generated_extractors) |extractor| {
             const tokens = std.math.cast(i32, extractor.config.generator.max_tokens) orelse return error.InvalidHostedExtractorTokenBudget;
             if (tokens <= 0) return error.InvalidHostedExtractorTokenBudget;
@@ -23968,9 +23999,13 @@ pub const Node = struct {
         self.config.request_limits.validateItemCount(images.len) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         const output_limit = self.config.request_limits.max_output_tokens_per_item orelse 8192;
-        const tokens = (validateReadMaxTokens(body.max_tokens orelse cfg.max_tokens) catch
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'max_tokens' must be between 1 and 8192" })) orelse @min(4096, output_limit);
-        if (tokens > output_limit) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'max_tokens' exceeds the deployment limit" });
+        const tokens = hostedReadTokens(body.max_tokens, cfg.max_tokens, output_limit) catch |err| {
+            const message = if (err == error.HostedReadTokenLimitExceeded)
+                "'max_tokens' exceeds the deployment limit"
+            else
+                "'max_tokens' must be between 1 and 8192";
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = message });
+        };
 
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
@@ -26267,9 +26302,8 @@ pub const Node = struct {
                             error.HostedExtractionWorkingLimitExceeded => return ctx.status(500).json(.{ .@"error" = "EXTRACTION_WORKING_LIMIT_EXCEEDED" }),
                             else => return extractionDirectFailureResponse(ctx, err),
                         };
-                        defer ctx.allocator.free(output);
+                        _ = ctx.response.bodyOwned(ctx.allocator, output);
                         try ctx.setHeader("content-type", "application/json");
-                        _ = ctx.response.body(output);
                         return ctx.response.build();
                     }
                 }
@@ -26778,8 +26812,7 @@ pub const Node = struct {
             defer response.deinit();
             if (!response.ok()) return error.ExtractorUpstreamFailed;
             const response_bytes = response.body orelse return error.InvalidConstrainedOutput;
-            self.hosted_reply_bytes +|= response_bytes.len;
-            if (self.hosted_reply_bytes > hosted_extraction_result_bytes) return error.ExtractorUpstreamOutputTooLarge;
+            try accountHostedUpstreamReply(&self.hosted_reply_bytes, response_bytes.len, hosted_extraction_result_bytes);
             const Wire = struct {
                 choices: []const struct { finish_reason: []const u8, message: struct {
                     content: ?[]const u8 = null,
@@ -26991,9 +27024,9 @@ pub const Node = struct {
         const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
         const response = try extractor.responseValueWithUsage(a, if (registered != null) envelope.object.get("model").?.string else config.generator.model, inputs.array.items, values, if (backend.hosted_usage_complete) generated else null);
         if (registered == null) return std.json.Stringify.valueAlloc(allocator, response, .{});
-        const rendered = try std.json.Stringify.valueAlloc(a, response, .{});
-        if (rendered.len > hosted_extraction_result_bytes) return error.ExtractorResponseTooLarge;
-        return allocator.dupe(u8, rendered);
+        const budget = quota.?;
+        try backend.control.check();
+        return serializeHostedExtraction(allocator, response, hosted_extraction_result_bytes, budget.limit -| budget.live);
     }
 
     fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
@@ -49478,6 +49511,31 @@ fn documentFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return ctx.status(status).json(.{ .@"error" = name, .message = "Document operation could not satisfy its input, capability, evidence, or execution contract" });
 }
 
+test "hosted extraction aggregate and rendered limits are independent" {
+    const a = std.testing.allocator;
+    var total: usize = 0;
+    try accountHostedUpstreamReply(&total, 5, 8);
+    try accountHostedUpstreamReply(&total, 3, 8);
+    try std.testing.expectError(error.ExtractorUpstreamOutputTooLarge, accountHostedUpstreamReply(&total, 1, 8));
+    try std.testing.expectEqual(@as(usize, 8), total);
+
+    const response: std.json.Value = .{ .string = "a\nb" };
+    try std.testing.expectError(error.ExtractorResponseTooLarge, serializeHostedExtraction(a, response, 5, 16));
+    try std.testing.expectError(error.HostedExtractionWorkingLimitExceeded, serializeHostedExtraction(a, response, 6, 5));
+    const output = try serializeHostedExtraction(a, response, 6, 6);
+    defer a.free(output);
+    try std.testing.expectEqualStrings("\"a\\nb\"", output);
+}
+
+test "hosted reader default narrows to deployment without clamping overrides" {
+    try std.testing.expectEqual(@as(usize, 2048), try hostedReadTokens(null, 4096, 2048));
+    try std.testing.expectEqual(@as(usize, 512), try hostedReadTokens(512, 4096, 2048));
+    try std.testing.expectError(error.HostedReadTokenLimitExceeded, hostedReadTokens(4096, null, 2048));
+    try std.testing.expectError(error.InvalidHostedReaderTokenBudget, Node.init(std.testing.allocator, .{
+        .image_readers = &.{.{ .name = "ocr", .config = .{ .provider = .openai, .max_tokens = 8193 } }},
+    }));
+}
+
 test "hosted reader endpoints and usage fail closed" {
     try std.testing.expect(isHostedInferenceEndpoint("http://127.0.0.1:8090/v1/"));
     try std.testing.expect(!isHostedInferenceEndpoint("file:///private/path"));
@@ -49631,12 +49689,13 @@ test "hosted image reader routes the inference API alias to chat completions" {
     const base_url = try std.fmt.allocPrint(a, "{s}/v1", .{upstream.baseUrl()});
     defer a.free(base_url);
     var node = try Node.init(a, .{
+        .request_limits = .{ .max_output_tokens_per_item = 16 },
         .image_readers = &.{.{ .name = "ocr", .config = .{
             .provider = .openai,
             .model = "lighton-ocr",
             .base_url = base_url,
             .prompt = "",
-            .max_tokens = 16,
+            .max_tokens = 4096,
             .hosted_parallelism = 2,
         } }},
     });
@@ -49659,6 +49718,19 @@ test "hosted image reader routes the inference API alias to chat completions" {
         var rejected = try node.readImages(&invalid_ctx);
         defer rejected.deinit();
         try std.testing.expect(rejected.status.code >= 400);
+        try std.testing.expectEqual(@as(usize, 0), upstream.routeHitCount(0));
+    }
+    {
+        const override = try std.fmt.allocPrint(a, "{{\"model\":\"readers/ocr\",\"max_tokens\":17,\"images\":[{{\"url\":\"data:image/png;base64,{s}\"}}]}}", .{encoded});
+        defer a.free(override);
+        var invalid = try httpx.Request.init(a, .POST, "/ai/v1/read");
+        defer invalid.deinit();
+        invalid.body = override;
+        var ctx = httpx.Context.init(a, io, &invalid);
+        defer ctx.deinit();
+        var rejected = try node.readImages(&ctx);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
         try std.testing.expectEqual(@as(usize, 0), upstream.routeHitCount(0));
     }
     var request = try httpx.Request.init(a, .POST, "/ai/v1/read");

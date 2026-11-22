@@ -140,7 +140,8 @@ with these aliases. Endpoint precedence is `base_url`, then `url`, then
 `api_url`. The listener validates the full image batch before sending one
 completion per page. Set `hosted_parallelism` between 1 and 8 to limit the
 number of simultaneous page completions within each request. It defaults to 1,
-and results retain input order.
+and results retain input order. The deployment output-token ceiling bounds the
+reader default. Explicit request values above that ceiling are rejected.
 These aliases accept `images` without artifact retention.
 For a standalone database deployment, enable
 [public inference](/docs/reference/inference-gateway#public-execution-policy)
@@ -231,7 +232,9 @@ reports for incomplete profiles, including setup failures, and exits with a nonz
 layout probe fails qualification. A qualifying page needs at most 5% character
 error and all required text. The dense fixture also requires matching rows and
 cells in an HTML or Markdown table. The receipt layout probe requires
-at least three distinct, valid boxes.
+at least three distinct, valid boxes. Memory qualification independently requires
+RSS and physical footprint for each measured workload phase and both process
+lifetime peaks.
 
 
 ## Read documents during ingestion

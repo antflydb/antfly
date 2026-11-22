@@ -23,6 +23,7 @@ from unittest.mock import patch
 from benchmark_llama_memory import (
     Profile,
     grounding_quality_passes,
+    memory_measurement_valid,
     quality_passes,
     run_profile,
     score_case,
@@ -95,6 +96,22 @@ class QualificationTest(unittest.TestCase):
             self.assertEqual(row["error"], str(failure))
             self.assertEqual(row["results"], [])
             self.assertEqual(row["parallel"], 4)
+
+    def test_memory_qualification_requires_lifetime_and_active_phase_counters(self):
+        metrics = {"rss_bytes": 100, "physical_footprint_bytes": 70}
+        peaks = {"serve": metrics, "grounding": metrics}
+        self.assertTrue(
+            memory_measurement_valid(peaks, ["serve", "grounding"], 120, 80)
+        )
+        self.assertFalse(memory_measurement_valid(peaks, ["serve"], 120, None))
+        self.assertFalse(
+            memory_measurement_valid(
+                {"serve": metrics}, ["serve", "grounding"], 120, 80
+            )
+        )
+        self.assertFalse(
+            memory_measurement_valid({"serve": {"rss_bytes": 100}}, ["serve"], 120, 80)
+        )
 
     def test_layout_requires_distinct_boxes_at_fixture_coverage(self):
         case = {

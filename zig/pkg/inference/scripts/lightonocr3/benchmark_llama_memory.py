@@ -308,12 +308,24 @@ def grounding_quality_passes(row, case):
     )
 
 
+def memory_measurement_valid(peaks, phases, peak_rss, peak_footprint):
+    return bool(
+        peak_rss and peak_rss > 0 and peak_footprint and peak_footprint > 0
+    ) and all(
+        peaks.get(phase, {}).get(metric, 0) > 0
+        for phase in phases
+        for metric in ("rss_bytes", "physical_footprint_bytes")
+    )
+
+
 def run_profile(args, cases, grounding_case, size, profile, parallel):
     try:
         return measure_profile(args, cases, grounding_case, size, profile, parallel)
     except (OSError, subprocess.SubprocessError) as error:
         return {
             "qualified": False,
+            "quality_qualified": False,
+            "memory_measurement_valid": False,
             "model": size,
             "profile": asdict(profile),
             "parallel": parallel,
@@ -464,19 +476,31 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
     layout_ok = grounding_case is None or (
         grounding is not None and grounding_quality_passes(grounding, grounding_case)
     )
-    qualified = (
+    quality_qualified = (
         failure is None
         and bool(layout_ok)
         and (args.grounding_only or len(quality_pages) == len(cases) * args.rounds)
     )
+    peak_rss = memory_peak(output, "maximum resident set size")
+    peak_footprint = memory_peak(output, "peak memory footprint")
+    phases = []
+    if not args.grounding_only:
+        phases.append("serve")
+    if grounding_case is not None:
+        phases.append("grounding")
+    memory_valid = memory_measurement_valid(
+        sampled_peaks, phases, peak_rss, peak_footprint
+    )
     return {
-        "qualified": qualified,
+        "qualified": quality_qualified and memory_valid,
+        "quality_qualified": quality_qualified,
+        "memory_measurement_valid": memory_valid,
         "model": size,
         "profile": asdict(profile),
         "parallel": parallel,
         "artifact_bytes": model.stat().st_size + projector.stat().st_size,
-        "peak_rss_bytes": memory_peak(output, "maximum resident set size"),
-        "peak_physical_footprint_bytes": memory_peak(output, "peak memory footprint"),
+        "peak_rss_bytes": peak_rss,
+        "peak_physical_footprint_bytes": peak_footprint,
         "sampled_peak_bytes_by_phase": sampled_peaks,
         "warm_idle": idle,
         "seconds": elapsed,
