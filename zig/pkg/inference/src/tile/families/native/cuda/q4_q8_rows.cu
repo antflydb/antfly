@@ -39,3 +39,4 @@ __device__ __forceinline__ void termite_q4_0_q8_1_rows_impl(
 {{q4q8_rows_linear}}
 
 }
+
