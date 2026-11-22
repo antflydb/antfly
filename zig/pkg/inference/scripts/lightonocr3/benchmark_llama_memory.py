@@ -39,6 +39,12 @@ from urllib.request import Request, urlopen
 from benchmark_corpus import cer, normalize, plain_text
 
 
+GROUNDING_BOX = re.compile(
+    r"!\[[a-z_]+\+?\]\(\s*(\d{1,4})\s*,\s*(\d{1,4})\s*,"
+    r"\s*(\d{1,4})\s*,\s*(\d{1,4})\s*\)"
+)
+
+
 @dataclass(frozen=True)
 class Profile:
     name: str
@@ -186,13 +192,20 @@ def score_case(row, case):
         return
     text = row["text"]
     expected = case["expected"]
+    boxes = [tuple(map(int, box)) for box in GROUNDING_BOX.findall(text)]
+    valid_boxes = sum(
+        0 <= x0 < x1 <= 1000 and 0 <= y0 < y1 <= 1000 for x0, y0, x1, y1 in boxes
+    )
+    transcript = GROUNDING_BOX.sub("", text)
     row.update(
-        exact=normalize(expected) == normalize(text),
-        cer=cer(expected, plain_text(text)),
-        missing=[term for term in case["required"] if term not in text],
+        exact=normalize(expected) == normalize(transcript),
+        cer=cer(expected, plain_text(transcript)),
+        missing=[term for term in case["required"] if term not in transcript],
         has_table_markup="<table" in text.lower()
         or bool(re.search(r"(?m)^\s*\|.+\|\s*$", text)),
-        has_grounding=bool(re.search(r"<\|?(?:bbox|box|region)", text, re.I)),
+        has_grounding=valid_boxes > 0,
+        grounding_boxes=len(boxes),
+        valid_grounding_boxes=valid_boxes,
     )
 
 
