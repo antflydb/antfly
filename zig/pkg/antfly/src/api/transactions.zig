@@ -8551,7 +8551,7 @@ test "distributed txn public mutation guards reject a reused id" {
     try std.testing.expectError(error.SessionLeaseLost, registry.getTerminalCommitForMutation(a, guard));
 }
 
-test "distributed txn legacy status and details report only a matching co-located lease" {
+test "distributed txn listing summary preserves status, table permissions and a matching co-located lease" {
     const a = std.testing.allocator;
     var backend = mem_backend.Backend.init(a, .{});
     defer backend.close();
@@ -8563,6 +8563,9 @@ test "distributed txn legacy status and details report only a matching co-locate
     defer registry.deinit(a);
     const id: db_mod.types.TxnId = @splat(6);
     _ = try registry.beginForPrincipalWithSettingsAndId(a, .{}, 1, "alice", &.{}, null, id);
+    var staged = try parseCommitRequest(a, "{\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"value\":1}}}}}");
+    defer staged.deinit(a);
+    _ = (try registry.stage(a, try registry.mutation(a, id, 1), &staged)).?;
     _ = (try registry.createSavepoint(a, try registry.mutation(a, id, 1))).?;
     const key = try makeSessionLeaseKey(a, id);
     defer a.free(key);
@@ -8587,6 +8590,9 @@ test "distributed txn legacy status and details report only a matching co-locate
         var listing = (try registry.getListingDetailsForPrincipal(a, id, "alice")).?;
         defer listing.deinit(a);
         try std.testing.expectEqual(status, listing.status);
+        try std.testing.expectEqual(@as(usize, 1), listing.tables.len);
+        try std.testing.expectEqualStrings("docs", listing.tables[0].table_name);
+        try std.testing.expectEqual(@as(usize, 1), listing.tables[0].staged_write_count);
         try std.testing.expectEqual(@as(usize, 0), listing.savepoint_ids.len);
         var authorization = (try registry.getAuthorizationDetailsForPrincipal(a, id, "alice")).?;
         defer authorization.deinit(a);
