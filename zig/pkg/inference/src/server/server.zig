@@ -23987,6 +23987,7 @@ pub const Node = struct {
         ctx: *httpx.Context,
         body: api.ReadRequest,
         cfg: readers_api.Config,
+        tokens: usize,
         attachments: []const httpx.attachment_envelope.Attachment,
         indexes: []const ?usize,
         admission: ReadRequestAdmission,
@@ -23995,17 +23996,6 @@ pub const Node = struct {
     ) !httpx.Response {
         const control = hostedInferenceControl(supplied);
         const images = body.images.?;
-        self.config.request_limits.validateItemCount(images.len) catch |err|
-            return inferenceExecutorContractFailureResponse(ctx, err);
-        const output_limit = self.config.request_limits.max_output_tokens_per_item orelse 8192;
-        const tokens = hostedReadTokens(body.max_tokens, cfg.max_tokens, output_limit) catch |err| {
-            const message = if (err == error.HostedReadTokenLimitExceeded)
-                "'max_tokens' exceeds the deployment limit"
-            else
-                "'max_tokens' must be between 1 and 8192";
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = message });
-        };
-
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -24041,7 +24031,7 @@ pub const Node = struct {
             validateEncodedImageMime(mime, bytes) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
             page.mime = image_pipeline.mimeEssenceForEncoded(bytes) orelse
                 return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia);
-            const units = @max(reserved_units.*, @max(decoded.requiredUnits(), estimateReadAdmissionUnits(images.len, tokens)));
+            const units = @max(reserved_units.*, decoded.requiredUnits());
             if (try self.growSlotUnits(ctx, reserved_units.*, units)) |response| return response;
             reserved_units.* = units;
             var prefix_buffer: [128]u8 = undefined;
@@ -24228,6 +24218,20 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "'max_tokens' must be between 1 and 8192",
             });
+        const hosted_reader = self.hostedImageReader(body.model);
+        if (hosted_reader) |cfg| {
+            if (body.retain_artifact orelse false)
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "configured image readers do not retain artifacts" });
+            self.config.request_limits.validateItemCount(body.images.?.len) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
+            max_tokens = hostedReadTokens(body.max_tokens, cfg.max_tokens, self.config.request_limits.max_output_tokens_per_item orelse 8192) catch |err| {
+                const message = if (err == error.HostedReadTokenLimitExceeded)
+                    "'max_tokens' exceeds the deployment limit"
+                else
+                    "'max_tokens' must be between 1 and 8192";
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = message });
+            };
+        }
         const inline_source_cap = readInlineSourceByteCap(self);
         var inline_source_bytes: usize = 0;
         for ((body.images orelse @as([]const api.ImageURL, &.{})), attachment_indexes) |image, attachment_index| {
@@ -24257,11 +24261,8 @@ pub const Node = struct {
         self.metrics.incRequest("read");
         defer self.metrics.decActive();
 
-        if (self.hostedImageReader(body.model)) |cfg| {
-            if (body.retain_artifact orelse false)
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "configured image readers do not retain artifacts" });
-            return self.readHostedImages(ctx, body, cfg, attachments, attachment_indexes, admission, &reserved_units, execution_control);
-        }
+        if (hosted_reader) |cfg|
+            return self.readHostedImages(ctx, body, cfg, max_tokens.?, attachments, attachment_indexes, admission, &reserved_units, execution_control);
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
@@ -26301,7 +26302,7 @@ pub const Node = struct {
                             error.HostedExtractionWorkingLimitExceeded => return ctx.status(500).json(.{ .@"error" = "EXTRACTION_WORKING_LIMIT_EXCEEDED" }),
                             else => return extractionDirectFailureResponse(ctx, err),
                         };
-                        _ = ctx.response.bodyOwned(ctx.allocator, output);
+                        _ = ctx.response.bodyOwned(output.owner, output.bytes);
                         try ctx.setHeader("content-type", "application/json");
                         return ctx.response.build();
                     }
@@ -26310,9 +26311,8 @@ pub const Node = struct {
             if (public_envelope.value == .object) if (public_envelope.value.object.get("method")) |method| {
                 if (method != .string or !std.mem.eql(u8, method.string, "generated") or uses_attachment_envelope) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Unsupported extraction method or media" });
                 const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, execution_control, null) catch |err| return extractionDirectFailureResponse(ctx, err);
-                defer ctx.allocator.free(output);
+                _ = ctx.response.bodyOwned(output.owner, output.bytes);
                 try ctx.setHeader("content-type", "application/json");
-                _ = ctx.response.body(output);
                 return ctx.response.build();
             };
             if (execution_control.document_store.configured() or (self.isDocumentOperation(ctx.allocator, public_envelope.value, .extract) catch |err| return documentFailureResponse(ctx, err))) {
@@ -26924,7 +26924,35 @@ pub const Node = struct {
         return caps;
     }
 
-    fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config) ![]u8 {
+    const GeneratedExtractionBody = struct {
+        bytes: []u8,
+        owner: std.mem.Allocator,
+    };
+
+    // The HTTP response owns both the buffer and its remaining admission
+    // charge. All response teardown paths free through this allocator.
+    const HostedExtractionBodyOwner = struct {
+        node: *Node,
+        backing: std.mem.Allocator,
+        units: usize,
+
+        const vtable: std.mem.Allocator.VTable = .{
+            .alloc = std.mem.Allocator.noAlloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        };
+
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+            const self: *HostedExtractionBodyOwner = @ptrCast(@alignCast(raw));
+            const backing = self.backing;
+            backing.rawFree(bytes, alignment, return_address);
+            self.node.releaseSlotUnits(self.units);
+            backing.destroy(self);
+        }
+    };
+
+    fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config) !GeneratedExtractionBody {
         var quota: httpx.QuotaAllocator = .{ .backing = allocator, .limit = hosted_extraction_working_bytes };
         return self.generatedExtractionBounded(allocator, envelope, control, registered, if (registered != null) &quota else null) catch |err| {
             if (err == error.OutOfMemory and quota.exceeded) return error.HostedExtractionWorkingLimitExceeded;
@@ -26932,7 +26960,7 @@ pub const Node = struct {
         };
     }
 
-    fn generatedExtractionBounded(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config, quota: ?*httpx.QuotaAllocator) ![]u8 {
+    fn generatedExtractionBounded(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config, quota: ?*httpx.QuotaAllocator) !GeneratedExtractionBody {
         const c = @import("antfly_structured");
         const extractor = c.extraction;
         var arena = std.heap.ArenaAllocator.init(if (quota) |budget| budget.allocator() else allocator);
@@ -26984,7 +27012,11 @@ pub const Node = struct {
             try self.reserveAdmissionUnits(retained_units);
             backend.hosted_units = retained_units;
         }
-        defer if (registered != null) self.releaseSlotUnits(backend.hosted_units);
+        var transferred_units: usize = 0;
+        defer if (registered != null) {
+            const remaining = self.inference_admission.capacityUnits(backend.hosted_units) - transferred_units;
+            if (remaining != 0) self.releaseSlotUnits(remaining);
+        };
         var validation = extractor.Validation{ .config = config };
         const Combined = struct {
             backend: *StructuredGeneration,
@@ -27022,12 +27054,20 @@ pub const Node = struct {
         const generated = try c.execute(a, .{ .require_all = registered != null, .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
         const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
         const response = try extractor.responseValueWithUsage(a, if (registered != null) envelope.object.get("model").?.string else config.generator.model, inputs.array.items, values, if (backend.hosted_usage_complete) generated else null);
-        if (registered == null) return std.json.Stringify.valueAlloc(allocator, response, .{});
+        if (registered == null) return .{ .bytes = try std.json.Stringify.valueAlloc(allocator, response, .{}), .owner = allocator };
         try backend.control.check();
         // QuotaAllocator charges the buffer to the live working set. It adds
         // no allocation header, so the response can free it through the backing
         // allocator after the quota and its HTTP client leave scope.
-        return serializeHostedExtraction(quota.?.allocator(), response, hosted_extraction_result_bytes);
+        const output_allocator = quota.?.allocator();
+        const bytes = try serializeHostedExtraction(output_allocator, response, hosted_extraction_result_bytes);
+        errdefer output_allocator.free(bytes);
+        const units = self.inference_admission.capacityUnits(admissionUnitsFor(bytes.len, read_admission_bytes_per_unit));
+        if (units == 0) return .{ .bytes = bytes, .owner = allocator };
+        const owner = try output_allocator.create(HostedExtractionBodyOwner);
+        owner.* = .{ .node = self, .backing = allocator, .units = units };
+        transferred_units = units;
+        return .{ .bytes = bytes, .owner = .{ .ptr = owner, .vtable = &HostedExtractionBodyOwner.vtable } };
     }
 
     fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
@@ -49648,6 +49688,8 @@ test "named hosted extractor validates upstream output and advertises its capabi
             try std.testing.expectEqualStrings("ExtractorUpstreamOutputTooLarge", rejected.value.object.get("error").?.string);
         }
         if (status == 200) {
+            // The handler has finished, but HTTP still owns the response bytes.
+            try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightUnits());
             var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
             defer parsed.deinit();
             try std.testing.expectEqualStrings("extractors/invoice", parsed.value.object.get("model").?.string);
@@ -49655,6 +49697,8 @@ test "named hosted extractor validates upstream output and advertises its capabi
             const result = parsed.value.object.get("data").?.array.items[0].object;
             try std.testing.expectEqualStrings("receipt", result.get("id").?.string);
             try std.testing.expectEqualStrings("12345", result.get("entities").?.array.items[0].object.get("text").?.string);
+            response.releaseBody();
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
         }
     }
 }
@@ -49725,6 +49769,9 @@ test "hosted image reader routes the inference API alias to chat completions" {
         try std.testing.expectEqual(@as(usize, 0), upstream.routeHitCount(0));
     }
     {
+        const capacity = node.inference_admission.capacity;
+        try node.reserveAdmissionUnits(capacity);
+        defer node.releaseSlotUnits(capacity);
         const override = try std.fmt.allocPrint(a, "{{\"model\":\"readers/ocr\",\"max_tokens\":17,\"images\":[{{\"url\":\"data:image/png;base64,{s}\"}}]}}", .{encoded});
         defer a.free(override);
         var invalid = try httpx.Request.init(a, .POST, "/ai/v1/read");

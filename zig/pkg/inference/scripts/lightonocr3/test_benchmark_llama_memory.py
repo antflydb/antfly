@@ -25,6 +25,7 @@ from benchmark_llama_memory import (
     grounding_quality_passes,
     memory_measurement_valid,
     quality_passes,
+    record_phase_sample,
     run_profile,
     score_case,
 )
@@ -96,6 +97,21 @@ class QualificationTest(unittest.TestCase):
             self.assertEqual(row["error"], str(failure))
             self.assertEqual(row["results"], [])
             self.assertEqual(row["parallel"], 4)
+
+    def test_memory_sample_crossing_a_phase_transition_is_discarded(self):
+        peaks = {}
+        phase = "warmup"
+        metrics = {"rss_bytes": 100, "physical_footprint_bytes": 70}
+
+        def read_across_transition():
+            nonlocal phase
+            phase = "serve"
+            return metrics
+
+        record_phase_sample(peaks, lambda: phase, read_across_transition)
+        self.assertEqual(peaks, {})
+        record_phase_sample(peaks, lambda: phase, lambda: metrics)
+        self.assertEqual(peaks, {"serve": metrics})
 
     def test_memory_qualification_requires_lifetime_and_active_phase_counters(self):
         metrics = {"rss_bytes": 100, "physical_footprint_bytes": 70}

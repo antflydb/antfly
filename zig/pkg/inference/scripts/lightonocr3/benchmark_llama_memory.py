@@ -308,6 +308,15 @@ def grounding_quality_passes(row, case):
     )
 
 
+def record_phase_sample(peaks, current_phase, read_memory):
+    phase = current_phase()
+    values = read_memory()
+    if values and phase == current_phase():
+        phase_peaks = peaks.setdefault(phase, {})
+        for key, value in values.items():
+            phase_peaks[key] = max(phase_peaks.get(key, 0), value)
+
+
 def memory_measurement_valid(peaks, phases, peak_rss, peak_footprint):
     return bool(
         peak_rss and peak_rss > 0 and peak_footprint and peak_footprint > 0
@@ -411,13 +420,14 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
 
         def sample():
             pid = None
-            while not finished.is_set():
+
+            def read_memory():
+                nonlocal pid
                 pid = pid or child_pid(proc.pid)
-                values = process_memory(pid) if pid else None
-                if values:
-                    peaks = sampled_peaks.setdefault(phase, {})
-                    for key, value in values.items():
-                        peaks[key] = max(peaks.get(key, 0), value)
+                return process_memory(pid) if pid else None
+
+            while not finished.is_set():
+                record_phase_sample(sampled_peaks, lambda: phase, read_memory)
                 finished.wait(0.10)
 
         sampler = threading.Thread(target=sample)
@@ -428,11 +438,12 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
             warmup = request_case(url, cases[0], alias)
             if warmup.get("finish") != "stop":
                 raise RuntimeError(f"Warm-up request failed: {warmup}")
+            phase = "idle"
             pid = child_pid(proc.pid)
             idle = process_memory(pid) if pid else None
             if not args.grounding_only:
-                phase = "serve"
                 with ThreadPoolExecutor(max_workers=parallel) as pool:
+                    phase = "serve"
                     start = time.perf_counter()
                     rows = list(
                         pool.map(
@@ -441,9 +452,11 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
                         )
                     )
                     elapsed = time.perf_counter() - start
+                    phase = "idle"
             if grounding_case:
                 phase = "grounding"
                 grounding = request_case(url, grounding_case, alias, "grounding")
+                phase = "idle"
         except (OSError, RuntimeError, ValueError, KeyError) as error:
             failure = str(error)
         finally:
