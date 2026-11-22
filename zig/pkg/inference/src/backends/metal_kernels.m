@@ -56200,7 +56200,7 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
     if (runtime == NULL || lhs_handle == NULL || rhs_handle == NULL || output_handle == NULL) return -1;
     if (runtime->dot_general_2d_f32_pipeline == nil) return -2;
     if (m == 0 || n == 0 || k == 0 || m > UINT32_MAX || n > UINT32_MAX || k > UINT32_MAX || rhs_contract_axis > 1u) return -3;
-    if (m > SIZE_MAX / k || m > SIZE_MAX / n || n > SIZE_MAX / k) return -4;
+    if (m > SIZE_MAX / sizeof(float) / k || m > SIZE_MAX / sizeof(float) / n || n > SIZE_MAX / sizeof(float) / k) return -4;
     @autoreleasepool {
         id<MTLBuffer> lhs_buffer = (__bridge id<MTLBuffer>)lhs_handle;
         id<MTLBuffer> rhs_buffer = (__bridge id<MTLBuffer>)rhs_handle;
@@ -56210,7 +56210,9 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
         const size_t total = m * n;
         const size_t output_bytes = total * sizeof(float);
         if (total > UINT32_MAX) return -5;
-        if (lhs_offset + lhs_bytes > lhs_buffer.length || rhs_offset + rhs_bytes > rhs_buffer.length || output_offset + output_bytes > output_buffer.length) return -6;
+        if (lhs_offset > lhs_buffer.length || lhs_bytes > lhs_buffer.length - lhs_offset ||
+            rhs_offset > rhs_buffer.length || rhs_bytes > rhs_buffer.length - rhs_offset ||
+            output_offset > output_buffer.length || output_bytes > output_buffer.length - output_offset) return -6;
         termite_metal_dot_general_2d_f32_params params = {
             .m = (uint32_t)m,
             .n = (uint32_t)n,

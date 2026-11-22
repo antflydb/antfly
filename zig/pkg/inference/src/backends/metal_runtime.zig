@@ -8804,13 +8804,16 @@ fn decoderRuntimeDotGeneral2DF32DeviceImpl(
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (!lhs.isDevice() or !rhs.isDevice()) return null;
-    if (m == 0 or n == 0 or k == 0 or rhs_contract_axis > 1) return null;
-    if (m > std.math.maxInt(usize) / k or m > std.math.maxInt(usize) / n or n > std.math.maxInt(usize) / k) return null;
-    if (lhs.elemCount() != m * k or rhs.elemCount() != n * k) return null;
-    const out_shape = [_]i32{ @intCast(m), @intCast(n) };
+    if (!lhs.isDevice() or !rhs.isDevice() or lhs.dtype != .f32 or rhs.dtype != .f32) return null;
+    const rows = std.math.cast(i32, m) orelse return null;
+    const columns = std.math.cast(i32, n) orelse return null;
+    if (m == 0 or n == 0 or k == 0 or k > std.math.maxInt(u32) or rhs_contract_axis > 1) return null;
+    if (m > std.math.maxInt(usize) / k or n > std.math.maxInt(usize) / k) return null;
+    const elements = std.math.mul(usize, m, n) catch return null;
+    if (elements > std.math.maxInt(u32) or lhs.elemCount() != m * k or rhs.elemCount() != n * k) return null;
+    const out_shape = [_]i32{ rows, columns };
     if (output_override) |override| {
-        if (!override.isDevice() or override.elemCount() != m * n) return null;
+        if (!override.isDevice() or override.dtype != .f32 or override.elemCount() != elements) return null;
         const rc = termite_metal_decode_runtime_dot_general_2d_f32_device(
             runtime,
             lhs.deviceHandle(),
