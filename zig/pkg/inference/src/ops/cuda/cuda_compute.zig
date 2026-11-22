@@ -60154,13 +60154,13 @@ test "public source audio linear recreates input bank through actual learning ca
         }
     };
     var run = Run{ .cb = cb };
-    var held: ?CT = null;
-    defer if (held) |output| cb.free(output);
-    for (0..6) |iteration| {
+    var held: [2]?CT = @splat(null);
+    defer for (held) |entry| if (entry) |output| cb.free(output);
+    for (0..7) |iteration| {
         if (iteration >= 4) {
             for (&compute.embedding_gemma2_execution.arenas) |*arena| {
                 if (arena.kind != .audio or arena.graph == null) continue;
-                arena.replay_samples = 2;
+                arena.replay_samples = if (iteration == 6) 0 else 2;
                 arena.eager_samples = 0;
                 arena.timing_replay = null;
             }
@@ -60181,19 +60181,20 @@ test "public source audio linear recreates input bank through actual learning ca
         try std.testing.expect(ordinary_pointer != 0 and compute.source_linear_scratch.active);
         const before_calls = run.calls;
         const output = (try cb.audioExecution(0x303, &.{ projected, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
-        defer if (iteration != 4) cb.free(output);
-        if (iteration == 4) held = output;
+        const retain_output = iteration == 3 or iteration == 4;
+        defer if (!retain_output) cb.free(output);
+        if (retain_output) held[iteration - 3] = output;
         try std.testing.expect(compute.source_linear_scratch.active);
         if (iteration == 2) {
             try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);
             try std.testing.expectEqual(@as(u64, 1), compute.audio_arena_executes);
         }
-        if (iteration == 3) {
+        if (iteration == 3 or iteration == 6) {
             try std.testing.expectEqual(before_calls, run.calls); // actual replay bypasses host body
-            try std.testing.expectEqual(@as(u64, 1), compute.audio_graph_replays);
+            try std.testing.expectEqual(@as(u64, if (iteration == 3) 1 else 2), compute.audio_graph_replays);
             try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);
         }
-        if (iteration >= 4) {
+        if (iteration == 4 or iteration == 5) {
             try std.testing.expectEqual(before_calls + 1, run.calls);
             try std.testing.expectEqual(run.output_pointer, tensorFromCt(output).buffer.ptr);
             try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);
@@ -60205,11 +60206,15 @@ test "public source audio linear recreates input bank through actual learning ca
         storage_live = false;
         try std.testing.expect(!compute.source_linear_scratch.active and compute.source_linear_scratch.buffer.ptr == 0);
     }
-    const held_values = try cb.toFloat32(held.?, std.testing.allocator);
-    defer std.testing.allocator.free(held_values);
-    try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 5 }, held_values);
+    try std.testing.expect(tensorFromCt(held[0].?).buffer.ptr != tensorFromCt(held[1].?).buffer.ptr);
+    for (held, 4..) |entry, value| {
+        const held_values = try cb.toFloat32(entry.?, std.testing.allocator);
+        defer std.testing.allocator.free(held_values);
+        const expected: [4]f32 = @splat(@floatFromInt(value));
+        try std.testing.expectEqualSlices(f32, &expected, held_values);
+    }
     try std.testing.expectEqual(@as(usize, 5), run.calls);
-    try std.testing.expectEqual(@as(u64, 4), compute.audio_arena_executes);
+    try std.testing.expectEqual(@as(u64, 5), compute.audio_arena_executes);
 }
 
 test "source GEMM row descriptors reject missing physical input before opaque CUDA access" {
