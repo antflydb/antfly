@@ -26383,7 +26383,13 @@ pub const DB = struct {
         if (producer != .unlabelled) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            const authority = @import("../source_authority.zig");
+            const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            if (producer == .ordinary) {
+                try authority.requireNativeOrUnbound(&read, namespace);
+            } else {
+                _ = try authority.require(&read, .native, namespace);
+            }
         }
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
             var read = try self.core.store.beginReadTxn();

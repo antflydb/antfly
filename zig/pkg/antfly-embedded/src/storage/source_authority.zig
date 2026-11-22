@@ -87,6 +87,15 @@ pub fn require(txn: anytype, kind: Kind, namespace: [24]u8) !State {
     return state;
 }
 
+/// Embedded roots without a source binding can admit ordinary local writes.
+/// An existing binding or ordered marker still fences local producer admission.
+pub fn requireNativeOrUnbound(txn: anytype, namespace: [24]u8) !void {
+    if (try load(txn)) |state| {
+        if (state.kind != .native or !std.mem.eql(u8, &state.namespace, &namespace)) return error.OnlineSourceScopeChanged;
+    }
+    try requireNoRaftMarker(txn);
+}
+
 fn requireNoRaftMarker(txn: anytype) !void {
     const marker = txn.get(&keys.ordered_document_applied_entry_key) catch |err| switch (err) {
         error.NotFound => null,
