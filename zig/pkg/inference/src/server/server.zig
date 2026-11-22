@@ -1326,18 +1326,17 @@ fn accountHostedUpstreamReply(total: *usize, bytes: usize, limit: usize) !void {
     total.* += bytes;
 }
 
-fn serializeHostedExtraction(allocator: std.mem.Allocator, response: std.json.Value, output_limit: usize, working_available: usize) ![]u8 {
+fn serializeHostedExtraction(allocator: std.mem.Allocator, response: std.json.Value, output_limit: usize) ![]u8 {
     // Size before allocating so the response owns one exact-size buffer.
     var scratch: [1024]u8 = undefined;
     var counter = std.Io.Writer.Discarding.init(&scratch);
     std.json.Stringify.value(response, .{}, &counter.writer) catch unreachable;
     const bytes = std.math.cast(usize, counter.fullCount()) orelse return error.ExtractorResponseTooLarge;
     if (bytes > output_limit) return error.ExtractorResponseTooLarge;
-    if (bytes > working_available) return error.HostedExtractionWorkingLimitExceeded;
     const result = try allocator.alloc(u8, bytes);
     errdefer allocator.free(result);
     var writer: std.Io.Writer = .fixed(result);
-    std.json.Stringify.value(response, .{}, &writer) catch unreachable;
+    std.json.Stringify.value(response, .{}, &writer) catch return error.ExtractorResponseTooLarge;
     return result;
 }
 
@@ -27024,9 +27023,11 @@ pub const Node = struct {
         const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
         const response = try extractor.responseValueWithUsage(a, if (registered != null) envelope.object.get("model").?.string else config.generator.model, inputs.array.items, values, if (backend.hosted_usage_complete) generated else null);
         if (registered == null) return std.json.Stringify.valueAlloc(allocator, response, .{});
-        const budget = quota.?;
         try backend.control.check();
-        return serializeHostedExtraction(allocator, response, hosted_extraction_result_bytes, budget.limit -| budget.live);
+        // QuotaAllocator charges the buffer to the live working set. It adds
+        // no allocation header, so the response can free it through the backing
+        // allocator after the quota and its HTTP client leave scope.
+        return serializeHostedExtraction(quota.?.allocator(), response, hosted_extraction_result_bytes);
     }
 
     fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
@@ -49520,9 +49521,12 @@ test "hosted extraction aggregate and rendered limits are independent" {
     try std.testing.expectEqual(@as(usize, 8), total);
 
     const response: std.json.Value = .{ .string = "a\nb" };
-    try std.testing.expectError(error.ExtractorResponseTooLarge, serializeHostedExtraction(a, response, 5, 16));
-    try std.testing.expectError(error.HostedExtractionWorkingLimitExceeded, serializeHostedExtraction(a, response, 6, 5));
-    const output = try serializeHostedExtraction(a, response, 6, 6);
+    try std.testing.expectError(error.ExtractorResponseTooLarge, serializeHostedExtraction(a, response, 5));
+    var quota: httpx.QuotaAllocator = .{ .backing = a, .limit = 5 };
+    try std.testing.expectError(error.OutOfMemory, serializeHostedExtraction(quota.allocator(), response, 6));
+    try std.testing.expect(quota.exceeded);
+    quota.limit = 6;
+    const output = try serializeHostedExtraction(quota.allocator(), response, 6);
     defer a.free(output);
     try std.testing.expectEqualStrings("\"a\\nb\"", output);
 }
