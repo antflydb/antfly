@@ -490,7 +490,8 @@ fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, r
     var record = (try store.loadRegistration(alloc, request.reference_id)) orelse
         return request.action == .acknowledge or (request.action == .status and @import("completion_outbox.zig").isObservation(request.reference_id));
     defer record.deinit();
-    const floor = try store.registrationFloorFor(request.reference_id);
+    const observation = @import("completion_outbox.zig").isObservation(request.reference_id);
+    const floor = if (observation) 0 else try store.registrationFloor();
     var outcome = record.value.outcome;
     const hex = std.fmt.bytesToHex(request.reference_id, .lower);
     outcome.reference_id = &hex;
@@ -531,7 +532,7 @@ fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, r
         if (record.value.phase == .acknowledging) return true;
         return settled(server, alloc, .{ .outcomes = &.{outcome} }, context);
     }
-    if (@import("completion_outbox.zig").isObservation(request.reference_id)) {
+    if (observation) {
         const id = try parseId(outcome.transaction_id orelse return error.InvalidTransactionSessionRecord);
         if (record.value.phase != .acknowledging and !try store.completionReferenceSettled(id, request.reference_id)) return false;
         try store.retireLocalPreparedRegistration(request.reference_id, id);

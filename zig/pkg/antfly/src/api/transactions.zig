@@ -1903,7 +1903,7 @@ pub const DurableSessionStore = struct {
                         return reference;
                     } else |err| if (err != error.NotFound) return err;
                 }
-                const floor = outbox.ownerFloor((try outbox.producer(txn, self.alloc, value.seed)).retired_through);
+                const floor: ?u64 = if (value.observe_only) null else (try outbox.producer(txn, self.alloc, value.seed)).retired_through;
                 const reference = try outbox.create(txn, self.alloc, value.seed, value.outcome, value.prepared);
                 var issuer_fence_buf: [128]u8 = undefined;
                 const issuer_fence = try sqlPinIssuerFenceKey(self.registration_issuer orelse 0, &issuer_fence_buf);
@@ -7994,7 +7994,12 @@ const ExpiryPosition = IndexPosition(@as(usize, @max(session_expiry_prefix.len, 
 fn parseExpiryKey(prefix: []const u8, key: []const u8) ?ParsedSessionExpiryKey {
     if (!std.mem.startsWith(u8, key, prefix)) return null;
     const suffix = key[prefix.len..];
-    if (suffix.len < 18 or suffix[16] != ':') return null;
+    if (suffix.len != 49 or suffix[16] != ':') return null;
+    // Cutoff comparisons rely on the canonical byte order used by the writer.
+    for (suffix[0..16]) |byte| switch (byte) {
+        '0'...'9', 'a'...'f' => {},
+        else => return null,
+    };
     return .{
         .timestamp = std.fmt.parseUnsigned(u64, suffix[0..16], 16) catch return null,
         .txn_id = distributed_txn.parseTxnIdHex(suffix[17..]) catch return null,
