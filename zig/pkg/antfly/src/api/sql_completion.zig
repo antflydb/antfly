@@ -106,7 +106,11 @@ pub fn prepareTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
         alloc.free(owned_id);
         return err;
     };
-    const outcome = &completion.outcomes.items[completion.outcomes.items.len - 1];
+    const index = completion.outcomes.items.len - 1;
+    const outcome = &completion.outcomes.items[index];
+    // An intent that never returned a reference must not be published as
+    // an unprepared outcome by the response path.
+    errdefer if (outcome.reference_id == null) discardOutcome(completion, alloc, index);
     const encoded = try alloc.alloc(u8, 32);
     errdefer if (outcome.reference_id == null) alloc.free(encoded);
     var seed: [8]u8 = undefined;

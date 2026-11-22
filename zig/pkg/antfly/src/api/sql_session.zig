@@ -47,6 +47,9 @@ pub const Coordinator = struct {
         const info = (try server.txn_sessions.readInfo(id)) orelse return error.SqlTransactionNotActive;
         if (info.version.owner != server.localSessionNodeId()) return error.SessionLeaseLost;
         if (info.terminal_abort) return .{ .outcome = .aborted, .reconciliation_id = id };
+        // The owner must know the completion reference before any COMMIT
+        // write can leave its outcome uncertain, including session retirement.
+        if (self.context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
         var lake_validation: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = self.identity, .context = self.context };
         lake_validation.validateAcceptedSerializable(alloc, id) catch |err| {
             if (err != error.SqlWriteConflict) return err;
@@ -73,7 +76,6 @@ pub const Coordinator = struct {
         const source = server.table_writes orelse return error.UnsupportedSqlExecution;
         var prepared = try server.preparePublicCommitWithIntegrity(alloc, tables, self.context);
         defer prepared.deinit();
-        if (self.context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
         var plan = (server.txn_sessions.sealExecutionPlan(alloc, guard, prepared.tables) catch |err| switch (err) {
             error.SessionWriteOutcomeUnknown => return .{ .outcome = .unknown, .reconciliation_id = id },
             else => return err,
