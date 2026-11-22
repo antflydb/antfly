@@ -25,6 +25,19 @@ pub const EncoderOutputs = union(enum) {
     host: []backends.Tensor,
     resident: struct { values: session_mod.ResidentOutputs, shape: [3]i64, incremental_receiver: ?Incremental.Receiver = null },
 
+    /// Validate the destination and publication before a consumer retains
+    /// the encoder resources or detaches the producer's physical output.
+    pub fn incrementalReceiverFor(self: *const EncoderOutputs, destination: backends.Session) !?Incremental.Receiver {
+        const resident = switch (self.*) {
+            .host => return null,
+            .resident => |*value| value,
+        };
+        const receiver = resident.incremental_receiver orelse return null;
+        if (receiver.destination_ptr != destination.ptr or receiver.destination_vtable != destination.vtable or resident.values.outputs.len != 1)
+            return error.InvalidIncrementalReceiver;
+        return receiver;
+    }
+
     pub fn deinit(self: *EncoderOutputs, allocator: std.mem.Allocator) void {
         self.deinitWithCleanup(allocator, .{ .outside_execution = true });
     }
@@ -312,10 +325,6 @@ pub fn outputVocabulary(decoder: backends.Session) ?usize {
     const outputs = decoder.outputInfo();
     if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3 or outputs[0].shape[2] <= 0) return null;
     return std.math.cast(usize, outputs[0].shape[2]);
-}
-
-pub fn encodeForFinalRow(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control) !EncoderOutputs {
-    return encodeForFinalRowWithPermit(allocator, encoder, decoder, inputs, dispatch, control, null);
 }
 
 pub fn encodeForFinalRowWithPermit(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {

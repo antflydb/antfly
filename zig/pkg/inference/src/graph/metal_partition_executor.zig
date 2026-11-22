@@ -1855,8 +1855,9 @@ pub const MetalPartitionExecutor = struct {
         const planned_primitives = if (exec_ctx.options) |opts| opts.planned_device_execution else false;
         const owned_frame = if (options.physical_frame) |frame| frame.pool.completeOwnedPayload() != null and frame.pool.metal_frame_dispatch else false;
         if (owned_frame and !ownedFramePolicyAvailable()) return error.PreparedMetalFramePolicyChanged;
+        const compatibility_banks = !owned_frame and !synchronous_regions;
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        if (!owned_frame and !synchronous_regions and (reservePartitionGraphPlanForExecution(chunk_ops) or
+        if (compatibility_banks and (reservePartitionGraphPlanForExecution(chunk_ops) or
             (planned_primitives and !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false))))
         {
             var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
@@ -1877,15 +1878,15 @@ pub const MetalPartitionExecutor = struct {
 
         // Phase-0 slot-bound output pool (persistent executor only). Binds
         // node outputs to fixed device buffers reused across steps.
-        const slot_bound_outputs = !synchronous_regions and self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
+        const slot_bound_outputs = compatibility_banks and self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
         if (slot_bound_outputs) self.ensureOutputPool(cb, buffer_plan) catch {};
-        const eager_arena_outputs = !synchronous_regions and self.owned and cb.kind() == .metal and metalEagerArenaEnabled();
+        const eager_arena_outputs = compatibility_banks and self.owned and cb.kind() == .metal and metalEagerArenaEnabled();
         var eager_arena = MetalEagerArena{};
         defer eager_arena.deinit(allocator, cb);
         if (eager_arena_outputs) {
             eager_arena.init(allocator, buffer_plan.allocations.len) catch {};
         }
-        const chunk_local_outputs = !synchronous_regions and self.owned and cb.kind() == .metal and chunk_ops > 0 and metalChunkLocalOutputsEnabled();
+        const chunk_local_outputs = compatibility_banks and self.owned and cb.kind() == .metal and chunk_ops > 0 and metalChunkLocalOutputsEnabled();
         var chunk_local_pool = ChunkLocalOutputPool{};
         defer chunk_local_pool.deinit(allocator, cb);
         if (chunk_local_outputs) {
@@ -1893,7 +1894,7 @@ pub const MetalPartitionExecutor = struct {
         }
         var resident_input_cache = ResidentInputCache{};
         defer resident_input_cache.deinit(allocator, cb);
-        const resident_input_cache_enabled = !synchronous_regions and self.owned and cb.kind() == .metal and (gatherPromoteInputEnabled() or reducePromoteInputEnabled());
+        const resident_input_cache_enabled = compatibility_banks and self.owned and cb.kind() == .metal and (gatherPromoteInputEnabled() or reducePromoteInputEnabled());
         if (resident_input_cache_enabled) {
             try resident_input_cache.init(allocator, graph, node_ids);
         }

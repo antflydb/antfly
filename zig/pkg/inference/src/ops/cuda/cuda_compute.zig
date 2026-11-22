@@ -3944,7 +3944,7 @@ pub const CudaCompute = struct {
                     owner.phase = .disabled;
                 } else owner.phase = .capture;
             } else if (capture) {
-                const matches = scope.valid and scope.cursor == owner.plan.?.event_count and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
+                const matches = scope.complete() and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
                 capture_active = false;
                 owner.pending_graph = try graph_mod.endRecording(&compute.ctx);
                 if (!matches) return error.InvalidExecutionPlan;
@@ -7866,7 +7866,7 @@ pub const CudaCompute = struct {
             inputs[index] = .{ .shape = shapes[index][0..1], .elements = recipe.hidden / recipe.heads };
         }
         const execution_key = recipe.key(segments[0..recipe.count], 0, 12);
-        const base = try self.audioCacheBase(execution_key, &inputs);
+        const base = try self.audioCacheBase(execution_key, &inputs, null);
         if (base.input_bytes > 128 * 1024 * 1024) return;
         if (self.embedding_gemma2_policy.audio_graph) for (self.audio_plans.entries) |entry| {
             if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled and entry.owner == null) {
@@ -7915,7 +7915,9 @@ pub const CudaCompute = struct {
     }
     pub const AudioCacheInput = struct { shape: []const i64, elements: usize };
     const AudioCacheBase = struct { key: u64, input_bytes: usize };
-    fn audioCacheBase(self: *const CudaCompute, key: u64, inputs: []const AudioCacheInput) !AudioCacheBase {
+    const AudioInputSpan = struct { offset: usize, bytes: usize };
+    fn audioCacheBase(self: *const CudaCompute, key: u64, inputs: []const AudioCacheInput, spans: ?[]AudioInputSpan) !AudioCacheBase {
+        if (spans) |output| if (output.len != inputs.len) return error.InvalidShape;
         var hash = std.hash.Wyhash.init(key);
         const bits = self.embedding_gemma2_policy.arithmeticBits();
         hash.update(std.mem.asBytes(&bits));
@@ -7923,11 +7925,13 @@ pub const CudaCompute = struct {
         hash.update(std.mem.asBytes(&self.cublaslt_workspace_scratch.buffer.ptr));
         hash.update(std.mem.asBytes(&self.embedding_gemma2_constant_generation));
         var input_bytes: usize = 0;
-        for (inputs) |input| {
+        for (inputs, 0..) |input, index| {
             hash.update(std.mem.sliceAsBytes(input.shape));
             const bytes = try checkedMul(input.elements, 4);
             hash.update(std.mem.asBytes(&bytes));
-            const aligned = std.mem.alignBackward(usize, try checkedAdd(bytes, 255), 256);
+            if (spans) |output| output[index] = .{ .offset = input_bytes, .bytes = bytes };
+            const alignment = @import("../../execution/stream_workspace.zig").alignment;
+            const aligned = std.mem.alignBackward(usize, try checkedAdd(bytes, alignment - 1), alignment);
             input_bytes = try checkedAdd(input_bytes, aligned);
         }
         return .{ .key = hash.final(), .input_bytes = input_bytes };
@@ -7948,7 +7952,7 @@ pub const CudaCompute = struct {
     /// cache entry, touching its LRU, or replaying numerical work for planning.
     pub fn audioCacheRequest(self: *const CudaCompute, key: u64, inputs: []const AudioCacheInput) !?CacheFunding.Request {
         if (!self.embedding_gemma2_policy.audio_graph or inputs.len == 0 or inputs.len > 20) return null;
-        const base = try self.audioCacheBase(key, inputs);
+        const base = try self.audioCacheBase(key, inputs, null);
         if (base.input_bytes > 128 * 1024 * 1024) return null;
         for (self.audio_plans.entries) |entry| if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled) {
             const plan = entry.plan orelse return null;
@@ -20590,16 +20594,21 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         try ensureF32(tensor);
         metadata.* = .{ .shape = tensor.shape, .elements = tensor.elem_count };
     }
-    const cache_base = try self.audioCacheBase(key, input_metadata[0..inputs.len]);
+    var input_spans: [20]CudaCompute.AudioInputSpan = undefined;
+    const spans = input_spans[0..inputs.len];
+    const cache_base = try self.audioCacheBase(key, input_metadata[0..inputs.len], spans);
+    for (inputs, spans) |ct, span| {
+        if (span.bytes > tensorFromCt(ct).buffer.len) return error.InvalidShape;
+    }
     const input_bytes = cache_base.input_bytes;
     if (input_bytes > 128 * 1024 * 1024) return null;
     var canonical: [20]CT = undefined;
     var canonical_count: usize = 0;
     defer for (canonical[0..canonical_count]) |ct| freeTensor(self, ct);
-    for (inputs) |ct| {
+    for (inputs, spans) |ct, span| {
         const t = tensorFromCt(ct);
         const alias = try borrowModelConstant(self, t);
-        tensorFromCt(alias).buffer.len = t.elem_count * 4;
+        tensorFromCt(alias).buffer.len = span.bytes;
         canonical[canonical_count] = alias;
         canonical_count += 1;
     }
@@ -20660,13 +20669,12 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     defer arena.noteUse(&self.ctx);
     var stable: [20]CT = undefined;
     var count: usize = 0;
-    var offset: usize = 0;
     defer for (stable[0..count]) |ct| freeTensor(self, ct);
-    for (inputs) |ct| {
+    const input_bank = try audioBufferView(arena.buffers[0], 0, storage.scratch_offset);
+    for (inputs, spans) |ct, span| {
         const t = tensorFromCt(ct);
-        const n = t.elem_count * 4;
-        const buffer = try audioBufferView(arena.buffers[0], offset, n);
-        try copyFromDeviceTracked(self, buffer, t.buffer, n);
+        const buffer = try audioBufferView(input_bank, span.offset, span.bytes);
+        try copyFromDeviceTracked(self, buffer, t.buffer, span.bytes);
         const shape = try self.allocator.dupe(i64, t.shape);
         const borrowed = createTensor(self, buffer, shape, t.elem_count) catch |err| {
             self.allocator.free(shape);
@@ -20675,7 +20683,6 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         tensorFromCt(borrowed).owns_buffer = false;
         stable[count] = borrowed;
         count += 1;
-        offset += std.mem.alignForward(usize, n, 256);
     }
     // Collect only completed events, with no new stream/device wait.
     if (arena.timing_replay) |replay| if (arena.timing) |pair| {
@@ -20719,7 +20726,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         };
         self.execution_scope = null;
         const result_tensor = tensorFromCt(result);
-        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.valid and scope.cursor == storage.events and result_tensor.buffer.ptr == arena.buffers[0].ptr + output.offset;
+        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.complete() and result_tensor.buffer.ptr == arena.buffers[0].ptr + output.offset;
         if (!matches and capture) graph_mod.discardRecording(&self.ctx);
         if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
         freeTensor(self, result);
@@ -60471,13 +60478,21 @@ test "source bias workspace policy isolates audio warm and arena plan identities
     compute.embedding_gemma2_constant_generation = 11;
     compute.cublaslt_workspace_scratch.buffer.ptr = 0x100000;
     const shape = [_]i64{ 1, 25, 1024 };
-    const inputs = [_]CudaCompute.AudioCacheInput{.{ .shape = &shape, .elements = 25 * 1024 }};
+    const inputs = [_]CudaCompute.AudioCacheInput{
+        .{ .shape = &.{3}, .elements = 3 },
+        .{ .shape = &shape, .elements = 25 * 1024 },
+    };
     // Context/driver/allocator remain poisoned: cache metadata has no SDK work.
-    const original = try compute.audioCacheBase(42, &inputs);
+    var spans: [inputs.len]CudaCompute.AudioInputSpan = undefined;
+    const original = try compute.audioCacheBase(42, &inputs, &spans);
+    try std.testing.expectEqualDeep(try compute.audioCacheBase(42, &inputs, null), original);
+    try std.testing.expectEqualDeep(CudaCompute.AudioInputSpan{ .offset = 0, .bytes = 12 }, spans[0]);
+    try std.testing.expectEqualDeep(CudaCompute.AudioInputSpan{ .offset = 256, .bytes = 25 * 1024 * 4 }, spans[1]);
+    try std.testing.expectEqual(@as(usize, 256 + 25 * 1024 * 4), original.input_bytes);
     var stale_plan: @import("audio_execution_plan.zig").Plan = .{ .peak = std.math.maxInt(usize) };
     compute.audio_plans.entries[0] = .{ .key = original.key, .stamp = 1, .warmed = true, .plan = &stale_plan };
     compute.embedding_gemma2_policy.source_bias_workspace = .source_1mib;
-    const candidate = try compute.audioCacheBase(42, &inputs);
+    const candidate = try compute.audioCacheBase(42, &inputs, null);
     try std.testing.expect(candidate.key != original.key);
     try std.testing.expectEqual(original.input_bytes, candidate.input_bytes);
     // The old plan would overflow funding if inspected under the new policy.

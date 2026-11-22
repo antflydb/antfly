@@ -57,12 +57,8 @@ pub const RetainedEncoderSource = Native.Source;
 /// The caller owns the mutable encoder holder during promotion. The source
 /// owns its shape snapshot and an independent complete storage/provider pin.
 pub fn retainIncrementalSource(allocator: std.mem.Allocator, encoded: *stages.EncoderOutputs, decoder: backends.Session) !?RetainedEncoderSource {
-    const resident = switch (encoded.*) {
-        .host => return null,
-        .resident => |*value| value,
-    };
-    const receiver = resident.incremental_receiver orelse return null;
-    if (receiver.destination_ptr != decoder.ptr or receiver.destination_vtable != decoder.vtable or resident.values.outputs.len != 1) return error.InvalidIncrementalReceiver;
+    const receiver = (try encoded.incrementalReceiverFor(decoder)) orelse return null;
+    const resident = &encoded.resident;
     const pin = try resident.values.retainResources(allocator);
     return .{ .receiver = receiver, .value = resident.values.outputs[0], .backend = resident.values.backend, .shape = resident.shape, .resources = pin };
 }

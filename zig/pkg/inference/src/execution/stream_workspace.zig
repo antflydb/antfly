@@ -133,6 +133,10 @@ pub const Scope = struct {
         return .{ .plan = plan, .base = backing + layout.scratch_offset };
     }
 
+    pub fn complete(self: *const Scope) bool {
+        return self.base != 0 and self.valid and self.cursor == self.plan.event_count;
+    }
+
     pub fn owns(self: *const Scope, pointer: DevicePointer) bool {
         return self.base != 0 and pointer >= self.base and pointer - self.base < self.plan.peak;
     }
@@ -187,7 +191,7 @@ test "LightOnOCR3 CUDA closed execution arena rejects live buffers and event dri
     try std.testing.expectEqual(a, c);
     scope.release(b);
     scope.release(c);
-    try std.testing.expect(scope.valid and scope.cursor == p.event_count);
+    try std.testing.expect(scope.complete());
     var changed = Scope{ .plan = p, .base = 10000 };
     _ = try changed.allocate(256);
     try std.testing.expectError(error.AudioPlanChanged, changed.allocate(256));
