@@ -1988,6 +1988,11 @@ test "webm demux rejects non-EBML input" {
 }
 
 pub fn buildFlacTestFileAlloc(a: std.mem.Allocator, bytes: []const u8, unknown_total: bool) ![]u8 {
+    return buildFlacTestBlocksAlloc(a, bytes, unknown_total, 1);
+}
+
+pub fn buildFlacTestBlocksAlloc(a: std.mem.Allocator, bytes: []const u8, unknown_total: bool, frames_per_block: usize) ![]u8 {
+    if (frames_per_block == 0) return error.InvalidArgument;
     const end = try flacMetadataEnd(bytes);
     const private = try a.dupe(u8, bytes[0..end]);
     defer a.free(private);
@@ -2001,12 +2006,16 @@ pub fn buildFlacTestFileAlloc(a: std.mem.Allocator, bytes: []const u8, unknown_t
     }
     var offset = end;
     while (offset < bytes.len) {
-        var frame = try flac.decodeFrameAlloc(a, info_block, bytes[offset..]);
-        defer frame.deinit();
-        const block = try buildSimpleBlockNoLacing(a, 1, bytes[offset..][0..frame.consumed]);
+        const first = offset;
+        for (0..frames_per_block) |_| {
+            if (offset == bytes.len) break;
+            var frame = try flac.decodeFrameAlloc(a, info_block, bytes[offset..]);
+            defer frame.deinit();
+            offset += frame.consumed;
+        }
+        const block = try buildSimpleBlockNoLacing(a, 1, bytes[first..offset]);
         errdefer a.free(block);
         try blocks.append(a, block);
-        offset += frame.consumed;
     }
     const entry = try buildAudioTrackEntry(a, 1, "A_FLAC", private, 2, null);
     defer a.free(entry);

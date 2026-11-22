@@ -835,7 +835,9 @@ test "WebM AV1 range header walking skips padded packet payload" {
     try buffered.walk(first.bytes, &expected, Capture.accept);
     try ranged.walkRange(&source, 0, length, &actual, Capture.accept);
     try std.testing.expectEqual(expected.count, actual.count);
-    try std.testing.expect(ahead.transferred_bytes < 32 * 1024);
+    try std.testing.expect(first.bytes.len > 1024);
+    try std.testing.expect(ahead.transferred_bytes < 1024);
+    try std.testing.expect(ahead.reads <= 3);
     try std.testing.expectEqual(buffered.packet_sequence, ranged.packet_sequence);
 }
 

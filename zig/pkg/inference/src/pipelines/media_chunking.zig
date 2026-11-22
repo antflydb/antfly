@@ -585,6 +585,12 @@ pub const Runner = struct {
         }
     }
     fn soundWindows(self: *Runner, provider: @import("media_chunking_audio.zig").Provider) !void {
+        self.emitSoundWindows(provider) catch |err| {
+            if (!self.stopPageOnReadPressure(err)) return err;
+        };
+    }
+
+    fn emitSoundWindows(self: *Runner, provider: @import("media_chunking_audio.zig").Provider) !void {
         defer self.finishSpeakers();
         try self.prepareSpeakers(provider);
         if (provider.sample_rate == 0) return error.UnsupportedAudioFormat;
@@ -1340,7 +1346,7 @@ pub const Runner = struct {
             var payloads: [2]Payload = undefined;
             for (payloads[0..count], 0..) |*payload, i| payload.* = slots[(active + i) % slots.len].payload;
             const outputs: ?[]Output = if (count > 1) self.executor.embed_video_batch.?(self.executor.context, self.allocator, payloads[0..count]) catch |err| blk: {
-                if (!videoPageReadPressure(err) and !@import("embedding_gemma2.zig").videoSpeculationPressure(err) and err != error.BatchIncompatible and (!self.request.allow_partial or abort(err))) return err;
+                if (!pageReadPressure(err) and !@import("embedding_gemma2.zig").videoSpeculationPressure(err) and err != error.BatchIncompatible and (!self.request.allow_partial or abort(err))) return err;
                 schedule.join();
                 // A following producer cannot remain active while an earlier
                 // dependency span is replayed against the shared source/codec.
@@ -1398,12 +1404,7 @@ pub const Runner = struct {
         var cursor = try self.videoCursor(duration);
         const base = self.ordinal;
         self.emitVideoWindows(source, &cursor) catch |err| {
-            if (self.request.max_chunks != 0 and self.summary.emitted != 0 and videoPageReadPressure(err)) {
-                // The next request has fresh source quotas. Resume at the
-                // last sink acknowledgment, even if preparation ran ahead.
-                self.stopped = true;
-                return;
-            }
+            if (self.stopPageOnReadPressure(err)) return;
             const terminal = videoTerminal(err) orelse return err;
             self.summary.page_terminal = terminal;
             return terminal.failure();
@@ -1428,12 +1429,19 @@ pub const Runner = struct {
         }
     }
 
-    fn videoPageReadPressure(err: anyerror) bool {
+    fn stopPageOnReadPressure(self: *Runner, err: anyerror) bool {
+        if (self.request.max_chunks == 0 or self.summary.emitted == 0 or !pageReadPressure(err)) return false;
+        // Resume from sink coverage, even if planning has advanced locally.
+        self.stopped = true;
+        return true;
+    }
+
+    fn pageReadPressure(err: anyerror) bool {
         return err == error.RemoteReadBudgetExceeded or err == error.RemoteRequestBudgetExceeded;
     }
 
     fn deferVideoWindowFailure(err: anyerror) bool {
-        return videoTerminal(err) != null or videoPageReadPressure(err);
+        return videoTerminal(err) != null or pageReadPressure(err);
     }
 
     fn videoTerminal(err: anyerror) ?chunker.types.ChunkPage.Terminal {
@@ -1589,6 +1597,30 @@ test "model aware media video windows use original MP4 and WebM timing and stop 
     runner = try Runner.init(a, .{ .input = .{ .binary = .{ .mime_type = "video/webm", .data = @embedFile("../testdata/video/vp9.webm") } } }, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
     try std.testing.expect((try runner.run()).complete);
     try std.testing.expect(result.kinds[@backingInt(planning.Kind.video)] >= 2);
+}
+test "model aware media remote audio pressure preserves acknowledged coverage" {
+    const a = std.testing.allocator;
+    const Audio = @import("media_chunking_audio.zig");
+    const Input = struct {
+        pcm: [1000]f32 = @splat(0.25),
+        fn read(raw: *anyopaque, _: std.mem.Allocator, first: usize, last: usize) !Audio.Lease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (last > self.pcm.len) return error.RemoteReadBudgetExceeded;
+            return .{ .pcm = .{ .samples = self.pcm[first..last], .sample_rate = 1000 } };
+        }
+    };
+    var source = Input{};
+    const provider = Audio.Provider{ .context = &source, .samples = 3000, .sample_rate = 1000, .read = Input.read };
+    var result = Qualification{};
+    var request = Request{ .input = .{ .binary = .{ .mime_type = "audio/webm", .data = "fixture" } }, .max_chunks = 3, .policy = .{ .window_ns = std.time.ns_per_s } };
+    var runner = try Runner.init(a, request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+    try runner.soundWindows(provider);
+    try std.testing.expect(runner.stopped);
+    try std.testing.expectEqual(@as(u64, 1), runner.summary.next_ordinal);
+    var token: [85]u8 = undefined;
+    request.continuation = runner.summary.identity.cursor(runner.summary.next_ordinal, &token);
+    runner = try Runner.init(a, request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+    try std.testing.expectError(error.RemoteReadBudgetExceeded, runner.soundWindows(provider));
 }
 test "model aware media remote video pressure preserves acknowledged coverage" {
     const a = std.testing.allocator;

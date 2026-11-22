@@ -202,7 +202,7 @@ pub const Session = struct {
             const prefix_size = switch (kind) {
                 // Frame and tile OBUs include entropy payload after the
                 // uncompressed header. Tile extents are read independently.
-                6 => if (packet == .range) @min(4096, descriptor.size) else descriptor.size,
+                6 => if (packet == .range) @min(128, descriptor.size) else descriptor.size,
                 4 => @min(4, descriptor.size),
                 1, 3, 7 => descriptor.size,
                 else => 0,
@@ -221,11 +221,25 @@ pub const Session = struct {
                 },
                 3, 6 => {
                     if (!self.have_sequence or self.pending or payload.len == 0) return error.InvalidVideoData;
-                    self.current = .{};
-                    self.current.temporal_id = temporal;
-                    self.current.spatial_id = spatial;
-                    var bits = initBits(payload);
-                    if (grammar.parse_frame_hdr(&self.context, &bits) < 0 or bits.@"error" != 0) return error.InvalidVideoData;
+                    var bits: grammar.GetBits = undefined;
+                    const probe_limit = if (packet == .range and kind == 6) @min(4096, descriptor.size) else descriptor.size;
+                    while (true) {
+                        self.current = .{};
+                        self.current.temporal_id = temporal;
+                        self.current.spatial_id = spatial;
+                        bits = initBits(prefix.bytes);
+                        const parsed = grammar.parse_frame_hdr(&self.context, &bits);
+                        if (bits.@"error" == 0) {
+                            if (parsed < 0) return error.InvalidVideoData;
+                            // Keep room for the tile-group header following
+                            // the combined frame header.
+                            if (prefix.bytes.len == descriptor.size or @intFromPtr(bits.ptr_end) - @intFromPtr(bits.ptr) >= 4 or prefix.bytes.len == probe_limit) break;
+                        }
+                        if (prefix.bytes.len >= probe_limit) return error.InvalidVideoData;
+                        const next = @min(probe_limit, prefix.bytes.len * 2);
+                        prefix.deinit();
+                        prefix = try packet.read(payload_offset, next);
+                    }
                     try self.owner.result();
                     if (first_frame) {
                         self.packet_restart_needs_sequence = self.packet_sequence == null;
@@ -252,7 +266,7 @@ pub const Session = struct {
                         if (kind == 6) {
                             // Frame OBU appends a tile-group header directly to
                             // the uncompressed header's bitstream, then aligns.
-                            try self.tiles(&bits, packet, payload, payload_offset, descriptor.size, context, accept);
+                            try self.tiles(&bits, packet, prefix.bytes, payload_offset, descriptor.size, context, accept);
                         }
                     }
                 },
