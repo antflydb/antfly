@@ -16179,9 +16179,12 @@ fn roundedBf16ProjectionBytes(self: *CudaCompute, rows: usize, out_dim: usize) ?
     if (count > std.math.maxInt(u32)) return null;
     return bytes;
 }
+fn roundedBf16ProjectionWorkspaceLimit(self: *const CudaCompute) usize {
+    return if (self.lighton_bf16_projection_outputs) 128 * 1024 * 1024 else lighton_bf16_decode_scratch_bytes;
+}
+
 fn roundedBf16ProjectionCapacity(self: *CudaCompute, bytes: usize) bool {
-    const scratch_bytes: usize = if (self.lighton_bf16_projection_outputs) 128 * 1024 * 1024 else lighton_bf16_decode_scratch_bytes;
-    if (bytes > scratch_bytes) return false;
+    if (bytes > roundedBf16ProjectionWorkspaceLimit(self)) return false;
     const existing = self.auxiliaryCache(.rounded_bf16_output).device;
     return existing.ptr == 0 or existing.len >= bytes;
 }
@@ -46927,7 +46930,9 @@ const PreparedCudaProjection = struct {
                 // epilogues and dequantized sources keep their original owner.
                 if (g.bias or p.dequant_weight_bytes != 0 or !isBf16Weight(weight) or p.weight.ptr != weight.buffer.ptr or p.weight.len != weight.buffer.len) return null;
                 p.rounded_output_bytes = roundedBf16ProjectionBytes(self, p.physical_rows, g.columns) orelse return null;
-                if (!roundedBf16ProjectionCapacity(self, p.rounded_output_bytes)) return null;
+                // The rounded plane lives in this invocation's assigned
+                // workspace. Cached direct-dispatch buffers have separate custody.
+                if (p.rounded_output_bytes > roundedBf16ProjectionWorkspaceLimit(self)) return null;
                 p.tuning = .{}; // Original rounded producer is untuned.
             }
             p.conversion_bytes = if (p.activation_mirror) 0 else try checkedMul(try checkedMul(p.physical_rows, g.width), 2);
@@ -58785,7 +58790,9 @@ test "CUDA rounded projection declares reduced output separately and refuses col
     try std.testing.expect((try PreparedCudaProjection.select(&compute, &descriptor, &bindings)) == null);
     compute.debug_cuda_graph_capture_active = false;
     compute.auxiliaryCache(.rounded_bf16_output).device = .{ .ptr = 65536, .len = profile.rounded_output_bytes - 1 };
-    try std.testing.expect((try PreparedCudaProjection.select(&compute, &descriptor, &bindings)) == null);
+    try std.testing.expect(!roundedBf16ProjectionCapacity(&compute, profile.rounded_output_bytes));
+    const with_legacy_cache = (try PreparedCudaProjection.select(&compute, &descriptor, &bindings)) orelse return error.MissingRoundedProjection;
+    try std.testing.expect(PreparedCudaProjection.equivalent(profile, with_legacy_cache));
 }
 
 fn completeCudaRecipeExpected(comptime rounded_mirror: bool, values: []const f32, index: usize, original: f32, sign: f32, width: usize) f32 {
