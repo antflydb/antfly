@@ -58,7 +58,9 @@ fn destinationStatus(a: A, server: *api.ApiHttpServer, table: Table, hosted_iceb
     const lake_activation = feeds and server.source.vtable.get_lake_index_lifecycle != null and
         server.source.vtable.mutate_lake_index_lifecycle != null;
     const native = if (table.storage.engine == .local) server.cfg.native_history_roots else null;
-    if (table.storage.engine != .object) return .{
+    var binding = try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json);
+    defer if (binding) |*owned| owned.deinit(a);
+    if (binding == null and table.storage.engine != .object) return .{
         .contract = .{
             .adapter = .native,
             .input = .row_transactions,
@@ -74,11 +76,8 @@ fn destinationStatus(a: A, server: *api.ApiHttpServer, table: Table, hosted_iceb
         },
         .cdc_unsupported_reason = runtime_reason,
     };
-    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse
-        return .{ .cdc_unsupported_reason = "The table has no qualified writable Iceberg binding." };
-    defer binding.deinit(a);
-    const external = binding.binding;
-    if (external.format == .iceberg and external.write_policy == .iceberg_writer and external.row_identity != null) {
+    const external = if (binding) |owned| owned.binding else return .{ .cdc_unsupported_reason = "The table has no qualified writable Iceberg binding." };
+    if (table.storage.engine == .object and external.format == .iceberg and external.write_policy == .iceberg_writer and external.row_identity != null) {
         try external.validateSupported();
         const rows = feeds and external.catalog != null and (server.cfg.deployment_mode == .standalone or hosted_iceberg);
         return .{
@@ -98,10 +97,11 @@ fn destinationStatus(a: A, server: *api.ApiHttpServer, table: Table, hosted_iceb
         (external.format == .parquet and external.object_mutability == .immutable and
             local.serverless_query_lake_parquet_manifest.isManifest(external.source_uri));
     return .{
-        .contract = if (committed_snapshot)
-            .{ .input = .committed_snapshots, .committed_by = .external_snapshot, .outbound = .{ .publication_activated = lake_activation } }
-        else
-            .{},
+        .contract = .{
+            .input = if (committed_snapshot) .committed_snapshots else .unavailable,
+            .committed_by = if (committed_snapshot) .external_snapshot else .none,
+            .outbound = .{ .publication_activated = lake_activation },
+        },
         .cdc_unsupported_reason = "The table has no qualified writable Iceberg binding.",
     };
 }
@@ -121,9 +121,16 @@ pub fn configure(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_i
     const hash = sourcesHash(table.replication_sources_json);
     if (!std.mem.eql(u8, &hash, parsed.value.expected_sources_hash)) return error.TableGenerationChanged;
     const source_count = parsed.value.replication_sources.array.items.len;
-    if (source_count != 0 and table.storage.engine == .object and
-        (try destinationStatus(a, server, table.*, snapshot.status.managed_iceberg_sources)).cdc_unsupported_reason.len != 0)
-        return error.UnsupportedOperation;
+    if (source_count != 0) {
+        if (table.storage.engine == .object) {
+            const destination = try destinationStatus(a, server, table.*, snapshot.status.managed_iceberg_sources);
+            if (destination.cdc_unsupported_reason.len != 0) return error.UnsupportedOperation;
+        } else if (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) |external| {
+            var binding = external;
+            binding.deinit(a);
+            return error.UnsupportedOperation;
+        }
+    }
     for (parsed.value.replication_sources.array.items) |source| {
         if (source != .object) return error.InvalidCreateTableRequest;
     }
@@ -183,7 +190,8 @@ pub fn status(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_id: 
     defer progress.deinit(a);
     for (snapshot.replication_source_statuses) |record| if (record.table_id == table.table_id) try progress.append(a, record);
     const destination = try destinationStatus(a, server, table.*, snapshot.status.managed_iceberg_sources);
-    var publication = if (table.storage.engine == .object)
+    var publication = if (table.storage.engine == .object or table.lake_index_catalog_json.len != 0 or
+        destination.contract.input == .committed_snapshots)
         try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json)
     else
         null;
@@ -277,6 +285,11 @@ test "lake SQL managed source replacement checks native definition hash and tabl
     source.table[0].schema_json =
         \\{"base_source":{"kind":"external","table_id":"hn","uri":"file:///lake","format":"iceberg"}}
     ;
+    source.table[0].storage.engine = .local;
+    const current_hash = sourcesHash(source.table[0].replication_sources_json);
+    const external_attach = try std.mem.replaceOwned(u8, a, attach, &hash, &current_hash);
+    defer a.free(external_attach);
+    try std.testing.expectError(error.UnsupportedOperation, configure(a, &server, "hn", 7, null, .{}, external_attach));
     const failed_publication = try local.metadata_lake_index_catalog.encode(a, .{
         .generation = 4,
         .failure = .{ .generation = 4, .desired = @splat(1), .reason = "test writer unavailable", .retry_at_ms = 1 },

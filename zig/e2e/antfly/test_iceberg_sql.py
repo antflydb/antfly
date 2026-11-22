@@ -413,6 +413,20 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
         )
         assert sql("SELECT id FROM parquet_events") == [["1"]]
         for name in ("ice_events", "parquet_events"):
+            status = requests.get(
+                f"{server.api_url}/tables/{name}/sources/managed",
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=30,
+            )
+            assert status.ok, status.text
+            source_status = status.json()
+            assert not source_status["cdc_supported"]
+            destination = source_status["destination_contract"]
+            assert destination["input"] == (
+                "committed_snapshots" if name == "ice_events" else "unavailable"
+            )
+            assert destination["committed_history"] == "unavailable"
+            assert not destination["outbound"]["document_committed"]
             row_feed = requests.post(
                 server.api_url + "/changefeeds",
                 auth=("admin", AUTH_BOOTSTRAP_PASSWORD),

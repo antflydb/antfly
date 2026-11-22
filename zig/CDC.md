@@ -430,6 +430,22 @@ base snapshot alongside pending or failed index generations. Its
 outbound event and bootstrap capabilities available on that runtime.
 `cdc_supported` reports whether the runtime can run an inbound connector
 for that destination.
+
+| Binding | Commit authority | Managed PostgreSQL | Outbound capability |
+| --- | --- | --- | --- |
+| Native local or replicated document table | Native transaction | Runtime with managed sources | Row history and bootstrap when the runtime exposes native history |
+| Native local or replicated relational table | Native transaction | Runtime with managed sources | Row history and bootstrap when installed. Eligible tables can also serve pgoutput on a configured native data node |
+| Antfly-written Iceberg table | Catalog snapshot covering one table's committed WAL | Standalone writer or distributed metadata owner with configured artifact storage | Row history and bootstrap when retained catalog WAL is available. Publication activation where installed |
+| Read-only Iceberg attachment | External catalog snapshot | Unavailable | Publication activation where installed |
+| Immutable Parquet manifest | Producer's committed file set | Unavailable | Publication activation where installed |
+| Parquet prefix inventory | Producer's visible objects | Unavailable | Publication activation where installed |
+
+Native artifact publication requires the runtime's artifact history and owner
+ports. A native row bootstrap additionally requires snapshot paging support.
+Object-backed tables without a qualified writable Iceberg binding advertise
+their external snapshot capability when applicable. Their managed PostgreSQL
+connector remains unavailable.
+
 See [destination integration](https://github.com/antflydb/antfly/issues/1698)
 and [committed history and changefeeds](https://github.com/antflydb/antfly/issues/1639).
 

@@ -6297,6 +6297,12 @@ def test_parquet_snapshot_manifest_refresh_and_cold_native_navigation(tmp_path):
         )
         assert created["schema"]["base_source"]["row_identity_version"] == 2
         assert sql("SELECT count(*) FROM committed") == [["75"]]
+        managed = call("GET", "/tables/committed/sources/managed")
+        assert not managed["cdc_supported"]
+        contract = managed["destination_contract"]
+        assert contract["input"] == "committed_snapshots"
+        assert contract["committed_by"] == "external_snapshot"
+        assert not contract["outbound"]["document_committed"]
         call(
             "POST",
             "/tables/committed/indexes/text",
