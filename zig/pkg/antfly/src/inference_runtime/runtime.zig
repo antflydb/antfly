@@ -651,7 +651,17 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             if (entries != .object) return error.InvalidConfig;
             for (entries.object.keys(), entries.object.values()) |name, value| {
                 if (!isNamedGeneratedExtractor(value)) continue;
-                var entry = try inference.server.NamedGeneratedExtractor.parse(extractor_alloc, name, value);
+                // Resolve the explicit endpoint before the shared parser normalizes
+                // url/api_url and hosted registration checks the scheme.
+                var resolved = value;
+                if (resolved.object.getPtr("generator")) |generator| {
+                    if (inference.server.NamedGeneratedExtractor.explicitEndpointField(generator.*)) |name_of_field| {
+                        const field = generator.object.getPtr(name_of_field).?;
+                        if (field.* == .string and common_secrets.parseSecretReference(field.string) != null)
+                            field.string = try common_secrets.resolveReferenceOwned(extractor_alloc, store, field.string);
+                    }
+                }
+                var entry = try inference.server.NamedGeneratedExtractor.parse(extractor_alloc, name, resolved);
                 if (entry.config.generator.api_key) |key|
                     entry.config.generator.api_key = try common_secrets.resolveReferenceOwned(extractor_alloc, store, key);
                 try generated_extractors.append(extractor_alloc, entry);

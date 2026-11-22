@@ -201,19 +201,48 @@ def score_case(row, case):
     text = row["text"]
     expected = case["expected"]
     boxes = [tuple(map(int, box)) for box in GROUNDING_BOX.findall(text)]
-    valid_boxes = sum(
-        0 <= x0 < x1 <= 1000 and 0 <= y0 < y1 <= 1000 for x0, y0, x1, y1 in boxes
-    )
+    valid_boxes = {
+        (x0, y0, x1, y1)
+        for x0, y0, x1, y1 in boxes
+        if 0 <= x0 < x1 <= 1000 and 0 <= y0 < y1 <= 1000
+    }
     transcript = GROUNDING_BOX.sub("", text)
+    table_rows = case.get("expected_table_rows", [])
+    content = transcript
+    if table_rows:
+        content = re.sub(r"(?m)^\s*\|?[ :|\-]+\|?\s*$", "", content).replace("|", " ")
+    plain = plain_text(content)
+    normalized = " " + normalize(plain) + " "
+    missing_rows = [
+        entry for entry in table_rows if " " + normalize(entry) + " " not in normalized
+    ]
     row.update(
         exact=normalize(expected) == normalize(transcript),
-        cer=cer(expected, plain_text(transcript)),
+        cer=cer(expected, plain),
+        missing_table_rows=missing_rows,
         missing=[term for term in case["required"] if term not in transcript],
         has_table_markup="<table" in text.lower()
         or bool(re.search(r"(?m)^\s*\|.+\|\s*$", text)),
-        has_grounding=valid_boxes > 0,
+        has_grounding=bool(valid_boxes),
         grounding_boxes=len(boxes),
-        valid_grounding_boxes=valid_boxes,
+        valid_grounding_boxes=len(valid_boxes),
+    )
+
+
+def quality_passes(row):
+    return (
+        row.get("finish") == "stop"
+        and row.get("cer", float("inf")) <= 0.05
+        and not row.get("missing")
+        and not row.get("missing_table_rows")
+    )
+
+
+def grounding_quality_passes(row, case):
+    return (
+        quality_passes(row)
+        and row["valid_grounding_boxes"] >= case.get("min_grounding_boxes", 1)
+        and row["grounding_boxes"] == row["valid_grounding_boxes"]
     )
 
 
@@ -340,17 +369,14 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
         score_case(grounding, grounding_case)
     scored = [row for row in rows if "cer" in row]
     ok = [row for row in scored if row["finish"] == "stop" and not row["missing"]]
+    quality_pages = [row for row in ok if quality_passes(row)]
     layout_ok = grounding_case is None or (
-        grounding is not None
-        and grounding.get("finish") == "stop"
-        and grounding.get("has_grounding")
-        and not grounding.get("missing")
-        and grounding["grounding_boxes"] == grounding["valid_grounding_boxes"]
+        grounding is not None and grounding_quality_passes(grounding, grounding_case)
     )
     qualified = (
         failure is None
         and bool(layout_ok)
-        and (args.grounding_only or len(ok) == len(cases) * args.rounds)
+        and (args.grounding_only or len(quality_pages) == len(cases) * args.rounds)
     )
     return {
         "qualified": qualified,
@@ -364,6 +390,7 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
         "warm_idle": idle,
         "seconds": elapsed,
         "completed_pages": len(ok),
+        "quality_pages": len(quality_pages),
         "requests": len(rows),
         "pages_per_second": len(ok) / elapsed if elapsed else None,
         "p50_seconds": statistics.median(row["seconds"] for row in ok) if ok else None,

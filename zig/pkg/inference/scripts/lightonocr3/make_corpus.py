@@ -39,10 +39,11 @@ def main():
     args = parser.parse_args()
     default_root = Path(__file__).resolve().parent / "corpus"
     root = args.output_dir or default_root
-    root.mkdir(exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     cases = [
         {
             "name": "receipt",
+            "min_grounding_boxes": 3,
             "size": [864, 640],
             "font_size": 34,
             "lines": [
@@ -140,6 +141,11 @@ def main():
                 "expected": "\n".join(case["lines"]),
                 "required": case["required"],
                 "max_new_tokens": 256,
+                **(
+                    {"min_grounding_boxes": case["min_grounding_boxes"]}
+                    if "min_grounding_boxes" in case
+                    else {}
+                ),
             }
         )
     if args.dense:
@@ -169,6 +175,7 @@ def main():
                 "expected": "\n".join(" ".join(row) for row in rows),
                 "required": ["SKU-1201", "SKU-1216", "SKU-1232", "USD 42.25"],
                 "max_new_tokens": 3072,
+                "expected_table_rows": [" ".join(row) for row in rows],
             }
         )
     (root / "cases.json").write_text(
