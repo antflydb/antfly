@@ -1855,6 +1855,26 @@ pub const TxnManager = struct {
         return legacyRecoveryPageInRead(alloc, &read, root, after, max_records);
     }
 
+    fn legacyRecordNeedsRecovery(record: TxnRecord) bool {
+        return !record.ordinary_producer and record.source_scope == null and
+            (record.status == .pending or !record.intents_resolved_known or !record.intents_resolved);
+    }
+
+    /// First binding must check the entire record keyspace in the same native
+    /// writer that installs strict admission. Remote inventories cannot
+    /// certify this cut. The persisted closure fences new legacy records.
+    pub fn requireLegacyDrainedInWriter(alloc: Allocator, writer: anytype, root: source_scope.Basis) !void {
+        _ = (try @import("source_producer_policy.zig").Store.read(alloc, writer, root)) orelse return error.SourcePendingWork;
+        var cursor = try writer.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(records_prefix);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, records_prefix)) break;
+            if (kv.key.len != records_prefix.len + 16 or kv.value.len > 4096) return error.InvalidTxnRecord;
+            if (legacyRecordNeedsRecovery(try decodeRecord(kv.value))) return error.SourcePendingWork;
+        }
+    }
+
     /// Reuse the caller's read snapshot so physical authority, applied marker,
     /// closure and inspected records cannot come from different cuts.
     pub fn legacyRecoveryPageInRead(alloc: Allocator, read: anytype, root: source_scope.Basis, after: ?TxnId, max_records: usize) !LegacyRecoveryPage {
@@ -1886,8 +1906,7 @@ pub const TxnManager = struct {
             bytes += kv.key.len + kv.value.len;
             const id: TxnId = kv.key[records_prefix.len..][0..16].*;
             last = id;
-            if (record.ordinary_producer or record.source_scope != null) continue;
-            if (record.status != .pending and record.intents_resolved_known and record.intents_resolved) continue;
+            if (!legacyRecordNeedsRecovery(record)) continue;
             try items.append(alloc, .{ .transaction_id = id, .record_digest = completion.bytesDigest(kv.value), .status = record.status, .prepared = record.prepared, .prepared_known = record.prepared_known, .coordinator = record.coordinator, .coordinator_known = record.coordinator_known, .intents_resolved = record.intents_resolved, .intents_resolved_known = record.intents_resolved_known });
         }
         return .{ .closure = closure, .items = try items.toOwnedSlice(alloc), .scanned_records = scanned, .next_after = last, .reached_end = true };
@@ -7074,6 +7093,35 @@ test "transaction source purpose closed legacy recovery inventory is bounded and
     // initial cursor must inspect the prefix itself rather than prefix+zero.
     try manager.putValue(records_prefix, raw);
     try std.testing.expectError(error.InvalidTxnRecord, manager.legacyRecoveryPage(a, root, null, 256));
+}
+
+test "transaction source purpose strict binding proves legacy drainage in its writer" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-legacy-drained");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 2, .topology_epoch = 1 };
+    const root = try source_scope.Basis.fromOwner(owner);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(@splat(1), 10, 11, &.{}, true, true, .{ .ordinary_producer = true });
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(@splat(2), 10, 11, &.{}, true, true);
+    _ = try manager.resolveIntentsWithExtraBatch(@splat(2), .aborted, 20, .{});
+    const terminal = try manager.getAlloc(a, &makeRecordKey(@splat(2)));
+    defer a.free(terminal);
+    var writer = try store.beginWriteTxn();
+    defer writer.abort();
+    try std.testing.expectError(error.SourcePendingWork, TxnManager.requireLegacyDrainedInWriter(a, &writer, root));
+    _ = try @import("source_producer_policy.zig").Store.close(a, &writer, root, .{ .term = 1, .index = 7 });
+    try TxnManager.requireLegacyDrainedInWriter(a, &writer, root);
+    try writer.put(&makeRecordKey(@splat(3)), terminal[0..txn_record_v5_size]);
+    try std.testing.expectError(error.SourcePendingWork, TxnManager.requireLegacyDrainedInWriter(a, &writer, root));
+    try writer.delete(&makeRecordKey(@splat(3)));
+    try writer.put(records_prefix, terminal);
+    try std.testing.expectError(error.InvalidTxnRecord, TxnManager.requireLegacyDrainedInWriter(a, &writer, root));
 }
 
 test "transaction source purpose closed legacy terminal recovery preserves original decisions and effects" {
