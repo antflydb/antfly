@@ -21,6 +21,7 @@ const std = @import("std");
 const transactions = @import("transactions.zig");
 const record = @import("sql_connection_record.zig");
 const prepared = @import("sql_prepared.zig");
+const RequestAdmission = @import("antfly_local_sources").common_request_admission.RequestAdmission;
 const settings = @import("antfly_local_sources").sql_setting_catalog;
 
 const directory_key = "\x00sql-connection-directory-v1";
@@ -58,9 +59,24 @@ pub fn loadReconciled(
     principal: []const u8,
     owner_node_id: u64,
     now_ms: u64,
+    admission: ?*RequestAdmission,
 ) !Owned {
     var owned = try load(store, alloc, id, principal, owner_node_id, now_ms);
     errdefer owned.deinit();
+    if (owned.value.state == .idle) return owned;
+    var lease: ?RequestAdmission.Lease = null;
+    defer if (lease) |*held| held.release();
+    if (admission) |capacity| {
+        const lifecycle = store.probeConnectionLifecycle(owned.value.active_txn orelse return owned) catch |err| switch (err) {
+            error.Unsupported => null,
+            else => return err,
+        };
+        if (lifecycle) |state| {
+            if (!std.meta.eql(state.connection_id, @as(?[32]u8, id))) return error.InvalidSqlConnection;
+            if (owned.value.state != .beginning and !state.terminal) return owned;
+        }
+        lease = capacity.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+    }
     if (!try reconcile(store, registry, owned.value, now_ms, null)) return owned;
     const result = try load(store, alloc, id, principal, owner_node_id, now_ms);
     owned.deinit();
@@ -511,7 +527,7 @@ test "HTTP connection recovers a durable pre-response BEGIN fence without an esc
     try std.testing.expectEqual(record.State.beginning, fenced.value.state);
     try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .discard = id }, "alice", 7, 2));
     _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
-    var recovered = try loadReconciled(&store, &registry, std.heap.page_allocator, id, "alice", 7, 2);
+    var recovered = try loadReconciled(&store, &registry, std.heap.page_allocator, id, "alice", 7, 2, null);
     defer recovered.deinit();
     try std.testing.expectEqual(record.State.idle, recovered.value.state);
     try std.testing.expect(recovered.value.active_txn == null);
@@ -747,7 +763,13 @@ test "HTTP connection reconciles a durable aborted coordinator decision" {
     const status_json = try std.json.Stringify.valueAlloc(response_alloc, status, .{});
     const generated_status = try std.json.parseFromSlice(metadata_openapi.TransactionSessionStatus, response_alloc, status_json, .{});
     try std.testing.expectEqualStrings("aborted", generated_status.value.disposition);
-    var reconciled = try loadReconciled(&store, &registry, alloc, id, "alice", 7, 2);
+    var admission = RequestAdmission.init(1);
+    {
+        var held = admission.tryAcquireLease().?;
+        defer held.release();
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, loadReconciled(&store, &registry, alloc, id, "alice", 7, 2, &admission));
+    }
+    var reconciled = try loadReconciled(&store, &registry, alloc, id, "alice", 7, 2, &admission);
     defer reconciled.deinit();
     try std.testing.expectEqual(record.State.idle, reconciled.value.state);
     _ = try registry.cleanupExpired(alloc, std.math.maxInt(u64));

@@ -6902,7 +6902,7 @@ pub const AntflyApiHandler = struct {
             const resource_principal = http_server_mod.transactionPrincipal(self.adapter.identity.*) orelse "";
             if (self.adapter.connection_id) |connection_id| {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
-                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms);
+                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms, &self.adapter.server.query_admission);
                 const connection = self.connection_owned.?.value;
                 if (connection.state == .beginning) return error.SqlConnectionBusy;
                 if ((!self.adapter.inherit_session_database and !std.mem.eql(u8, self.adapter.database, connection.database)) or
@@ -7217,7 +7217,7 @@ pub const AntflyApiHandler = struct {
         const store = self.api_server.txn_sessions.durable orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "durable SQL connection storage unavailable" });
         const principal = http_server_mod.transactionPrincipal(identity) orelse "";
         const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
-        var connection = @import("sql_connections.zig").loadReconciled(store, &self.api_server.txn_sessions, self.api_server.alloc, connection_id, principal, self.api_server.localSessionNodeId(), now_ms) catch |err| {
+        var connection = @import("sql_connections.zig").loadReconciled(store, &self.api_server.txn_sessions, self.api_server.alloc, connection_id, principal, self.api_server.localSessionNodeId(), now_ms, &self.api_server.query_admission) catch |err| {
             var buffer: [256]u8 = undefined;
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
         };

@@ -105,6 +105,8 @@ pub fn prepareTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
 }
 
 pub fn observeTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8) !void {
+    var read = try server.acquireSqlExecution(false);
+    defer read.release();
     try registerTransaction(server, alloc, completion, id, true);
 }
 
@@ -136,8 +138,8 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
     var seed: [8]u8 = undefined;
     try server.inferenceIo().randomSecure(&seed);
     const local_node = if (server.cfg.session_router) |router| router.localNodeId() else 0;
-    const target_node = (try server.txn_sessions.getOwnerNodeId(alloc, id)) orelse @import("transactions.zig").sessionOwnerNodeId(id);
-    const local = server.txn_sessions.durable_scope == .cluster_shared or target_node == local_node;
+    const local = server.txn_sessions.durable_scope == .cluster_shared or
+        ((try server.txn_sessions.getOwnerNodeId(alloc, id)) orelse @import("transactions.zig").sessionOwnerNodeId(id)) == local_node;
     if (observe_only and !local) return error.CompletionWrongOwner;
     const reference = if (local)
         if (observe_only) try store.createLocalObservedRegistration(seed, outcome.*, id) else try store.createLocalPreparedRegistration(seed, outcome.*, id)
@@ -290,11 +292,12 @@ fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, com
             continue;
         }
         const id = if (record.value.outcome.transaction_id) |encoded| try parseId(encoded) else null;
-        const owner_node = if (id) |txn_id| (try server.txn_sessions.getOwnerNodeId(alloc, txn_id)) orelse @import("transactions.zig").sessionOwnerNodeId(txn_id) else local;
+        const local_proof = @import("completion_outbox.zig").isObservation(reference) or server.txn_sessions.durable_scope == .cluster_shared or
+            (if (id) |txn_id| (try server.txn_sessions.getOwnerNodeId(alloc, txn_id)) orelse @import("transactions.zig").sessionOwnerNodeId(txn_id) else local) == local;
         // These references have never escaped the execution owner. Retire a
         // successful local proof and its intent in one atomic batch rather than
         // accumulating every autocommit in the connection's bounded manifest.
-        if (id != null and record.value.execution_admitted and (server.txn_sessions.durable_scope == .cluster_shared or owner_node == local) and try store.completionReferenceSettled(id.?, reference)) {
+        if (id != null and record.value.execution_admitted and local_proof and try store.completionReferenceSettled(id.?, reference)) {
             if (store.retireLocalPreparedRegistration(reference, id.?)) |_| {
                 discardOutcome(completion, alloc, index);
                 continue;
@@ -530,6 +533,10 @@ fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, r
     const context: operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
     if (request.action == .status) {
         if (record.value.phase == .acknowledging) return true;
+        if (observation) {
+            const id = try parseId(outcome.transaction_id orelse return error.InvalidTransactionSessionRecord);
+            return store.completionReferenceSettled(id, request.reference_id);
+        }
         return settled(server, alloc, .{ .outcomes = &.{outcome} }, context);
     }
     if (observation) {

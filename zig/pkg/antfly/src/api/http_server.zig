@@ -4147,7 +4147,7 @@ pub const ApiHttpServer = struct {
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
-    sql_observation_ack_backlog: bool = false,
+    sql_observation_ack_backlog: std.atomic.Value(bool) = .init(false),
     last_sql_abort_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
@@ -10251,11 +10251,12 @@ pub const ApiHttpServer = struct {
         const previous_ns = self.last_sql_abort_cleanup_ns.load(.acquire);
         const periodic = previous_ns == 0 or now_ns -| previous_ns >= std.time.ns_per_min;
         if (periodic and self.last_sql_abort_cleanup_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
-        if (periodic or self.sql_observation_ack_backlog) {
-            self.sql_observation_ack_backlog = @import("sql_completion.zig").reclaimLegacyObservationAcks(self) catch |err| retry: {
+        if (periodic or self.sql_observation_ack_backlog.load(.acquire)) {
+            const backlog = @import("sql_completion.zig").reclaimLegacyObservationAcks(self) catch |err| retry: {
                 std.log.warn("legacy SQL observation acknowledgement cleanup deferred err={s}", .{@errorName(err)});
                 break :retry true;
             };
+            self.sql_observation_ack_backlog.store(backlog, .release);
         }
         const retention_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
         if (periodic or self.txn_sessions.durable_scope == .cluster_shared) self.txn_sessions.migrateLegacySqlAbortReceipts(self.alloc) catch |err| {

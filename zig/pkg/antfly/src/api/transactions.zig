@@ -1226,6 +1226,7 @@ pub const DurableSessionStore = struct {
 
     // Captured before this store allocates its first reference. Only earlier
     // references can belong to a dead process; never sweep a live collector.
+    observation_ack_mutex: std.atomic.Mutex = .unlocked,
     observation_ack_cursor: ?ObservationAckPosition = null,
     registration_recovery_before: ?u64 = null,
     registration_locks: [64]std.atomic.Mutex = @splat(.unlocked),
@@ -1690,14 +1691,13 @@ pub const DurableSessionStore = struct {
     const ObservationAck = struct { key: [observation_ack_prefix_len + 16]u8, reference: [16]u8 };
 
     pub fn reclaimLegacyObservationAcks(self: *DurableSessionStore, shared: bool) !bool {
-        const mutation = self.mutationMutex();
-        platform_sync.lockYielding(mutation);
-        defer mutation.unlock();
+        if (!self.observation_ack_mutex.tryLock()) return true;
+        defer self.observation_ack_mutex.unlock();
         var prefix_bytes: [observation_ack_prefix_len + 1]u8 = undefined;
         var prefix: []const u8 = completion_retirement_root;
         var first = prefix;
         if (!shared) {
-            const namespace: Outbox.Namespace = .{ .issuer = self.registration_issuer orelse 0, .observation = true };
+            const namespace: Outbox.Namespace = .{ .observation = true };
             const producer = switch (self.backend) {
                 .docstore => |store| result: {
                     var txn = try store.beginReadTxn();
@@ -1752,18 +1752,23 @@ pub const DurableSessionStore = struct {
         const start = if (after) |*position| position.bytes[0..position.len] else first;
         try self.scanPrefixFromWithContextMode(prefix, start, if (after) |position| position.exclusive else false, &scan, Scan.visit, true);
         const acks = scan.acks[0..scan.count];
-        if (acks.len != 0) switch (self.backend) {
-            .docstore => |store| {
-                var txn = try store.beginWriteTxn();
-                errdefer txn.abort();
-                if (try reclaimLegacyObservationAcksTxn(&txn, acks)) try txn.commit() else txn.abort();
-            },
-            .runtime => |store| {
-                var txn = try store.beginWrite();
-                errdefer txn.abort();
-                if (try reclaimLegacyObservationAcksTxn(&txn, acks)) try txn.commit() else txn.abort();
-            },
-        };
+        if (acks.len != 0) {
+            const mutation = self.mutationMutex();
+            platform_sync.lockYielding(mutation);
+            defer mutation.unlock();
+            switch (self.backend) {
+                .docstore => |store| {
+                    var txn = try store.beginWriteTxn();
+                    errdefer txn.abort();
+                    if (try reclaimLegacyObservationAcksTxn(&txn, acks)) try txn.commit() else txn.abort();
+                },
+                .runtime => |store| {
+                    var txn = try store.beginWrite();
+                    errdefer txn.abort();
+                    if (try reclaimLegacyObservationAcksTxn(&txn, acks)) try txn.commit() else txn.abort();
+                },
+            }
+        }
         self.observation_ack_cursor = scan.next;
         return scan.next != null;
     }
@@ -2618,21 +2623,29 @@ pub const DurableSessionStore = struct {
     /// Reads the transaction under an existing connection write transaction,
     /// so terminal proof and committed setting values share its detach cut.
     pub fn connectionLifecycle(self: *DurableSessionStore, id: db_mod.types.TxnId) !?ConnectionLifecycle {
+        return self.readConnectionLifecycle(id, false);
+    }
+
+    pub fn probeConnectionLifecycle(self: *DurableSessionStore, id: db_mod.types.TxnId) !?ConnectionLifecycle {
+        return self.readConnectionLifecycle(id, true);
+    }
+
+    fn readConnectionLifecycle(self: *DurableSessionStore, id: db_mod.types.TxnId, bounded: bool) !?ConnectionLifecycle {
         switch (self.backend) {
             .docstore => |store| {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                return self.connectionLifecycleTxn(&txn, id);
+                return self.connectionLifecycleTxn(&txn, id, bounded);
             },
             .runtime => |store| {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                return self.connectionLifecycleTxn(&txn, id);
+                return self.connectionLifecycleTxn(&txn, id, bounded);
             },
         }
     }
 
-    fn connectionLifecycleTxn(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId) !?ConnectionLifecycle {
+    fn connectionLifecycleTxn(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId, bounded: bool) !?ConnectionLifecycle {
         const key = try makeSessionKey(self.alloc, id);
         defer self.alloc.free(key);
         const packed_state = prefix: {
@@ -2653,6 +2666,7 @@ pub const DurableSessionStore = struct {
             .version = .{ .owner = std.mem.readInt(u64, p[1..9], .little), .touched = std.mem.readInt(u64, p[41..49], .little), .executing = p[0] & 2 != 0 },
             .terminal = p[0] & 4 != 0,
         };
+        if (bounded) return error.Unsupported;
         var legacy = (try self.loadSessionTxn(txn, id)) orelse return null;
         defer legacy.deinit(self.alloc);
         return .{ .connection_id = legacy.connection_id, .version = Version.of(legacy), .terminal = legacy.terminal_abort or legacy.terminal_commit != null };
@@ -5875,15 +5889,23 @@ pub const SessionRegistry = struct {
     fn cleanupExpiredMode(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
         var expired_ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         defer expired_ids.deinit(alloc);
+        var positions: std.ArrayListUnmanaged(ExpiryPosition) = .empty;
+        defer positions.deinit(alloc);
+        var after: ?ExpiryPosition = null;
+        var next: ?ExpiryPosition = null;
+        defer if (self.durable != null) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (std.meta.eql(after, self.expiry_cursor)) self.expiry_cursor = next;
+        };
         if (self.durable) |durable| {
             self.mutex.lock();
-            const after = self.expiry_cursor;
+            after = self.expiry_cursor;
+            next = after;
             self.mutex.unlock();
-            const page = try durable.scanExpiredIds(alloc, session_expiry_prefix, after, cutoff_ns, 1024, null);
+            const page = try durable.scanExpiredIds(alloc, session_expiry_prefix, after, cutoff_ns, 1024, &positions);
             expired_ids = .fromOwnedSlice(page.ids);
-            self.mutex.lock();
-            if (std.meta.eql(after, self.expiry_cursor)) self.expiry_cursor = page.next_after;
-            self.mutex.unlock();
+            next = page.next_after;
         } else {
             self.mutex.lock();
             var loaded_it = self.sessions.iterator();
@@ -5898,14 +5920,23 @@ pub const SessionRegistry = struct {
         }
 
         var removed_count: usize = 0;
-        for (expired_ids.items) |txn_id| {
+        const page_end = next;
+        for (expired_ids.items, 0..) |txn_id, index| {
+            if (self.durable != null) {
+                // Keep the failing row and its unprocessed suffix eligible.
+                next = positions.items[index];
+                next.?.exclusive = false;
+            }
             const execution = self.tryAcquireCommitExecution(txn_id) orelse continue;
             defer execution.release();
             const session_lock = self.sessionLock(txn_id);
             session_lock.lock();
             defer session_lock.unlock();
             // Scanning pinned receipts must not populate the foreground cache.
-            var view = (try self.readSessionAssumeStripe(txn_id)) orelse continue;
+            var view = (self.readSessionAssumeStripe(txn_id) catch |err| {
+                if (skipCorruptExpiredSession(txn_id, err)) continue;
+                return err;
+            }) orelse continue;
             defer view.deinit();
             const current = view.session;
             if (current.last_touched_timestamp >= cutoff_ns) continue;
@@ -5914,9 +5945,9 @@ pub const SessionRegistry = struct {
             // would turn an uncertain connection into unrecoverable quota
             // debt. Keep both active and terminal records while referenced.
             if (!sessionCanExpire(current)) continue;
-            self.deletePersistent(txn_id, DurableSessionStore.Version.of(current), cutoff_ns, null) catch |err| switch (err) {
-                error.SessionLeaseLost => continue,
-                else => return err,
+            self.deletePersistent(txn_id, DurableSessionStore.Version.of(current), cutoff_ns, null) catch |err| {
+                if (err == error.SessionLeaseLost or skipCorruptExpiredSession(txn_id, err)) continue;
+                return err;
             };
             self.releaseLease(txn_id, current.owner_node_id) catch {};
             self.mutex.lock();
@@ -5925,7 +5956,18 @@ pub const SessionRegistry = struct {
             if (removed) |*entry| entry.value.deinit(alloc);
             removed_count += 1;
         }
+        next = page_end;
         return removed_count;
+    }
+
+    fn skipCorruptExpiredSession(id: db_mod.types.TxnId, err: anyerror) bool {
+        switch (err) {
+            error.InvalidTransactionSessionRecord, error.InvalidSqlConnection, error.SyntaxError, error.UnexpectedToken, error.UnexpectedEndOfInput => {
+                std.log.warn("expired session record skipped txn_id={x} err={s}", .{ id, @errorName(err) });
+                return true;
+            },
+            else => return false,
+        }
     }
 
     pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
@@ -12411,4 +12453,24 @@ test "distributed txn shared acknowledgement sweep reclaims retired observation 
     defer read.abort();
     try std.testing.expectError(error.NotFound, read.get(old_key));
     try std.testing.expectEqualStrings(retirement.marker, try read.get(ordinary_key));
+}
+
+test "distributed txn ordinary expiry retries an unprocessed page after a storage error" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/expiry-retry" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(alloc);
+    _ = try registry.begin(alloc, .{}, 0);
+    _ = try registry.begin(alloc, .{}, 0);
+    const cutoff = std.math.maxInt(u64);
+    durable.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, registry.cleanupExpired(alloc, cutoff));
+    try std.testing.expect(registry.hasSessionCleanupBacklog(false));
+    durable.fail_writes_for_test = false;
+    try std.testing.expectEqual(@as(usize, 2), try registry.cleanupExpired(alloc, cutoff));
+    try std.testing.expect(!registry.hasSessionCleanupBacklog(false));
 }
