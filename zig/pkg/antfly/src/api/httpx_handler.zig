@@ -7071,6 +7071,7 @@ pub const AntflyApiHandler = struct {
                 self.prepared_response = response;
                 return;
             }
+            var legacy_replay: ?*transactions_api.DurableSessionStore = null;
             if (compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
                 if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
                     const id = distributed_txn.parseTxnIdHex(supplied) catch return error.SqlTransactionNotActive;
@@ -7079,7 +7080,8 @@ pub const AntflyApiHandler = struct {
                         _ = try self.reportCommitDecision(id, decision);
                         return;
                     }
-                    if (probe.terminal_payload) {
+                    if (probe.payload == .unknown) legacy_replay = store;
+                    if (probe.payload == .terminal) {
                         var read = try self.adapter.server.acquireSqlExecution(false);
                         defer read.release();
                         if (try self.replayCommit(store, supplied, null, resource_principal)) return;
@@ -7095,6 +7097,9 @@ pub const AntflyApiHandler = struct {
                 return;
             };
             defer execution.release();
+            if (legacy_replay) |store| {
+                if (try self.replayCommit(store, self.adapter.session_id.?, null, resource_principal)) return;
+            }
             self.preparation.release();
             self.execution_entered = true;
             self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
