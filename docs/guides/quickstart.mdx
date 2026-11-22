@@ -187,10 +187,10 @@ antfly index list --table wikipedia
 antfly load --table wikipedia \
   --file wiki-articles.jsonl \
   --id-field title \
-  --sync-level full_text
+  --sync-level query
 ```
 
-The CLI reads the JSONL and batches it for you. `--sync-level full_text` returns once each batch is keyword-searchable; embeddings keep generating in the background. (An application that owns its own ingestion uses the SDK [batch operations](/docs/api/data-operations) with bounded batches and retries.)
+The CLI reads the JSONL and batches it for you. `--sync-level query` returns once each batch is keyword-searchable; embeddings keep generating in the background. (An application that owns its own ingestion uses the SDK [batch operations](/docs/api/data-operations) with bounded batches and retries.)
 
 Wait until 10% of documents have searchable embeddings:
 

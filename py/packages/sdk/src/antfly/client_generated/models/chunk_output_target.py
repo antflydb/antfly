@@ -26,9 +26,9 @@ class ChunkOutputTarget:
         model (str):
         execute (bool | Unset): False retains this model as a planning boundary while skipping its inference; used for
             independent output repairs. Default: True.
-        skip_windows (list[ChunkOutputTargetSkipWindowsItem] | Unset): Execution-only repair mask for already accepted
-            sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status
-            skipped.
+        skip_windows (list[ChunkOutputTargetSkipWindowsItem] | Unset): Execution-only repair mask for accepted receipts.
+            A sub_index of 4294967295 skips all outputs at that ordinal. Other entries skip individual sub-windows. Masks
+            leave recipe and boundary identities unchanged.
         required (bool | Unset):  Default: True.
         model_identity (str | Unset):
         task_type (str | Unset):  Default: 'RETRIEVAL_DOCUMENT'.

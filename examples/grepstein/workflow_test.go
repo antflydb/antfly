@@ -372,7 +372,7 @@ func TestVertexOCRProfilePinsModelAndCompatibleLocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	reader := producer.Config.OCR.Reader
-	if reader.Model != "gemini-3.8-flash" || reader.Location != "global" || reader.MaxTokens != 32768 {
+	if reader.Model != "gemini-3.8-flash" || reader.Location != "global" || reader.MaxTokens != 0 || units["execution"].(map[string]any)["max_output_tokens_per_item"] != uint32(32768) {
 		t.Fatalf("OCR profile must persist its model, location and output budget: %+v", reader)
 	}
 }

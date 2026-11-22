@@ -4135,6 +4135,7 @@ pub const ApiHttpServer = struct {
     sql_settlement_active: std.atomic.Value(bool) = .init(false),
     sql_completion_owner_active: std.atomic.Value(bool) = .init(false),
     sql_completion_recovery_after: u64 = 0,
+    sql_observation_retirement_after: ?[]u8 = null,
     sql_completion_consumer_active: std.atomic.Value(bool) = .init(false),
     write_admission: RequestAdmission,
     inference_admission: RequestAdmission,
@@ -4146,6 +4147,7 @@ pub const ApiHttpServer = struct {
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
+    last_sql_abort_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
@@ -5116,6 +5118,7 @@ pub const ApiHttpServer = struct {
         self.mcp_sessions.deinit(self.owner_alloc);
         self.memory_mcp_sessions.deinit(self.owner_alloc);
         self.a2a_tasks.deinit(self.owner_alloc);
+        if (self.sql_observation_retirement_after) |key| self.alloc.free(key);
         self.txn_sessions.deinit(self.alloc);
         self.memory_work_cursors.deinit(self.alloc);
         if (self.opened_session_store) |opened| {
@@ -5660,8 +5663,20 @@ pub const ApiHttpServer = struct {
         @import("sql_completion.zig").recoverUnpublished(self, self.alloc, 32) catch |err| {
             std.log.warn("unpublished SQL completion cleanup deferred err={s}", .{@errorName(err)});
         };
+        @import("sql_completion.zig").retireSettledObservations(self, self.alloc, 64) catch |err| {
+            std.log.warn("SQL completion observation retirement deferred err={s}", .{@errorName(err)});
+        };
         self.retryPendingTransactionRecovery(32) catch |err| {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
+        };
+        if (self.txn_sessions.durable) |store| {
+            const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+            @import("sql_connections.zig").reconcileExpired(store, &self.txn_sessions, self.alloc, now_ms) catch |err| {
+                std.log.warn("expired SQL connection cleanup deferred err={s}", .{@errorName(err)});
+            };
+        }
+        self.maybeCleanupExpiredSqlAbortReceipts() catch |err| {
+            std.log.warn("SQL abort receipt cleanup deferred err={s}", .{@errorName(err)});
         };
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
@@ -10229,14 +10244,41 @@ pub const ApiHttpServer = struct {
         return router.localNodeId();
     }
 
-    fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
-        const ttl_ns = self.cfg.session_ttl_ns orelse return;
+    fn maybeCleanupExpiredSqlAbortReceipts(self: *ApiHttpServer) !void {
+        if (self.txn_sessions.durable == null) return;
         const now_ns = platform_time.realtimeNs();
-        const interval_ns = self.cfg.session_cleanup_interval_ns orelse ttl_ns;
+        const previous_ns = self.last_sql_abort_cleanup_ns.load(.acquire);
+        const periodic = previous_ns == 0 or now_ns -| previous_ns >= std.time.ns_per_min;
+        if (periodic and self.last_sql_abort_cleanup_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
+        const retention_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
+        if (periodic or self.txn_sessions.durable_scope == .cluster_shared) self.txn_sessions.migrateLegacySqlAbortReceipts(self.alloc) catch |err| {
+            std.log.warn("legacy SQL abort receipt migration deferred err={s}", .{@errorName(err)});
+        };
+        if (!periodic and !self.txn_sessions.hasSqlReceiptCleanupBacklog()) return;
+        _ = try self.txn_sessions.cleanupExpiredSqlAbortReceipts(self.alloc, now_ns -| retention_ns);
+        if (!periodic) return;
+        if (self.cfg.deployment_mode == .standalone and self.txn_sessions.durable_scope == .node_local and
+            self.cfg.session_executor == null and self.cfg.hot_standby_mutation_policy_source == null and self.mutationBackgroundExecutionPermitted())
+        {
+            const store = self.txn_sessions.durable.?;
+            _ = try store.reclaimStandaloneSqlAbortProofs();
+        }
+    }
+
+    fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
+        const tagged_sql_only = self.cfg.session_ttl_ns == null;
+        if (tagged_sql_only and self.txn_sessions.durable_scope != .cluster_shared) return;
+        const ttl_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
+        const now_ns = platform_time.realtimeNs();
+        const interval_ns = self.cfg.session_cleanup_interval_ns orelse if (tagged_sql_only) std.time.ns_per_min else ttl_ns;
         const previous_ns = self.last_session_cleanup_ns.load(.acquire);
-        if (previous_ns != 0 and now_ns -| previous_ns < interval_ns) return;
-        self.last_session_cleanup_ns.store(now_ns, .release);
-        _ = try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
+        const periodic = previous_ns == 0 or now_ns -| previous_ns >= interval_ns;
+        if (!periodic and !(tagged_sql_only and self.txn_sessions.hasTaggedSqlCleanupBacklog())) return;
+        if (periodic) self.last_session_cleanup_ns.store(now_ns, .release);
+        _ = if (tagged_sql_only)
+            try self.txn_sessions.cleanupExpiredTaggedSqlDecisions(self.alloc, now_ns -| ttl_ns)
+        else
+            try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
     }
 
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
@@ -14496,7 +14538,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn directTransactionRouteEligible(details: transactions_api.SessionDetails, read_only: bool) bool {
-        return read_only or (details.connection_id == null and !details.graph_receipt);
+        return read_only or (details.connection_id == null and !details.graph_receipt and !details.prepared_completion_only);
     }
 
     pub fn listAuthorizedTransactionSessions(
@@ -25480,6 +25522,7 @@ pub const ApiHttpServer = struct {
         const req = db_mod.types.DocumentArtifactTableReprocessRequest{
             .from_key = if (shard_resumes.len > 0) "" else (running_state.next_key orelse running_state.from_key),
             .to_key = running_state.to_key,
+            .selection = running_state.selection,
             .limit = running_state.limit,
             .shard_cursors = shard_resumes,
         };

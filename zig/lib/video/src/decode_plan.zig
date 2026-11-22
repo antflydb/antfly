@@ -25,7 +25,10 @@ pub const Options = struct {
     seek_cache: ?*SeekCache = null,
     /// Software AVC profiles; the decoder still validates full picture syntax.
     portable_config: bool = false,
+    /// Metadata-only consumers do not need to pin complete IDR payloads.
+    headers_only: bool = false,
     /// Split adjacent IDR runs before exceeding a decoder's dependency bound.
+    packet_budget_error: anyerror = error.ResourceLimitExceeded,
     max_run_packets: usize = std.math.maxInt(usize),
     max_selections: usize = 64,
     max_decode_packets: usize = 500_000,
@@ -80,10 +83,85 @@ pub const Plan = struct {
 /// Cached nearest verified IDR for immutable packet metadata and payloads.
 /// Payload leases remain plan-owned; this cache retains indexes only.
 pub const SeekCache = struct {
+    /// Sorted immutable sync-sample directory. Only the result of inspecting
+    /// content is published. Failed or canceled reads remain retryable.
+    pub const Candidate = struct {
+        packet: usize,
+        verified: std.atomic.Value(Status) = .init(.unknown),
+        /// Published only after every intervening hint was conclusively rejected.
+        predecessor: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+
+        const Status = enum(u32) { unknown, probing, idr, rejected };
+
+        fn isIdr(self: *Candidate, builder: *Builder) !bool {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            while (true) switch (self.verified.load(.acquire)) {
+                .idr => return true,
+                .rejected => return false,
+                .probing => {
+                    try builder.reader.input.control.check();
+                    try std.Io.futexWaitTimeout(io, Status, &self.verified.raw, .probing, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } });
+                },
+                .unknown => {
+                    if (self.verified.cmpxchgStrong(.unknown, .probing, .acq_rel, .acquire) != null) continue;
+                    var status: Status = .unknown;
+                    defer {
+                        self.verified.store(status, .release);
+                        std.Io.futexWake(io, Status, &self.verified.raw, std.math.maxInt(u32));
+                    }
+                    if (builder.probe_candidates >= builder.options.max_probe_candidates or builder.reader.packets[self.packet].size > builder.options.max_packet_bytes) return error.ResourceLimitExceeded;
+                    builder.probe_candidates += 1;
+                    const idr = try builder.probe(self.packet);
+                    status = if (idr) .idr else .rejected;
+                    return idr;
+                },
+            };
+        }
+    };
+    candidates: ?[]Candidate = null,
     allocator: std.mem.Allocator,
     nearest: []usize,
     stamp: Stamp,
     portable: bool,
+    // A paged request borrows sorted verified IDRs and memoizes just its
+    // recently searched intervals. Dense storage remains useful for cold scans.
+    verified: []const usize = &.{},
+    complete: bool = false,
+    registry: ?*const @import("h264_dynamic.zig").Session = null,
+    recent: [32]struct { first: usize, last: usize, anchor: usize } = undefined,
+    recent_count: usize = 0,
+    next_slot: usize = 0,
+
+    pub fn forPage(a: std.mem.Allocator, reader: *const media.mp4.Reader, verified: []const usize) SeekCache {
+        return .{ .allocator = a, .nearest = &.{}, .stamp = Stamp.init(reader), .portable = true, .verified = verified };
+    }
+    fn lookup(self: *const SeekCache, index: usize) ?usize {
+        if (self.nearest.len != 0) {
+            const value = self.nearest[index];
+            return if (value == std.math.maxInt(usize)) null else value;
+        }
+        const epoch_start = if (self.registry) |registry| registry.independentEpochStart(index) else null;
+        if (self.complete) {
+            const after = std.sort.upperBound(usize, self.verified, index, usizeOrder);
+            return @max(epoch_start orelse 0, if (after == 0) 0 else self.verified[after - 1]);
+        }
+        if (epoch_start == index) return index;
+        for (self.recent[0..self.recent_count]) |range| if (index >= range.first and index <= range.last) return range.anchor;
+        return if (std.sort.binarySearch(usize, self.verified, index, usizeOrder) != null) index else null;
+    }
+    fn usizeOrder(a: usize, b: usize) std.math.Order {
+        return std.math.order(a, b);
+    }
+    fn remember(self: *SeekCache, first: usize, last: usize, anchor: usize) void {
+        if (self.nearest.len != 0) {
+            @memset(self.nearest[first .. last + 1], anchor);
+            return;
+        }
+        self.recent[self.next_slot] = .{ .first = first, .last = last, .anchor = anchor };
+        self.next_slot = (self.next_slot + 1) % self.recent.len;
+        self.recent_count = @min(self.recent_count + 1, self.recent.len);
+    }
+
     pub fn init(a: std.mem.Allocator, reader: *const media.mp4.Reader, portable: bool) !SeekCache {
         if (reader.input.identity.len == 0) return error.InvalidVideoReaderSelection;
         const nearest = try a.alloc(usize, reader.packets.len);
@@ -103,19 +181,93 @@ const Builder = struct {
     probe_candidates: usize = 0,
     probe_bytes: usize = 0,
     search_steps: usize = 0,
+    fn probe(self: *Builder, index: usize) !bool {
+        const packet = self.reader.packets[index];
+        const width = self.reader.track.nal_length_bytes;
+        if (!self.options.headers_only) {
+            if (packet.size > self.options.max_probe_bytes -| self.probe_bytes) return error.ResourceLimitExceeded;
+            var payload = try self.reader.readPacket(index);
+            defer payload.deinit();
+            self.probe_bytes += packet.size;
+            const idr = if (self.options.portable_config) try avc.isPortableIdr(payload.bytes, width) else try avc.isIdr(payload.bytes, width);
+            if (idr) {
+                try self.anchors.append(self.allocator, .{ .index = index, .payload = payload });
+                payload = .{ .source = null, .bytes = &.{} };
+            }
+            return idr;
+        }
+        if (packet.size == 0 or (width != 1 and width != 2 and width != 4)) return error.MalformedVideoPacket;
+        var cursor: usize = 0;
+        var nals: usize = 0;
+        var idr_start = false;
+        while (cursor < packet.size) {
+            const header_size = @as(usize, width) + 1;
+            if (packet.size - cursor < header_size) return error.MalformedVideoPacket;
+            const n = @min(header_size + 1, packet.size - cursor);
+            if (n > self.options.max_probe_bytes -| self.probe_bytes or nals == 4096) return error.ResourceLimitExceeded;
+            var prefix = try self.reader.input.read(try std.math.add(u64, packet.offset, cursor), n);
+            defer prefix.deinit();
+            self.probe_bytes += n;
+            nals += 1;
+            var size: usize = 0;
+            for (prefix.bytes[0..width]) |b| size = (size << 8) | b;
+            if (size == 0 or size > packet.size - cursor - width) return error.MalformedVideoPacket;
+            const kind = try avc.checkedNalType(prefix.bytes[width], self.options.portable_config);
+            if (kind >= 1 and kind <= 4) return false;
+            if (kind == 5) {
+                if (size == 1) return error.MalformedVideoPacket;
+                // first_mb_in_slice == 0 is the one-bit Exp-Golomb code 1.
+                idr_start = idr_start or prefix.bytes[header_size] & 0x80 != 0;
+            }
+            cursor += width + size;
+        }
+        return idr_start;
+    }
     fn start(self: *Builder, selected: usize) !usize {
         if (self.options.mode == .from_start) return 0;
         var index = selected;
         if (self.options.seek_cache) |cache| {
-            if (cache.nearest[selected] != std.math.maxInt(usize)) return cache.nearest[selected];
+            if (cache.lookup(selected)) |anchor| return anchor;
         }
+        if (self.options.seek_cache) |cache| if (cache.candidates) |candidates| {
+            // Compare only immutable packet numbers, never copy a concurrently
+            // updated candidate during the binary search.
+            var lo: usize = 0;
+            var hi = candidates.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (candidates[mid].packet <= selected) lo = mid + 1 else hi = mid;
+            }
+            const end = lo;
+            var first_unresolved = lo;
+            var anchor: usize = 0;
+            while (lo > 0) {
+                lo -= 1;
+                if (self.search_steps >= self.options.max_search_steps) return error.ResourceLimitExceeded;
+                self.search_steps += 1;
+                try self.reader.input.control.check();
+                const candidate = &candidates[lo];
+                const known = candidate.predecessor.load(.acquire);
+                if (known != std.math.maxInt(usize)) {
+                    anchor = known;
+                    break;
+                }
+                first_unresolved = lo;
+                if (try candidate.isIdr(self)) {
+                    anchor = candidate.packet;
+                    break;
+                }
+            }
+            for (candidates[first_unresolved..end]) |*candidate| candidate.predecessor.store(anchor, .release);
+            cache.remember(anchor, selected, anchor);
+            return anchor;
+        };
         while (true) {
             if (self.search_steps >= self.options.max_search_steps) return error.ResourceLimitExceeded;
             self.search_steps += 1;
             if (self.search_steps % 256 == 1) try self.reader.input.control.check();
-            if (self.options.seek_cache) |cache| if (cache.nearest[index] != std.math.maxInt(usize)) {
-                const anchor = cache.nearest[index];
-                @memset(cache.nearest[index .. selected + 1], anchor);
+            if (self.options.seek_cache) |cache| if (cache.lookup(index)) |anchor| {
+                cache.remember(index, selected, anchor);
                 return anchor;
             };
             if (self.reader.packets[index].sync) {
@@ -127,22 +279,17 @@ const Builder = struct {
                 };
                 if (!rejected) {
                     const size = self.reader.packets[index].size;
-                    if (size > self.options.max_packet_bytes or self.probe_candidates >= self.options.max_probe_candidates or size > self.options.max_probe_bytes -| self.probe_bytes) return error.ResourceLimitExceeded;
+                    if (size > self.options.max_packet_bytes or self.probe_candidates >= self.options.max_probe_candidates) return error.ResourceLimitExceeded;
                     self.probe_candidates += 1;
-                    var lease = try self.reader.readPacket(index);
-                    errdefer lease.deinit();
-                    self.probe_bytes += size;
-                    if (try (if (self.options.portable_config) avc.isPortableIdr(lease.bytes, self.reader.track.nal_length_bytes) else avc.isIdr(lease.bytes, self.reader.track.nal_length_bytes))) {
-                        try self.anchors.append(self.allocator, .{ .index = index, .payload = lease });
-                        if (self.options.seek_cache) |cache| @memset(cache.nearest[index .. selected + 1], index);
+                    if (try self.probe(index)) {
+                        if (self.options.seek_cache) |cache| cache.remember(index, selected, index);
                         return index;
                     }
-                    lease.deinit();
                     try self.rejected.append(self.allocator, index);
                 }
             }
             if (index == 0) {
-                if (self.options.seek_cache) |cache| @memset(cache.nearest[0 .. selected + 1], 0);
+                if (self.options.seek_cache) |cache| cache.remember(0, selected, 0);
                 return 0;
             } // Baseline fallback is not a claimed verified seek.
             index -= 1;
@@ -177,19 +324,34 @@ pub fn create(allocator: std.mem.Allocator, reader: *media.mp4.Reader, selection
     for (sorted) |index| {
         try reader.input.control.check();
         const first = try builder.start(index);
-        if (index - first + 1 > options.max_run_packets) return error.ResourceLimitExceeded;
+        if (index - first + 1 > options.max_run_packets) return options.packet_budget_error;
         if (runs.items.len != 0) {
             const last = &runs.items[runs.items.len - 1];
-            if ((first <= last.last or first - last.last - 1 <= options.merge_gap_packets) and index - last.first + 1 <= options.max_run_packets) {
+            if (first == last.first) {
                 last.last = index;
                 continue;
             }
         }
         try runs.append(allocator, .{ .first = first, .last = index });
     }
+    // First collect each restart's entire dependency interval. Only then can
+    // we bridge neighboring GOPs without splitting a later GOP across runs.
+    var kept: usize = 0;
+    for (runs.items) |run| {
+        if (kept != 0) {
+            const last = &runs.items[kept - 1];
+            if (run.first - last.last - 1 <= options.merge_gap_packets and run.last - last.first + 1 <= options.max_run_packets) {
+                last.last = run.last;
+                continue;
+            }
+        }
+        runs.items[kept] = run;
+        kept += 1;
+    }
+    runs.shrinkRetainingCapacity(kept);
     var submissions: usize = 0;
     for (runs.items) |run| submissions = std.math.add(usize, submissions, run.last - run.first + 1) catch return error.ResourceLimitExceeded;
-    if (submissions > options.max_decode_packets) return error.ResourceLimitExceeded;
+    if (submissions > options.max_decode_packets) return options.packet_budget_error;
     const owned_runs = try runs.toOwnedSlice(allocator);
     errdefer allocator.free(owned_runs);
     return .{ .allocator = allocator, .selection = copied, .runs = owned_runs, .anchors = try builder.anchors.toOwnedSlice(allocator), .stamp = Stamp.init(reader), .submitted_packets = submissions, .probe_candidates = builder.probe_candidates, .probe_bytes = builder.probe_bytes, .skipped_packets = sorted[sorted.len - 1] + 1 - submissions };

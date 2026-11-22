@@ -67,3 +67,13 @@ then compares six streamed window vectors with buffered full-clip HLS inference.
 
 `anamorphic-2x1.mp4` and `anamorphic-2x1.webm` are 64x48 test patterns with a 2:1 sample
 aspect ratio, generated with FFmpeg (`testsrc`, `setsar=2/1`, H.264 Baseline and VP9).
+
+`h264-two-pps.mp4` derives from `h264-frameonly.mp4`. Its avcC lists an unused PPS with ID 1 before the original PPS. Both reference the original SPS, and all slices select PPS ID 0. The edit-list box is replaced with an equal-size free box to exercise content-relative timestamps. Doubling the media timescale makes the eight frames span one sampling interval.
+
+`h264-18001.mp4` is a 128×64 solid red, 300 fps AVC clip with 18,001 frames, no B frames, and a 30-frame GOP. Regenerate with `ffmpeg -f lavfi -i color=c=red:s=128x64:r=300 -frames:v 18001 -c:v libx264 -preset ultrafast -threads 1 -g 30 -bf 0 -pix_fmt yuv420p -movflags +faststart -an h264-18001.mp4`.
+
+`hevc-fragmented.mp4` remuxes the four-second `codecs/hevc-hvc1.mp4` fixture with FFmpeg stream copy, `-use_editlist 0 -movflags +empty_moov+default_base_moof+frag_keyframe`. Each tfdt is advanced by 1,966,080 ticks (120 seconds at 16,384 Hz).
+
+`h264-sps-intra-geometry.mp4` is the lib/video non-IDR intra geometry transition fixture used to verify independent chunk replay.
+
+`h264-cropped-coded-width.mp4` contains one 4112×64 AVC picture cropped to 4096×64 in the SPS. Generate the elementary stream with `ffmpeg -f lavfi -i color=s=4112x64:r=1 -frames:v 1 -threads 1 -pix_fmt yuv420p -c:v libx264 -x264-params crop-rect=0,0,16,0 -f h264 crop.h264`, then remux with `ffmpeg -r 1 -i crop.h264 -c copy -movflags +faststart h264-cropped-coded-width.mp4`.

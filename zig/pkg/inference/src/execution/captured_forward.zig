@@ -686,7 +686,7 @@ const TestProvider = struct {
         const second = try entry.acquireFrame();
         defer entry.returnFrame(second);
         try std.testing.expect(first.backend.ptr != second.backend.ptr);
-        if (client != null) {
+        if (@import("build_options").enable_pjrt and client != null) {
             const original = first.executable.?.runtime.plan.?;
             const receiving = second.executable.?.runtime.plan.?;
             var compiled_count: usize = 0;

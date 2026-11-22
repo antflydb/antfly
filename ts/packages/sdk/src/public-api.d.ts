@@ -2362,7 +2362,16 @@ export interface paths {
         /**
          * Register or replace an artifact enrichment
          * @description Registers a table-level generated artifact definition. Reusing the same
-         *     artifact name replaces the existing mapping. Chunk or asset enrichments
+         *     artifact name replaces the existing mapping.
+         *     Omitting all producer fields (producer, producer_json and transcriber)
+         *     on an existing same-kind artifact retains its admitted producer. Supplying
+         *     any one of these fields explicitly replaces the producer; mutually
+         *     exclusive spellings cannot be combined. Execution-policy updates persist
+         *     separately from publication authority, without reading credentials,
+         *     reconstructing the recipe, or invalidating completed output.
+         *     Changing execution alone preserves completed artifacts; changing producer
+         *     semantics may invalidate them. Use explicit reprocessing for incomplete
+         *     or all existing work. Chunk or asset enrichments
          *     may set `full_text_index: true` to map generated text into the table's
          *     default full-text index.
          */
@@ -9232,7 +9241,7 @@ export interface components {
             last_error_code?: string | null;
             /** @description Human-readable last extraction or materialization error summary, when available. */
             last_error_message?: string | null;
-            /** @description Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. */
+            /** @description Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it. */
             manifest_json?: string;
             /** @description Optional opaque JSON state for incremental processing. Present only for raw detail responses. */
             state_json?: string | null;
@@ -9652,6 +9661,12 @@ export interface components {
         /** @description Bounded request for reprocessing a derived artifact across source rows in key order. */
         DocumentArtifactTableReprocessRequest: {
             /**
+             * @description all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+             * @default all
+             * @enum {string}
+             */
+            selection?: "all" | "incomplete";
+            /**
              * @description Exclusive lower bound source document key. Use the prior response next_key to continue.
              * @default
              */
@@ -9735,6 +9750,12 @@ export interface components {
         /** @description Request to create a durable table artifact reprocess job. */
         DocumentArtifactReprocessJobStartRequest: {
             /**
+             * @description all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+             * @default all
+             * @enum {string}
+             */
+            selection?: "all" | "incomplete";
+            /**
              * @description Exclusive lower bound source document key.
              * @default
              */
@@ -9757,6 +9778,12 @@ export interface components {
             advance?: boolean;
         };
         DocumentArtifactReprocessJob: {
+            /**
+             * @description all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+             * @default all
+             * @enum {string}
+             */
+            selection?: "all" | "incomplete";
             /**
              * Format: uint64
              * @description Server-assigned durable repair job identifier.
@@ -10013,7 +10040,8 @@ export interface components {
          * @description Response acknowledgment/publication barrier, independent of commit_requires:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
          *     - "write": Wait for durable application to the local key-value store
-         *     - "full_text": Wait for full-text index WAL write
+         *     - "query": Wait for durable application and document full-text query visibility
+         *     - "full_text": Compatibility alias for query
          *     - "enrichments": Wait for this write's enrichment publication
          *     - "full_index": Wait for full-text, enrichment and vector-index publication
          *     A post-commit wait failure never rolls back the source. Terminal background
@@ -10023,7 +10051,7 @@ export interface components {
          * @default propose
          * @enum {string}
          */
-        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "full_index";
+        SyncLevel: "propose" | "write" | "query" | "full_text" | "enrichments" | "full_index";
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
@@ -17721,7 +17749,7 @@ export interface components {
              * @default true
              */
             execute?: boolean;
-            /** @description Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped. */
+            /** @description Execution-only repair mask for accepted receipts. A sub_index of 4294967295 skips all outputs at that ordinal. Other entries skip individual sub-windows. Masks leave recipe and boundary identities unchanged. */
             skip_windows?: {
                 /** Format: uint64 */
                 ordinal: number;
@@ -18369,8 +18397,13 @@ export interface components {
              */
             limit?: number;
         };
-        /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
+        /** @description Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply. */
         ExecutionPolicy: {
+            /**
+             * Format: uint32
+             * @description Invocation output-token budget for reader/generator assets and document-extraction OCR pages. Overrides producer max_tokens at execution only; it does not change the stored recipe, source fingerprint, or completed outputs. A lower value does not retroactively reject accepted output. Omit to use the producer budget.
+             */
+            max_output_tokens_per_item?: number;
             /** @description Maximum items to process in one batch for this operation. */
             batch_items?: number;
             /**

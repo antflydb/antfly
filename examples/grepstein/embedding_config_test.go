@@ -108,7 +108,7 @@ func TestHostedCorpusProfilesKeepModelsDimensionsAndRoutingAligned(t *testing.T)
 	}
 	ocr := producer["config"].(map[string]any)["ocr"].(map[string]any)
 	reader := ocr["reader"].(map[string]any)
-	if reader["max_tokens"] != float64(8192) || reader["model"] != DefaultOCRModel || reader["api_url"] != "https://inference.example/ai/v1" {
+	if asset["execution"].(map[string]any)["max_output_tokens_per_item"] != uint32(8192) || reader["model"] != DefaultOCRModel || reader["api_url"] != "https://inference.example/ai/v1" {
 		t.Fatal(ocr)
 	}
 	graphBytes, err := json.Marshal(indexes[DefaultAutographIndex])

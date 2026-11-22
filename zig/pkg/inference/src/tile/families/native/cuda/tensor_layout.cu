@@ -595,3 +595,9 @@ extern "C" __global__ void termite_source_clamp_bf16_values_f32(
     float* output,const float* input,unsigned count,unsigned flags,float low,float high) {
     antfly_source_clamp_bf16_values_f32(output,input,count,flags,low,high);
 }
+
+// native-program:entry termite_bf16_to_f16_in_place
+extern "C" __global__ void termite_bf16_to_f16_in_place(unsigned short* data, unsigned int count) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) data[i] = __half_as_ushort(__float2half_rn(__uint_as_float((unsigned int)data[i] << 16)));
+}

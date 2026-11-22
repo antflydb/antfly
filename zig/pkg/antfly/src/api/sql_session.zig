@@ -29,7 +29,7 @@ pub const Coordinator = struct {
     context: operation.RequestContext,
 
     fn retire(self: *Coordinator, guard: transactions.Mutation, version: transactions.DurableSessionStore.Version, commit_settings: bool) !sql.CommitResult {
-        const retired = self.server.txn_sessions.retireBeforeExecution(self.server.alloc, guard, version, commit_settings) catch |err| switch (err) {
+        const retired = self.server.txn_sessions.finishSqlCommitBeforeExecution(self.server.alloc, guard, version, commit_settings) catch |err| switch (err) {
             error.SessionLeaseLost => return err,
             else => false,
         };
@@ -47,6 +47,9 @@ pub const Coordinator = struct {
         const info = (try server.txn_sessions.readInfo(id)) orelse return error.SqlTransactionNotActive;
         if (info.version.owner != server.localSessionNodeId()) return error.SessionLeaseLost;
         if (info.terminal_abort) return .{ .outcome = .aborted, .reconciliation_id = id };
+        // The owner must know the completion reference before any COMMIT
+        // write can leave its outcome uncertain, including session retirement.
+        if (self.context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
         var lake_validation: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = self.identity, .context = self.context };
         lake_validation.validateAcceptedSerializable(alloc, id) catch |err| {
             if (err != error.SqlWriteConflict) return err;
@@ -73,7 +76,6 @@ pub const Coordinator = struct {
         const source = server.table_writes orelse return error.UnsupportedSqlExecution;
         var prepared = try server.preparePublicCommitWithIntegrity(alloc, tables, self.context);
         defer prepared.deinit();
-        if (self.context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
         var plan = (server.txn_sessions.sealExecutionPlan(alloc, guard, prepared.tables) catch |err| switch (err) {
             error.SessionWriteOutcomeUnknown => return .{ .outcome = .unknown, .reconciliation_id = id },
             else => return err,
@@ -84,7 +86,7 @@ pub const Coordinator = struct {
         const outcome = (source.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, info.sync_level, plan.firstAttempt(), self.context.cancellation) catch |err| {
             const rejection = transactions.classifyCommitRejection(plan.firstAttempt(), err);
             if (rejection == .fresh or rejection == .confirmed) {
-                _ = (server.txn_sessions.recordAttemptAbort(alloc, id, if (rejection == .fresh) plan.publication else null) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
+                _ = (server.txn_sessions.recordSqlAttemptAbort(alloc, id, if (rejection == .fresh) plan.publication else null, transactions.SqlAbortAcknowledgement.fromCause(transactions.abortCause(err))) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
                 return .{ .outcome = .aborted, .abort_cause = transactions.abortCause(err), .reconciliation_id = id };
             }
             if (err == error.EnrichmentWorkerFailed) {
@@ -132,6 +134,10 @@ pub const Adapter = struct {
     commit_context: *anyopaque,
     commit_fn: *const fn (*anyopaque, sql.Scope, transactions.Mutation) anyerror!sql.CommitResult,
     supports_range_guards: bool = false,
+    observed_execution_started: bool = false,
+    begin_prepared_completion_only: bool = false,
+    rollback_for_commit: bool = false,
+    failed_commit_completion: @FieldType(operation.RequestContext, "sql_completion") = null,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
     connection_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
@@ -170,7 +176,7 @@ pub const Adapter = struct {
             .expected_revision = self.connection_revision orelse return error.SqlConnectionChanged,
             .txn_id = txn_id,
         } });
-        const info = self.registry.beginForPrincipalWithSettingsAndId(self.alloc, .{ .sql = .{
+        const info = self.registry.beginForPrincipalWithSettingsAndId(self.alloc, .{ .prepared_completion_only = self.begin_prepared_completion_only, .sql = .{
             .database = scope.database,
             .namespace = scope.namespace,
             .isolation = options.isolation,
@@ -194,6 +200,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
+        self.observed_execution_started = state.execution_started;
         return inspected(id, state);
     }
 
@@ -206,7 +213,10 @@ pub const Adapter = struct {
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
         if (state.terminal_abort) return .{ .outcome = .aborted, .reconciliation_id = id };
-        if (state.execution_started or state.terminal != null) return error.SqlTransactionOutcomeUnknown;
+        if (state.execution_started or state.terminal != null) {
+            self.observed_execution_started = state.execution_started;
+            return error.SqlTransactionOutcomeUnknown;
+        }
         if (state.metadata.failed) return error.SqlTransactionAborted;
         const result = try self.commit_fn(self.commit_context, scope, self.admitted.?);
         if (self.connection_id) |connection| {
@@ -217,7 +227,9 @@ pub const Adapter = struct {
             // A committed decision must not turn into an apparent retryable
             // error merely because detachment failed. Retain the fence for
             // recovery; the caller still receives the proven decision.
-            self.connectionMutation(scope, action) catch {};
+            if (self.connectionMutation(scope, action)) |_| {
+                if (action == .terminal) self.registry.evictDetachedSqlSession(id);
+            } else |_| {}
         }
         return result;
     }
@@ -226,7 +238,16 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        if (!try self.registry.retireBeforeExecution(self.alloc, self.admitted.?, state.version, false))
+        if (self.failed_commit_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
+        const retirement = if (self.rollback_for_commit)
+            self.registry.finishSqlCommitBeforeExecution(self.alloc, self.admitted.?, state.version, false)
+        else
+            self.registry.retireBeforeExecution(self.alloc, self.admitted.?, state.version, false);
+        const retired = retirement catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown => if (self.rollback_for_commit) return error.SqlTransactionOutcomeUnknown else return err,
+            else => return err,
+        };
+        if (!retired)
             return error.SqlTransactionOutcomeUnknown;
     }
 

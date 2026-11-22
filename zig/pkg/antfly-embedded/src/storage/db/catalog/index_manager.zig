@@ -6935,7 +6935,7 @@ pub const IndexManager = struct {
         }
         const catalog_indexes = try serializeCatalog(alloc, self);
         errdefer alloc.free(catalog_indexes);
-        const catalog_enrichments = try enrichment_catalog.serializeCatalog(alloc, self.enrichments.items);
+        const catalog_enrichments = try self.publicationEnrichments(alloc);
         errdefer alloc.free(catalog_enrichments);
         const catalog_resolvers = try self.serializeResolverDefinitions(alloc);
         errdefer alloc.free(catalog_resolvers);
@@ -13068,6 +13068,8 @@ pub const IndexManager = struct {
             const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
             defer self.alloc.free(enrichment_data);
             try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+            try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, &txn);
+            try @import("enrichment_execution.zig").stage(self.alloc, &txn, enrichment_data);
             try txn.put(enrichment_catalog_key, enrichment_data);
         }
         if (self.resolvers.items.len != resolver_checkpoint) {
@@ -15491,29 +15493,13 @@ pub const IndexManager = struct {
                     owned_embedding_names.items,
                 );
                 defer artifact_cleanup.deinit();
-                // #1216: a native-catalog HBC index's own metadata (dims,
-                // root node, postings) lives under a fixed, name-derived
-                // scope, independent of the generated-artifact cleanup
-                // above. Its deletes commit in the same transaction as the
-                // catalog mutation below: a crash can never leave the
-                // catalog naming "img" over an erased scope, nor "img" gone
-                // while its stale dims survive underneath a later
-                // re-admission -- see `HBCIndex.nativeCatalogScopeDeletesForRemoval`.
-                // perf/lwa-maint-serialize: background maintenance must not
-                // write the scope between loading those deletes and the
-                // commit -- see `HBCIndex.pauseMaintenanceAcrossRemoval`.
+                // Keep maintenance out until the scope and catalog removal
+                // publish together. The native writer deletes the scope in
+                // private batches inside that transaction.
                 entry.index.pauseMaintenanceAcrossRemoval();
-                // Only valid while `entry.index` itself still is --
-                // `retireDenseIndexEntry` below destroys it, so the
-                // success path below resumes explicitly, *before* that
-                // call, instead of via `defer`; this `errdefer` covers
-                // every early-return failure path above that point, where
-                // `entry.index` is still live.
                 errdefer entry.index.resumeMaintenanceAcrossRemoval();
-                var scope_deletes = try entry.index.nativeCatalogScopeDeletesForRemoval();
-                defer if (scope_deletes) |*deletes| deletes.deinit();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
-                try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, name, null, commit_mutation, if (scope_deletes) |*deletes| deletes else null);
+                try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, name, null, commit_mutation, entry.index.nativeCatalogScope());
                 entry.index.resumeMaintenanceAcrossRemoval();
                 const replicated_leann = if (entry.index.leann) |leann_store| leann_store.isReplicated() else false;
                 self.retireDenseIndexEntry(entry);
@@ -25251,6 +25237,10 @@ pub const IndexManager = struct {
             producer_positions.getPtr(self.enrichments.items[position].name).?.* = position;
             producer_positions.getPtr(self.enrichments.items[previous].name).?.* = previous;
         }
+        const effective_execution = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
+        defer self.alloc.free(effective_execution);
+        try @import("enrichment_execution.zig").stage(self.alloc, txn, effective_execution);
+        try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, txn);
         inline for (.{ index_catalog_key, enrichment_catalog_key, resolver_catalog_key }, .{ expected.indexes, expected.enrichments, expected.resolvers }) |key, value| {
             if (value.len != 0) try txn.put(key, value) else txn.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -25269,7 +25259,7 @@ pub const IndexManager = struct {
         while (repairs.next()) |slot| if (slot.blocked()) return false;
         const indexes = try serializeCatalog(self.alloc, self);
         defer self.alloc.free(indexes);
-        const enrichments = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
+        const enrichments = try self.publicationEnrichments(self.alloc);
         defer self.alloc.free(enrichments);
         const resolvers = try self.serializeResolverDefinitions(self.alloc);
         defer self.alloc.free(resolvers);
@@ -25460,8 +25450,8 @@ pub const IndexManager = struct {
         return kept.toOwnedSlice(self.alloc);
     }
 
-    /// `scope_deletes`, when given, commit in the same native transaction.
-    fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation, scope_deletes: ?*const native_catalog_backend.ScopeDeletes) !void {
+    /// A native scope deletion commits in the same transaction.
+    fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation, delete_scope: ?[]const u8) !void {
         const data = if (self.get(excluded_name) != null)
             try serializeCatalogExcluding(self.alloc, self, excluded_name)
         else
@@ -25484,7 +25474,7 @@ pub const IndexManager = struct {
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
-        if (scope_deletes) |deletes| try txn.putIndexCatalogBatch(deletes.scope, deletes.mutations);
+        if (delete_scope) |scope| try txn.deleteIndexCatalogScope(scope);
         var retiring_names: std.ArrayList([]const u8) = .empty;
         defer retiring_names.deinit(self.alloc);
         const primary_retiring = if (removed_config) |config|
@@ -25636,6 +25626,8 @@ pub const IndexManager = struct {
         const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, retained_producers);
         defer self.alloc.free(enrichment_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+        try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, &txn);
+        try @import("enrichment_execution.zig").stage(self.alloc, &txn, enrichment_data);
         try txn.put(enrichment_catalog_key, enrichment_data);
         // Allocate the complete post-commit catalog before crossing durability.
         var next_active: std.ArrayListUnmanaged(ResolverConfig) = .empty;
@@ -25732,6 +25724,14 @@ pub const IndexManager = struct {
         for (configs) |cfg| {
             try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, cfg));
         }
+        try @import("enrichment_execution.zig").apply(self.alloc, &txn, self.enrichments.items);
+    }
+
+    fn publicationEnrichments(self: *IndexManager, alloc: Allocator) ![]u8 {
+        if (self.primary_store) |store| {
+            if (store.get(alloc, enrichment_catalog_key)) |raw| return raw else |err| if (err != error.NotFound) return err;
+        }
+        return enrichment_catalog.serializeCatalog(alloc, self.enrichments.items);
     }
 
     fn persistEnrichmentCatalog(self: *IndexManager, store: anytype) !void {
@@ -25741,6 +25741,15 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, &txn);
+        try @import("enrichment_execution.zig").stage(self.alloc, &txn, data);
+        if (txn.get(enrichment_catalog_key)) |previous| {
+            if (std.meta.eql(try @import("../artifact_semantics.zig").digest(self.alloc, "", previous, ""), try @import("../artifact_semantics.zig").digest(self.alloc, "", data, ""))) {
+                try txn.commit();
+                _ = self.write_plan_generation.fetchAdd(1, .release);
+                return;
+            }
+        } else |err| if (err != error.NotFound) return err;
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
         // Removed source definitions lose readiness in the same durable DDL
         // transaction. Re-adding identical configuration must backfill again.
@@ -25823,6 +25832,8 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../artifact_local_publication.zig").stageCatalogCompatibility(self.alloc, &txn);
+        try @import("enrichment_execution.zig").stage(self.alloc, &txn, enrichment_data);
         try txn.put(enrichment_catalog_key, enrichment_data);
         const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
@@ -36623,9 +36634,13 @@ pub fn onlineBaseEmbeddingProducer(cfg: enrichment_catalog.EnrichmentConfig) boo
 }
 
 pub fn enrichmentDefinitionsEqual(alloc: Allocator, left: enrichment_catalog.EnrichmentConfig, right: enrichment_catalog.EnrichmentConfig) !bool {
-    const a = try std.json.Stringify.valueAlloc(alloc, left, .{});
+    var semantic_left = left;
+    semantic_left.execution_json = "";
+    var semantic_right = right;
+    semantic_right.execution_json = "";
+    const a = try std.json.Stringify.valueAlloc(alloc, semantic_left, .{});
     defer alloc.free(a);
-    const b = try std.json.Stringify.valueAlloc(alloc, right, .{});
+    const b = try std.json.Stringify.valueAlloc(alloc, semantic_right, .{});
     defer alloc.free(b);
     return std.mem.eql(u8, a, b);
 }
@@ -37130,6 +37145,7 @@ pub fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentCo
 fn parsePublicExecutionConfig(alloc: Allocator, execution_json: []const u8) !types.EnrichmentExecutionConfig {
     const policy = try enrichment_types.parseExecutionPolicyJson(alloc, execution_json);
     return .{
+        .max_output_tokens_per_item = policy.max_output_tokens_per_item,
         .batch_items = if (policy.batch_items) |value| std.math.cast(u32, value) orelse return error.InvalidEnrichmentConfig else null,
         .batch_bytes = if (policy.batch_bytes) |value| std.math.cast(u64, value) orelse return error.InvalidEnrichmentConfig else null,
         .max_document_pages = if (policy.max_document_pages) |value| std.math.cast(u32, value) orelse return error.InvalidEnrichmentConfig else null,

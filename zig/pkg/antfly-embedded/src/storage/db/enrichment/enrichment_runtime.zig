@@ -8226,6 +8226,9 @@ fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichm
             cursor_bytes = retained_checkpoint;
             cursor = next;
         }
+        // Stop this attempt at the blocked ordinal. A later attempt can
+        // replay the acknowledged rows and recheck the provider's limits.
+        if (!replaying) if (page.terminal) |terminal| return terminal.failure();
         // Do not freeze retryable result receipts into an accepted immutable
         // parent. The saved page keeps healthy model work while only gaps retry.
         if (pending_index) return error.IncompleteChunkCoverage;
@@ -12619,6 +12622,7 @@ const SharedPdfWindowScheduler = struct {
         consumer.config = try document_extraction_mod.parseConfig(alloc, outer.config_json);
         consumer.owned_config = true;
         applyDocumentExtractionRuntimePolicy(&consumer.config);
+        try document_extraction_mod.applyExecutionPolicy(alloc, &consumer.config, request.execution_json);
         try document_extraction_mod.applySourceMetadataFromJson(alloc, &consumer.config, raw);
         if (!document_extraction_mod.ocrEnabledForRoute(consumer.config, "pdf")) return;
         // Custom dispatch may select a non-PDF extractor even for PDF bytes.
@@ -12719,6 +12723,7 @@ const SharedPdfWindowScheduler = struct {
             var other = document_extraction_mod.parseConfig(self.runtime.alloc, outer.config_json) catch continue;
             defer other.deinit(self.runtime.alloc);
             applyDocumentExtractionRuntimePolicy(&other);
+            try document_extraction_mod.applyExecutionPolicy(self.runtime.alloc, &other, request.execution_json);
             try document_extraction_mod.applySourceMetadataFromJson(self.runtime.alloc, &other, raw);
             if (other.routes.len != 0 or other.route_preset != .mixed_files or
                 !std.mem.eql(u8, config.credentials, other.credentials) or
@@ -15348,6 +15353,7 @@ const DocumentPreparationPipeline = struct {
             if (job.budgeted) |*budgeted|
                 job.reclaimer_id = try budgeted.reservation.manager.registerReclaimer(.document_extraction_working_set, job, Job.reclaim);
             applyDocumentExtractionRuntimePolicy(&job.config);
+            try document_extraction_mod.applyExecutionPolicy(description, &job.config, request.execution_json);
             if (self.runtime.config.remote_content) |remote| job.remote_snapshot = try remote.acquire();
             if (job.remote_snapshot) |snapshot| job.remote_config = snapshot.config.*;
             job.remote_config.runtime = null;
@@ -17837,6 +17843,12 @@ fn processAsset(
             }
         }
     }
+    if (producer_cfg.type == .reader or producer_cfg.type == .generator) {
+        if (try enrichment_types.withGenerationBudgetAlloc(runtime.alloc, producer_cfg.config_json, request.execution_json)) |updated| {
+            runtime.alloc.free(producer_cfg.config_json);
+            producer_cfg.config_json = updated;
+        }
+    }
     const config_json = producer_cfg.config_json;
     producer_cfg.config_json = "";
     var config_json_owned = true;
@@ -18911,13 +18923,27 @@ fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.
             batch.failure = err;
             break :blk null;
         };
-        for (chunks[first..end]) |chunk| repairMediaOutputPrepared(runtime, request, raw_doc, request.chunker_json, stage_prefix, name, chunk.metadata.?, current_output, &batch) catch |err| {
+        const covered_end = if (batch.page) |page| covered: {
+            const start = metadata.descriptor.ordinal;
+            if (page.start_ordinal != start or page.covered_through_ordinal <= start or page.covered_through_ordinal - start > end - first) return error.InvalidChunkOutput;
+            break :covered first + @as(usize, @intCast(page.covered_through_ordinal - start));
+        } else end;
+        // A failed retry without any coverage leaves current receipts intact.
+        if (batch.failure) |err| {
+            if (@import("inference_chunker").types.ChunkPage.Terminal.fromError(err) != null) return err;
+            switch (err) {
+                error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded => return err,
+                else => {},
+            }
+        }
+        for (chunks[first..covered_end]) |chunk| repairMediaOutputPrepared(runtime, request, raw_doc, request.chunker_json, stage_prefix, name, chunk.metadata.?, current_output, &batch) catch |err| {
             if (err != error.IncompleteChunkCoverage) return err;
             retry = true;
         };
         try persistMediaRepairs(runtime, request, raw_doc, stage_prefix, name, pending.updates.items);
         _ = decision_arena.reset(.retain_capacity);
-        first = end;
+        if (batch.page) |page| if (page.terminal) |terminal| return terminal.failure();
+        first = covered_end;
     }
     return retry;
 }
@@ -19650,6 +19676,7 @@ fn processDocumentExtractionAsset(
     var config = try document_extraction_mod.parseConfig(runtime.alloc, config_json);
     defer config.deinit(runtime.alloc);
     applyDocumentExtractionRuntimePolicy(&config);
+    try document_extraction_mod.applyExecutionPolicy(runtime.alloc, &config, request.execution_json);
     try document_extraction_mod.applySourceMetadataFromJson(runtime.alloc, &config, raw_doc);
 
     const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
@@ -19732,6 +19759,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -19762,6 +19790,7 @@ fn processDocumentExtractionAsset(
                 previous_child_ranges,
                 existing_state,
                 from_generation,
+                request.execution_json,
                 window,
             );
             try recordIsolatedRequestErrorFor(runtime, window, request, error.RemoteDocumentFetchFailed, scope.attemptNumber(runtime));
@@ -19794,6 +19823,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, raw_err, scope.attemptNumber(runtime));
@@ -19881,6 +19911,7 @@ fn processDocumentExtractionAsset(
                 previous_child_ranges,
                 existing_state,
                 from_generation,
+                request.execution_json,
                 window,
             );
             try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -20036,6 +20067,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -20193,6 +20225,7 @@ fn processDocumentExtractionAsset(
         ocr_failure_details[index] = summary.borrowed();
     }
     const streamed_extraction = document_extraction_mod.Result{
+        .execution_json = request.execution_json,
         .content_type = collect_ctx.info.content_type,
         .route_type = collect_ctx.info.route_type,
         .unsupported_reason = collect_ctx.info.unsupported_reason,
@@ -20264,6 +20297,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -20427,6 +20461,7 @@ fn writeDocumentExtractionFailureManifest(
     previous_child_ranges: []const types.DocumentArtifactChildRange,
     existing_state: ?[]const u8,
     from_generation: u64,
+    execution_json: []const u8,
     window: *GeneratedReplayWindow,
 ) !void {
     var previous_state = RuntimeDocumentExtractionPreviousState{};
@@ -20437,6 +20472,7 @@ fn writeDocumentExtractionFailureManifest(
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
     const failed_extraction = document_extraction_mod.Result{
+        .execution_json = execution_json,
         .content_type = @constCast(content_type),
         .route_type = @constCast("error"),
         .units = @constCast(empty_units[0..]),
@@ -37687,6 +37723,10 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
     try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
     try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+    if (extraction.execution_json.len > 0) {
+        try appendJsonFieldName(alloc, &out, &first, "execution");
+        try out.appendSlice(alloc, extraction.execution_json);
+    }
     if (extraction.unsupported_reason.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
     }
@@ -40911,7 +40951,7 @@ fn requireLocalAssetSourceWithAllocator(runtime: *EnrichmentRuntime, alloc: Allo
     const entry = runtime.index_manager.getEnrichment(.asset, name) orelse return error.InvalidEnrichmentConfig;
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", name);
     defer alloc.free(key);
-    try local.require(alloc, txn, key, local.recipe(entry), parent, output);
+    try local.requireCompatible(alloc, txn, key, local.recipe(entry), local.legacyRecipe(entry), parent, output);
 }
 
 fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: LocalSourceFence) !void {
@@ -42915,6 +42955,20 @@ fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void 
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
     }
     try Step.run(runtime, dense, request, &cache, &sources, &window);
+    try expect.expectEqual(@as(usize, 1), harness.provider_calls);
+    // Updating operational policy must preserve the exact authority and the
+    // accepted causal proof, not just a high-level config hash.
+    var policy_cfg = (try db.getEnrichment(alloc, .embedding, "model")).?;
+    defer policy_cfg.deinit(alloc);
+    policy_cfg.execution = .{ .batch_items = 2 };
+    _ = try db.upsertEnrichment(policy_cfg);
+    var updated_pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer updated_pin.release();
+    try expect.expect(updated_pin.plan().matchesArtifactInventory(catalog.catalogs));
+    var updated_request = updated_pin.plan().generated_templates[0];
+    updated_request.doc_key = "doc";
+    updated_request.reprocess_generation = reprocess_generation;
+    try Step.run(runtime, dense, updated_request, &cache, &sources, &window);
     try expect.expectEqual(@as(usize, 1), harness.provider_calls);
     const first = blk: {
         var read = try db.core.store.beginReadTxn();
@@ -47263,6 +47317,7 @@ test "model aware media pass resumes acknowledged pages after interruption and s
     const Fake = struct {
         calls: usize = 0,
         interrupted: bool = true,
+        terminal_first: bool = true,
         first_calls: usize = 0,
         stale: bool = false,
         revision: [64]u8 = @splat('4'),
@@ -47299,7 +47354,7 @@ test "model aware media pass resumes acknowledged pages after interruption and s
             errdefer a.free(plan);
             const fingerprint = try a.dupe(u8, "2222222222222222222222222222222222222222222222222222222222222222");
             errdefer a.free(fingerprint);
-            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal == 1 };
+            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal == 1, .terminal = if (!probe and ordinal == 0 and self.terminal_first) .coded_window_budget_exceeded else null };
         }
     };
     var fake = Fake{};
@@ -47315,6 +47370,9 @@ test "model aware media pass resumes acknowledged pages after interruption and s
     var cfg = try chunking_types_mod.parseConfigFromSlice(alloc, request.chunker_json);
     defer cfg.deinit(alloc);
     cfg.max_chunks = 1;
+    try std.testing.expectError(error.ChunkCodedWindowBudgetExceeded, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    fake.terminal_first = false;
     try std.testing.expectError(error.ChunkRequestFailed, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
     try std.testing.expectEqual(@as(usize, 1), fake.first_calls);
     fake.interrupted = false;
@@ -47672,12 +47730,13 @@ test "model aware media output repairs retain healthy vectors and persist indepe
         calls: usize = 0,
         fail: bool = false,
         revision_override: ?[]const u8 = null,
+        page_cap: usize = std.math.maxInt(usize),
         recipe_template: *C.types.ModelMetadata,
         results: []const output_types.Result,
         fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: C.Input, cfg: chunking_types_mod.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!C.types.ChunkPage {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
-            try std.testing.expectEqual(@as(usize, 0), if (cfg.replay) |replay| replay.ordinal else 0);
+            const start = if (cfg.replay) |replay| replay.ordinal else 0;
             var config = try std.json.parseFromSlice(output_types.Config, a, cfg.outputs_json, .{});
             defer config.deinit();
             try std.testing.expect(!config.value.targets[0].execute and config.value.targets[1].execute == (cfg.replay != null));
@@ -47698,24 +47757,24 @@ test "model aware media output repairs retain healthy vectors and persist indepe
             var metadata = self.recipe_template.*;
             metadata.embedding = null;
             metadata.outputs_json = outputs_json;
-            const count: usize = if (cfg.replay != null) cfg.max_chunks else 1;
+            const count: usize = if (cfg.replay != null) @min(cfg.max_chunks, self.page_cap) else 1;
             const chunks = try a.alloc(C.Chunk, count);
             errdefer a.free(chunks);
             var initialized: usize = 0;
             errdefer for (chunks[0..initialized]) |*chunk| chunk.deinit(a);
             for (chunks, 0..) |*chunk, i| {
-                metadata.descriptor.ordinal = i;
-                const inference_id = try std.fmt.allocPrint(a, "{s}:{d}", .{ metadata.plan_id, i });
+                metadata.descriptor.ordinal = start + i;
+                const inference_id = try std.fmt.allocPrint(a, "{s}:{d}", .{ metadata.plan_id, start + i });
                 defer a.free(inference_id);
                 metadata.inference_id = inference_id;
-                chunk.* = .{ .id = @intCast(i), .mime_type = "audio/wav", .metadata = try metadata.clone(a), .owns_metadata = true };
+                chunk.* = .{ .id = @intCast(start + i), .mime_type = "audio/wav", .metadata = try metadata.clone(a), .owns_metadata = true };
                 initialized += 1;
             }
             const plan = try a.dupe(u8, metadata.plan_id);
             errdefer a.free(plan);
             const fingerprint = try a.dupe(u8, metadata.source_fingerprint);
             errdefer a.free(fingerprint);
-            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = 0, .covered_through_ordinal = count, .complete = true };
+            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = start, .covered_through_ordinal = start + count, .complete = cfg.replay == null or count == cfg.max_chunks };
         }
     };
     var fake = Fake{ .recipe_template = &recipe_template, .results = &initial };
@@ -47948,18 +48007,18 @@ test "model aware media output repairs retain healthy vectors and persist indepe
     defer alloc.free(multi_cursor);
     try storePutBatchWithRetry(&runtime, &.{ .{ .key = cursor_key, .value = multi_cursor }, .{ .key = page_key, .value = multi_page } }, &.{});
     const before_batch = fake.calls;
-    var pending = MediaRepairAccumulator{ .arena = std.heap.ArenaAllocator.init(alloc) };
-    defer pending.deinit();
-    var batch = MediaRepairBatch{ .pending = &pending, .page = try prepareMediaRepairPage(&runtime, parsed_config, .{ .text = "original" }, "speech", originals[0].metadata.?, 3) };
-    defer batch.page.?.deinit(alloc);
-    for (&originals) |chunk| try repairMediaOutputPrepared(&runtime, request, raw, config, prefix, "speech", chunk.metadata.?, null, &batch);
-    try persistMediaRepairs(&runtime, request, raw, prefix, "speech", pending.updates.items);
+    fake.page_cap = 2;
+    var repair_request = request;
+    repair_request.chunker_json = config;
+    const speech_target = output_types.Target{ .name = "speech", .kind = .transcribe, .model = "whisper" };
+    try std.testing.expect(!try repairMediaOutputPage(&runtime, repair_request, raw, parsed_config, .{ .text = "original" }, prefix, "speech", speech_target, null, &originals));
+    fake.page_cap = std.math.maxInt(usize);
     const saved_cursor = (try storeGetOptionalAllocWithRetry(&runtime, cursor_key)).?;
     defer alloc.free(saved_cursor);
     var decoded_cursor = try std.json.parseFromSlice(media_pass.Cursor, alloc, try media_pass.payload(saved_cursor), .{});
     defer decoded_cursor.deinit();
-    try std.testing.expectEqual(@as(u64, 1), decoded_cursor.value.mutation_revision);
-    try std.testing.expectEqual(before_batch + 1, fake.calls);
+    try std.testing.expectEqual(@as(u64, 2), decoded_cursor.value.mutation_revision);
+    try std.testing.expectEqual(before_batch + 2, fake.calls);
     const saved_bytes = (try storeGetOptionalAllocWithRetry(&runtime, page_key)).?;
     defer alloc.free(saved_bytes);
     var saved_page = try media_pass.decodePage(alloc, saved_bytes);

@@ -33,6 +33,8 @@ pub const Options = struct {
     max_packet_bytes: usize = 16 * 1024 * 1024,
     max_decode_bytes: usize = 128 * 1024 * 1024,
     max_dependency_packets: usize = 256,
+    /// Presentation slots include repeats. Compressed packet work is bounded independently.
+    max_selection_slots: usize = 65_536,
     /// Lazy reconstruction slots for field pairs separated by other pictures.
     max_pending_pictures: usize = 16,
     /// Per reconstructed picture, including both standalone PAFF field packets.
@@ -45,7 +47,7 @@ pub const Options = struct {
     share_reference_storage: bool = true,
     reference_storage_stats: ?*ReferenceStorageStats = null,
 };
-pub const Color = struct { matrix: ?u8 = null, transfer: ?u8 = null, primaries: ?u8 = null };
+pub const Color = struct { sar: ?[2]u16 = null, matrix: ?u8 = null, transfer: ?u8 = null, primaries: ?u8 = null };
 pub const Config = struct {
     color: Color = .{},
     profile: u32,
@@ -308,7 +310,7 @@ fn hrd(bits: *Bits) !void {
 }
 fn vui(bits: *Bits, color: *Color) !bool {
     if (try bits.read(1) != 0) {
-        if (try bits.read(8) == 255) _ = try bits.read(32);
+        color.sar = try @import("display.zig").readSampleAspect(bits);
     }
     if (try bits.read(1) != 0) _ = try bits.read(1);
     var full = false;
@@ -1148,7 +1150,7 @@ pub fn decodeFrame(allocator: std.mem.Allocator, reader: *media.mp4.Reader, inde
     try reader.input.control.check();
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     if (index >= reader.packets.len) return error.InvalidPacketIndex;
-    if (reader.track.inband_parameter_sets) {
+    if (reader.track.requiresAvcRegistry()) {
         const session = try @import("h264_dynamic.zig").Session.init(allocator, reader, options);
         defer session.deinit();
         return session.decodeFrame(index);
@@ -1167,11 +1169,11 @@ pub const SelectionCallback = *const fn (*anyopaque, usize, *const Frame) anyerr
 pub fn decodeSelected(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: *anyopaque, callback: SelectionCallback) !Statistics {
     try reader.input.control.check();
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
-    if (indexes.len == 0 or indexes.len > options.max_dependency_packets) return error.ResourceLimitExceeded;
+    if (indexes.len == 0 or indexes.len > options.max_selection_slots) return error.ResourceLimitExceeded;
     for (indexes) |index| if (index >= reader.packets.len) {
         return error.InvalidPacketIndex;
     };
-    if (reader.track.inband_parameter_sets) {
+    if (reader.track.requiresAvcRegistry()) {
         const session = try @import("h264_dynamic.zig").Session.init(allocator, reader, options);
         defer session.deinit();
         return session.decodeSelected(indexes, callback_context, callback);
@@ -1184,7 +1186,7 @@ pub fn decodeSelected(allocator: std.mem.Allocator, reader: *media.mp4.Reader, i
     return .{ .decoded_packets = frame.decoded_packets, .payload_bytes = frame.payload_bytes, .decode_high_water = frame.decode_high_water };
 }
 pub fn decodeWithConfigurations(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, configurations: @import("h264_dynamic.zig").Context) !Frame {
-    if (indexes.len == 0 or indexes.len > options.max_dependency_packets) return error.ResourceLimitExceeded;
+    if (indexes.len == 0 or indexes.len > options.max_selection_slots) return error.ResourceLimitExceeded;
     for (indexes) |index| if (index >= reader.packets.len) return error.InvalidPacketIndex;
     var budget = @import("decode_budget.zig").Budget{ .backing = allocator, .limit = options.max_decode_bytes };
     return decodeBudget(&budget, reader, indexes, options, callback_context, callback, configurations) catch |err| return if (err == error.OutOfMemory and budget.denied) error.ResourceLimitExceeded else err;
@@ -1326,7 +1328,7 @@ pub const Incremental = struct {
     lanes: union(enum) { eight: [3]Continuation(u8), wide: [3]Continuation(u16) } = .{ .eight = .{ .{}, .{}, .{} } },
     valid: bool = true,
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !*Incremental {
-        if (reader.track.codec != .avc or reader.track.inband_parameter_sets) return error.UnsupportedIncrementalConfiguration;
+        if (reader.track.codec != .avc or reader.track.requiresAvcRegistry()) return error.UnsupportedIncrementalConfiguration;
         var owner = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Incremental) }) else media.admission.Token{};
         errdefer owner.deinit();
         const self = try a.create(Incremental);
@@ -1367,7 +1369,7 @@ pub const Incremental = struct {
     pub fn decodeSelectedWithConfigurations(self: *Incremental, reader: *media.mp4.Reader, indexes: []const usize, callback_context: *anyopaque, callback: SelectionCallback, configurations: ?@import("h264_dynamic.zig").Context) !Statistics {
         if (!self.valid) return error.UnsupportedIncrementalConfiguration;
         if (indexes.len == 0) return error.InvalidPacketIndex;
-        if (indexes.len > self.options.max_dependency_packets) return error.ResourceLimitExceeded;
+        if (indexes.len > self.options.max_selection_slots) return error.ResourceLimitExceeded;
         // Independent colour planes publish only after all three prediction
         // lanes complete. Preserve their combined span/slot envelope.
         if (self.cfg.?.separate_planes) {
@@ -1451,16 +1453,19 @@ pub const Incremental = struct {
         // A warm DPB is useful only while it is cheaper than an independently
         // verified restart. Never discard an unfinished field/partition pair.
         if (!self.hasPending() and (first > self.cursor() +| 32 or last - self.cursor() >= self.options.max_dependency_packets)) {
-            var restart = first;
+            const known = if (configurations) |epoch| epoch.progressiveRestart(first) else null;
+            var restart = known orelse first;
             var probes: usize = 0;
             while (restart > self.cursor() and probes < self.options.max_dependency_packets) : (restart -= 1) {
                 probes += 1;
-                if (!reader.packets[restart].sync and configurations == null) continue;
-                var lease = try reader.readPacket(restart);
-                defer lease.deinit();
-                if (lease.bytes.len > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
-                const probe_cfg = if (configurations) |epoch_context| try epoch_context.session.configAt(epoch_context.base + restart) else self.cfg.?;
-                if (!try isDependencyReset(self.budget.allocator(), probe_cfg, lease.bytes, reader.track.nal_length_bytes, reader.input)) continue;
+                if (known == null) {
+                    if (!reader.packets[restart].sync and configurations == null) continue;
+                    var lease = try reader.readPacket(restart);
+                    defer lease.deinit();
+                    if (lease.bytes.len > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
+                    const probe_cfg = if (configurations) |epoch_context| try epoch_context.session.configAt(epoch_context.base + restart) else self.cfg.?;
+                    if (!try isDependencyReset(self.budget.allocator(), probe_cfg, lease.bytes, reader.track.nal_length_bytes, reader.input)) continue;
+                }
                 // Apply a hysteresis of 32 packets to avoid resetting for tiny
                 // savings. Dependency-limit recovery takes priority over it.
                 if (restart - self.cursor() > 32 or last - self.cursor() >= self.options.max_dependency_packets) {
@@ -1605,8 +1610,12 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
     const coded_pixels = try std.math.mul(usize, cfg.coded_width, cfg.coded_height);
     if (coded_pixels > options.max_pixels) return error.ResourceLimitExceeded;
     var start = if (live.initialized) live.next_packet else first_index;
+    // A cold progressive run can reuse the validated slice-prefix index.
+    // Field and partition assemblies still resolve their reset from payloads.
+    const restart = if (live.initialized) start else if (configurations) |epoch| epoch.progressiveRestart(start) else null;
+    start = restart orelse start;
     var dependency_count: usize = 0;
-    while (!live.initialized) {
+    while (restart == null) {
         if (dependency_count >= options.max_dependency_packets) return error.ResourceLimitExceeded;
         dependency_count += 1;
         if (reader.packets[start].size > options.max_packet_bytes) return error.ResourceLimitExceeded;
@@ -2015,4 +2024,17 @@ fn decodeSeparatedState(comptime Sample: type, cfg: Config, config_reservation: 
     frame.payload_bytes = payload;
     frame.decode_high_water = budget.peak;
     return frame;
+}
+
+test "AVC VUI retains standard and extended sample aspect ratios" {
+    // aspect_ratio_info_present, followed by idc and the remaining zero VUI flags.
+    var table = [_]u8{ 0x81, 0x80, 0 };
+    var bits = Bits{ .allocator = std.testing.allocator, .bytes = &table, .end = table.len * 8 };
+    var signal = Color{};
+    _ = try vui(&bits, &signal);
+    try std.testing.expectEqual([2]u16{ 10, 11 }, signal.sar.?);
+    var extended = [_]u8{ 0xff, 0x80, 0x08, 0, 0x07, 0x80, 0 };
+    bits = .{ .allocator = std.testing.allocator, .bytes = &extended, .end = extended.len * 8 };
+    _ = try vui(&bits, &signal);
+    try std.testing.expectEqual([2]u16{ 16, 15 }, signal.sar.?);
 }
