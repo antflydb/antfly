@@ -8541,8 +8541,11 @@ pub const NativeFile = struct {
             }
             if (replay_ceiling == null and !holds_authority and sidecar_fence == null) {
                 switch (self.holdSidecarReadFence(io)) {
-                    .held => |fence| sidecar_fence = fence,
-                    .absent => {},
+                    .held => |fence| {
+                        sidecar_fence = fence;
+                        use_persisted_frontier = protected;
+                    },
+                    .absent => use_persisted_frontier = protected,
                     .own => if (torn_protected_watermark) return error.FileBusy,
                     .busy => {
                         publish_waits += 1;
@@ -40503,6 +40506,41 @@ test "lite redo durable frontier failure retains redo for recovery" {
     defer next_reader.close();
     try expectRedoDocument(&next_reader, "beta", "two");
     try std.testing.expectEqual(@as(u32, 2), test_cold_recovery_sync.count);
+}
+
+test "lite redo readers recover a newer disk frontier behind a live mapped publisher" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-mixed-region.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reader.close();
+    const region = (try reader.regionForInode()).?;
+    const published = region.readLogStateChecked().?;
+    try std.testing.expect(region.isLogStateLive(published));
+    writer.test_region_unusable = true;
+    try writer.beginTransaction();
+    try writer.putDocument("beta", "two");
+    try writer.commitTransaction();
+    try writer.releaseWriterOwnership();
+
+    try std.testing.expectEqual(published, region.readLogStateChecked().?);
+    try std.testing.expect(region.isLogStateLive(published));
+    try reader.refreshCrossProcessRedoOverlay();
+    try expectRedoDocument(&reader, "beta", "two");
+
+    var cold = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer cold.close();
+    try expectRedoDocument(&cold, "beta", "two");
 }
 
 test "lite redo segment rotation uses the inode fence without a lock region" {
