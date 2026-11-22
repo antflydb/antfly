@@ -89,15 +89,21 @@ pub const Index = union(enum) {
             .max_packet_bytes = read_limit,
         }, coded_extent_limit) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
         defer directory.deinit();
-        if (directory.track.codec == .flac) return .{ .webm_flac = try WebmFlac.init(a, directory, source, max_bytes, bounded.live, admission) };
+        return initWebmDirectory(a, directory, source, max_frames, max_bytes, bounded.live, admission);
+    }
+
+    pub fn initWebmDirectory(a: std.mem.Allocator, directory: media.webm_audio.Directory, source: *media.source.Source, max_frames: usize, max_bytes: usize, directory_bytes: usize, admission: ?Admission) !Index {
+        if (directory.track.codec == .flac) return .{ .webm_flac = try WebmFlac.init(a, directory, source, max_bytes, directory_bytes, admission) };
         const OpusSeek = @import("media_opus_seek.zig");
         if (directory.track.codec == .opus and directory.track.seek_pre_roll_ns > OpusSeek.max_webm_preroll_ns) return error.UnsupportedStreamingAudioProfile;
         const Progressive = OpusSeek.Index;
         const Webm = audio.webm.WindowIndexFor(Progressive);
         const temporary = Webm.directoryScratchBytes(directory);
-        if (temporary >= max_bytes - bounded.live) return error.AudioTooLarge;
-        const index_limit = max_bytes - bounded.live - temporary;
-        bounded.limit = max_bytes - index_limit;
+        const available = max_bytes -| directory_bytes;
+        if (temporary >= available) return error.AudioTooLarge;
+        const index_limit = available - temporary;
+        var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = temporary };
+        const scratch = bounded.allocator();
         const owner = try Progressive.createBounded(admission, index_limit);
         var initial = Progressive{ .owner = owner };
         errdefer initial.deinit();
@@ -1054,6 +1060,35 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
     var repeated = try late_provider.read(late_provider.context, a, start, end);
     defer repeated.deinit(a);
     try std.testing.expectEqualSlices(f32, late.pcm.samples, repeated.pcm.samples);
+
+    const Cache = @import("media_index_cache.zig").Cache;
+    const RuntimeMemory = @import("../runtime/tier/memory.zig");
+    const TestAdmission = struct {
+        fn acquire(raw: *anyopaque, bytes: usize) !RuntimeMemory.AdmissionLease {
+            const owner: *RuntimeMemory.AdmissionController = @ptrCast(@alignCast(raw));
+            return owner.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var controller: RuntimeMemory.AdmissionController = .{};
+    const admission: Cache.Admission = .{ .context = &controller, .acquire = TestAdmission.acquire };
+    var cache: Cache = .{};
+    defer cache.deinit();
+    source.storage.range.immutable_binding = @splat(42);
+    cache.remember(std.heap.smp_allocator, Cache.audioKey(&source, 1024, 64 * 1024).?, .{ .audio = track.seek.? }, admission);
+    var flights: [256]@import("media_speaker_flights.zig").Registry.Lease = undefined;
+    var acquired: usize = 0;
+    defer for (flights[0..acquired]) |flight| flight.deinit();
+    for (&flights, 0..) |*flight, i| {
+        var key: [32]u8 = @splat(0);
+        key[0] = @intCast(i);
+        flight.* = try cache.acquireBuild(key, .{});
+        acquired += 1;
+    }
+    const reads = source.reads;
+    var warm = try @import("media_chunking_audio_source.zig").Track.initCached(a, &source, .{}, 64 * 1024, 1024, &cache, admission);
+    defer warm.deinit();
+    try std.testing.expect(warm.cached != null);
+    try std.testing.expectEqual(reads, source.reads);
 
     const over_limit = try audio.webm.buildOpusTestFileWithPrerollAlloc(a, ogg.packets[0].bytes, packets, 3 * std.time.ns_per_s);
     defer a.free(over_limit);

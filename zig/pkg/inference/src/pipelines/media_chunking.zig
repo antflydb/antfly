@@ -951,6 +951,7 @@ pub const Runner = struct {
 
     const VideoAudio = struct {
         source: *media.source.Source,
+        observed: ?struct { builder: *media.webm_audio.DirectoryBuilder, memory: *media.admission.TrackedAllocator } = null,
         track: ?@import("media_chunking_audio_source.zig").Track = null,
         frames: @import("media_chunking_audio.zig").FrameCheckpointSession = .{},
     };
@@ -969,7 +970,16 @@ pub const Runner = struct {
     fn prepareVideoAudio(self: *Runner) !void {
         const owner = self.video_audio orelse return;
         if (owner.track != null or self.audio_failure != null) return;
-        owner.track = @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission) catch |err| {
+        const Track = @import("media_chunking_audio_source.zig").Track;
+        const track = if (owner.observed) |observed|
+            Track.initObservedWebm(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission, observed.builder, observed.memory.live)
+        else
+            Track.initCached(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission);
+        if (owner.observed) |observed| {
+            observed.builder.deinit();
+            owner.observed = null;
+        }
+        owner.track = track catch |err| {
             if (abort(err) and err != error.AudioTooLarge) return err;
             self.audio_failure = err;
             return;
@@ -1072,6 +1082,31 @@ pub const Runner = struct {
             if (build) |lease| lease.deinit();
             build = null;
             return self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
+        }
+        if (webm and self.request.needs_audio and source.storage == .range) {
+            const audio_key = Cache.audioKey(source, count, self.request.max_working_bytes);
+            const warm_audio = if (audio_key) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
+            defer if (warm_audio) |entry| self.request.index_cache.?.release(entry);
+            if (warm_audio == null) {
+                var memory = media.admission.TrackedAllocator{ .backing = self.allocator, .reservation = try self.pool.acquire(.{}), .limit = self.request.max_working_bytes };
+                defer memory.reservation.deinit();
+                const read_limit = @min(source.limits.max_read_bytes, source.limits.max_retained_bytes);
+                var builder = media.webm_audio.DirectoryBuilder{
+                    .allocator = memory.allocator(),
+                    .limits = .{ .max_packets = count, .max_metadata_bytes = @min(self.request.max_working_bytes, read_limit), .max_index_bytes = self.request.max_working_bytes, .max_packet_bytes = read_limit },
+                };
+                audio_owner.observed = .{ .builder = &builder, .memory = &memory };
+                defer if (audio_owner.observed != null) {
+                    builder.deinit();
+                    audio_owner.observed = null;
+                };
+                var reader = try media.webm.Reader.initObserved(self.allocator, source, .{ .max_packets = count, .max_index_bytes = self.request.max_working_bytes }, builder.observer());
+                defer reader.deinit();
+                if (builder.failure) |err| {
+                    if (err == error.OutOfMemory and memory.denied != null) builder.failure = error.AudioTooLarge;
+                }
+                return self.webmWindowsCached(&reader, identity, &build);
+            }
         }
         var input = try @import("embedding_gemma2_video.zig").ContainerInput.openLimited(self.allocator, source, bytes, webm, .reference, limits, .{ .max_packets = count, .max_index_bytes = self.request.max_working_bytes });
         defer input.deinit();

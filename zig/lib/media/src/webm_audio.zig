@@ -592,16 +592,92 @@ pub const Directory = struct {
     }
 };
 
+/// Collect audio geometry while a video reader visits the same blocks.
+pub const DirectoryBuilder = struct {
+    allocator: std.mem.Allocator,
+    limits: Webm.Limits,
+    track: ?TrackInfo = null,
+    packets: std.ArrayList(Packet) = .empty,
+    padding: std.ArrayList(BlockPadding) = .empty,
+    failure: ?anyerror = null,
+
+    pub fn observer(self: *DirectoryBuilder) Webm.BlockObserver {
+        return .{ .context = self, .tracks = tracks, .block = block };
+    }
+
+    fn tracks(context: *anyopaque, bytes: []const u8) void {
+        const self: *DirectoryBuilder = @ptrCast(@alignCast(context));
+        self.collectTracks(bytes) catch |err| self.fail(err);
+    }
+
+    fn collectTracks(self: *DirectoryBuilder, bytes: []const u8) !void {
+        if (bytes.len > self.limits.max_metadata_bytes) return error.ResourceLimitExceeded;
+        var parsed = DemuxState{};
+        try parseTracks(bytes, &parsed);
+        var track = parsed.track orelse return error.UnsupportedAudioFormat;
+        if (track.codec == null or track.codec_private.len == 0) return error.UnsupportedAudioFormat;
+        track.codec_private = try self.allocator.dupe(u8, track.codec_private);
+        self.track = track;
+    }
+
+    fn block(context: *anyopaque, input: *Source, elem: Webm.Element, discard: ?Webm.Element, prefix: []const u8, ticks: u64, scale: u64) void {
+        const self: *DirectoryBuilder = @ptrCast(@alignCast(context));
+        if (self.failure != null) return;
+        self.collectBlock(input, elem, discard, prefix, ticks, scale) catch |err| self.fail(err);
+    }
+
+    fn collectBlock(self: *DirectoryBuilder, input: *Source, elem: Webm.Element, discard: ?Webm.Element, prefix: []const u8, ticks: u64, scale: u64) !void {
+        const track = self.track orelse return error.UnsupportedAudioFormat;
+        var scan = Webm.Scan{ .input = input, .limits = self.limits };
+        const before = self.packets.items.len;
+        const limit = if (track.codec == .flac) std.math.cast(usize, input.length()) orelse std.math.maxInt(usize) else self.limits.max_packet_bytes;
+        try indexBlock(self.allocator, &scan, elem, track, ticks, scale, &self.packets, limit, prefix);
+        if (self.packets.items.len != before) if (discard) |field| {
+            if (field.end - field.payload > 8) return error.UnsupportedAudioFormat;
+            var lease = try input.readSparse(field.payload, @intCast(field.end - field.payload));
+            defer lease.deinit();
+            const ns = try readSignedInt(lease.bytes);
+            if (ns != 0) try self.padding.append(self.allocator, .{ .first = before, .end = self.packets.items.len, .ns = ns });
+        };
+    }
+
+    /// Borrow the accumulated geometry through the caller's audio index build.
+    pub fn borrowDirectory(self: *DirectoryBuilder) !Directory {
+        if (self.failure) |err| return err;
+        const track = self.track orelse return error.UnsupportedAudioFormat;
+        if (self.packets.items.len == 0) return error.UnsupportedAudioFormat;
+        return .{ .track = track, .packets = self.packets.items, .padding = self.padding.items, .allocator = self.allocator };
+    }
+
+    fn fail(self: *DirectoryBuilder, err: anyerror) void {
+        self.deinit();
+        self.failure = err;
+    }
+
+    pub fn deinit(self: *DirectoryBuilder) void {
+        if (self.track) |track| self.allocator.free(track.codec_private);
+        self.packets.deinit(self.allocator);
+        self.padding.deinit(self.allocator);
+        self.track = null;
+    }
+};
+
 const RangeBlock = struct {
     source: *Source,
     start: u64,
     length: usize,
+    initial: []const u8 = &.{},
     position: usize = 0,
     lease: ?@import("source.zig").Lease = null,
     lease_start: usize = 0,
 
     fn byte(self: *RangeBlock) !u8 {
         if (self.position == self.length) return error.UnsupportedAudioFormat;
+        if (self.position < self.initial.len) {
+            const value = self.initial[self.position];
+            self.position += 1;
+            return value;
+        }
         if (self.lease == null or self.position - self.lease_start >= self.lease.?.bytes.len) {
             self.close();
             self.lease_start = self.position;
@@ -678,7 +754,7 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
                 defer lease.deinit();
                 ticks = try readUint(lease.bytes);
             },
-            simple_block_id => try indexBlock(a, scan, child, track, ticks, scale, packets, packet_limit),
+            simple_block_id => try indexBlock(a, scan, child, track, ticks, scale, packets, packet_limit, &.{}),
             block_group_id => {
                 var discard: ?Webm.Element = null;
                 var nested = child.payload;
@@ -686,7 +762,7 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
                     const field = try scan.rawHeader(nested, child.end);
                     if (field.unknown) return error.UnsupportedAudioFormat;
                     switch (field.id) {
-                        block_id => try indexBlock(a, scan, field, track, ticks, scale, packets, packet_limit),
+                        block_id => try indexBlock(a, scan, field, track, ticks, scale, packets, packet_limit, &.{}),
                         discard_padding_id => discard = field,
                         else => {},
                     }
@@ -707,9 +783,9 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
     return pos;
 }
 
-fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track: TrackInfo, ticks: u64, scale: u64, packets: *std.ArrayList(Packet), packet_limit: usize) !void {
+fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track: TrackInfo, ticks: u64, scale: u64, packets: *std.ArrayList(Packet), packet_limit: usize, prefix: []const u8) !void {
     const length = std.math.cast(usize, elem.end - elem.payload) orelse return error.ResourceLimitExceeded;
-    var reader = RangeBlock{ .source = scan.input, .start = elem.payload, .length = length };
+    var reader = RangeBlock{ .source = scan.input, .start = elem.payload, .length = length, .initial = prefix };
     defer reader.close();
     const block = try describeBlock(&reader, length, track.number, ticks, scale) orelse return;
     const limit = @min(scan.limits.max_packets, scan.limits.max_index_bytes / @sizeOf(Packet));
@@ -756,4 +832,43 @@ test "WebM borrowed and range indexes preserve signed block padding" {
         try std.testing.expectEqualSlices(BlockPadding, &.{.{ .first = 0, .end = 1, .ns = if (interior) 1 else -1 }}, borrowed_padding.items);
         try std.testing.expectEqualSlices(BlockPadding, borrowed_padding.items, range_padding.items);
     }
+}
+
+test "WebM joint video and audio index reuses the block prefix" {
+    const a = std.testing.allocator;
+    const video_fields = "\xd7\x81\x01\x83\x81\x01\x86\x85V_VP9\xe0\x86\xb0\x81\x10\xba\x81\x10";
+    const audio_fields = "\xd7\x81\x02\x83\x81\x02\x86\x86A_OPUS\x63\xa2\x81\x01";
+    const video_entry = "\xae" ++ [_]u8{0x80 | video_fields.len} ++ video_fields;
+    const audio_entry = "\xae" ++ [_]u8{0x80 | audio_fields.len} ++ audio_fields;
+    const track_bytes = video_entry ++ audio_entry;
+    const cluster = "\xe7\x81\x00\xa3\x85\x81\x00\x00\x80\x01" ++
+        "\xa0\x8c\xa1\x86\x82\x00\x01\x00\xf8\xff\x75\xa2\x81\xff";
+    const segment = "\x16\x54\xae\x6b" ++ [_]u8{0x80 | track_bytes.len} ++ track_bytes ++
+        "\x1f\x43\xb6\x75" ++ [_]u8{0x80 | cluster.len} ++ cluster;
+    const bytes = "\x1a\x45\xdf\xa3\x87\x42\x82\x84webm" ++
+        "\x18\x53\x80\x67" ++ [_]u8{0x80 | segment.len} ++ segment;
+    const Fixture = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: @import("source.zig").Control) !usize {
+            @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    const range = @import("source.zig").Range{ .context = &marker, .length = bytes.len, .read_at = Fixture.read };
+    var plain = Source{ .allocator = a, .identity = "a/v", .storage = .{ .range = range } };
+    var video = try Webm.Reader.init(a, &plain, .{});
+    defer video.deinit();
+    var joint = Source{ .allocator = a, .identity = plain.identity, .storage = .{ .range = range }, .limits = .{ .max_reads = plain.reads + 1 } };
+    var builder = DirectoryBuilder{ .allocator = a, .limits = .{} };
+    defer builder.deinit();
+    var reader = try Webm.Reader.initObserved(a, &joint, .{}, builder.observer());
+    defer reader.deinit();
+    try std.testing.expectEqual(plain.reads + 1, joint.reads); // Only signed padding needs another read.
+    try std.testing.expectEqualSlices(Webm.Packet, video.packets, reader.packets);
+    const observed = try builder.borrowDirectory();
+    var standalone = Source{ .allocator = a, .identity = plain.identity, .storage = .{ .range = range } };
+    const baseline = try Directory.init(a, &standalone, .{});
+    defer baseline.deinit();
+    try std.testing.expectEqualSlices(Packet, baseline.packets, observed.packets);
+    try std.testing.expectEqualSlices(BlockPadding, baseline.padding, observed.padding);
 }

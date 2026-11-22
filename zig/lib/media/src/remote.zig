@@ -147,9 +147,12 @@ pub const ReadAhead = struct {
 
     fn readSparsePreferring(context: *anyopaque, offset: u64, out: []u8, minimum: usize, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
-        // Cache hits provide no evidence about upstream request density.
-        if (out.len == 0 or self.cachedPrefix(offset, out.len) != 0) return self.readWindow(offset, out, minimum, control, 0);
-        if (self.upstream.sparse_read_preferring == null and !self.upstream.accepts_full_read_size) return self.readWindow(offset, out, minimum, control, minimum);
+        const may_prefetch = self.upstream.sparse_read_preferring != null or self.upstream.accepts_full_read_size;
+        if (!may_prefetch) return self.readWindow(offset, out, minimum, control, minimum);
+        // A cache hit is not an independent upstream miss. A partial hit
+        // can still fetch the required suffix without training the heuristic.
+        const cached = self.cachedPrefix(offset, out.len);
+        if (out.len == 0 or cached != 0) return self.readWindow(offset, out, minimum, control, cached +| @max(256, out.len - cached));
         const requests_left = self.max_reads -| self.reads;
         const bytes_left = self.max_bytes -| self.charged_bytes;
         const source_left = self.upstream.length -| offset;
@@ -182,10 +185,11 @@ pub const ReadAhead = struct {
         try control.check();
         if (offset > self.upstream.length or out.len > self.upstream.length - offset) return error.UnexpectedEndOfSource;
         if (out.len == 0) return 0;
-        if (self.cachedPrefix(offset, out.len) != 0) return self.readWindow(offset, out, out.len, control, 0);
-        const size: usize = @intCast(@min(out.len, self.max_bytes -| self.charged_bytes));
+        const cached = self.copyCached(offset, out);
+        if (cached == out.len) return cached;
+        const size: usize = @intCast(@min(out.len - cached, self.max_bytes -| self.charged_bytes));
         if (size == 0) return error.RemoteReadBudgetExceeded;
-        return self.fetchAt(offset, out[0..size], size, control);
+        return cached + try self.fetchAt(offset + cached, out[cached..][0..size], size, control);
     }
 
     fn fetchAt(self: *ReadAhead, offset: u64, out: []u8, minimum: usize, control: source.Control) !usize {
@@ -216,14 +220,22 @@ pub const ReadAhead = struct {
         if (offset > self.upstream.length or out.len > self.upstream.length - offset) return error.UnexpectedEndOfSource;
         if (out.len == 0) return 0;
         if (self.window_bytes == 0) return error.InvalidRemoteCacheBudget;
+        const cached = self.copyCached(offset, out);
+        if (cached >= minimum) return cached;
+        return cached + try self.fillWindow(offset + cached, out[cached..], minimum - cached, control, fill_bytes -| cached);
+    }
+
+    fn copyCached(self: *ReadAhead, offset: u64, out: []u8) usize {
         const cached = self.cachedPrefix(offset, out.len);
         if (cached != 0) {
             const delta: usize = @intCast(offset - self.start);
             @memcpy(out[0..cached], self.buffer.?[delta..][0..cached]);
             self.hits += 1;
-            // Source completes a short read at offset + cached.
-            return cached;
         }
+        return cached;
+    }
+
+    fn fillWindow(self: *ReadAhead, offset: u64, out: []u8, minimum: usize, control: source.Control, fill_bytes: usize) !usize {
         if (self.buffer == null) {
             var reservation = if (self.admission_pool) |pool| try pool.acquire(.{ .host_bytes = self.window_bytes }) else @import("admission.zig").Token{};
             errdefer reservation.deinit();
@@ -232,7 +244,7 @@ pub const ReadAhead = struct {
         }
         // Keep an existing prefix when extending the same window. Later
         // probes may ask for that prefix again before growing the suffix.
-        const append = self.valid < self.window_bytes and offset >= self.start and offset - self.start == self.valid;
+        const append = self.valid < self.window_bytes and minimum <= self.window_bytes - self.valid and offset >= self.start and offset - self.start == self.valid;
         const retained = if (append) self.valid else 0;
         const fill = if (self.prefetch_limited) @min(fill_bytes, out.len) else fill_bytes;
         const fetch: usize = @intCast(@min(fill, self.window_bytes - retained, self.upstream.length - offset, self.max_bytes -| self.charged_bytes));
@@ -630,4 +642,31 @@ test "preferred object reads honor the wire allowance through read ahead" {
         try std.testing.expectEqual(@as(usize, 1), object.requests);
         try std.testing.expectEqual(@as(u64, 3), object.charged_bytes);
     }
+}
+
+test "sparse cache overlap fills its suffix in the final source callback" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            @memcpy(out, "abcdefgh"[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var cache = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 8, .accepts_full_read_size = true },
+        .window_bytes = 4,
+        .max_bytes = 6,
+        .max_reads = 2,
+    };
+    defer cache.deinit();
+    var input = source.Source{ .allocator = std.testing.allocator, .identity = "overlap", .storage = .{ .range = cache.range() }, .limits = .{ .max_reads = 2 } };
+    var first = try input.readSparse(0, 4);
+    first.deinit();
+    var overlap = try input.readSparsePreferring(2, 4, 6, .{});
+    defer overlap.deinit();
+    try std.testing.expectEqualSlices(u8, "cdef", overlap.bytes);
+    try std.testing.expectEqual(@as(usize, 2), input.reads);
+    try std.testing.expectEqual(@as(usize, 2), cache.reads);
+    try std.testing.expectEqual(@as(u64, 6), cache.transferred_bytes);
 }

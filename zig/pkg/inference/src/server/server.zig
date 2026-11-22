@@ -15939,11 +15939,18 @@ pub const Node = struct {
             defer if (security_snapshot) |*snapshot| snapshot.deinit();
             var security = if (security_snapshot) |snapshot| defaultedRequestContentSecurity(snapshot.value) else effectiveRequestContentSecurity(self);
             const download_context = InferenceDownloadRequestContext{ .io = io, .control = control };
-            const remote = try scraping.PinnedRange.createWithLocalCache(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, switch (reference.version_kind) {
+            const context = try inferenceDownloadContext(&download_context);
+            const version_kind: scraping.PinnedRange.VersionKind = switch (reference.version_kind) {
                 .strong_etag => .strong_etag,
                 .s3_version_id => .s3_version_id,
                 .file_sha256 => .file_sha256,
-            }, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{}, &self.host_caches.local_source_verifications);
+            };
+            const credentials = if (self.config.s3_credentials) |*value| value else null;
+            const verifications = &self.host_caches.local_source_verifications;
+            const remote = if (request.observe_only)
+                try scraping.PinnedRange.createMetadataOnly(transport_allocator, context, reference.uri, reference.version, version_kind, reference.length, &security, credentials, verifications)
+            else
+                try scraping.PinnedRange.createWithLocalCache(transport_allocator, context, reference.uri, reference.version, version_kind, reference.length, &security, credentials, &.{}, verifications);
             defer remote.destroy();
             const Range = struct {
                 fn read(raw: *anyopaque, offset: u64, out: []u8, check: media.source.Control) !usize {
@@ -15965,7 +15972,7 @@ pub const Node = struct {
             identity_hash.update(reference.version);
             const binding = identity_hash.finalResult();
             const source_identity = std.fmt.bytesToHex(binding, .lower);
-            cache.upstream.immutable_binding = binding;
+            if (!request.observe_only) cache.upstream.immutable_binding = binding;
             var source = media.source.Source{ .allocator = transport_allocator, .identity = &source_identity, .storage = .{ .range = cache.range() }, .limits = .{ .max_total_bytes = std.math.maxInt(u64), .max_reads = std.math.maxInt(usize) } };
             var resolved = request;
             resolved.input = .{ .binary = .{ .mime_type = reference.mime_type, .data = &.{} } };
@@ -40660,6 +40667,39 @@ test "chunk request input parser rejects invalid content parts" {
         try std.testing.expectError(case.expected_error, parseChunkRequestInput(std.testing.allocator, parsed.value));
         try std.testing.expectEqualStrings(case.expected_message, chunkInputParseErrorMessage(case.expected_error));
     }
+}
+
+test "model aware media cold local generation observation skips digest verification at the server boundary" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Chunks = @import("../pipelines/media_chunking.zig");
+    const Sink = struct {
+        fn unexpected(_: *anyopaque, _: Chunks.Item) !void {
+            return error.UnexpectedChunk;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "video", .data = "contents" });
+    const path = try tmp.dir.realPathFileAlloc(io, "video", a);
+    defer a.free(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(uri);
+    const allowed = [_][]u8{path};
+    var node = try Node.init(a, .{ .content_security = .{ .allowed_paths = &allowed } });
+    defer node.deinit();
+    var marker: u8 = 0;
+    const sink = Chunks.Sink{ .context = &marker, .accept = Sink.unexpected };
+    var request = Chunks.Request{
+        .input = .{ .source = .{ .uri = uri, .version = &(@as([64]u8, @splat('0'))), .version_kind = .file_sha256, .length = 8, .mime_type = "video/mp4" } },
+        .observe_only = true,
+        .execute = false,
+    };
+    // A deliberately invalid target stops after reference resolution. The
+    // deliberately wrong file hash would fail first if resolution read bytes.
+    try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedDirect(a, io, .{}, request, .{ .model = "" }, sink));
+    request.observe_only = false;
+    try std.testing.expectError(error.SourceVersionChanged, node.chunkAndEmbedDirect(a, io, .{}, request, .{ .model = "" }, sink));
 }
 
 test "chunk request input parser accepts valid text and media" {

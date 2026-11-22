@@ -1037,6 +1037,7 @@ pub const PinnedRange = struct {
     backend: ?union(enum) { http: httpx.Client, s3: objectstore.S3.Client, file: LocalFile } = null,
     headers: []const HTTPHeader = &.{},
     file_io_lease: ?DownloadContext.BlockingLease = null,
+    metadata_only: bool = false,
 
     const LocalFile = struct {
         file: std.Io.File,
@@ -1059,11 +1060,21 @@ pub const PinnedRange = struct {
     }
 
     pub fn createWithLocalCache(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader, cache: ?*LocalVerificationCache) !*PinnedRange {
+        return createMode(alloc, context, uri, version, kind, length, security, credentials, headers, cache, false);
+    }
+
+    /// Resolve a declared identity for generation observation. A cold local
+    /// digest is a claim until an ordinary read opens and verifies the file.
+    pub fn createMetadataOnly(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, cache: ?*LocalVerificationCache) !*PinnedRange {
+        return createMode(alloc, context, uri, version, kind, length, security, credentials, &.{}, cache, true);
+    }
+
+    fn createMode(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader, cache: ?*LocalVerificationCache, metadata_only: bool) !*PinnedRange {
         try context.check();
         if (headers.len > 128) return error.InvalidSourceReference;
         const parsed = try validateReference(uri, version, kind, length);
         const self = try alloc.create(PinnedRange);
-        self.* = .{ .allocator = alloc, .context = context, .transport = .{ .backing = alloc, .limit = context.transport_memory_limit_bytes }, .security = security, .kind = kind, .length = length, .headers = headers };
+        self.* = .{ .allocator = alloc, .context = context, .transport = .{ .backing = alloc, .limit = context.transport_memory_limit_bytes }, .security = security, .kind = kind, .length = length, .headers = headers, .metadata_only = metadata_only };
         errdefer self.destroy();
         self.initBackend(uri, version, parsed, credentials, cache) catch |err| return transportError(&self.transport, err);
         return self;
@@ -1125,6 +1136,12 @@ pub const PinnedRange = struct {
             key_hash.update(self.identity);
             const key = key_hash.finalResult();
             const cached_digest = if (cache) |receipts| receipts.lookup(key, stat) else null;
+            if (self.metadata_only) {
+                if (cached_digest) |actual| if (!std.mem.eql(u8, &actual, version)) return error.SourceVersionChanged;
+                try local.check(context.io);
+                self.backend = .{ .file = local };
+                return;
+            }
             const digest = cached_digest orelse computed: {
                 const verification = if (cache) |receipts| try receipts.acquire(context, key) else null;
                 defer if (verification) |lease| lease.deinit();
@@ -1193,6 +1210,7 @@ pub const PinnedRange = struct {
     }
     fn readAtInternal(self: *PinnedRange, offset: u64, out: []u8) !usize {
         try self.context.check();
+        if (self.metadata_only) return error.InvalidSourceReference;
         if (offset > self.length or out.len == 0 or out.len > self.length - offset) return error.InvalidRemoteRange;
         if (out.len > maxDownloadSize(self.security)) return error.StreamTooLong;
         const ceiling = try DownloadCeiling.init(self.context, self.security);
@@ -2992,6 +3010,12 @@ test "local verification receipts avoid repeated full-file reads and invalidate 
     std.crypto.hash.sha2.Sha256.hash("0123456789", &hash, .{});
     const version = std.fmt.bytesToHex(hash, .lower);
     var cache: LocalVerificationCache = .{};
+    const observation = try PinnedRange.createMetadataOnly(a, .{ .io = io }, uri, &version, .file_sha256, 10, &security, null, &cache);
+    defer observation.destroy();
+    try observation.validate();
+    var probe: [1]u8 = undefined;
+    try std.testing.expectError(error.InvalidSourceReference, observation.readAt(0, &probe));
+    try std.testing.expectEqual(@as(u64, 0), cache.hashed_bytes.load(.monotonic));
     const cold = try PinnedRange.createWithLocalCache(a, .{ .io = io }, uri, &version, .file_sha256, 10, &security, null, &.{}, &cache);
     cold.destroy();
     // A warm continuation cannot allocate the 256 KiB streaming hash buffer.
