@@ -421,6 +421,9 @@ compatibility write and its source checkpoint can replay that write.
 Writable Iceberg reports its ingress and catalog commit capability. External
 read-only Iceberg attachments report committed snapshots as their change
 authority. Index publication is a separate milestone across these contracts.
+External Parquet can follow a producer-published manifest that names the
+committed immutable file set. Listing a prefix gives no atomic multi-file
+commit boundary. Parquet attachments have no row-changefeed capability.
 The managed-source status reports the durable published generation and its
 base snapshot alongside pending or failed index generations. Its
 `destination_contract` reports transaction scope, commit authority, and the

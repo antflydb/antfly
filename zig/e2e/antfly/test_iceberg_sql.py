@@ -241,6 +241,7 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
         pytest.importorskip("psycopg")
     import psycopg
     import pyarrow as pa
+    import pyarrow.parquet as pq
     from pyiceberg.catalog.sql import SqlCatalog
     from pyiceberg.partitioning import PartitionField, PartitionSpec
     from pyiceberg.schema import Schema
@@ -383,19 +384,48 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
 
-        row_feed = requests.post(
-            server.api_url + "/changefeeds",
-            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-            headers={"Idempotency-Key": "external-iceberg-row-bootstrap"},
-            json={
-                "tables": ["ice_events"],
-                "start": "snapshot_then_changes",
-                "include": "rows",
-            },
-            timeout=30,
+        parquet_root = tmp_path / "external-parquet"
+        objects = parquet_root / "buckets" / "antfly" / "objects"
+        objects.mkdir(parents=True)
+        stream = pa.BufferOutputStream()
+        pq.write_table(pa.table({"id": [1]}), stream)
+        payload = stream.getvalue().to_pybytes()
+        (objects / "rows.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
         )
-        assert row_feed.status_code == 501, row_feed.text + server.debug_logs()
-        assert row_feed.json()["error"] == "changefeed_capability_unsupported"
+        request(
+            "/tables/parquet_events",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "parquet_events",
+                        "format": "parquet",
+                        "uri": parquet_root.as_uri(),
+                    },
+                },
+            },
+        )
+        assert sql("SELECT id FROM parquet_events") == [["1"]]
+        for name in ("ice_events", "parquet_events"):
+            row_feed = requests.post(
+                server.api_url + "/changefeeds",
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                headers={"Idempotency-Key": f"{name}-row-bootstrap"},
+                json={
+                    "tables": [name],
+                    "start": "snapshot_then_changes",
+                    "include": "rows",
+                },
+                timeout=30,
+            )
+            assert row_feed.status_code == 501, row_feed.text + server.debug_logs()
+            assert row_feed.json()["error"] == "changefeed_capability_unsupported"
 
         for cold in (False, True):
             if cold:
