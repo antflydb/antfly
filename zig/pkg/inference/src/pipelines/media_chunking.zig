@@ -291,12 +291,15 @@ pub const Runner = struct {
                 const end: u128 = @intCast(descriptor.coordinates.end_ns orelse return error.InvalidChunkCoordinates);
                 const first = std.math.cast(usize, @divFloor(start * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)) orelse return error.InvalidChunkCoordinates;
                 const last = std.math.cast(usize, @divFloor(end * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)) orelse return error.InvalidChunkCoordinates;
+                const known_samples = if (provider.final_samples) |final| final(provider.context) else provider.samples;
                 const extent = AudioExtent{
-                    .samples = @min(last, provider.samples) -| first,
+                    .samples = @min(last, known_samples orelse provider.samples) -| first,
                     .sample_rate = provider.sample_rate,
                     .start_ns = std.math.cast(i64, @divFloor(@as(u128, first) * std.time.ns_per_s, provider.sample_rate)) orelse return error.InvalidChunkCoordinates,
                 };
-                if (extent.samples != 0 and !try self.audioReplayNeeded(ordinal, extent)) {
+                // Streams can advertise a ceiling until EOF is known. Only
+                // synthesize skipped windows from an exact sample extent.
+                if (known_samples != null and extent.samples != 0 and !try self.audioReplayNeeded(ordinal, extent)) {
                     output_payload.video.masked_audio = extent;
                 } else {
                     borrowed_audio = if (extent.samples == 0) .{ .pcm = .{ .samples = &.{}, .sample_rate = provider.sample_rate } } else provider.read(provider.context, self.allocator, first, first + extent.samples) catch |err| blk: {
