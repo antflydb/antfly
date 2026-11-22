@@ -8095,7 +8095,7 @@ pub const NativeFile = struct {
             // An unbounded scan saw no watermark and no writer before it
             // began. A writer admitted since may have appended records it has
             // not made durable; retry with the bound the region now gives.
-            if (scan.unbounded) {
+            if (scan.unbounded and !scan.holds_authority) {
                 const own_pid: u32 = antfly_platform.process.currentId() orelse 0;
                 if (region.logStatePublished() or region.foreignWriterHeld(own_pid) or
                     (!scan.holds_authority and scan.native.foreignSidecarWriterHeld(scan.io)))
@@ -8407,7 +8407,7 @@ pub const NativeFile = struct {
                 };
                 if (ctx.skip) return;
                 var rctx: RecordCtx = .{ .overlay = overlay, .pop_allocator = pop_allocator };
-                const replay = if (ctx.check.persisted_frontier != null) &redo_log.replayBufferedPrefix else &redo_log.replayBounded;
+                const replay = if (ctx.check.persisted_frontier != null or ctx.check.holds_authority) &redo_log.replayBufferedPrefix else &redo_log.replayBounded;
                 var full_outcome = try replay(pop_allocator, ctx.file.file, ctx.io, ctx.file.header.redoOffset() + ctx.start_offset, ctx.end_offset - ctx.start_offset, ctx.start_after_sequence, ctx.max_sequence, ctx.check.covered, RecordCtx.onRecord, &rctx);
                 full_outcome.valid_bytes += ctx.start_offset;
                 // A failure here discards the overlay this call built.
@@ -8455,7 +8455,7 @@ pub const NativeFile = struct {
         // writer authority: nothing else appends while this open scans.
         const holds_authority = self.holdsWriterAuthority();
         const owns_recovery_fence = self.writer_lock_file != null or
-            (self.header.protected_redo and holds_authority and switch (self.holdSidecarReadFence(io)) {
+            (holds_authority and switch (self.holdSidecarReadFence(io)) {
                 .own => true,
                 .held => |fence| held: {
                     fence.unlock(io);
@@ -8531,6 +8531,16 @@ pub const NativeFile = struct {
             // sequence than the data file. The sidecar fence lets a cold
             // opener use the persisted frontier without racing appends.
             const protected = self.header.protected_redo and !self.no_sync;
+            if (!protected and owns_recovery_fence) {
+                // A successor holds the same writer flock that admitted it.
+                // Recover the complete legacy tail while building its view.
+                if (scan_region) |r| if (promised_durable == null and r.logStatePublished()) {
+                    promised_durable = r.readLogStateRaw().durable_sequence;
+                    durable_ceiling_offset = null;
+                };
+                replay_ceiling = null;
+                published_fold_start = 0;
+            }
             var use_persisted_frontier = protected and (owns_recovery_fence or sidecar_fence != null);
             const live_writer = protected and if (scan_region) |r| r.foreignLiveWriter(0) else false;
             const synced_without_region: ?redo_log.Frontier = if (protected and self.read_only and extent_fence != null and !live_writer and !use_persisted_frontier) proof: {
@@ -8757,7 +8767,7 @@ pub const NativeFile = struct {
                 };
                 var visit: Visit = .{ .meta = &meta_ctx, .have_through = have_through, .allocator = allocator, .entry = entry, .io = io, .verify_only = frontier_to_seal != null };
                 defer visit.deinit();
-                const replay = if (persisted_frontier != null) &redo_log.replayBufferedPrefix else &redo_log.replayBounded;
+                const replay = if (persisted_frontier != null or owns_recovery_fence) &redo_log.replayBufferedPrefix else &redo_log.replayBounded;
                 const base = self.header.redoOffset() + fold_start;
                 meta_outcome = try replay(allocator, self.file, io, base, scan_end - fold_start, folded_through, ceiling, scan_check.covered, Visit.onRecord, &visit);
                 meta_outcome.valid_bytes += fold_start;
@@ -8776,7 +8786,7 @@ pub const NativeFile = struct {
                 if (visit.decoded != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
                 overlay_caught_up = true;
             } else {
-                const replay = if (persisted_frontier != null) &redo_log.replayBufferedPrefix else &redo_log.replayBounded;
+                const replay = if (persisted_frontier != null or owns_recovery_fence) &redo_log.replayBufferedPrefix else &redo_log.replayBounded;
                 meta_outcome = try replay(allocator, self.file, io, self.header.redoOffset() + fold_start, scan_end - fold_start, folded_through, replay_ceiling, scan_check.covered, MetaCtx.onRecord, &meta_ctx);
                 meta_outcome.valid_bytes += fold_start;
             }
@@ -8985,6 +8995,12 @@ pub const NativeFile = struct {
                 redo.validate_full_prefix = false;
             }
         } else if (!self.read_only and replay_ceiling == null) {
+            const redo = &self.redo.?;
+            if (owns_recovery_fence) {
+                self.refreshExternalRedoAuthority(redo);
+                redo.tail_source = .own;
+                redo.validate_full_prefix = false;
+            }
             self.publishRedoLogState();
         }
     }
@@ -10973,7 +10989,7 @@ pub const NativeFile = struct {
         defer scan_ctx.staged.deinit(self.allocator);
         defer scan_ctx.records.deinit(self.allocator);
         const base = self.header.redoOffset();
-        const replay_prefix: *const @TypeOf(redo_log.replayBounded) = if (persisted != null and scan_end != capacity and start_offset == 0)
+        const replay_prefix: *const @TypeOf(redo_log.replayBounded) = if (start_offset == 0)
             redo_log.replayBufferedPrefix
         else
             redo_log.replayBounded;
@@ -11135,25 +11151,24 @@ pub const NativeFile = struct {
     /// handoffs. An epoch change discards the cached frontier and forces
     /// recovery before an externally leased handle can change WAL bytes.
     fn refreshExternalRedoAuthority(self: *NativeFile, redo: *RedoCommitState) void {
-        if (!self.externally_locked or self.writer_lock_file != null or !self.header.protected_redo) return;
+        if (!self.externally_locked or self.writer_lock_file != null) return;
         const io = self.runtimeIo();
-        const epoch = ownSidecarEpoch(io, redo.sidecar_inode);
+        var epoch = ownSidecarEpoch(io, redo.sidecar_inode);
+        if (epoch == null) lookup: {
+            const path = writerLockPathAlloc(self.allocator, io, self.path) catch break :lookup;
+            defer self.allocator.free(path);
+            const lock = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch break :lookup;
+            defer lock.close(io);
+            const stat = lock.stat(io) catch break :lookup;
+            redo.sidecar_inode = stat.inode;
+            epoch = ownSidecarEpoch(io, stat.inode);
+        }
+        if (epoch == null and !self.header.protected_redo) return;
         if (epoch != null and redo.sidecar_epoch == epoch) return;
-        redo.sidecar_epoch = null;
+        redo.sidecar_epoch = epoch;
         redo.frontier_cache = null;
         redo.tail_source = .unknown;
         redo.validate_full_prefix = true;
-        if (epoch) |current| {
-            redo.sidecar_epoch = current;
-            return;
-        }
-        const path = writerLockPathAlloc(self.allocator, io, self.path) catch return;
-        defer self.allocator.free(path);
-        const lock = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return;
-        defer lock.close(io);
-        const stat = lock.stat(io) catch return;
-        redo.sidecar_inode = stat.inode;
-        redo.sidecar_epoch = ownSidecarEpoch(io, stat.inode);
     }
 
     fn refreshIfWriterBaseStale(self: *NativeFile, writer_authority: bool) !void {
@@ -11217,7 +11232,9 @@ pub const NativeFile = struct {
         // any record content (already shared and current).
         const base = self.activeCheckpoint().commit_sequence;
         const redo_stale = if (self.redo) |*redo| latest > (redo.writer.last_sequence orelse 0) else false;
-        if (self.redo != null and (self.header.segmented_redo or (self.header.protected_redo and !self.no_sync))) {
+        if (self.redo != null and (self.header.segmented_redo or (self.header.protected_redo and !self.no_sync) or
+            (self.redo.?.sidecar_epoch != null and self.redo.?.validate_full_prefix)))
+        {
             if (base < latest or redo_stale) self.redo.?.tail_source = .unknown;
             if (writer_authority) {
                 try self.resyncRedoTailUnderAuthority();
@@ -23890,7 +23907,7 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
 /// data file at all (only `.reader` does), so this cannot self-conflict
 /// with any lock a concurrent reader or this same process's own already-
 /// open `NativeFile` might hold.
-fn recoverCrashedWriterDataFile(allocator: Allocator, io: std.Io, path: []const u8, region: ?*shared_lock_region.Region, policy: ?antfly_platform.filesystem.DurabilityPolicy, defer_protected_replay: bool) !void {
+fn recoverCrashedWriterDataFile(allocator: Allocator, io: std.Io, path: []const u8, region: ?*shared_lock_region.Region, policy: ?antfly_platform.filesystem.DurabilityPolicy, defer_redo_replay: bool) !void {
     const opened = try openDataFile(io, path, .writer, true);
     const file = opened.file;
     defer file.close(io);
@@ -23901,10 +23918,9 @@ fn recoverCrashedWriterDataFile(allocator: Allocator, io: std.Io, path: []const 
     header.checkpoints = loadCheckpointSlots(file, io, header.page_size, file_size);
     const recovered = try recoverActiveCheckpoint(file, io, header, file_size, !header.protected_redo);
     header.active_checkpoint = recovered.index;
-    // The granted flock is kept across the successor's open or writer
-    // refresh. Protected redo has an independent on-disk frontier and
-    // needs no repair to the old publisher's watermark at admission.
-    if (header.protected_redo and defer_protected_replay) return;
+    // The successor keeps this flock and validates the WAL while
+    // rebuilding its own view. Admission only repairs the checkpoint.
+    if (defer_redo_replay) return;
     if (region) |r| if (header.redo_log_capacity != 0) try recoverCrashedWriterRedoState(allocator, io, file, header, header.checkpoints[recovered.index], r, policy);
 }
 
@@ -24001,9 +24017,7 @@ fn fairLockRecoverDeadWriter(ctx_ptr: ?*anyopaque) anyerror!void {
     // A writer admitted by the sidecar flock alone (no region slot) may be
     // writing right now; recovery must exclude it before touching the file.
     if (ctx.lease == null) ctx.lease = try sidecarWriterLockUntil(ctx.allocator, ctx.io, ctx.wait_io, ctx.path, ctx.deadline_ns, false);
-    // The lease has no NativeFile options yet. Use the strongest
-    // supported policy before exposing recovery to concurrent readers.
-    try recoverCrashedWriterDataFile(ctx.allocator, ctx.io, ctx.path, ctx.region, .full_fsync, true);
+    try recoverCrashedWriterDataFile(ctx.allocator, ctx.io, ctx.path, ctx.region, null, true);
 }
 
 pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
@@ -27292,6 +27306,14 @@ test "lite fair writer lock bounds every writer's wait under sustained contentio
 // via `recoverCrashedWriterDataFile`), clear the word, and acquire --
 // promptly, not only once its own deadline has fully expired.
 test "lite fair writer lock recovers promptly from a killed writer's stale lease" {
+    try exerciseDeadFairWriterRecovery(false);
+}
+
+test "lite fair writer lock hands legacy WAL recovery to its successor" {
+    try exerciseDeadFairWriterRecovery(true);
+}
+
+fn exerciseDeadFairWriterRecovery(legacy: bool) !void {
     if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -27301,11 +27323,15 @@ test "lite fair writer lock recovers promptly from a killed writer's stale lease
     defer a.free(path);
 
     {
-        var seed = try NativeFile.createWithRedoLog(a, io, path, .{ .indexed_reclamation = true }, 64 * 1024);
+        var seed = if (legacy)
+            try createSingleExtentRedoForTest(a, io, path, .{ .indexed_reclamation = true }, 64 * 1024)
+        else
+            try NativeFile.createWithRedoLog(a, io, path, .{ .indexed_reclamation = true }, 64 * 1024);
         defer seed.close();
         try seed.beginTransaction();
         try seed.putDocument("doc", "seeded before the crash");
         try seed.commitTransaction();
+        if (legacy) try writeLegacyRedoHeaderForTest(&seed, io);
     }
 
     var pipe_fds: [2]std.c.fd_t = undefined;
