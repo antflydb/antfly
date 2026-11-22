@@ -1440,7 +1440,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     self.current_visible_source = null;
                     return null;
                 }
-                try self.makeRunSourceResident(winner_source);
+                if (!self.keys_only) try self.makeRunSourceResident(winner_source);
                 const entry = self.source_entries[winner_source].?;
                 if (!entry.tombstone) {
                     self.current_visible_source = winner_source;
@@ -1608,6 +1608,15 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         fn advanceForwardSourcesAtKey(self: *@This(), key: []const u8) !void {
             const match_count = self.collectForwardHeapSourcesAtKey(key);
+            if (self.keys_only and match_count != 0) {
+                // Keep the winner's next block resident once advancement
+                // actually needs it. Selecting a spilled key needs no read.
+                const winner = self.advance_sources[0];
+                if (self.isPersistedRunSource(winner) and self.resident_run_source != winner) {
+                    if (self.resident_run_source) |resident| try self.spillRunSource(resident);
+                    self.resident_run_source = winner;
+                }
+            }
             for (self.advance_sources[0..match_count]) |source_index| {
                 const idx = self.positions[source_index] orelse continue;
                 try self.advanceSource(source_index, idx);
@@ -1833,7 +1842,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 if (self.positions[source_index] == null) {
                     self.clearSourceBlock(source_index);
                 } else if (self.bounded_run_block_residency) {
-                    try self.spillRunSource(source_index);
+                    if (self.keys_only and self.resident_run_source == null) {
+                        self.resident_run_source = source_index;
+                    } else {
+                        try self.spillRunSource(source_index);
+                    }
                 }
                 return;
             }
@@ -1910,9 +1923,9 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     try self.sourceEntryAt(source_index, idx)
                 else
                     null;
+                self.clearSourceKeyCopy(source_index);
                 if (self.positions[source_index] == null) {
                     self.clearSourceBlock(source_index);
-                    self.clearSourceKeyCopy(source_index);
                     if (self.resident_run_source == source_index) self.resident_run_source = null;
                 } else if (self.bounded_run_block_residency and self.resident_run_source != source_index) {
                     try self.spillRunSource(source_index);
@@ -2285,6 +2298,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .namespace_name = self.namespace.name,
                 .key = key,
                 .value = &.{},
+                .logical_value_len = entry.logical_value_len orelse entry.value.len,
                 .tombstone = entry.tombstone,
             };
             self.clearSourceBlock(source_index);
@@ -13263,6 +13277,53 @@ test "lsm presence probes avoid value copies across source tiers (#1095)" {
             }
         }
     }
+}
+
+test "lsm length-only forward cursor uses spilled lengths and retains the advancing block" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try Backend.open(a, "/length-only", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{});
+    defer store.deinit();
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("b", "bb");
+        try write.put("d", "dddd");
+        try write.put("e", "eeeee");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("a", "a");
+        try write.put("b", "new");
+        try write.put("c", "");
+        try write.commit();
+    }
+
+    while (try backend.runMaintenanceStep()) {}
+    try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
+
+    var read = try store.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    cursor.setLengthOnly();
+    var entry = try cursor.first();
+    for ([_][]const u8{ "a", "b", "c", "d", "e" }, [_]usize{ 1, 3, 0, 4, 5 }) |key, length| {
+        try std.testing.expectEqualStrings(key, entry.?.key);
+        try std.testing.expectEqualStrings("", entry.?.value);
+        try std.testing.expectEqual(length, cursor.valueLen(entry.?));
+        const loads_before = backend.snapshotReadStats().cursor_block_loads;
+        entry = try cursor.next();
+        if (std.mem.eql(u8, key, "a") or std.mem.eql(u8, key, "e"))
+            try std.testing.expectEqual(loads_before, backend.snapshotReadStats().cursor_block_loads);
+    }
+    try std.testing.expect(entry == null);
 }
 
 test "public graph metric borrowed wire LSM write presence and key cursor preserve snapshots" {

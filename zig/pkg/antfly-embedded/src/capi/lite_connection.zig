@@ -5353,7 +5353,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         var resolved = resolved_options;
         resolved.externally_locked = true;
         initial = try api.openLiteHandleAllocWithRuntime(alloc, path, resolved, true, h.handleLockIo(), null);
-        initial.?.owned_lite_backend.?.native_docstore.?.file.releaseWriterOwnership();
+        try initial.?.owned_lite_backend.?.native_docstore.?.file.releaseWriterOwnership();
         // Marks this instance subject to the `active_writer` backstop
         // (native.zig's `publishCheckpoint`/inode_lock.zig's own doc
         // comment): this becomes `owner.current` below, the Owner's own

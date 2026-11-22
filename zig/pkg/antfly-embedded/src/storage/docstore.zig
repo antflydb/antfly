@@ -3389,6 +3389,7 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
         if (!(try replay_journal_format.state(&txn)).isCurrent()) return null;
+        if (try replay_journal_format.baseWroteSince(&txn)) return null;
         const floor_raw = txn.get(internal_keys.replay_hint_index_floor_key[0..]) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -3398,7 +3399,7 @@ pub const DocStore = struct {
             if (from_sequence +| 1 < floor) return null;
         }
         const ordinal = replayHintOrdinal(hint);
-        var cursor = try txn.openCursor();
+        var cursor = try txn.openPhysicalKeyCursorAdapter();
         defer cursor.close();
         const lower = internal_keys.replayRangeLower(ordinal, from_sequence + 1);
         const upper = internal_keys.replayRangeUpper(ordinal);

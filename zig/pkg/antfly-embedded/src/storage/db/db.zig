@@ -47185,6 +47185,13 @@ pub const DB = struct {
         if (resident >= primary_sequence) return true;
         const applied = @max(resident, try self.core.loadAppliedSequence(alloc, index_name));
         if (applied >= primary_sequence) return true;
+        // Direct text projections can use the indexed hint lane to ignore
+        // unrelated replay. Artifact inputs have their own revision frontier.
+        if (self.core.textIndexEntry(index_name)) |entry| {
+            if (entry.source_artifact_names.len == 0 and entry.chunk_name == null) {
+                if (try self.core.store.replayHintRecordBetween(.full_text, applied, primary_sequence)) |pending| return !pending;
+            }
+        }
         return (try self.managedIndexReplayTargetSequence(alloc, index_name, .full_text, applied)) <= applied;
     }
 

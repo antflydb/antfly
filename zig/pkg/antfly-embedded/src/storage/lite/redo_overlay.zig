@@ -287,10 +287,8 @@ pub const SharedRedoOverlay = struct {
     /// next append (`NativeFile.refreshIfWriterBaseStale`), so no record
     /// below it is ever missing. An opener replays the log past it.
     applied_through: std.atomic.Value(u64) = .init(0),
-    /// Highest sequence a catch-up has decoded into this overlay, applied or
-    /// not yet (a writer resync decodes before its barrier, and marks it
-    /// applied only once it is durable). A replay never decodes a sequence
-    /// at or below it twice.
+    /// Highest sequence a catch-up has decoded into this overlay. Recovery
+    /// can resume past it even before the recovered state is published.
     decoded_through: std.atomic.Value(u64) = .init(0),
     /// Bumped whenever a replay adds another process's records. Every
     /// instance sharing this overlay reads them, so it is part of each
@@ -723,6 +721,62 @@ pub const SharedRedoOverlay = struct {
         defer self.mutex.unlock(io);
         if (self.pages.fetchRemove(page_id)) |kv| allocator.free(kv.value);
         _ = self.page_sequences.remove(page_id);
+    }
+
+    /// Drop the abandoning writer's unpublished versions while it still
+    /// owns the inode's writer lease. A valid on-disk frontier can recover
+    /// them later. Until then a successor is free to reuse their sequences.
+    pub fn discardUnsealedSuffix(self: *SharedRedoOverlay, io: std.Io, from: u64) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        const allocator = owned_allocator;
+        for (&self.maps, 0..) |*map, root| {
+            var entries = map.iterator();
+            while (entries.next()) |entry| {
+                var removed: usize = 0;
+                var head: ?*VersionedOverlayEntry = entry.value_ptr.*;
+                while (head) |version| {
+                    if (version.sequence < from) break;
+                    head = version.older;
+                    allocator.free(version.value);
+                    self.entry_pool.destroy(version);
+                    removed += 1;
+                }
+                if (removed == 0) continue;
+                if (head) |version| {
+                    entry.value_ptr.* = version;
+                    self.pending_retirement_versions -|= removed;
+                } else {
+                    const key = entry.key_ptr.*;
+                    self.destroyOrderedKey(allocator, @intCast(root), key);
+                    map.removeByPtr(entry.key_ptr);
+                    allocator.free(key);
+                    self.pending_retirement_versions -|= removed - 1;
+                }
+            }
+            _ = self.replayed_sequence[root].fetchMin(from - 1, .acq_rel);
+        }
+        var pages = self.page_sequences.iterator();
+        while (pages.next()) |entry| {
+            if (entry.value_ptr.* < from) continue;
+            if (self.pages.fetchRemove(entry.key_ptr.*)) |page| allocator.free(page.value);
+            self.page_sequences.removeByPtr(entry.key_ptr);
+        }
+        self.unstamped_pages.clearRetainingCapacity();
+
+        const sealed_through = from - 1;
+        // These summaries can include already folded entries. Clamp them
+        // conservatively without forgetting any sealed changes they track.
+        var scopes = self.scope_latest.valueIterator();
+        while (scopes.next()) |scope| {
+            scope.latest = @min(scope.latest, sealed_through);
+            scope.latest_put = @min(scope.latest_put, sealed_through);
+        }
+        self.scope_untracked = @min(self.scope_untracked, sealed_through);
+        _ = self.applied_through.fetchMin(sealed_through, .acq_rel);
+        _ = self.decoded_through.fetchMin(sealed_through, .acq_rel);
+        _ = self.replay_epoch.fetchAdd(1, .acq_rel);
     }
 
     /// The number of superseded-but-not-yet-reclaimed versions across
@@ -1298,10 +1352,8 @@ pub const SharedRedoOverlay = struct {
     /// (`[root:u8][key_len:u16][key][flags:u8][...]`) back into
     /// `(root, key) -> version chain` pairs, pushing a new version (tagged
     /// with `sequence`, the record's own `commit_sequence`) onto whatever
-    /// chain already exists for that `(root, key)`. Used only during
-    /// initial population from the log (no concurrent reader can reach
-    /// this overlay yet at that point), so it writes the maps directly
-    /// rather than through `appendVersion`'s locking.
+    /// chain already exists for that `(root, key)`. The caller either
+    /// owns an unpublished overlay or holds its mutex.
     pub fn decodeLogicalMutationsPayload(self: *SharedRedoOverlay, _: Allocator, payload: []const u8, sequence: u64) !void {
         const allocator = owned_allocator;
         var pos: usize = 0;
@@ -1338,7 +1390,7 @@ pub const SharedRedoOverlay = struct {
             // handed a pointer the pool's own free list does not own.
             self.noteScopeLocked(root, key, sequence, decoded.is_delete);
             const gop = try self.maps[root].getOrPut(allocator, key);
-            _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
+            errdefer if (!gop.found_existing) self.maps[root].removeByPtr(gop.key_ptr);
             // A catch-up replays records this overlay may already hold, or
             // ones older than this process's own later appends. Keep each
             // chain newest-first and each sequence once.
@@ -1351,6 +1403,7 @@ pub const SharedRedoOverlay = struct {
                     cursor = version.older;
                 }
                 if (cursor) |version| if (version.sequence == sequence) {
+                    _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
                     allocator.free(decoded.value);
                     continue;
                 };
@@ -1359,6 +1412,7 @@ pub const SharedRedoOverlay = struct {
                     node.* = decoded;
                     node.older = cursor;
                     above.older = node;
+                    _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
                     self.pending_retirement_versions += 1;
                     continue;
                 }
@@ -1386,6 +1440,7 @@ pub const SharedRedoOverlay = struct {
                 gop.key_ptr.* = owned_key;
             }
             gop.value_ptr.* = node;
+            _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
         }
     }
 
@@ -1406,8 +1461,15 @@ pub const SharedRedoOverlay = struct {
             const owned = try allocator.dupe(u8, payload[pos..][0..len]);
             errdefer allocator.free(owned);
             pos += len;
-            try self.page_sequences.put(allocator, page_id, sequence);
-            if (try self.pages.fetchPut(allocator, page_id, owned)) |old| allocator.free(old.value);
+            // A reader catch-up may already have installed a newer image.
+            if ((self.page_sequences.get(page_id) orelse 0) > sequence) {
+                allocator.free(owned);
+                continue;
+            }
+            try self.page_sequences.ensureUnusedCapacity(allocator, 1);
+            try self.pages.ensureUnusedCapacity(allocator, 1);
+            self.page_sequences.putAssumeCapacity(page_id, sequence);
+            if (self.pages.fetchPutAssumeCapacity(page_id, owned)) |old| allocator.free(old.value);
         }
     }
 };

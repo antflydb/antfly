@@ -1874,7 +1874,7 @@ fn reclamationExternallyLockedRefreshDefersDebtToItsMaintenanceOwnerImpl(alloc: 
         .externally_locked = true,
         .reclamation = policy,
     });
-    initial.file.releaseWriterOwnership();
+    try initial.file.releaseWriterOwnership();
     var lease = try native.lockWriterPathWithIo(alloc, std.testing.io, path);
     defer lease.close();
     {
@@ -10463,7 +10463,7 @@ test "lite externally locked read pins wait for fork-inherited publication fence
     var seed = try store.beginWrite();
     try seed.put("doc", "committed");
     try seed.commit();
-    store.file.releaseWriterOwnership();
+    try store.file.releaseWriterOwnership();
 
     var pipe: [2]std.c.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe));
@@ -11137,12 +11137,19 @@ test "lite redo log maintainOnce's ride-along reclaim commit never advances redo
     try store.maintainOnce(false);
 
     const live = store.file.activeCheckpoint();
+    {
+        var reader = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{ .read_only = true });
+        defer reader.close();
+        const recovered = reader.activeCheckpoint();
+        try std.testing.expectEqual(live.redo_folded_through, recovered.redo_folded_through);
+        try std.testing.expectEqual(store.file.durableSequence(), recovered.commit_sequence);
+    }
+
+    // A fresh open sees a deferred commit only after the writer seals it.
+    try store.sync();
     var reader = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{ .read_only = true });
     defer reader.close();
-    const recovered = reader.activeCheckpoint();
-
-    try std.testing.expectEqual(live.redo_folded_through, recovered.redo_folded_through);
-    try std.testing.expectEqual(live.commit_sequence, recovered.commit_sequence);
+    try std.testing.expectEqual(store.file.activeCheckpoint().commit_sequence, reader.activeCheckpoint().commit_sequence);
 }
 
 test "lite native docstore cold writes and large disk-index cursors stay bounded" {
