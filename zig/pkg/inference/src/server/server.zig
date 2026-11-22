@@ -40686,8 +40686,9 @@ test "model aware media cold local generation observation skips digest verificat
     const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
     defer a.free(uri);
     const allowed = [_][]u8{path};
-    var node = try Node.init(a, .{ .content_security = .{ .allowed_paths = &allowed } });
+    var node = try Node.init(a, .{ .process_termination_available = true, .content_security = .{ .allowed_paths = &allowed } });
     defer node.deinit();
+    try node.attachIo(io);
     var marker: u8 = 0;
     const sink = Chunks.Sink{ .context = &marker, .accept = Sink.unexpected };
     var request = Chunks.Request{
@@ -40698,8 +40699,10 @@ test "model aware media cold local generation observation skips digest verificat
     // A deliberately invalid target stops after reference resolution. The
     // deliberately wrong file hash would fail first if resolution read bytes.
     try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedDirect(a, io, .{}, request, .{ .model = "" }, sink));
+    try std.testing.expectEqual(@as(u64, 0), node.host_caches.local_source_verifications.hash_count.load(.monotonic));
     request.observe_only = false;
     try std.testing.expectError(error.SourceVersionChanged, node.chunkAndEmbedDirect(a, io, .{}, request, .{ .model = "" }, sink));
+    try std.testing.expectEqual(@as(u64, 1), node.host_caches.local_source_verifications.hash_count.load(.monotonic));
 }
 
 test "chunk request input parser accepts valid text and media" {
