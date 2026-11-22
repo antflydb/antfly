@@ -193,6 +193,7 @@ pub const SnapshotBackfillRunner = struct {
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
     external_destination: ?ExternalStreamDestination = null,
+    protected_native_bootstrap: bool = false,
     secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
     prepared_snapshot_timeout_ns: u64 = default_prepared_snapshot_timeout_ns,
@@ -200,6 +201,18 @@ pub const SnapshotBackfillRunner = struct {
     work_permit: ?WorkPermit = null,
     lifecycle_hook: ?ReplicationLifecycleHook = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
+
+    fn publishNativeSnapshotStatus(self: *SnapshotBackfillRunner, sink: anytype, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+        if (!self.protected_native_bootstrap) return callUpsertStatus(sink, record);
+        const Sink = switch (@typeInfo(@TypeOf(sink))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(sink),
+        };
+        if (comptime @hasDecl(Sink, "publishNativeReplicationBootstrapDurable")) {
+            return sink.publishNativeReplicationBootstrapDurable(table.replication_sources_json, record, try self.workDeadlineNs());
+        }
+        return error.UnsupportedDurableReplicationStatusSink;
+    }
 
     fn checkpointWork(self: *SnapshotBackfillRunner) !void {
         if (self.work_permit) |permit| try permit.checkpoint(.snapshot_step);
@@ -321,6 +334,7 @@ pub const SnapshotBackfillRunner = struct {
             &progress_cutover_provider_identity,
         ) catch |err| {
             self.checkpointWork() catch return err;
+            if (self.protected_native_bootstrap) return err;
             try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer) catch return err;
             defer parsed.deinit(self.alloc);
@@ -400,6 +414,10 @@ pub const SnapshotBackfillRunner = struct {
         defer parsed.deinit(self.alloc);
         var external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
         defer if (external) |*binding| binding.deinit(self.alloc);
+        if (self.protected_native_bootstrap) {
+            if (external != null or start_offset != 0) return error.UnsupportedReplicationRoute;
+            parsed.require_exact_cutover = true;
+        }
         const lake_owner = if (external) |binding| blk: {
             if (binding.binding.format != .iceberg or binding.binding.write_policy != .iceberg_writer or
                 binding.binding.row_identity == null) return error.UnsupportedReplicationRoute;
@@ -442,8 +460,9 @@ pub const SnapshotBackfillRunner = struct {
             .{ table.name, source_ordinal, resolved_dsn.cacheGeneration(), @tagName(resolved_dsn.source) },
         );
 
-        const phase_snapshot = "snapshot";
-        const phase_complete = "cutover_prepared";
+        const control = @import("source_control.zig");
+        const phase_snapshot = if (self.protected_native_bootstrap) control.native_bootstrap_snapshot_phase else "snapshot";
+        const phase_complete = if (self.protected_native_bootstrap) control.native_bootstrap_prepared_phase else "cutover_prepared";
         const config = foreign_mod.Config{
             .kind = .postgres,
             .dsn = try self.alloc.dupe(u8, resolved_dsn.value),
@@ -838,6 +857,7 @@ pub const SnapshotBackfillRunner = struct {
             null;
         try self.checkpointWork();
         defer if (prepared_snapshot) |*prepared| prepared.deinit(self.alloc);
+        if (self.protected_native_bootstrap and prepared_snapshot == null) return error.ReplicationExactCutoverRequired;
 
         var prepare_result: ?foreign_mod.ReplicationPrepareResult = null;
         if (prepared_snapshot == null and persisted_prepared_checkpoint == null) {
@@ -881,6 +901,7 @@ pub const SnapshotBackfillRunner = struct {
             effective_publication_name,
         );
         try checkProgressCutoverAuthority(
+            false,
             self.alloc,
             status_sink,
             table,
@@ -938,7 +959,7 @@ pub const SnapshotBackfillRunner = struct {
             .cutover_provider_identity = progress_cutover_provider_identity.*,
             .updated_at_ms = ioNowMillis(self.io),
         };
-        try callUpsertStatus(status_sink, prepared_status);
+        try self.publishNativeSnapshotStatus(status_sink, table, prepared_status);
         try self.reachLifecycle(
             .provider_prepared,
             table.table_id,
@@ -967,6 +988,7 @@ pub const SnapshotBackfillRunner = struct {
         while (true) {
             try self.checkpointWork();
             try checkProgressCutoverAuthority(
+                self.protected_native_bootstrap,
                 self.alloc,
                 status_sink,
                 table,
@@ -1013,6 +1035,7 @@ pub const SnapshotBackfillRunner = struct {
             defer result.deinit(self.alloc);
             try self.checkpointWork();
             try checkProgressCutoverAuthority(
+                self.protected_native_bootstrap,
                 self.alloc,
                 status_sink,
                 table,
@@ -1067,6 +1090,7 @@ pub const SnapshotBackfillRunner = struct {
                 for (result.rows) |row| {
                     try self.checkpointWork();
                     try checkProgressCutoverAuthority(
+                        self.protected_native_bootstrap,
                         self.alloc,
                         status_sink,
                         table,
@@ -1114,6 +1138,7 @@ pub const SnapshotBackfillRunner = struct {
             try self.checkpointWork();
 
             try checkProgressCutoverAuthority(
+                self.protected_native_bootstrap,
                 self.alloc,
                 status_sink,
                 table,
@@ -1154,7 +1179,7 @@ pub const SnapshotBackfillRunner = struct {
             }
 
             if (lake_owner == null) {
-                try callUpsertStatus(status_sink, .{
+                try self.publishNativeSnapshotStatus(status_sink, table, .{
                     .table_id = table.table_id,
                     .source_ordinal = source_ordinal,
                     .source_kind = parsed.type_name,
@@ -1205,6 +1230,7 @@ pub const SnapshotBackfillRunner = struct {
 
         try self.checkpointWork();
         try checkProgressCutoverAuthority(
+            self.protected_native_bootstrap,
             self.alloc,
             status_sink,
             table,
@@ -1220,6 +1246,7 @@ pub const SnapshotBackfillRunner = struct {
         try finishBackfillBulkIngestWindow(self.alloc, self.write_source, bulk_ingest_tables.items);
         try self.checkpointWork();
         try checkProgressCutoverAuthority(
+            self.protected_native_bootstrap,
             self.alloc,
             status_sink,
             table,
@@ -1279,7 +1306,7 @@ pub const SnapshotBackfillRunner = struct {
             try callCheckCutoverAuthority(status_sink, table.replication_sources_json, pending);
         }
 
-        try callUpsertStatus(status_sink, .{
+        try self.publishNativeSnapshotStatus(status_sink, table, .{
             .table_id = table.table_id,
             .source_ordinal = source_ordinal,
             .source_kind = parsed.type_name,
@@ -1898,17 +1925,28 @@ pub const StreamingReplicationRunner = struct {
         table: metadata_table_manager.TableRecord,
         status: metadata_table_manager.ReplicationSourceStatusRecord,
         state: @import("source_control.zig").State,
+        snapshot: ?@import("source_scope_capture.zig").Snapshot,
         context: @import("antfly_local_sources").api_operation.RequestContext,
     ) !void {
         const control = @import("source_control.zig");
         const scope = state.scope orelse return error.SourceBindingConflict;
-        if (state.closing or state.retired or !phaseAllowsStreaming(status.phase)) return;
+        const bootstrap_phase = std.mem.eql(u8, status.phase, control.native_bootstrap_prepared_phase);
+        if (state.closing or state.retired or (!bootstrap_phase and !phaseAllowsStreaming(status.phase))) return;
         if (!std.meta.eql(scope.provider, try nativeSourceProviderBinding(status)))
             return error.ReplicationCutoverAuthorityLost;
-        // A legacy status checkpoint cannot prove which transactions the
-        // destination already owns. Scoped streaming resumes from its own
-        // accepted frontier once bootstrap has established it.
-        if (state.accepted.sequence == 0) return error.ReplicationCutoverAuthorityLost;
+        if (state.accepted.sequence == 0) {
+            const checkpoint = state.native_bootstrap_checkpoint orelse return error.ReplicationCutoverAuthorityLost;
+            if (!bootstrap_phase or !std.mem.eql(u8, checkpoint, status.prepared_checkpoint))
+                return error.ReplicationCutoverAuthorityLost;
+            try self.checkpointWork();
+            try callCheckCutoverAuthority(service, table.replication_sources_json, status);
+            return @import("../api/source_destination_completion.zig").stage(service, admission, self.alloc, scope, control.digest(table.replication_sources_json), .{
+                .batch_id = checkpoint,
+                .checkpoint = checkpoint,
+                .payload_digest = control.digest("antfly:native-postgres-bootstrap:v1"),
+                .accepted_at_ns = platform_time.realtimeNs(),
+            }, &.{}, snapshot, context);
+        }
         const resume_cut = state.accepted.checkpoint;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -1956,7 +1994,7 @@ pub const StreamingReplicationRunner = struct {
             .expected_checkpoint = resume_cut,
             .payload_digest = control.digest(payload),
             .accepted_at_ns = platform_time.realtimeNs(),
-        }, requests, context);
+        }, requests, snapshot, context);
     }
 
     fn applyExternal(self: *StreamingReplicationRunner, owner: ExternalStreamDestination, table: metadata_table_manager.TableRecord, source_ordinal: u32, status: ?metadata_table_manager.ReplicationSourceStatusRecord, previous: []const u8, checkpoint: []const u8, changes: []const foreign_mod.ReplicationChange) !void {
@@ -3614,6 +3652,7 @@ fn callCompleteCutoverRetirementDurable(
 }
 
 fn checkProgressCutoverAuthority(
+    protected_native_bootstrap: bool,
     alloc: Allocator,
     status_sink: anytype,
     table: metadata_table_manager.TableRecord,
@@ -3626,7 +3665,7 @@ fn checkProgressCutoverAuthority(
     cutover_config_fingerprint: [cutover_config_fingerprint_len]u8,
     cutover_provider_identity: foreign_mod.ExactCutoverIntent.ProviderIdentity,
 ) !void {
-    try requireLegacyOwnership(status_sink, alloc, table, source_ordinal);
+    if (!protected_native_bootstrap) try requireLegacyOwnership(status_sink, alloc, table, source_ordinal);
     if (cutover_authority_id == 0) return;
     try callCheckCutoverAuthority(
         status_sink,
@@ -3634,6 +3673,7 @@ fn checkProgressCutoverAuthority(
         .{
             .table_id = table.table_id,
             .source_ordinal = source_ordinal,
+            .phase = if (protected_native_bootstrap) @import("source_control.zig").native_bootstrap_snapshot_phase else "configured",
             .source_kind = parsed.type_name,
             .external_table = parsed.postgres_table,
             .slot_name = slot_name,
@@ -3740,25 +3780,7 @@ fn hashCutoverConfigBytes(hasher: *std.crypto.hash.sha2.Sha256, value: []const u
     hasher.update(value);
 }
 
-/// Bind scoped admission to the exact managed slot incarnation as well as
-/// the PostgreSQL instance. A new cutover on the same instance needs a handoff.
-pub fn nativeSourceProviderBinding(status: metadata_table_manager.ReplicationSourceStatusRecord) ![32]u8 {
-    if (status.cutover_intent_id == 0 or status.cutover_authority_id == 0 or
-        status.slot_name.len == 0 or status.publication_name.len == 0 or
-        std.meta.eql(status.cutover_provider_identity, empty_cutover_provider_identity))
-        return error.ReplicationCutoverAuthorityLost;
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly:scoped-postgres-provider:v1");
-    hash.update(&status.cutover_provider_identity);
-    hash.update(&status.cutover_config_fingerprint);
-    var epoch: [16]u8 = undefined;
-    std.mem.writeInt(u64, epoch[0..8], status.cutover_intent_id, .big);
-    std.mem.writeInt(u64, epoch[8..16], status.cutover_authority_id, .big);
-    hash.update(&epoch);
-    hashCutoverConfigBytes(&hash, status.slot_name);
-    hashCutoverConfigBytes(&hash, status.publication_name);
-    return hash.finalResult();
-}
+pub const nativeSourceProviderBinding = @import("source_control.zig").nativeSourceProviderBinding;
 
 fn exactCutoverIntentOwnsConfig(
     status: metadata_table_manager.ReplicationSourceStatusRecord,
@@ -4830,6 +4852,17 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             try self.records.append(self.alloc, try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record));
         }
 
+        pub fn publishNativeReplicationBootstrapDurable(
+            self: *@This(),
+            _: []const u8,
+            record: metadata_table_manager.ReplicationSourceStatusRecord,
+            _: ?u64,
+        ) !void {
+            try std.testing.expect(@import("source_control.zig").isNativeBootstrapPhase(record.phase));
+            try std.testing.expectEqualStrings("lsn:exact", record.prepared_checkpoint);
+            try self.upsertReplicationSourceStatus(record);
+        }
+
         pub fn claimReplicationSourceCutoverDurable(
             self: *@This(),
             _: []const u8,
@@ -4868,6 +4901,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
         .registry = &registry,
         .write_source = write_source.source(),
         .batch_size = 1,
+        .protected_native_bootstrap = true,
     };
 
     _ = try runner.runTableSource(&status_sink, .{
@@ -4882,6 +4916,12 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     try std.testing.expectEqualStrings("lsn:exact", status_sink.records.items[status_sink.records.items.len - 1].prepared_checkpoint);
     try std.testing.expectEqualStrings("exported_snapshot", status_sink.records.items[status_sink.records.items.len - 1].cutover_mode);
     const final_status = status_sink.records.items[status_sink.records.items.len - 1];
+    const control = @import("source_control.zig");
+    try std.testing.expectEqualStrings(control.native_bootstrap_prepared_phase, final_status.phase);
+    try std.testing.expectEqualStrings(control.native_bootstrap_snapshot_phase, status_sink.records.items[1].phase);
+    try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[1].snapshot_offset);
+    try std.testing.expectEqual(@as(u64, 2), final_status.snapshot_offset);
+    runner.protected_native_bootstrap = false;
     try std.testing.expect(final_status.cutover_intent_id != 0);
     try std.testing.expect(final_status.cutover_authority_id != 0);
     try std.testing.expect(!std.mem.eql(

@@ -6071,6 +6071,10 @@ pub const TransitionCommand = union(enum) {
         record: metadata.ReplicationSourceStatusRecord,
     },
     complete_replication_source_retirement: metadata.ReplicationSourceStatusRecord,
+    publish_native_replication_bootstrap: struct {
+        catalog_digest: source_control.Digest,
+        record: metadata.ReplicationSourceStatusRecord,
+    },
     upsert_range: metadata.RangeRecord,
     complete_restore_range: metadata.RestoreIntentIdentity,
     remove_range: struct {
@@ -6185,6 +6189,9 @@ pub const TransitionCommand = union(enum) {
             },
             .upsert_replication_source_status => |*record| {
                 metadata_table_manager.freeReplicationSourceStatus(alloc, record.*);
+            },
+            .publish_native_replication_bootstrap => |*publication| {
+                metadata_table_manager.freeReplicationSourceStatus(alloc, publication.record);
             },
             .complete_replication_source_retirement => |*record| {
                 metadata_table_manager.freeReplicationSourceStatus(alloc, record.*);
@@ -6422,6 +6429,17 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             {
                 return error.InvalidReplicationCutoverIntent;
             }
+        },
+        .publish_native_replication_bootstrap => |publication| {
+            const record = publication.record;
+            if (record.table_id == 0 or std.mem.allEqual(u8, &publication.catalog_digest, 0) or
+                !std.mem.eql(u8, record.source_kind, "postgres") or
+                !std.mem.eql(u8, record.cutover_mode, "exported_snapshot") or
+                !source_control.isNativeBootstrapPhase(record.phase) or
+                record.prepared_checkpoint.len == 0 or record.prepared_checkpoint.len > 1024 or
+                record.stream_checkpoint.len != 0 or record.retired_cutover_authority_id != 0)
+                return error.InvalidReplicationCutoverIntent;
+            _ = try source_control.nativeSourceProviderBinding(record);
         },
         .complete_replication_source_retirement => |record| {
             if (record.cutover_authority_id == 0 or
@@ -15988,6 +16006,13 @@ pub const RaftApplyStore = struct {
     pub fn legacyReplicationSourceIntakeAllowed(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !bool {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
+        var key_buffer: [224]u8 = undefined;
+        const key = try replicationSourceStatusKeyForGroup(&key_buffer, group_id, table_id, ordinal);
+        if (try stagingGet(&txn, key)) |bytes| {
+            const status = try decodeReplicationSourceStatusRecord(a, bytes);
+            defer metadata_table_manager.freeReplicationSourceStatus(a, status);
+            if (source_control.isNativeBootstrapPhase(status.phase)) return false;
+        }
         return @import("../source_legacy_intake.zig").allowed(a, &txn, group_id, table_id, ordinal, definition);
     }
     pub fn nativeSourceRecoveryScope(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !?source_control.Scope {
@@ -16061,7 +16086,7 @@ pub const RaftApplyStore = struct {
             if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
         } else if (write.mutation != .configure or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
         switch (write.mutation) {
-            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing => {
+            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap => {
                 const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return,
@@ -16078,6 +16103,17 @@ pub const RaftApplyStore = struct {
             var incarnation_buffer: [160]u8 = undefined;
             const incarnation_raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&incarnation_buffer, group_id))) orelse return;
             if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation, &authority.owner.metadata_incarnation)) return;
+        }
+        if (write.mutation == .certify_native_bootstrap) {
+            var status_buffer: [224]u8 = undefined;
+            const status_key = try replicationSourceStatusKeyForGroup(&status_buffer, group_id, scope.table_id, scope.source_ordinal);
+            const status_bytes = (try stagingGet(txn, status_key)) orelse return;
+            const status = try decodeReplicationSourceStatusRecord(a, status_bytes);
+            if (!std.mem.eql(u8, status.phase, source_control.native_bootstrap_prepared_phase) or
+                !std.mem.eql(u8, status.prepared_checkpoint, write.mutation.certify_native_bootstrap) or
+                status.stream_checkpoint.len != 0) return;
+            const provider = source_control.nativeSourceProviderBinding(status) catch return;
+            if (!std.mem.eql(u8, &provider, &scope.provider)) return;
         }
         const next = write.mutation.apply(a, state) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -19584,7 +19620,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_schema_progress_batch, .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
-            .upsert_replication_source_status, .claim_replication_source_cutover, .complete_replication_source_retirement => metadataSnapshotProjectionBit(.replication_source_status),
+            .upsert_replication_source_status, .claim_replication_source_cutover, .complete_replication_source_retirement, .publish_native_replication_bootstrap => metadataSnapshotProjectionBit(.replication_source_status),
             .complete_restore_range => metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.restore_progress) |
                 metadataSnapshotProjectionBit(.catalog_revision),
@@ -22326,6 +22362,9 @@ pub const RaftApplyStore = struct {
                     claim.record,
                 );
             },
+            .publish_native_replication_bootstrap => |publication| {
+                try self.applyNativeReplicationBootstrapTxn(txn, group_id, publication.catalog_digest, publication.record);
+            },
             .complete_replication_source_retirement => |expected| {
                 try self.applyReplicationSourceRetirementCompletionTxn(
                     txn,
@@ -24328,6 +24367,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         record: metadata.ReplicationSourceStatusRecord,
     ) !void {
+        if (source_control.isNativeBootstrapPhase(record.phase)) return;
         var key_buf: [224]u8 = undefined;
         const key = try replicationSourceStatusKeyForGroup(
             &key_buf,
@@ -24342,6 +24382,7 @@ pub const RaftApplyStore = struct {
         if (encoded_existing) |encoded| {
             const existing = try decodeReplicationSourceStatusRecord(self.alloc, encoded);
             defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing);
+            if (source_control.isNativeBootstrapPhase(existing.phase)) return;
             if (existing.cutover_authority_id != 0) {
                 if (!replicationCutoverAuthorityIdentityEqual(existing, record))
                     return;
@@ -24367,6 +24408,7 @@ pub const RaftApplyStore = struct {
         expected_authority_id: u64,
         record: metadata.ReplicationSourceStatusRecord,
     ) !void {
+        if (source_control.isNativeBootstrapPhase(record.phase)) return;
         var table_key_buf: [160]u8 = undefined;
         const table_key = try tableKeyForGroup(
             &table_key_buf,
@@ -24399,6 +24441,7 @@ pub const RaftApplyStore = struct {
         if (encoded_existing) |encoded| {
             const existing = try decodeReplicationSourceStatusRecord(self.alloc, encoded);
             defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing);
+            if (source_control.isNativeBootstrapPhase(existing.phase)) return;
             if (replicationCutoverAuthorityIdentityEqual(existing, record)) {
                 if (!replicationCutoverRetirementEqual(existing, record)) return;
                 // Provider cleanup can legitimately fail after authority is
@@ -24451,6 +24494,47 @@ pub const RaftApplyStore = struct {
             return;
         }
         try self.putReplicationSourceStatusTxn(txn, group_id, status_key, record);
+    }
+
+    fn applyNativeReplicationBootstrapTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        digest: source_control.Digest,
+        record: metadata.ReplicationSourceStatusRecord,
+    ) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var table_buffer: [160]u8 = undefined;
+        const table_key = try tableKeyForGroup(&table_buffer, group_id, record.table_id);
+        const table = try decodeTableRecord(a, (try stagingGet(txn, table_key)) orelse return);
+        if (!std.mem.eql(u8, &digest, &source_control.digest(table.replication_sources_json))) return;
+        var status_buffer: [224]u8 = undefined;
+        const key = try replicationSourceStatusKeyForGroup(&status_buffer, group_id, record.table_id, record.source_ordinal);
+        const current = try decodeReplicationSourceStatusRecord(a, (try stagingGet(txn, key)) orelse return);
+        if (!source_control.isNativeBootstrapPhase(record.phase) or
+            !std.mem.eql(u8, record.cutover_mode, "exported_snapshot") or
+            record.prepared_checkpoint.len == 0 or record.prepared_checkpoint.len > 1024 or
+            record.stream_checkpoint.len != 0 or record.retired_cutover_authority_id != 0 or
+            current.stream_checkpoint.len != 0 or
+            !replicationCutoverAuthorityIdentityEqual(current, record) or
+            !replicationCutoverRetirementEqual(current, record)) return;
+        if (std.mem.eql(u8, current.phase, "cutover_preparing")) {
+            // Claim the fresh exported cut before any legacy snapshot or
+            // stream can pass through a completed phase for this authority.
+            if (!std.mem.eql(u8, record.phase, source_control.native_bootstrap_snapshot_phase) or
+                !std.mem.eql(u8, current.cutover_mode, "exported_snapshot_pending") or
+                current.prepared_checkpoint.len != 0 or current.snapshot_offset != 0 or
+                record.snapshot_offset != 0) return;
+        } else if (std.mem.eql(u8, current.phase, source_control.native_bootstrap_snapshot_phase)) {
+            if (!std.mem.eql(u8, current.prepared_checkpoint, record.prepared_checkpoint) or
+                current.snapshot_offset > record.snapshot_offset) return;
+            const same_offset = current.snapshot_offset == record.snapshot_offset;
+            if (std.mem.eql(u8, record.phase, source_control.native_bootstrap_prepared_phase) and !same_offset) return;
+            if (same_offset and !std.mem.eql(u8, current.checkpoint, record.checkpoint)) return;
+        } else return;
+        try self.putReplicationSourceStatusTxn(txn, group_id, key, record);
     }
 
     fn applyReplicationSourceRetirementCompletionTxn(
@@ -29400,6 +29484,7 @@ const TransitionTag = enum(u8) {
     admit_online_merge = 63,
     create_restore_job_with_staging = 64,
     compare_and_set_job_state = 79,
+    publish_native_replication_bootstrap = 86,
 };
 
 fn appendInitialPlacementProof(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), proof: fk_generation_publication.InitialPlacementProof) !void {
@@ -29723,6 +29808,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try appendRequiredString(alloc, &out, claim.expected_replication_sources_json);
             try appendInt(alloc, &out, u64, claim.expected_authority_id);
             try appendReplicationSourceStatusRecord(alloc, &out, claim.record);
+        },
+        .publish_native_replication_bootstrap => |publication| {
+            try out.append(alloc, @backingInt(TransitionTag.publish_native_replication_bootstrap));
+            try out.appendSlice(alloc, &publication.catalog_digest);
+            try appendReplicationSourceStatusRecord(alloc, &out, publication.record);
         },
         .complete_replication_source_retirement => |record| {
             try out.append(
@@ -30295,6 +30385,16 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 .expected_replication_sources_json = expected_replication_sources_json,
                 .expected_authority_id = expected_authority_id,
                 .record = record,
+            } };
+        },
+        .publish_native_replication_bootstrap => blk: {
+            const digest_end = std.math.add(usize, pos, 32) catch return error.InvalidMetadataTransitionEncoding;
+            if (digest_end > encoded.len) return error.InvalidMetadataTransitionEncoding;
+            const digest = encoded[pos..][0..32].*;
+            pos = digest_end;
+            break :blk .{ .publish_native_replication_bootstrap = .{
+                .catalog_digest = digest,
+                .record = try readReplicationSourceStatusRecord(alloc, encoded, &pos),
             } };
         },
         .complete_replication_source_retirement => .{

@@ -165,6 +165,7 @@ pub fn stage(
     catalog_digest: source.Digest,
     input: @import("../metadata/source_delivery.zig").Input,
     tables: []const @import("distributed_txn.zig").TableCommitRequest,
+    snapshot: ?@import("../metadata/source_scope_capture.zig").Snapshot,
     context: Context,
 ) !void {
     const raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
@@ -224,6 +225,20 @@ pub fn stage(
         .checkpoint = checkpoint,
     }, context);
     defer prepared.deinit();
+    if (current.native_bootstrap_checkpoint != null) {
+        const lifecycle = snapshot orelse return error.SourceBindingConflict;
+        try lifecycle.requireBind();
+        if (!lifecycle.native_bootstrap_certified or
+            !std.meta.eql(lifecycle.spec, (try @import("../metadata/source_scope_binding.zig").spec(current)).?))
+            return error.SourceBindingConflict;
+        for (prepared.routes) |participant| try admission.requireScope(a, participant.fence, participant.table_name, .{
+            .version = 1,
+            .owner = participant.owner,
+            .spec = lifecycle.spec,
+            .minimum_metadata_index = lifecycle.cut.index,
+            .action = .bind,
+        }, context);
+    }
     const route = prepared.routes[prepared.coordinator_index];
     if (current.pending) |pending| {
         const record = ledger.current.?;

@@ -25,6 +25,13 @@ pub const artifact_control = @import("source_artifact_control.zig");
 pub const checkpoint_authority = @import("source_checkpoint_authority.zig");
 pub const protocol_version: u16 = 101;
 pub const closing_protocol_version: u16 = 115;
+pub const native_bootstrap_protocol_version: u16 = 130;
+pub const native_bootstrap_snapshot_phase = "native_bootstrap_snapshot";
+pub const native_bootstrap_prepared_phase = "native_bootstrap_prepared";
+pub fn isNativeBootstrapPhase(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, native_bootstrap_snapshot_phase) or
+        std.mem.eql(u8, phase, native_bootstrap_prepared_phase);
+}
 pub const manifest_protocol_version: u16 = 116;
 pub const max_pending_bytes = 1024 * 1024;
 pub const max_state_bytes = 8 * 1024 * 1024;
@@ -196,6 +203,7 @@ pub const State = struct {
     retired: bool = false,
     closing: bool = false,
     scope_fencing: bool = false,
+    native_bootstrap_checkpoint: ?[]const u8 = null,
     manifest_retention: bool = false,
     retirement_receipt: []const u8 = "",
     retired_reservation_digest: Digest = @splat(0),
@@ -215,6 +223,9 @@ pub const State = struct {
             if (self.scope == null or self.scope.?.destination != .native or self.artifact_control == null or !std.mem.eql(u8, &authority.binding, &self.scope.?.identity()) or (authority.retirement != null and !self.retired)) return error.InvalidSourceControl;
         }
         if (self.manifest_retention and (self.scope == null or self.artifact_control == null)) return error.InvalidSourceControl;
+        if (self.native_bootstrap_checkpoint) |checkpoint| {
+            if (!self.scope_fencing or !text(checkpoint, 1024, false)) return error.InvalidSourceControl;
+        }
         if (self.scope_fencing and (self.checkpoint_authority == null or self.scope == null or self.scope.?.destination != .native)) return error.InvalidSourceControl;
         if (self.committed.sequence > self.accepted.sequence) return error.InvalidSourceControl;
         for ([_]Frontier{ self.accepted, self.committed }) |frontier| {
@@ -226,6 +237,11 @@ pub const State = struct {
         }
         if (self.pending) |pending| {
             try pending.validate();
+            if (pending.sequence == 1) {
+                if (self.native_bootstrap_checkpoint) |checkpoint| {
+                    if (!std.mem.eql(u8, checkpoint, pending.checkpoint)) return error.InvalidSourceControl;
+                }
+            }
             if (pending.retain_manifest != self.manifest_retention) return error.InvalidSourceControl;
             if (self.scope == null or pending.destination != self.scope.?.destination) return error.SourceBindingConflict;
             if (pending.sequence != (std.math.add(u64, self.accepted.sequence, 1) catch return error.InvalidSourceControl) or !predecessor(pending.expected_checkpoint, self.accepted)) return error.InvalidSourceControl;
@@ -309,6 +325,7 @@ pub const Mutation = union(enum) {
     /// Stop new grants while preserving original recovery and cleanup debt.
     close: void,
     enable_scope_fencing: void,
+    certify_native_bootstrap: []const u8,
     configure: Scope,
     bind_checkpoint: checkpoint_authority.Spec,
     fence_checkpoint: struct { authority_digest: Digest, proof: Digest },
@@ -336,6 +353,7 @@ pub const Mutation = union(enum) {
     pub fn validate(self: Mutation) !void {
         switch (self) {
             .close, .enable_scope_fencing => {},
+            .certify_native_bootstrap => |checkpoint| if (!text(checkpoint, 1024, false)) return error.InvalidSourceControl,
             .configure, .reseed => |scope| try scope.validate(),
             .bind_checkpoint => |authority| {
                 try authority.validate();
@@ -372,6 +390,17 @@ pub const Mutation = union(enum) {
                 if (state.closing or state.retired or scope.destination != .native or state.checkpoint_authority == null) return error.SourceBindingConflict;
                 if (state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false)) return error.SourcePendingWork;
                 next.scope_fencing = true;
+            },
+            .certify_native_bootstrap => |checkpoint| {
+                if (!state.scope_fencing or state.closing or state.retired) return error.SourceBindingConflict;
+                if (state.native_bootstrap_checkpoint) |prior| {
+                    if (!std.mem.eql(u8, prior, checkpoint)) return error.SourceCheckpointConflict;
+                    return state;
+                }
+                if (state.pending != null or state.accepted.sequence != 0 or
+                    state.outstanding.len != 0 or state.artifact_control.?.current != null)
+                    return error.SourcePendingWork;
+                next.native_bootstrap_checkpoint = try a.dupe(u8, checkpoint);
             },
             .close => {
                 if (state.scope == null) return error.SourceBindingConflict;
@@ -430,6 +459,12 @@ pub const Mutation = union(enum) {
                 if (state.outstanding.len == max_outstanding or
                     acceptance_credit > max_outstanding_encoded_bytes - outstandingBytes(state.outstanding)) return error.SourceAdmissionBackpressure;
                 if (reservation.sequence != (std.math.add(u64, state.accepted.sequence, 1) catch return error.SourceReceiptExpired)) return error.SourceReceiptExpired;
+                if (state.accepted.sequence == 0) {
+                    if (state.native_bootstrap_checkpoint) |bootstrap| {
+                        if (!std.mem.eql(u8, bootstrap, reservation.checkpoint))
+                            return error.SourceCheckpointConflict;
+                    }
+                }
                 if (!predecessor(reservation.expected_checkpoint, state.accepted)) return error.SourceCheckpointConflict;
                 if (reservation.artifact) |spec| {
                     next.artifact_control = try (state.artifact_control orelse artifact_control.State{}).reserve(reservation.identity(scope), spec, scope.identity());
@@ -734,6 +769,30 @@ test "source control bounds accepted backlog without weakening original pending 
     state = try (Mutation{ .commit = .{ .sequence = max_outstanding, .receipt_digest = digest("receipt-255"), .reference = "snapshot" } }).apply(ca, state);
     state = try (Mutation{ .reserve = extra }).apply(ca, state);
     try std.testing.expect(state.pending != null);
+}
+
+/// Bind scoped admission to the exact managed slot incarnation as well as
+/// the PostgreSQL instance. A new cutover on the same instance needs a handoff.
+pub fn nativeSourceProviderBinding(status: anytype) ![32]u8 {
+    if (status.cutover_intent_id == 0 or status.cutover_authority_id == 0 or
+        status.slot_name.len == 0 or status.publication_name.len == 0 or
+        std.mem.allEqual(u8, &status.cutover_provider_identity, 0))
+        return error.ReplicationCutoverAuthorityLost;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:scoped-postgres-provider:v1");
+    hash.update(&status.cutover_provider_identity);
+    hash.update(&status.cutover_config_fingerprint);
+    var epoch: [16]u8 = undefined;
+    std.mem.writeInt(u64, epoch[0..8], status.cutover_intent_id, .big);
+    std.mem.writeInt(u64, epoch[8..16], status.cutover_authority_id, .big);
+    hash.update(&epoch);
+    for ([_][]const u8{ status.slot_name, status.publication_name }) |identifier| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, identifier.len, .big);
+        hash.update(&length);
+        hash.update(identifier);
+    }
+    return hash.finalResult();
 }
 
 fn hashField(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
@@ -1077,7 +1136,7 @@ test "source control replans only proven unadmitted delivery while retaining log
 fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
-        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority")) @field(value, name) != null else true;
+        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "native_bootstrap_checkpoint")) @field(value, name) != null else true;
         if (include) {
             try stream.objectField(name);
             try stream.write(@field(value, name));
@@ -1088,6 +1147,7 @@ fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!
 pub fn requiredProtocol(mutation: Mutation) u16 {
     return switch (mutation) {
         .close, .enable_scope_fencing => closing_protocol_version,
+        .certify_native_bootstrap => native_bootstrap_protocol_version,
         .bind_checkpoint, .fence_checkpoint => checkpoint_authority.protocol_version,
         .reserve => |reservation| if (reservation.retain_manifest) manifest_protocol_version else if (reservation.artifact != null) artifact_control.protocol_version else protocol_version,
         .replan => |plan| if (plan.retain_manifest) manifest_protocol_version else if (plan.artifact != null) artifact_control.protocol_version else protocol_version,
@@ -1360,6 +1420,16 @@ test "source control scope fencing pins idle bindings until closing retirement a
     state = try (Mutation{ .enable_scope_fencing = {} }).apply(ca, state);
     try std.testing.expect(hasWork(state));
     try std.testing.expectEqual(state.revision, (try (Mutation{ .enable_scope_fencing = {} }).apply(ca, state)).revision);
+    const certify: Mutation = .{ .certify_native_bootstrap = "lsn:0/1234" };
+    try std.testing.expectEqual(native_bootstrap_protocol_version, requiredProtocol(certify));
+    state = try certify.apply(ca, state);
+    try std.testing.expectEqualStrings("lsn:0/1234", state.native_bootstrap_checkpoint.?);
+    try std.testing.expectEqual(state.revision, (try certify.apply(ca, state)).revision);
+    try std.testing.expectError(error.SourceCheckpointConflict, (Mutation{ .certify_native_bootstrap = "lsn:0/1235" }).apply(ca, state));
+    var reservation: Reservation = .{ .sequence = 1, .batch_id = "bootstrap", .checkpoint = "lsn:0/1235", .accepted_at_ns = 1, .payload_digest = @splat(5), .plan_digest = @splat(6), .transaction_id = @splat(7), .destination = .native, .delivery_manifest = "bootstrap", .artifact = artifactTestSpec(scope, 1) };
+    try std.testing.expectError(error.SourceCheckpointConflict, (Mutation{ .reserve = reservation }).apply(ca, state));
+    reservation.checkpoint = state.native_bootstrap_checkpoint.?;
+    try std.testing.expect((try (Mutation{ .reserve = reservation }).apply(ca, state)).pending != null);
     try std.testing.expectError(error.SourcePendingWork, (Mutation{ .retire = .{ .receipt = "too-early" } }).apply(ca, state));
     state = try (Mutation{ .close = {} }).apply(ca, state);
     state = try (Mutation{ .retire = .{ .receipt = "cohort-closed" } }).apply(ca, state);
@@ -1369,6 +1439,7 @@ test "source control scope fencing pins idle bindings until closing retirement a
     var reopened = try parse(a, saved);
     defer reopened.deinit();
     try std.testing.expect(reopened.value.scope_fencing and reopened.value.closing);
+    try std.testing.expectEqualStrings("lsn:0/1234", reopened.value.native_bootstrap_checkpoint.?);
     state = try (Mutation{ .fence_checkpoint = .{ .authority_digest = authority.digest(), .proof = @splat(6) } }).apply(ca, reopened.value);
     try std.testing.expect(!hasWork(state));
     try std.testing.expectEqual(closing_protocol_version, requiredProtocol(.{ .enable_scope_fencing = {} }));

@@ -20,6 +20,7 @@ const std = @import("std");
 const control = @import("source_control.zig");
 pub const native = @import("antfly_local_sources").storage_source_scope;
 const A = std.mem.Allocator;
+const native_control = @import("antfly_local_sources").storage_source_scope_control;
 pub const Query = struct {
     metadata_group_id: u64,
     metadata_incarnation: [32]u8,
@@ -48,6 +49,32 @@ pub const Snapshot = struct {
     live_definition: bool,
     checkpoint_table: []const u8,
     pending: ?Pending = null,
+    native_bootstrap_certified: bool = false,
+    pub fn jsonStringify(self: Snapshot, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Snapshot).@"struct".field_names) |name| {
+            if ((comptime !std.mem.eql(u8, name, "native_bootstrap_certified")) or self.native_bootstrap_certified) {
+                try stream.objectField(name);
+                try stream.write(@field(self, name));
+            }
+        }
+        try stream.endObject();
+    }
+    pub fn authorize(self: Snapshot, intent: native_control.Intent) !native_control.Command {
+        try self.requireBinding(intent.spec);
+        switch (intent.action) {
+            .bind => try self.requireBind(),
+            .close => try self.requireClose(),
+            .drop => try self.requireDrop(),
+        }
+        const result: native_control.Command = .{
+            .version = if (intent.action == .bind and self.native_bootstrap_certified) 2 else 1,
+            .intent = intent,
+            .metadata_cut = self.cut,
+        };
+        try result.validate();
+        return result;
+    }
     pub fn deinit(self: *Snapshot, a: A) void {
         a.free(self.checkpoint_table);
         self.* = undefined;
@@ -73,6 +100,7 @@ pub fn capture(a: A, query: Query, applied_index: u64, incarnation: [32]u8, deco
     if (!std.meta.eql(query.metadata_incarnation, incarnation)) return error.InvalidMetadataIncarnation;
     if (decoder_version < control.closing_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
     try state.validate();
+    if (state.native_bootstrap_checkpoint != null and decoder_version < control.native_bootstrap_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
     const source = state.scope orelse return error.SourceBindingConflict;
     const authority = state.checkpoint_authority orelse return error.SourceBindingConflict;
     if (!state.scope_fencing or source.destination != .native or source.table_id != query.actor_table_id or !std.meta.eql(source.source_id, query.source_id) or authority.owner.metadata_group_id != query.metadata_group_id or !std.meta.eql(authority.owner.metadata_incarnation, incarnation)) return error.SourceBindingConflict;
@@ -87,7 +115,7 @@ pub fn capture(a: A, query: Query, applied_index: u64, incarnation: [32]u8, deco
         pending = .{ .reference = .{ .domain = spec.domain(), .binding = spec.binding, .generation = spec.generation, .token = artifact.token(), .sequence = reservation.sequence }, .transaction_id = reservation.transaction_id, .purpose = try reservation.inputFingerprint(source), .reservation = reservation.identity(source), .plan_digest = reservation.plan_digest, .artifact_plan_digest = artifact.plan_digest };
         try pending.?.reference.validate();
     }
-    return .{ .cut = .{ .group_id = query.metadata_group_id, .incarnation = incarnation, .index = applied_index }, .spec = spec, .phase = if (state.retired) .retired else if (state.closing) .closing else .active, .actor_revision = state.revision, .live_definition = if (definition) |value| std.meta.eql(value, source.definition) else false, .checkpoint_table = try a.dupe(u8, authority.table_name), .pending = pending };
+    return .{ .cut = .{ .group_id = query.metadata_group_id, .incarnation = incarnation, .index = applied_index }, .spec = spec, .phase = if (state.retired) .retired else if (state.closing) .closing else .active, .actor_revision = state.revision, .live_definition = if (definition) |value| std.meta.eql(value, source.definition) else false, .checkpoint_table = try a.dupe(u8, authority.table_name), .pending = pending, .native_bootstrap_certified = state.native_bootstrap_checkpoint != null };
 }
 
 pub fn readOnService(svc: anytype, a: A, query: Query, request: anytype) !Snapshot {
@@ -111,13 +139,5 @@ pub fn authorizeOnService(svc: anytype, a: A, intent: @import("antfly_local_sour
     try intent.validate();
     var snapshot = try readOnService(svc, a, .{ .metadata_group_id = intent.owner.metadata_group_id, .metadata_incarnation = intent.owner.metadata_incarnation, .actor_table_id = intent.spec.actor_table_id, .source_id = intent.spec.source_id, .minimum_applied_index = intent.minimum_metadata_index }, request);
     defer snapshot.deinit(a);
-    try snapshot.requireBinding(intent.spec);
-    switch (intent.action) {
-        .bind => try snapshot.requireBind(),
-        .close => try snapshot.requireClose(),
-        .drop => try snapshot.requireDrop(),
-    }
-    const command: @import("antfly_local_sources").storage_source_scope_control.Command = .{ .version = 1, .intent = intent, .metadata_cut = snapshot.cut };
-    try command.validate();
-    return command;
+    return snapshot.authorize(intent);
 }

@@ -61,7 +61,21 @@ pub fn run(a: A) !void {
     try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
     const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}", .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]" };
     try store.applyStandaloneCommand(group, .{ .upsert_table = table });
-    const source: control.Scope = .{ .table_id = table.table_id, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = try control.definitionDigest(a, table.replication_sources_json, 0), .provider = @splat(2), .destination = .native, .destination_binding = @splat(3) };
+    const cutover: metadata.ReplicationSourceStatusRecord = .{
+        .table_id = table.table_id,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .external_table = "users",
+        .cutover_mode = "exported_snapshot_pending",
+        .phase = "cutover_preparing",
+        .slot_name = "slot_first",
+        .publication_name = "pub_first",
+        .cutover_intent_id = 1,
+        .cutover_authority_id = 2,
+        .cutover_config_fingerprint = @splat(8),
+        .cutover_provider_identity = @splat(9),
+    };
+    const source: control.Scope = .{ .table_id = table.table_id, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = try control.definitionDigest(a, table.replication_sources_json, 0), .provider = try control.nativeSourceProviderBinding(cutover), .destination = .native, .destination_binding = @splat(3) };
     const actor: Actor = .{ .a = a, .store = &store, .scope = source, .catalog = control.digest(table.replication_sources_json) };
     try std.testing.expect(try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
     try actor.apply(.{ .configure = source });
@@ -75,6 +89,72 @@ pub fn run(a: A) !void {
     try actor.expectWork(1);
     try actor.apply(.{ .enable_scope_fencing = {} });
     try actor.expectWork(1);
+    try store.applyStandaloneCommand(group, .{ .upsert_replication_source_status = .{
+        .table_id = table.table_id,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .phase = control.native_bootstrap_prepared_phase,
+        .prepared_checkpoint = "lsn:0/1234",
+    } });
+    const forged = try store.getReplicationSourceStatus(a, group, table.table_id, 0);
+    defer if (forged) |record| metadata.freeReplicationSourceStatus(a, record);
+    try std.testing.expect(forged == null);
+    try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
+    try store.applyStandaloneCommand(group, .{ .claim_replication_source_cutover = .{
+        .expected_replication_sources_json = table.replication_sources_json,
+        .expected_authority_id = 0,
+        .record = cutover,
+    } });
+    var snapshot_status = cutover;
+    snapshot_status.cutover_mode = "exported_snapshot";
+    snapshot_status.phase = control.native_bootstrap_snapshot_phase;
+    snapshot_status.prepared_checkpoint = "lsn:0/1234";
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = snapshot_status,
+    } });
+    var publication_status = snapshot_status;
+    publication_status.phase = control.native_bootstrap_prepared_phase;
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = @splat(90),
+        .record = publication_status,
+    } });
+    try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
+    {
+        var stale = try actor.read();
+        defer stale.deinit();
+        try std.testing.expect(stale.value.native_bootstrap_checkpoint == null);
+    }
+    var ahead = publication_status;
+    ahead.snapshot_offset += 1;
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = ahead,
+    } });
+    var changed_cursor = publication_status;
+    changed_cursor.checkpoint = "snapshot_keyset:[42]";
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = changed_cursor,
+    } });
+    {
+        const protected = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, protected);
+        try std.testing.expectEqualStrings(control.native_bootstrap_snapshot_phase, protected.phase);
+        try std.testing.expectEqual(snapshot_status.snapshot_offset, protected.snapshot_offset);
+        try std.testing.expectEqualStrings(snapshot_status.checkpoint, protected.checkpoint);
+    }
+    const bytes = try store_mod.encodeTransitionCommand(a, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = publication_status,
+    } });
+    defer a.free(bytes);
+    var decoded = (try store_mod.decodeTransitionCommand(a, bytes)) orelse return error.TestUnexpectedResult;
+    defer decoded.deinit(a);
+    try store.applyStandaloneCommand(group, decoded);
+    snapshot_status.phase = "cutover_prepared";
+    try store.applyStandaloneCommand(group, .{ .upsert_replication_source_status = snapshot_status });
+    try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
     store.deinit();
     opened = false;
     store = try Store.init(a, .{ .root_dir = path });
@@ -82,6 +162,7 @@ pub fn run(a: A) !void {
     var restored = try actor.read();
     defer restored.deinit();
     try std.testing.expect(restored.value.scope_fencing and !restored.value.closing);
+    try std.testing.expectEqualStrings("lsn:0/1234", restored.value.native_bootstrap_checkpoint.?);
     try actor.expectWork(1);
     try std.testing.expect(!try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
     try actor.apply(.{ .close = {} });

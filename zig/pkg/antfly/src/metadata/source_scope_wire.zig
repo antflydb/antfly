@@ -135,3 +135,39 @@ test "metadata source scope wire never turns inconsistent pending identity into 
     reply.snapshot.pending.?.reference.generation += 1;
     try std.testing.expectError(error.SourceControlCorrupt, reply.validate(request));
 }
+
+test "metadata source scope wire authorizes ordered first bind from certified bootstrap" {
+    const a = std.testing.allocator;
+    const request = fixture();
+    var snapshot = observation();
+    const control = @import("antfly_local_sources").storage_source_scope_control;
+    var intent: control.Intent = .{
+        .version = 1,
+        .owner = .{
+            .metadata_group_id = 1,
+            .metadata_incarnation = request.query.metadata_incarnation,
+            .namespace = snapshot.spec.checkpoint_owner.namespace,
+            .table_binding = @splat(6),
+            .root_generation = snapshot.spec.checkpoint_owner.root_generation,
+            .group_id = 17,
+            .topology_epoch = 1,
+        },
+        .spec = snapshot.spec,
+        .minimum_metadata_index = request.query.minimum_applied_index,
+        .action = .bind,
+    };
+    const legacy = try encodeReply(a, request, snapshot);
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "native_bootstrap_certified") == null);
+    try std.testing.expectEqual(@as(u8, 1), (try snapshot.authorize(intent)).version);
+    snapshot.native_bootstrap_certified = true;
+    const raw = try encodeReply(a, request, snapshot);
+    defer a.free(raw);
+    var captured = try decodeReply(a, request, raw);
+    defer captured.deinit(a);
+    try std.testing.expectEqual(@as(u8, 2), (try captured.authorize(intent)).version);
+    captured.phase = .closing;
+    try std.testing.expectError(error.SourceBindingConflict, captured.authorize(intent));
+    intent.action = .close;
+    try std.testing.expectEqual(@as(u8, 1), (try captured.authorize(intent)).version);
+}

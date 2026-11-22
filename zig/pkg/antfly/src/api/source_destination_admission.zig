@@ -65,6 +65,50 @@ pub const Admission = struct {
     coordinator: @import("completion_admission.zig").Coordinator,
     artifacts: destination.Ports,
     checkpoints: checkpoints.Port,
+    scope_reads: ?@import("source_scope_operations.zig").Port = null,
+    scope_controls: ?@import("source_scope_control_operations.zig").Port = null,
+
+    pub fn requireScope(self: Admission, a: A, fence: metadata.CatalogRouteFence, table: []const u8, intent: local.storage_source_scope_control.Intent, context: Context) !void {
+        const reads = self.scope_reads orelse return error.ChangefeedCapabilityUnsupported;
+        const controls = self.scope_controls orelse return error.ChangefeedCapabilityUnsupported;
+        try intent.validate();
+        const query: local.storage_source_scope_control.Query = .{
+            .version = 1,
+            .owner = intent.owner,
+            .domain = intent.spec.domain(),
+            .minimum_applied_index = 1,
+        };
+        const observed = try reads.read(a, fence, table, query, context);
+        try observed.validate(query);
+        if (observed.record) |record| {
+            if (!std.meta.eql(record.spec, intent.spec) or record.phase != .active)
+                return error.SourceBindingConflict;
+            return;
+        }
+        var io_impl = std.Io.Threaded.init(a, .{});
+        defer io_impl.deinit();
+        var nonce: [16]u8 = undefined;
+        try @import("antfly_platform").entropy.fill(io_impl.io(), &nonce);
+        if (std.mem.allEqual(u8, &nonce, 0)) nonce[0] = 1;
+        const input: @import("source_scope_control_operations.zig").wire.Request = .{
+            .version = 1,
+            .request_id = nonce,
+            .operation = .submit,
+            .intent = intent,
+        };
+        const result = try controls.execute(a, fence, table, input, context);
+        try result.validate(input, try input.digest(a));
+        if (!result.confirmed()) return error.SourceOutcomeUnresolved;
+        if (result.command.?.version != 2) return error.SourceBindingConflict;
+        switch (result.outcome.?) {
+            .applied => {},
+            .rejected => |rejection| switch (rejection) {
+                .pending => return error.SourcePendingWork,
+                else => return error.SourceBindingConflict,
+            },
+            .superseded => unreachable,
+        }
+    }
 
     fn grantFromState(a: A, state: source.State) !Grant {
         try state.validate();

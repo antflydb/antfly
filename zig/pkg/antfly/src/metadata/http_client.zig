@@ -497,16 +497,8 @@ pub const MetadataHttpClient = struct {
         try intent.validate();
         var snapshot = try self.captureSourceScope(base_uri, .{ .version = 1, .query = .{ .metadata_group_id = intent.owner.metadata_group_id, .metadata_incarnation = intent.owner.metadata_incarnation, .actor_table_id = intent.spec.actor_table_id, .source_id = intent.spec.source_id, .minimum_applied_index = intent.minimum_metadata_index } }, context);
         defer snapshot.deinit(self.alloc);
-        try snapshot.requireBinding(intent.spec);
-        switch (intent.action) {
-            .bind => try snapshot.requireBind(),
-            .close => try snapshot.requireClose(),
-            .drop => try snapshot.requireDrop(),
-        }
         try context.ensureActive();
-        const command: @import("antfly_local_sources").storage_source_scope_control.Command = .{ .version = 1, .intent = intent, .metadata_cut = snapshot.cut };
-        try command.validate();
-        return command;
+        return snapshot.authorize(intent);
     }
 
     pub fn captureSourceScope(self: *MetadataHttpClient, base_uri: []const u8, input: @import("source_scope_wire.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("source_scope_capture.zig").Snapshot {

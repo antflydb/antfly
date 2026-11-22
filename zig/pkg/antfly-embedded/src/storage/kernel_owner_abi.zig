@@ -49,7 +49,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 127 includes retained metadata session snapshot ranges and counts.
 // Version 128 adds source recovery scope lookup to the metadata owner.
 // Version 129 supports first source binding after an ordered native drain check.
-pub const abi_version: u32 = 129;
+// Version 130 decodes native PostgreSQL bootstrap certification in metadata apply.
+pub const abi_version: u32 = 130;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

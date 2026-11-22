@@ -63,7 +63,9 @@ pub const Reply = struct {
     outcome: ?ordered.Outcome = null,
     /// A known result can be rejected; inspect the outcome before acting.
     pub fn confirmed(self: Reply) bool {
-        return self.version == 1 and self.command != null and self.command.?.version == 1 and self.receipt != null and self.receipt.?.term != 0 and self.receipt.?.index != 0 and self.outcome != null and self.outcome.? != .superseded;
+        const command = self.command orelse return false;
+        command.validate() catch return false;
+        return self.version == 1 and self.receipt != null and self.receipt.?.term != 0 and self.receipt.?.index != 0 and self.outcome != null and self.outcome.? != .superseded;
     }
     pub fn validate(self: Reply, request: Request, expected: control.scope.Digest) !void {
         try request.validate();
@@ -171,6 +173,12 @@ test "source scope control wire binds applied phase cut and correlation before c
     const bytes = try encodeReply(a, request, reply);
     defer a.free(bytes);
     try std.testing.expect((try decodeReply(a, request, bytes)).confirmed());
+    reply.command.?.version = 2;
+    const ordered_bytes = try encodeReply(a, request, reply);
+    defer a.free(ordered_bytes);
+    const ordered_reply = try decodeReply(a, request, ordered_bytes);
+    try std.testing.expect(ordered_reply.confirmed());
+    try std.testing.expectEqual(@as(u8, 2), ordered_reply.command.?.version);
     reply.outcome.?.applied.cut.term += 1;
     try std.testing.expectError(error.SourceAdmissionCorrupt, reply.validate(request, try request.digest(a)));
     reply.outcome = .{ .rejected = .pending };

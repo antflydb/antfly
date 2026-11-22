@@ -3824,6 +3824,7 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         },
         else => {},
     }
+    if (command == .publish_native_replication_bootstrap) return @import("source_control.zig").native_bootstrap_protocol_version;
     if (command == .apply_source_control) return @import("source_control.zig").requiredProtocolEncoded(command.apply_source_control);
     if (command == .apply_changefeed_control) return @import("changefeed_control.zig").requiredProtocolEncoded(command.apply_changefeed_control);
     if (command == .apply_pg_publication) return metadata_topology_protocol.pg_publication_version;
@@ -10742,6 +10743,28 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
 
+    pub fn publishNativeReplicationBootstrapDurable(self: *MetadataHttpService, sources_json: []const u8, record: metadata_table_manager.ReplicationSourceStatusRecord, deadline_ns: ?u64) !void {
+        try ensureCdcWorkPermit(self);
+        const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
+        try context.ensureActive();
+        const command: metadata_storage.TransitionCommand = .{ .publish_native_replication_bootstrap = .{
+            .catalog_digest = @import("source_control.zig").digest(sources_json),
+            .record = record,
+        } };
+        try ensureCoordinatedDecoderWithContext(self, command, context);
+        const receipt = try self.proposeTransitionCommandWithReceipt(command);
+        try self.waitForTransitionAppliedWithContext(receipt, context);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const observed = (try store.getReplicationSourceStatus(self.alloc, self.metadata_group_id, record.table_id, record.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, observed);
+        if (!replicationCutoverAuthorityMatches(observed, record) or
+            !std.mem.eql(u8, observed.phase, record.phase) or observed.snapshot_offset != record.snapshot_offset or
+            !std.mem.eql(u8, observed.prepared_checkpoint, record.prepared_checkpoint) or
+            !std.mem.eql(u8, observed.checkpoint, record.checkpoint))
+            return error.ReplicationCutoverAuthorityLost;
+        try context.ensureActive();
+    }
+
     /// Atomically claims exact-cutover authority against both the current
     /// source catalog and prior authority, then waits for the applied proof.
     pub fn claimReplicationSourceCutoverDurable(
@@ -10843,7 +10866,32 @@ pub const MetadataHttpService = struct {
         const source_status = (try store.getReplicationSourceStatus(a, self.metadata_group_id, scope.table_id, ordinal)) orelse return;
         defer metadata_table_manager.freeReplicationSourceStatus(a, source_status);
         try ensureCdcWorkPermit(self);
-        try runner.stageScopedStream(self, admission, table, source_status, state.value, context);
+        if (state.value.native_bootstrap_checkpoint == null and
+            std.mem.eql(u8, source_status.phase, control.native_bootstrap_prepared_phase))
+        {
+            if (!std.meta.eql(scope.provider, try control.nativeSourceProviderBinding(source_status)))
+                return error.ReplicationCutoverAuthorityLost;
+            return control.mutateOnService(self, a, .{
+                .table_id = scope.table_id,
+                .source_id = scope.source_id,
+                .expected_revision = state.value.revision,
+                .expected_binding = scope.identity(),
+                .expected_catalog_digest = control.digest(table.replication_sources_json),
+                .mutation = .{ .certify_native_bootstrap = source_status.prepared_checkpoint },
+            }, context);
+        }
+        var snapshot = if (state.value.native_bootstrap_checkpoint != null) blk: {
+            const authority = state.value.checkpoint_authority.?;
+            break :blk try @import("source_scope_capture.zig").readOnService(self, a, .{
+                .metadata_group_id = authority.owner.metadata_group_id,
+                .metadata_incarnation = authority.owner.metadata_incarnation,
+                .actor_table_id = scope.table_id,
+                .source_id = scope.source_id,
+                .minimum_applied_index = 1,
+            }, context);
+        } else null;
+        defer if (snapshot) |*captured| captured.deinit(a);
+        try runner.stageScopedStream(self, admission, table, source_status, state.value, snapshot, context);
     }
 
     pub fn replicationSourceAuthorityCurrent(
@@ -10870,7 +10918,9 @@ pub const MetadataHttpService = struct {
             expected.source_ordinal,
         )) orelse return error.ReplicationCutoverAuthorityLost;
         defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, current);
-        if (!replicationCutoverAuthorityMatches(current, expected))
+        const control = @import("source_control.zig");
+        if (!replicationCutoverAuthorityMatches(current, expected) or
+            (control.isNativeBootstrapPhase(expected.phase) and !std.mem.eql(u8, current.phase, expected.phase)))
             return error.ReplicationCutoverAuthorityLost;
     }
 

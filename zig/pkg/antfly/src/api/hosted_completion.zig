@@ -52,8 +52,12 @@ pub const Hosted = struct {
     pub fn sourceAdmission(self: *Hosted) @import("source_destination_admission.zig").Admission {
         const checkpoint = @import("source_checkpoint_operations.zig").wire;
         const artifact = @import("source_plan_operations.zig").wire;
+        const scope_read = @import("source_scope_operations.zig").wire;
+        const scope_control = @import("source_scope_control_operations.zig").wire;
         return .{
             .coordinator = self.coordinator(),
+            .scope_reads = .{ .ptr = self, .read_fn = Routed(scope_read.Query, scope_read.Observation, "fetchGroupSourceScopeObservation").read },
+            .scope_controls = .{ .ptr = self, .execute_fn = Routed(scope_control.Request, scope_control.Reply, "fetchGroupSourceScopeControl").read },
             .checkpoints = .{ .ptr = self, .read_fn = Routed(checkpoint.Request, checkpoint.Reply, "fetchGroupSourceCheckpointObservation").read },
             .artifacts = .{
                 .controls = .{ .ptr = self, .execute_fn = Routed(artifact.ControlRequest, artifact.ControlReply, "fetchGroupSourcePlanControl").read },
