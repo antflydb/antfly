@@ -20768,15 +20768,17 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             try arena.launch(&self.ctx);
         }
     }
-    self.audio_arena_executes += 1;
-    if (arena.timing_replay == null) if (arena.timing) |pair| {
-        try self.ctx.recordProfileEnd(pair);
-        arena.timing_replay = if (capture_sample) null else replay;
-    };
     if (!published_directly) {
         const result = try audioBufferView(arena.buffers[0], output.offset, output_bytes);
         try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
     }
+    // Include the publication copy in replay samples. The direct ordinary
+    // route already publishes its result as part of the measured work.
+    if (arena.timing_replay == null) if (arena.timing) |pair| {
+        try self.ctx.recordProfileEnd(pair);
+        arena.timing_replay = if (capture_sample) null else replay;
+    };
+    self.audio_arena_executes += 1;
     out_owned = false;
     return out;
 }

@@ -7518,14 +7518,18 @@ fn stopT5CudaProfile(profile: *?std.DynLib) void {
 }
 
 test "complete Imported Metal RMS scope uses assigned output beside layout and elementwise ops" {
-    try qualifyCompleteMetalPrimitive(false);
+    try qualifyCompleteMetalPrimitive(false, false);
 }
 
 test "complete Imported Metal standalone dot publishes assigned output" {
-    try qualifyCompleteMetalPrimitive(true);
+    try qualifyCompleteMetalPrimitive(true, false);
 }
 
-fn qualifyCompleteMetalPrimitive(comptime dot: bool) !void {
+test "Imported Metal dot with a downstream consumer keeps compatibility ownership" {
+    try qualifyCompleteMetalPrimitive(true, true);
+}
+
+fn qualifyCompleteMetalPrimitive(comptime dot: bool, comptime consumed: bool) !void {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const runtime = @import("../backends/metal_runtime.zig");
     if (!runtime.metalDeviceAvailable()) return error.SkipZigTest;
@@ -7538,7 +7542,9 @@ fn qualifyCompleteMetalPrimitive(comptime dot: bool) !void {
     const rhs_shape: []const i64 = if (dot) &.{ 64, 4 } else &.{64};
     const rhs_node = try builder.parameter("gamma", Shape.init(.f32, rhs_shape));
     if (dot) {
-        try graph.markOutput(try builder.matmul2DLayout(input_node, rhs_node, false, false));
+        const product = try builder.matmul2DLayout(input_node, rhs_node, false, false);
+        try graph.markOutput(product);
+        if (consumed) try graph.markOutput(try builder.neg(product));
     } else {
         const normalized = try builder.rmsNorm(input_node, rhs_node, 64, 1e-5);
         const activated = try builder.neg(normalized);
@@ -7565,7 +7571,8 @@ fn qualifyCompleteMetalPrimitive(comptime dot: bool) !void {
     const inputs = [_]Tensor{ input, gamma };
     var proof = (try prepared_mod.prepare(session, .{ .tensors = &inputs }, a, null)) orelse return error.MissingPreparedMetalFrame;
     defer proof.deinit();
-    try std.testing.expect(proof.hasCompleteOwnedPayload());
+    try std.testing.expectEqual(!consumed, proof.hasCompleteOwnedPayload());
+    if (consumed) return;
     var result = (try session.runResident(&inputs, a)) orelse return error.MissingResidentResult;
     defer result.deinit();
     const stats = session.executionDiagnostics().?.execution.?;

@@ -1635,6 +1635,9 @@ pub const MetalPartitionExecutor = struct {
                     // A terminal standalone dot cannot be subsumed by a
                     // neighboring projection or grouped head schedule.
                     if (saw_dot or std.mem.indexOfScalar(NodeId, graph.outputs.items, id) == null) return false;
+                    for (graph.nodes.items, reachable) |consumer, active| {
+                        if (active and std.mem.indexOfScalar(NodeId, consumer.getInputs(), id) != null) return false;
+                    }
                     saw_dot = true;
                 },
                 .norm => |norm| if (norm.kind != .rms) return false,
