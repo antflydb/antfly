@@ -629,9 +629,11 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
     defer registry.deinit(alloc);
 
     try reconcileExpired(&store, &registry, alloc, 1);
-    for ([_]bool{ false, true }, [_]u8{ 'a', 'b' }) |request_persisted, digit| {
+    var transaction_ids: [2][16]u8 = undefined;
+    for ([_]bool{ false, true }, [_]u8{ 'a', 'b' }, &transaction_ids) |request_persisted, digit, *saved_id| {
         const id: [32]u8 = @splat(digit);
         const txn_id = transactions.newSessionTxnId(7);
+        saved_id.* = txn_id;
         _ = try mutate(&store, .{ .create = .{ .id = id, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 1);
         _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 1, .txn_id = txn_id } }, "alice", 7, 2);
         _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
@@ -660,6 +662,12 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
         try std.testing.expect(try store.completionReferenceSettled(txn_id, reference));
     }
     try std.testing.expectEqual(@as(usize, 2), try registry.cleanupExpiredSqlAbortReceipts(alloc, std.math.maxInt(u64)));
+    for (transaction_ids, [_]u8{ 'c', 'd' }) |id, digit| {
+        try std.testing.expect((try registry.getStatusForPrincipal(alloc, id, "alice")) == null);
+        const delayed_reference: [16]u8 = @splat(digit);
+        try store.pinCompletion(id, delayed_reference);
+        try std.testing.expect(try store.completionReferenceSettled(id, delayed_reference));
+    }
 }
 
 test "HTTP connection reconciles a durable aborted coordinator decision" {
