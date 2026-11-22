@@ -3380,9 +3380,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// Held from prepare to the end of `stage` only: decisions run in
             /// the group apply (`resolution`), so nothing here is held across
             /// the commit or its fsync.
-            /// Null while not held: a held guard cannot be told apart from
-            /// another writer's by probing its mutex.
-            apply_guard: ?index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            /// The catalog stays shared from prepare to `finish`, so the
+            /// index and `entry` stay put; the index's own mutex is held only
+            /// from prepare to the end of `stage` and again for `install`
+            /// (`index_locked`).
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            index_locked: bool = true,
             segments: [max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined,
             segment_count: usize = 0,
             seal: ?persistent_mod.PersistentIndex.SealPublication = null,
@@ -3433,12 +3436,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// versions this write made dead. Takes the index's apply guard
             /// for just this, not across the commit.
             pub fn install(self: *InlineTextPublication) void {
-                if (self.apply_guard == null) {
-                    self.apply_guard = self.index_manager.lockManagedIndexApply(self.index_ref) catch |err| {
-                        std.log.err("inline text publication install: apply guard failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
-                        self.finish();
-                        return;
-                    };
+                if (!self.index_locked) {
+                    self.apply_guard.relockIndex();
+                    self.index_locked = true;
                 }
                 if (self.mutationsAlloc(self.alloc)) |mutations| {
                     defer self.alloc.free(mutations);
@@ -3473,8 +3473,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             fn releaseGuard(self: *InlineTextPublication) void {
-                if (self.apply_guard) |*guard| guard.unlock();
-                self.apply_guard = null;
+                if (self.index_locked) self.apply_guard.unlockIndex();
+                self.index_locked = false;
             }
 
             fn finish(self: *InlineTextPublication) void {
@@ -3484,6 +3484,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
                 self.segment_count = 0;
                 self.releaseGuard();
+                self.apply_guard.unlockCatalog();
                 self.resolution.deinit();
                 self.alloc.destroy(self);
             }

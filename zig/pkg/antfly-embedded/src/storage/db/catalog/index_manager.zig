@@ -3455,6 +3455,22 @@ pub const IndexManager = struct {
             self.* = undefined;
         }
 
+        /// Releases only the index's own mutex: the catalog stays shared,
+        /// so the index (and its entry's address) outlives the guard.
+        /// `relockIndex` takes it back; `unlockCatalog` ends the guard.
+        pub fn unlockIndex(self: *ManagedIndexApplyGuard) void {
+            self.mutex.unlock();
+        }
+
+        pub fn relockIndex(self: *ManagedIndexApplyGuard) void {
+            self.manager.lockAtomicWithBackoff(self.mutex);
+        }
+
+        pub fn unlockCatalog(self: *ManagedIndexApplyGuard) void {
+            self.manager.catalog_mutex.unlockShared();
+            self.* = undefined;
+        }
+
         /// WS4 phase 2: enforces -- not just documents -- that a caller
         /// holding this guard across a native commit (an inline
         /// publication's prepare-to-install window) still holds it at
