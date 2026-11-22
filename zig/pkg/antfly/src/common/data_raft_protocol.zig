@@ -40,7 +40,9 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 54;
+/// Version 55 distinguishes physical participants that share a storage namespace.
+pub const batch_physical_completion_protocol_version: u16 = 55;
+pub const batch_protocol_version: u16 = batch_physical_completion_protocol_version;
 pub const batch_split_origin_enrollment_protocol_version: u16 = 54;
 pub const batch_split_history_seed_protocol_version: u16 = 53;
 
@@ -131,6 +133,23 @@ pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anyty
         if (request.source_producer != .unlabelled) return batch_row_producer_protocol_version;
     }
     const mutation = request.transaction orelse return null;
+    // Check the envelope before producer-specific floors. Version 4 writes a
+    // different local admission record even when the source producer is ordinary.
+    switch (mutation) {
+        .begin => |value| {
+            if (comptime @hasField(@TypeOf(value), "completion_admission")) {
+                if (value.completion_admission) |bytes| {
+                    if (try completionEnvelopeVersion(a, bytes, false) >= 4)
+                        return batch_physical_completion_protocol_version;
+                }
+            }
+        },
+        .publish_completion => |value| {
+            if (try completionEnvelopeVersion(a, value.certificate, true) >= 4)
+                return batch_physical_completion_protocol_version;
+        },
+        else => {},
+    }
     return switch (mutation) {
         .publish_completion => |value| if (try completionEnvelopeVersion(a, value.certificate, true) >= 3) batch_completion_recovery_protocol_version else batch_completion_publication_protocol_version,
         .begin => |value| if (isNonhistoryProducer(value)) batch_nonhistory_producer_protocol_version else if (isLegacyProducer(value)) batch_legacy_producer_protocol_version else if (isOrdinaryProducer(value)) batch_ordinary_producer_protocol_version else if (hasSourceScope(value)) batch_source_attempt_protocol_version else if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
@@ -289,6 +308,16 @@ test "data raft ordered history ordinary producer requires its own activation fl
     };
     const Request = struct { transaction: ?Mutation };
     try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .begin = .{ .ordinary_producer = true, .completion_owner = 1 } } }));
+    const begin: Request = .{ .transaction = .{ .begin = .{
+        .ordinary_producer = true,
+        .completion_owner = 1,
+        .completion_admission = "{\"admission\":{\"version\":4}}",
+    } } };
+    try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), try completionProtocolVersion(std.testing.allocator, begin));
+    const publish: Request = .{ .transaction = .{ .publish_completion = .{
+        .certificate = "{\"certificate\":{\"manifest\":{\"version\":4}}}",
+    } } };
+    try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), try completionProtocolVersion(std.testing.allocator, publish));
     try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .ordinary_producer = true, .completion_owner = 1 } } }));
     try std.testing.expectEqual(@as(?u16, 31), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .completion_owner = 1 } } }));
 }

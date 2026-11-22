@@ -129,7 +129,7 @@ pub const Coordinator = struct {
         if (unsupported != 0) return error.ChangefeedCapabilityUnsupported;
         std.mem.sort(Captured, captured.items, {}, struct {
             fn less(_: void, left: Captured, right: Captured) bool {
-                return std.mem.order(u8, &left.input.owner.namespace, &right.input.owner.namespace) == .lt;
+                return completion.ownerLessThan(left.input.owner, right.input.owner);
             }
         }.less);
         const frozen_inputs = try scratch.alloc(plan_mod.Input, captured.items.len);

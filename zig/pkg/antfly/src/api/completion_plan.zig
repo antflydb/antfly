@@ -124,18 +124,16 @@ pub const Plan = struct {
         // fanout completion order. Keep the corresponding payloads together.
         for (1..participants.len) |i| {
             var j = i;
-            while (j > 0 and std.mem.order(u8, &participants[j].owner.namespace, &participants[j - 1].owner.namespace) == .lt) : (j -= 1) {
+            while (j > 0 and completion.ownerLessThan(participants[j].owner, participants[j - 1].owner)) : (j -= 1) {
                 std.mem.swap(Participant, &participants[j], &participants[j - 1]);
                 std.mem.swap(completion.Participant, &members[j], &members[j - 1]);
             }
         }
-        const admission: completion.Admission = .{ .version = 3, .transaction_id = transaction_id, .admission_digest = admission_digest, .coordinator_namespace = coordinator.namespace, .coordinator_fence = coordinator.digest(), .participants = members };
-        errdefer for (members[1..], members[0 .. members.len - 1]) |right, left| {
+        const version: u16 = for (members[1..], members[0 .. members.len - 1]) |right, left| {
             if (std.mem.eql(u8, &left.namespace, &right.namespace))
-                std.log.debug("completion plan shares storage namespace across participant groups left={} right={}", .{
-                    left.routed_owner.?.group_id, right.routed_owner.?.group_id,
-                });
-        };
+                break completion.physical_participant_version;
+        } else 3;
+        const admission: completion.Admission = .{ .version = version, .transaction_id = transaction_id, .admission_digest = admission_digest, .coordinator_namespace = coordinator.namespace, .coordinator_fence = coordinator.digest(), .participants = members };
         try admission.validate();
         try admission.requireRoutedOwner(coordinator);
         const encoded = try completion.encodeAdmission(owned, admission);
@@ -171,7 +169,7 @@ pub const Plan = struct {
     /// codec supplies no storage, lease, source ACK, or commit authority.
     pub fn encodeFrozen(self: *const Plan, a: A) ![]u8 {
         try self.admission.validate();
-        if (self.admission.version != 3 or self.created_at_ns == 0 or self.begin_timestamp == 0 or self.participants.len != self.admission.participants.len or self.admission_bytes.len > completion.max_bytes) return error.InvalidTxnRecord;
+        if (self.admission.version < 3 or self.created_at_ns == 0 or self.begin_timestamp == 0 or self.participants.len != self.admission.participants.len or self.admission_bytes.len > completion.max_bytes) return error.InvalidTxnRecord;
         var parsed_admission = try completion.parseAdmission(a, self.admission_bytes);
         defer parsed_admission.deinit();
         if (!std.mem.eql(u8, &parsed_admission.value.digest, &self.admission.digest())) return error.SourcePayloadConflict;
@@ -187,7 +185,7 @@ pub const Plan = struct {
             if (mutation != .prepare) return error.InvalidBatchRequest;
             if (mutation.prepare.ordinary_producer != self.ordinary_producer or mutation.prepare.legacy_producer != self.legacy_producer or request.req.timestamp_ns != self.begin_timestamp or request.req.sync_level != .write or request.req.document_version_scheme != .revision_v1 or !std.meta.eql(mutation.prepare.source_purpose, self.source_purpose) or !std.meta.eql(mutation.prepare.source_scope, self.source_scope)) return error.SourcePayloadConflict;
             if (!std.mem.eql(u8, &mutation.prepare.txn_id, &self.admission.transaction_id) or mutation.prepare.completion_owner == null or !std.mem.eql(u8, &mutation.prepare.completion_owner.?.digest(), &participant.owner.digest()) or mutation.prepare.topology_epoch != participant.owner.topology_epoch) return error.SourceTransactionIdentityConflict;
-            const member = try self.admission.member(participant.owner.namespace);
+            const member = try self.admission.memberForOwner(participant.owner);
             if (member.roles & completion.Roles.checkpoint != 0) checkpoints += 1;
             if (mutation.prepare.source_checkpoint) |checkpoint| {
                 try checkpoint.validate();
@@ -213,7 +211,7 @@ pub const Plan = struct {
         for (self.participants, self.admission.participants) |participant, member| {
             try self.admission.requireRoutedOwner(participant.owner);
             if (!std.mem.eql(u8, &participant.owner.namespace, &member.namespace) or !std.mem.eql(u8, participant.locator, member.locator)) return error.InvalidParticipant;
-            try self.admission.requirePreparedInput(participant.owner.namespace, participant.prepare_bytes);
+            try self.admission.requireOwnerPreparedInput(participant.owner, participant.prepare_bytes);
             if (participant.prepare_bytes.len > completion.max_bytes) return error.HistoryTooLarge;
             payload_bytes = std.math.add(usize, payload_bytes, participant.prepare_bytes.len) catch return error.HistoryTooLarge;
             size = std.math.add(usize, size, 4 + participant.prepare_bytes.len) catch return error.HistoryTooLarge;
@@ -254,7 +252,7 @@ pub const Plan = struct {
         var parsed = try completion.parseAdmission(a, admission_bytes);
         defer parsed.deinit();
         const admission = parsed.value.admission;
-        if (admission.version != 3 or admission.participants.len != count) return error.InvalidTxnRecord;
+        if (admission.version < 3 or admission.participants.len != count) return error.InvalidTxnRecord;
         const coordinator = try admission.coordinatorOwner();
         const inputs = try a.alloc(Input, count);
         defer a.free(inputs);
@@ -272,10 +270,11 @@ pub const Plan = struct {
             payload_bytes = std.math.add(usize, payload_bytes, len) catch return error.HistoryTooLarge;
             if (payload_bytes > max_frozen_payload_bytes) return error.HistoryTooLarge;
             const bytes = raw[cursor..][0..len];
-            try admission.requirePreparedInput(member.namespace, bytes);
+            const owner = member.routed_owner orelse return error.InvalidTxnRecord;
+            try admission.requireOwnerPreparedInput(owner, bytes);
             request.* = try batch.parseInternalBatchRequest(a, bytes);
             initialized += 1;
-            input.* = .{ .owner = try admission.recoveryOwner(member.namespace), .locator = member.locator, .roles = member.roles, .prepare = request.req };
+            input.* = .{ .owner = owner, .locator = member.locator, .roles = member.roles, .prepare = request.req };
             cursor += len;
         }
         if (cursor != raw.len) return error.InvalidTxnRecord;
@@ -306,7 +305,7 @@ pub const Plan = struct {
         if (index >= self.participants.len) return error.InvalidParticipant;
         const participant = self.participants[index];
         try self.admission.requireRoutedOwner(participant.owner);
-        try self.admission.requirePreparedInput(participant.owner.namespace, participant.prepare_bytes);
+        try self.admission.requireOwnerPreparedInput(participant.owner, participant.prepare_bytes);
         return batch.parseInternalBatchRequest(a, participant.prepare_bytes);
     }
 };
@@ -502,4 +501,28 @@ test "source scope ordinary completion frozen plans retain original producer pro
     input.prepare.transaction.?.prepare.legacy_producer = false;
     input.prepare.transaction.?.prepare.ordinary_producer = true;
     try std.testing.expectError(error.SourceTransactionIdentityConflict, Plan.freeze(a, id, @splat(4), owner, &.{ input, unlabelled }, 101));
+}
+
+test "completion frozen plan orders physical owners within a shared namespace" {
+    const a = std.testing.allocator;
+    const left: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 9, .topology_epoch = 3 };
+    var right = left;
+    right.group_id = 10;
+    const id: [16]u8 = @splat(4);
+    const inputs = [_]Input{
+        .{ .owner = right, .locator = "table2:00000004:docs:10", .roles = completion.Roles.guards, .prepare = try (types.TransactionIntentRequest{ .completion_owner = right }).completionBatch(id, 10, right.topology_epoch) },
+        .{ .owner = left, .locator = "table2:00000004:docs:9", .roles = completion.Roles.effects, .prepare = try (types.TransactionIntentRequest{ .completion_owner = left, .writes = &.{.{ .key = "row", .value = "{}" }} }).completionBatch(id, 10, left.topology_epoch) },
+    };
+    var plan = try Plan.freezeDerived(a, id, right, &inputs, 11);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(u16, completion.physical_participant_version), plan.admission.version);
+    try std.testing.expectEqual(left, plan.participants[0].owner);
+    try std.testing.expectEqualStrings(inputs[0].locator, plan.participant_ids[0]);
+    try std.testing.expectEqualStrings(inputs[1].locator, plan.participant_ids[1]);
+    const encoded = try plan.encodeFrozen(a);
+    defer a.free(encoded);
+    var restored = try Plan.restoreFrozen(a, encoded, try frozenDigest(encoded));
+    defer restored.deinit();
+    try std.testing.expectEqual(right, try restored.admission.coordinatorOwner());
+    try std.testing.expectEqualDeep(plan.participant_ids, restored.participant_ids);
 }
