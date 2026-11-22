@@ -123,6 +123,14 @@ pub fn stageDispatcher(dispatch: anytype) ?Dispatch {
     return if (selected.run_stage_fn != null) selected else null;
 }
 
+pub fn runStage(allocator: std.mem.Allocator, session: session_mod.Session, inputs: []const session_mod.StageInput, control: ?Control, dispatch: ?Dispatch) !session_mod.ResidentOutputs {
+    if (dispatch) |selected| {
+        const execute = selected.run_stage_fn orelse return error.DecoderDispatchChanged;
+        return execute(selected.ptr, selected.task, allocator, session, inputs, control);
+    }
+    return (try session.runStageInputsWithControl(inputs, allocator, control)) orelse return error.UnexpectedResidentStageDecline;
+}
+
 pub fn run(allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: ?*std.atomic.Mutex, inputs: []const Tensor, control: ?Control, dispatch: anytype) ![]Tensor {
     if (comptime @TypeOf(dispatch) != @TypeOf(null)) {
         if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) {

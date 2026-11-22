@@ -234,10 +234,7 @@ pub const State = struct {
                 } else .{ .host = self.borrow(info, &past.empty_shape, &.{}) },
             };
         }
-        var outputs = if (dispatch) |selected|
-            try selected.run_stage_fn.?(selected.ptr, selected.task, self.allocator, self.session, self.stage_inputs, control)
-        else
-            (try self.session.runStageInputsWithControl(self.stage_inputs, self.allocator, control)) orelse return error.UnexpectedResidentStageDecline;
+        var outputs = try @import("tensor_dispatch.zig").runStage(self.allocator, self.session, self.stage_inputs, control, dispatch);
         defer outputs.deinit();
         if (outputs.outputs.len != self.session.outputInfo().len) return error.InvalidDecoderOutput;
         defer @memset(updated, null);

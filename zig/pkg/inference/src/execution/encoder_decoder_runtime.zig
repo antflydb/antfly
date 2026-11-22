@@ -123,7 +123,7 @@ fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: 
     const incremental = if (intent == .incremental) Incremental.qualify(encoder, decoder) else null;
     const placement: PlacementReason = if (intent == .vocabulary_row and outputVocabulary(decoder) == null)
         .unknown_decoder_vocabulary
-    else if (!supportsResidentDispatch(dispatch))
+    else if (!supportsResidentDispatch(dispatch) or (dispatched and @import("tensor_dispatch.zig").stageDispatcher(dispatch) == null))
         .dispatcher_host_only
     else if (incremental != null)
         .resident_incremental
@@ -338,7 +338,7 @@ fn finalGreedyToken(allocator: std.mem.Allocator, decoder: backends.Session, enc
     defer plan.deinit();
     var inputs: DecoderInputs = undefined;
     try plan.bind(&inputs, tokens, mask, try decoderHiddenInput(encoder, mask.len));
-    const values = try finalVocabularyRow(allocator, decoder, inputs.stageInputs(), tokens.len, vocab, control);
+    const values = try finalVocabularyRow(allocator, decoder, inputs.stageInputs(), tokens.len, vocab, control, null);
     defer allocator.free(values);
     // Preserve the reference's first-index tie and NaN comparison behavior.
     var best: usize = 0;
@@ -348,9 +348,9 @@ fn finalGreedyToken(allocator: std.mem.Allocator, decoder: backends.Session, enc
     return std.math.cast(i32, best) orelse error.LogitsSizeMismatch;
 }
 
-pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Session, inputs: []const session_mod.StageInput, query_rows: usize, vocab: usize, control: ?Control) ![]f32 {
+pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Session, inputs: []const session_mod.StageInput, query_rows: usize, vocab: usize, control: ?Control, dispatch: ?@import("tensor_dispatch.zig").Dispatch) ![]f32 {
     if (query_rows == 0 or vocab == 0) return error.InvalidInputShape;
-    var outputs = (try decoder.runStageInputsWithControl(inputs, allocator, control)) orelse return error.UnexpectedResidentStageDecline;
+    var outputs = try @import("tensor_dispatch.zig").runStage(allocator, decoder, inputs, control, dispatch);
     defer outputs.deinit();
     if (outputs.outputs.len != 1) return error.InvalidDecoderOutput;
     return residentVocabularyRow(allocator, decoder, &outputs, 0, query_rows, vocab, control);
@@ -456,6 +456,29 @@ test "encoder decoder resident stages retain hidden state and materialize only t
             try std.testing.expectEqual(@as(i32, 1), token);
             if (kind != .native) try std.testing.expectEqual(@as(u64, 4 * @sizeOf(f32)), audit.download_bytes);
         }
+        const Broker = struct {
+            calls: usize = 0,
+            fn host(_: *anyopaque, _: @import("tensor_dispatch.zig").Task, _: std.mem.Allocator, _: backends.Session, _: ?*session_mod.RunPermit, _: ?*std.atomic.Mutex, _: []const backends.Tensor, _: ?Control) ![]backends.Tensor {
+                return error.UnexpectedHostDecoder;
+            }
+            fn stage(raw: *anyopaque, _: @import("tensor_dispatch.zig").Task, work: std.mem.Allocator, target: backends.Session, bindings: []const session_mod.StageInput, active: ?Control) !session_mod.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                for (bindings) |binding| if (binding == .resident) {
+                    return (try target.runStageInputsWithControl(bindings, work, active)) orelse error.UnexpectedResidentStageDecline;
+                };
+                return error.ExpectedResidentEncoder;
+            }
+        };
+        var broker = Broker{};
+        const dispatch = @import("tensor_dispatch.zig").Dispatch{ .ptr = &broker, .task = .generate, .run_stage_fn = Broker.stage, .run_fn = Broker.host };
+        var numerical = try @import("decoder_stage.zig").Decoder.initWithOptions(a, decoder, &encoded, 2, &.{ 1, 1 }, 4, control, .{ .allow_native = false });
+        defer numerical.deinit();
+        var row = try numerical.stepFullPrefix(&.{ 0, 1 }, dispatch);
+        defer row.deinit();
+        try std.testing.expectEqual(@as(usize, 1), broker.calls);
+        try std.testing.expectEqual(@as(usize, 4), row.logits.len);
+        try std.testing.expect(row.logits[1] > row.logits[0]);
         const retained = try encoded.resident.values.backend.toFloat32(encoded.resident.values.outputs[0], a);
         defer a.free(retained);
         try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0, 3, 0, 1, 0 }, retained);

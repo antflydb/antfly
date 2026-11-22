@@ -246,7 +246,10 @@ pub const Decoder = struct {
         try plan.bind(&inputs, prefix, self.encoder_mask, hidden);
         switch (hidden) {
             .resident => {
-                row.owned_logits = try stages.finalVocabularyRow(self.allocator, self.session, inputs.stageInputs(), prefix.len, self.vocab_size, self.control);
+                const adapters = @import("tensor_dispatch.zig");
+                const stage = adapters.stageDispatcher(dispatch);
+                if (adapters.hasDispatcher(dispatch) and stage == null) return error.DecoderDispatchChanged;
+                row.owned_logits = try stages.finalVocabularyRow(self.allocator, self.session, inputs.stageInputs(), prefix.len, self.vocab_size, self.control, stage);
                 row.logits = row.owned_logits.?;
             },
             .host => {
