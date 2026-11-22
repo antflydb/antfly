@@ -221,12 +221,16 @@ decided at the tip.
    flusher; per-transaction hot-key writes removed. Full-text level-0
    records are folded by ordinary merges, which check each input at the
    tip (`l0/` present) rather than in this process's mirror.
-4. Incremental cross-process refresh. Done for document rows, full-text
-   and sparse indexes; other index kinds still reopen. It needed
-   `refreshCrossProcessRedoOverlay` to adopt the page bound other writers'
-   commits raised (`SharedRedoOverlay.pageBoundThrough`): without it, reads
-   of their page-shaped values failed `InvalidPageId`, and the file's next
-   commit could allocate the same page ids again.
+4. Incremental cross-process refresh. Done for reads of document rows,
+   full-text and sparse indexes, so a read no longer needs the writer lease
+   after another process commits; `refreshCrossProcessRedoOverlay` adopts
+   the page bound other writers raised (`SharedRedoOverlay.pageBoundThrough`).
+   A write still reopens after one (`Owner.writer_reopen_pending`): the
+   runtime's free-page allocator and replay-sequence caches did not see those
+   commits. Next: reconcile those two in place, then let writes reuse it.
+   Releasing the writer lease before the durability wait stays off: with it,
+   `lite-mp-bench` (8 threads, indexed) closes a retired runtime under live
+   reservations within one 15 s Debug run.
 5. Delete-marker cleanup and the remaining per-type folds.
 
 Each stage keeps the crash sweeps, the multi-process capi tests and the
