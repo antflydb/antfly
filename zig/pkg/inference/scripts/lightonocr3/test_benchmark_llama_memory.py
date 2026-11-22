@@ -22,12 +22,14 @@ from unittest.mock import patch
 
 from benchmark_llama_memory import (
     Profile,
+    active_slot_tasks,
     grounding_quality_passes,
     memory_measurement_valid,
     missing_memory_phases,
     quality_passes,
     read_json,
     record_phase_sample,
+    run_pass,
     run_profile,
     score_case,
 )
@@ -131,6 +133,55 @@ class QualificationTest(unittest.TestCase):
                     peaks, lambda: ("grounding", 1), lambda: metrics, read_slots
                 )
                 self.assertEqual(peaks, expected)
+
+    def test_slots_schema_validates_width_and_active_task_ids(self):
+        slots = [{"id": 0, "is_processing": False}]
+        with patch("benchmark_llama_memory.read_json", return_value=slots):
+            self.assertEqual(active_slot_tasks("http://localhost", 1), set())
+            with self.assertRaisesRegex(ValueError, "expected 2"):
+                active_slot_tasks("http://localhost", 2)
+            slots[0]["is_processing"] = True
+            with self.assertRaisesRegex(ValueError, "expected 1"):
+                active_slot_tasks("http://localhost", 1)
+            slots[0]["id_task"] = 7
+            self.assertEqual(active_slot_tasks("http://localhost", 1), {(0, 7)})
+
+    def test_run_pass_disables_timing_probes_and_reports_memory_preflight_errors(self):
+        case = {"name": "receipt"}
+        args = SimpleNamespace(grounding_only=True)
+        with (
+            patch("benchmark_llama_memory.subprocess.Popen") as spawn,
+            patch("benchmark_llama_memory.wait_ready"),
+            patch("benchmark_llama_memory.child_pid", return_value=None),
+            patch("benchmark_llama_memory.os.kill"),
+            patch(
+                "benchmark_llama_memory.request_case", return_value={"finish": "stop"}
+            ) as request,
+            patch(
+                "benchmark_llama_memory.active_slot_tasks",
+                side_effect=OSError("HTTP 404"),
+            ) as probe,
+        ):
+            argv = (args, [case], case, 1, ["llama-server"], "http://localhost", "q4")
+            timing = run_pass(*argv, record_memory=False)
+            self.assertEqual(spawn.call_args.args[0], ["llama-server", "--no-slots"])
+            self.assertIsNone(timing.error)
+            self.assertIsNone(request.call_args.kwargs["on_submit"])
+            probe.assert_not_called()
+
+            memory = run_pass(*argv, record_memory=True)
+            self.assertEqual(
+                spawn.call_args.args[0],
+                ["/usr/bin/time", "-l", "llama-server", "--slots"],
+            )
+            self.assertEqual(
+                memory.error, "llama.cpp /slots preflight failed: HTTP 404"
+            )
+            self.assertEqual(
+                memory.slot_probe_errors["preflight"],
+                {"count": 1, "first_error": "HTTP 404"},
+            )
+            self.assertIsNone(memory.grounding)
 
     def test_memory_phase_starts_at_http_submission(self):
         calls = []

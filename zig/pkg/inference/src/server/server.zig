@@ -1349,6 +1349,13 @@ fn serializeHostedExtraction(allocator: std.mem.Allocator, response: std.json.Va
     return serializeSizedJson(allocator, response, @intCast(bytes));
 }
 
+fn hostedOcrResponseUnits(body_size: u64, capacity: usize) !usize {
+    if (body_size > hosted_ocr_response_body_bytes) return error.HostedReaderOutputTooLarge;
+    const units = admissionUnitsFor(@intCast(body_size), read_admission_bytes_per_unit);
+    if (capacity != 0 and units > capacity) return error.HostedReaderOutputTooLarge;
+    return units;
+}
+
 fn hostedReadTokens(requested: ?i64, configured: ?i64, ceiling: usize) !usize {
     if (try validateReadMaxTokens(requested)) |tokens| {
         if (tokens > ceiling) return error.HostedReadTokenLimitExceeded;
@@ -24105,9 +24112,8 @@ pub const Node = struct {
             .usage = if (measured) usage else null,
         };
         const body_size = hostedJsonSize(result);
-        if (body_size > hosted_ocr_response_body_bytes)
+        const response_units = hostedOcrResponseUnits(body_size, self.inference_admission.capacity) catch
             return ctx.status(502).json(.{ .@"error" = "READER_OUTPUT_TOO_LARGE" });
-        const response_units = admissionUnitsFor(@intCast(body_size), read_admission_bytes_per_unit);
         const target_units = reserved_units.* +| (response_units -| hosted_ocr_initial_response_units);
         if (target_units != reserved_units.*) {
             if (try self.growSlotUnits(ctx, reserved_units.*, target_units)) |response| return response;
@@ -49740,6 +49746,15 @@ test "named hosted extractor validates upstream output and advertises its capabi
             try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
         }
     }
+}
+
+test "hosted image reader response size respects finite work capacity" {
+    const one_unit = read_admission_bytes_per_unit;
+    try std.testing.expectEqual(@as(usize, 1), try hostedOcrResponseUnits(one_unit, 1));
+    try std.testing.expectError(error.HostedReaderOutputTooLarge, hostedOcrResponseUnits(one_unit + 1, 1));
+    try std.testing.expectEqual(@as(usize, 2), try hostedOcrResponseUnits(one_unit + 1, 2));
+    try std.testing.expectEqual(@as(usize, 2), try hostedOcrResponseUnits(hosted_ocr_response_body_bytes, 0));
+    try std.testing.expectError(error.HostedReaderOutputTooLarge, hostedOcrResponseUnits(hosted_ocr_response_body_bytes + 1, 0));
 }
 
 test "hosted image reader routes the inference API alias to chat completions" {
