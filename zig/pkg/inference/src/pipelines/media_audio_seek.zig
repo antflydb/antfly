@@ -147,6 +147,7 @@ pub const Index = union(enum) {
 /// coordinate so a cold seek can decode independent frames in that block.
 const WebmFlac = struct {
     const Extent = struct { packet: media.webm_audio.Packet, first: usize };
+    const Cut = struct { first: usize, end: usize, removed_before: usize };
     const FramePoint = struct { block: usize, sample: usize, offset: usize };
     const FrameDirectory = struct {
         refs: std.atomic.Value(usize) = .init(1),
@@ -197,12 +198,14 @@ const WebmFlac = struct {
     extents: []Extent,
     leading: usize,
     sample_count: usize,
-    trim: usize,
+    cuts: []Cut,
+    tail_trim: usize,
+    tail_group_start: usize,
     working_bytes: usize,
     frame_directory: *FrameDirectory,
 
     fn init(a: std.mem.Allocator, directory: media.webm_audio.Directory, input: *media.source.Source, budget: usize, temporary: usize, admission: ?Index.Admission) !WebmFlac {
-        const retained = directory.packets.len *| @sizeOf(Extent) +| @sizeOf(FrameDirectory);
+        const retained = directory.packets.len *| @sizeOf(Extent) +| directory.padding.len *| @sizeOf(Cut) +| @sizeOf(FrameDirectory);
         if (retained > budget -| temporary) return error.AudioTooLarge;
         const parsed = try audio.flac.parseStream(directory.track.codec_private);
         if (parsed.data_offset != directory.track.codec_private.len) return error.UnsupportedAudioFormat;
@@ -231,8 +234,63 @@ const WebmFlac = struct {
         const leading = if (offset > @max(1, rate / 1000)) offset else 0;
         if (leading > @as(usize, rate) * 3600) return error.UnsupportedAudioFormat;
         const count = try std.math.add(usize, ceiling, leading);
-        const trim = if (directory.discard_padding_ns > 0) frames(@intCast(directory.discard_padding_ns), rate) else 0;
-        return .{ .allocator = a, .info = info, .extents = extents, .leading = leading, .sample_count = count, .trim = trim, .working_bytes = budget - retained, .frame_directory = frame_directory };
+        const cuts = try a.alloc(Cut, directory.padding.len);
+        errdefer a.free(cuts);
+        var cut_count: usize = 0;
+        var removed: usize = 0;
+        var tail_trim: usize = 0;
+        var tail_group_start: usize = 0;
+        for (directory.padding) |padding| {
+            const start = extents[padding.first].first;
+            const end = if (padding.end < extents.len) extents[padding.end].first else ceiling;
+            const drop = @min(end - start, frames(@abs(padding.ns), rate));
+            if (drop == 0) continue;
+            if (padding.ns > 0 and padding.end == extents.len and declared == 0) {
+                tail_trim = drop;
+                tail_group_start = start;
+                continue;
+            }
+            const first = if (padding.ns < 0) start else end - drop;
+            cuts[cut_count] = .{ .first = first, .end = first + drop, .removed_before = removed };
+            cut_count += 1;
+            removed += drop;
+        }
+        const owned_cuts = try a.realloc(cuts, cut_count);
+        return .{ .allocator = a, .info = info, .extents = extents, .leading = leading, .sample_count = count - removed, .cuts = owned_cuts, .tail_trim = tail_trim, .tail_group_start = tail_group_start, .working_bytes = budget - retained, .frame_directory = frame_directory };
+    }
+
+    fn rawAt(self: WebmFlac, playback: usize, comptime start: bool) usize {
+        var low: usize = 0;
+        var high = self.cuts.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const coordinate = self.cuts[middle].first - self.cuts[middle].removed_before;
+            if (coordinate < playback or (start and coordinate == playback)) low = middle + 1 else high = middle;
+        }
+        if (low == 0) return playback;
+        const cut = self.cuts[low - 1];
+        return playback +| (cut.removed_before + (cut.end - cut.first));
+    }
+
+    fn afterCut(self: WebmFlac, raw: usize) usize {
+        var low: usize = 0;
+        var high = self.cuts.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.cuts[middle].end <= raw) low = middle + 1 else high = middle;
+        }
+        return low;
+    }
+
+    fn playbackAt(self: WebmFlac, raw: usize) usize {
+        const next = self.afterCut(raw);
+        if (next < self.cuts.len) {
+            const cut = self.cuts[next];
+            return raw - cut.removed_before - (raw -| cut.first);
+        }
+        if (next == 0) return raw;
+        const cut = self.cuts[next - 1];
+        return raw - cut.removed_before - (cut.end - cut.first);
     }
 
     fn frames(ns: u64, rate: u32) usize {
@@ -243,6 +301,8 @@ const WebmFlac = struct {
         var result = self;
         result.allocator = a;
         result.extents = try a.dupe(Extent, self.extents);
+        errdefer a.free(result.extents);
+        result.cuts = try a.dupe(Cut, self.cuts);
         _ = self.frame_directory.refs.fetchAdd(1, .monotonic);
         return result;
     }
@@ -250,6 +310,7 @@ const WebmFlac = struct {
     fn deinit(self: *WebmFlac) void {
         self.frame_directory.release();
         self.allocator.free(self.extents);
+        self.allocator.free(self.cuts);
     }
 
     fn rawSamples(self: WebmFlac) ?usize {
@@ -258,8 +319,8 @@ const WebmFlac = struct {
     }
 
     fn finalSamples(self: WebmFlac) ?usize {
-        const count = (self.rawSamples() orelse return null) + self.leading;
-        return if (self.trim < count) count - self.trim else count;
+        const raw = self.rawSamples() orelse return null;
+        return self.playbackAt(raw - @min(raw -| self.tail_group_start, self.tail_trim)) + self.leading;
     }
 
     fn samples(self: WebmFlac) usize {
@@ -267,7 +328,7 @@ const WebmFlac = struct {
     }
 
     fn estimatedBytes(self: WebmFlac) usize {
-        return std.mem.sliceAsBytes(self.extents).len +| @sizeOf(FrameDirectory);
+        return std.mem.sliceAsBytes(self.extents).len +| std.mem.sliceAsBytes(self.cuts).len +| @sizeOf(FrameDirectory);
     }
 
     fn read(self: WebmFlac, a: std.mem.Allocator, first: usize, last: usize, lookahead: usize, out: []f32, persisted: ?*const FramePlan.Snapshot, capture: ?*providers.FrameCheckpointSession, input: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl) !usize {
@@ -280,11 +341,12 @@ const WebmFlac = struct {
         if (last_clipped == first and lookahead <= first) return 0;
         const silence = @min(last_clipped, self.leading) -| first;
         @memset(out[0..silence], 0);
-        if (lookahead <= last and silence == last_clipped - first and (self.trim == 0 or self.rawSamples() != null)) return silence;
-        const begin = first -| self.leading;
-        const end = last_clipped -| self.leading;
+        if (lookahead <= last and silence == last_clipped - first and (self.tail_trim == 0 or self.rawSamples() != null)) return silence;
+        const begin = self.rawAt(first -| self.leading, true);
+        const end = self.rawAt(last_clipped -| self.leading, false);
         const raw_samples = self.rawSamples();
-        const stop_at = if (raw_samples == null) (@max(last_clipped, lookahead) -| self.leading) +| self.trim else end;
+        const stop_at = if (raw_samples == null) self.rawAt(@max(last_clipped, lookahead) -| self.leading, false) +| self.tail_trim else end;
+        var cut_index = self.afterCut(begin);
         var low: usize = 0;
         var high = self.extents.len;
         while (low < high) {
@@ -318,12 +380,18 @@ const WebmFlac = struct {
                 };
                 const next = try std.math.add(usize, position, frame.frame_samples);
                 if (stop) |known| if (next > known) return error.UnsupportedAudioFormat;
-                const from = @min(frame.frame_samples, begin -| position);
-                const to = @min(frame.frame_samples, end -| position);
-                for (from..@max(from, to)) |sample| {
-                    if (copied == out.len) return error.UnsupportedAudioFormat;
-                    out[copied] = mono(frame.samples[sample * frame.channels ..][0..frame.channels]);
-                    copied += 1;
+                var from = @max(position, begin);
+                const to = @min(next, end);
+                while (from < to) {
+                    while (cut_index < self.cuts.len and self.cuts[cut_index].end <= from) cut_index += 1;
+                    const cut = if (cut_index < self.cuts.len) self.cuts[cut_index] else Cut{ .first = to, .end = to, .removed_before = 0 };
+                    for (from..@max(from, @min(to, cut.first))) |sample| {
+                        if (copied == out.len) return error.UnsupportedAudioFormat;
+                        const index_in_frame = (sample - position) * frame.channels;
+                        out[copied] = mono(frame.samples[index_in_frame..][0..frame.channels]);
+                        copied += 1;
+                    }
+                    from = @min(to, cut.end);
                 }
                 position = next;
                 at += frame.consumed;
@@ -418,7 +486,7 @@ pub const Reader = struct {
     fn acknowledgeFrameStart(raw: *anyopaque, next_sample: usize) void {
         const self: *Reader = @ptrCast(@alignCast(raw));
         const session = self.frame_capture orelse return;
-        const raw_sample = next_sample -| self.index.webm_flac.leading;
+        const raw_sample = self.index.webm_flac.rawAt(next_sample -| self.index.webm_flac.leading, true);
         const decoded = FramePlan.Snapshot{ .points = session.decoded.items };
         session.continuation = decoded.nearest(raw_sample);
     }
@@ -471,9 +539,9 @@ pub const Reader = struct {
         const self: *Reader = @ptrCast(@alignCast(raw));
         const index = self.index.webm_flac;
         if (index.finalSamples() != null) return null;
-        const tail = index.extents[index.extents.len - 1].first + index.leading;
+        const tail = index.extents[index.extents.len - 1].first;
         const end = @min(lookahead, index.samples());
-        if (end <= first or end +| index.trim <= tail) return null;
+        if (end <= first or index.rawAt(end -| index.leading, false) +| index.tail_trim <= tail) return null;
         return try self.readUnknownFlac(a, first, @min(last, end), end);
     }
 
@@ -866,6 +934,37 @@ test "model aware media range WebM audio preserves FLAC clocks with absent strea
         try std.testing.expectEqual(end, index.samples());
         try std.testing.expect(source.total_bytes - before < encoded.len / 2);
         try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
+    }
+}
+
+test "model aware media range FLAC applies signed interior block padding" {
+    const a = std.testing.allocator;
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.flac", a, .limited(1024 * 1024));
+    defer a.free(encoded);
+    var unpadded = try audio.decode(a, encoded, .{});
+    defer unpadded.deinit();
+    for ([_]bool{ false, true }) |unknown| {
+        const webm = try audio.webm.buildPaddedFlacTestBlocksAlloc(a, encoded, unknown, &.{ -10 * std.time.ns_per_ms, 10 * std.time.ns_per_ms });
+        defer a.free(webm);
+        var expected = try audio.decode(a, webm, .{});
+        defer expected.deinit();
+        const drop = unpadded.sample_rate / 100;
+        const two_blocks = 2 * @as(usize, (try audio.flac.parseStreamInfo(encoded)).max_block_size);
+        const kept = two_blocks - 2 * drop;
+        try std.testing.expectEqual(unpadded.samples.len - 2 * drop, expected.samples.len);
+        try std.testing.expectEqualSlices(f32, unpadded.samples[drop .. two_blocks - drop], expected.samples[0..kept]);
+        try std.testing.expectEqualSlices(f32, unpadded.samples[two_blocks..], expected.samples[kept..]);
+        var source = media.source.Source{ .allocator = a, .identity = "signed-flac-padding", .storage = .{ .borrowed = webm } };
+        var index = try Index.initWebmSource(a, &source, 1024, 1024 * 1024, null);
+        defer index.deinit();
+        var reader = Reader{ .index = &index, .source = &source };
+        const provider = reader.provider();
+        var actual = try provider.read(provider.context, a, 0, expected.samples.len);
+        defer actual.deinit(a);
+        try std.testing.expectEqualSlices(f32, expected.samples, actual.pcm.samples);
+        var middle = try provider.read(provider.context, a, 129, 4096);
+        defer middle.deinit(a);
+        try std.testing.expectEqualSlices(f32, expected.samples[129..4096], middle.pcm.samples);
     }
 }
 

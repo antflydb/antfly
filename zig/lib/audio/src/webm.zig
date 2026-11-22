@@ -113,6 +113,30 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, audio_bytes: []const u8) 
     var decoded = track.pcm;
     errdefer decoded.deinit();
 
+    if (demuxed.padding.len != 0) {
+        const frames = track.access_unit_frames orelse return error.UnsupportedAudioFormat;
+        const Copy = struct {
+            out: []f32 = &.{},
+            offset: usize = 0,
+            fn write(raw: *anyopaque, samples: []const f32, _: u32, _: u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (samples.len > self.out.len - self.offset) return error.UnsupportedAudioFormat;
+                @memcpy(self.out[self.offset..][0..samples.len], samples);
+                self.offset += samples.len;
+            }
+        };
+        var copy = Copy{};
+        var timeline = try TimelineSink.init(.{ .context = &copy, .write = Copy.write }, demuxed.access_unit_times_ns, frames, decoded.sample_rate, decoded.channels, track.timeline_delay_frames, decoded.samples.len / decoded.channels, demuxed.padding);
+        const output = try allocator.alloc(f32, try std.math.mul(usize, timeline.keep, decoded.channels));
+        errdefer allocator.free(output);
+        copy.out = output;
+        try timeline.consumer().push(decoded.samples, decoded.sample_rate, decoded.channels);
+        try timeline.finish();
+        allocator.free(decoded.samples);
+        decoded.samples = output;
+        return decoded;
+    }
+
     decoded.samples = try placeOnTimelineAlloc(
         allocator,
         decoded.samples,
@@ -122,11 +146,6 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, audio_bytes: []const u8) 
         track.access_unit_frames,
         track.timeline_delay_frames,
     );
-
-    if (demuxed.discard_padding_ns > 0 and decoded.sample_rate != 0) {
-        const trim_frames = nsToFrames(@intCast(demuxed.discard_padding_ns), decoded.sample_rate);
-        decoded.samples = try trimTrailingFramesAlloc(allocator, decoded.samples, decoded.channels, trim_frames);
-    }
 
     return decoded;
 }
@@ -458,6 +477,39 @@ fn buildOggPackets(allocator: std.mem.Allocator, headers: [3][]const u8, access_
 /// does not parse, so a FLAC track can only be placed by its start offset:
 /// an internal gap in a WebM/FLAC recording still closes up. No recorder in
 /// the formats this decoder targets writes FLAC that way.
+fn flacPlaybackCounts(a: std.mem.Allocator, info: flac.StreamInfo, units: []const []const u8, total: usize, counts: []usize) !usize {
+    if (units.len == 0 or counts.len != units.len) return error.UnsupportedAudioFormat;
+    const origin = try flac.frameStart(info, units[0]);
+    var previous: usize = 0;
+    for (units[1..], 0..) |unit, i| {
+        const sample = try flac.frameStart(info, unit);
+        if (sample <= origin) return error.UnsupportedAudioFormat;
+        const next = std.math.cast(usize, sample - origin) orelse return error.UnsupportedAudioFormat;
+        if (next <= previous) return error.UnsupportedAudioFormat;
+        counts[i] = next - previous;
+        previous = next;
+    }
+    if (total != 0) {
+        if (total <= previous) return error.UnsupportedAudioFormat;
+        counts[counts.len - 1] = total - previous;
+        return total;
+    }
+
+    // An unknown STREAMINFO total only needs the last packet to resolve
+    // the length. Frame-sized scratch keeps the additional pass bounded.
+    var tail = units[units.len - 1];
+    var final = previous;
+    while (tail.len != 0) {
+        try @import("work_control.zig").check();
+        var frame = try flac.decodeFrameAlloc(a, info, tail);
+        defer frame.deinit();
+        final = try std.math.add(usize, final, frame.frame_samples);
+        tail = tail[frame.consumed..];
+    }
+    counts[counts.len - 1] = final - previous;
+    return final;
+}
+
 fn decodeFlacTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !DecodedTrack {
     if (demuxed.codec_private.len < 4 or !std.mem.eql(u8, demuxed.codec_private[0..4], "fLaC")) {
         return error.UnsupportedAudioFormat;
@@ -476,7 +528,16 @@ fn decodeFlacTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !Decoded
     }
 
     const decoded = try flac.decodeInterleaved(allocator, native);
+    errdefer allocator.free(decoded.samples);
+    const counts = if (demuxed.padding.len != 0) counts: {
+        const info = try flac.parseStreamInfo(native);
+        const frames = try allocator.alloc(usize, demuxed.access_units.len);
+        errdefer allocator.free(frames);
+        _ = try flacPlaybackCounts(allocator, info, demuxed.access_units, decoded.samples.len / decoded.channels, frames);
+        break :counts frames;
+    } else null;
     return .{
+        .access_unit_frames = counts,
         .pcm = .{
             .samples = decoded.samples,
             .sample_rate = decoded.sample_rate,
@@ -492,63 +553,24 @@ fn nsToFrames(ns: u64, sample_rate: u32) usize {
     return std.math.cast(usize, frames) orelse std.math.maxInt(usize);
 }
 
-fn trimTrailingFramesAlloc(allocator: std.mem.Allocator, samples: []f32, channels: u8, trim_frames: usize) ![]f32 {
-    if (trim_frames == 0 or channels == 0) return samples;
-    const total_frames = samples.len / channels;
-    if (trim_frames >= total_frames) return samples;
+const PlaybackGroup = struct {
+    next: usize,
+    available: usize,
+    prefix: usize,
+    kept: usize,
+};
 
-    const keep_frames = total_frames - trim_frames;
-    const out = try allocator.alloc(f32, keep_frames * channels);
-    @memcpy(out, samples[0 .. keep_frames * channels]);
-    allocator.free(samples);
-    return out;
+fn playbackGroup(counts: []const usize, packet: usize, remaining: usize, rate: u32, padding: []const container.BlockPadding, index: *usize) !PlaybackGroup {
+    const block = if (index.* < padding.len and padding[index.*].first == packet) padding[index.*] else null;
+    const next = if (block) |value| value.end else packet + 1;
+    if (next <= packet or next > counts.len) return error.UnsupportedAudioFormat;
+    var available: usize = 0;
+    for (counts[packet..next]) |count| available += @min(count, remaining - available);
+    const drop = if (block) |value| @min(available, nsToFrames(@abs(value.ns), rate)) else 0;
+    if (block != null) index.* += 1;
+    return .{ .next = next, .available = available, .prefix = if (block != null and block.?.ns < 0) drop else 0, .kept = available - drop };
 }
 
-/// Unknown totals need only retain declared discard padding, not decode the
-/// source once to count and again to emit. Ring storage grows with actual input
-/// and remains subject to the caller's allocation budget.
-const TailSink = struct {
-    a: std.mem.Allocator,
-    sink: @import("pcm_sink.zig").Sink,
-    rate: u32,
-    channels: u8,
-    tail_samples: usize,
-    ring: std.ArrayList(f32) = .empty,
-    head: usize = 0,
-    output: [2048]f32 = undefined,
-    buffered: usize = 0,
-    total: usize = 0,
-    fn emit(self: *@This(), value: f32) !void {
-        self.output[self.buffered] = value;
-        self.buffered += 1;
-        if (self.buffered == self.output.len - self.output.len % self.channels) try self.flush();
-    }
-    fn flush(self: *@This()) !void {
-        if (self.buffered != 0) try self.sink.push(self.output[0..self.buffered], self.rate, self.channels);
-        self.buffered = 0;
-    }
-    fn write(raw: *anyopaque, pcm: []const f32, rate: u32, channels: u8) !void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        if (rate != self.rate or channels != self.channels) return error.UnsupportedAudioFormat;
-        self.total = try std.math.add(usize, self.total, pcm.len);
-        if (self.tail_samples == 0) return self.sink.push(pcm, rate, channels);
-        for (pcm) |sample| {
-            if (self.ring.items.len < self.tail_samples) {
-                try self.ring.append(self.a, sample);
-            } else {
-                try self.emit(self.ring.items[self.head]);
-                self.ring.items[self.head] = sample;
-                self.head = (self.head + 1) % self.ring.items.len;
-            }
-        }
-    }
-    fn finish(self: *@This()) !void {
-        // Preserve existing container semantics: padding at least as long as
-        // the timeline does not discard the entire clip.
-        if (self.total <= self.tail_samples) for (self.ring.items) |sample| try self.emit(sample);
-        try self.flush();
-    }
-};
 const TimelineSink = struct {
     sink: @import("pcm_sink.zig").Sink,
     times: []const u64,
@@ -557,31 +579,37 @@ const TimelineSink = struct {
     channels: u8,
     delay: usize,
     total: usize,
+    padding: []const container.BlockPadding,
+    padding_index: usize = 0,
+    group: PlaybackGroup = undefined,
     keep: usize = 0,
     unit: usize = 0,
     unit_offset: usize = 0,
     source_frames: usize = 0,
     timeline_frames: usize = 0,
     inserted: usize = 0,
-    fn init(sink: @import("pcm_sink.zig").Sink, times: []const u64, counts: []const usize, rate: u32, channels: u8, delay: usize, total: usize, padding: i64) !TimelineSink {
+    fn init(sink: @import("pcm_sink.zig").Sink, times: []const u64, counts: []const usize, rate: u32, channels: u8, delay: usize, total: usize, padding: []const container.BlockPadding) !TimelineSink {
         if (counts.len != times.len or rate == 0 or channels == 0) return error.UnsupportedAudioFormat;
         var cursor: usize = 0;
         var source_cursor: usize = 0;
         var inserted: usize = 0;
-        for (counts, times) |count, time| {
-            const wanted = nsToFrames(time, rate) -| delay;
+        var unit: usize = 0;
+        var padding_index: usize = 0;
+        while (unit < counts.len) {
+            const wanted = nsToFrames(times[unit], rate) -| delay;
             if (wanted > cursor + @max(1, rate / 1000)) {
                 inserted = try std.math.add(usize, inserted, wanted - cursor);
                 if (inserted > max_timeline_silence_seconds * rate) return error.UnsupportedAudioFormat;
                 cursor = wanted;
             }
-            const available = @min(count, total -| source_cursor);
-            source_cursor += available;
-            cursor = try std.math.add(usize, cursor, available);
+            const group = try playbackGroup(counts, unit, total - source_cursor, rate, padding, &padding_index);
+            source_cursor += group.available;
+            cursor = try std.math.add(usize, cursor, group.kept);
+            unit = group.next;
         }
+        if (padding_index != padding.len) return error.UnsupportedAudioFormat;
         cursor = try std.math.add(usize, cursor, total - source_cursor);
-        const trim = if (padding > 0) nsToFrames(@intCast(padding), rate) else 0;
-        return .{ .sink = sink, .times = times, .counts = counts, .rate = rate, .channels = channels, .delay = delay, .total = total, .keep = if (trim < cursor) cursor - trim else cursor };
+        return .{ .sink = sink, .times = times, .counts = counts, .rate = rate, .channels = channels, .delay = delay, .total = total, .padding = padding, .keep = cursor };
     }
     fn output(self: *@This(), samples: []const f32) !void {
         const frames = samples.len / self.channels;
@@ -607,20 +635,25 @@ const TimelineSink = struct {
                         gap -= count;
                     }
                 }
-                if (self.counts[self.unit] == 0) {
-                    self.unit += 1;
+                self.group = try playbackGroup(self.counts, self.unit, self.total -| self.source_frames, rate, self.padding, &self.padding_index);
+                if (self.group.available == 0) {
+                    self.unit = self.group.next;
                     continue;
                 }
             }
             const available = (samples.len - offset) / channels;
-            const count = if (self.unit < self.counts.len) @min(available, self.counts[self.unit] - self.unit_offset) else available;
-            try self.output(samples[offset..][0 .. count * channels]);
+            const count = if (self.unit < self.counts.len) @min(available, self.group.available - self.unit_offset) else available;
+            if (self.unit < self.counts.len) {
+                const first = @max(self.unit_offset, self.group.prefix);
+                const end = @min(self.unit_offset + count, self.group.prefix + self.group.kept);
+                if (end > first) try self.output(samples[offset + (first - self.unit_offset) * channels ..][0 .. (end - first) * channels]);
+            } else try self.output(samples[offset..][0 .. count * channels]);
             self.source_frames += count;
             offset += count * channels;
             if (self.unit < self.counts.len) {
                 self.unit_offset += count;
-                if (self.unit_offset == self.counts[self.unit]) {
-                    self.unit += 1;
+                if (self.unit_offset == self.group.available) {
+                    self.unit = self.group.next;
                     self.unit_offset = 0;
                 }
             }
@@ -707,7 +740,7 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
                 .codec_private = directory.track.codec_private,
                 .access_units = units,
                 .access_unit_times_ns = times,
-                .discard_padding_ns = directory.discard_padding_ns,
+                .padding = directory.padding,
                 .allocator = a,
             }, max_packets, builder, true);
             index.packets = packets;
@@ -784,28 +817,32 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
             var cursor: usize = 0;
             var source: usize = 0;
             var inserted: usize = 0;
-            for (counts, demuxed.access_unit_times_ns) |count, time| {
-                const wanted = nsToFrames(time, rate) -| delay;
+            var packet: usize = 0;
+            var padding_index: usize = 0;
+            while (packet < counts.len) {
+                const group = try playbackGroup(counts, packet, total - source, rate, demuxed.padding, &padding_index);
+                const wanted = nsToFrames(demuxed.access_unit_times_ns[packet], rate) -| delay;
                 if (wanted > cursor + @max(1, rate / 1000)) {
                     inserted = try std.math.add(usize, inserted, wanted - cursor);
                     if (inserted > max_timeline_silence_seconds * rate) return error.UnsupportedAudioFormat;
                     cursor = wanted;
                 }
-                const available = @min(count, total -| source);
-                if (available != 0) {
-                    if (spans.items.len != 0 and spans.items[spans.items.len - 1].first + spans.items[spans.items.len - 1].count == cursor and spans.items[spans.items.len - 1].source + spans.items[spans.items.len - 1].count == source) {
-                        spans.items[spans.items.len - 1].count += available;
-                    } else try spans.append(a, .{ .first = cursor, .source = source, .count = available });
+                const first = source + group.prefix;
+                if (group.kept != 0) {
+                    if (spans.items.len != 0 and spans.items[spans.items.len - 1].first + spans.items[spans.items.len - 1].count == cursor and spans.items[spans.items.len - 1].source + spans.items[spans.items.len - 1].count == first) {
+                        spans.items[spans.items.len - 1].count += group.kept;
+                    } else try spans.append(a, .{ .first = cursor, .source = first, .count = group.kept });
                 }
-                source += available;
-                cursor = try std.math.add(usize, cursor, available);
+                source += group.available;
+                cursor = try std.math.add(usize, cursor, group.kept);
+                packet = group.next;
             }
+            if (padding_index != demuxed.padding.len) return error.UnsupportedAudioFormat;
             if (source < total) {
                 try spans.append(a, .{ .first = cursor, .source = source, .count = total - source });
                 cursor = try std.math.add(usize, cursor, total - source);
             }
-            const trim = if (demuxed.discard_padding_ns > 0) nsToFrames(@intCast(demuxed.discard_padding_ns), rate) else 0;
-            return .{ .allocator = a, .codec = codec, .spans = try spans.toOwnedSlice(a), .samples = if (trim < cursor) cursor - trim else cursor, .sample_rate = rate, .channels = channels };
+            return .{ .allocator = a, .codec = codec, .spans = try spans.toOwnedSlice(a), .samples = cursor, .sample_rate = rate, .channels = channels };
         }
         pub fn deinit(self: *Self) void {
             const a = self.allocator;
@@ -905,7 +942,7 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
                 count.* = decoded - drop;
                 total = try std.math.add(usize, total, count.*);
             }
-            var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns, frames, 48_000, head.channels, skip, total, demuxed.discard_padding_ns);
+            var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns, frames, 48_000, head.channels, skip, total, demuxed.padding);
             try opus.visitPackets(a, demuxed.access_units, tocs, head.channels, head.output_gain_q8, skip, null, timeline.consumer());
             try timeline.finish();
         },
@@ -921,7 +958,7 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
             for (decoded.audio_packets, frames, 0..) |packet, *count, i| count.* = if (i == 0) 0 else packet.decoded_sample_count;
             const rate = decoded.headers.identification.sample_rate;
             const delay = @max(nsToFrames(demuxed.codec_delay_ns, rate), decoded.audio_packets[0].decoded_sample_count);
-            var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns, frames, rate, decoded.headers.identification.channels, delay, @intCast(decoded.playable_samples), demuxed.discard_padding_ns);
+            var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns, frames, rate, decoded.headers.identification.channels, delay, @intCast(decoded.playable_samples), demuxed.padding);
             try vorbis.visitDemuxed(a, decoded, timeline.consumer());
             try timeline.finish();
         },
@@ -931,10 +968,15 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
             try native.appendSlice(a, demuxed.codec_private);
             for (demuxed.access_units) |unit| try native.appendSlice(a, unit);
             const info = try flac.parseStreamInfo(native.items);
+            if (demuxed.padding.len != 0) {
+                const declared = std.math.cast(usize, info.total_samples) orelse return error.UnsupportedAudioFormat;
+                const total = try flacPlaybackCounts(a, info, demuxed.access_units, declared, frames);
+                var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns, frames, info.sample_rate, info.channels, nsToFrames(demuxed.codec_delay_ns, info.sample_rate), total, demuxed.padding);
+                try flac.visitInterleaved(a, native.items, timeline.consumer());
+                try timeline.finish();
+                return;
+            }
             if (info.total_samples == 0) {
-                const trim = if (demuxed.discard_padding_ns > 0) nsToFrames(@intCast(demuxed.discard_padding_ns), info.sample_rate) else 0;
-                var tail = TailSink{ .a = a, .sink = sink, .rate = info.sample_rate, .channels = info.channels, .tail_samples = try std.math.mul(usize, trim, info.channels) };
-                defer tail.ring.deinit(a);
                 const delay = nsToFrames(demuxed.codec_delay_ns, info.sample_rate);
                 var gap = nsToFrames(demuxed.access_unit_times_ns[0], info.sample_rate) -| delay;
                 if (gap > max_timeline_silence_seconds * info.sample_rate) return error.UnsupportedAudioFormat;
@@ -942,16 +984,15 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
                     const zeros: [2048]f32 = @splat(0);
                     while (gap != 0) {
                         const count = @min(gap, zeros.len / info.channels);
-                        try TailSink.write(&tail, zeros[0 .. count * info.channels], info.sample_rate, info.channels);
+                        try sink.push(zeros[0 .. count * info.channels], info.sample_rate, info.channels);
                         gap -= count;
                     }
                 }
-                try flac.visitInterleaved(a, native.items, .{ .context = &tail, .write = TailSink.write });
-                try tail.finish();
+                try flac.visitInterleaved(a, native.items, sink);
                 return;
             }
             const count = [_]usize{@intCast(info.total_samples)};
-            var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns[0..1], &count, info.sample_rate, info.channels, nsToFrames(demuxed.codec_delay_ns, info.sample_rate), count[0], demuxed.discard_padding_ns);
+            var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns[0..1], &count, info.sample_rate, info.channels, nsToFrames(demuxed.codec_delay_ns, info.sample_rate), count[0], &.{});
             try flac.visitInterleaved(a, native.items, timeline.consumer());
             try timeline.finish();
         },
@@ -1671,6 +1712,37 @@ test "streaming audio webm leaves a remuxed vorbis recording alone" {
     try cloned.visitWindowSource(allocator, 1024, 4096, .{ .context = &actual, .write = Capture.write }, &source);
     try std.testing.expectEqualSlices(f32, expected.values.items, actual.values.items);
 
+    // A signed trim belongs to the entire laced group.
+    var grouped = std.ArrayList(u8).empty;
+    defer grouped.deinit(allocator);
+    try grouped.append(allocator, 0xa1);
+    try grouped.appendSlice(allocator, laced[1..]);
+    var padding_bytes: [8]u8 = undefined;
+    const padding_ns: i64 = -10 * std.time.ns_per_ms;
+    std.mem.writeInt(i64, &padding_bytes, padding_ns, .big);
+    try appendLeafElement(&grouped, allocator, &.{ 0x75, 0xa2 }, &padding_bytes);
+    var padded_block = std.ArrayList(u8).empty;
+    defer padded_block.deinit(allocator);
+    try appendLeafElement(&padded_block, allocator, &.{0xa0}, grouped.items);
+    const padded_cluster = try buildCluster(allocator, 0, &.{padded_block.items});
+    defer allocator.free(padded_cluster);
+    const padded_file = try buildWebmFile(allocator, tracks, &.{padded_cluster});
+    defer allocator.free(padded_file);
+    var padded_source = test_media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = padded_file }, .identity = "padded-vorbis" };
+    const padded_directory = try container.Directory.init(allocator, &padded_source, .{});
+    defer padded_directory.deinit();
+    var padded = try Window.initDirectory(allocator, allocator, padded_directory, 100_000, Builder{});
+    defer padded.deinit();
+    const trimmed = nsToFrames(@abs(padding_ns), padded.sample_rate);
+    try std.testing.expectEqual(buffered.samples - trimmed, padded.samples);
+    actual.values.clearRetainingCapacity();
+    try padded.visitWindowSource(allocator, 1024 - trimmed, 4096 - trimmed, .{ .context = &actual, .write = Capture.write }, &padded_source);
+    try std.testing.expectEqualSlices(f32, expected.values.items, actual.values.items);
+    var padded_pcm = try decodeInterleaved(allocator, padded_file);
+    defer padded_pcm.deinit();
+    try expectStreaming(allocator, padded_file, padded_pcm);
+    try std.testing.expectEqualSlices(f32, expected.values.items, padded_pcm.samples[(1024 - trimmed) * padded.channels .. (4096 - trimmed) * padded.channels]);
+
     var demuxed_vorbis = try vorbis.demuxOggAlloc(allocator, tone_ogg_bytes);
     defer demuxed_vorbis.deinit();
     try std.testing.expectEqual(audio_packets.len, demuxed_vorbis.audio_packets.len);
@@ -1992,6 +2064,14 @@ pub fn buildFlacTestFileAlloc(a: std.mem.Allocator, bytes: []const u8, unknown_t
 }
 
 pub fn buildFlacTestBlocksAlloc(a: std.mem.Allocator, bytes: []const u8, unknown_total: bool, frames_per_block: usize) ![]u8 {
+    return buildFlacBlocks(a, bytes, unknown_total, frames_per_block, &.{});
+}
+
+pub fn buildPaddedFlacTestBlocksAlloc(a: std.mem.Allocator, bytes: []const u8, unknown_total: bool, padding: []const i64) ![]u8 {
+    return buildFlacBlocks(a, bytes, unknown_total, 1, padding);
+}
+
+fn buildFlacBlocks(a: std.mem.Allocator, bytes: []const u8, unknown_total: bool, frames_per_block: usize, padding: []const i64) ![]u8 {
     if (frames_per_block == 0) return error.InvalidArgument;
     const end = try flacMetadataEnd(bytes);
     const private = try a.dupe(u8, bytes[0..end]);
@@ -2013,7 +2093,21 @@ pub fn buildFlacTestBlocksAlloc(a: std.mem.Allocator, bytes: []const u8, unknown
             defer frame.deinit();
             offset += frame.consumed;
         }
-        const block = try buildSimpleBlockNoLacing(a, 1, bytes[first..offset]);
+        const simple = try buildSimpleBlockNoLacing(a, 1, bytes[first..offset]);
+        const block = if (blocks.items.len < padding.len and padding[blocks.items.len] != 0) group: {
+            defer a.free(simple);
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(a);
+            try body.append(a, 0xa1);
+            try body.appendSlice(a, simple[1..]);
+            var value: [8]u8 = undefined;
+            std.mem.writeInt(i64, &value, padding[blocks.items.len], .big);
+            try appendLeafElement(&body, a, &.{ 0x75, 0xa2 }, &value);
+            var encoded: std.ArrayList(u8) = .empty;
+            defer encoded.deinit(a);
+            try appendLeafElement(&encoded, a, &.{0xa0}, body.items);
+            break :group try encoded.toOwnedSlice(a);
+        } else simple;
         errdefer a.free(block);
         try blocks.append(a, block);
     }
@@ -2046,25 +2140,4 @@ test "streaming audio webm FLAC with unknown sample total preserves full PCM" {
     var capture = Capture{ .expected = expected.samples };
     try visitInterleaved(a, file, .{ .context = &capture, .write = Capture.write });
     try std.testing.expectEqual(expected.samples.len, capture.offset);
-}
-
-test "webm unknown-length discard padding ring preserves final-tail semantics" {
-    const Collect = struct {
-        samples: std.ArrayList(f32) = .empty,
-        fn write(raw: *anyopaque, pcm: []const f32, _: u32, _: u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.samples.appendSlice(std.testing.allocator, pcm);
-        }
-    };
-    const a = std.testing.allocator;
-    const input = [_]f32{ 0, 1, 2, 3, 4, 5, 6, 7 };
-    for ([_]usize{ 0, 2, 4, 8, 12 }) |trim| {
-        var collect = Collect{};
-        defer collect.samples.deinit(a);
-        var tail = TailSink{ .a = a, .sink = .{ .context = &collect, .write = Collect.write }, .rate = 48000, .channels = 2, .tail_samples = trim };
-        defer tail.ring.deinit(a);
-        for (0..4) |i| try TailSink.write(&tail, input[i * 2 ..][0..2], 48000, 2);
-        try tail.finish();
-        try std.testing.expectEqualSlices(f32, input[0..if (trim < input.len) input.len - trim else input.len], collect.samples.items);
-    }
 }
