@@ -2738,7 +2738,7 @@ pub const Frame = struct {
                 input.value = target;
                 input.source_backend = cb;
                 self.stats.input_copies += 1;
-                self.stats.input_copy_bytes += @intCast(binding.shape.numElements().? * @sizeOf(f32));
+                self.stats.input_copy_bytes += @as(u64, @intCast(binding.shape.numElements().?)) * binding.shape.dtype.byteSize();
             }
             self.bound_input_count = i + 1;
         }
