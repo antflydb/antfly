@@ -3175,6 +3175,7 @@ pub const StorageKind = enum {
 };
 
 pub const LiteResolvedOpenOptions = struct {
+    redo_recovery_base: ?*const lite_backend.native.NativeFile = null,
     storage_kind: StorageKind = .lite,
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
     profile: lite_backend.Profile = .native,
@@ -3456,6 +3457,7 @@ pub fn openLiteHandleAllocWithSharedInference(
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
+            .redo_recovery_base = resolved.redo_recovery_base,
             .externally_locked = resolved.externally_locked,
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,

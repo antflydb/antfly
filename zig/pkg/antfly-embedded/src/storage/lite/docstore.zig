@@ -2846,6 +2846,7 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
 }
 
 pub const OpenOptions = struct {
+    redo_recovery_base: ?*const native.NativeFile = null,
     externally_locked: bool = false,
     reclamation: reclamation.Options = .{},
     read_only: bool = false,
@@ -3465,6 +3466,7 @@ pub const Store = struct {
     pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !Store {
         const policy = try reclamation.Policy.init(opts.reclamation);
         const native_opts = native.OpenOptions{
+            .redo_recovery_base = opts.redo_recovery_base,
             .externally_locked = opts.externally_locked,
             .read_only = opts.read_only,
             .wait_for_reader_lock = opts.read_only,

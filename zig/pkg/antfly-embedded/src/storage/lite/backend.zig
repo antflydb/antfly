@@ -74,6 +74,7 @@ pub const EngineSelection = enum {
 };
 
 pub const OpenOptions = struct {
+    redo_recovery_base: ?*const native.NativeFile = null,
     externally_locked: bool = false,
     reclamation: docstore.reclamation.Options = .{},
     engine: EngineSelection = .auto,
@@ -820,6 +821,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
         .io = opts.io,
+        .redo_recovery_base = opts.redo_recovery_base,
         .ride_along_idle_ns = opts.ride_along_idle_ns,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
