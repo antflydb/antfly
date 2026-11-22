@@ -21921,6 +21921,7 @@ pub const DataServer = struct {
         snapshot: *const antfly.metadata_api.AdminSnapshot,
         local_intents: []const antfly.raft.PlacementIntent,
     ) !void {
+        const raft = self.data_raft orelse return error.RaftRuntimeUnavailable;
         var has_unpublished_group = false;
         for (local_intents) |intent| {
             if (findRangeByGroupId(snapshot.ranges, intent.record.group_id) == null) {
@@ -21943,6 +21944,15 @@ pub const DataServer = struct {
         for (local_intents) |intent| {
             const group_id = intent.record.group_id;
             if (findRangeByGroupId(snapshot.ranges, group_id) != null) continue;
+            // Once admitted, this owner is driven by ordered Raft apply.
+            // Reopening it as a provisional catalog owner can contend with
+            // the destination fence already installed by split replay.
+            const admitted = blk: {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                break :blk raft.host.http_host.host.runtime_host.group(group_id) != null;
+            };
+            if (admitted) continue;
             // Drop publication intentionally removes the table/range catalog
             // before placement retirement converges. Such a range-less intent
             // is existing retirement debt, not an unpublished split
@@ -21965,7 +21975,10 @@ pub const DataServer = struct {
                 provisioning_ranges,
                 backend_runtime,
             );
-            _ = try result;
+            _ = result catch |err| switch (err) {
+                error.IntegrityTopologyBusy, error.TransactionTopologyBusy => return error.TransitionDestinationProvisioningBusy,
+                else => return err,
+            };
             reconciled = true;
         }
 
