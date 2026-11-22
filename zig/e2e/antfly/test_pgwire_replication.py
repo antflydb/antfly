@@ -1050,6 +1050,28 @@ def test_pg_recvlogical_resume_after_restart(
                     ),
                     timeout_s=25,
                 )
+            rule = f"{server.url}/auth/v1/users/admin/row-filters/smoke"
+            admin_auth = ("admin", harness.AUTH_BOOTSTRAP_PASSWORD)
+            requests.put(
+                rule,
+                auth=admin_auth,
+                json={"term": {"id": 18}},
+                timeout=15,
+            ).raise_for_status()
+            try:
+                filtered_output = tmp_path / "filtered-slot.bin"
+                filtered = subprocess.run(
+                    stream_command(filtered_output),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                assert filtered.returncode != 0
+                assert "forbidden" in filtered.stderr.lower()
+                assert not filtered_output.exists() or not filtered_output.read_bytes()
+            finally:
+                requests.delete(rule, auth=admin_auth, timeout=15).raise_for_status()
         slot("--drop-slot")
         assert catalog_slot() == []
         sql("DROP PUBLICATION changes")
