@@ -10246,7 +10246,9 @@ pub const ApiHttpServer = struct {
         if (previous_ns != 0 and now_ns -| previous_ns < std.time.ns_per_min) return;
         if (self.last_sql_abort_cleanup_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
         const retention_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
-        try self.txn_sessions.migrateLegacySqlAbortReceipts(self.alloc);
+        self.txn_sessions.migrateLegacySqlAbortReceipts(self.alloc) catch |err| {
+            std.log.warn("legacy SQL abort receipt migration deferred err={s}", .{@errorName(err)});
+        };
         _ = try self.txn_sessions.cleanupExpiredSqlAbortReceipts(self.alloc, now_ns -| retention_ns);
     }
 
