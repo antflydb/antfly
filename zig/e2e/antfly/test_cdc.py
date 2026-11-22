@@ -3797,6 +3797,92 @@ def test_public_changefeed_backpressure_isolated_until_acknowledgment():
         server.stop()
 
 
+def test_public_changefeed_closes_after_one_table_is_dropped():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            api = server.api_url
+            names = ["feed_retired_root", "feed_surviving_root"]
+            for name in names:
+                _changefeed_call(
+                    client, "POST", f"{api}/tables/{name}", json={"num_shards": 1}
+                )
+            feed = _changefeed_call(
+                client,
+                "POST",
+                f"{api}/changefeeds",
+                headers={"Idempotency-Key": "retire-dropped-root"},
+                json={"tables": names},
+            ).json()
+            retired = f"{api}/tables/{names[0]}"
+            _changefeed_call(client, "DELETE", retired)
+            assert wait_until(
+                lambda: client.get(retired, timeout=15).status_code == 404,
+                timeout_s=30,
+            )
+            path = f"{api}/changefeeds/{feed['id']}"
+            assert _changefeed_call(client, "DELETE", path).status_code == 204
+            assert _changefeed_call(client, "DELETE", path).status_code == 204
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_resets_stalled_lease_under_native_history_pressure():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            api = server.api_url
+            name = "feed_history_pressure"
+            table = f"{api}/tables/{name}"
+            feeds = f"{api}/changefeeds"
+            _changefeed_call(client, "POST", table, json={"num_shards": 1})
+            stalled = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": "stalled-pressure-probe"},
+                json={"tables": [name], "include": "keys_and_versions"},
+            ).json()
+            path = f"{feeds}/{stalled['id']}"
+            payload = "x" * (9 * 1024**2)
+
+            def write(index):
+                return client.post(
+                    f"{table}/batch",
+                    json={"inserts": {f"row-{index}": {"payload": payload}}},
+                    timeout=60,
+                )
+
+            # Cross the soft 192 MiB watermark while staying below 256 MiB.
+            for index in range(22):
+                response = write(index)
+                assert response.ok, response.text
+
+            def reset():
+                reply = client.get(path, timeout=15)
+                return (
+                    reply.status_code == 409
+                    and reply.json()["error"] == "changefeed_resynchronization_required"
+                )
+
+            assert wait_until(reset, timeout_s=60), "stalled feed remained active"
+            expired = client.get(
+                f"{path}/events", params={"after": stalled["cursor"]}, timeout=15
+            )
+            assert expired.status_code == 409
+            assert expired.json()["error"] == "changefeed_resynchronization_required"
+            # Later writes exceed the old pinned budget after background cleanup.
+            for index in range(22, 31):
+                response = write(index)
+                assert response.ok, response.text
+    finally:
+        server.stop()
+
+
 def test_public_changefeed_oversized_update_requires_narrower_projection():
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
