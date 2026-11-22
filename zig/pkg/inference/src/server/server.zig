@@ -1310,6 +1310,25 @@ pub const RequestLimits = platform.resource_policy.InferenceRequestLimits;
 
 pub const NamedImageReader = struct { name: []const u8, config: readers_api.Config };
 
+pub const NamedGeneratedExtractor = struct {
+    name: []const u8,
+    config: @import("antfly_structured").extraction.Config,
+
+    pub fn parse(a: std.mem.Allocator, name: []const u8, value: std.json.Value) !NamedGeneratedExtractor {
+        const config = try std.json.parseFromValueLeaky(@import("antfly_structured").extraction.Config, a, value, .{ .allocate = .alloc_always });
+        try config.validate();
+        const generator_value = value.object.get("generator").?;
+        const url = if (generator_value == .object) generator_value.object.get("url") else null;
+        if (name.len == 0 or config.generator.provider != .openai or url == null or url.? != .string or url.?.string.len == 0 or
+            config.probabilities != .verdict_only or (config.output != .auto and config.output != .json_schema) or
+            config.generator.tools_json != null or config.generator.tool_choice_json != null or config.generator.rate_limit != null or
+            config.generator.max_completion_tokens != null or config.generator.response_format_json != null or config.generator.reasoning_effort != null or
+            config.generator.connection_id != null or config.generator.logprobs)
+            return error.InvalidGeneratedExtractorConfig;
+        return .{ .name = name, .config = config };
+    }
+};
+
 pub const NodeConfig = struct {
     /// Fixed before model/client creation; CUDA requires explicit device and
     /// allocator capacities. F32 remains the default qualification profile.
@@ -1321,6 +1340,7 @@ pub const NodeConfig = struct {
     pjrt_gemm: @import("../execution/precision.zig").Gemm = .provider_default,
     audio_readers: []const transcribing_api.NamedConfig = &.{},
     image_readers: []const NamedImageReader = &.{},
+    generated_extractors: []const NamedGeneratedExtractor = &.{},
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -26017,9 +26037,30 @@ pub const Node = struct {
             var public_envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, request_json, .{ .duplicate_field_behavior = .@"error" }) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "body must be a valid extraction request" });
             defer public_envelope.deinit();
+            if (public_envelope.value == .object) if (public_envelope.value.object.get("model")) |model| {
+                if (model == .string and std.mem.startsWith(u8, model.string, "extractors/")) {
+                    const name = model.string["extractors/".len..];
+                    for (self.config.generated_extractors) |entry| {
+                        if (!std.mem.eql(u8, entry.name, name)) continue;
+                        if (uses_attachment_envelope) return extractionDirectFailureResponse(ctx, error.UnsupportedExtractionInput);
+                        for (public_envelope.value.object.keys()) |key| {
+                            if (!std.mem.eql(u8, key, "model") and !std.mem.eql(u8, key, "inputs") and !std.mem.eql(u8, key, "schema_version"))
+                                return extractionDirectFailureResponse(ctx, error.InvalidGeneratedExtractorConfig);
+                        }
+                        const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, execution_control, entry.config) catch |err| switch (err) {
+                            error.InvalidConstrainedOutput, error.ExtractorUpstreamFailed => return ctx.status(502).json(.{ .@"error" = @errorName(err) }),
+                            else => return extractionDirectFailureResponse(ctx, err),
+                        };
+                        defer ctx.allocator.free(output);
+                        try ctx.setHeader("content-type", "application/json");
+                        _ = ctx.response.body(output);
+                        return ctx.response.build();
+                    }
+                }
+            };
             if (public_envelope.value == .object) if (public_envelope.value.object.get("method")) |method| {
                 if (method != .string or !std.mem.eql(u8, method.string, "generated") or uses_attachment_envelope) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Unsupported extraction method or media" });
-                const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, execution_control) catch |err| return extractionDirectFailureResponse(ctx, err);
+                const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, execution_control, null) catch |err| return extractionDirectFailureResponse(ctx, err);
                 defer ctx.allocator.free(output);
                 try ctx.setHeader("content-type", "application/json");
                 _ = ctx.response.body(output);
@@ -26440,6 +26481,7 @@ pub const Node = struct {
         generator: std.json.Value,
         model: []const u8,
         logprobs: bool,
+        hosted_extractor: ?@import("antfly_structured").extraction.GeneratorConfig = null,
         fn cancelled(ptr: ?*const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr.?));
             self.control.check() catch |err| return err == error.Cancelled or err == error.Canceled;
@@ -26453,10 +26495,77 @@ pub const Node = struct {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             try self.control.check();
         }
+        fn invokeHosted(self: *@This(), a: std.mem.Allocator, invocation: @import("antfly_structured").Invocation, original: @import("antfly_structured").extraction.GeneratorConfig) !@import("antfly_structured").Reply {
+            const c = @import("antfly_structured");
+            const format = try std.json.Stringify.valueAlloc(a, .{ .type = "json_schema", .json_schema = .{
+                .name = "antfly_output",
+                .strict = true,
+                .schema = invocation.schema,
+            } }, .{});
+            const schema = try std.json.Stringify.valueAlloc(a, invocation.schema, .{});
+            const system = try std.fmt.allocPrint(a, "Return one structured result per input. Preserve item IDs. JSON schema: {s}", .{schema});
+            const messages = try c.evidenceMessages(a, invocation, system, true);
+            const body = try c.chatRequestJsonWithOptionsAlloc(a, original.model, messages, .openai_compatible, .{
+                .response_format_json = format,
+                .max_tokens = original.max_tokens,
+                .temperature = original.temperature,
+                .top_p = original.top_p,
+                .top_k = original.top_k,
+                .frequency_penalty = original.frequency_penalty,
+                .presence_penalty = original.presence_penalty,
+            });
+            const url = try std.fmt.allocPrint(a, "{s}/chat/completions", .{std.mem.trimEnd(u8, original.url, "/")});
+            const headers: []const [2][]const u8 = if (original.api_key) |key|
+                &.{.{ "Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{key}) }}
+            else
+                &.{};
+            var http = httpx.Client.init(a, self.io);
+            defer http.deinit();
+            const Cancel = struct {
+                fn requested(raw: *const anyopaque) bool {
+                    const current: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                    current.check() catch return true;
+                    return false;
+                }
+            };
+            var response = http.post(url, .{
+                .json = body,
+                .headers = headers,
+                .max_response_size = 1024 * 1024,
+                .cancellation = httpx.CancellationToken.fromCallback(&self.control, Cancel.requested),
+                .timeout_ms = if (self.control.deadline_ns) |deadline| @max(1, (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms) else null,
+                .max_retries = 0,
+                .follow_redirects = false,
+                .cookies_enabled = false,
+            }) catch {
+                try self.control.check();
+                return error.ExtractorUpstreamFailed;
+            };
+            defer response.deinit();
+            if (!response.ok()) return error.ExtractorUpstreamFailed;
+            const Wire = struct {
+                choices: []const struct { finish_reason: []const u8, message: struct { content: ?[]const u8 = null } },
+                usage: ?struct { prompt_tokens: u64, completion_tokens: u64 } = null,
+            };
+            const wire = std.json.parseFromSliceLeaky(Wire, a, response.body orelse return error.InvalidConstrainedOutput, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidConstrainedOutput,
+            };
+            try self.control.check();
+            if (wire.usage) |usage| if (invocation.usage) |observed| observed.record(usage.prompt_tokens, usage.completion_tokens);
+            if (wire.choices.len != 1 or !std.mem.eql(u8, wire.choices[0].finish_reason, "stop")) return error.InvalidConstrainedOutput;
+            const value = c.parseReply(a, wire.choices[0].message.content orelse return error.InvalidConstrainedOutput) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidConstrainedOutput,
+            };
+            return .{ .value = value, .input_tokens = if (wire.usage) |usage| usage.prompt_tokens else 0, .output_tokens = if (wire.usage) |usage| usage.completion_tokens else 0 };
+        }
+
         fn invoke(ptr: *anyopaque, a: std.mem.Allocator, invocation: @import("antfly_structured").Invocation) !@import("antfly_structured").Reply {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const c = @import("antfly_structured");
             try self.control.check();
+            if (self.hosted_extractor) |cfg| return self.invokeHosted(a, invocation, cfg);
             var body = c.object();
             try c.put(a, &body, "model", .{ .string = self.model });
             try c.put(a, &body, "stream", .{ .bool = false });
@@ -26530,7 +26639,7 @@ pub const Node = struct {
         return caps;
     }
 
-    fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl) ![]u8 {
+    fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config) ![]u8 {
         const c = @import("antfly_structured");
         const extractor = c.extraction;
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -26539,6 +26648,11 @@ pub const Node = struct {
         var config_value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, envelope, .{}), .{ .allocate = .alloc_always });
         const inputs = config_value.object.fetchSwapRemove("inputs") orelse return error.InvalidGeneratedExtractorConfig;
         if (inputs.value != .array or inputs.value.array.items.len == 0 or inputs.value.array.items.len > 128) return error.InvalidGeneratedExtractorConfig;
+        if (registered != null) {
+            try self.config.request_limits.validateItemCount(inputs.value.array.items.len);
+            if (self.config.request_limits.max_output_tokens_per_item) |limit|
+                if (registered.?.generator.max_tokens > limit) return error.InvalidMaxTokens;
+        }
         const texts = try a.alloc([]const u8, inputs.value.array.items.len);
         for (texts, inputs.value.array.items) |*text, input| {
             if (input != .object or input.object.count() > 2) return error.InvalidGeneratedExtractorConfig;
@@ -26549,20 +26663,24 @@ pub const Node = struct {
             text.* = content.string;
         }
         if (config_value.object.fetchSwapRemove("schema_version")) |version| if (version.value != .integer or version.value.integer != 2) return error.InvalidGeneratedExtractorConfig;
-        const raw_config = try std.json.Stringify.valueAlloc(a, config_value, .{});
-        var parsed = try extractor.parse(a, raw_config);
-        defer parsed.deinit();
-        const config = parsed.value;
+        var parsed: ?std.json.Parsed(extractor.Config) = null;
+        defer if (parsed) |*value| value.deinit();
+        const config = registered orelse blk: {
+            parsed = try extractor.parse(a, try std.json.Stringify.valueAlloc(a, config_value, .{}));
+            break :blk parsed.?.value;
+        };
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |value| {
             var owned = value;
             owned.deinit();
         };
         const io = self.inferenceIo(a, control.io, &owned_io);
-        const generator = config_value.object.get("generator").?;
-        const caps = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities, false);
-        const mode = try caps.select(config.output, config.probabilities);
-        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs };
+        const generator = config_value.object.get("generator") orelse .null;
+        const mode = if (registered != null) @as(c.Output, .json_schema) else blk: {
+            const caps = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities, false);
+            break :blk try caps.select(config.output, config.probabilities);
+        };
+        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs, .hosted_extractor = if (registered != null) config.generator else null };
         var validation = extractor.Validation{ .config = config };
         const Combined = struct {
             backend: *StructuredGeneration,
@@ -26586,7 +26704,7 @@ pub const Node = struct {
         const instructions = try std.fmt.allocPrint(a, "Extract only entities and relations grounded in each input. Use literal source surface forms. Relations reference entity positions. Set present=false for absent candidates. Never invent offsets or confidence. {s}", .{config.instructions});
         const generated = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
         const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
-        return std.json.Stringify.valueAlloc(allocator, try extractor.responseValue(a, config.generator.model, inputs.value.array.items, values, generated), .{});
+        return std.json.Stringify.valueAlloc(allocator, try extractor.responseValue(a, if (registered != null) envelope.object.get("model").?.string else config.generator.model, inputs.value.array.items, values, generated), .{});
     }
 
     fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
@@ -27928,8 +28046,29 @@ pub const Node = struct {
                 continue;
             }
             var model_count: usize = 0;
+            var alias_arena = std.heap.ArenaAllocator.init(a);
+            defer alias_arena.deinit();
             var listed_model_names = std.StringHashMapUnmanaged(void).empty;
             defer listed_model_names.deinit(a);
+
+            if (listing_scope == null and std.mem.eql(u8, task, "readers")) {
+                for (self.config.image_readers) |entry| {
+                    const alias = try std.fmt.allocPrint(alias_arena.allocator(), "readers/{s}", .{entry.name});
+                    try appendConfiguredTaskModel(&body, a, &model_count, alias, &.{"image"}, &.{"ocr"});
+                    try listed_model_names.put(a, alias, {});
+                }
+            }
+            if (listing_scope == null and std.mem.eql(u8, task, "extractors")) {
+                for (self.config.generated_extractors) |entry| {
+                    const alias = try std.fmt.allocPrint(alias_arena.allocator(), "extractors/{s}", .{entry.name});
+                    const capabilities: []const []const u8 = if (entry.config.schema.object.contains("relations"))
+                        &.{ "extraction", "entities", "relations", "json_schema" }
+                    else
+                        &.{ "extraction", "entities", "json_schema" };
+                    try appendConfiguredTaskModel(&body, a, &model_count, alias, &.{"text"}, capabilities);
+                    try listed_model_names.put(a, alias, {});
+                }
+            }
 
             // Add built-in chunkers
             if (std.mem.eql(u8, task, "chunkers")) {
@@ -31064,6 +31203,16 @@ fn appendModelMetadata(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allo
         try buf.appendSlice(allocator, manifest.qualified_limits_json);
     }
     try buf.append(allocator, '}');
+}
+
+fn appendConfiguredTaskModel(body: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, count: *usize, alias: []const u8, inputs: []const []const u8, capabilities: []const []const u8) !void {
+    if (count.* != 0) try body.append(a, ',');
+    try jsonEncodeString(body, a, alias);
+    try body.append(a, ':');
+    const info = try std.json.Stringify.valueAlloc(a, .{ .inputs = inputs, .capabilities = capabilities, .invocable = true }, .{});
+    defer a.free(info);
+    try body.appendSlice(a, info);
+    count.* += 1;
 }
 
 fn appendModelInfo(
@@ -49038,6 +49187,83 @@ fn documentFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     const name = @errorName(err);
     const status: u16 = if (err == error.DocumentArtifactNotFound or err == error.ModelNotFound) 404 else if (err == error.DocumentArtifactExpired) 410 else if (err == error.DocumentModelRevisionMismatch) 409 else if (err == error.DocumentUnresolved) 422 else if (err == error.DocumentBudgetExhausted or err == error.Timeout) 504 else if (err == error.RemoteDocumentModelDenied) 403 else if (err == error.CloudflareRateLimited) 429 else if (std.mem.indexOf(u8, name, "Limit") != null or err == error.DocumentOutputTooLarge) 413 else if (std.mem.startsWith(u8, name, "Cloudflare") or err == error.InvalidCloudflareResponse) 502 else 400;
     return ctx.status(status).json(.{ .@"error" = name, .message = "Document operation could not satisfy its input, capability, evidence, or execution contract" });
+}
+
+test "named hosted extractor validates upstream output and advertises its capabilities" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fixture = struct {
+        fn inspect(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, req.body, .{});
+            defer parsed.deinit();
+            const object = parsed.value.object;
+            try std.testing.expectEqualStrings("local-extractor", object.get("model").?.string);
+            try std.testing.expectEqualStrings("json_schema", object.get("response_format").?.object.get("type").?.string);
+        }
+        fn serve(upstream: *httpx.TestServer) void {
+            for (0..3) |_| upstream.handleOne() catch return;
+        }
+    };
+    const valid = "{\"items\":[{\"item\":0,\"value\":{\"entities\":[{\"label\":\"invoice_number\",\"text\":\"12345\",\"present\":true}],\"relations\":[]}}]}";
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var routes: [3]httpx.testing_mod.Route = undefined;
+    for (&routes, [3][]const u8{ "stop", "stop", "length" }, [3][]const u8{ valid, "malformed", valid }) |*route, finish, content| {
+        route.* = .{
+            .method = .POST,
+            .path = "/v1/chat/completions",
+            .max_uses = 1,
+            .assert_request = Fixture.inspect,
+            .respond = .{ .body = try std.json.Stringify.valueAlloc(scratch, .{ .choices = .{.{ .finish_reason = finish, .message = .{ .content = content } }} }, .{}) },
+        };
+    }
+    var upstream = try httpx.TestServer.start(a, io, &routes);
+    defer upstream.deinit();
+    upstream.max_request_bytes = 64 * 1024;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&upstream});
+
+    const config = try std.fmt.allocPrint(scratch,
+        \\{{"method":"generated","generator":{{"provider":"openai","model":"local-extractor","url":"{s}/v1","max_tokens":256}},"schema":{{"entities":["invoice_number"]}},"probabilities":"verdict_only"}}
+    , .{upstream.baseUrl()});
+    const entry = try NamedGeneratedExtractor.parse(scratch, "invoice", try std.json.parseFromSliceLeaky(std.json.Value, scratch, config, .{}));
+    var node = try Node.init(a, .{
+        .generated_extractors = &.{entry},
+        .image_readers = &.{.{ .name = "ocr", .config = .{ .provider = .openai, .model = "local-reader" } }},
+    });
+    defer node.deinit();
+    const catalog = try node.listModelsJsonAlloc(a, io);
+    defer a.free(catalog);
+    var listings = try std.json.parseFromSlice(std.json.Value, a, catalog, .{});
+    defer listings.deinit();
+    const extractor_info = listings.value.object.get("extractors").?.object.get("extractors/invoice").?.object;
+    try std.testing.expectEqualStrings("text", extractor_info.get("inputs").?.array.items[0].string);
+    const reader_info = listings.value.object.get("readers").?.object.get("readers/ocr").?.object;
+    try std.testing.expectEqualStrings("image", reader_info.get("inputs").?.array.items[0].string);
+
+    for ([_]u16{ 200, 502, 502, 400 }, 0..) |status, index| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        request.body = if (index == 3)
+            "{\"model\":\"extractors/invoice\",\"inputs\":[{\"content\":\"Invoice 12345\"}],\"generator\":{}}"
+        else
+            "{\"model\":\"extractors/invoice\",\"inputs\":[{\"id\":\"receipt\",\"content\":\"Invoice 12345\"}]}";
+        var ctx = httpx.Context.init(a, io, &request);
+        defer ctx.deinit();
+        var response = try node.extractJSON(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(status, response.status.code);
+        if (status == 200) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("extractors/invoice", parsed.value.object.get("model").?.string);
+            const result = parsed.value.object.get("data").?.array.items[0].object;
+            try std.testing.expectEqualStrings("receipt", result.get("id").?.string);
+            try std.testing.expectEqualStrings("12345", result.get("entities").?.array.items[0].object.get("text").?.string);
+        }
+    }
 }
 
 test "hosted image reader routes the inference API alias to chat completions" {

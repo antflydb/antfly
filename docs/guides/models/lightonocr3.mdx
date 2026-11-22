@@ -139,6 +139,47 @@ For inline ingestion configuration, use the same reader object under `ocr.reader
 If llama-server runs on a separate machine, set `base_url` to an endpoint
 reachable from Antfly, such as a local SSH forwarded port.
 
+### Extract entities from the transcription
+
+Serve an instruction-tuned text GGUF in a second llama.cpp instance. Give its
+`llama-server` an alias such as `invoice-extractor`, use a build that supports JSON Schema output,
+and bind it on port 18091. Add an extractor alongside the reader in the
+inference-only configuration.
+
+```json
+{
+  "extractors": {
+    "invoice-fields": {
+      "method": "generated",
+      "generator": {
+        "provider": "openai",
+        "url": "http://127.0.0.1:18091/v1",
+        "model": "invoice-extractor",
+        "max_tokens": 512,
+        "temperature": 0
+      },
+      "output": "json_schema",
+      "probabilities": "verdict_only",
+      "schema": {"entities": ["invoice_number", "total"]}
+    }
+  }
+}
+```
+
+Pass the text from the reader to `POST /ai/v1/extract`:
+
+```json
+{
+  "model": "extractors/invoice-fields",
+  "inputs": [{"id": "invoice-1", "content": "Invoice 12345. Total USD 42.00."}]
+}
+```
+
+The named extractor uses its configured entity and relation schema. Antfly
+checks the returned structure and aligns entity text to spans in the input.
+`GET /ai/v1/models` lists the reader under `readers` and the extractor under
+`extractors`, with their accepted input modalities.
+
 ## Read documents during ingestion
 
 To OCR scanned PDF pages and images as they are indexed, name the model as the

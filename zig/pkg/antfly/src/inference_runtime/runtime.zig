@@ -342,6 +342,12 @@ fn resolveRunMaxConcurrentRequests(cli: ?u32, cfg: ?*const common_config.Config)
 }
 
 // Standalone serving uses the same resources and inference sections as the DB.
+fn isNamedGeneratedExtractor(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const method = value.object.get("method") orelse return false;
+    return method == .string and std.mem.eql(u8, method.string, "generated");
+}
+
 fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Config {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -350,6 +356,20 @@ fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Conf
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidConfig;
     var root = &parsed.value.object;
+    // The common runtime bindings are a separate configuration contract.
+    // Named generated extractors are owned by the inference listener.
+    if (root.getPtr("extractors")) |extractors| {
+        if (extractors.* == .object) {
+            var index: usize = 0;
+            while (index < extractors.object.count()) {
+                if (isNamedGeneratedExtractor(extractors.object.values()[index])) {
+                    _ = extractors.object.swapRemove(extractors.object.keys()[index]);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
     var model_config = if (root.get("inference")) |value| switch (value) {
         .object => value.object,
         else => return error.InvalidConfig,
@@ -606,9 +626,21 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         }
     }
 
+    var extractor_arena = std.heap.ArenaAllocator.init(alloc);
+    defer extractor_arena.deinit();
+    const extractor_alloc = extractor_arena.allocator();
+    var generated_extractors: std.ArrayList(inference.server.NamedGeneratedExtractor) = .empty;
     var loaded_config: ?common_config.Config = if (config_path) |path| blk: {
         const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
         defer alloc.free(raw);
+        const tree = try std.json.parseFromSliceLeaky(std.json.Value, extractor_alloc, raw, .{ .allocate = .alloc_always });
+        if (tree == .object) if (tree.object.get("extractors")) |entries| {
+            if (entries != .object) return error.InvalidConfig;
+            for (entries.object.keys(), entries.object.values()) |name, value| {
+                if (!isNamedGeneratedExtractor(value)) continue;
+                try generated_extractors.append(extractor_alloc, try inference.server.NamedGeneratedExtractor.parse(extractor_alloc, name, value));
+            }
+        };
         break :blk parseRunConfig(alloc, raw) catch |err| {
             platform.inference_settings.diagnoseInvalidConfig(alloc, raw);
             return err;
@@ -684,6 +716,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var node = try InferenceNode.init(alloc, .{
         .audio_readers = audio_readers,
         .image_readers = image_readers.items,
+        .generated_extractors = generated_extractors.items,
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .max_loaded_models = model_settings.max_loaded_models,
