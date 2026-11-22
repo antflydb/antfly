@@ -10672,12 +10672,14 @@ pub const DB = struct {
         wait_for_completion: bool,
         only_incomplete: bool,
     ) !bool {
-        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse {
+            if (only_incomplete) return error.InvalidArgument;
             return self.reprocessEmbeddingArtifactIssue(alloc, .{
                 .artifact_kind = .embedding,
                 .doc_key = doc_key,
                 .artifact_name = artifact_name,
             }, wait_for_completion);
+        };
         defer cfg.deinit(alloc);
         // A missing producer definition means this artifact cannot currently be
         // regenerated. A missing source document is a distinct, actionable
@@ -10689,6 +10691,7 @@ pub const DB = struct {
         const force_artifacts = [_][]const u8{artifact_name};
         var producer = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
         defer producer.deinit(alloc);
+        if (only_incomplete and producer.type != .document_extraction) return error.InvalidArgument;
         // Document extraction persists a config-fenced target generation with
         // this source mutation. Replay owns provider work, including cold starts
         // and retries; accepting it must never wait for remote OCR. Other asset
@@ -91295,6 +91298,9 @@ test "db execution policy retains legacy local asset publications" {
     try db.runUntilIdle();
     const calls = fake.generator_calls;
     try std.testing.expect(calls > 0);
+    try std.testing.expectError(error.InvalidArgument, db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "summary", false, true));
+    try std.testing.expectEqual(calls, fake.generator_calls);
+
     const local = @import("artifact_local_publication.zig");
     const artifact = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "summary");
     defer a.free(artifact);
