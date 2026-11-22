@@ -129,10 +129,8 @@ pub const InferenceAdmission = struct {
     pub fn growUnits(self: *InferenceAdmission, current_units: usize, target_units: usize) !void {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
-        const current = self.capacityUnits(current_units);
-        const target = self.capacityUnits(target_units);
-        if (target <= current) return;
-        const additional = target - current;
+        const additional = self.incrementalUnits(current_units, target_units);
+        if (additional == 0) return;
         if (additional > self.capacity - self.active_units) {
             self.rejected_requests_total +|= 1;
             return error.QueueFull;
@@ -161,6 +159,12 @@ pub const InferenceAdmission = struct {
         // A zero limit is the documented escape hatch for unlimited
         // admission. Requests then consume zero accounting units.
         return @min(@max(units, 1), self.capacity);
+    }
+
+    /// The exact weighted charge added by a growth operation, after capacity
+    /// clamping. A temporary growth owner can release only this increment.
+    pub fn incrementalUnits(self: *const InferenceAdmission, current_units: usize, target_units: usize) usize {
+        return self.capacityUnits(target_units) -| self.capacityUnits(current_units);
     }
 
     /// Units requested by the caller before the configured capacity clamps
@@ -332,4 +336,17 @@ test "independent request and weighted work limits retain one request with eight
     defer admission.releaseReservedUnits(5);
     try std.testing.expectError(error.QueueFull, admission.acquireRequestSlot());
     try std.testing.expectEqual(@as(usize, 5), admission.inFlightUnits());
+}
+
+test "temporary dispatch growth releases only its incremental charge" {
+    var controller = InferenceAdmission.init(8);
+    try controller.reserveUnits(2);
+    try controller.growUnits(2, 30);
+    try std.testing.expectError(error.QueueFull, controller.reserveUnits(2));
+    controller.releaseReservedUnits(controller.incrementalUnits(2, 30));
+    try std.testing.expectEqual(@as(usize, 2), controller.inFlightUnits());
+    try controller.reserveUnits(2);
+    try controller.growUnits(2, 5);
+    controller.releaseReservedUnits(controller.incrementalUnits(2, 5));
+    try std.testing.expectEqual(@as(usize, 4), controller.inFlightUnits());
 }
