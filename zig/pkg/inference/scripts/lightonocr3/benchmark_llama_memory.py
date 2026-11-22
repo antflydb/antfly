@@ -243,7 +243,10 @@ def parsed_tables(text):
         if not is_table:
             continue
         rows = [
-            [normalize(cell) for cell in line.strip().strip("|").split("|")]
+            [
+                normalize(cell)
+                for cell in line.strip().removeprefix("|").removesuffix("|").split("|")
+            ]
             for line in block
         ]
         if (

@@ -71,6 +71,11 @@ class QualificationTest(unittest.TestCase):
         )
         score_case(row, case)
         self.assertTrue(quality_passes(row))
+        row["text"] = row["text"].replace(
+            "| Replacement part | SKU-1202", "|| Replacement part | SKU-1202"
+        )
+        score_case(row, case)
+        self.assertFalse(quality_passes(row))
         row["text"] = table.replace(">3<", ">8<")
         score_case(row, case)
         self.assertLess(row["cer"], 0.05)
