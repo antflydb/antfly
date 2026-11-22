@@ -147,6 +147,37 @@ def child_pid(parent):
     return int(children[0]) if len(children) == 1 else None
 
 
+def signal_pass_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def shutdown_pass(proc, record_memory):
+    try:
+        pid = child_pid(proc.pid) if record_memory else proc.pid
+    except OSError:
+        pid = None
+    # Let /usr/bin/time reap the server and write its counters when possible.
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pid = None
+    if pid is None:
+        signal_pass_group(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        signal_pass_group(proc, signal.SIGKILL)
+        proc.wait(timeout=10)
+    else:
+        if pid is None:
+            # The wrapper may have exited while descendants survived SIGTERM.
+            signal_pass_group(proc, signal.SIGKILL)
+
+
 def wait_ready(proc, url, alias):
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and proc.poll() is None:
@@ -342,7 +373,7 @@ def read_active_memory(read_memory, read_active_tasks):
     if not before:
         return None, 0
     values = read_memory()
-    # Shared task IDs verify slot occupancy throughout the memory read.
+    # Shared task IDs give a lower bound on occupancy throughout the read.
     return values, len(before & read_active_tasks()) if values else 0
 
 
@@ -412,7 +443,7 @@ def memory_occupancy_report(task_peaks, required):
     return {
         "required_verified_tasks_by_phase": required,
         "max_verified_tasks_by_phase": highest,
-        "sampled_peak_bytes_by_phase_and_occupancy": task_peaks,
+        "sampled_peak_bytes_by_phase_and_minimum_verified_occupancy": task_peaks,
         "missing_memory_occupancy_phases": missing,
     }
 
@@ -606,7 +637,9 @@ def run_pass(
                 command = ["/usr/bin/time", "-l", *command, "--slots"]
             else:
                 command = [*command, "--no-slots"]
-            proc = subprocess.Popen(command, stdout=log, stderr=log)
+            proc = subprocess.Popen(
+                command, stdout=log, stderr=log, start_new_session=True
+            )
 
             def sample():
                 pid = None
@@ -694,21 +727,7 @@ def run_pass(
                 set_phase("finished")
                 if sampler is not None:
                     sampler.join()
-                pid = child_pid(proc.pid) if record_memory else proc.pid
-                if pid:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                try:
-                    proc.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    if pid:
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    proc.wait(timeout=10)
+                shutdown_pass(proc, record_memory)
                 log.seek(0)
                 output = log.read().decode(errors="replace")
     except (OSError, subprocess.SubprocessError) as error:

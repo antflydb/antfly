@@ -1317,6 +1317,7 @@ pub fn isHostedInferenceEndpoint(url: []const u8) bool {
 const hosted_inference_timeout_ms: u64 = 120_000;
 const hosted_ocr_response_bytes: usize = 2 * 1024 * 1024;
 const hosted_ocr_result_bytes: usize = 16 * 1024 * 1024;
+const hosted_ocr_retained_reply_bytes: usize = 32 * 1024 * 1024;
 const hosted_ocr_response_body_bytes: usize = 32 * 1024 * 1024;
 const hosted_ocr_initial_response_units: usize = 1;
 const hosted_extraction_working_bytes: usize = 32 * 1024 * 1024;
@@ -23940,6 +23941,7 @@ pub const Node = struct {
         next: usize = 0,
         result_bytes: usize = 0,
         retained_reply_bytes: usize = 0,
+        retained_reply_limit: usize,
         failure: ?anyerror = null,
         stopped: std.atomic.Value(bool) = .init(false),
 
@@ -23977,12 +23979,14 @@ pub const Node = struct {
             self.lock();
             defer self.mutex.unlock();
             if (self.failure != null) return error.Cancelled;
-            self.result_bytes += reply.items[0].text.len;
-            if (self.result_bytes > hosted_ocr_result_bytes) {
+            const text_bytes = self.result_bytes +| reply.items[0].text.len;
+            const reply_bytes = self.retained_reply_bytes +| reply.retainedPayloadBytes() +| @sizeOf(readers_api.Result);
+            if (text_bytes > hosted_ocr_result_bytes or reply_bytes > self.retained_reply_limit) {
                 self.recordFailureLocked(error.HostedReaderOutputTooLarge);
                 return error.HostedReaderOutputTooLarge;
             }
-            self.retained_reply_bytes +|= reply.retainedPayloadBytes() +| @sizeOf(readers_api.Result);
+            self.result_bytes = text_bytes;
+            self.retained_reply_bytes = reply_bytes;
             self.replies[index] = reply;
         }
 
@@ -24068,6 +24072,11 @@ pub const Node = struct {
         defer for (replies) |*slot| {
             if (slot.*) |*reply| reply.deinit(wire_allocator);
         };
+        const capacity = self.inference_admission.capacity;
+        const retained_reply_limit = if (capacity == 0)
+            hosted_ocr_retained_reply_bytes
+        else
+            @min(hosted_ocr_retained_reply_bytes, capacity *| read_admission_bytes_per_unit);
         var queue: HostedReadQueue = .{
             .allocator = wire_allocator,
             .client = &client,
@@ -24077,6 +24086,7 @@ pub const Node = struct {
             .prompt = body.prompt,
             .tokens = tokens,
             .input_limit = self.config.request_limits.max_input_tokens_per_item,
+            .retained_reply_limit = retained_reply_limit,
             .control = control,
         };
         {
@@ -49749,6 +49759,31 @@ test "named hosted extractor validates upstream output and advertises its capabi
             try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
         }
     }
+}
+
+test "hosted image reader stops dispatch when retained metadata exceeds its limit" {
+    var replies: [3]?readers_api.BatchResult = @splat(null);
+    const pages: [3]Node.HostedImagePage = undefined;
+    var items = [_]readers_api.Result{.{ .text = "x", .regions_json = "[123]" }};
+    const reply: readers_api.BatchResult = .{ .items = &items, .execution = undefined };
+    const reply_bytes = @sizeOf(readers_api.Result) + reply.retainedPayloadBytes();
+    var queue: Node.HostedReadQueue = .{
+        .allocator = std.testing.allocator,
+        .client = undefined,
+        .pages = &pages,
+        .replies = &replies,
+        .config = undefined,
+        .prompt = null,
+        .tokens = 1,
+        .input_limit = null,
+        .control = .{},
+        .retained_reply_limit = reply_bytes * 2 - 1,
+    };
+    try queue.accept(queue.take().?, reply);
+    try std.testing.expectError(error.HostedReaderOutputTooLarge, queue.accept(queue.take().?, reply));
+    try std.testing.expectEqual(reply_bytes, queue.retained_reply_bytes);
+    try std.testing.expect(replies[1] == null and queue.take() == null);
+    try std.testing.expect(queue.stopped.load(.acquire));
 }
 
 test "hosted image reader response size respects finite work capacity" {

@@ -17,9 +17,11 @@
 
 from http.client import IncompleteRead
 from pathlib import Path
+import signal
+import subprocess
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from benchmark_llama_memory import (
     Profile,
@@ -33,6 +35,7 @@ from benchmark_llama_memory import (
     record_phase_sample,
     run_pass,
     run_profile,
+    shutdown_pass,
     score_case,
 )
 
@@ -148,7 +151,10 @@ class QualificationTest(unittest.TestCase):
         report = memory_occupancy_report(task_peaks, {"serve": 2})
         self.assertEqual(report["max_verified_tasks_by_phase"], {"serve": 1})
         self.assertEqual(report["missing_memory_occupancy_phases"], ["serve"])
-        self.assertEqual(task_peaks, {"serve": {1: metrics}})
+        self.assertEqual(
+            report["sampled_peak_bytes_by_phase_and_minimum_verified_occupancy"],
+            {"serve": {1: metrics}},
+        )
 
     def test_truncated_http_response_is_a_reportable_io_error(self):
         with patch("benchmark_llama_memory.urlopen") as open_request:
@@ -177,6 +183,7 @@ class QualificationTest(unittest.TestCase):
             patch("benchmark_llama_memory.wait_ready"),
             patch("benchmark_llama_memory.child_pid", return_value=None),
             patch("benchmark_llama_memory.os.kill"),
+            patch("benchmark_llama_memory.os.killpg"),
             patch(
                 "benchmark_llama_memory.request_case", return_value={"finish": "stop"}
             ) as request,
@@ -188,6 +195,7 @@ class QualificationTest(unittest.TestCase):
             argv = (args, [case], case, 1, ["llama-server"], "http://localhost", "q4")
             timing = run_pass(*argv, record_memory=False)
             self.assertEqual(spawn.call_args.args[0], ["llama-server", "--no-slots"])
+            self.assertTrue(spawn.call_args.kwargs["start_new_session"])
             self.assertIsNone(timing.error)
             self.assertIsNone(request.call_args.kwargs["on_submit"])
             probe.assert_not_called()
@@ -205,6 +213,32 @@ class QualificationTest(unittest.TestCase):
                 {"count": 1, "first_error": "HTTP 404"},
             )
             self.assertIsNone(memory.grounding)
+
+    def test_shutdown_reaps_group_when_wrapper_has_no_unique_child(self):
+        proc = Mock(pid=29)
+        with (
+            patch("benchmark_llama_memory.child_pid", return_value=None),
+            patch("benchmark_llama_memory.os.killpg") as kill_group,
+        ):
+            shutdown_pass(proc, record_memory=True)
+        proc.wait.assert_called_once_with(timeout=20)
+        self.assertEqual(
+            kill_group.call_args_list,
+            [call(29, signal.SIGTERM), call(29, signal.SIGKILL)],
+        )
+
+    def test_shutdown_escalates_to_group_if_known_child_does_not_exit(self):
+        proc = Mock(pid=29)
+        proc.wait.side_effect = [subprocess.TimeoutExpired("time", 20), 0]
+        with (
+            patch("benchmark_llama_memory.child_pid", return_value=30),
+            patch("benchmark_llama_memory.os.kill") as kill_process,
+            patch("benchmark_llama_memory.os.killpg") as kill_group,
+        ):
+            shutdown_pass(proc, record_memory=True)
+        kill_process.assert_called_once_with(30, signal.SIGTERM)
+        kill_group.assert_called_once_with(29, signal.SIGKILL)
+        self.assertEqual(proc.wait.call_args_list, [call(timeout=20), call(timeout=10)])
 
     def test_memory_process_launch_failure_is_scoped_to_that_pass(self):
         with patch(
