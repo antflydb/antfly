@@ -25522,6 +25522,7 @@ pub const ApiHttpServer = struct {
         const req = db_mod.types.DocumentArtifactTableReprocessRequest{
             .from_key = if (shard_resumes.len > 0) "" else (running_state.next_key orelse running_state.from_key),
             .to_key = running_state.to_key,
+            .selection = running_state.selection,
             .limit = running_state.limit,
             .shard_cursors = shard_resumes,
         };

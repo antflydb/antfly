@@ -7558,7 +7558,25 @@ paths:
       description: >
         Registers a table-level generated artifact definition. Reusing the same
 
-        artifact name replaces the existing mapping. Chunk or asset enrichments
+        artifact name replaces the existing mapping.
+
+        Omitting all producer fields (producer, producer_json and transcriber)
+
+        on an existing same-kind artifact retains its admitted producer. Supplying
+
+        any one of these fields explicitly replaces the producer; mutually
+
+        exclusive spellings cannot be combined. Execution-policy updates persist
+
+        separately from publication authority, without reading credentials,
+
+        reconstructing the recipe, or invalidating completed output.
+
+        Changing execution alone preserves completed artifacts; changing producer
+
+        semantics may invalidate them. Use explicit reprocessing for incomplete
+
+        or all existing work. Chunk or asset enrichments
 
         may set `full_text_index: true` to map generated text into the table's
 
@@ -28304,7 +28322,9 @@ components:
         manifest_json:
           type: string
           description: Opaque JSON manifest for the artifact units and provenance. Present only for raw
-            detail responses.
+            detail responses. Newly produced document-extraction generations include the declared execution
+            policy under execution, including on failed generations; it is not a measured provider budget.
+            Older manifests may omit it.
         state_json:
           type: string
           nullable: true
@@ -28922,6 +28942,17 @@ components:
       type: object
       description: Bounded request for reprocessing a derived artifact across source rows in key order.
       properties:
+        selection:
+          type: string
+          enum:
+            - all
+            - incomplete
+          default: all
+          description: all explicitly regenerates selected source records, including accepted artifacts.
+            incomplete selects only missing or incomplete document_extraction artifacts, including converged
+            manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds
+            reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance
+            does not certify inference completion.
         from_key:
           type: string
           description: Exclusive lower bound source document key. Use the prior response next_key to continue.
@@ -29058,6 +29089,17 @@ components:
       type: object
       description: Request to create a durable table artifact reprocess job.
       properties:
+        selection:
+          type: string
+          enum:
+            - all
+            - incomplete
+          default: all
+          description: all explicitly regenerates selected source records, including accepted artifacts.
+            incomplete selects only missing or incomplete document_extraction artifacts, including converged
+            manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds
+            reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance
+            does not certify inference completion.
         from_key:
           type: string
           description: Exclusive lower bound source document key.
@@ -29099,6 +29141,17 @@ components:
         - last_updated_at_millis
         - expires_at_millis
       properties:
+        selection:
+          type: string
+          enum:
+            - all
+            - incomplete
+          default: all
+          description: all explicitly regenerates selected source records, including accepted artifacts.
+            incomplete selects only missing or incomplete document_extraction artifacts, including converged
+            manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds
+            reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance
+            does not certify inference completion.
         job_id:
           type: integer
           format: uint64
@@ -42625,9 +42678,9 @@ components:
         skip_windows:
           type: array
           maxItems: 4096
-          description: Execution-only repair mask for accepted receipts. A sub_index of 4294967295
-            skips all outputs at that ordinal. Other entries skip individual sub-windows. Masks leave
-            recipe and boundary identities unchanged.
+          description: Execution-only repair mask for accepted receipts. A sub_index of 4294967295 skips
+            all outputs at that ordinal. Other entries skip individual sub-windows. Masks leave recipe
+            and boundary identities unchanged.
           items:
             type: object
             required:
@@ -43672,9 +43725,20 @@ components:
     ExecutionPolicy:
       type: object
       additionalProperties: false
-      description: Non-semantic execution policy for one producer or index maintenance operation. These
-        fields tune how work is batched and do not change generated artifact identity.
+      description: Non-semantic execution policy for one producer or index maintenance operation. Updates
+        persist separately from the frozen publication catalog and affect future invocations without invalidating
+        accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use
+        the bounded reprocess APIs. Node/provider ceilings still apply.
       properties:
+        max_output_tokens_per_item:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 4294967295
+          description: Invocation output-token budget for reader/generator assets and document-extraction
+            OCR pages. Overrides producer max_tokens at execution only; it does not change the stored
+            recipe, source fingerprint, or completed outputs. A lower value does not retroactively reject
+            accepted output. Omit to use the producer budget.
         batch_items:
           x-go-type-skip-optional-pointer: true
           type: integer

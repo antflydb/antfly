@@ -217,8 +217,12 @@ parallelism as well: an image-only 8192-token LightOn request uses 36 work units
 so four independent requests need 144 units with the current admission policy.
 Completed short pages still stop at EOS.
 The 8192-token value is the first-call budget, not a retry-only allowance. Keep
-it explicit in the producer: the runtime's omitted-value default is separate
-from the deployment's maximum. Dense HTML tables can consume many tokens even
+it explicit in the reader file: new tables move this value into the artifact's
+`execution.max_output_tokens_per_item` policy, separate from the semantic producer
+recipe and the deployment's maximum. For existing tables, update that execution
+field through artifact PUT while retaining the stored producer, then use
+`selection: incomplete` in a bounded reprocess job. Completed source artifacts
+are preserved; incomplete PDFs may repeat pages within that source artifact. Dense HTML tables can consume many tokens even
 when their visible word count is modest. Do not change sampling, rendering,
 model revision, or source identity while comparing output-budget policies.
 Use the [same-fixture policy benchmark](../../docs/guides/inference-policy-benchmark.md)
@@ -853,3 +857,19 @@ release ZIP is a separate source: a bounded audio selection must retain its
 archive URL, strong ETag, member names/CRC32 and per-file SHA-256. Selected-member
 checks do not establish the full archive checksum or current official hosting.
 Record that distinction, and never treat a 403/interstitial as document bytes.
+
+### Resuming tables created before execution policies
+
+New tables use `grepstein-corpus-v2` semantic bindings. To resume or append to a
+released v1 table, run once with its original creation flags and reader file,
+including the original `max_tokens`. The loader verifies the old description and
+saves `table-binding.json` scoped to the endpoint, table name, table ID, original
+description and new semantic recipe. It preserves the server description,
+producer JSON, accepted records and `load.json` checkpoints. Subsequent runs can
+reuse that verified binding; append states can inherit it from `--accepted-state`.
+Model, source recipe, page-window or table-identity changes are still rejected.
+
+Changing a reader file alone does not update an existing table's execution
+policy. Use artifact PUT to set `execution.max_output_tokens_per_item`, preserving
+the stored producer, then an explicit incomplete-only reprocess job if needed.
+The loader's binding migration performs no table writes or OCR.
