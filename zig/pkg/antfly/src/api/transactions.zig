@@ -1541,7 +1541,11 @@ pub const DurableSessionStore = struct {
     }
 
     fn legacySqlPinsFenced(txn: anytype) !bool {
-        const version = txn.get(sql_legacy_pin_fence_key) catch |err| if (err == error.NotFound) return false else return err;
+        return sqlPinFenceExists(txn, sql_legacy_pin_fence_key);
+    }
+
+    fn sqlPinFenceExists(txn: anytype, key: []const u8) !bool {
+        const version = txn.get(key) catch |err| if (err == error.NotFound) return false else return err;
         if (!std.mem.eql(u8, version, "sealed-v1")) return error.InvalidTransactionSessionRecord;
         return true;
     }
@@ -1549,29 +1553,46 @@ pub const DurableSessionStore = struct {
     /// Seal the exclusive issuer and owner namespace on its storage write cut.
     /// The caller must establish that it has no separately routed issuers.
     pub fn sealStandaloneLegacySqlPins(self: *DurableSessionStore) !void {
+        try self.sealLegacySqlPins(0);
+    }
+
+    pub fn sealSharedLegacySqlPinIssuer(self: *DurableSessionStore, issuer: u64) !void {
+        if (issuer == 0) return error.CompletionWrongOwner;
+        try self.bindRegistrationIssuer(issuer);
+        try self.sealLegacySqlPins(issuer);
+    }
+
+    fn sqlPinIssuerFenceKey(issuer: u64, buf: []u8) ![]const u8 {
+        if (issuer == 0) return sql_legacy_pin_fence_key;
+        return std.fmt.bufPrint(buf, "{s}:{x:0>16}", .{ sql_legacy_pin_fence_key, issuer });
+    }
+
+    fn sealLegacySqlPins(self: *DurableSessionStore, issuer: u64) !void {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
-        if ((self.registration_issuer orelse 0) != 0) return error.CompletionWrongOwner;
+        if ((self.registration_issuer orelse 0) != issuer) return error.CompletionWrongOwner;
+        var key_buf: [128]u8 = undefined;
+        const key = try sqlPinIssuerFenceKey(issuer, &key_buf);
         switch (self.backend) {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                if (try self.sealStandaloneLegacySqlPinsTxn(&txn)) try txn.commit() else txn.abort();
+                if (try self.sealLegacySqlPinsTxn(&txn, key)) try txn.commit() else txn.abort();
             },
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                if (try self.sealStandaloneLegacySqlPinsTxn(&txn)) try txn.commit() else txn.abort();
+                if (try self.sealLegacySqlPinsTxn(&txn, key)) try txn.commit() else txn.abort();
             },
         }
     }
 
-    fn sealStandaloneLegacySqlPinsTxn(self: *DurableSessionStore, txn: anytype) !bool {
-        if (try legacySqlPinsFenced(txn)) return false;
+    fn sealLegacySqlPinsTxn(self: *DurableSessionStore, txn: anytype, key: []const u8) !bool {
+        if (try sqlPinFenceExists(txn, key)) return false;
         const producer = try self.registrationOutbox().producer(txn, self.alloc, @splat(0));
         if (producer.active != 0 or self.reserved_registrations != 0) return error.CompletionIssuerNotDrained;
-        try txn.put(sql_legacy_pin_fence_key, "sealed-v1");
+        try txn.put(key, "sealed-v1");
         return true;
     }
 
@@ -1657,7 +1678,9 @@ pub const DurableSessionStore = struct {
                 if (try self.registrationOutbox().available(txn, self.alloc) <= held) return error.SessionLimitExceeded;
                 const floor = (try self.registrationOutbox().producer(txn, self.alloc, value.seed)).retired_through;
                 const reference = try self.registrationOutbox().create(txn, self.alloc, value.seed, value.outcome, value.prepared);
-                if (!value.prepared and value.outcome.transaction_id != null and value.outcome.ddl_receipt_json == null and try legacySqlPinsFenced(txn)) {
+                var issuer_fence_buf: [128]u8 = undefined;
+                const issuer_fence = try sqlPinIssuerFenceKey(self.registration_issuer orelse 0, &issuer_fence_buf);
+                if (!value.prepared and value.outcome.transaction_id != null and value.outcome.ddl_receipt_json == null and try sqlPinFenceExists(txn, issuer_fence)) {
                     const hex = value.outcome.transaction_id.?;
                     const id = distributed_txn.parseTxnIdHex(hex) catch return error.InvalidArgument;
                     _ = try self.completionReferenceTxn(txn, id, reference, false, floor, .atomic_pin);
@@ -8937,6 +8960,28 @@ test "distributed txn public mutation guards reject a reused id" {
     _ = try registry.beginForPrincipalWithSettingsAndId(a, .{}, 1, "bob", &.{}, null, id);
     try std.testing.expectError(error.SessionLeaseLost, registry.readMutationInfo(guard));
     try std.testing.expectError(error.SessionLeaseLost, registry.getTerminalCommitForMutation(a, guard));
+}
+
+test "distributed txn shared SQL pin issuer seals remain independent" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "shared-sql-pin-fence" });
+    defer store.deinit();
+    var first = DurableSessionStore.initRuntime(a, &store);
+    var second = DurableSessionStore.initRuntime(a, &store);
+    try first.bindRegistrationIssuer(1);
+    try second.bindRegistrationIssuer(2);
+    const seed: [8]u8 = @splat(3);
+    const missing = "01010101010101010101010101010101";
+    const pending = try first.createRegistration(seed, .{ .transaction_id = missing });
+    try std.testing.expectError(error.CompletionIssuerNotDrained, first.sealSharedLegacySqlPinIssuer(1));
+    try first.removeRegistration(pending);
+    try first.sealSharedLegacySqlPinIssuer(1);
+    var reopened = DurableSessionStore.initRuntime(a, &store);
+    try reopened.bindRegistrationIssuer(1);
+    try std.testing.expectError(error.SqlTransactionOutcomeUnknown, reopened.createRegistration(seed, .{ .transaction_id = missing }));
+    _ = try second.createRegistration(seed, .{ .transaction_id = missing });
 }
 
 test "distributed txn standalone SQL pin fence drains and persists across issuer restart" {

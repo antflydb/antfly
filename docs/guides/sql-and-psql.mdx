@@ -274,6 +274,8 @@ An administrator can seal legacy SQL transaction pin creation on an exclusive st
 
 Send an authenticated `POST /db/v1/sql` with the header `X-Antfly-SQL-Settlement: seal-legacy-transaction-pins-v1` and the body `{}`. A successful response returns `{"sealed":true}`. A store with outstanding issuer registrations returns HTTP 409. Repeating a successful seal is safe. Shared and routed stores require a fleet-wide compatibility cut.
 
+For a routed issuer backed by a shared transaction store, use the same authenticated request with `X-Antfly-SQL-Settlement: seal-shared-transaction-pin-issuer-v1` on the issuing node. Upgrade that issuer before sealing and keep it on a version that enforces the seal. The write checks and seals the local issuer's outbox. Shared owners retain compatibility for other issuers until the fleet cut is established.
+
 ## Use Agent Skills
 
 Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),

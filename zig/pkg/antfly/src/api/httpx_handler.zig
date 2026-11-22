@@ -7172,10 +7172,13 @@ pub const AntflyApiHandler = struct {
             return response;
         }
         if (ctx.header("X-Antfly-SQL-Settlement")) |action| {
-            const seal_legacy_pins = std.mem.eql(u8, action, "seal-legacy-transaction-pins-v1");
+            const seal_shared_issuer = std.mem.eql(u8, action, "seal-shared-transaction-pin-issuer-v1");
+            const seal_legacy_pins = seal_shared_issuer or std.mem.eql(u8, action, "seal-legacy-transaction-pins-v1");
             if (!seal_legacy_pins and !owner_mode and !std.mem.eql(u8, action, "12") and !std.mem.eql(u8, action, "ack-v12") and !std.mem.eql(u8, action, "11") and !std.mem.eql(u8, action, "ack-v11") and !std.mem.eql(u8, action, "10") and !std.mem.eql(u8, action, "ack-v10") and !std.mem.eql(u8, action, "9") and !std.mem.eql(u8, action, "ack-v9") and !std.mem.eql(u8, action, "8") and !std.mem.eql(u8, action, "ack-v8") and !std.mem.eql(u8, action, "7") and !std.mem.eql(u8, action, "ack-v7") and !std.mem.eql(u8, action, "6") and !std.mem.eql(u8, action, "ack-v6") and !std.mem.eql(u8, action, "5") and !std.mem.eql(u8, action, "ack-v5") and !std.mem.eql(u8, action, "4") and !std.mem.eql(u8, action, "ack-v4") and !std.mem.eql(u8, action, "3") and !std.mem.eql(u8, action, "ack-v3")) return ctx.status(400).text("unsupported SQL settlement");
             if (!owner_mode and (identity == null or !http_server_mod.permissionsAllow(identity.?.permissions, .@"*", "*", .admin))) return ctx.status(403).text("settlement requires management authority");
-            if (seal_legacy_pins and (self.api_server.cfg.deployment_mode != .standalone or
+            if (seal_shared_issuer and (self.api_server.txn_sessions.durable_scope != .cluster_shared or self.api_server.localSessionNodeId() == 0))
+                return ctx.status(409).text("SQL completion issuer fence requires a shared store and a routed issuer");
+            if (seal_legacy_pins and !seal_shared_issuer and (self.api_server.cfg.deployment_mode != .standalone or
                 self.api_server.txn_sessions.durable_scope != .node_local or self.api_server.cfg.session_executor != null or
                 self.api_server.cfg.hot_standby_mutation_policy_source != null or !self.api_server.mutationBackgroundExecutionPermitted()))
                 return ctx.status(409).text("SQL completion fence requires an exclusive standalone store");
@@ -7208,6 +7211,7 @@ pub const AntflyApiHandler = struct {
                 acknowledge: bool = false,
                 acknowledged: bool = false,
                 seal_legacy_pins: bool = false,
+                shared_issuer: ?u64 = null,
                 seal_error: ?anyerror = null,
                 owner_request: ?owner_mod.OwnerRequest = null,
                 fn run(job: *@This()) void {
@@ -7218,7 +7222,8 @@ pub const AntflyApiHandler = struct {
                             job.seal_error = error.DurabilityUnavailable;
                             return;
                         };
-                        store.sealStandaloneLegacySqlPins() catch |err| {
+                        const sealed = if (job.shared_issuer) |issuer| store.sealSharedLegacySqlPinIssuer(issuer) else store.sealStandaloneLegacySqlPins();
+                        sealed catch |err| {
                             job.seal_error = err;
                         };
                         return;
@@ -7230,7 +7235,7 @@ pub const AntflyApiHandler = struct {
                     if (job.acknowledge) job.acknowledged = @import("sql_completion.zig").acknowledge(job.server, job.alloc, job.receipt, context) catch false else job.remaining = @import("sql_completion.zig").remaining(job.server, job.alloc, job.receipt, context) catch null;
                 }
             };
-            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .acknowledge = std.mem.eql(u8, action, "ack-v12") or std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .seal_legacy_pins = seal_legacy_pins, .owner_request = if (parsed_owner) |value| value.value else null };
+            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .acknowledge = std.mem.eql(u8, action, "ack-v12") or std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .seal_legacy_pins = seal_legacy_pins, .shared_issuer = if (seal_shared_issuer) self.api_server.localSessionNodeId() else null, .owner_request = if (parsed_owner) |value| value.value else null };
             var future = try io.concurrent(Probe.run, .{&job});
             job.done.waitUncancelable(ctx.io);
             @import("protected_future.zig").wait(io, &future);
