@@ -126,12 +126,14 @@ pub const Scope = struct {
     output_active: bool = false,
     output_taken: bool = false,
     published_ptr: DevicePointer = 0,
+    bound_start: DevicePointer = 0,
+    bound_end: DevicePointer = 0,
     /// Bind the funded byte range before recording or submitting any kernels.
     pub fn bind(plan: *Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
         if (backing == 0 or backing % alignment != 0 or layout.bytes > backing_bytes or
-            backing > @as(DevicePointer, std.math.maxInt(DevicePointer)) - @as(DevicePointer, layout.bytes) or
+            backing > @as(DevicePointer, std.math.maxInt(DevicePointer)) - @as(DevicePointer, backing_bytes) or
             !std.meta.eql(layout, try plan.layout(layout.scratch_offset))) return error.InvalidExecutionPlan;
-        return .{ .plan = plan, .base = backing + layout.scratch_offset };
+        return .{ .plan = plan, .base = backing + layout.scratch_offset, .bound_start = backing, .bound_end = backing + backing_bytes };
     }
 
     pub fn complete(self: *const Scope) bool {
@@ -142,10 +144,10 @@ pub const Scope = struct {
     /// owned storage. Capture continues to use the stable arena address.
     pub fn bindPublishedOutput(self: *Scope, pointer: DevicePointer, bytes: usize) !void {
         const slot = self.plan.output orelse return error.InvalidExecutionPlan;
-        if (self.base == 0 or !self.valid or self.cursor != 0 or self.published_ptr != 0 or
+        if (self.bound_start == 0 or !self.valid or self.cursor != 0 or self.published_ptr != 0 or
             pointer == 0 or pointer % alignment != 0 or bytes != self.plan.allocations[slot].bytes or
             pointer > std.math.maxInt(DevicePointer) - bytes) return error.InvalidExecutionPlan;
-        if (pointer < self.base + self.plan.peak and self.base < pointer + bytes) return error.InvalidExecutionPlan;
+        if (pointer < self.bound_end and self.bound_start < pointer + bytes) return error.InvalidExecutionPlan;
         self.published_ptr = pointer;
     }
 
@@ -228,13 +230,15 @@ test "stream workspace redirects only the sealed publication slot" {
     plan.release(0x1000);
     plan.allocate(64, 0x2000);
     try std.testing.expect(plan.finish(0x2000));
-    const layout = try plan.layout(0);
-    var scope = try Scope.bind(&plan, layout, 0x1000, layout.bytes);
+    const layout = try plan.layout(alignment);
+    var scope = try Scope.bind(&plan, layout, 0x1000, layout.bytes + alignment);
     try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x1000, 64));
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x1100, 64));
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x1200, 64));
     try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x2000, 32));
     try scope.bindPublishedOutput(0x2000, 64);
-    try std.testing.expectEqual(@as(DevicePointer, 0x1000), try scope.allocate(64));
-    scope.release(0x1000);
+    try std.testing.expectEqual(@as(DevicePointer, 0x1100), try scope.allocate(64));
+    scope.release(0x1100);
     try std.testing.expectEqual(@as(DevicePointer, 0x2000), try scope.allocate(64));
     try std.testing.expect(scope.complete());
     scope.release(0x2000);
