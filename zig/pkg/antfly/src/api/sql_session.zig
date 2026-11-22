@@ -134,6 +134,7 @@ pub const Adapter = struct {
     commit_context: *anyopaque,
     commit_fn: *const fn (*anyopaque, sql.Scope, transactions.Mutation) anyerror!sql.CommitResult,
     supports_range_guards: bool = false,
+    failed_commit_completion: @FieldType(operation.RequestContext, "sql_completion") = null,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
     connection_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
@@ -228,7 +229,12 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        if (!try self.registry.retireBeforeExecution(self.alloc, self.admitted.?, state.version, false))
+        if (self.failed_commit_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
+        const retired = self.registry.retireBeforeExecution(self.alloc, self.admitted.?, state.version, false) catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown => if (self.failed_commit_completion != null) return error.SqlTransactionOutcomeUnknown else return err,
+            else => return err,
+        };
+        if (!retired)
             return error.SqlTransactionOutcomeUnknown;
     }
 

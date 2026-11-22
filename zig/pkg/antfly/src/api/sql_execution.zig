@@ -403,6 +403,7 @@ pub const Adapter = struct {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             })) == .failed;
+            if (command == .commit) owner.failed_commit_completion = self.context.sql_completion;
             const outcome = (session.execute(command) catch |zig017_err| {
                 if (zig017_err == error.SqlTransactionOutcomeUnknown) {
                     if (session.transaction_id) |id| self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
