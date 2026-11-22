@@ -33,7 +33,6 @@ const Fixture = struct {
     bounded_embed: bool,
     block_next: std.atomic.Value(bool) = .init(false),
     release_block: std.atomic.Value(bool) = .init(false),
-    execution_gate: std.atomic.Mutex = .unlocked,
     active: std.atomic.Value(usize) = .init(0),
     cancelled: std.atomic.Value(usize) = .init(0),
     entered: std.atomic.Value(usize) = .init(0),
@@ -185,6 +184,7 @@ pub fn main(init: std.process.Init) !void {
         .allow_unknown_models = true,
         .process_termination_available = true,
         .max_concurrent_requests = 1,
+        .max_work_units = 64,
         .image_readers = hosted_readers,
     });
     defer node.deinit();
@@ -212,7 +212,6 @@ pub fn main(init: std.process.Init) !void {
         .session = .{
             .ptr = &fixture,
             .vtable = &Fixture.vtable,
-            .execution_gate = &fixture.execution_gate,
             .run_admission = .{
                 .controller = node.model_manager.resource_domain.?.admission,
                 .backend_class = .cpu,
@@ -227,6 +226,7 @@ pub fn main(init: std.process.Init) !void {
         .native_generation_graph_cache = inference.graph.cache.GraphCache.init(alloc),
         .pinned = true,
     };
+    try model.session.installOwnedExecutionGate(alloc);
     try node.model_manager.loaded.put(alloc, try alloc.dupe(u8, model_dir), model);
 
     var server = httpx.Server.initWithConfig(alloc, init.io, node.httpServerConfig("127.0.0.1", port));
