@@ -24164,10 +24164,12 @@ pub const Node = struct {
             queue.run();
             group.await(ctx.io) catch |err| return documentFailureResponse(ctx, err);
         }
-        if (queue.failure == error.OutOfMemory and wire_quota.exceeded)
-            return ctx.status(502).json(.{ .@"error" = "READER_WORKING_LIMIT_EXCEEDED" });
         if (queue.failure) |err| return switch (err) {
-            error.OutOfMemory, error.ReadOutputTruncated, error.DocumentUnresolved, error.Timeout, error.Cancelled, error.Canceled => documentFailureResponse(ctx, err),
+            error.OutOfMemory => if (wire_quota.exceeded)
+                ctx.status(502).json(.{ .@"error" = "READER_WORKING_LIMIT_EXCEEDED" })
+            else
+                documentFailureResponse(ctx, err),
+            error.ReadOutputTruncated, error.DocumentUnresolved, error.Timeout, error.Cancelled, error.Canceled => documentFailureResponse(ctx, err),
             error.InferenceInputTokensExceeded => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "image tokens exceed the deployment limit" }),
             error.InvalidReadExecutionReport => ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" }),
             error.InvalidHostedReaderResponse => ctx.status(502).json(.{ .@"error" = "INVALID_READER_RESPONSE" }),
