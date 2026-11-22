@@ -386,6 +386,22 @@ pub const SharedRedoOverlay = struct {
         }
     }
 
+    /// One past the highest page id a stamped page-shaped write at or before
+    /// `through` occupies (0 if none): the page bound a catch-up must adopt,
+    /// or its reads reject those pages and its next commit allocates them
+    /// again. This process's own unstamped staging is excluded.
+    pub fn pageBoundThrough(self: *SharedRedoOverlay, io: std.Io, through: u64) u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var bound: u64 = 0;
+        var it = self.page_sequences.iterator();
+        while (it.next()) |entry| {
+            const sequence = entry.value_ptr.*;
+            if (sequence != unstamped_page and sequence <= through) bound = @max(bound, entry.key_ptr.* + 1);
+        }
+        return bound;
+    }
+
     /// Stages (or replaces) a page-shaped write, keyed by page id. Takes
     /// ownership of `bytes`.
     pub fn appendPage(self: *SharedRedoOverlay, _: Allocator, io: std.Io, page_id: u64, bytes: []u8) !void {

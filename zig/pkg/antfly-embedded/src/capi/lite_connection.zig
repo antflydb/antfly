@@ -2883,11 +2883,9 @@ pub const Owner = struct {
         return true;
     }
 
-    /// Off until the serving file adopts another process's page-level state
-    /// too: its redo commits write page-shaped values past this file's
-    /// checkpoint `page_count`, which reads then reject (`InvalidPageId`,
-    /// 8-process indexed SQLite comparison).
-    const in_place_refresh_enabled = false;
+    /// `refreshCrossProcessRedoOverlay` adopts the page bound other
+    /// writers' commits raised (`SharedRedoOverlay.pageBoundThrough`).
+    const in_place_refresh_enabled = true;
 
     /// lite-index-write-path.md "Cross-process refresh": catches `root` up
     /// with commits other processes made since it last did, when those are
@@ -2905,6 +2903,9 @@ pub const Owner = struct {
         try file.refreshCrossProcessRedoOverlay();
         // A fold adopts records without decoding them into the overlay.
         if (redo.checkpoint_sequence != folded_before) return false;
+        // A slot another writer published without a fold is only visible
+        // to a fresh open.
+        if (probe.activeCheckpoint().page_count > file.activeCheckpoint().page_count) return false;
         if (file.committedSequence() < probe.committedSequence()) return false;
         const io = file.runtime();
         const shared = redo.shared;

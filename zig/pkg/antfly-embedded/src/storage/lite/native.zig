@@ -9860,6 +9860,15 @@ pub const NativeFile = struct {
             break :catch_up;
         }
 
+        // Other writers' commits allocated pages past this view's bound for
+        // their page-shaped values (each record's checkpoint carries the
+        // raised `page_count`, which a cold open adopts). Adopt it too, or
+        // reads reject those pages (`InvalidPageId`) and this file's next
+        // commit hands the same page ids out again.
+        const page_bound = redo.shared.pageBoundThrough(io, redo.durable_sequence);
+        if (page_bound > self.header.checkpoints[self.header.active_checkpoint].page_count)
+            self.header.checkpoints[self.header.active_checkpoint].page_count = page_bound;
+
         // Provisional bump, exactly as an ordinary redo commit already
         // does for its own writer: no real pages touched, just the
         // logical watermark overlay-aware reads compare against.
@@ -35607,6 +35616,41 @@ test "lite redo log cross-process refresh sees put, overwrite and delete made af
 
     // A refresh with nothing new is a clean no-op.
     try reader.refreshCrossProcessRedoOverlay();
+}
+
+// Another writer's page-shaped value (an external chain) lives in pages
+// past the reader's checkpoint `page_count`; a refresh must adopt the bound
+// those commits raised, or the read is rejected as `InvalidPageId`.
+test "lite redo log cross-process refresh reads another writer's page-shaped values" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-refresh-chain.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 1024 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+    const bound_before = reader.activeCheckpoint().page_count;
+
+    const large = try a.alloc(u8, 64 * 1024);
+    defer a.free(large);
+    for (large, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    try writer.beginTransaction();
+    try writer.putDocument("large", large);
+    try writer.commitTransaction();
+
+    try reader.refreshCrossProcessRedoOverlay();
+    try std.testing.expect(reader.activeCheckpoint().page_count > bound_before);
+    try std.testing.expect(reader.activeCheckpoint().page_count >= writer.activeCheckpoint().page_count);
+    const value = (try reader.getDocumentAlloc(a, "large")).?;
+    defer a.free(value);
+    try std.testing.expectEqualSlices(u8, large, value);
 }
 
 test "lite redo log cross-process refresh still sees a pinned reader's own writes across a checkpoint" {

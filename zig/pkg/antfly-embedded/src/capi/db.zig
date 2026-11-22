@@ -983,7 +983,13 @@ pub const HandleGuard = struct {
         // reacquire below only needs to take `connection.mutex` back.
         if (self.path_lease) |lease| {
             var owned = lease;
+            // The write still runs on this generation after its wait (an
+            // inline index install among it): keep it alive until `leave`,
+            // as `WriterLane.checkout`'s pin does for lane-managed writes.
+            const pinned = if (self.lane_pinned_root == null) connection.current else null;
+            if (pinned) |root| _ = root.lane_pins.fetchAdd(1, .acq_rel);
             if (connection.gate.mutex.retainForWaiter(io, &owned, connection.storeIdentity())) {
+                self.lane_pinned_root = pinned;
                 // Handing the lease to another same-process caller also
                 // hands it the right to call `refresh`/`pin` -> `attach` on
                 // this shared `Connection`, which asserts nothing is
@@ -999,7 +1005,7 @@ pub const HandleGuard = struct {
                 self.path_lease = null;
                 connection.gate.mutex.unlock(io);
                 self.connection_gate_held = false;
-            }
+            } else if (pinned) |root| _ = root.lane_pins.fetchSub(1, .release);
         }
         if (comptime builtin.is_test) if (test_writer_lane_release_hook) |hook| hook.notify(hook.ptr);
     }
@@ -1159,6 +1165,7 @@ pub const HandleGuard = struct {
             if (guard.read_slot) connection.owner.writer_lane.endRead();
             if (guard.connection_gate_held) connection.gate.mutex.unlock(io);
             if (writer_lane_owes_connection_mutex_release) connection.mutex.unlock(io);
+            if (guard.lane_pinned_root) |pinned| _ = pinned.lane_pins.fetchSub(1, .release);
             return;
         }
         switch (guard.access) {
