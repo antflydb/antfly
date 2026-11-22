@@ -16172,8 +16172,7 @@ const Bf16Projection = struct {
 fn roundedBf16ProjectionBytes(self: *CudaCompute, rows: usize, out_dim: usize) ?usize {
     if ((!self.lighton_bf16_decode_outputs and !self.lighton_bf16_projection_outputs) or self.capability_profile != .lightonocr3 or
         self.lazy_host_store != null or self.resident_training_cache or
-        !lightOnDevice(self).tensorCores() or rows == 0 or rows > (if (self.lighton_bf16_projection_outputs) @as(usize, 8192) else 64) or
-        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+        !lightOnDevice(self).tensorCores() or rows == 0 or rows > (if (self.lighton_bf16_projection_outputs) @as(usize, 8192) else 64)) return null;
     const count = checkedMul(rows, out_dim) catch return null;
     const bytes = checkedMul(count, 2) catch return null;
     if (count > std.math.maxInt(u32)) return null;
@@ -16189,6 +16188,7 @@ fn roundedBf16ProjectionCapacity(self: *CudaCompute, bytes: usize) bool {
     return existing.ptr == 0 or existing.len >= bytes;
 }
 fn prepareRoundedBf16Projection(self: *CudaCompute, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) !?Bf16Projection {
+    if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
     const bytes = roundedBf16ProjectionBytes(self, rows, out_dim) orelse return null;
     const count = bytes / 2;
     try buffer_mod.validateRegions(4, .{ input, weight, workspace, dst }, .{ try checkedMul(try checkedMul(rows, in_dim), 2), try checkedMul(try checkedMul(out_dim, in_dim), 2), workspace.len, try checkedMul(count, 4) }, .{ 2, 2, 256, 4 }, 3);
@@ -47153,6 +47153,8 @@ const PreparedCudaProjection = struct {
         if (!equivalent(actual, self.profile)) return error.PreparedKernelBindingChanged;
         if (invocation.output == null) return true; // All metadata matched before admission.
         const p = self.profile;
+        const recording = self.compute.debug_cuda_graph_capture_active or self.compute.ctx.debug_graph_capture_active;
+        if (recording and p.rounded_output_bytes != 0 and p.activation_mirror) return error.PreparedKernelBindingChanged;
         const g = p.geometry;
         const output = try self.outputBuffer(invocation);
         const input = tensorFromCt(invocation.inputs[0]);
@@ -47178,7 +47180,9 @@ const PreparedCudaProjection = struct {
             const call = try self.buffers(invocation);
             try resources.vendor.validate(call);
             try self.stage(invocation);
-            errdefer if (p.rounded_output_bytes != 0) self.compute.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+            // On a recording error the capture owner must abort before any
+            // stream wait. Ordinary dispatch retains its failure fence.
+            errdefer if (p.rounded_output_bytes != 0 and !recording) self.compute.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
             const selection = try resources.vendor.submit(&self.compute.ctx, call);
             if (p.rounded_output_bytes != 0) {
                 try self.compute.scalar_clamp_kernel.widen16Bit(&self.compute.ctx, call.dst.ptr, output.ptr, p.rounded_output_bytes / 2, true);
@@ -47330,7 +47334,7 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kerne
     // and all auxiliary output planes are empty. Padded physical rows remain
     // in the declared primary span. The source/profile is still invocation-
     // validated by matches/run; no model Tensor plane inherits this authority.
-    return route.Owned{ .context = owner, .output_plane_metadata = .assigned_dense, .implementation = .{ .context = implementation.context, .table = implementation.table, .policy_epoch = key }, .key = key, .requirements = .{ .primary_bytes = profile.primary_bytes, .primary_alignment = if (cold_recipe != null) @as(u32, @intCast(buffer_mod.DeviceBuffer.allocation_alignment)) else 1, .profile = @backingInt(profile.family), .workspace = .{ .byte_size = profile.workspace_bytes, .alignment = 256 }, .probe_output = if (cold_recipe == null and PreparedCudaProjection.isVendor(profile)) .assigned_unpublished else .none, .capture = if (profile.rounded_output_bytes != 0 or (profile.family == .f32_direct and profile.workspace_bytes == 0 and !usesGraphPortableMatmul(self, profile.geometry.rows, profile.geometry.width, profile.geometry.columns))) .unsupported else .supported }, .vtable = &PreparedCudaProjection.vtable };
+    return route.Owned{ .context = owner, .output_plane_metadata = .assigned_dense, .implementation = .{ .context = implementation.context, .table = implementation.table, .policy_epoch = key }, .key = key, .requirements = .{ .primary_bytes = profile.primary_bytes, .primary_alignment = if (cold_recipe != null) @as(u32, @intCast(buffer_mod.DeviceBuffer.allocation_alignment)) else 1, .profile = @backingInt(profile.family), .workspace = .{ .byte_size = profile.workspace_bytes, .alignment = 256 }, .probe_output = if (cold_recipe == null and PreparedCudaProjection.isVendor(profile)) .assigned_unpublished else .none, .capture = if ((profile.rounded_output_bytes != 0 and profile.activation_mirror) or (profile.family == .f32_direct and profile.workspace_bytes == 0 and !usesGraphPortableMatmul(self, profile.geometry.rows, profile.geometry.width, profile.geometry.columns))) .unsupported else .supported }, .vtable = &PreparedCudaProjection.vtable };
 }
 /// Strict F32 primitive contractions keep their original matrix-axis flags.
 /// Batched dots and transposed-LHS matrices already use this same kernel;
@@ -47717,7 +47721,7 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                     if (format == .bf16_rounded) {
                         try std.testing.expectEqual(program.profile.physical_rows * columns * 2, program.profile.rounded_output_bytes);
                         try std.testing.expectEqual(cublaslt_mod.CublasLt.DensePrecision.bf16, coldProjectionLayout(&compute, facts[0..descriptor.input_count], program.profile, null).?.request.output_precision);
-                        try std.testing.expect(selected.requirements.capture == .unsupported);
+                        try std.testing.expect(selected.requirements.capture == .supported);
                     }
                     try std.testing.expect(selected.requirements.probe_output == .none);
                 }
@@ -47774,21 +47778,15 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                 try std.testing.expect(vendor.tensor_core_plans.count() > 0);
                 try std.testing.expect(try vendor.reserveTensorCorePlanSlots(&compute.ctx, vendor.plan_cache_capacity));
                 try std.testing.expectEqual(@as(usize, 0), vendor.tensor_core_plans.count());
-                if (format == .bf16_rounded) {
-                    // The original rounded producer is ordinary-only. Reuse
-                    // its owned vendor descriptors after REAL cache eviction.
-                    try std.testing.expect(try runAssignedKernelOp(&compute, invocation));
-                } else {
-                    const replay = (try createPhysicalReplayOp(&compute)).?;
-                    defer replay.deinit();
-                    try std.testing.expect(try replay.begin(&.{ output_lease, workspace_lease }));
-                    var recording = true;
-                    errdefer if (recording) replay.abort();
-                    try std.testing.expect(try runAssignedKernelOp(&compute, invocation));
-                    try replay.commit();
-                    recording = false;
-                    try replay.launch();
-                }
+                const replay = (try createPhysicalReplayOp(&compute)).?;
+                defer replay.deinit();
+                try std.testing.expect(try replay.begin(&.{ output_lease, workspace_lease }));
+                var recording = true;
+                errdefer if (recording) replay.abort();
+                try std.testing.expect(try runAssignedKernelOp(&compute, invocation));
+                try replay.commit();
+                recording = false;
+                try replay.launch();
                 try compute.ctx.synchronize();
                 const actual = try cb.toFloat32(output, a);
                 defer a.free(actual);
@@ -58787,7 +58785,8 @@ test "CUDA rounded projection declares reduced output separately and refuses col
     try std.testing.expect((try prepareKernelRouteOp(&compute, request)) == null);
     try std.testing.expect(!denied.has_induced_failure);
     compute.debug_cuda_graph_capture_active = true;
-    try std.testing.expect((try PreparedCudaProjection.select(&compute, &descriptor, &bindings)) == null);
+    const recording_profile = (try PreparedCudaProjection.select(&compute, &descriptor, &bindings)) orelse return error.MissingRoundedProjection;
+    try std.testing.expect(PreparedCudaProjection.equivalent(profile, recording_profile));
     compute.debug_cuda_graph_capture_active = false;
     compute.auxiliaryCache(.rounded_bf16_output).device = .{ .ptr = 65536, .len = profile.rounded_output_bytes - 1 };
     try std.testing.expect(!roundedBf16ProjectionCapacity(&compute, profile.rounded_output_bytes));
