@@ -76,7 +76,7 @@ pub const Command = struct {
         if (!observed.record.intents_resolved or observed.record.source_scope == null or !same(observed.record.source_scope.?, self.intent.reference) or observed.record.source_purpose == null or !same(observed.record.source_purpose.?, self.intent.source_purpose) or !same(observed.admission.digest, self.intent.admission_digest)) return error.SourceTransactionIdentityConflict;
         const plan = observed.admission.admission;
         try plan.requireRoutedOwner(self.intent.owner);
-        const coordinator = try plan.member(plan.coordinator_namespace);
+        const coordinator = try plan.coordinatorMember();
         if (coordinator.roles & completion.Roles.checkpoint == 0) return error.InvalidSourceAdmission;
         return .{ .root = try scope.Basis.fromOwner(self.intent.owner), .coordinator = try scope.Basis.fromOwner(coordinator.routed_owner.?), .slot = .{ .reference = self.intent.reference, .transaction_id = plan.transaction_id, .source_purpose = self.intent.source_purpose, .admission_digest = observed.admission.digest }, .coordinator_record_digest = observed.record.digest };
     }

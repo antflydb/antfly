@@ -54,7 +54,7 @@ pub const Authority = struct {
         // The supplied locator chooses a route, not authority. The original
         // retained coordinator membership must name exactly that locator.
         const admission = observation.value.decision.?.admission.admission;
-        const member = try admission.member(admission.coordinator_namespace);
+        const member = try admission.coordinatorMember();
         if (!std.mem.eql(u8, member.locator, coordinator_locator)) return error.SourceTransactionIdentityConflict;
         try budget.checkpoint();
         try context.ensureActive();

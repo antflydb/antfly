@@ -75,7 +75,7 @@ pub const Reply = struct {
             if (request.operation == .submit) {
                 if (!std.meta.eql(command.intent, request.intent.?)) return error.SourceAdmissionCorrupt;
                 const admission = command.observation.decision.?.admission.admission;
-                const member = try admission.member(admission.coordinator_namespace);
+                const member = try admission.coordinatorMember();
                 if (!std.mem.eql(u8, member.locator, request.coordinator_locator.?)) return error.SourceAdmissionCorrupt;
             }
             if (self.receipt) |cut| {

@@ -4114,7 +4114,7 @@ pub fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8
         if (binding.topology_epoch != topology_epoch) return error.InvalidBatchRequest;
     } else if (owner != null) return error.InvalidBatchRequest;
     if (!std.mem.eql(u8, &admission.transaction_id, &id) or participants.len != admission.participants.len) return error.InvalidBatchRequest;
-    const coordinator = try admission.member(admission.coordinator_namespace);
+    const coordinator = try admission.coordinatorMember();
     if (!std.mem.eql(u8, participants[0], coordinator.locator)) return error.InvalidBatchRequest;
     var index: usize = 1;
     for (admission.participants) |member| {

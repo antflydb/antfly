@@ -177,8 +177,7 @@ pub const Admission = struct {
             } else if (participant.routed_owner != null) return error.InvalidTxnRecord;
             if (i != 0 and std.mem.order(u8, &self.participants[i - 1].namespace, &participant.namespace) != .lt) return error.InvalidTxnRecord;
         }
-        const coordinator = self.find(self.coordinator_namespace) orelse return error.InvalidTxnRecord;
-        if (!same(coordinator.owner_fence, self.coordinator_fence)) return error.InvalidTxnRecord;
+        _ = self.findFenced(self.coordinator_namespace, self.coordinator_fence) orelse return error.InvalidTxnRecord;
     }
     fn find(self: Admission, namespace: Namespace) ?Participant {
         var low: usize = 0;
@@ -193,6 +192,17 @@ pub const Admission = struct {
         }
         return null;
     }
+    fn findFenced(self: Admission, namespace: Namespace, owner_fence: Digest) ?Participant {
+        for (self.participants) |participant| {
+            if (same(participant.namespace, namespace) and same(participant.owner_fence, owner_fence))
+                return participant;
+        }
+        return null;
+    }
+    pub fn coordinatorMember(self: Admission) !Participant {
+        try self.validate();
+        return self.findFenced(self.coordinator_namespace, self.coordinator_fence) orelse error.InvalidParticipant;
+    }
     pub fn member(self: Admission, namespace: Namespace) !Participant {
         try self.validate();
         return self.find(namespace) orelse error.InvalidParticipant;
@@ -201,8 +211,9 @@ pub const Admission = struct {
         try self.validate();
         try owner.validate();
         if (self.version < 2) return error.ChangefeedCapabilityUnsupported;
-        const participant = try self.member(owner.namespace);
-        if (!same(participant.owner_fence, owner.digest())) return error.TopologyChanged;
+        if (self.findFenced(owner.namespace, owner.digest()) != null) return;
+        if (self.find(owner.namespace) == null) return error.InvalidParticipant;
+        return error.TopologyChanged;
     }
     /// Recovery may use this identity only with its original authoritative
     /// route fence and retained native evidence; it is not a fresh owner lease.

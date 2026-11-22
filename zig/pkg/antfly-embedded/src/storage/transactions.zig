@@ -636,7 +636,7 @@ pub const TxnManager = struct {
         const scratch = arena.allocator();
         var members: std.ArrayList([]const u8) = .empty;
         var unique: std.StringHashMapUnmanaged(void) = .empty;
-        const owner = try admission.member(admission.coordinator_namespace);
+        const owner = try admission.coordinatorMember();
         try members.append(scratch, owner.locator);
         for (admission.participants) |participant| {
             const member = try unique.getOrPut(scratch, participant.locator);
@@ -1455,7 +1455,7 @@ pub const TxnManager = struct {
                         defer self.alloc.free(namespace);
                         if (!std.mem.eql(u8, namespace, &owner.namespace)) return error.InvalidParticipant;
                         const local = try admission.value.admission.member(owner.namespace);
-                        const coordinator = try admission.value.admission.member(admission.value.admission.coordinator_namespace);
+                        const coordinator = try admission.value.admission.coordinatorMember();
                         if (participants.len == 1 and std.mem.eql(u8, participants[0], coordinator.locator) and std.mem.eql(u8, participant, local.locator)) {
                             durable_participant = participants[0];
                             enlisted = true;
@@ -3526,7 +3526,7 @@ pub const TxnManager = struct {
             const namespace = try batch.get(&internal_keys.identity_namespace_key);
             if (namespace.len != 24) return error.InvalidTxnRecord;
             const member = try admission.member(namespace[0..24].*);
-            const coordinator = try admission.member(admission.coordinator_namespace);
+            const coordinator = try admission.coordinatorMember();
             if (coordinator.roles & completion.Roles.checkpoint == 0 or next.coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return error.InvalidParticipant;
             const root = try source_scope.Basis.fromOwner(member.routed_owner.?);
             try producer_policy.Store.require(scope_arena.allocator(), &batch, root, .scoped_source);
@@ -3948,7 +3948,7 @@ pub fn completionAcknowledgmentsPending(read: anytype, admission: completion.Adm
     if (index.resolved == index.enlisted) return false;
     if (!retain_terminal or index.enlisted - index.resolved != 1) return true;
 
-    const coordinator = try admission.member(admission.coordinator_namespace);
+    const coordinator = try admission.coordinatorMember();
     const ack_key = makeParticipantIndexKey(resolved_index_prefix, txn_id, coordinator.locator);
     const ack = read.get(&ack_key) catch |err| switch (err) {
         error.NotFound => return false,

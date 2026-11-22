@@ -131,7 +131,7 @@ pub const Port = struct {
         if (!decision.record.acknowledgments_pending) return;
         const admission = decision.admission.admission;
         const owner = try admission.recoveryOwner(admission.coordinator_namespace);
-        const coordinator = try admission.member(admission.coordinator_namespace);
+        const coordinator = try admission.coordinatorMember();
         const locator = local.api_local_transaction_contract.parseParticipantRef(coordinator.locator) orelse return error.InvalidParticipant;
         try validateParticipantFence(owner, locator.group_id, fence);
         var pending: [64][]const u8 = undefined;
@@ -168,7 +168,7 @@ pub const Port = struct {
         if (cutoff_ns == 0 or timestamp_ns < cutoff_ns or decision.record.status != .pending or decision.record.created_at_ns >= cutoff_ns) return error.SourceOutcomeUnresolved;
         if (decision.record.source_purpose != null) return error.SourceOutcomeUnresolved;
         const admission = decision.admission.admission;
-        const member = try admission.member(admission.coordinator_namespace);
+        const member = try admission.coordinatorMember();
         const owner = try admission.recoveryOwner(member.namespace);
         const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
         try validateParticipantFence(owner, locator.group_id, fence);

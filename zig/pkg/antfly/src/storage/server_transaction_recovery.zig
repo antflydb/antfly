@@ -159,7 +159,7 @@ fn runRecoveryPageWithConfig(
                 summary.recovery.deferred_unresolved += 1;
                 continue;
             }
-            const coordinator = try admission.member(admission.coordinator_namespace);
+            const coordinator = try admission.coordinatorMember();
             if (config.owns_recovery_fn) |owns| if (!owns(config.resolver_ctx.?, coordinator.locator)) continue;
             const enqueue = config.enqueue_completion_fn orelse {
                 summary.recovery.deferred_unresolved += 1;

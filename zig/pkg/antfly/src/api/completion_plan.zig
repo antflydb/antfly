@@ -130,6 +130,12 @@ pub const Plan = struct {
             }
         }
         const admission: completion.Admission = .{ .version = 3, .transaction_id = transaction_id, .admission_digest = admission_digest, .coordinator_namespace = coordinator.namespace, .coordinator_fence = coordinator.digest(), .participants = members };
+        errdefer for (members[1..], members[0 .. members.len - 1]) |right, left| {
+            if (std.mem.eql(u8, &left.namespace, &right.namespace))
+                std.log.debug("completion plan shares storage namespace across participant groups left={} right={}", .{
+                    left.routed_owner.?.group_id, right.routed_owner.?.group_id,
+                });
+        };
         try admission.validate();
         try admission.requireRoutedOwner(coordinator);
         const encoded = try completion.encodeAdmission(owned, admission);
@@ -137,7 +143,7 @@ pub const Plan = struct {
         const ids = try owned.alloc([]const u8, participants.len);
         // The admission uses namespace order. Existing transaction recovery
         // locators instead require coordinator first, then canonical followers.
-        ids[0] = (try admission.member(coordinator.namespace)).locator;
+        ids[0] = (try admission.coordinatorMember()).locator;
         var follower: usize = 1;
         for (participants) |participant| {
             if (std.mem.eql(u8, &participant.owner.namespace, &coordinator.namespace)) continue;
@@ -169,7 +175,7 @@ pub const Plan = struct {
         var parsed_admission = try completion.parseAdmission(a, self.admission_bytes);
         defer parsed_admission.deinit();
         if (!std.mem.eql(u8, &parsed_admission.value.digest, &self.admission.digest())) return error.SourcePayloadConflict;
-        if (self.participant_ids.len != self.participants.len or !std.mem.eql(u8, self.participant_ids[0], (try self.admission.member(self.admission.coordinator_namespace)).locator)) return error.InvalidParticipant;
+        if (self.participant_ids.len != self.participants.len or !std.mem.eql(u8, self.participant_ids[0], (try self.admission.coordinatorMember()).locator)) return error.InvalidParticipant;
         var follower: usize = 1;
         var checkpoints: usize = 0;
         var has_checkpoint_command = false;
@@ -199,7 +205,7 @@ pub const Plan = struct {
         if (self.source_scope) |scope| {
             try scope.validate();
             if (self.source_purpose == null or !has_checkpoint_command or !has_checkpoint_receipts) return error.InvalidSourceAdmission;
-            const coordinator = try self.admission.member(self.admission.coordinator_namespace);
+            const coordinator = try self.admission.coordinatorMember();
             if (coordinator.roles & completion.Roles.checkpoint == 0) return error.InvalidSourceAdmission;
         }
         var size: usize = frozen_header_bytes + self.admission_bytes.len;
