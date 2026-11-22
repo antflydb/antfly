@@ -15709,6 +15709,14 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         const completion = try AntflyApiHandler.requestCompletion(&ctx);
         try std.testing.expect(!completion.unknown);
         try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+        var retry_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer retry_ctx.deinit();
+        var retry_response = try handler.executeSQL(&retry_ctx);
+        defer retry_response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), retry_response.status.code);
+        const retried = try AntflyApiHandler.requestCompletion(&retry_ctx);
+        try std.testing.expectEqual(@as(usize, 1), retried.outcomes.items.len);
+        try std.testing.expectEqualStrings(completion.outcomes.items[0].reference_id.?, retried.outcomes.items[0].reference_id.?);
     }
     _ = try connections.mutate(&durable, .{ .uncertain = .{ .id = id, .guard = guard } }, principal, node, now_ms);
     var blocked_read = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "SELECT 1");

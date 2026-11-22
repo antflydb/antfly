@@ -4135,6 +4135,7 @@ pub const ApiHttpServer = struct {
     sql_settlement_active: std.atomic.Value(bool) = .init(false),
     sql_completion_owner_active: std.atomic.Value(bool) = .init(false),
     sql_completion_recovery_after: u64 = 0,
+    sql_observation_retirement_after: u64 = 0,
     sql_completion_consumer_active: std.atomic.Value(bool) = .init(false),
     write_admission: RequestAdmission,
     inference_admission: RequestAdmission,
@@ -5660,6 +5661,9 @@ pub const ApiHttpServer = struct {
     fn runLocalSessionMaintenanceOnce(self: *ApiHttpServer) !void {
         @import("sql_completion.zig").recoverUnpublished(self, self.alloc, 32) catch |err| {
             std.log.warn("unpublished SQL completion cleanup deferred err={s}", .{@errorName(err)});
+        };
+        @import("sql_completion.zig").retireSettledObservations(self, self.alloc, 64) catch |err| {
+            std.log.warn("SQL completion observation retirement deferred err={s}", .{@errorName(err)});
         };
         self.retryPendingTransactionRecovery(32) catch |err| {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});

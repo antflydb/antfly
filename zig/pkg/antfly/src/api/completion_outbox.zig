@@ -27,6 +27,7 @@ pub const Record = struct {
     prepared: bool = false,
     execution_admitted: bool = false,
     joined: bool = false,
+    observation: ?bool = null,
 };
 pub const RecoveryPage = struct { references: [][16]u8, after: u64 };
 // Node-local stores retain their original namespace (issuer zero). Shared
@@ -50,6 +51,7 @@ pub const Namespace = struct {
         errdefer references.deinit(alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
+        cursor.setKeysOnly();
         var buf: [128]u8 = undefined;
         const lower = try std.fmt.bufPrint(&buf, "{s}{x:0>16}", .{ entry_prefix, after +| 1 });
         var row = try cursor.seekAtOrAfter(lower);
@@ -114,7 +116,7 @@ pub const Namespace = struct {
     }
     pub fn put(self: Namespace, txn: anytype, alloc: std.mem.Allocator, reference: [16]u8, record: Record) !void {
         var buf: [128]u8 = undefined;
-        const value = try std.json.Stringify.valueAlloc(alloc, record, .{});
+        const value = try std.json.Stringify.valueAlloc(alloc, record, .{ .emit_null_optional_fields = false });
         defer alloc.free(value);
         try txn.put(try self.key(&buf, reference), value);
     }

@@ -1844,8 +1844,23 @@ pub const DurableSessionStore = struct {
         create: struct { seed: [8]u8, outcome: @import("../pgwire/completion.zig").Outcome, reserved: bool = false, prepared: bool = false, local_transaction_id: ?[16]u8 = null, observe_only: bool = false },
         put: struct { reference: [16]u8, record: Outbox.Record },
         remove: [16]u8,
+        join: [16]u8,
         retire_local: struct { reference: [16]u8, transaction_id: [16]u8 },
     };
+    fn observationRegistrationKey(self: *const DurableSessionStore, id: [16]u8, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__sql_completion_observation__:{x:0>16}:{s}", .{
+            self.registration_issuer orelse 0,
+            &std.fmt.bytesToHex(id, .lower),
+        });
+    }
+
+    fn removeObservedRegistrationTxn(self: *DurableSessionStore, txn: anytype, id: [16]u8, reference: [16]u8) !void {
+        var buf: [128]u8 = undefined;
+        const key = try self.observationRegistrationKey(id, &buf);
+        const current = txn.get(key) catch |err| if (err == error.NotFound) return else return err;
+        if (std.mem.eql(u8, current, &reference)) try txn.delete(key);
+    }
+
     fn registrationMutationTxn(self: *DurableSessionStore, txn: anytype, action: RegistrationMutation) ![16]u8 {
         if (self.registration_recovery_before == null)
             self.registration_recovery_before = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).next;
@@ -1854,6 +1869,17 @@ pub const DurableSessionStore = struct {
                 if (value.reserved and self.reserved_registrations == 0) return error.SessionLimitExceeded;
                 const held = self.reserved_registrations - @as(usize, if (value.reserved) 1 else 0);
                 if (try self.registrationOutbox().available(txn, self.alloc) <= held) return error.SessionLimitExceeded;
+                var observation_buf: [128]u8 = undefined;
+                const observation_key = if (value.observe_only) try self.observationRegistrationKey(value.local_transaction_id.?, &observation_buf) else null;
+                if (observation_key) |key| {
+                    if (txn.get(key)) |previous| {
+                        if (previous.len != 16) return error.InvalidTransactionSessionRecord;
+                        const reference = previous[0..16].*;
+                        var current = (try self.registrationOutbox().load(txn, self.alloc, reference)) orelse return error.InvalidTransactionSessionRecord;
+                        defer current.deinit();
+                        return reference;
+                    } else |err| if (err != error.NotFound) return err;
+                }
                 const floor = (try self.registrationOutbox().producer(txn, self.alloc, value.seed)).retired_through;
                 const reference = try self.registrationOutbox().create(txn, self.alloc, value.seed, value.outcome, value.prepared);
                 var issuer_fence_buf: [128]u8 = undefined;
@@ -1868,15 +1894,36 @@ pub const DurableSessionStore = struct {
                     // Fold the local handoff into the intent allocation batch:
                     // no remote RPC or intermediate WAL commits are necessary.
                     _ = try self.completionReferenceTxn(txn, id, reference, false, floor, if (value.observe_only) .observe else .prepare);
-                    try self.registrationOutbox().put(txn, self.alloc, reference, .{ .outcome = value.outcome, .prepared = true, .execution_admitted = true, .phase = .registered });
+                    try self.registrationOutbox().put(txn, self.alloc, reference, .{ .outcome = value.outcome, .prepared = true, .execution_admitted = true, .phase = .registered, .observation = if (value.observe_only) true else null });
                 }
+                if (observation_key) |key| try txn.put(key, &reference);
                 return reference;
             },
             .put => |value| try self.registrationOutbox().put(txn, self.alloc, value.reference, value.record),
-            .remove => |reference| try self.registrationOutbox().remove(txn, self.alloc, reference),
+            .remove => |reference| {
+                if (try self.registrationOutbox().load(txn, self.alloc, reference)) |loaded| {
+                    var previous = loaded;
+                    defer previous.deinit();
+                    if (previous.value.observation orelse false) {
+                        const id = try distributed_txn.parseTxnIdHex(previous.value.outcome.transaction_id.?);
+                        try self.removeObservedRegistrationTxn(txn, id, reference);
+                    }
+                }
+                try self.registrationOutbox().remove(txn, self.alloc, reference);
+            },
+            .join => |reference| {
+                var record = (try self.registrationOutbox().load(txn, self.alloc, reference)) orelse return @splat(0);
+                defer record.deinit();
+                if (!record.value.joined) {
+                    record.value.joined = true;
+                    try self.registrationOutbox().put(txn, self.alloc, reference, record.value);
+                }
+                return reference;
+            },
             .retire_local => |value| {
                 const floor = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).retired_through;
                 if (!try self.completionReferenceTxn(txn, value.transaction_id, value.reference, true, floor, .pin)) return error.CompletionUnavailable;
+                try self.removeObservedRegistrationTxn(txn, value.transaction_id, value.reference);
                 try self.registrationOutbox().remove(txn, self.alloc, value.reference);
             },
         }
@@ -1954,6 +2001,11 @@ pub const DurableSessionStore = struct {
     pub fn putRegistration(self: *DurableSessionStore, reference: [16]u8, record: Outbox.Record) !void {
         _ = try self.registrationMutation(.{ .put = .{ .reference = reference, .record = record } });
     }
+    pub fn joinRegistration(self: *DurableSessionStore, reference: [16]u8) !bool {
+        const joined = try self.registrationMutation(.{ .join = reference });
+        return std.mem.eql(u8, &joined, &reference);
+    }
+
     pub fn removeRegistration(self: *DurableSessionStore, reference: [16]u8) !void {
         _ = try self.registrationMutation(.{ .remove = reference });
     }
@@ -1972,6 +2024,14 @@ pub const DurableSessionStore = struct {
         };
     }
     pub fn registrationRecoveryPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize) !Outbox.RecoveryPage {
+        return self.scanRegistrationPage(alloc, after, limit, false);
+    }
+
+    pub fn observationRetirementPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize) !Outbox.RecoveryPage {
+        return self.scanRegistrationPage(alloc, after, limit, true);
+    }
+
+    fn scanRegistrationPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize, current: bool) !Outbox.RecoveryPage {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
@@ -1980,13 +2040,15 @@ pub const DurableSessionStore = struct {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
                 if (self.registration_recovery_before == null) self.registration_recovery_before = (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next;
-                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
+                const before = if (current) (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next else self.registration_recovery_before.?;
+                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, before, after, limit);
             },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
                 if (self.registration_recovery_before == null) self.registration_recovery_before = (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next;
-                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
+                const before = if (current) (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next else self.registration_recovery_before.?;
+                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, before, after, limit);
             },
         };
     }
@@ -2527,31 +2589,28 @@ pub const DurableSessionStore = struct {
         return true;
     }
 
-    fn maintainTaggedSqlPage(self: *DurableSessionStore, ids: []const db_mod.types.TxnId, cutoff: ?u64, removed: *std.AutoHashMapUnmanaged(db_mod.types.TxnId, void)) !void {
-        if (ids.len == 0) return;
+    fn maintainTaggedSqlPage(self: *DurableSessionStore, ids: []const db_mod.types.TxnId, cutoff: ?u64, removed: *std.AutoHashMapUnmanaged(db_mod.types.TxnId, void)) !usize {
+        if (ids.len == 0) return 0;
         const mutation = self.mutationMutex();
-        var remaining = ids;
-        while (remaining.len != 0) {
-            platform_sync.lockYielding(mutation);
-            defer mutation.unlock();
-            const batch = switch (self.backend) {
-                .docstore => |store| result: {
-                    var txn = try store.beginWriteTxn();
-                    errdefer txn.abort();
-                    const batch = try self.maintainTaggedSqlPageTxn(&txn, remaining, cutoff, removed);
-                    if (batch.changed) try txn.commit() else txn.abort();
-                    break :result batch;
-                },
-                .runtime => |store| result: {
-                    var txn = try store.beginWrite();
-                    errdefer txn.abort();
-                    const batch = try self.maintainTaggedSqlPageTxn(&txn, remaining, cutoff, removed);
-                    if (batch.changed) try txn.commit() else txn.abort();
-                    break :result batch;
-                },
-            };
-            remaining = remaining[batch.consumed..];
-        }
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        const batch = switch (self.backend) {
+            .docstore => |store| result: {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const batch = try self.maintainTaggedSqlPageTxn(&txn, ids, cutoff, removed);
+                if (batch.changed) try txn.commit() else txn.abort();
+                break :result batch;
+            },
+            .runtime => |store| result: {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                const batch = try self.maintainTaggedSqlPageTxn(&txn, ids, cutoff, removed);
+                if (batch.changed) try txn.commit() else txn.abort();
+                break :result batch;
+            },
+        };
+        return batch.consumed;
     }
 
     const TaggedSqlBatch = struct { consumed: usize = 0, changed: bool = false };
@@ -2912,7 +2971,7 @@ pub const DurableSessionStore = struct {
         return true;
     }
 
-    fn scanExpiredIds(self: *DurableSessionStore, alloc: std.mem.Allocator, prefix: []const u8, after: ?ParsedSessionExpiryKey, cutoff_ns: u64, limit: usize) !struct { ids: []db_mod.types.TxnId, next_after: ?ParsedSessionExpiryKey } {
+    fn scanExpiredIds(self: *DurableSessionStore, alloc: std.mem.Allocator, prefix: []const u8, after: ?ParsedSessionExpiryKey, cutoff_ns: u64, limit: usize, positions: ?*std.ArrayListUnmanaged(ParsedSessionExpiryKey)) !struct { ids: []db_mod.types.TxnId, next_after: ?ParsedSessionExpiryKey } {
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         errdefer ids.deinit(alloc);
         const Scan = struct {
@@ -2921,17 +2980,19 @@ pub const DurableSessionStore = struct {
             cutoff: u64,
             limit: usize,
             ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
+            positions: ?*std.ArrayListUnmanaged(ParsedSessionExpiryKey),
             next_after: ?ParsedSessionExpiryKey = null,
             fn visit(raw: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
                 const parsed = parseExpiryKey(scan.prefix, key) orelse return true;
                 if (parsed.timestamp >= scan.cutoff or scan.ids.items.len >= scan.limit) return false;
                 try scan.ids.append(scan.allocator, parsed.txn_id);
+                if (scan.positions) |keys| try keys.append(scan.allocator, parsed);
                 if (scan.ids.items.len == scan.limit) scan.next_after = parsed;
                 return scan.next_after == null;
             }
         };
-        var scan = Scan{ .allocator = alloc, .prefix = prefix, .cutoff = cutoff_ns, .limit = limit, .ids = &ids };
+        var scan = Scan{ .allocator = alloc, .prefix = prefix, .cutoff = cutoff_ns, .limit = limit, .ids = &ids, .positions = positions };
         const start = if (after) |key| try makeExpiryKey(alloc, prefix, key.timestamp, key.txn_id) else null;
         defer if (start) |key| alloc.free(key);
         try self.scanPrefixFromWithContext(prefix, start, &scan, Scan.visit);
@@ -5444,8 +5505,12 @@ pub const SessionRegistry = struct {
         if (index_only) {
             var removed: std.AutoHashMapUnmanaged(db_mod.types.TxnId, void) = .empty;
             defer removed.deinit(durable.alloc);
-            try durable.maintainTaggedSqlPage(page.ids[0..page.candidates], null, &removed);
-            try durable.advanceTaggedSqlBackfill(persisted_position, if (page.more) page.last.items else "");
+            const consumed = try durable.maintainTaggedSqlPage(page.ids[0..page.candidates], null, &removed);
+            if (consumed < page.candidates) {
+                const key = try makeSessionKey(durable.alloc, page.ids[consumed - 1]);
+                defer durable.alloc.free(key);
+                try durable.advanceTaggedSqlBackfill(persisted_position, key);
+            } else try durable.advanceTaggedSqlBackfill(persisted_position, if (page.more) page.last.items else "");
             return;
         } else for (page.ids[0..page.candidates]) |id| {
             const stripe = self.sessionLock(id);
@@ -5543,7 +5608,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         const after = self.sql_abort_expiry_cursor;
         self.mutex.unlock();
-        const page = try durable.scanExpiredIds(alloc, sql_abort_expiry_prefix, after, cutoff_ns, 128);
+        const page = try durable.scanExpiredIds(alloc, sql_abort_expiry_prefix, after, cutoff_ns, 128, null);
         defer alloc.free(page.ids);
         const removed = try durable.expireSqlAbortReceiptPage(page.ids, cutoff_ns);
         self.mutex.lock();
@@ -5567,16 +5632,19 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         const after = self.tagged_sql_expiry_cursor;
         self.mutex.unlock();
-        const page = try durable.scanExpiredIds(alloc, tagged_sql_expiry_prefix, after, cutoff_ns, 128);
+        var positions: std.ArrayListUnmanaged(ParsedSessionExpiryKey) = .empty;
+        defer positions.deinit(alloc);
+        const page = try durable.scanExpiredIds(alloc, tagged_sql_expiry_prefix, after, cutoff_ns, 128, &positions);
         defer alloc.free(page.ids);
         var removed: std.AutoHashMapUnmanaged(db_mod.types.TxnId, void) = .empty;
         defer removed.deinit(durable.alloc);
-        try durable.maintainTaggedSqlPage(page.ids, cutoff_ns, &removed);
+        const consumed = try durable.maintainTaggedSqlPage(page.ids, cutoff_ns, &removed);
+        const next_after = if (consumed < page.ids.len) positions.items[consumed - 1] else page.next_after;
         var it = removed.keyIterator();
         while (it.next()) |id| self.evictDetachedSqlSession(id.*);
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (std.meta.eql(after, self.tagged_sql_expiry_cursor)) self.tagged_sql_expiry_cursor = page.next_after;
+        if (std.meta.eql(after, self.tagged_sql_expiry_cursor)) self.tagged_sql_expiry_cursor = next_after;
         return removed.count();
     }
 
@@ -5593,7 +5661,7 @@ pub const SessionRegistry = struct {
             self.mutex.lock();
             const after = self.expiry_cursor;
             self.mutex.unlock();
-            const page = try durable.scanExpiredIds(alloc, session_expiry_prefix, after, cutoff_ns, 1024);
+            const page = try durable.scanExpiredIds(alloc, session_expiry_prefix, after, cutoff_ns, 1024, null);
             expired_ids = .fromOwnedSlice(page.ids);
             self.mutex.lock();
             if (std.meta.eql(after, self.expiry_cursor)) self.expiry_cursor = page.next_after;
@@ -8689,8 +8757,7 @@ fn decodeSessionObject(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, obj
     }
     if (session.staged != null) {
         if (obj.get("listing_v2")) |summary| {
-            if (summary != .string) return error.InvalidTransactionSessionRecord;
-            session.listing_summary_tail = try alloc.dupe(u8, summary.string);
+            if (summary == .string) session.listing_summary_tail = try alloc.dupe(u8, summary.string);
         } else if (obj.get("listing_v1")) |summary| {
             if (summary == .object) {
                 const json = try std.json.Stringify.valueAlloc(alloc, summary, .{});
