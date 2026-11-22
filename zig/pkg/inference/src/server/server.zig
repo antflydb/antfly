@@ -15658,6 +15658,7 @@ pub const Node = struct {
         defer a.free(cursor);
         request.continuation = cursor;
         request.max_chunks = 1;
+        request.validate_next_video_page = false;
         var collector = chunk_response.NativeCollector{ .allocator = a };
         defer collector.deinit();
         const execution = try self.chunkAndEmbedDirect(a, io, control, request, target, .{ .context = &collector, .accept = chunk_response.NativeCollector.accept });
@@ -51367,7 +51368,7 @@ const MediaOutputExecution = struct {
             self.video_failure = null;
         };
         self.picture_ids = descriptor.coordinates.selected_pictures orelse &.{};
-        if (payload == .video and self.hasFrameConsumers() and self.frame_arena == null) {
+        if (payload == .video and payload.video.replay_required and self.hasFrameConsumers() and self.frame_arena == null) {
             self.beginVideo(a);
             self.frame_ordinal = descriptor.ordinal;
             self.picture_ids = descriptor.coordinates.selected_pictures orelse &.{};

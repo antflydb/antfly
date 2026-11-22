@@ -1446,6 +1446,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     var plan_id: []const u8 = "";
     var pending_outputs = false;
     var preparation_complete = true;
+    var page_terminal: ?chunking.inference.ChunkPage.Terminal = null;
     var pages: usize = 0;
     var completed_pages: usize = 0;
     if (fast_checkpoint) |saved_group| {
@@ -1567,6 +1568,10 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             a.free(cursor.source_version);
             position = null;
         }
+        if (page.terminal) |terminal| {
+            page_terminal = terminal;
+            break;
+        }
         const plan = try a.dupe(u8, page.plan_id);
         errdefer a.free(plan);
         const fingerprint = try a.dupe(u8, page.source_fingerprint);
@@ -1619,7 +1624,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     for ([_][]const u8{ "media_outputs", "transcript", "transcript_spans" }) |name| _ = document.object.swapRemove(name);
     if (output_rows.items.len != 0) {
         const projection = try media_outputs.project(scratch, output_rows.items);
-        const encoded_outputs = try std.json.Stringify.valueAlloc(scratch, .{ .plan_id = plan_id, .chunks = output_rows.items, .complete_chunks = projection.complete_chunks, .failed_chunks = projection.failed_chunks, .terminal_chunks = projection.terminal_chunks, .status = projection.status }, .{ .emit_null_optional_fields = false });
+        const encoded_outputs = try std.json.Stringify.valueAlloc(scratch, .{ .plan_id = plan_id, .chunks = output_rows.items, .complete_chunks = projection.complete_chunks, .failed_chunks = projection.failed_chunks, .terminal_chunks = projection.terminal_chunks, .status = if (page_terminal != null) .failed else projection.status }, .{ .emit_null_optional_fields = false });
         try document.object.put(scratch, "media_outputs", try std.json.parseFromSliceLeaky(std.json.Value, scratch, encoded_outputs, .{}));
         try document.object.put(scratch, "transcript", .{ .string = projection.text });
         const encoded_spans = try std.json.Stringify.valueAlloc(scratch, projection.transcript_spans, .{ .emit_null_optional_fields = false });
@@ -1627,7 +1632,10 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     }
     var state = document.object.get("_enrichment") orelse std.json.Value{ .object = .empty };
     if (state != .object) return error.InvalidChunkSource;
-    try state.object.put(scratch, "chunk_embeddings", .{ .bool = !pending_outputs });
+    try state.object.put(scratch, "chunk_embeddings", .{ .bool = !pending_outputs and page_terminal == null });
+    if (page_terminal) |terminal| {
+        try state.object.put(scratch, "chunk_embeddings_terminal_error", .{ .string = @errorName(terminal.failure()) });
+    } else _ = state.object.swapRemove("chunk_embeddings_terminal_error");
     try state.object.put(scratch, "chunk_embeddings_pending", .{ .bool = pending_outputs });
     try state.object.put(scratch, "chunk_embeddings_preparation_recipe", .{ .string = &recipe_fingerprint });
     if (!preparation_complete and position != null) {

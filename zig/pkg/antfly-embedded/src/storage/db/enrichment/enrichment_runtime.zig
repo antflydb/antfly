@@ -8226,6 +8226,9 @@ fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichm
             cursor_bytes = retained_checkpoint;
             cursor = next;
         }
+        // A terminal page retains its verified rows in the checkpoint, but
+        // cannot authorize another model request or a complete inventory.
+        if (page.terminal) |terminal| return terminal.failure();
         // Do not freeze retryable result receipts into an accepted immutable
         // parent. The saved page keeps healthy model work while only gaps retry.
         if (pending_index) return error.IncompleteChunkCoverage;

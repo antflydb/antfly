@@ -146,8 +146,8 @@ pub const Collector = struct {
         const source = std.fmt.bytesToHex(summary.identity.source, .lower);
         const plan = std.fmt.bytesToHex(summary.identity.plan, .lower);
         var cursor: [85]u8 = undefined;
-        const failure: ?anyerror = execution.failure orelse if (summary.cold_resume_blocked) error.ChunkCodedWindowBudgetExceeded else null;
-        const resumable = !request.observe_only and !summary.cold_resume_blocked and if (failure) |err| pipeline.abort(err) or err == error.ChunkOutputTooLarge or err == error.ResourceLimitExceeded or err == error.StreamTooLong else !summary.source_complete;
+        const failure: ?anyerror = execution.failure orelse if (summary.page_terminal) |terminal| terminal.failure() else null;
+        const resumable = !request.observe_only and summary.page_terminal == null and if (failure) |err| pipeline.abort(err) or err == error.ChunkOutputTooLarge or err == error.ResourceLimitExceeded or err == error.StreamTooLong else !summary.source_complete;
         const partial = if (failure) |err| (err == error.ChunkOutputTooLarge or err == error.ChunkEventBudgetExceeded) else !summary.complete;
         const output_coverage = try a.alloc(api.ChunkOutputCoverage, summary.output_count);
         for (output_coverage, summary.output_counts[0..summary.output_count]) |*dest, count| dest.* = .{ .name = count.name, .required = count.required, .complete = @intCast(count.complete), .failed = @intCast(count.failed), .skipped = @intCast(count.skipped) };
@@ -263,9 +263,13 @@ pub const NativeCollector = struct {
         return self.finishAcknowledged(request, target, execution);
     }
     pub fn finishPage(self: *@This(), request: pipeline.Request, target: Target, execution: Execution) !@import("inference_chunker").types.ChunkPage {
-        if (execution.failure) |err| return err;
         const summary = execution.summary;
-        if (summary.cold_resume_blocked) return error.ChunkCodedWindowBudgetExceeded;
+        if (execution.failure) |err| {
+            if (summary.page_terminal == null or summary.page_terminal.?.failure() != err or self.chunks.items.len == 0) return err;
+        }
+        if (self.chunks.items.len == 0) if (summary.page_terminal) |terminal| return terminal.failure();
+        var acknowledged = execution;
+        acknowledged.failure = null;
         if (summary.next_ordinal - summary.start_ordinal != self.chunks.items.len or
             (!summary.complete and self.chunks.items.len == 0) or (request.observe_only and self.observation == null)) return error.IncompleteChunkCoverage;
         const a = self.allocator;
@@ -275,7 +279,7 @@ pub const NativeCollector = struct {
         errdefer a.free(source);
         const version = try a.dupe(u8, sourceVersion(request, source));
         errdefer a.free(version);
-        const chunks = try self.finishAcknowledged(request, target, execution);
+        const chunks = try self.finishAcknowledged(request, target, acknowledged);
         errdefer @import("inference_chunker").types.freeChunks(a, chunks);
         var observed: ?*@import("inference_chunker").types.ModelMetadata = null;
         if (self.observation) |*chunk| {
@@ -283,7 +287,7 @@ pub const NativeCollector = struct {
             observed = chunk.metadata;
             chunk.owns_metadata = false;
         }
-        return .{ .chunks = chunks, .observation = observed, .plan_id = plan, .source_fingerprint = source, .source_version = version, .start_ordinal = summary.start_ordinal, .covered_through_ordinal = summary.next_ordinal, .complete = summary.source_complete };
+        return .{ .chunks = chunks, .observation = observed, .plan_id = plan, .source_fingerprint = source, .source_version = version, .start_ordinal = summary.start_ordinal, .covered_through_ordinal = summary.next_ordinal, .complete = summary.source_complete, .terminal = summary.page_terminal };
     }
     pub fn finishAcknowledged(self: *@This(), request: pipeline.Request, supplied_target: Target, execution: Execution) ![]@import("inference_chunker").Chunk {
         if (execution.failure) |err| return err;
@@ -364,11 +368,19 @@ test "model aware media WebM response omits an unusable cold continuation" {
     defer arena.deinit();
     var wire = Collector{ .allocator = arena.allocator() };
     const identity = planning.Identity{ .plan = @splat(1), .source = @splat(2) };
-    const execution = Execution{ .summary = .{ .identity = identity, .start_ordinal = 0, .next_ordinal = 1, .emitted = 1, .cold_resume_blocked = true }, .model_identity = @splat('3'), .model_revision = @splat('4'), .dimensions = 2 };
+    const execution = Execution{ .summary = .{ .identity = identity, .start_ordinal = 0, .next_ordinal = 1, .emitted = 1, .page_terminal = .coded_window_budget_exceeded }, .model_identity = @splat('3'), .model_revision = @splat('4'), .dimensions = 2 };
     const request = Request{ .input = .{ .text = "unused" }, .max_chunks = 1 };
     const response = try wire.response(request, .{ .model = "model" }, execution);
     try std.testing.expect(response.next_continuation == null);
     try std.testing.expectEqualStrings("ChunkCodedWindowBudgetExceeded", response.@"error".?.code);
     var native = NativeCollector{ .allocator = arena.allocator() };
-    try std.testing.expectError(error.ChunkCodedWindowBudgetExceeded, native.finishPage(request, .{ .model = "model" }, execution));
+    defer native.deinit();
+    var id: [85]u8 = undefined;
+    try NativeCollector.accept(&native, .{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .text, .start_byte = 0, .end_byte = 1 } }, .id = identity.cursor(0, &id), .mime_type = "text/plain" });
+    var page = try native.finishPage(request, .{ .model = "model" }, execution);
+    defer page.deinit(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), page.chunks.len);
+    try std.testing.expectEqual(@as(u64, 1), page.covered_through_ordinal);
+    try std.testing.expect(!page.complete);
+    try std.testing.expectEqual(@import("inference_chunker").types.ChunkPage.Terminal.coded_window_budget_exceeded, page.terminal.?);
 }

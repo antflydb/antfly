@@ -38,7 +38,7 @@ pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { ordinal: ?u64 = null, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { ordinal: ?u64 = null, replay_required: bool = true, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
 };
 pub const Preflight = struct { video_plan: ?@import("embedding_gemma2_video.zig").Plan = null, input_tokens: usize, picture_count: ?u32 = null, selected_pictures: ?[]const u64 = null, picture_basis: ?planning.PictureBasis = null };
 pub const Output = struct { vector: []f32, input_tokens: usize };
@@ -97,6 +97,7 @@ pub const Request = struct {
     native_content: bool = false,
     allow_partial: bool = false,
     max_chunks: usize = 0,
+    validate_next_video_page: bool = true,
     max_working_bytes: usize = 512 * 1024 * 1024,
 };
 pub const Item = struct {
@@ -126,8 +127,7 @@ pub const Summary = struct {
     complete: bool = false,
     /// Enumeration completion is independent of output failures.
     source_complete: bool = false,
-    /// This ordinal has no cold WebM replay within the source policy.
-    cold_resume_blocked: bool = false,
+    page_terminal: ?chunker.types.ChunkPage.Terminal = null,
     degraded: bool = false,
     output_counts: [16]OutputCoverage = @splat(.{ .name = "", .required = true }),
     output_count: usize = 0,
@@ -995,19 +995,25 @@ pub const Runner = struct {
         const webm = @import("embedding_gemma2_video.zig").WebmInput{ .reader = reader, .index = &indexed, .timeline = .{ .index = &indexed, .value = timeline }, .projection_binding = &binding, .continuation = &continuation, .apple_continuation = &apple_continuation };
         const base = self.ordinal;
         self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, webm) catch |err| {
-            if (err != error.ChunkReplayUnavailable) return err;
-            self.summary.cold_resume_blocked = true;
-            return error.ChunkCodedWindowBudgetExceeded;
+            self.summary.page_terminal = switch (err) {
+                error.ChunkReplayUnavailable => .coded_window_budget_exceeded,
+                error.EmptyVideoWindow => .empty_video_window,
+                else => return err,
+            };
+            return self.summary.page_terminal.?.failure();
         };
-        if (self.stopped and self.request.max_chunks != 0 and self.summary.emitted >= self.request.max_chunks) {
+        if (self.request.validate_next_video_page and self.stopped and self.request.max_chunks != 0 and self.summary.emitted >= self.request.max_chunks) {
             var next = try self.videoCursor(snapshot.duration);
             try next.seekVideo(self.summary.next_ordinal - base);
             if (try next.next()) |shape| {
-                _ = self.planDurableWebmWindow(webm, self.videoTimestampPolicy(shape)) catch |err| {
-                    if (err != error.ChunkReplayUnavailable) return err;
-                    // The acknowledged prefix and its exact-window IDs stay
-                    // valid, but there is no resumable page after that prefix.
-                    self.summary.cold_resume_blocked = true;
+                _ = self.planDurableWebmWindow(webm, self.videoTimestampPolicy(shape), try std.math.add(u64, base, shape.ordinal)) catch |err| {
+                    // Keep the acknowledged prefix independent of the
+                    // replayability of the following ordinal.
+                    self.summary.page_terminal = switch (err) {
+                        error.ChunkReplayUnavailable => .coded_window_budget_exceeded,
+                        error.EmptyVideoWindow => .empty_video_window,
+                        else => return err,
+                    };
                 };
             }
         }
@@ -1034,16 +1040,35 @@ pub const Runner = struct {
     fn videoTimestampPolicy(self: *const Runner, shape: planning.Descriptor) video.sampling.TimestampPolicy {
         return .{ .start_ns = shape.coordinates.start_ns.?, .end_ns = shape.coordinates.end_ns, .step_ns = @intCast(self.request.policy.step_ns), .max_frames = @min(self.request.policy.max_frames, self.executor.model.max_frames), .overflow = .truncate, .hold = self.request.policy.video_hold != 0 };
     }
-    fn planDurableWebmWindow(self: *const Runner, input: @import("embedding_gemma2_video.zig").WebmInput, policy: video.sampling.TimestampPolicy) !@import("embedding_gemma2_video.zig").WebmInput {
+    fn planDurableWebmWindow(self: *const Runner, input: @import("embedding_gemma2_video.zig").WebmInput, policy: video.sampling.TimestampPolicy, ordinal: u64) !struct { input: @import("embedding_gemma2_video.zig").WebmInput, replay_required: bool } {
         const limit = self.request.limits.max_coded_window_bytes;
-        const planned = @import("embedding_gemma2_video.zig").planWebmWindow(input, policy, limit, self.control) catch |err| switch (err) {
+        const selective = if (self.request.outputs) |config| for (config.targets) |target| {
+            if (target.skip_windows.len != 0) break true;
+        } else false else false;
+        var planned = @import("embedding_gemma2_video.zig").planWebmWindow(input, policy, if (selective) std.math.maxInt(usize) else limit, self.control) catch |err| switch (err) {
             error.ResourceLimitExceeded => return error.ChunkReplayUnavailable,
             else => return err,
         };
         // Published ordinals can be replayed by a fresh process. Warm
         // execution is an optimization for these cold-replayable windows.
-        if (planned.window.?.cold_bytes > limit) return error.ChunkReplayUnavailable;
-        return planned;
+        const window = &planned.window.?;
+        const replay_required = !selective or try self.videoReplayNeeded(ordinal, window.count);
+        if (replay_required and window.cold_bytes > limit) return error.ChunkReplayUnavailable;
+        window.replay.coded_bytes = limit;
+        return .{ .input = planned, .replay_required = replay_required };
+    }
+    fn videoReplayNeeded(self: *const Runner, ordinal: u64, pictures: usize) !bool {
+        const config = self.request.outputs orelse return true;
+        if (self.request.execute and (try config.boundary()).wants(ordinal, 0)) return true;
+        if (!self.request.execute_outputs) return false;
+        for (config.targets) |target| switch (target.kind) {
+            .embedding => if (target.wants(ordinal, 0)) return true,
+            .classify => for (0..pictures) |slot| {
+                if (target.wants(ordinal, @intCast(slot))) return true;
+            },
+            .transcribe, .diarize => {},
+        };
+        return false;
     }
     fn videoCursor(self: *const Runner, duration: i128) !planning.Temporal {
         const end = std.math.cast(i64, duration) orelse return error.TimestampOverflow;
@@ -1069,8 +1094,8 @@ pub const Runner = struct {
             }
             slot.payload = .{ .video = .{ .ordinal = shape.ordinal, .bytes = &.{}, .reader = &window.coded.reader, .policy = policy, .source_timestamps = true, .selection = if (window.selection) |*selection| selection else null, .packet_base = window.packet_base } };
         } else {
-            const webm = if (source.webm) |input| try self.planDurableWebmWindow(input, policy) else null;
-            slot.payload = .{ .video = .{ .ordinal = shape.ordinal, .bytes = source.bytes, .reader = source.reader, .webm = webm, .policy = policy } };
+            const webm = if (source.webm) |input| try self.planDurableWebmWindow(input, policy, shape.ordinal) else null;
+            slot.payload = .{ .video = .{ .ordinal = shape.ordinal, .bytes = source.bytes, .reader = source.reader, .webm = if (webm) |planned| planned.input else null, .replay_required = if (webm) |planned| planned.replay_required else true, .policy = policy } };
         }
         slot.initialized = true;
     }
@@ -1082,7 +1107,7 @@ pub const Runner = struct {
             slot.measured = measured;
             slot.measured_allocator = self.allocator;
         };
-        if (slot.payload.video.prepared_outputs == null) if (self.executor.prepare_video_outputs) |prepare| {
+        if (slot.payload.video.replay_required and slot.payload.video.prepared_outputs == null) if (self.executor.prepare_video_outputs) |prepare| {
             slot.payload.video.prepared_outputs = try prepare(self.executor.context, self.allocator, slot.payload, slot.measured orelse return error.InvalidInputShape);
         };
     }
@@ -1138,7 +1163,7 @@ pub const Runner = struct {
                     };
                 }
             }
-            if (!self.primary_ahead) return;
+            if (!self.primary_ahead or !next.payload.video.replay_required) return;
             const start = self.runner.executor.start_video orelse return;
             next.ahead = start(self.runner.executor.context, next.payload, &self.runner.pool) catch |err| {
                 // Speculation must never deny a request which fits serially.
@@ -1438,12 +1463,31 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     var page = try Runner.init(a, request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
     try page.webmWindowsSnapshot(&reader, &snapshot);
     try std.testing.expectEqual(@as(usize, 1), page.summary.emitted);
-    try std.testing.expect(page.summary.cold_resume_blocked);
+    try std.testing.expectEqual(chunker.types.ChunkPage.Terminal.coded_window_budget_exceeded, page.summary.page_terminal.?);
+    var exact_request = request;
+    exact_request.validate_next_video_page = false;
+    var exact = try Runner.init(a, exact_request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+    try exact.webmWindowsSnapshot(&reader, &snapshot);
+    try std.testing.expectEqual(@as(usize, 1), exact.summary.emitted);
+    try std.testing.expect(exact.summary.page_terminal == null);
+
+    var masked_request = request;
+    masked_request.execute_outputs = false;
+    masked_request.output_executor = .{ .context = &result, .execute = struct {
+        fn unexpected(_: *anyopaque, _: std.mem.Allocator, _: Payload, _: planning.Descriptor, _: ?EmbeddingContext, _: ?Output, _: ?anyerror, _: bool) ![]const output_types.Result {
+            return error.TestUnexpectedResult;
+        }
+    }.unexpected };
+    masked_request.outputs = .{ .boundary_model = "embedding", .targets = &.{.{ .name = "embedding", .model = "test", .kind = .embedding, .skip_windows = &.{.{ .ordinal = 1, .sub_index = 0 }} }} };
+    var masked = try Runner.init(a, masked_request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+    try masked.webmWindowsSnapshot(&reader, &snapshot);
+    try std.testing.expectEqual(@as(usize, 1), masked.summary.emitted);
+    try std.testing.expect(masked.summary.page_terminal == null);
     var token: [85]u8 = undefined;
     request.continuation = page.summary.identity.cursor(page.summary.next_ordinal, &token);
     var resumed = try Runner.init(a, request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
     try std.testing.expectError(error.ChunkCodedWindowBudgetExceeded, resumed.webmWindowsSnapshot(&reader, &snapshot));
-    try std.testing.expect(resumed.summary.cold_resume_blocked);
+    try std.testing.expectEqual(chunker.types.ChunkPage.Terminal.coded_window_budget_exceeded, resumed.summary.page_terminal.?);
     try std.testing.expectEqual(@as(usize, 0), resumed.summary.emitted);
 }
 
