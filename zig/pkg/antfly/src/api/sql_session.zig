@@ -86,7 +86,7 @@ pub const Coordinator = struct {
         const outcome = (source.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, info.sync_level, plan.firstAttempt(), self.context.cancellation) catch |err| {
             const rejection = transactions.classifyCommitRejection(plan.firstAttempt(), err);
             if (rejection == .fresh or rejection == .confirmed) {
-                _ = (server.txn_sessions.recordAttemptAbort(alloc, id, if (rejection == .fresh) plan.publication else null) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
+                _ = (server.txn_sessions.recordSqlAttemptAbort(alloc, id, if (rejection == .fresh) plan.publication else null, transactions.SqlAbortAcknowledgement.fromCause(transactions.abortCause(err))) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
                 return .{ .outcome = .aborted, .abort_cause = transactions.abortCause(err), .reconciliation_id = id };
             }
             if (err == error.EnrichmentWorkerFailed) {

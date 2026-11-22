@@ -6824,8 +6824,10 @@ pub const AntflyApiHandler = struct {
 
         fn replayCommit(self: *@This(), store: *transactions_api.DurableSessionStore, encoded: []const u8, connection: ?[32]u8, principal: []const u8) !bool {
             const txn_id = distributed_txn.parseTxnIdHex(encoded) catch return false;
-            const disposition = (try store.sqlCommitDecisionStatus(std.heap.page_allocator, txn_id, connection, principal)) orelse return false;
+            const decision = (try store.sqlCommitDecisionStatus(std.heap.page_allocator, txn_id, connection, principal)) orelse return false;
             self.reportsCommitResult(txn_id);
+            const disposition = decision.disposition;
+            if (disposition == .aborted) if (decision.abort_acknowledgement.diagnostic()) |err| return err;
             self.result = try sql_runtime.Result.empty(std.heap.page_allocator, if (disposition == .aborted) "ROLLBACK" else "COMMIT");
             self.result.?.output.mutation_outcome = switch (disposition) {
                 .committed => .committed,
@@ -6867,7 +6869,12 @@ pub const AntflyApiHandler = struct {
                 self.adapter.connection_revision = connection.revision;
                 if (connection.active_txn) |active| {
                     self.connection_session_hex = std.fmt.bytesToHex(active, .lower);
-                    if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) return error.SqlTransactionNotActive;
+                    if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) {
+                        if (self.prepared_mode != .statement or self.parameters.len != 0 or
+                            !@import("../pgwire/session_commands.zig").isCommit(self.statement) or
+                            !try self.replayCommit(store, supplied, connection_id, resource_principal)) return error.SqlTransactionNotActive;
+                        return;
+                    };
                     if (connection.state == .uncertain) {
                         if (self.prepared_mode != .statement or self.parameters.len != 0 or
                             !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlConnectionBusy;
@@ -7427,7 +7434,11 @@ pub const AntflyApiHandler = struct {
                 owned.reports_existing_commit = true;
             }
             const diagnostic = sql_execution.diagnostic(err);
-            if (!job.adapter.reports_existing_commit and std.mem.eql(u8, diagnostic.code, "40003")) completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
+            if (std.mem.eql(u8, diagnostic.code, "40003")) {
+                if (job.adapter.reports_existing_commit) {
+                    completion.unknown = true;
+                } else completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
+            }
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
             if (std.mem.eql(u8, diagnostic.code, "53300")) try ctx.setHeader("Retry-After", "1");
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
@@ -7449,6 +7460,8 @@ pub const AntflyApiHandler = struct {
         }
         var result = job.result.?;
         defer result.deinit();
+        if (job.adapter.reports_existing_commit and (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required))
+            completion.unknown = true;
         if (!job.adapter.reports_existing_commit and (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required or (result.output.ddl_receipt != null and result.output.ddl_receipt.?.state != .ready))) {
             const ddl = if (result.output.ddl_receipt) |value| try std.json.Stringify.valueAlloc(ctx.allocator, value, .{ .emit_null_optional_fields = false }) else null;
             defer if (ddl) |value| ctx.allocator.free(value);
@@ -15679,7 +15692,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         defer observed.deinit();
         try std.testing.expectEqual(@as(u16, 409), observed.status.code);
         const completion = try AntflyApiHandler.requestCompletion(&ctx);
-        try std.testing.expect(!completion.unknown);
+        try std.testing.expect(completion.unknown);
         try std.testing.expectEqual(@as(usize, 0), completion.outcomes.items.len);
     }
     _ = try connections.mutate(&durable, .{ .uncertain = .{ .id = id, .guard = guard } }, principal, node, now_ms);
