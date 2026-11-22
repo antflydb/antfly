@@ -2139,10 +2139,6 @@ const gemma4MtpMetalPrefillHiddenCaptureEnabled = decoder_routes.metalPreparedPr
 
 const gemma4MetalDirectGreedyDefault = decoder_forward.metalDirectTailDefault;
 
-fn pipelinedMetalDecodeEnabled() bool {
-    return metal_runtime.pipelinedDecodeFrameEnabled();
-}
-
 const gemma4MetalDirectGreedyEnabled = decoder_forward.metalDirectTailEnabled;
 
 pub fn gemma4MtpAutoMinGenerationTokens() usize {
@@ -5939,7 +5935,6 @@ pub const NativeGenerationPipeline = struct {
         decode_state: *NativeDecodeState,
     ) bool {
         if (config.kv_cache_mode == .select_v1) return false;
-        if (!pipelinedMetalDecodeEnabled()) return false;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         if (self.cb.kind() != .metal) return false;
         if (self.scheduler != null) return false;
@@ -5949,7 +5944,7 @@ pub const NativeGenerationPipeline = struct {
         if (token_table != null or json_grammar.* != null or gbnf_grammar != null) return false;
         if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return false;
         if (!gemma4MetalDirectGreedyEnabled()) return false;
-        return true;
+        return metal_runtime.pipelinedDecodeFrameEnabled();
     }
 
     fn pendingStepContext(self: *NativeGenerationPipeline, state: *NativeDecodeState) pending_step.Context {
