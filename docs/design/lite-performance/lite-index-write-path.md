@@ -221,8 +221,13 @@ decided at the tip.
    flusher; per-transaction hot-key writes removed. Full-text level-0
    records are folded by ordinary merges, which check each input at the
    tip (`l0/` present) rather than in this process's mirror.
-4. Incremental cross-process refresh. Done for document rows and full-text
-   indexes; other index kinds still reopen.
+4. Incremental cross-process refresh. Implemented for document rows,
+   full-text and sparse indexes, but switched off
+   (`Owner.in_place_refresh_enabled`): another process's redo commits write
+   page-shaped values past the serving file's checkpoint `page_count`, and
+   reads of them fail `InvalidPageId` (8-process indexed SQLite comparison).
+   The serving file must adopt that page-level state (page count, allocator
+   view) before this is turned on.
 5. Delete-marker cleanup and the remaining per-type folds.
 
 Each stage keeps the crash sweeps, the multi-process capi tests and the

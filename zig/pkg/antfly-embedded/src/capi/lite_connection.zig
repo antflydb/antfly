@@ -2883,6 +2883,12 @@ pub const Owner = struct {
         return true;
     }
 
+    /// Off until the serving file adopts another process's page-level state
+    /// too: its redo commits write page-shaped values past this file's
+    /// checkpoint `page_count`, which reads then reject (`InvalidPageId`,
+    /// 8-process indexed SQLite comparison).
+    const in_place_refresh_enabled = false;
+
     /// lite-index-write-path.md "Cross-process refresh": catches `root` up
     /// with commits other processes made since it last did, when those are
     /// redo-only and changed only what a runtime reads through the file
@@ -2892,6 +2898,7 @@ pub const Owner = struct {
     /// anything else changed (schema, catalogs, index definitions, other
     /// index kinds, a fold): the caller reopens.
     fn refreshInPlace(root: *h.Handle, file: *native.NativeFile, probe: *native.NativeFile) !bool {
+        if (!in_place_refresh_enabled) return false;
         const redo = if (file.redo) |*r| r else return false;
         const since = root.lite_runtime_sequence;
         const folded_before = redo.checkpoint_sequence;
@@ -8761,6 +8768,7 @@ test "capi native separate writer processes keep full-text deletes at full_index
 // its runtime, and the handle keeps writing and finding its own afterwards.
 test "capi native separate writer processes refresh full-text in place" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!Owner.in_place_refresh_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = try api.TestDirectory.init("xproc-fts-in-place");
     defer tmp.cleanup();
