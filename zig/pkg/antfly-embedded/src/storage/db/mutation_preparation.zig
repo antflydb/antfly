@@ -1374,17 +1374,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const force_asset = request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request));
                     var reprocess_snapshot: @import("enrichment/document_extraction_completion.zig").Snapshot = .{};
                     if (force_asset) {
-                        const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
-                        defer alloc.free(key);
-                        const manifest = S.ownerField(self, "core").*.store.get(alloc, key) catch |err| switch (err) {
-                            error.NotFound => null,
-                            else => return err,
-                        };
-                        defer if (manifest) |raw| alloc.free(raw);
-                        // Generic assets need not contain a document manifest.
+                        // Generic asset bodies are not document manifests.
+                        // Classify first, so forcing them never reads a second
+                        // potentially large output merely to inspect coverage.
                         var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
                         defer producer.deinit(alloc);
+                        if (only_incomplete_assets and producer.type != .document_extraction) return error.InvalidArgument;
                         if (producer.type == .document_extraction) {
+                            const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
+                            defer alloc.free(key);
+                            const manifest = S.ownerField(self, "core").*.store.get(alloc, key) catch |err| switch (err) {
+                                error.NotFound => null,
+                                else => return err,
+                            };
+                            defer if (manifest) |raw| alloc.free(raw);
                             if (manifest) |raw| reprocess_snapshot = try @import("enrichment/document_extraction_completion.zig").snapshot(alloc, raw);
                             if (only_incomplete_assets and reprocess_snapshot.complete()) continue;
                         }
