@@ -6419,7 +6419,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
             try cuda.CudaCompute.checkRequestCacheRetirement(&cb);
             const compute: *const cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
             var result = @This(){ .executions = compute.audio_arena_executes, .replays = compute.audio_graph_replays };
-            for (compute.audio_plans.entries) |entry| if (entry.owner != null and entry.plan != null and !entry.disabled) {
+            for (compute.audio_plans.entries) |entry| if (entry.owner != null and entry.owner.?.managed and !entry.disabled) {
                 result.owners += 1;
             };
             for (compute.embedding_gemma2_execution.arenas) |arena| if (arena.kind == .audio and arena.graph != null) {

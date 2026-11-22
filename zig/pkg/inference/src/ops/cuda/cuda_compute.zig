@@ -7277,7 +7277,7 @@ pub const CudaCompute = struct {
                 CacheRetirement.word(&hash, entry.stamp);
                 CacheRetirement.word(&hash, @intFromBool(entry.warmed));
                 CacheRetirement.word(&hash, @intFromBool(entry.disabled));
-                CacheRetirement.word(&hash, if (entry.plan) |value| @intFromPtr(value) else 0);
+                CacheRetirement.word(&hash, if (entry.owner) |value| @intFromBool(value.managed) else 0);
                 CacheRetirement.word(&hash, if (entry.owner) |value| @intFromPtr(value) else 0);
             }
             var packed_entries = expected.embedding_gemma2_execution.weights.iterator();
@@ -7367,10 +7367,7 @@ pub const CudaCompute = struct {
         switch (request) {
             .audio_learning => |value| {
                 for (self.audio_plans.entries) |entry| if (entry.stamp != 0 and entry.key == value.key and entry.warmed and !entry.disabled) {
-                    if (entry.owner) |owner| {
-                        if (entry.plan != &owner.plan) return error.InvalidAudioPlanOwner;
-                        return .{};
-                    }
+                    if (entry.owner != null and entry.owner.?.managed) return .{};
                     return .{ .miss = true, .amounts = .{ .host_scratch_bytes = @sizeOf(@import("audio_execution_plan.zig").Owner) } };
                 };
                 return .{};
@@ -7595,20 +7592,17 @@ pub const CudaCompute = struct {
 
         try funding.bind(epoch);
         errdefer funding.unbind();
-        // Legacy event metadata has no typed retained owner. Copy the SAME
-        // learned plan into its cold-funded backing; the old pure allocation
-        // stays in Funding until the actual post-unlock phase destructor.
+        // A standalone warm plan may enter managed serving later. Attach
+        // custody to its existing backing without copying the event table.
         for (funding.entries) |*entry| if (funding.audioLearningReady(entry)) {
-            for (&expected.audio_plans.entries) |*cached| if (cached.stamp != 0 and cached.key == entry.request.audio_learning.key and cached.plan != null and cached.owner == null) {
+            for (&expected.audio_plans.entries) |*cached| {
+                const owner = cached.owner orelse continue;
+                if (cached.stamp == 0 or cached.key != entry.request.audio_learning.key or owner.managed) continue;
                 var token = try funding.take(entry.request, .{ .host_scratch_bytes = @sizeOf(@import("audio_execution_plan.zig").Owner) });
                 errdefer if (token.owner != null) token.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
-                const owner = try token.publishAudioLearning();
-                owner.plan = cached.plan.?.*;
-                entry.retired_audio_plan = cached.plan;
-                cached.owner = owner;
-                cached.plan = &owner.plan;
+                try token.fundAudioLearning(owner);
                 break;
-            };
+            }
         };
         // Audio metadata publication above completes all fallible work. Every
         // raw owner/controller and the current epoch already validated before
@@ -7869,7 +7863,7 @@ pub const CudaCompute = struct {
         const base = try self.audioCacheBase(execution_key, &inputs, null);
         if (base.input_bytes > 128 * 1024 * 1024) return;
         if (self.embedding_gemma2_policy.audio_graph) for (self.audio_plans.entries) |entry| {
-            if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled and entry.owner == null) {
+            if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled and (entry.owner == null or !entry.owner.?.managed)) {
                 try builder.add(.{ .audio_learning = .{ .key = base.key } });
                 break;
             }
@@ -7955,7 +7949,7 @@ pub const CudaCompute = struct {
         const base = try self.audioCacheBase(key, inputs, null);
         if (base.input_bytes > 128 * 1024 * 1024) return null;
         for (self.audio_plans.entries) |entry| if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled) {
-            const plan = entry.plan orelse return null;
+            const plan = if (entry.owner) |owner| &owner.plan else return null;
             const storage = plan.layout(base.input_bytes) catch return null;
             if (storage.output == null) return null;
             return self.audioArenaRequestFromPlan(base, plan, storage);
@@ -20622,22 +20616,17 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         return out;
     }
     const plan_mod = @import("audio_execution_plan.zig");
-    if (entry.plan == null) {
-        const plan = if (self.ctx.prepared_cache_funding) |funding| prepared: {
+    if (entry.owner == null) {
+        const owner = if (self.ctx.prepared_cache_funding) |funding| prepared: {
             var token = funding.take(.{ .audio_learning = .{ .key = base_key } }, .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }) catch |err| {
                 if (err == error.UnpreparedCacheAdmission) return null; // same ordinary body, before layer execution
                 return err;
             };
             errdefer if (token.owner != null) token.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
-            const owner = try token.publishAudioLearning();
-            entry.owner = owner;
-            break :prepared &owner.plan;
-        } else raw: {
-            const value = try std.heap.c_allocator.create(plan_mod.Plan);
-            value.* = .{};
-            break :raw value;
-        };
-        entry.plan = plan;
+            break :prepared try token.publishAudioLearning();
+        } else try plan_mod.Owner.create(std.heap.c_allocator);
+        entry.owner = owner;
+        const plan = &owner.plan;
         var scope = plan_mod.Scope{ .plan = plan };
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
@@ -20645,11 +20634,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         const out = run(context, canonical[0..canonical_count]) catch |err| {
             self.execution_scope = null;
             if (err == error.Cancelled or err == error.Timeout) {
-                if (entry.owner) |owner| {
-                    try owner.retire(plan_cleanup);
-                    entry.owner = null;
-                } else std.heap.c_allocator.destroy(plan);
-                entry.plan = null;
+                try owner.retire(plan_cleanup);
+                entry.owner = null;
             } else entry.disabled = true;
             return err;
         };
@@ -20657,7 +20643,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         if (!plan.finish(tensorFromCt(out).buffer.ptr) or self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before) entry.disabled = true;
         return out;
     }
-    const plan = entry.plan.?;
+    const plan = &entry.owner.?.plan;
     const storage = plan.layout(input_bytes) catch return null;
     const output = storage.output orelse return null;
     const first_input = tensorFromCt(inputs[0]);
@@ -57551,16 +57537,12 @@ test "CUDA audio learning cache state uses actual warm no-plan eligibility and o
     const cold = try compute.cacheRequestState(request);
     try std.testing.expect(cold.miss);
     try std.testing.expectEqualDeep(@import("../../runtime/tier/memory.zig").AdmissionAmounts{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }, cold.amounts);
-    var legacy: plan_mod.Plan = .{};
-    compute.audio_plans.entries[0].plan = &legacy;
-    try std.testing.expect((try compute.cacheRequestState(request)).miss); // raw metadata upgrade, not second learning
-    const owner = try plan_mod.Owner.createOutsideExecution(std.testing.allocator);
+    const owner = try plan_mod.Owner.create(std.testing.allocator);
     defer owner.destroyUnusedOutsideExecution();
     compute.audio_plans.entries[0].owner = owner;
-    compute.audio_plans.entries[0].plan = &owner.plan;
+    try std.testing.expect((try compute.cacheRequestState(request)).miss);
+    owner.managed = true;
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
-    compute.audio_plans.entries[0].plan = &legacy;
-    try std.testing.expectError(error.InvalidAudioPlanOwner, compute.cacheRequestState(request));
     compute.audio_plans.entries[0].owner = null;
     compute.audio_plans.entries[0].disabled = true;
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
@@ -60489,8 +60471,8 @@ test "source bias workspace policy isolates audio warm and arena plan identities
     try std.testing.expectEqualDeep(CudaCompute.AudioInputSpan{ .offset = 0, .bytes = 12 }, spans[0]);
     try std.testing.expectEqualDeep(CudaCompute.AudioInputSpan{ .offset = 256, .bytes = 25 * 1024 * 4 }, spans[1]);
     try std.testing.expectEqual(@as(usize, 256 + 25 * 1024 * 4), original.input_bytes);
-    var stale_plan: @import("audio_execution_plan.zig").Plan = .{ .peak = std.math.maxInt(usize) };
-    compute.audio_plans.entries[0] = .{ .key = original.key, .stamp = 1, .warmed = true, .plan = &stale_plan };
+    var stale_owner: @import("audio_execution_plan.zig").Owner = .{ .allocator = std.testing.allocator, .plan = .{ .peak = std.math.maxInt(usize) } };
+    compute.audio_plans.entries[0] = .{ .key = original.key, .stamp = 1, .warmed = true, .owner = &stale_owner };
     compute.embedding_gemma2_policy.source_bias_workspace = .source_1mib;
     const candidate = try compute.audioCacheBase(42, &inputs, null);
     try std.testing.expect(candidate.key != original.key);

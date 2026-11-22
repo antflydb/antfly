@@ -420,7 +420,6 @@ pub const Funding = struct {
         temporary_host_bytes: usize = 0,
         optional_declined: bool = false,
         audio_learning: ?*@import("audio_execution_plan.zig").Owner = null,
-        retired_audio_plan: ?*@import("audio_execution_plan.zig").Plan = null,
         upgrade_raw: bool = false,
         // Value-only identity, not a second lease owner. Filled under actual
         // cache exclusion; no cache/SDK/Model pointer crosses the cold window.
@@ -580,7 +579,7 @@ pub const Funding = struct {
     fn prepareAudioLearningOutsideExecution(self: *Funding) !void {
         for (self.entries) |*entry| if (entry.request == .audio_learning and entry.miss and entry.state == .ready) {
             if (entry.audio_learning != null) return error.InvalidPreparedCacheState;
-            entry.audio_learning = try @import("audio_execution_plan.zig").Owner.createOutsideExecution(self.allocator);
+            entry.audio_learning = try @import("audio_execution_plan.zig").Owner.create(self.allocator);
         };
     }
     /// A decoder is mandatory. If the combined optional reservation declines,
@@ -728,9 +727,6 @@ pub const Funding = struct {
             const unused_learning = entry.audio_learning;
             entry.audio_learning = null;
             if (unused_learning) |owner| owner.destroyUnusedOutsideExecution();
-            const retired_plan = entry.retired_audio_plan;
-            entry.retired_audio_plan = null;
-            if (retired_plan) |plan| std.heap.c_allocator.destroy(plan);
             if (entry.lease) |*lease| lease.release();
             entry.lease = null;
             if (entry.temporary) |*lease| lease.release();
@@ -767,15 +763,23 @@ pub const Lease = struct {
     /// The large exact Plan backing was allocated only after cold funding.
     /// Cache publication retains no Funding/entry/model/creation-B pointer.
     pub fn publishAudioLearning(self: *Lease) !*@import("audio_execution_plan.zig").Owner {
+        const entry = self.entry orelse return error.InvalidPreparedCacheState;
+        const owner = entry.audio_learning orelse return error.MissingPreparedAudioPlan;
+        try self.fundAudioLearning(owner);
+        entry.audio_learning = null;
+        return owner;
+    }
+
+    /// Adopt the existing plan in place. Its address remains stable and its
+    /// funding shell retires independently of the cache backing.
+    pub fn fundAudioLearning(self: *Lease, owner: *@import("audio_execution_plan.zig").Owner) !void {
         const funding = self.owner orelse return error.UnpreparedCacheAdmission;
         const entry = self.entry orelse return error.InvalidPreparedCacheState;
-        if (funding.state != .bound or entry.state != .taken or entry.request != .audio_learning) return error.InvalidPreparedCacheState;
+        if (funding.state != .bound or entry.state != .taken or entry.request != .audio_learning or owner.managed or owner.retiring or owner.quota != .none) return error.InvalidPreparedCacheState;
         const current = funding.boundary orelse return error.MissingCurrentCleanupEpoch;
         if (try current.isSealed()) return error.RetirementEpochSealed;
-        const owner = entry.audio_learning orelse return error.MissingPreparedAudioPlan;
-        entry.audio_learning = null;
         owner.quota = self.publishQuota();
-        return owner;
+        owner.managed = true;
     }
 
     /// Successful caches retain the SAME cold shell for their future actual
@@ -1487,6 +1491,11 @@ test "CUDA audio learned metadata one below host class refuses before payload ba
 }
 
 test "CUDA audio learned metadata publication and LRU death retain exact old Domain quota until actual current B seals" {
+    try qualifyAudioMetadataRetirement(false);
+    try qualifyAudioMetadataRetirement(true);
+}
+
+fn qualifyAudioMetadataRetirement(comptime adopt_warm_plan: bool) !void {
     var gate: std.atomic.Mutex = .unlocked;
     const Probe = struct {
         gate: *std.atomic.Mutex,
@@ -1545,20 +1554,28 @@ test "CUDA audio learned metadata publication and LRU death retain exact old Dom
     defer epoch.release();
     try funding.?.bind(&publication_epoch);
     var token = try funding.?.take(.{ .audio_learning = .{ .key = 93 } }, .{ .host_scratch_bytes = bytes });
-    const owner = try token.publishAudioLearning();
+    const owner = if (adopt_warm_plan) warm: {
+        const raw = try plan_mod.Owner.create(std.testing.allocator);
+        errdefer raw.destroyUnusedOutsideExecution();
+        raw.plan.allocate(256, 0x1000);
+        try std.testing.expect(raw.plan.finish(0x1000));
+        try token.fundAudioLearning(raw);
+        break :warm raw;
+    } else try token.publishAudioLearning();
     var cache: plan_mod.Cache = .{};
     defer cache.clearWithCleanup(.{ .outside_execution = true }) catch unreachable;
-    cache.entries[0] = .{ .key = 93, .stamp = 1, .warmed = true, .plan = &owner.plan, .owner = owner };
+    cache.entries[0] = .{ .key = 93, .stamp = 1, .warmed = true, .owner = owner };
     cache.clock = 1;
     funding.?.unbind();
     funding.?.finishOutsideExecution();
     funding = null; // no phase/task pointer survives in the cache owner
     publication_guard.finish();
     try std.testing.expectError(error.RetirementEpochSealed, cache.clearWithCleanup(.{ .boundary = &publication_epoch }));
-    try std.testing.expect(cache.entries[0].owner == owner and cache.entries[0].plan == &owner.plan);
+    try std.testing.expect(cache.entries[0].owner == owner and owner.managed);
+    if (adopt_warm_plan) try std.testing.expectEqual(@as(usize, 256), (try owner.plan.layout(0)).bytes);
     try std.testing.expectError(error.MissingCurrentCleanupEpoch, cache.clearLegacy());
-    const original = cache.entries[0].plan;
-    for (0..3) |_| try std.testing.expect((try cache.getWithCleanup(93, .{ .boundary = &epoch })).plan == original);
+    const original = cache.entries[0].owner;
+    for (0..3) |_| try std.testing.expect((try cache.getWithCleanup(93, .{ .boundary = &epoch })).owner == original);
     try std.testing.expect(gate.tryLock());
     var gate_held = true;
     defer if (gate_held) gate.unlock();

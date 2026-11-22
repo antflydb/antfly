@@ -32,10 +32,11 @@ pub const Owner = struct {
     allocator: std.mem.Allocator,
     plan: Plan = .{},
     quota: Quota = .none,
+    managed: bool = false,
     retiring: bool = false,
     node: retirement.Node = undefined,
 
-    pub fn createOutsideExecution(a: std.mem.Allocator) !*Owner {
+    pub fn create(a: std.mem.Allocator) !*Owner {
         const self = try a.create(Owner);
         self.* = .{ .allocator = a };
         return self;
@@ -46,6 +47,7 @@ pub const Owner = struct {
     }
     pub fn validateCleanup(self: *const Owner, current: Cleanup) !void {
         if (self.retiring) return error.AudioPlanAlreadyRetired;
+        if (!self.managed) return;
         try self.quota.validateCleanup(current);
         if (!current.outside_execution) {
             const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
@@ -63,7 +65,7 @@ pub const Owner = struct {
         try self.validateCleanup(current);
         self.retiring = true;
         errdefer self.retiring = false;
-        if (current.outside_execution) {
+        if (!self.managed or current.outside_execution) {
             destroyOutside(self);
         } else {
             const boundary = try current.boundary.?.boundary();
@@ -72,7 +74,7 @@ pub const Owner = struct {
         }
     }
 };
-pub const Entry = struct { key: u64 = 0, stamp: u64 = 0, warmed: bool = false, disabled: bool = false, plan: ?*Plan = null, owner: ?*Owner = null };
+pub const Entry = struct { key: u64 = 0, stamp: u64 = 0, warmed: bool = false, disabled: bool = false, owner: ?*Owner = null };
 pub const Cache = struct {
     entries: [8]Entry = @splat(.{}),
     clock: u64 = 0,
@@ -85,7 +87,7 @@ pub const Cache = struct {
                 entry.* = previous; // registration failed before transfer
                 return err;
             };
-        } else if (previous.plan) |plan| std.heap.c_allocator.destroy(plan);
+        }
     }
     pub fn getWithCleanup(self: *Cache, key: u64, current: Cleanup) !*Entry {
         var oldest: usize = 0;
@@ -111,14 +113,8 @@ pub const Cache = struct {
         if (entry.key != key or entry.stamp == 0) return error.AudioPlanChanged;
         return entry;
     }
-    pub fn get(self: *Cache, key: u64) *Entry {
-        return self.getWithCleanup(key, .{}) catch platform.inference_process_supervisor.restartWorker();
-    }
     pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
-        for (self.entries) |entry| if (entry.owner) |owner| {
-            if (entry.plan != &owner.plan) return error.InvalidAudioPlanOwner;
-            try owner.validateCleanup(current);
-        };
+        for (self.entries) |entry| if (entry.owner) |owner| try owner.validateCleanup(current);
     }
     pub fn clearWithCleanup(self: *Cache, current: Cleanup) !void {
         try self.validateCleanup(current);
@@ -129,7 +125,9 @@ pub const Cache = struct {
         for (&previous.entries) |*entry| retireEntry(entry, current) catch platform.inference_process_supervisor.restartWorker();
     }
     pub fn clearLegacy(self: *Cache) !void {
-        for (self.entries) |entry| if (entry.owner != null) return error.MissingCurrentCleanupEpoch;
+        for (self.entries) |entry| if (entry.owner) |owner| {
+            if (owner.managed) return error.MissingCurrentCleanupEpoch;
+        };
         try self.clearWithCleanup(.{});
     }
     pub fn clear(self: *Cache) void {
