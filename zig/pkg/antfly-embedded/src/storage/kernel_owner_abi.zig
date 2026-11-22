@@ -1761,7 +1761,7 @@ pub extern fn antfly_metadata_apply_store_projection(
 ) callconv(.c) Status;
 /// Stored receipts may exceed one Raft frame after a bounded splice.
 pub const metadata_session_max_value_bytes = (32 << 20) + (64 << 10);
-pub const MetadataSessionReadOperation = enum(u32) { get, first, last, next, prev, seek_at_or_after, seek_at_or_before, get_range, count_prefix, prefix_page };
+pub const MetadataSessionReadOperation = enum(u32) { get, first, last, next, prev, seek_at_or_after, seek_at_or_before, get_range, count_prefix, prefix_page, probe_prefix };
 pub const MetadataSessionReadRequest = extern struct {
     version: u32 = abi_version,
     operation: MetadataSessionReadOperation,

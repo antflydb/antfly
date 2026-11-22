@@ -95,8 +95,8 @@ fn reconcile(store: *transactions.DurableSessionStore, registry: *transactions.S
     } else if (session) |value| {
         if (!value.terminal) {
             const cutoff = expiry_cutoff_ms orelse return false;
-            if (state != .active or value.version.executing) return false;
-            registry.rollbackConnectionBeforeExecution(txn_id, id, value.version, .{ .expired = .{ .state = .active, .cutoff_ms = cutoff } }) catch |err| switch (err) {
+            if ((state != .active and state != .uncertain) or value.version.executing) return false;
+            registry.rollbackConnectionBeforeExecution(txn_id, id, value.version, .{ .expired = .{ .state = state, .cutoff_ms = cutoff } }) catch |err| switch (err) {
                 error.SessionLeaseLost, error.SqlTransactionOutcomeUnknown => return false,
                 else => return err,
             };
@@ -614,6 +614,48 @@ test "HTTP connection keeps a referenced durable transaction through session GC"
     try std.testing.expectError(error.SqlTransactionNotActive, registry.cloneSqlStaged(alloc, txn_id));
     try std.testing.expectError(error.SqlConnectionNotFound, load(&store, alloc, id, "alice", 7, 2));
     try std.testing.expect((try registry.getSqlState(alloc, txn_id)) == null);
+}
+
+test "HTTP connection reconciles expired uncertain attempts that never started execution" {
+    const alloc = std.testing.allocator;
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var native = try backend.runtimeStore(alloc, .{ .name = "sql-connection-uncertain-test" });
+    defer native.deinit();
+    var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
+    var registry = transactions.SessionRegistry.initWithLeaseTtl(&store, transactions.SessionLeaseStore.initFromDurable(&store), 60 * std.time.ns_per_s);
+    registry.durable_scope = .cluster_shared;
+    defer registry.deinit(alloc);
+
+    for ([_]bool{ false, true }, [_]u8{ 'a', 'b' }) |request_persisted, digit| {
+        const id: [32]u8 = @splat(digit);
+        const txn_id = transactions.newSessionTxnId(7);
+        _ = try mutate(&store, .{ .create = .{ .id = id, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 1);
+        _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 1, .txn_id = txn_id } }, "alice", 7, 2);
+        _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
+        _ = try mutate(&store, .{ .bind = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2);
+        const guard = try registry.mutation(alloc, txn_id, 7);
+        if (request_persisted) {
+            var session = (try store.load(txn_id)).?;
+            defer session.deinit(alloc);
+            session.commit_body_digest = @splat(4);
+            try store.saveForTest(session, null);
+        }
+        if (request_persisted) _ = try mutate(&store, .{ .uncertain = .{ .id = id, .guard = guard } }, "alice", 7, 2);
+        try reconcileExpired(&store, &registry, alloc, 999);
+        var pending = try load(&store, alloc, id, "alice", 7, 999);
+        defer pending.deinit();
+        try std.testing.expectEqual(if (request_persisted) record.State.uncertain else .active, pending.value.state);
+        try reconcileExpired(&store, &registry, alloc, 1000);
+        try std.testing.expectError(error.SqlConnectionNotFound, load(&store, alloc, id, "alice", 7, 2));
+        const disposition = (try registry.getStatusForPrincipal(alloc, txn_id, "alice")).?;
+        try std.testing.expectEqual(transactions.SessionDisposition.aborted, disposition.disposition);
+        try std.testing.expectEqual(@as(u64, 0), disposition.lease_expires_at);
+        try std.testing.expect((try registry.getStatusForPrincipal(alloc, txn_id, "bob")) == null);
+        var receipt = (try store.load(txn_id)).?;
+        defer receipt.deinit(alloc);
+        try std.testing.expect(receipt.terminal_abort and receipt.staged == null and receipt.execution_plan == null);
+    }
 }
 
 test "HTTP connection reconciles a durable aborted coordinator decision" {
