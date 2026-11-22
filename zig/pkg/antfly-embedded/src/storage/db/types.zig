@@ -715,6 +715,7 @@ pub const EnrichmentNeighborContextConfig = struct {
 };
 
 pub const EnrichmentExecutionConfig = struct {
+    max_output_tokens_per_item: ?u32 = null,
     batch_items: ?u32 = null,
     batch_bytes: ?u64 = null,
     max_document_pages: ?u32 = null,
@@ -1656,7 +1657,10 @@ pub const DocumentArtifactReprocessShardResume = struct {
     limit: u32 = 0,
 };
 
+pub const ArtifactReprocessSelection = enum { all, incomplete };
+
 pub const DocumentArtifactTableReprocessRequest = struct {
+    selection: ArtifactReprocessSelection = .all,
     from_key: []const u8 = "",
     to_key: []const u8 = "",
     limit: u32 = 100,
@@ -1670,7 +1674,7 @@ pub const DocumentArtifactTableReprocessRequest = struct {
         // Preserve the legacy initial-request envelope. Only actual resumes
         // add the marker; an empty cursor remains distinct from an open bound.
         inline for (comptime std.meta.fieldNames(@This())) |name| {
-            const emit = if (comptime std.mem.eql(u8, name, "resume_from_key")) self.resume_from_key else true;
+            const emit = if (comptime std.mem.eql(u8, name, "resume_from_key")) self.resume_from_key else if (comptime std.mem.eql(u8, name, "selection")) self.selection != .all else true;
             if (emit) {
                 try writer.objectField(name);
                 try writer.write(@field(self, name));

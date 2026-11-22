@@ -936,34 +936,9 @@ fn documentArtifactReprocessRequestForCursor(
         .from_key = cursor.next_key,
         .resume_from_key = true,
         .to_key = req.to_key,
+        .selection = req.selection,
         .limit = if (cursor.limit != 0) cursor.limit else req.limit,
     };
-}
-
-test "privacy reprocess continuations preserve empty IDs across shard and owner transport" {
-    const a = std.testing.allocator;
-    for ([_][]const u8{ "", "\x00", "after" }) |key| {
-        const req = documentArtifactReprocessRequestForCursor(.{ .to_key = "end", .limit = 100 }, .{ .group_id = 1, .next_key = key, .limit = 1 });
-        try std.testing.expect(req.resume_from_key);
-        try std.testing.expectEqual(@as(u32, 1), req.limit);
-        const raw = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", req);
-        defer a.free(raw);
-        var decoded = try std.json.parseFromSlice(StorageKernelArtifactRangeRequest, a, raw, .{});
-        defer decoded.deinit();
-        try std.testing.expect(decoded.value.request.resume_from_key);
-        try std.testing.expectEqualStrings(key, decoded.value.request.from_key);
-        try std.testing.expectEqualStrings("end", decoded.value.request.to_key);
-    }
-    const initial = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", .{});
-    defer a.free(initial);
-    try std.testing.expect(std.mem.indexOf(u8, initial, "resume_from_key") == null);
-    const id = try a.alloc(u8, 64 * 1024);
-    defer a.free(id);
-    @memset(id, 'x');
-    const request = documentArtifactReprocessRequestForCursor(.{}, .{ .next_key = id });
-    const bounded = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", request);
-    defer a.free(bounded);
-    try std.testing.expect(bounded.len < id.len + 512);
 }
 
 fn appendOwnedArtifactRepairIssues(
@@ -28546,7 +28521,25 @@ fn putArtifactEnrichmentInDb(
 ) !void {
     var parsed = try parseArtifactEnrichmentConfig(alloc, artifact_name, enrichment_json);
     defer parsed.deinit();
-    _ = try db.upsertEnrichment(parsed.value);
+    var input = try std.json.parseFromSlice(std.json.Value, alloc, enrichment_json, .{});
+    defer input.deinit();
+    if (input.value != .object) return error.InvalidEnrichmentConfig;
+    if (!input.value.object.contains("producer_json") and !input.value.object.contains("producer") and !input.value.object.contains("transcriber")) {
+        if (try db.getEnrichment(alloc, parsed.value.kind, artifact_name)) |value| {
+            var existing = value;
+            defer existing.deinit(alloc);
+            try input.value.object.put(input.arena.allocator(), "producer_json", .{ .string = try input.arena.allocator().dupe(u8, existing.producer_json) });
+        }
+    }
+    // Use the same public normalization as metadata admission, including typed
+    // producer configuration and the transcription shorthand. A direct parse
+    // of the internal struct silently discards both public spellings.
+    const normalized = try std.json.Stringify.valueAlloc(alloc, .{ .enrichments = .{input.value} }, .{});
+    defer alloc.free(normalized);
+    const configs = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, normalized);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, configs);
+    if (configs.len != 1) return error.InvalidEnrichmentConfig;
+    _ = try db.upsertEnrichment(configs[0]);
 }
 
 const deleteArtifactEnrichmentFromDbByName = @import("antfly_local_sources").api_local_table_writes.deleteArtifactEnrichmentFromDbByName;
@@ -40484,6 +40477,59 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "privacy reprocess continuations preserve empty IDs across shard and owner transport" {
+            const a = std.testing.allocator;
+            for ([_][]const u8{ "", "\x00", "after" }) |key| {
+                const req = documentArtifactReprocessRequestForCursor(.{ .to_key = "end", .limit = 100, .selection = .incomplete }, .{ .group_id = 1, .next_key = key, .limit = 1 });
+                try std.testing.expect(req.resume_from_key);
+                try std.testing.expectEqual(@as(u32, 1), req.limit);
+                const raw = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", req);
+                defer a.free(raw);
+                var decoded = try std.json.parseFromSlice(StorageKernelArtifactRangeRequest, a, raw, .{});
+                defer decoded.deinit();
+                try std.testing.expect(decoded.value.request.resume_from_key);
+                try std.testing.expectEqual(.incomplete, decoded.value.request.selection);
+                try std.testing.expectEqualStrings(key, decoded.value.request.from_key);
+                try std.testing.expectEqualStrings("end", decoded.value.request.to_key);
+            }
+            const initial = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", .{});
+            defer a.free(initial);
+            try std.testing.expect(std.mem.indexOf(u8, initial, "resume_from_key") == null);
+            const id = try a.alloc(u8, 64 * 1024);
+            defer a.free(id);
+            @memset(id, 'x');
+            const request = documentArtifactReprocessRequestForCursor(.{}, .{ .next_key = id });
+            const bounded = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", request);
+            defer a.free(bounded);
+            try std.testing.expect(bounded.len < id.len + 512);
+        }
+
+        test "enrichment shorthand local PUT preserves and replaces producer forms" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/policy-put", .{tmp.sub_path});
+            defer a.free(path);
+            var db = try db_mod.DB.open(a, path, .{});
+            defer db.close();
+            try putArtifactEnrichmentInDb(a, &db, "audio",
+                \\{"name":"audio","kind":"asset","field":"url","transcriber":{"provider":"antfly","model":"first"}}
+            );
+            try putArtifactEnrichmentInDb(a, &db, "audio",
+                \\{"name":"audio","kind":"asset","field":"url","producer":{"type":"document_extraction","config":{"transcription":{"transcriber":{"provider":"antfly","model":"second"}}}}}
+            );
+            try putArtifactEnrichmentInDb(a, &db, "audio",
+                \\{"name":"audio","kind":"asset","field":"url","transcriber":{"provider":"antfly","model":"third"}}
+            );
+            try putArtifactEnrichmentInDb(a, &db, "audio",
+                \\{"name":"audio","kind":"asset","field":"url","content_type":"application/json","execution":{"batch_items":2}}
+            );
+            var saved = (try db.getEnrichment(a, .asset, "audio")).?;
+            defer saved.deinit(a);
+            try std.testing.expect(std.mem.indexOf(u8, saved.producer_json, "third") != null);
+            try std.testing.expectEqual(@as(?u32, 2), saved.execution.?.batch_items);
+        }
+
         // Source quiescence joins source-owned work; cached DB workers also
         // borrow it through runtime hooks and must drain before its destruction.
         fn deinitManagedSourceForTest(source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {
