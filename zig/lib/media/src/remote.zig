@@ -115,6 +115,7 @@ pub const ReadAhead = struct {
     charged_bytes: u64 = 0,
     reads: usize = 0,
     hits: usize = 0,
+    prefetch_limited: bool = false,
     sparse_pressure: u2 = 0,
     sparse_miss: ?u64 = null,
     pub fn range(self: *ReadAhead) source.Range {
@@ -178,7 +179,10 @@ pub const ReadAhead = struct {
         if (self.reads >= self.max_reads) return error.RemoteRequestBudgetExceeded;
         self.reads += 1;
         self.charged_bytes += out.len;
-        const n = try self.upstream.read_at(self.upstream.context, offset, out, control);
+        const n = self.upstream.read_at(self.upstream.context, offset, out, control) catch |err| {
+            if (err == error.RemoteReadBudgetExceeded) self.charged_bytes -= out.len;
+            return err;
+        };
         if (n == 0 or n > out.len) return error.InvalidSourceRead;
         self.charged_bytes -= out.len - n;
         self.transferred_bytes += n;
@@ -213,21 +217,31 @@ pub const ReadAhead = struct {
         // probes may ask for that prefix again before growing the suffix.
         const append = self.valid < self.window_bytes and offset >= self.start and offset - self.start == self.valid;
         const retained = if (append) self.valid else 0;
-        const fetch: usize = @intCast(@min(fill_bytes, self.window_bytes - retained, self.upstream.length - offset, self.max_bytes -| self.charged_bytes));
+        const fill = if (self.prefetch_limited) @min(fill_bytes, out.len) else fill_bytes;
+        const fetch: usize = @intCast(@min(fill, self.window_bytes - retained, self.upstream.length - offset, self.max_bytes -| self.charged_bytes));
         if (fetch == 0) return error.RemoteReadBudgetExceeded;
         self.valid = retained;
         if (!append) self.start = offset;
         errdefer self.valid = retained;
-        const wanted = retained + fetch;
-        const required = @min(out.len, fetch);
+        var wanted = retained + fetch;
+        const required = retained + @min(out.len, fetch);
         while (self.valid < wanted) {
             try control.check();
             if (self.reads >= self.max_reads) {
-                if (self.valid - retained >= required) break;
+                if (self.valid >= required) break;
                 return error.RemoteRequestBudgetExceeded;
             }
             const n = self.fetchAt(self.start + self.valid, self.buffer.?[self.valid..wanted], control) catch |err| {
-                if (self.valid - retained >= required and (err == error.RemoteReadBudgetExceeded or err == error.RemoteRequestBudgetExceeded)) break;
+                if (err == error.RemoteReadBudgetExceeded) {
+                    self.prefetch_limited = true;
+                    if (self.valid >= required) break;
+                    if (wanted > required) {
+                        wanted = required;
+                        continue;
+                    }
+                    if (self.valid > retained) break;
+                }
+                if (err == error.RemoteRequestBudgetExceeded and self.valid >= required) break;
                 return err;
             };
             self.valid += n;
@@ -383,6 +397,34 @@ test "remote prefetch tolerates upstream quota only after satisfying demand" {
             try std.testing.expectError(failure, ReadAhead.readAt(&cache, 64, &out, .{}));
         }
     }
+}
+
+test "remote retries an oversized prefetch with only the demand suffix" {
+    const Upstream = struct {
+        remaining: usize = 8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (out.len > self.remaining) return error.RemoteReadBudgetExceeded;
+            self.remaining -= out.len;
+            for (out, 0..) |*byte, index| byte.* = @intCast(offset + index);
+            return out.len;
+        }
+    };
+    var provider = Upstream{};
+    var cache = ReadAhead{ .allocator = std.testing.allocator, .upstream = .{ .context = &provider, .read_at = Upstream.read, .length = 32 }, .max_bytes = 16, .max_reads = 4 };
+    defer cache.deinit();
+    var out: [4]u8 = undefined;
+    try std.testing.expectEqual(out.len, try ReadAhead.readAt(&cache, 0, &out, .{}));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, &out);
+    try std.testing.expectEqual(@as(usize, 2), cache.reads);
+    try std.testing.expectEqual(@as(u64, 4), cache.charged_bytes);
+    try std.testing.expectEqual(out.len, try ReadAhead.readAt(&cache, 4, &out, .{}));
+    try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6, 7 }, &out);
+    try std.testing.expectEqual(@as(usize, 3), cache.reads);
+    try std.testing.expectEqual(@as(u64, 8), cache.charged_bytes);
+    try std.testing.expectError(error.RemoteReadBudgetExceeded, ReadAhead.readAt(&cache, 8, &out, .{}));
+    try std.testing.expectEqual(@as(u64, 8), cache.transferred_bytes);
+    try std.testing.expectEqual(@as(u64, 8), cache.charged_bytes);
 }
 
 test "remote isolated look-behind preserves the forward cache" {

@@ -554,13 +554,18 @@ pub const Directory = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(a: std.mem.Allocator, source: *Source, limits: Webm.Limits) !Directory {
+        return initWithFlacPacketLimit(a, source, limits, limits.max_packet_bytes);
+    }
+
+    /// FLAC packets may hold multiple frames and need not fit in one read.
+    pub fn initWithFlacPacketLimit(a: std.mem.Allocator, source: *Source, limits: Webm.Limits, max_flac_packet_bytes: usize) !Directory {
         var scan = Webm.Scan{ .input = source, .limits = limits };
         const header = try scan.rawHeader(0, source.length());
         if (header.id != ebml_header_id or header.unknown) return error.UnsupportedAudioFormat;
         var offset = header.end;
         while (offset < source.length()) {
             const element = try scan.rawHeader(offset, source.length());
-            if (element.id == segment_id) return scanSegment(a, &scan, element);
+            if (element.id == segment_id) return scanSegment(a, &scan, element, max_flac_packet_bytes);
             if (element.unknown) return error.UnsupportedAudioFormat;
             offset = element.end;
         }
@@ -599,7 +604,7 @@ const RangeBlock = struct {
     }
 };
 
-fn scanSegment(a: std.mem.Allocator, scan: *Webm.Scan, segment: Webm.Element) !Directory {
+fn scanSegment(a: std.mem.Allocator, scan: *Webm.Scan, segment: Webm.Element, max_flac_packet_bytes: usize) !Directory {
     var state = DemuxState{};
     defer if (state.track) |track| a.free(track.codec_private);
     var packets: std.ArrayList(Packet) = .empty;
@@ -609,7 +614,8 @@ fn scanSegment(a: std.mem.Allocator, scan: *Webm.Scan, segment: Webm.Element) !D
         const elem = try scan.rawHeader(pos, segment.end);
         if (elem.id == cluster_id) {
             const track = state.track orelse return error.UnsupportedAudioFormat;
-            pos = try scanCluster(a, scan, elem, track, state.timestamp_scale_ns, &packets, &state.discard_padding_ns);
+            const packet_limit = if (track.codec == .flac) max_flac_packet_bytes else scan.limits.max_packet_bytes;
+            pos = try scanCluster(a, scan, elem, track, state.timestamp_scale_ns, &packets, &state.discard_padding_ns, packet_limit);
             continue;
         }
         if (elem.unknown) return error.UnsupportedAudioFormat;
@@ -640,7 +646,7 @@ fn scanSegment(a: std.mem.Allocator, scan: *Webm.Scan, segment: Webm.Element) !D
     return .{ .track = track, .packets = owned, .discard_padding_ns = state.discard_padding_ns, .allocator = a };
 }
 
-fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, track: TrackInfo, scale: u64, packets: *std.ArrayList(Packet), padding: *i64) !u64 {
+fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, track: TrackInfo, scale: u64, packets: *std.ArrayList(Packet), padding: *i64, packet_limit: usize) !u64 {
     var ticks: u64 = 0;
     var pos = cluster.payload;
     while (pos < cluster.end) {
@@ -654,7 +660,7 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
                 defer lease.deinit();
                 ticks = try readUint(lease.bytes);
             },
-            simple_block_id => try indexBlock(a, scan, child, track, ticks, scale, packets),
+            simple_block_id => try indexBlock(a, scan, child, track, ticks, scale, packets, packet_limit),
             block_group_id => {
                 const before = packets.items.len;
                 var discard: ?Webm.Element = null;
@@ -663,7 +669,7 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
                     const field = try scan.rawHeader(nested, child.end);
                     if (field.unknown) return error.UnsupportedAudioFormat;
                     switch (field.id) {
-                        block_id => try indexBlock(a, scan, field, track, ticks, scale, packets),
+                        block_id => try indexBlock(a, scan, field, track, ticks, scale, packets, packet_limit),
                         discard_padding_id => discard = field,
                         else => {},
                     }
@@ -683,7 +689,7 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
     return pos;
 }
 
-fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track: TrackInfo, ticks: u64, scale: u64, packets: *std.ArrayList(Packet)) !void {
+fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track: TrackInfo, ticks: u64, scale: u64, packets: *std.ArrayList(Packet), packet_limit: usize) !void {
     const length = std.math.cast(usize, elem.end - elem.payload) orelse return error.ResourceLimitExceeded;
     var reader = RangeBlock{ .source = scan.input, .start = elem.payload, .length = length };
     defer reader.close();
@@ -694,7 +700,7 @@ fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track:
     if (count > packets.capacity) try packets.ensureTotalCapacityPrecise(a, @min(limit, @max(count, packets.capacity *| 2)));
     var offset = reader.position;
     for (block.sizes[0..block.count]) |size| {
-        if (size > scan.limits.max_packet_bytes) return error.ResourceLimitExceeded;
+        if (size > packet_limit) return error.ResourceLimitExceeded;
         var packet = Packet{ .offset = elem.payload + offset, .time_ns = block.time_ns, .size = size };
         reader.position = offset;
         for (packet.prefix[0..@min(size, if (track.codec == .flac) packet.prefix.len else 2)]) |*value| value.* = try reader.byte();

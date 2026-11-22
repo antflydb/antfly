@@ -646,7 +646,10 @@ pub const Runner = struct {
                 probed_first = @intCast(@min(provider.samples, @divFloor(@as(u128, @intCast(cursor.offset_ns)) * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)));
                 const window_end_ns = @as(u128, @intCast(cursor.offset_ns)) + @as(u128, @intCast(@min(self.request.policy.window_ns, self.executor.model.max_audio_ns)));
                 const lookahead_ns = window_end_ns + @as(u128, @intCast(self.executor.model.min_audio_ns));
-                const stop: usize = @intCast(@min(provider.samples, @divFloor(lookahead_ns * provider.sample_rate, std.time.ns_per_s) + 1));
+                // Forward streams may need a read beyond the boundary to
+                // observe EOF. Indexed FLAC discovers EOF from its last frame.
+                const extra_sample: u128 = @intFromBool(provider.probe_window == null or self.executor.model.min_audio_ns > 0);
+                const stop: usize = @intCast(@min(provider.samples, @divFloor(lookahead_ns * provider.sample_rate, std.time.ns_per_s) + extra_sample));
                 const discovered = if (provider.probe_window) |probe| discovered: {
                     // Acknowledged windows only need enough tail data to
                     // reconstruct an EOF-adjusted boundary.
@@ -1633,7 +1636,8 @@ test "model aware media reuses audio lookahead and reconstructs an acknowledged 
         pcm: [750]f32 = @splat(0.25),
         finalized: bool = false,
         first: usize = 0,
-        fn probe(raw: *anyopaque, _: std.mem.Allocator, first: usize, last: usize, _: usize) !?Audio.Lease {
+        fn probe(raw: *anyopaque, _: std.mem.Allocator, first: usize, last: usize, lookahead: usize) !?Audio.Lease {
+            try std.testing.expectEqual(@as(usize, 1000), lookahead);
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.first = first;
             self.finalized = true;
@@ -1662,7 +1666,7 @@ test "model aware media reuses audio lookahead and reconstructs an acknowledged 
     source.finalized = false;
     runner = try Runner.init(a, request, result.executor(), .{}, sink);
     try runner.soundWindows(provider);
-    try std.testing.expectEqual(@as(usize, 1000), source.first);
+    try std.testing.expectEqual(@as(usize, 999), source.first);
     try std.testing.expectEqual(@as(usize, 1), result.seen);
 }
 

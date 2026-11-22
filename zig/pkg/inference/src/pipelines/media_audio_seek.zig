@@ -81,12 +81,13 @@ pub const Index = union(enum) {
         var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = max_bytes };
         const scratch = bounded.allocator();
         const read_limit = @min(source.limits.max_read_bytes, source.limits.max_retained_bytes);
-        const directory = media.webm_audio.Directory.init(scratch, source, .{
+        const coded_extent_limit = std.math.cast(usize, source.length()) orelse std.math.maxInt(usize);
+        const directory = media.webm_audio.Directory.initWithFlacPacketLimit(scratch, source, .{
             .max_packets = max_frames,
             .max_metadata_bytes = @min(max_bytes, read_limit),
             .max_index_bytes = max_bytes,
             .max_packet_bytes = read_limit,
-        }) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
+        }, coded_extent_limit) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
         defer directory.deinit();
         if (directory.track.codec == .flac) return .{ .webm_flac = try WebmFlac.init(a, directory, source, max_bytes, bounded.live, admission) };
         const OpusSeek = @import("media_opus_seek.zig");
@@ -784,13 +785,35 @@ test "model aware media FLAC reads and indexes individual frames within a WebM b
     const a = std.testing.allocator;
     const encoded = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.flac", a, .limited(1024 * 1024));
     defer a.free(encoded);
-    const webm = try audio.webm.buildFlacTestBlocksAlloc(a, encoded, false, std.math.maxInt(usize));
+    const parsed = try audio.flac.parseStream(encoded);
+    // Keep STREAMINFO and drop optional metadata so the read cap isolates
+    // the packet extent constraint.
+    const compact = try std.mem.concat(a, u8, &.{ encoded[0..42], encoded[parsed.data_offset..] });
+    defer a.free(compact);
+    compact[4] |= 0x80;
+    const webm = try audio.webm.buildFlacTestBlocksAlloc(a, compact, false, std.math.maxInt(usize));
     defer a.free(webm);
     var reference = try audio.decode(a, encoded, .{});
     defer reference.deinit();
-    var source = media.source.Source{ .allocator = a, .identity = "multiframe-flac", .storage = .{ .borrowed = webm } };
+    const Transport = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: media.source.Control) !usize {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var transport = Transport{ .bytes = webm };
+    const read_limit = parsed.stream_info.max_frame_size;
+    var source = media.source.Source{
+        .allocator = a,
+        .identity = "multiframe-flac",
+        .storage = .{ .range = .{ .context = &transport, .read_at = Transport.read, .length = webm.len } },
+        .limits = .{ .max_read_bytes = read_limit, .max_retained_bytes = read_limit },
+    };
     var index = try Index.initWebmSource(a, &source, 1024, 1024 * 1024, null);
     defer index.deinit();
+    try std.testing.expect(index.webm_flac.extents[0].packet.size > read_limit);
     const boundary = index.webm_flac.info.max_block_size;
     var reader = Reader{ .index = &index, .source = &source };
     const provider = reader.provider();

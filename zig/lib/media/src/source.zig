@@ -58,6 +58,8 @@ pub const Range = struct {
     borrow_at: ?*const fn (*anyopaque, u64, usize, Control) anyerror!?[]const u8 = null,
     context: *anyopaque,
     /// May return a short read. Returning zero before the declared end is EOF.
+    /// RemoteReadBudgetExceeded rejects a request before transferring bytes.
+    /// A provider that transferred a prefix can report it as a short read.
     read_at: *const fn (*anyopaque, u64, []u8, Control) anyerror!usize,
     sparse_read_at: ?*const fn (*anyopaque, u64, []u8, Control) anyerror!usize = null,
     isolated_read_at: ?*const fn (*anyopaque, u64, []u8, Control) anyerror!usize = null,
