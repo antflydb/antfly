@@ -2100,8 +2100,10 @@ pub const DurableSessionStore = struct {
             fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
                 scan.inspected += 1;
-                const id = distributed_txn.parseTxnIdHex(key[scan.prefix_len..]) catch null;
-                if (id != null and value.len == 16) {
+                const suffix = key[scan.prefix_len..];
+                const id = distributed_txn.parseTxnIdHex(suffix) catch null;
+                // The maintenance deadline can resume from an entry's encoded key.
+                if (id != null and value.len == 16 and std.mem.eql(u8, suffix, &std.fmt.bytesToHex(id.?, .lower))) {
                     try scan.entries.append(scan.alloc, .{ .transaction_id = id.?, .reference = value[0..16].* });
                 } else {
                     std.log.warn("malformed SQL observation index row retained key_bytes={d} value_bytes={d}", .{ key.len, value.len });
