@@ -1511,6 +1511,9 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         if (cached_rows.len != 0) {
             const targets = try scratch.dupe(media_outputs.Target, consumers.targets);
             const first: usize = @intCast(if (position) |cursor| cursor.ordinal else 0);
+            // A disabled target has an existing receipt for every requested
+            // ordinal. Start a fresh page before entering uncached coverage.
+            if (first < cached_rows.len) config.max_chunks = @min(config.max_chunks, cached_rows.len - first);
             for (targets) |*target| {
                 target.execute = false;
                 for (@min(first, cached_rows.len)..@min(first +| config.max_chunks, cached_rows.len)) |ordinal| {
@@ -1519,7 +1522,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
                         break;
                     }
                 }
-                if (first +| config.max_chunks > cached_rows.len) target.execute = true;
+                if (first >= cached_rows.len) target.execute = true;
                 var skips = std.ArrayList(media_outputs.Target.Window).empty;
                 const current_recipe = for (current_identities) |identity| {
                     if (std.mem.eql(u8, identity.name, target.name)) break identity.recipe_id;
