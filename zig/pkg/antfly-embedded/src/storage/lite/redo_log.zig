@@ -864,10 +864,29 @@ pub fn replayBufferedPrefix(
     return replayBoundedWithWindow(allocator, file, io, base_offset, capacity, start_after_sequence, max_sequence, unlogged_through, on_record, ctx, &window);
 }
 
+/// Copy precisely the bytes that passed framing, CRC and sequence checks.
+pub fn copyVerifiedPrefix(
+    allocator: Allocator,
+    file: File,
+    io: Io,
+    base_offset: u64,
+    capacity: u64,
+    folded: u64,
+    sequence: u64,
+    slot_sequence: u64,
+    output: *File.Writer,
+) anyerror!ReplayOutcome {
+    const scratch = try allocator.alloc(u8, @intCast(@min(capacity, 64 * 1024)));
+    defer allocator.free(scratch);
+    var window: ReplayReadWindow = .{ .scratch = scratch, .output = output };
+    return replayBoundedWithWindow(allocator, file, io, base_offset, capacity, folded, sequence, slot_sequence, null, null, &window);
+}
+
 const ReplayReadWindow = struct {
     scratch: []u8 = &.{},
     start: u64 = 0,
     len: usize = 0,
+    output: ?*File.Writer = null,
 
     fn read(window: *ReplayReadWindow, file: File, io: Io, out: []u8, offset: u64, limit: u64) !usize {
         if (out.len == 0) return 0;
@@ -1065,6 +1084,11 @@ fn replayBoundedWithWindow(
             }
         }
 
+        if (window.output) |output| {
+            try output.interface.writeAll(raw_header[0..record_header_len]);
+            try output.interface.writeAll(payload_buf.items);
+        }
+
         if (!superseded) {
             if (on_record) |cb| {
                 try cb(ctx, .{ .commit_sequence = header.commit_sequence, .payload = payload_buf.items, .offset = pos });
@@ -1075,6 +1099,9 @@ fn replayBoundedWithWindow(
         if (run_salt == null) run_salt = header.salt;
         pos += record_header_len + payload_len;
         last_sequence = header.commit_sequence;
+        if (window.output != null and max_sequence == header.commit_sequence) {
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .durable_ceiling };
+        }
     }
 }
 
