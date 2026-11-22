@@ -26796,8 +26796,8 @@ pub const Node = struct {
             }
             if (wire.choices.len != 1 or !std.mem.eql(u8, wire.choices[0].finish_reason, "stop")) return error.InvalidConstrainedOutput;
             const message = wire.choices[0].message;
-            if ((message.refusal orelse "").len != 0 or (message.tool_calls orelse &.{}).len != 0)
-                return error.InvalidConstrainedOutput;
+            if (message.refusal) |refusal| if (refusal.len != 0) return error.InvalidConstrainedOutput;
+            if (message.tool_calls) |calls| if (calls.len != 0) return error.InvalidConstrainedOutput;
             const value = c.parseReply(output_allocator, message.content orelse return error.InvalidConstrainedOutput) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidConstrainedOutput,
