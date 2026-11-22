@@ -1426,6 +1426,8 @@ pub const MetadataHttpClient = struct {
                 error.TableTopologyProtocolUpgradeRequired,
             409 => if (std.mem.eql(u8, response.body, "ResolverCurationConflict"))
                 error.ResolverCurationConflict
+            else if (std.mem.eql(u8, response.body, "ConstraintRetirementRequired"))
+                error.ConstraintRetirementRequired
             else if ((input == .store_root_enroll or input == .store_root_enrollment_status) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
                 error.StoreRootEnrollmentChanged
             else
@@ -4995,6 +4997,7 @@ test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
     const Executor = struct {
         outcome: []const u8,
         status: u16 = 503,
+        body: []const u8 = "{}",
         disconnected: bool = false,
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const fixture: *@This() = @ptrCast(@alignCast(ptr));
@@ -5004,7 +5007,7 @@ test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
             }
             const headers = try alloc.alloc(http_common.Header, 1);
             headers[0] = .{ .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try alloc.dupe(u8, fixture.outcome) };
-            return .{ .status = fixture.status, .headers = headers, .body = try alloc.dupe(u8, "{}") };
+            return .{ .status = fixture.status, .headers = headers, .body = try alloc.dupe(u8, fixture.body) };
         }
     };
     var fixture: Executor = .{ .outcome = routes.Routes.raft_mutation_outcome_not_proposed };
@@ -5014,6 +5017,14 @@ test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
     var submitted = false;
     try std.testing.expectError(error.NotLeader, client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted));
     try std.testing.expect(!submitted);
+    fixture.status = system_catalog.httpStatus(error.ConstraintRetirementRequired);
+    try std.testing.expectEqual(@as(u16, 409), fixture.status);
+    fixture.body = "ConstraintRetirementRequired";
+    const drop: @import("../system_catalog/server_call.zig").Call = .{ .mutate = .{ .mutation = .{ .action = .drop, .kind = .table, .name = "retained" } } };
+    try std.testing.expectError(error.ConstraintRetirementRequired, client.forwardSystemCatalogObserved("http://owner", drop, forwarding, false, &submitted));
+    try std.testing.expect(!submitted);
+    fixture.status = 503;
+    fixture.body = "{}";
     fixture.outcome = routes.Routes.raft_mutation_outcome_unknown;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted));
     try std.testing.expect(submitted);

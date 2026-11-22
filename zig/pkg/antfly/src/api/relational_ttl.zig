@@ -270,9 +270,14 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
                 };
                 const id = self.next_txn;
                 self.next_txn += 1;
-                const txn = try self.db.beginTransactionWithId(@splat(id), @as(u64, id) * 100);
-                errdefer self.db.abortTransaction(txn, @as(u64, id) * 100 + 1) catch {};
+                const timestamp = @as(u64, id) * 100;
+                const txn = if (request.source_producer == .unlabelled)
+                    try self.db.beginTransactionWithId(@splat(id), timestamp)
+                else
+                    try self.db.beginProducerTransactionScoped(@splat(id), timestamp, timestamp, &.{}, true, false, null, request.source_producer);
+                errdefer self.db.abortTransaction(txn, timestamp + 1) catch {};
                 try self.db.writeTransaction(txn, .{
+                    .completion_ordinary_producer = request.source_producer == .ordinary,
                     .relational_schema_version = request.relational_schema_version,
                     .relational_integrity_generation_set = request.relational_integrity_generation_set,
                     .writes = request.writes,
@@ -280,7 +285,7 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
                     .predicates = request.predicates,
                     .integrity_commands = request.integrity_commands,
                 });
-                try self.db.commitTransaction(txn, @as(u64, id) * 100 + 1);
+                try self.db.commitTransaction(txn, timestamp + 1);
                 return .{ .committed = .{ .participant_count = 1 } };
             }
             fn candidate(self: *@This(), key: []const u8) !expiry.Candidate {
@@ -296,7 +301,7 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
         var fixture: Fixture = .{ .db = &db, .tables = .{.{ .table_id = 500, .name = "rows", .schema_json = declaration }} };
         const source: StatusSource = .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .linearizable_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.freeAdmin } };
         var bound = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init("rows", 501, &db, @import("../raft/read_gate.zig").alreadyReadSafeBarrier());
-        const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch = Fixture.commit } };
+        const writer: writes.TableWriteSource = .{ .ptr = &fixture, .supports_transaction_producers = true, .vtable = &.{ .batch = Fixture.batch, .commit_batch = Fixture.commit } };
         var inserted = try integrity.prepareWithCoverage(alloc, bound.source(), &fixture.tables, &fixture.ranges, &.{.{ .table_name = "rows", .writes = &.{
             .{ .key = "p", .value = "{\"id\":1,\"parent\":null,\"expires\":\"1970-01-01T00:00:00.000000001Z\"}" },
             .{ .key = "c", .value = "{\"id\":2,\"parent\":1,\"expires\":\"1970-01-01T00:00:00.000000001Z\"}" },

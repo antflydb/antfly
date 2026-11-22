@@ -1407,7 +1407,7 @@ fn routeCommitParticipants(alloc: std.mem.Allocator, catalog: table_catalog.Cata
             if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
                 !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
                 return error.TopologyChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, fence.route.group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, fence.route.group_id, topology_epoch);
             if (participant.route_fence) |*existing| {
                 if (!@import("antfly_local_sources").api_range_read_guards.sameOwner(existing.*, fence)) return error.TopologyChanged;
                 existing.catalog_revision = @max(existing.catalog_revision, fence.catalog_revision);
@@ -1417,65 +1417,65 @@ fn routeCommitParticipants(alloc: std.mem.Allocator, catalog: table_catalog.Cata
 
         for (table.writes) |write| {
             const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.writes.append(alloc, write);
         }
         for (table.deletes) |key| {
             const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
         for (table.graph_writes) |edge| {
             const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.graph_writes.append(alloc, edge);
         }
         for (table.graph_deletes) |edge| {
             const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.graph_deletes.append(alloc, edge);
         }
         for (table.predicates) |predicate| {
             const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.predicates.append(alloc, predicate);
         }
         for (table.transforms) |transform| {
             const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
         }
         for (table.integrity) |operation| {
             const group_id = routing.resolveGroupForKey(operation.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.integrity.append(alloc, operation);
         }
         for (table.integrity_commands) |command| {
             const group_id = routing.resolveGroupForKey(&command.address.routing) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.integrity_commands.append(alloc, command);
         }
         if (table.relational_activation) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             if (participant.relational_activation != null) return error.InvalidTxnRequest;
             participant.relational_activation = command;
         }
         if (table.relational_retirement) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             if (participant.relational_retirement != null) return error.InvalidTxnRequest;
             participant.relational_retirement = command;
         }
         if (table.relational_index_maintenance) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
             if (group_id != command.owner_group_id) return error.PreparedGenerationChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
             participant.relational_index_maintenance = command;
         }
         if (table.commit_requires == .direct_enrichments and groups.count() == 0) {
-            _ = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
+            _ = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
         }
         // Match all enlisted owner proofs in one traversal of this table's
         // ranges. Guarded reads keep their observed fence and bound writes get

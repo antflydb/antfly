@@ -33,7 +33,10 @@ resume, and slot drop. The exported-snapshot cases read pre-cut rows using
 two-table cases also exercise transaction rollback and rollback to savepoint.
 The cross-node case kills a data node mid-stream, verifies the confirmed LSN
 on a surviving node, and streams a later commit with stock `pg_recvlogical`.
-The fixture uses three metadata nodes and three data nodes on a single host.
+The topology case uses the same slot through a live range split and merge. It
+verifies writes to both split participants, confirmed LSN advancement, and
+continuation after the merge and serving-node failover. These fixtures use
+three metadata nodes and three data nodes on a single host.
 Changing replica identity invalidates the old slot binding and returns a
 resynchronization error before streaming. Schema changes require the
 publication and slot to be created for the new relation definition.

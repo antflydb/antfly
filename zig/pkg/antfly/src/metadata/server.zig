@@ -1883,7 +1883,8 @@ test "metadata server can expose admin listener endpoints" {
     var persisted = (try api.txn_sessions.durable.?.load(durable_session.txn_id)).?;
     persisted.deinit(std.heap.page_allocator);
     // Retire the fixture record after proving the default store is durable.
-    try std.testing.expect(api.txn_sessions.removeBeforeExecution(std.heap.page_allocator, durable_session.txn_id));
+    const guard = try api.txn_sessions.mutation(std.heap.page_allocator, durable_session.txn_id, public_cfg.session_router.?.localNodeId());
+    try std.testing.expect(try api.txn_sessions.retireBeforeExecution(std.heap.page_allocator, guard, durable_session.version, false));
 
     try server.svc.upsertTable(.{ .table_id = 77, .name = "docs" });
 
