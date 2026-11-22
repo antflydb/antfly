@@ -1015,6 +1015,7 @@ pub const AntflyApiHandler = struct {
         alloc: std.mem.Allocator,
         server: ?*http_server_mod.ApiHttpServer = null,
         value: @import("../pgwire/completion.zig").Completion = .{},
+        reports_existing_commit: bool = false,
         fn prepareTransaction(raw: *anyopaque, id: [16]u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try @import("sql_completion.zig").prepareTransaction(self.server orelse return error.DurabilityUnavailable, self.alloc, &self.value, id);
@@ -1091,7 +1092,8 @@ pub const AntflyApiHandler = struct {
         // manufacture an unresolved durable owner. Ambiguous 409s stay fenced.
         const code = response.status.code;
         const rejected = code == 400 or code == 401 or code == 403 or code == 404 or code == 405 or code == 413 or code == 415 or code == 422 or code == 429;
-        if (!completion.execution_owned and !rejected and code != 204 and ctx.request.method != .GET) {
+        const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+        if (!owned.reports_existing_commit and !completion.execution_owned and !rejected and code != 204 and ctx.request.method != .GET) {
             if (response.body) |body| {
                 const Summary = struct { status: ?[]const u8 = null, transaction_id: ?[]const u8 = null, code: ?[]const u8 = null };
                 var parsed = std.json.parseFromSlice(Summary, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch null;
@@ -7361,6 +7363,10 @@ pub const AntflyApiHandler = struct {
         @import("protected_future.zig").wait(runtime_io, &future);
         completion.unknown = false;
         if (job.failure) |err| {
+            if (job.reports_existing_commit) {
+                const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+                owned.reports_existing_commit = true;
+            }
             const diagnostic = sql_execution.diagnostic(err);
             if (!job.reports_existing_commit and std.mem.eql(u8, diagnostic.code, "40003")) completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});

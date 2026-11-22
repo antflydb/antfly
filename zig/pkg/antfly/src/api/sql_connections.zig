@@ -624,7 +624,6 @@ test "HTTP connection reconciles expired uncertain attempts that never started e
     defer native.deinit();
     var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
     var registry = transactions.SessionRegistry.initWithLeaseTtl(&store, transactions.SessionLeaseStore.initFromDurable(&store), 60 * std.time.ns_per_s);
-    registry.durable_scope = .cluster_shared;
     registry.max_sessions = 1;
     defer registry.deinit(alloc);
 
