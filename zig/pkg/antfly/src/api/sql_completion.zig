@@ -531,6 +531,12 @@ fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, r
         if (record.value.phase == .acknowledging) return true;
         return settled(server, alloc, .{ .outcomes = &.{outcome} }, context);
     }
+    if (@import("completion_outbox.zig").isObservation(request.reference_id)) {
+        const id = try parseId(outcome.transaction_id orelse return error.InvalidTransactionSessionRecord);
+        if (record.value.phase != .acknowledging and !try store.completionReferenceSettled(id, request.reference_id)) return false;
+        try store.retireLocalPreparedRegistration(request.reference_id, id);
+        return true;
+    }
     if (record.value.phase != .acknowledging) {
         // A premature acknowledgement must not close registration and strand
         // a live consumer. Once terminal proof is observed it remains terminal.
@@ -572,6 +578,10 @@ fn forwardOwner(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, req
 pub fn ownerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, request: OwnerRequest, forward: bool) !bool {
     if (request.consumer_node_id != null) return consumerAction(server, alloc, request, forward);
     const txn = @import("transactions.zig");
+    // Observation proofs can only be created and retired atomically with the
+    // local outbox record. Standalone owner actions cannot mutate them.
+    if (@import("completion_outbox.zig").isObservation(request.reference_id) and request.action != .status)
+        return error.InvalidArgument;
     if (server.txn_sessions.durable_scope != .cluster_shared) {
         const node = (try server.txn_sessions.getOwnerNodeId(alloc, request.transaction_id)) orelse txn.sessionOwnerNodeId(request.transaction_id);
         const local = if (server.cfg.session_router) |router| router.localNodeId() else 0;
@@ -634,8 +644,15 @@ pub fn retireSettledObservations(server: *server_mod.ApiHttpServer, alloc: std.m
             std.log.warn("mismatched SQL observation registration retained", .{});
             continue;
         }
-        if (record.value.phase == .acknowledging or try store.completionReferenceSettled(entry.transaction_id, reference))
-            try store.retireLocalPreparedRegistration(reference, entry.transaction_id);
+        if (record.value.phase == .acknowledging or try store.completionReferenceSettled(entry.transaction_id, reference)) {
+            store.retireLocalPreparedRegistration(reference, entry.transaction_id) catch |err| switch (err) {
+                error.InvalidTransactionSessionRecord, error.CompletionUnavailable => {
+                    std.log.warn("SQL observation retirement skipped txn_id={x} err={s}", .{ entry.transaction_id, @errorName(err) });
+                    continue;
+                },
+                else => return err,
+            };
+        }
     }
     if (server.sql_observation_retirement_after) |key| server.alloc.free(key);
     server.sql_observation_retirement_after = page.next_after;

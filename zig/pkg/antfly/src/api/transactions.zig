@@ -1681,31 +1681,7 @@ pub const DurableSessionStore = struct {
         return removed;
     }
 
-    const SqlAbortProofPosition = struct {
-        bytes: [sql_abort_proof_prefix.len + 33]u8 = undefined,
-        len: usize,
-        exclusive: bool,
-
-        fn after(key: []const u8) ?SqlAbortProofPosition {
-            var position: SqlAbortProofPosition = .{
-                .len = @min(key.len, sql_abort_proof_prefix.len + 33),
-                .exclusive = key.len <= sql_abort_proof_prefix.len + 32,
-            };
-            @memcpy(position.bytes[0..position.len], key[0..position.len]);
-            if (position.exclusive) return position;
-            // All longer keys sharing this prefix are malformed. Jump past
-            // that run without skipping any fixed-width marker.
-            var end = position.len;
-            while (end > sql_abort_proof_prefix.len) {
-                end -= 1;
-                if (position.bytes[end] == 255) continue;
-                position.bytes[end] += 1;
-                position.len = end + 1;
-                return position;
-            }
-            return null;
-        }
-    };
+    const SqlAbortProofPosition = IndexPosition(sql_abort_proof_prefix.len + 32);
 
     fn reclaimSqlAbortProofsTxn(txn: anytype, cursor: anytype, previous: ?SqlAbortProofPosition, next_position: *?SqlAbortProofPosition) !usize {
         const key_len = sql_abort_proof_prefix.len + 32;
@@ -1724,7 +1700,7 @@ pub const DurableSessionStore = struct {
                 count += 1;
             }
             if (count == keys.len or inspected == 256) {
-                next_position.* = SqlAbortProofPosition.after(entry.key);
+                next_position.* = SqlAbortProofPosition.after(entry.key, sql_abort_proof_prefix.len);
                 break;
             }
         }
@@ -1754,6 +1730,22 @@ pub const DurableSessionStore = struct {
             try decodeSqlTerminalReceipt(alloc, id, raw)
         else |err| switch (err) {
             error.NotFound => live: {
+                const session_key = try makeSessionKey(alloc, id);
+                defer alloc.free(session_key);
+                probe: {
+                    var scope = txn.openReadScope(alloc) catch |scope_err| switch (scope_err) {
+                        error.Unsupported => break :probe,
+                        else => return scope_err,
+                    };
+                    defer scope.close();
+                    const bytes = scope.probePrefix(session_key, connection_prefix_len) catch |probe_err| switch (probe_err) {
+                        error.NotFound => return null,
+                        error.Unsupported, error.EndOfStream => break :probe,
+                        else => return probe_err,
+                    };
+                    const header = (try parseConnectionPrefix(bytes)) orelse try parseSqlPrefix(bytes, sql_field);
+                    if (header) |payload| if (payload[0] & 4 == 0) return null;
+                }
                 var session = (try self.loadSessionTxn(txn, id)) orelse return null;
                 if (session.sql == null or session.graph_receipt) {
                     session.deinit(self.alloc);
@@ -1953,7 +1945,9 @@ pub const DurableSessionStore = struct {
             },
             .retire_local => |value| {
                 const outbox = self.registrationOutboxFor(value.reference);
-                const floor = outbox.ownerFloor((try outbox.producer(txn, self.alloc, @splat(0))).retired_through);
+                // Observations are created only with the issuer record in this store.
+                // No delayed owner mutation can recreate a retired observation.
+                const floor: ?u64 = if (outbox.observation) null else (try outbox.producer(txn, self.alloc, @splat(0))).retired_through;
                 if (!try self.completionReferenceTxn(txn, value.transaction_id, value.reference, true, floor, .pin)) return error.CompletionUnavailable;
                 try self.removeObservedRegistrationTxn(txn, value.transaction_id, value.reference);
                 try outbox.remove(txn, self.alloc, value.reference);
@@ -2221,7 +2215,10 @@ pub const DurableSessionStore = struct {
             error.NotFound => "[]",
             else => return err,
         };
-        var parsed = try std.json.parseFromSlice([][16]u8, self.alloc, bytes, .{});
+        var parsed = std.json.parseFromSlice([][16]u8, self.alloc, bytes, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidTransactionSessionRecord,
+        };
         defer parsed.deinit();
         var refs: std.ArrayList([16]u8) = .empty;
         defer refs.deinit(self.alloc);
@@ -3045,7 +3042,8 @@ pub const DurableSessionStore = struct {
         return true;
     }
 
-    fn scanExpiredIds(self: *DurableSessionStore, alloc: std.mem.Allocator, prefix: []const u8, after: ?ParsedSessionExpiryKey, cutoff_ns: u64, limit: usize, positions: ?*std.ArrayListUnmanaged(ParsedSessionExpiryKey)) !struct { ids: []db_mod.types.TxnId, next_after: ?ParsedSessionExpiryKey } {
+    fn scanExpiredIds(self: *DurableSessionStore, alloc: std.mem.Allocator, prefix: []const u8, after: ?ExpiryPosition, cutoff_ns: u64, limit: usize, positions: ?*std.ArrayListUnmanaged(ExpiryPosition)) !struct { ids: []db_mod.types.TxnId, next_after: ?ExpiryPosition } {
+        if (limit == 0) return .{ .ids = &.{}, .next_after = null };
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         errdefer ids.deinit(alloc);
         const Scan = struct {
@@ -3054,22 +3052,25 @@ pub const DurableSessionStore = struct {
             cutoff: u64,
             limit: usize,
             ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
-            positions: ?*std.ArrayListUnmanaged(ParsedSessionExpiryKey),
-            next_after: ?ParsedSessionExpiryKey = null,
+            positions: ?*std.ArrayListUnmanaged(ExpiryPosition),
+            next_after: ?ExpiryPosition = null,
+            inspected: usize = 0,
             fn visit(raw: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
-                const parsed = parseExpiryKey(scan.prefix, key) orelse return true;
-                if (parsed.timestamp >= scan.cutoff or scan.ids.items.len >= scan.limit) return false;
-                try scan.ids.append(scan.allocator, parsed.txn_id);
-                if (scan.positions) |keys| try keys.append(scan.allocator, parsed);
-                if (scan.ids.items.len == scan.limit) scan.next_after = parsed;
-                return scan.next_after == null;
+                scan.inspected += 1;
+                if (parseExpiryKey(scan.prefix, key)) |parsed| {
+                    if (parsed.timestamp >= scan.cutoff) return false;
+                    try scan.ids.append(scan.allocator, parsed.txn_id);
+                    if (scan.positions) |keys| try keys.append(scan.allocator, ExpiryPosition.after(key, scan.prefix.len).?);
+                }
+                if (scan.inspected < scan.limit) return true;
+                scan.next_after = ExpiryPosition.after(key, scan.prefix.len);
+                return false;
             }
         };
         var scan = Scan{ .allocator = alloc, .prefix = prefix, .cutoff = cutoff_ns, .limit = limit, .ids = &ids, .positions = positions };
-        const start = if (after) |key| try makeExpiryKey(alloc, prefix, key.timestamp, key.txn_id) else null;
-        defer if (start) |key| alloc.free(key);
-        try self.scanPrefixFromWithContext(prefix, start, &scan, Scan.visit);
+        const start = if (after) |*position| position.bytes[0..position.len] else null;
+        try self.scanPrefixFromWithContextMode(prefix, start, if (after) |position| position.exclusive else false, &scan, Scan.visit, true);
         return .{ .ids = try ids.toOwnedSlice(alloc), .next_after = scan.next_after };
     }
 
@@ -3161,13 +3162,14 @@ pub const DurableSessionStore = struct {
         ctx: *anyopaque,
         callback: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!bool,
     ) !void {
-        return self.scanPrefixFromWithContextMode(prefix, start_after, ctx, callback, false);
+        return self.scanPrefixFromWithContextMode(prefix, start_after, true, ctx, callback, false);
     }
 
     fn scanPrefixFromWithContextMode(
         self: *DurableSessionStore,
         prefix: []const u8,
         start_after: ?[]const u8,
+        exclusive: bool,
         ctx: *anyopaque,
         callback: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!bool,
         keys_only: bool,
@@ -3183,7 +3185,9 @@ pub const DurableSessionStore = struct {
                     var entry = try cursor.seekAtOrAfter(start_after orelse prefix);
                     while (entry) |row| : (entry = try cursor.next()) {
                         if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                        if (start_after) |start| if (std.mem.eql(u8, row.key, start)) continue;
+                        if (exclusive) if (start_after) |start| {
+                            if (std.mem.eql(u8, row.key, start)) continue;
+                        };
                         if (!(try callback(ctx, row.key, &.{}))) break;
                     }
                     return;
@@ -3201,7 +3205,7 @@ pub const DurableSessionStore = struct {
                         return if (try adapter.visit(adapter.context, key, value)) .@"continue" else .stop;
                     }
                 };
-                var adapter = Adapter{ .context = ctx, .prefix = prefix, .start_after = start_after, .visit = callback };
+                var adapter = Adapter{ .context = ctx, .prefix = prefix, .start_after = if (exclusive) start_after else null, .visit = callback };
                 try store.scanWithContext(start_after orelse prefix, &.{}, .{}, &adapter, Adapter.run);
             },
             .runtime => |store| {
@@ -3213,7 +3217,9 @@ pub const DurableSessionStore = struct {
                 var entry = try cursor.seekAtOrAfter(start_after orelse prefix);
                 while (entry) |row| : (entry = try cursor.next()) {
                     if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                    if (start_after) |start| if (std.mem.eql(u8, row.key, start)) continue;
+                    if (exclusive) if (start_after) |start| {
+                        if (std.mem.eql(u8, row.key, start)) continue;
+                    };
                     if (!(try callback(ctx, row.key, row.value))) break;
                 }
             },
@@ -3485,9 +3491,9 @@ pub const SessionRegistry = struct {
     durable_scope: SessionStoreScope = .node_local,
     connection_sweep_offset: std.atomic.Value(usize) = .init(0),
     reserved_session_count: usize = 0,
-    expiry_cursor: ?ParsedSessionExpiryKey = null,
-    tagged_sql_expiry_cursor: ?ParsedSessionExpiryKey = null,
-    sql_abort_expiry_cursor: ?ParsedSessionExpiryKey = null,
+    expiry_cursor: ?ExpiryPosition = null,
+    tagged_sql_expiry_cursor: ?ExpiryPosition = null,
+    sql_abort_expiry_cursor: ?ExpiryPosition = null,
     sql_abort_migration_lock: AtomicMutex = .{},
     sql_abort_migration_after: std.ArrayList(u8) = .empty,
     sql_abort_migration_rescan_ns: u64 = 0,
@@ -5706,7 +5712,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         const after = self.tagged_sql_expiry_cursor;
         self.mutex.unlock();
-        var positions: std.ArrayListUnmanaged(ParsedSessionExpiryKey) = .empty;
+        var positions: std.ArrayListUnmanaged(ExpiryPosition) = .empty;
         defer positions.deinit(alloc);
         const page = try durable.scanExpiredIds(alloc, tagged_sql_expiry_prefix, after, cutoff_ns, 128, &positions);
         defer alloc.free(page.ids);
@@ -7952,6 +7958,38 @@ const ParsedSessionExpiryKey = struct {
     timestamp: u64,
     txn_id: db_mod.types.TxnId,
 };
+
+fn IndexPosition(comptime canonical_len: usize) type {
+    return struct {
+        const Self = @This();
+        bytes: [canonical_len + 1]u8 = @splat(0),
+        len: usize,
+        exclusive: bool,
+
+        fn after(key: []const u8, prefix_len: usize) ?Self {
+            var position: Self = .{
+                .len = @min(key.len, canonical_len + 1),
+                .exclusive = key.len <= canonical_len,
+            };
+            @memcpy(position.bytes[0..position.len], key[0..position.len]);
+            if (position.exclusive) return position;
+            // All longer keys sharing this prefix are malformed. Jump past
+            // that run without skipping any fixed-width marker.
+            var end = position.len;
+            while (end > prefix_len) {
+                end -= 1;
+                if (position.bytes[end] == 255) continue;
+                position.bytes[end] += 1;
+                position.len = end + 1;
+                return position;
+            }
+            return null;
+        }
+    };
+}
+
+// The supported expiry prefixes fit with their fixed-width timestamp and ID.
+const ExpiryPosition = IndexPosition(@as(usize, @max(session_expiry_prefix.len, tagged_sql_expiry_prefix.len, sql_abort_expiry_prefix.len)) + 49);
 
 fn parseExpiryKey(prefix: []const u8, key: []const u8) ?ParsedSessionExpiryKey {
     if (!std.mem.startsWith(u8, key, prefix)) return null;
@@ -12147,4 +12185,55 @@ test "distributed txn observation retirement advances beyond malformed index row
     try std.testing.expectEqual(id, next.entries[0].transaction_id);
     try std.testing.expectEqual(reference, next.entries[0].reference);
     try std.testing.expect(next.next_after == null);
+}
+
+test "distributed txn observation capacity follows live records rather than the sequence window" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/observation-capacity" });
+    defer store.deinit();
+    const outbox: DurableSessionStore.Outbox.Namespace = .{ .observation = true };
+    const producer: DurableSessionStore.Outbox.Producer = .{ .id = @splat(1), .next = 65537, .active = 1 };
+    const state = try std.json.Stringify.valueAlloc(alloc, producer, .{});
+    defer alloc.free(state);
+    var write = try store.beginWrite();
+    errdefer write.abort();
+    try write.put("\x00\x00__sql_observation_producer__:0000000000000000", state);
+    const reference = try outbox.create(&write, alloc, @splat(1), .{}, true);
+    try std.testing.expectEqual(@as(usize, 65534), try outbox.available(&write, alloc));
+    try outbox.remove(&write, alloc, reference);
+    try std.testing.expect((try outbox.load(&write, alloc, reference)) == null);
+    try write.commit();
+}
+
+test "distributed txn expiry scan counts malformed keys and resumes before a canonical key" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/expiry-scan-budget" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    const id: [16]u8 = @splat(1);
+    const valid = try makeExpiryKey(alloc, sql_abort_expiry_prefix, 1, id);
+    defer alloc.free(valid);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(sql_abort_expiry_prefix ++ "!", "");
+        try write.put(sql_abort_expiry_prefix ++ "!begin-overlong-run" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "");
+        try write.put(sql_abort_expiry_prefix ++ "!begin-overlong-run" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "extra", "");
+        try write.put(valid, "");
+        try write.commit();
+    }
+    const first = try durable.scanExpiredIds(alloc, sql_abort_expiry_prefix, null, 2, 1, null);
+    defer alloc.free(first.ids);
+    try std.testing.expectEqual(@as(usize, 0), first.ids.len);
+    const second = try durable.scanExpiredIds(alloc, sql_abort_expiry_prefix, first.next_after.?, 2, 1, null);
+    defer alloc.free(second.ids);
+    try std.testing.expectEqual(@as(usize, 0), second.ids.len);
+    const third = try durable.scanExpiredIds(alloc, sql_abort_expiry_prefix, second.next_after.?, 2, 2, null);
+    defer alloc.free(third.ids);
+    try std.testing.expectEqualSlices([16]u8, &.{id}, third.ids);
+    try std.testing.expect(third.next_after == null);
 }

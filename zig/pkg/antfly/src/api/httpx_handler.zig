@@ -7067,6 +7067,11 @@ pub const AntflyApiHandler = struct {
                 self.prepared_response = response;
                 return;
             }
+            if (compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
+                if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
+                    if (try self.replayCommit(store, supplied, null, resource_principal)) return;
+                };
+            }
             self.is_write = switch (compiled.statement) {
                 .select, .explain => false,
                 .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
@@ -15508,7 +15513,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var native = try storage.runtimeStore(alloc, .{ .name = "http-sql-connection-routes-test" });
     defer native.deinit();
     var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &native);
-    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable, .write_max_concurrent_requests = 1 }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     const Route = struct {
@@ -15645,6 +15650,12 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .session_id = encoded }, .{});
         defer alloc.free(body);
         for ([_]Route.Kind{ .sql, .fenced_sql }) |kind| {
+            var held: usize = 0;
+            if (kind == .fenced_sql) {
+                while (server.tryAcquireWrite()) held += 1;
+                try std.testing.expect(held != 0);
+            }
+            defer for (0..held) |_| server.releaseWrite();
             var reply = try Route.call(alloc, &handler, alice_auth, kind, null, body);
             defer reply.deinit(alloc);
             try std.testing.expectEqual(@as(u16, 200), reply.status);
@@ -15779,9 +15790,27 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     try durable.putRegistration(reference, registration.value);
     try std.testing.expect(try durable.managedCompletion(txn_id, reference, true, try durable.registrationFloorFor(reference)));
 
+    // Put a settled observation with a damaged target directory before the
+    // valid row. It must remain retryable without blocking its neighbor.
+    const corrupt_id: [16]u8 = @splat(0);
+    _ = try server.txn_sessions.beginForPrincipalWithSettingsAndId(alloc, .{}, node, principal, &.{}, null, corrupt_id);
+    const corrupt_hex = std.fmt.bytesToHex(corrupt_id, .lower);
+    const corrupt_reference = try durable.createLocalObservedRegistration(@splat(3), .{ .transaction_id = &corrupt_hex }, corrupt_id);
+    _ = (try server.txn_sessions.recordTerminalAbort(alloc, corrupt_id)).?;
+    const directory = try std.fmt.allocPrint(alloc, "\x00\x00__api_completion_consumers__:{s}", .{&corrupt_hex});
+    defer alloc.free(directory);
+    {
+        var write = try native.beginWrite();
+        errdefer write.abort();
+        try write.put(directory, "invalid");
+        try write.commit();
+    }
+
     const completions = @import("sql_completion.zig");
     try completions.retireSettledObservations(&server, alloc, 8);
     try std.testing.expect((try durable.loadRegistration(alloc, reference)) == null);
+    var retained = (try durable.loadRegistration(alloc, corrupt_reference)).?;
+    defer retained.deinit();
     const reference_hex = std.fmt.bytesToHex(reference, .lower);
     const observed_outcome: @import("../pgwire/completion.zig").Outcome = .{
         .reference_id = &reference_hex,

@@ -115,15 +115,16 @@ pub const Namespace = struct {
     // read-only admission. Sparse retired holes are reclaimed by the next mutation.
     pub fn available(self: Namespace, txn: anytype, alloc: std.mem.Allocator) !usize {
         var state = try self.producer(txn, alloc, @splat(0));
-        try self.advanceFloor(txn, &state);
+        if (!self.observation) try self.advanceFloor(txn, &state);
         if (state.next >= observation_bit) return 0;
-        const occupied = state.next - state.retired_through - 1;
+        const occupied = if (self.observation) state.active else state.next - state.retired_through - 1;
         return @intCast(@min(max_window - @min(max_window, occupied), observation_bit - state.next));
     }
     pub fn create(self: Namespace, txn: anytype, alloc: std.mem.Allocator, seed: [8]u8, outcome: wire.Outcome, prepared: bool) ![16]u8 {
         var state = try self.producer(txn, alloc, seed);
-        try self.advanceFloor(txn, &state);
-        if (state.next >= observation_bit or state.next - state.retired_through > max_window) return error.SessionLimitExceeded;
+        if (!self.observation) try self.advanceFloor(txn, &state);
+        const full = if (self.observation) state.active >= max_window else state.next - state.retired_through > max_window;
+        if (state.next >= observation_bit or full) return error.SessionLimitExceeded;
         var reference: [16]u8 = undefined;
         reference[0..8].* = state.id;
         std.mem.writeInt(u64, reference[8..16], self.ownerFloor(state.next), .big);
@@ -168,7 +169,7 @@ pub const Namespace = struct {
         if (state.active == 0) return error.InvalidArgument;
         try txn.delete(target);
         state.active -= 1;
-        try self.advanceFloor(txn, &state);
+        if (!self.observation) try self.advanceFloor(txn, &state);
         try self.putProducer(txn, alloc, state);
     }
     // Point lookups avoid materializing a write-cursor snapshot of the whole session
