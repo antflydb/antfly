@@ -49,13 +49,19 @@ pub const Index = struct {
         return .{ .owner = owner };
     }
     pub fn create(admission: ?Admission) !*Owner {
+        return createBounded(admission, null);
+    }
+
+    pub fn createBounded(admission: ?Admission, limit: ?usize) !*Owner {
         const backing = @import("antfly_platform").allocator.concurrentFallback();
         var lease: ?memory.AdmissionLease = if (admission) |quota| try quota.acquire(quota.context, @sizeOf(Owner)) else null;
         errdefer if (lease) |*owned| owned.release();
         const owner = try backing.create(Owner);
         errdefer backing.destroy(owner);
         owner.* = .{ .allocation = .{ .backing = backing, .admission_context = if (admission) |quota| quota.context else null, .admit = if (admission) |quota| quota.acquire else null }, .lease = lease, .admission = admission, .arena = undefined };
-        owner.arena = .init(if (admission != null) owner.allocation.allocator() else backing);
+        const retained = if (admission != null) owner.allocation.allocator() else backing;
+        if (limit) |bytes| owner.bound = .{ .backing = retained, .limit = bytes };
+        owner.arena = .init(if (owner.bound) |*bound| bound.allocator() else retained);
         errdefer {
             owner.arena.deinit();
             owner.allocation.deinit();
@@ -101,7 +107,10 @@ pub const Index = struct {
         try audio.work_control.check();
     }
     pub fn visitWindow(self: Index, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink) !void {
-        try self.owner.visit(a, first, last, sink, .{ .check_fn = check });
+        try self.visitWindowPackets(a, first, last, sink, null);
+    }
+    pub fn visitWindowPackets(self: Index, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink, packets: ?@import("antfly_media").webm_audio.PacketSource) !void {
+        try self.owner.visit(a, first, last, sink, .{ .check_fn = check }, packets);
     }
     pub fn visitWindowControlled(self: Index, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink, control: Control) !void {
         try self.owner.visit(a, first, last, sink, control);
@@ -112,6 +121,7 @@ pub const Owner = struct {
     mutex: std.atomic.Mutex = .unlocked,
     allocation: admitted.AdmittedAllocator,
     arena: std.heap.ArenaAllocator,
+    bound: ?@import("../runtime/bounded_allocator.zig").BoundedAllocator = null,
     lease: ?memory.AdmissionLease,
     checkpoint_lease: ?memory.AdmissionLease = null,
     admission: ?Admission,
@@ -162,7 +172,7 @@ pub const Owner = struct {
         };
         point.* = value;
     }
-    fn visit(self: *Owner, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink, control: Control) !void {
+    fn visit(self: *Owner, a: std.mem.Allocator, first: usize, last: usize, sink: opus.WindowSink, control: Control, packets: ?@import("antfly_media").webm_audio.PacketSource) !void {
         if (last < first or last > self.demuxed.playable_frames) return error.InvalidAudioWindow;
         if (first == last) return;
         try control.lockWithPoll(&self.mutex, 100 * std.time.ns_per_us);
@@ -195,7 +205,9 @@ pub const Owner = struct {
             const expected = self.demuxed.packet_sample_counts[packet_index];
             if (position <= raw_first and position + expected > raw_first) try self.frontier(lane * 2, .{ .packet = packet_index, .first = position, .state = state });
             if (position < raw_last and position + expected >= raw_last) try self.frontier(lane * 2 + 1, .{ .packet = packet_index, .first = position, .state = state });
-            const decoded = try opus.decodeWindowPacket(a, &state, self.demuxed.packets[packet_index], self.demuxed.packet_tocs[packet_index], self.demuxed.header.channels);
+            var lease = if (packets) |input| try input.read(packet_index) else null;
+            defer if (lease) |*owned| owned.deinit();
+            const decoded = try opus.decodeWindowPacket(a, &state, if (lease) |owned| owned.bytes else self.demuxed.packets[packet_index], self.demuxed.packet_tocs[packet_index], self.demuxed.header.channels);
             defer a.free(decoded);
             _ = self.decoded_packets.fetchAdd(1, .monotonic);
             const frames = decoded.len / self.demuxed.header.channels;

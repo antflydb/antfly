@@ -54,6 +54,8 @@ const HeaderDefaults = struct {
 };
 
 const FrameHeader = struct {
+    number: u64,
+    variable_block_size: bool,
     block_size: u16,
     sample_rate: u32,
     bits_per_sample: u8,
@@ -269,6 +271,17 @@ pub fn parseStreamInfoBlock(payload: []const u8) !StreamInfo {
     };
 }
 
+/// Frame coordinates from a CRC-validated native header.
+pub fn frameStart(info: StreamInfo, bytes: []const u8) !u64 {
+    var reader = BitReader.init(bytes);
+    const header = try parseFrameHeader(&reader, info);
+    const size = reader.bit_offset / 8;
+    if (size >= bytes.len or crc8(bytes[0..size]) != bytes[size]) return error.UnsupportedAudioFormat;
+    if (header.variable_block_size) return header.number;
+    if (info.max_block_size == 0) return error.UnsupportedAudioFormat;
+    return std.math.mul(u64, header.number, info.max_block_size);
+}
+
 pub fn decodeFrameAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, bytes: []const u8) !FrameDecoded {
     var reader = BitReader.init(bytes);
     const header = try parseFrameHeader(&reader, stream_info);
@@ -381,7 +394,7 @@ fn parseFrameHeaderWithDefaults(reader: *BitReader, defaults: HeaderDefaults) !F
     const bits_code = try reader.readBits(u8, 3);
     if ((try reader.readBits(u1, 1)) != 0) return error.UnsupportedAudioFormat;
 
-    _ = try readUtf8Integer(reader);
+    const number = try readUtf8Integer(reader);
 
     const block_size = try resolveBlockSize(reader, block_size_code, defaults.max_block_size);
     const sample_rate = try resolveSampleRate(reader, sample_rate_code, defaults.sample_rate);
@@ -402,6 +415,8 @@ fn parseFrameHeaderWithDefaults(reader: *BitReader, defaults: HeaderDefaults) !F
     }
 
     return .{
+        .number = number,
+        .variable_block_size = blocking_strategy != 0,
         .block_size = block_size,
         .sample_rate = sample_rate,
         .bits_per_sample = bits_per_sample,

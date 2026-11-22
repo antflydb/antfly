@@ -81,7 +81,7 @@ pub const Packet = struct {
     invisible: bool,
     discardable: bool,
 };
-const Element = struct { id: u32, payload: u64, end: u64, unknown: bool };
+pub const Element = struct { id: u32, payload: u64, end: u64, unknown: bool };
 pub const Cue = struct { pts: i64, cluster_offset: u64, packet_index: usize };
 fn segmentChild(id: u32) bool {
     return switch (id) {
@@ -89,7 +89,7 @@ fn segmentChild(id: u32) bool {
         else => false,
     };
 }
-const Scan = struct {
+pub const Scan = struct {
     input: *source.Source,
     limits: Limits,
     clock: ?*@import("timeline.zig").SampleClock = null,
@@ -110,7 +110,7 @@ const Scan = struct {
         element.end = cursor;
         return element;
     }
-    fn rawHeader(self: *Scan, offset: u64, parent_end: u64) !Element {
+    pub fn rawHeader(self: *Scan, offset: u64, parent_end: u64) !Element {
         try self.input.control.check();
         if (offset >= parent_end or parent_end > self.input.length()) return error.MalformedMedia;
         if (self.elements >= self.limits.max_elements) return error.ResourceLimitExceeded;

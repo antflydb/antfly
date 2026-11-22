@@ -119,6 +119,7 @@ pub const Cache = struct {
             const a = self.allocation.backing;
             if (self.opus_owned) switch (self.data.audio) {
                 inline .opus, .flac => |*index| index.deinit(),
+                .webm_flac => self.data.audio.deinit(),
                 .webm => |*index| index.codec.opus.deinit(),
                 else => unreachable,
             };
@@ -415,7 +416,7 @@ pub const Cache = struct {
             .aac => |owner| entry.data = .{ .aac = try @import("media_chunking_audio_source.zig").Mp4.Snapshot.copy(a, owner) },
             .audio => |index| {
                 entry.data = .{ .audio = try index.copy(a) };
-                entry.opus_owned = index == .opus or index == .flac or (index == .webm and index.webm.codec == .opus);
+                entry.opus_owned = index == .opus or index == .flac or index == .webm_flac or (index == .webm and index.webm.codec == .opus);
             },
             .mp4 => |original| {
                 var track = original.track;

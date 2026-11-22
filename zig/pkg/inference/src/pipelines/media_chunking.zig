@@ -798,7 +798,7 @@ pub const Runner = struct {
                 .range => &.{},
             });
         }
-        if ((self.request.audio_boundary and std.ascii.startsWithIgnoreCase(mime, "video/")) or (std.ascii.startsWithIgnoreCase(mime, "audio/") and audio.detectFormatFromMime(mime) == .mp4)) {
+        if ((self.request.audio_boundary and std.ascii.startsWithIgnoreCase(mime, "video/")) or (std.ascii.startsWithIgnoreCase(mime, "audio/") and (audio.detectFormatFromMime(mime) == .mp4 or audio.detectFormatFromMime(mime) == .webm))) {
             var audio_track = try @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission);
             defer audio_track.deinit();
             try self.soundWindows(audio_track.provider());

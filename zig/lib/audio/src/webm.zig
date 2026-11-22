@@ -642,6 +642,17 @@ const TimelineSink = struct {
 /// Immutable timeline spans over exact codec windows, including pause gaps,
 /// codec delay and container tail padding. No decoded PCM is retained.
 pub const WindowIndex = WindowIndexFor(opus.WindowIndex);
+fn opusSamplesFromHeader(toc: opus.Toc, bytes: []const u8) !u16 {
+    const count: u32 = switch (toc.code) {
+        0 => 1,
+        1, 2 => 2,
+        3 => if (bytes.len >= 2) bytes[1] & 63 else return error.UnsupportedAudioFormat,
+    };
+    const samples = toc.frame_duration_us * 48 * count / 1000;
+    if (samples == 0 or samples > 5760) return error.UnsupportedAudioFormat;
+    return @intCast(samples);
+}
+
 pub fn WindowIndexFor(comptime OpusIndex: type) type {
     return struct {
         const Self = @This();
@@ -654,6 +665,7 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
         sample_rate: u32,
         channels: u8,
         retained_owner: ?OpusIndex = null,
+        packets: ?[]container.Packet = null,
         pub fn init(a: std.mem.Allocator, bytes: []const u8, max_packets: usize) !Self {
             const Builder = struct {
                 fn build(_: @This(), alloc: std.mem.Allocator, demuxed: opus.Demuxed, max: usize) !OpusIndex {
@@ -665,9 +677,46 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
         pub fn initWithBuilder(a: std.mem.Allocator, bytes: []const u8, max_packets: usize, builder: anytype) !Self {
             var demuxed = try demux(a, bytes);
             defer demuxed.deinit();
+            return initDemuxed(a, a, demuxed, max_packets, builder, false);
+        }
+
+        pub fn directoryScratchBytes(directory: container.Directory) usize {
+            const per_packet = @sizeOf([]const u8) + @sizeOf(u64) + @sizeOf(usize);
+            const timing = directory.packets.len *| per_packet;
+            if (directory.track.codec != .vorbis) return timing;
+            return timing +| (directory.packets.len +| 3) *| @sizeOf(ogg.Packet) +| directory.packets.len *| 2 +| directory.track.codec_private.len;
+        }
+
+        pub fn initDirectory(a: std.mem.Allocator, scratch: std.mem.Allocator, directory: container.Directory, max_packets: usize, builder: anytype) !Self {
+            const packets = try a.dupe(container.Packet, directory.packets);
+            errdefer a.free(packets);
+            const units = try scratch.alloc([]const u8, packets.len);
+            defer scratch.free(units);
+            const times = try scratch.alloc(u64, packets.len);
+            defer scratch.free(times);
+            for (packets, units, times) |*packet, *unit, *time| {
+                unit.* = packet.prefix[0..@min(packet.prefix.len, packet.size)];
+                time.* = packet.time_ns;
+            }
+            var index = try initDemuxed(a, scratch, .{
+                .codec = directory.track.codec.?,
+                .channels = directory.track.channels,
+                .codec_delay_ns = directory.track.codec_delay_ns,
+                .seek_pre_roll_ns = directory.track.seek_pre_roll_ns,
+                .codec_private = directory.track.codec_private,
+                .access_units = units,
+                .access_unit_times_ns = times,
+                .discard_padding_ns = directory.discard_padding_ns,
+                .allocator = a,
+            }, max_packets, builder, true);
+            index.packets = packets;
+            return index;
+        }
+
+        fn initDemuxed(a: std.mem.Allocator, scratch: std.mem.Allocator, demuxed: DemuxedAudio, max_packets: usize, builder: anytype, header_only: bool) !Self {
             if (demuxed.access_units.len == 0 or demuxed.access_units.len > max_packets) return error.UnsupportedStreamingAudioProfile;
-            const counts = try a.alloc(usize, demuxed.access_units.len);
-            defer a.free(counts);
+            const counts = try scratch.alloc(usize, demuxed.access_units.len);
+            defer scratch.free(counts);
             var codec: CodecIndex = undefined;
             var delay: usize = 0;
             var rate: u32 = 48000;
@@ -691,10 +740,10 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
                     var skip: usize = head.pre_skip;
                     for (packets, tocs, raw_counts, counts, demuxed.access_units) |*packet, *toc, *raw_count, *count, unit| {
                         if (unit.len == 0) return error.UnsupportedAudioFormat;
-                        packet.* = try a.dupe(u8, unit);
+                        packet.* = try a.dupe(u8, if (header_only) &.{} else unit);
                         initialized += 1;
                         toc.* = try opus.parseToc(unit[0]);
-                        raw_count.* = try opus.packetSamples(unit, 48000);
+                        raw_count.* = if (header_only) try opusSamplesFromHeader(toc.*, unit) else try opus.packetSamples(unit, 48000);
                         const drop = @min(skip, raw_count.*);
                         skip -= drop;
                         count.* = raw_count.* - drop;
@@ -705,12 +754,17 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
                     codec = .{ .opus = try builder.build(a, owned, max_packets) };
                 },
                 .vorbis => {
-                    const packets = try buildOggPackets(a, try splitXiphLacedTriple(demuxed.codec_private), demuxed.access_units);
+                    const packets = try buildOggPackets(scratch, try splitXiphLacedTriple(demuxed.codec_private), demuxed.access_units);
                     defer {
-                        for (packets) |packet| a.free(packet.bytes);
-                        a.free(packets);
+                        for (packets) |packet| scratch.free(packet.bytes);
+                        scratch.free(packets);
                     }
                     const index = try vorbis.WindowIndex.initPackets(a, packets, max_packets);
+                    if (index.demuxed.audio_packets.len != counts.len) {
+                        var rejected = index;
+                        rejected.deinit();
+                        return error.UnsupportedAudioFormat;
+                    }
                     codec = .{ .vorbis = index };
                     rate = index.demuxed.headers.identification.sample_rate;
                     channels = index.demuxed.headers.identification.channels;
@@ -756,6 +810,7 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
             const spans = self.spans;
             var retained = self.retained_owner;
             a.free(spans);
+            if (self.packets) |packets| a.free(packets);
             switch (self.codec) {
                 inline else => |*index| index.deinit(),
             }
@@ -764,17 +819,24 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
         pub fn copy(self: Self, a: std.mem.Allocator) !Self {
             const spans = try a.dupe(Span, self.spans);
             errdefer a.free(spans);
-            return .{ .allocator = a, .codec = switch (self.codec) {
+            const packets = if (self.packets) |packets| try a.dupe(container.Packet, packets) else null;
+            errdefer if (packets) |owned| a.free(owned);
+            return .{ .allocator = a, .packets = packets, .codec = switch (self.codec) {
                 .opus => |index| .{ .opus = try index.copy(a) },
                 .vorbis => |index| .{ .vorbis = try index.copy(a) },
             }, .spans = spans, .samples = self.samples, .sample_rate = self.sample_rate, .channels = self.channels };
         }
         pub fn estimatedBytes(self: Self) usize {
-            return self.spans.len *| @sizeOf(Span) +| switch (self.codec) {
+            return self.spans.len *| @sizeOf(Span) +| (if (self.packets) |packets| std.mem.sliceAsBytes(packets).len else 0) +| switch (self.codec) {
                 inline else => |index| index.estimatedBytes(),
             };
         }
         pub fn visitWindow(self: *const Self, a: std.mem.Allocator, first: usize, last: usize, sink: @import("pcm_sink.zig").Sink) !void {
+            return self.visitWindowSource(a, first, last, sink, null);
+        }
+
+        pub fn visitWindowSource(self: *const Self, a: std.mem.Allocator, first: usize, last: usize, sink: @import("pcm_sink.zig").Sink, source: ?*@import("antfly_media").source.Source) !void {
+            const packets: ?container.PacketSource = if (self.packets) |directory| .{ .source = source orelse return error.UnsupportedAudioFormat, .packets = directory } else null;
             if (last < first or last > self.samples) return error.UnsupportedAudioFormat;
             var lo: usize = 0;
             var hi = self.spans.len;
@@ -796,7 +858,15 @@ pub fn WindowIndexFor(comptime OpusIndex: type) type {
                 const end = @min(last, span.first + span.count);
                 if (end > begin) {
                     switch (self.codec) {
-                        inline else => |*index| try index.visitWindow(a, span.source + begin - span.first, span.source + end - span.first, sink),
+                        inline else => |*index| {
+                            const from = span.source + begin - span.first;
+                            const to = span.source + end - span.first;
+                            if (@hasDecl(@TypeOf(index.*), "visitWindowPackets")) {
+                                try index.visitWindowPackets(a, from, to, sink, packets);
+                            } else {
+                                try index.visitWindow(a, from, to, sink);
+                            }
+                        },
                     }
                     cursor = end;
                 }
@@ -1553,6 +1623,39 @@ test "streaming audio webm leaves a remuxed vorbis recording alone" {
     const laced_file = try buildWebmFile(allocator, tracks, &.{laced_cluster});
     defer allocator.free(laced_file);
 
+    const test_media = @import("antfly_media");
+    var source = test_media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = laced_file }, .identity = "laced-vorbis" };
+    const directory = try container.Directory.init(allocator, &source, .{});
+    defer directory.deinit();
+    const Builder = struct {
+        fn build(_: @This(), _: std.mem.Allocator, _: opus.Demuxed, _: usize) !opus.WindowIndex {
+            return error.UnsupportedAudioFormat;
+        }
+    };
+    const Window = WindowIndexFor(opus.WindowIndex);
+    var ranged = try Window.initDirectory(allocator, allocator, directory, 100_000, Builder{});
+    defer ranged.deinit();
+    var buffered = try Window.init(allocator, laced_file, 100_000);
+    defer buffered.deinit();
+    try std.testing.expectEqual(buffered.samples, ranged.samples);
+    var cloned = try ranged.copy(allocator);
+    defer cloned.deinit();
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        values: std.ArrayList(f32) = .empty,
+        fn write(raw: *anyopaque, values: []const f32, _: u32, _: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.values.appendSlice(self.allocator, values);
+        }
+    };
+    var expected = Capture{ .allocator = allocator };
+    defer expected.values.deinit(allocator);
+    var actual = Capture{ .allocator = allocator };
+    defer actual.values.deinit(allocator);
+    try buffered.visitWindow(allocator, 1024, 4096, .{ .context = &expected, .write = Capture.write });
+    try cloned.visitWindowSource(allocator, 1024, 4096, .{ .context = &actual, .write = Capture.write }, &source);
+    try std.testing.expectEqualSlices(f32, expected.values.items, actual.values.items);
+
     var demuxed_vorbis = try vorbis.demuxOggAlloc(allocator, tone_ogg_bytes);
     defer demuxed_vorbis.deinit();
     try std.testing.expectEqual(audio_packets.len, demuxed_vorbis.audio_packets.len);
@@ -1740,6 +1843,19 @@ test "webm demux reconstructs frames for all three lacing modes" {
         for (case.frames, demuxed.access_units) |expected, actual| {
             try std.testing.expectEqualSlices(u8, expected, actual);
         }
+
+        const Source = @import("antfly_media").source.Source;
+        var source = Source{ .allocator = allocator, .storage = .{ .borrowed = file }, .identity = "laced" };
+        const directory = try container.Directory.init(allocator, &source, .{});
+        defer directory.deinit();
+        try std.testing.expectEqual(case.frames.len, directory.packets.len);
+        const packets = container.PacketSource{ .source = &source, .packets = directory.packets };
+        for (case.frames, directory.packets, 0..) |expected, packet, index| {
+            var range = try packets.read(index);
+            defer range.deinit();
+            try std.testing.expectEqualSlices(u8, expected, range.bytes);
+            try std.testing.expectEqualSlices(u8, expected[0..@min(expected.len, 2)], packet.prefix[0..@min(expected.len, 2)]);
+        }
     }
 }
 
@@ -1856,14 +1972,13 @@ test "webm demux rejects non-EBML input" {
     try std.testing.expectError(error.UnsupportedAudioFormat, demux(allocator, "not a webm file"));
 }
 
-test "streaming audio webm FLAC with unknown sample total preserves full PCM" {
-    const a = std.testing.allocator;
-    const end = try flacMetadataEnd(tone_flac_bytes);
-    const private = try a.dupe(u8, tone_flac_bytes[0..end]);
+pub fn buildFlacTestFileAlloc(a: std.mem.Allocator, bytes: []const u8, unknown_total: bool) ![]u8 {
+    const end = try flacMetadataEnd(bytes);
+    const private = try a.dupe(u8, bytes[0..end]);
     defer a.free(private);
     const info = std.mem.readInt(u64, private[18..26], .big);
-    std.mem.writeInt(u64, private[18..26], info & ~@as(u64, 0x0f_ffff_ffff), .big);
-    const block = try buildSimpleBlockNoLacing(a, 1, tone_flac_bytes[end..]);
+    if (unknown_total) std.mem.writeInt(u64, private[18..26], info & ~@as(u64, 0x0f_ffff_ffff), .big);
+    const block = try buildSimpleBlockNoLacing(a, 1, bytes[end..]);
     defer a.free(block);
     const entry = try buildAudioTrackEntry(a, 1, "A_FLAC", private, 2, null);
     defer a.free(entry);
@@ -1872,6 +1987,12 @@ test "streaming audio webm FLAC with unknown sample total preserves full PCM" {
     const cluster = try buildCluster(a, 0, &.{block});
     defer a.free(cluster);
     const file = try buildWebmFile(a, tracks, &.{cluster});
+    return file;
+}
+
+test "streaming audio webm FLAC with unknown sample total preserves full PCM" {
+    const a = std.testing.allocator;
+    const file = try buildFlacTestFileAlloc(a, tone_flac_bytes, true);
     defer a.free(file);
     var expected = try flac.decodeInterleaved(a, tone_flac_bytes);
     defer expected.deinit();

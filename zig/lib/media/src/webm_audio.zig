@@ -436,99 +436,268 @@ pub fn parseBlockIntoAccessUnits(
     cluster_ticks: u64,
     timestamp_scale_ns: u64,
 ) !void {
-    var cursor: usize = 0;
-    const track_vint = try readVint(block_bytes, 0);
-    cursor += track_vint.len;
-    if (cursor + 3 > block_bytes.len) return error.UnsupportedAudioFormat;
+    var reader = BlockCursor{ .bytes = block_bytes };
+    const block = try describeBlock(&reader, block_bytes.len, target_track, cluster_ticks, timestamp_scale_ns) orelse return;
+    var offset = reader.position;
+    for (block.sizes[0..block.count]) |size| {
+        try access_units.append(allocator, block_bytes[offset..][0..size]);
+        try access_unit_times_ns.append(allocator, block.time_ns);
+        offset += size;
+    }
+}
 
-    const relative_ticks = @as(i16, @bitCast(std.mem.readInt(u16, block_bytes[cursor..][0..2], .big)));
-    const flags = block_bytes[cursor + 2];
-    cursor += 3;
-    if (track_vint.value != target_track) return;
+const BlockCursor = struct {
+    bytes: []const u8,
+    position: usize = 0,
 
-    // A block before its cluster's timestamp is clamped to the start; the
-    // alternative is a negative position on the timeline.
-    const absolute_ticks: u64 = if (relative_ticks < 0)
-        cluster_ticks -| @as(u64, @intCast(-@as(i32, relative_ticks)))
-    else
-        cluster_ticks + @as(u64, @intCast(relative_ticks));
-    const time_ns = std.math.mul(u64, absolute_ticks, timestamp_scale_ns) catch
-        return error.UnsupportedAudioFormat;
-
-    const lacing: u2 = @intCast((flags & 0x06) >> 1);
-    if (lacing == 0) {
-        const frame = block_bytes[cursor..];
-        if (frame.len == 0) return error.UnsupportedAudioFormat;
-        try access_units.append(allocator, frame);
-        try access_unit_times_ns.append(allocator, time_ns);
-        return;
+    fn byte(self: *BlockCursor) !u8 {
+        if (self.position == self.bytes.len) return error.UnsupportedAudioFormat;
+        const value = self.bytes[self.position];
+        self.position += 1;
+        return value;
     }
 
-    if (cursor >= block_bytes.len) return error.UnsupportedAudioFormat;
-    const frame_count = @as(usize, block_bytes[cursor]) + 1;
-    cursor += 1;
-    if (frame_count == 0) return error.UnsupportedAudioFormat;
+    fn vint(self: anytype) !SizeResult {
+        var bytes: [8]u8 = undefined;
+        bytes[0] = try self.byte();
+        const len = try vintLength(bytes[0]);
+        for (bytes[1..len]) |*value| value.* = try self.byte();
+        return readVint(bytes[0..len], 0);
+    }
+};
 
-    const sizes = try allocator.alloc(usize, frame_count);
-    defer allocator.free(sizes);
+const BlockLayout = struct {
+    sizes: [256]usize = undefined,
+    count: usize,
+    time_ns: u64,
+};
 
+fn describeBlock(reader: anytype, length: usize, target: u64, ticks: u64, scale: u64) !?BlockLayout {
+    const track = try BlockCursor.vint(reader);
+    if (track.is_unknown) return error.UnsupportedAudioFormat;
+    if (track.value != target) return null;
+    const high = try reader.byte();
+    const low = try reader.byte();
+    const relative = std.mem.readInt(i16, &.{ high, low }, .big);
+    const flags = try reader.byte();
+    const absolute = if (relative < 0) ticks -| @as(u64, @intCast(-@as(i32, relative))) else try std.math.add(u64, ticks, @intCast(relative));
+    var result = BlockLayout{ .count = 1, .time_ns = try std.math.mul(u64, absolute, scale) };
+    const lacing: u2 = @truncate(flags >> 1);
+    if (lacing != 0) result.count = @as(usize, try reader.byte()) + 1;
+    var total: usize = 0;
     switch (lacing) {
-        1 => { // Xiph lacing.
-            var total: usize = 0;
-            for (0..frame_count - 1) |i| {
-                var size: usize = 0;
-                while (true) {
-                    if (cursor >= block_bytes.len) return error.UnsupportedAudioFormat;
-                    const b = block_bytes[cursor];
-                    cursor += 1;
-                    size += b;
-                    if (b != 0xff) break;
-                }
-                sizes[i] = size;
-                total += size;
+        1 => for (result.sizes[0 .. result.count - 1]) |*size| {
+            size.* = 0;
+            while (true) {
+                const value = try reader.byte();
+                size.* = try std.math.add(usize, size.*, value);
+                if (value != 255) break;
             }
-            const remaining = block_bytes.len - cursor;
-            if (total > remaining) return error.UnsupportedAudioFormat;
-            sizes[frame_count - 1] = remaining - total;
+            total = try std.math.add(usize, total, size.*);
         },
-        2 => { // Fixed-size lacing.
-            const remaining = block_bytes.len - cursor;
-            if (remaining % frame_count != 0) return error.UnsupportedAudioFormat;
-            const each = remaining / frame_count;
-            for (0..frame_count) |i| sizes[i] = each;
+        2 => {
+            const remaining = length - reader.position;
+            if (remaining % result.count != 0) return error.UnsupportedAudioFormat;
+            @memset(result.sizes[0..result.count], remaining / result.count);
+            total = remaining - result.sizes[0];
         },
-        3 => { // EBML lacing.
-            if (frame_count >= 2) {
-                const first = try readVint(block_bytes, cursor);
-                cursor += first.len;
-                sizes[0] = std.math.cast(usize, first.value) orelse return error.UnsupportedAudioFormat;
-                var prev_signed: i64 = @intCast(first.value);
-                var total: usize = sizes[0];
-                for (1..frame_count - 1) |i| {
-                    const delta_vint = try readVint(block_bytes, cursor);
-                    cursor += delta_vint.len;
-                    const bias: i64 = (@as(i64, 1) << @intCast(7 * delta_vint.len - 1)) - 1;
-                    const delta: i64 = @as(i64, @intCast(delta_vint.value)) - bias;
-                    const size_signed = prev_signed + delta;
-                    if (size_signed < 0) return error.UnsupportedAudioFormat;
-                    sizes[i] = @intCast(size_signed);
-                    total += sizes[i];
-                    prev_signed = size_signed;
-                }
-                const remaining = block_bytes.len - cursor;
-                if (total > remaining) return error.UnsupportedAudioFormat;
-                sizes[frame_count - 1] = remaining - total;
-            } else {
-                sizes[0] = block_bytes.len - cursor;
+        3 => if (result.count > 1) {
+            const first = try BlockCursor.vint(reader);
+            if (first.is_unknown) return error.UnsupportedAudioFormat;
+            var previous: i64 = @intCast(first.value);
+            result.sizes[0] = std.math.cast(usize, previous) orelse return error.UnsupportedAudioFormat;
+            total = result.sizes[0];
+            for (result.sizes[1 .. result.count - 1]) |*size| {
+                const encoded = try BlockCursor.vint(reader);
+                if (encoded.is_unknown) return error.UnsupportedAudioFormat;
+                const bias = (@as(i64, 1) << @intCast(7 * encoded.len - 1)) - 1;
+                previous = try std.math.add(i64, previous, @as(i64, @intCast(encoded.value)) - bias);
+                size.* = std.math.cast(usize, previous) orelse return error.UnsupportedAudioFormat;
+                total = try std.math.add(usize, total, size.*);
             }
         },
-        else => unreachable,
+        0 => {},
+    }
+    const remaining = length - reader.position;
+    if (total > remaining) return error.UnsupportedAudioFormat;
+    result.sizes[result.count - 1] = remaining - total;
+    for (result.sizes[0..result.count]) |size| if (size == 0) return error.UnsupportedAudioFormat;
+    return result;
+}
+
+const Source = @import("source.zig").Source;
+const Webm = @import("webm.zig");
+pub const Packet = struct {
+    offset: u64,
+    time_ns: u64,
+    size: usize,
+    prefix: [2]u8 = @splat(0),
+};
+
+pub const PacketSource = struct {
+    source: *Source,
+    packets: []const Packet,
+
+    pub fn read(self: PacketSource, index: usize) !@import("source.zig").Lease {
+        if (index >= self.packets.len) return error.UnsupportedAudioFormat;
+        const packet = self.packets[index];
+        return self.source.read(packet.offset, packet.size);
+    }
+};
+
+/// Immutable packet geometry. The directory holds no source or payload lease.
+pub const Directory = struct {
+    track: TrackInfo,
+    packets: []Packet,
+    discard_padding_ns: i64,
+    allocator: std.mem.Allocator,
+
+    pub fn init(a: std.mem.Allocator, source: *Source, limits: Webm.Limits) !Directory {
+        var scan = Webm.Scan{ .input = source, .limits = limits };
+        const header = try scan.rawHeader(0, source.length());
+        if (header.id != ebml_header_id or header.unknown) return error.UnsupportedAudioFormat;
+        var offset = header.end;
+        while (offset < source.length()) {
+            const element = try scan.rawHeader(offset, source.length());
+            if (element.id == segment_id) return scanSegment(a, &scan, element);
+            if (element.unknown) return error.UnsupportedAudioFormat;
+            offset = element.end;
+        }
+        return error.UnsupportedAudioFormat;
     }
 
-    for (sizes) |size| {
-        if (size > block_bytes.len - cursor) return error.UnsupportedAudioFormat;
-        try access_units.append(allocator, block_bytes[cursor .. cursor + size]);
-        try access_unit_times_ns.append(allocator, time_ns);
-        cursor += size;
+    pub fn deinit(self: Directory) void {
+        self.allocator.free(self.track.codec_private);
+        self.allocator.free(self.packets);
+    }
+};
+
+const RangeBlock = struct {
+    source: *Source,
+    start: u64,
+    length: usize,
+    position: usize = 0,
+    lease: ?@import("source.zig").Lease = null,
+    lease_start: usize = 0,
+
+    fn byte(self: *RangeBlock) !u8 {
+        if (self.position == self.length) return error.UnsupportedAudioFormat;
+        if (self.lease == null or self.position - self.lease_start >= self.lease.?.bytes.len) {
+            self.close();
+            self.lease_start = self.position;
+            self.lease = try self.source.read(self.start + self.position, @min(if (self.position == 0) @as(usize, 12) else 64, self.length - self.position));
+        }
+        const value = self.lease.?.bytes[self.position - self.lease_start];
+        self.position += 1;
+        return value;
+    }
+
+    fn close(self: *RangeBlock) void {
+        if (self.lease) |*lease| lease.deinit();
+        self.lease = null;
+    }
+};
+
+fn scanSegment(a: std.mem.Allocator, scan: *Webm.Scan, segment: Webm.Element) !Directory {
+    var state = DemuxState{};
+    defer if (state.track) |track| a.free(track.codec_private);
+    var packets: std.ArrayList(Packet) = .empty;
+    defer packets.deinit(a);
+    var pos = segment.payload;
+    while (pos < segment.end) {
+        const elem = try scan.rawHeader(pos, segment.end);
+        if (elem.id == cluster_id) {
+            const track = state.track orelse return error.UnsupportedAudioFormat;
+            pos = try scanCluster(a, scan, elem, track.number, state.timestamp_scale_ns, &packets, &state.discard_padding_ns);
+            continue;
+        }
+        if (elem.unknown) return error.UnsupportedAudioFormat;
+        const size = elem.end - elem.payload;
+        if (elem.id == info_id or (elem.id == tracks_id and state.track == null)) {
+            if (size > scan.limits.max_metadata_bytes) return error.ResourceLimitExceeded;
+            var lease = try scan.input.read(elem.payload, @intCast(size));
+            defer lease.deinit();
+            if (elem.id == info_id) {
+                try parseInfo(lease.bytes, &state);
+            } else {
+                var parsed = DemuxState{};
+                try parseTracks(lease.bytes, &parsed);
+                if (parsed.track) |track| {
+                    if (track.codec == null or track.codec_private.len == 0) return error.UnsupportedAudioFormat;
+                    var owned = track;
+                    owned.codec_private = try a.dupe(u8, track.codec_private);
+                    state.track = owned;
+                }
+            }
+        }
+        pos = elem.end;
+    }
+    const track = state.track orelse return error.UnsupportedAudioFormat;
+    if (packets.items.len == 0) return error.UnsupportedAudioFormat;
+    const owned = try packets.toOwnedSlice(a);
+    state.track = null;
+    return .{ .track = track, .packets = owned, .discard_padding_ns = state.discard_padding_ns, .allocator = a };
+}
+
+fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, track: u64, scale: u64, packets: *std.ArrayList(Packet), padding: *i64) !u64 {
+    var ticks: u64 = 0;
+    var pos = cluster.payload;
+    while (pos < cluster.end) {
+        const child = try scan.rawHeader(pos, cluster.end);
+        if (cluster.unknown and !isClusterChildId(child.id)) break;
+        if (child.unknown) return error.UnsupportedAudioFormat;
+        switch (child.id) {
+            timecode_id => {
+                if (child.end - child.payload > 8) return error.UnsupportedAudioFormat;
+                var lease = try scan.input.read(child.payload, @intCast(child.end - child.payload));
+                defer lease.deinit();
+                ticks = try readUint(lease.bytes);
+            },
+            simple_block_id => try indexBlock(a, scan, child, track, ticks, scale, packets),
+            block_group_id => {
+                const before = packets.items.len;
+                var discard: ?Webm.Element = null;
+                var nested = child.payload;
+                while (nested < child.end) {
+                    const field = try scan.rawHeader(nested, child.end);
+                    if (field.unknown) return error.UnsupportedAudioFormat;
+                    switch (field.id) {
+                        block_id => try indexBlock(a, scan, field, track, ticks, scale, packets),
+                        discard_padding_id => discard = field,
+                        else => {},
+                    }
+                    nested = field.end;
+                }
+                if (packets.items.len != before) if (discard) |field| {
+                    if (field.end - field.payload > 8) return error.UnsupportedAudioFormat;
+                    var lease = try scan.input.read(field.payload, @intCast(field.end - field.payload));
+                    defer lease.deinit();
+                    padding.* = try readSignedInt(lease.bytes);
+                };
+            },
+            else => {},
+        }
+        pos = child.end;
+    }
+    return pos;
+}
+
+fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track: u64, ticks: u64, scale: u64, packets: *std.ArrayList(Packet)) !void {
+    const length = std.math.cast(usize, elem.end - elem.payload) orelse return error.ResourceLimitExceeded;
+    var reader = RangeBlock{ .source = scan.input, .start = elem.payload, .length = length };
+    defer reader.close();
+    const block = try describeBlock(&reader, length, track, ticks, scale) orelse return;
+    const limit = @min(scan.limits.max_packets, scan.limits.max_index_bytes / @sizeOf(Packet));
+    const count = packets.items.len + block.count;
+    if (count > limit) return error.ResourceLimitExceeded;
+    if (count > packets.capacity) try packets.ensureTotalCapacityPrecise(a, @min(limit, @max(count, packets.capacity *| 2)));
+    var offset = reader.position;
+    for (block.sizes[0..block.count]) |size| {
+        if (size > scan.limits.max_packet_bytes) return error.ResourceLimitExceeded;
+        var packet = Packet{ .offset = elem.payload + offset, .time_ns = block.time_ns, .size = size };
+        reader.position = offset;
+        for (packet.prefix[0..@min(size, packet.prefix.len)]) |*value| value.* = try reader.byte();
+        packets.appendAssumeCapacity(packet);
+        offset += size;
     }
 }
