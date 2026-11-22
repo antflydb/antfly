@@ -911,6 +911,7 @@ pub const Status = enum(u32) {
     source_control_corrupt = 951,
     source_binding_conflict = 952,
     read_unavailable = 953,
+    history_full = 954,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

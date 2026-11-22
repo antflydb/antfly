@@ -1495,7 +1495,7 @@ const RaftTableApplyStateMachine = struct {
             // rejected participant mutation by late retention pressure or a
             // newly retired FK generation. Both conditions must be prevented
             // during prepare, before the coordinator commits its decision.
-            if (err == error.RetainedEffectsFull or err == error.GenerationRetired) if (req.transaction) |control| {
+            if (err == error.RetainedEffectsFull or err == error.HistoryFull or err == error.GenerationRetired) if (req.transaction) |control| {
                 if (control == .resolve and control.resolve.status == .committed) return null;
             };
             if (req.transaction) |control| if (control == .resolve and control.resolve.status == .committed) {
@@ -2601,6 +2601,7 @@ const RaftTableApplyStateMachine = struct {
                             err == error.StorageOwnerAdmissionPending or
                             err == error.ArtifactCatalogDrift or
                             err == error.RetainedEffectsFull or
+                            err == error.HistoryFull or
                             err == error.RowPolicyReadersActive or
                             err == error.OnlineSourcePinPending or
                             err == error.StorageBusy or

@@ -491,7 +491,7 @@ pub const Operations = struct {
         _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
-            error.RetainedEffectsFull => return retainedBatchPressure(input),
+            error.RetainedEffectsFull, error.HistoryFull => return retainedBatchPressure(input),
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
@@ -674,7 +674,7 @@ pub const Operations = struct {
         _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request) catch |err| switch (err) {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
-            error.RetainedEffectsFull => return retainedBatchPressure(input),
+            error.RetainedEffectsFull, error.HistoryFull => return retainedBatchPressure(input),
             error.DecisionNotProposed => return error.DecisionNotProposed,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
@@ -728,7 +728,7 @@ pub const Operations = struct {
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
-            error.RetainedEffectsFull => return error.RetainedEffectsFull,
+            error.RetainedEffectsFull, error.HistoryFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
@@ -805,7 +805,7 @@ pub const Operations = struct {
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
-            error.RetainedEffectsFull => return error.RetainedEffectsFull,
+            error.RetainedEffectsFull, error.HistoryFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
@@ -849,7 +849,7 @@ pub const Operations = struct {
         const writes = self.writes orelse return error.NotFound;
         _ = (distributed_txn.resolveGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
             error.OnlineSourcePinPending => return error.EnrichmentRetryInProgress,
-            error.RetainedEffectsFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
+            error.RetainedEffectsFull, error.HistoryFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
             error.DecisionNotProposed => return error.DecisionNotProposed,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,

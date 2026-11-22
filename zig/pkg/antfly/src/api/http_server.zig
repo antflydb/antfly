@@ -15379,6 +15379,7 @@ pub const ApiHttpServer = struct {
             error.TextMergeBackpressureUnavailable,
             error.TextMergeRuntimeShutdown,
             error.RetainedEffectsFull,
+            error.HistoryFull,
             => return error.Backpressured,
             error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
             // Index definitions commit before their physical activation job.

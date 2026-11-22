@@ -3861,13 +3861,17 @@ def test_public_changefeed_resets_stalled_lease_under_native_history_pressure():
                     )
                 except requests.RequestException as error:
                     pytest.fail(f"Write {index} failed: {error}\n{server.debug_logs()}")
+                if response.status_code == 429:
+                    assert response.headers.get("Retry-After")
+                    return False
                 assert response.ok, (
                     f"Write {index}: {response.text}\n{server.debug_logs()}"
                 )
+                return True
 
             # Cross the soft 192 MiB watermark while staying below 256 MiB.
             for index in range(22):
-                write(index)
+                assert write(index)
 
             def reset():
                 reply = client.get(path, timeout=15)
@@ -3882,9 +3886,13 @@ def test_public_changefeed_resets_stalled_lease_under_native_history_pressure():
             )
             assert expired.status_code == 409
             assert expired.json()["error"] == "changefeed_resynchronization_required"
-            # Later writes exceed the old pinned budget after background cleanup.
+            # The public reset can precede physical retirement. The hard limit
+            # may backpressure these writes but must leave the server able to
+            # retire the lease and accept the same write.
             for index in range(22, 31):
-                write(index)
+                assert wait_until(lambda: write(index), timeout_s=60, interval_s=1), (
+                    f"Write {index} stayed backpressured\n{server.debug_logs()}"
+                )
     finally:
         server.stop()
 

@@ -629,16 +629,36 @@ pub fn reclaim(txn: anytype, namespace: frame.Namespace) !bool {
     var state = (try load(txn)) orelse return true;
     try requireNamespace(txn, state, namespace);
     if (state.reclaimed == state.floor()) return true;
+    try reclaimNext(txn, &state);
+    try save(txn, state);
+    return state.reclaimed == state.floor();
+}
+
+fn reclaimNext(txn: anytype, state: *State) !void {
     const sequence = state.reclaimed + 1;
-    const descriptor = try frame.Descriptor.decode((try optional(txn, &recordKey(sequence))) orelse return error.HistoryCorrupt, namespace, sequence);
+    const descriptor = try frame.Descriptor.decode((try optional(txn, &recordKey(sequence))) orelse return error.HistoryCorrupt, state.namespace, sequence);
     const stored = descriptor.storedBytes();
     const count = descriptor.count;
     for (0..count) |i| try txn.delete(&chunkKey(sequence, @intCast(i)));
     try txn.delete(&recordKey(sequence));
     state.retained_bytes = std.math.sub(u64, state.retained_bytes, stored) catch return error.HistoryCorrupt;
     state.reclaimed = sequence;
-    try save(txn, state);
-    return state.reclaimed == state.floor();
+}
+
+fn reclaimForCapacity(txn: anytype, state: *State, additional_bytes: u64) !void {
+    const required = std.math.add(u64, state.reserved_bytes, additional_bytes) catch return error.HistoryFull;
+    if (required > state.limit) return error.HistoryFull;
+    const retained_limit = state.limit - required;
+    if (state.retained_bytes <= retained_limit) return;
+    const floor = state.floor();
+    // Use the same bounded number of frames as a native collection command.
+    // The consumer floor and reclaimed prefix are part of the write snapshot.
+    for (0..32) |_| {
+        if (state.reclaimed == floor) break;
+        try reclaimNext(txn, state);
+        if (state.retained_bytes <= retained_limit) return;
+    }
+    return error.HistoryFull;
 }
 
 fn optional(txn: anytype, key: []const u8) !?[]const u8 {
@@ -1172,7 +1192,7 @@ pub const Capture = struct {
                 try txn.put(&memberKey(entry.key_ptr.*), &raw);
             }
         }
-        if (state.reserved_bytes > state.limit - state.retained_bytes) return error.HistoryFull;
+        try reclaimForCapacity(txn, &state, 0);
         if (self.rows.count() != 0) {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
@@ -1205,7 +1225,7 @@ pub const Capture = struct {
                 const encoded = try frame.encode(scratch, .{ .namespace = state.namespace, .sequence = sequence, .transaction_id = transaction_id, .transaction_scope = if (self.transaction_id == null) .root_local else .coordinated, .source_position = position, .committed_at_ns = if (self.transaction_id == null) self.history_commit_time_ns else 0, .schema_before = self.schema_before, .schema_after = schema_after }, events.items);
                 const descriptor_raw = try frame.Descriptor.encode(scratch, state.namespace, sequence, encoded);
                 const descriptor = try frame.Descriptor.decode(descriptor_raw, state.namespace, sequence);
-                if (descriptor.storedBytes() > state.limit - state.retained_bytes - state.reserved_bytes) return error.HistoryFull;
+                try reclaimForCapacity(txn, &state, descriptor.storedBytes());
                 for (0..descriptor.count) |i| try txn.put(&chunkKey(sequence, @intCast(i)), encoded[i * frame.chunk_bytes .. @min(encoded.len, (i + 1) * frame.chunk_bytes)]);
                 try txn.put(&recordKey(sequence), descriptor_raw);
                 produced = .{ .sequence = sequence, .frame_digest = frame.digest(descriptor_raw) };
@@ -1277,6 +1297,40 @@ pub fn ChunkSource(comptime Txn: type) type {
             return .{ .context = self, .read = get };
         }
     };
+}
+
+test "native history consumer control capacity reclaims only through the acknowledged floor" {
+    const Store = struct {
+        descriptor: []const u8,
+        removed: usize = 0,
+
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key, &recordKey(1))) return self.descriptor;
+            return error.NotFound;
+        }
+
+        pub fn delete(self: *@This(), _: []const u8) anyerror!void {
+            self.removed += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    const namespace: frame.Namespace = @splat(1);
+    const bytes_on_disk = try frame.encode(a, .{ .namespace = namespace, .sequence = 1, .transaction_id = @splat(2) }, &.{.{ .key = "row", .before = null, .after = "value" }});
+    defer a.free(bytes_on_disk);
+    const raw = try frame.Descriptor.encode(a, namespace, 1, bytes_on_disk);
+    defer a.free(raw);
+    const descriptor = try frame.Descriptor.decode(raw, namespace, 1);
+    const bytes = descriptor.storedBytes();
+    var store: Store = .{ .descriptor = raw };
+    var state: State = .{ .namespace = namespace, .latest = 1, .retained_bytes = bytes, .limit = bytes };
+    state.consumers[0] = .{ .epoch = 1 };
+    try std.testing.expectError(error.HistoryFull, reclaimForCapacity(&store, &state, 1));
+    try std.testing.expectEqual(@as(usize, 0), store.removed);
+    state.consumers[0].acknowledged = 1;
+    try reclaimForCapacity(&store, &state, 1);
+    try std.testing.expectEqual(@as(usize, descriptor.count) + 1, store.removed);
+    try std.testing.expectEqual(@as(u64, 1), state.reclaimed);
+    try std.testing.expectEqual(@as(u64, 0), state.retained_bytes);
 }
 
 test "native history consumer control coordinated frame completion distinguishes absent evidence from a corrupt publication" {

@@ -167,6 +167,9 @@ ordered root's leader can reset public feeds that hold its retention floor.
 The worker starts checking at 75 percent of the retained and reserved byte
 budget. Consumers of a reset feed must resynchronize. The hard root budget
 still applies during bursts that outrun the maintenance and collection passes.
+When a write reaches that limit before pinned history is released, Antfly can
+return a retryable `429`. A write can reclaim available frames under the same
+consumer floor while background collection continues.
 
 Extend a streaming feed with `POST /db/v1/changefeeds/{id}/renew` and a
 JSON `expires_at` Unix timestamp in seconds. A successful reply confirms the

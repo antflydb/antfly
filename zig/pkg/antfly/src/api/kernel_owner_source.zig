@@ -1895,7 +1895,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer alloc.free(request_json);
         if (committed_at_ns) |clock| {
             lease.owner().timestampedBatchAtRaftEntry(table_name, request_json, raft_term, raft_index, clock) catch |err| {
-                if (terminal_failure) |classify| if (classify(err, req)) lease.entry.apply_handoff_until_ns.store(0, .release);
+                if (err == error.HistoryFull) {
+                    lease.entry.apply_handoff_until_ns.store(0, .release);
+                } else if (terminal_failure) |classify| {
+                    if (classify(err, req)) lease.entry.apply_handoff_until_ns.store(0, .release);
+                }
                 return err;
             };
             lease.entry.apply_handoff_until_ns.store(0, .release);

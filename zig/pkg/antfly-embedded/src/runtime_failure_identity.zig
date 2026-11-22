@@ -55,6 +55,7 @@ const mappings = [_]Mapping{
     .{ .status = .history_consumer_conflict, .err = error.HistoryConsumerConflict },
     .{ .status = .invalid_history_admission, .err = error.InvalidHistoryAdmission },
     .{ .status = .history_too_large, .err = error.HistoryTooLarge },
+    .{ .status = .history_full, .err = error.HistoryFull },
     .{ .status = .history_checkpoint_conflict, .err = error.HistoryCheckpointConflict },
     .{ .status = .corrupt_ordered_apply_receipt, .err = error.CorruptOrderedApplyReceipt },
     .{ .status = .history_authority_required, .err = error.HistoryAuthorityRequired },
