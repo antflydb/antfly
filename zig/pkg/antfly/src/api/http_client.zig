@@ -3772,6 +3772,8 @@ pub const ApiHttpClient = struct {
                 }
                 return remoteGroupConflictError(resp.body);
             }
+            if (resp.status == 429 and outcome == null and std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "HistoryFull"))
+                return error.HistoryFull;
             if (resp.status == 429 and std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "RetainedEffectsFull")) {
                 if (forwarding == null or (outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
                     return error.RetainedEffectsFull;

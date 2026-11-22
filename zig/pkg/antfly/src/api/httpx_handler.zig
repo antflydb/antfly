@@ -4025,6 +4025,7 @@ pub const AntflyApiHandler = struct {
             input.req,
         ) catch |err| return switch (err) {
             error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
+            error.HistoryFull => historyPressureResponse(ctx),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.OnlineMergeArtifactCatalogUncoordinated => blk: {
@@ -4081,6 +4082,11 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("Retry-After", "1");
         if (batch) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
         return textResponse(ctx, 429, "RetainedEffectsFull");
+    }
+
+    fn historyPressureResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return textResponse(ctx, 429, "HistoryFull");
     }
 
     fn internalHistoryDecision(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -4881,6 +4887,7 @@ pub const AntflyApiHandler = struct {
             forwarding_context,
         ) catch |err| return switch (err) {
             error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
+            error.HistoryFull => historyPressureResponse(ctx),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
             error.DecisionNotProposed => blk: {
                 try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);

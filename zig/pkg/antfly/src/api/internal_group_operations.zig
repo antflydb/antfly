@@ -52,6 +52,7 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
 pub const Error = @import("source_transaction_errors.zig").Error || operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
     ResourceBudgetExceeded,
     RetainedEffectsFull,
+    HistoryFull,
     AuthoritativeLookupMissing,
     TopologyChanged,
     IdentityReadGenerationChanged,
@@ -491,7 +492,8 @@ pub const Operations = struct {
         _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
-            error.RetainedEffectsFull, error.HistoryFull => return retainedBatchPressure(input),
+            error.RetainedEffectsFull => return retainedBatchPressure(input),
+            error.HistoryFull => return if (input.transaction == null) error.HistoryFull else retainedBatchPressure(input),
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
@@ -674,7 +676,8 @@ pub const Operations = struct {
         _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request) catch |err| switch (err) {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
-            error.RetainedEffectsFull, error.HistoryFull => return retainedBatchPressure(input),
+            error.RetainedEffectsFull => return retainedBatchPressure(input),
+            error.HistoryFull => return if (input.transaction == null) error.HistoryFull else retainedBatchPressure(input),
             error.DecisionNotProposed => return error.DecisionNotProposed,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
