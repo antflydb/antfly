@@ -32,8 +32,12 @@ pub const Manager = struct {
     initialized: std.atomic.Value(bool) = .init(false),
     scans: std.atomic.Value(u64) = .init(0),
     pub fn open(self: *Manager, io: std.Io, root: []const u8, identity: [32]u8) !Gate {
+        return self.openDirectory(io, root, ".antfly-speaker-plans", identity);
+    }
+
+    pub fn openDirectory(self: *Manager, io: std.Io, root: []const u8, subdir: []const u8, identity: [32]u8) !Gate {
         var path: [std.fs.max_path_bytes]u8 = undefined;
-        const directory = try std.fmt.bufPrint(&path, "{s}/.antfly-speaker-plans", .{root});
+        const directory = try std.fmt.bufPrint(&path, "{s}/{s}", .{ root, subdir });
         try std.Io.Dir.cwd().createDirPath(io, directory);
         const dir = try std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true });
         errdefer dir.close(io);

@@ -270,7 +270,8 @@ const WebmFlac = struct {
         return std.mem.sliceAsBytes(self.extents).len +| @sizeOf(FrameDirectory);
     }
 
-    fn read(self: WebmFlac, a: std.mem.Allocator, first: usize, last: usize, lookahead: usize, out: []f32, persisted: ?*const FramePlan.Snapshot, input: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl) !usize {
+    fn read(self: WebmFlac, a: std.mem.Allocator, first: usize, last: usize, lookahead: usize, out: []f32, persisted: ?*const FramePlan.Snapshot, capture: ?*providers.FrameCheckpointSession, input: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl) !usize {
+        if (capture) |session| if (out.len != 0) session.reset();
         const pcm_bytes = std.mem.sliceAsBytes(out).len;
         if (pcm_bytes > self.working_bytes) return error.AudioTooLarge;
         var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = self.working_bytes - pcm_bytes };
@@ -312,6 +313,9 @@ const WebmFlac = struct {
                 try control.check();
                 var frame = readFrame(scratch, self.info, input, extent.packet, at, &buffer, .{ .context = work.context, .check_fn = work.check_fn }) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
                 defer frame.deinit();
+                if (capture) |session| if (out.len != 0 and position < end) {
+                    if (std.math.cast(i64, extent.packet.offset + at)) |offset| session.observe(a, .{ .ordinal = position, .offset_ns = offset });
+                };
                 const next = try std.math.add(usize, position, frame.frame_samples);
                 if (stop) |known| if (next > known) return error.UnsupportedAudioFormat;
                 const from = @min(frame.frame_samples, begin -| position);
@@ -376,6 +380,7 @@ pub const Reader = struct {
     lane: u1 = 0,
     fork_allocator: ?std.mem.Allocator = null,
     frame_snapshot: ?*const FramePlan.Snapshot = null,
+    frame_capture: ?*providers.FrameCheckpointSession = null,
     control: @import("../execution_control.zig").InferenceExecutionControl = .{},
     pub fn provider(self: *Reader) providers.Provider {
         var result = providers.Provider{ .context = self, .samples = self.index.samples(), .sample_rate = self.index.rate(), .read = read, .fork = fork };
@@ -385,6 +390,7 @@ pub const Reader = struct {
                 result.probe_window = probeWindow;
             }
             if (self.source) |input| if (input.storage == .range and input.storage.range.immutable_binding != null) {
+                result.acknowledge_frame_start = acknowledgeFrameStart;
                 result.restore_frames = restoreFrames;
                 result.save_frames = saveFrames;
             };
@@ -405,33 +411,55 @@ pub const Reader = struct {
         context.directory = .flac_frames;
         session.snapshot = FramePlan.Store.load(context, a, session.identity) catch null;
         if (session.snapshot) |*snapshot| self.frame_snapshot = snapshot;
+        session.limit = @min(FramePlan.max_points, self.index.webm_flac.working_bytes / (16 * @sizeOf(FramePlan.Point)));
+        self.frame_capture = session;
+    }
+
+    fn acknowledgeFrameStart(raw: *anyopaque, next_sample: usize) void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        const session = self.frame_capture orelse return;
+        const raw_sample = next_sample -| self.index.webm_flac.leading;
+        const decoded = FramePlan.Snapshot{ .points = session.decoded.items };
+        session.continuation = decoded.nearest(raw_sample);
     }
 
     fn saveFrames(raw: *anyopaque, a: std.mem.Allocator, store: FramePlan.Store.Context, session: *providers.FrameCheckpointSession) void {
         const self: *Reader = @ptrCast(@alignCast(raw));
         self.frame_snapshot = null;
+        self.frame_capture = null;
+        defer session.decoded.deinit(a);
         defer if (session.snapshot) |snapshot| snapshot.deinit(a);
         const index = self.index.webm_flac;
         const directory = index.frame_directory;
-        if (directory.generation.load(.acquire) == session.generation) return;
+        if (directory.generation.load(.acquire) == session.generation and session.continuation == null) return;
         self.control.lockWithPoll(&directory.mutex, 100 * std.time.ns_per_us) catch return;
         const points = directory.points;
+        const recent = @min(points.len, directory.generation.load(.acquire) -% session.generation);
         const next = directory.next;
         directory.mutex.unlock();
 
         var builder = FramePlan.Buffer{};
-        for (0..points.len) |i| if (points[(next + i) % points.len]) |point| {
+        const count = if (session.snapshot == null) points.len else recent;
+        for (0..count) |i| if (points[(next + points.len - count + i) % points.len]) |point| {
             const offset = index.extents[point.block].packet.offset + point.offset;
             const encoded = std.math.cast(i64, offset) orelse continue;
             // Frame snapshots share the bounded journal encoding. Ordinals
             // are raw sample numbers and offsets are absolute coded bytes.
             builder.append(.{ .ordinal = point.sample, .offset_ns = encoded }, true) catch return;
         };
+        if (session.continuation) |point| builder.append(point, true) catch return;
         const snapshot = builder.snapshot();
         if (snapshot.points.len == 0) return;
         var context = store;
         context.directory = .flac_frames;
-        FramePlan.Store.save(context, a, session.identity, snapshot) catch {};
+        if (session.snapshot) |previous| {
+            var merged = FramePlan.Buffer{};
+            merged.merge(previous) catch return;
+            merged.merge(snapshot) catch return;
+            const base_digest = previous.digest();
+            if (std.mem.eql(u8, &base_digest, &merged.snapshot().digest())) return;
+            FramePlan.Store.saveUpdate(context, a, session.identity, merged.snapshot(), .{ .base_digest = base_digest, .delta = snapshot }) catch {};
+        } else FramePlan.Store.save(context, a, session.identity, snapshot) catch {};
     }
 
     fn finalSamples(raw: *anyopaque) ?usize {
@@ -459,7 +487,7 @@ pub const Reader = struct {
         if (last - first > self.index.webm_flac.working_bytes / @sizeOf(f32)) return error.AudioTooLarge;
         const pcm = try a.alloc(f32, last - first);
         errdefer a.free(pcm);
-        const count = try self.index.webm_flac.read(a, first, last, lookahead, pcm, self.frame_snapshot, self.source orelse return error.UnsupportedAudioFormat, self.control);
+        const count = try self.index.webm_flac.read(a, first, last, lookahead, pcm, self.frame_snapshot, self.frame_capture, self.source orelse return error.UnsupportedAudioFormat, self.control);
         return .{ .pcm = .{ .samples = pcm[0..count], .sample_rate = self.index.rate() }, .owned = pcm };
     }
 
@@ -468,6 +496,7 @@ pub const Reader = struct {
         const copy = try a.create(Reader);
         copy.* = self.*;
         copy.lane = 1;
+        copy.frame_capture = null;
         copy.fork_allocator = a;
         return .{ .provider = copy.provider(), .context = copy, .destroy = destroyFork };
     }
@@ -515,7 +544,7 @@ pub const Reader = struct {
                 if (capture.at != samples.len) return error.IncompleteAudioStream;
             },
             .flac => |*index| try index.read(a, first, last, samples, self.source, self.bytes, self.control),
-            .webm_flac => |*index| _ = try index.read(a, first, last, last, samples, self.frame_snapshot, self.source orelse return error.UnsupportedAudioFormat, self.control),
+            .webm_flac => |*index| _ = try index.read(a, first, last, last, samples, self.frame_snapshot, self.frame_capture, self.source orelse return error.UnsupportedAudioFormat, self.control),
         }
         return .{ .pcm = .{ .samples = samples, .sample_rate = self.index.rate() }, .owned = samples };
     }
@@ -875,7 +904,9 @@ test "model aware media FLAC reads and indexes individual frames within a WebM b
     var index = try Index.initWebmSource(a, &source, 1024, 1024 * 1024, null);
     defer index.deinit();
     try std.testing.expect(index.webm_flac.extents[0].packet.size > read_limit);
-    const boundary = index.webm_flac.info.max_block_size;
+    const boundary: usize = index.webm_flac.info.max_block_size;
+    const page_end = boundary + 256;
+    const overlapped = boundary + 128;
     var reader = Reader{ .index = &index, .source = &source };
     const provider = reader.provider();
     var directory = std.testing.tmpDir(.{});
@@ -887,15 +918,16 @@ test "model aware media FLAC reads and indexes individual frames within a WebM b
     var session = providers.FrameCheckpointSession{};
     provider.restore_frames.?(provider.context, a, context, &session);
     const before = source.total_bytes;
-    var first = try provider.read(provider.context, a, 0, boundary);
+    var first = try provider.read(provider.context, a, 0, page_end);
     defer first.deinit(a);
-    try std.testing.expectEqualSlices(f32, reference.samples[0..boundary], first.pcm.samples);
+    try std.testing.expectEqualSlices(f32, reference.samples[0..page_end], first.pcm.samples);
+    provider.acknowledge_frame_start.?(provider.context, overlapped);
+    const point = session.continuation.?;
+    try std.testing.expectEqual(boundary, point.ordinal);
     try std.testing.expect(source.total_bytes - before < encoded.len / 2);
     var copy = try index.copy(a);
     defer copy.deinit();
-    const point = (try copy.webm_flac.frame_directory.seek(0, boundary, .{})).?;
-    try std.testing.expectEqual(@as(usize, boundary), point.sample);
-    try std.testing.expect(point.offset != 0);
+    try std.testing.expect((try copy.webm_flac.frame_directory.seek(0, overlapped, .{})) == null);
     reader.index = &copy;
     var second = try provider.read(provider.context, a, boundary, @as(usize, boundary) + 512);
     defer second.deinit(a);
@@ -905,14 +937,14 @@ test "model aware media FLAC reads and indexes individual frames within a WebM b
     var cold = try Index.initWebmSource(a, &source, 1024, 1024 * 1024, null);
     defer cold.deinit();
     reader.index = &cold;
-    transport.floor = cold.webm_flac.extents[0].packet.offset + point.offset;
-    try std.testing.expectError(error.RemoteReadBudgetExceeded, provider.read(provider.context, a, boundary, @as(usize, boundary) + 512));
+    transport.floor = @intCast(point.offset_ns);
+    try std.testing.expectError(error.RemoteReadBudgetExceeded, provider.read(provider.context, a, overlapped, overlapped + 512));
     var restored = providers.FrameCheckpointSession{};
     provider.restore_frames.?(provider.context, a, context, &restored);
     defer provider.save_frames.?(provider.context, a, context, &restored);
-    var resumed = try provider.read(provider.context, a, boundary, @as(usize, boundary) + 512);
+    var resumed = try provider.read(provider.context, a, overlapped, overlapped + 512);
     defer resumed.deinit(a);
-    try std.testing.expectEqualSlices(f32, second.pcm.samples, resumed.pcm.samples);
+    try std.testing.expectEqualSlices(f32, reference.samples[overlapped..][0..512], resumed.pcm.samples);
 }
 
 test "model aware media unknown FLAC duration does not read the tail before the first window" {

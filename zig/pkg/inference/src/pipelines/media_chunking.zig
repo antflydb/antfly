@@ -796,7 +796,12 @@ pub const Runner = struct {
                 checkpoints.append(.{ .ordinal = self.ordinal, .offset_ns = if (self.request.policy.audio_speaker_turns) descriptor.coordinates.start_ns.? else planned.coordinates.start_ns.? });
                 checkpoints.append(.{ .ordinal = try std.math.add(u64, self.ordinal, 1), .offset_ns = if (last == actual_samples) cursor.end_ns else cursor.offset_ns });
             }
+            const emitted = self.summary.emitted;
             if (!try self.emit(descriptor, .{ .pcm = .{ .samples = window.pcm.samples[0 .. last - first], .sample_rate = provider.sample_rate } }, "audio/wav")) break;
+            if (self.summary.emitted != emitted and last < actual_samples) if (provider.acknowledge_frame_start) |acknowledge| {
+                const next_sample: usize = @intCast(@min(actual_samples, @divFloor(@as(u128, @intCast(cursor.offset_ns)) * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)));
+                acknowledge(provider.context, next_sample);
+            };
         }
     }
     fn pdfCancelled(raw: ?*const anyopaque) bool {
