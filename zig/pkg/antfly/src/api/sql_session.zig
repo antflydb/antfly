@@ -52,7 +52,10 @@ pub const Coordinator = struct {
             if (err != error.SqlWriteConflict) return err;
             return self.retire(guard, info.version, false);
         };
-        var request = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, null)) orelse {
+        var request = (server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, null) catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown => return .{ .outcome = .unknown, .reconciliation_id = id },
+            else => return err,
+        }) orelse {
             return self.retire(guard, info.version, true);
         };
         defer request.deinit(alloc);
@@ -71,7 +74,10 @@ pub const Coordinator = struct {
         var prepared = try server.preparePublicCommitWithIntegrity(alloc, tables, self.context);
         defer prepared.deinit();
         if (self.context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
-        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, guard, prepared.tables)) orelse return error.SqlTransactionNotActive;
+        var plan = (server.txn_sessions.sealExecutionPlan(alloc, guard, prepared.tables) catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown => return .{ .outcome = .unknown, .reconciliation_id = id },
+            else => return err,
+        }) orelse return error.SqlTransactionNotActive;
         defer plan.deinit();
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.

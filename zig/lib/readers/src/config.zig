@@ -78,6 +78,7 @@ pub const Config = struct {
     model: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    hosted_parallelism: u8 = 1,
     api_key: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
     capability_token: ?[]const u8 = null,
@@ -93,6 +94,7 @@ pub const Config = struct {
     uses_language_correction: bool = false,
 
     pub fn validate(self: Config) !void {
+        if (self.hosted_parallelism == 0 or self.hosted_parallelism > 8 or (self.provider != .openai and self.hosted_parallelism != 1)) return error.InvalidReaderConfig;
         if (self.provider == .cloudflare) {
             try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
             try cloudflare.modelId(self.model orelse return error.UnsupportedCloudflareModel);

@@ -63,10 +63,14 @@ checks alone do not establish numerical or policy coverage.
    either to a complete searchable transcript. Exercise the configured accurate
    reader/refinement policy and verify exhausted budgets remain unresolved.
 
-A 512-token diagnostic, matching the deployed allowance, rejected a cached dense
-DOJ page on Glowworm. The Grepstein reader example now requests 2048 tokens; both checkpoint diagnostics
-completed that page and retained the checked tail text. This is a bounded
-sample, not proof that every corpus page fits. Do not retry an unchanged capped request forever.
+A historical 512-token diagnostic rejected a cached dense DOJ page on Glowworm;
+both checkpoint diagnostics completed that sample at 2048 tokens. Grepstein's
+current reader example requests 8192 tokens on the first call, and its shared
+write/L4 deployment policies permit that ceiling. Those historical samples are
+not proof that every corpus page fits. Use the
+[same-fixture policy benchmark](../../guides/inference-policy-benchmark.md) to
+measure token budgets without changing completed corpus checkpoints.
+Do not retry an unchanged capped request forever.
 Measure the failing pages, then qualify a larger admitted output allowance or
 a bounded document refinement policy. A higher serving ceiling and the reader
 request must agree; increasing only one does not recover the missing tail.
