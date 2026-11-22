@@ -4135,7 +4135,7 @@ pub const ApiHttpServer = struct {
     sql_settlement_active: std.atomic.Value(bool) = .init(false),
     sql_completion_owner_active: std.atomic.Value(bool) = .init(false),
     sql_completion_recovery_after: u64 = 0,
-    sql_observation_retirement_after: ?[16]u8 = null,
+    sql_observation_retirement_after: ?[]u8 = null,
     sql_completion_consumer_active: std.atomic.Value(bool) = .init(false),
     write_admission: RequestAdmission,
     inference_admission: RequestAdmission,
@@ -5118,6 +5118,7 @@ pub const ApiHttpServer = struct {
         self.mcp_sessions.deinit(self.owner_alloc);
         self.memory_mcp_sessions.deinit(self.owner_alloc);
         self.a2a_tasks.deinit(self.owner_alloc);
+        if (self.sql_observation_retirement_after) |key| self.alloc.free(key);
         self.txn_sessions.deinit(self.alloc);
         self.memory_work_cursors.deinit(self.alloc);
         if (self.opened_session_store) |opened| {

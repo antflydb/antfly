@@ -1276,6 +1276,10 @@ pub const DurableSessionStore = struct {
         return .{ .issuer = self.registration_issuer orelse 0 };
     }
 
+    fn registrationOutboxFor(self: *DurableSessionStore, reference: [16]u8) Outbox.Namespace {
+        return .{ .issuer = self.registration_issuer orelse 0, .observation = Outbox.isObservation(reference) };
+    }
+
     const Backend = union(enum) {
         docstore: *docstore_mod.DocStore,
         runtime: *backend_erased.Store,
@@ -1892,42 +1896,43 @@ pub const DurableSessionStore = struct {
             self.registration_recovery_before = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).next;
         switch (action) {
             .create => |value| {
-                if (value.reserved and self.reserved_registrations == 0) return error.SessionLimitExceeded;
-                const held = self.reserved_registrations - @as(usize, if (value.reserved) 1 else 0);
-                if (try self.registrationOutbox().available(txn, self.alloc) <= held) return error.SessionLimitExceeded;
+                if (value.reserved and !value.observe_only and self.reserved_registrations == 0) return error.SessionLimitExceeded;
+                const outbox: Outbox.Namespace = .{ .issuer = self.registration_issuer orelse 0, .observation = value.observe_only };
+                const held = self.reserved_registrations - @as(usize, if (value.reserved and !value.observe_only) 1 else 0);
+                if (!value.observe_only and try outbox.available(txn, self.alloc) <= held) return error.SessionLimitExceeded;
                 var observation_buf: [128]u8 = undefined;
                 const observation_key = if (value.observe_only) try self.observationRegistrationKey(value.local_transaction_id.?, &observation_buf) else null;
                 if (observation_key) |key| {
                     if (txn.get(key)) |previous| {
                         if (previous.len != 16) return error.InvalidTransactionSessionRecord;
                         const reference = previous[0..16].*;
-                        var current = (try self.registrationOutbox().load(txn, self.alloc, reference)) orelse return error.InvalidTransactionSessionRecord;
+                        var current = (try self.registrationOutboxFor(reference).load(txn, self.alloc, reference)) orelse return error.InvalidTransactionSessionRecord;
                         defer current.deinit();
                         return reference;
                     } else |err| if (err != error.NotFound) return err;
                 }
-                const floor = (try self.registrationOutbox().producer(txn, self.alloc, value.seed)).retired_through;
-                const reference = try self.registrationOutbox().create(txn, self.alloc, value.seed, value.outcome, value.prepared);
+                const floor = outbox.ownerFloor((try outbox.producer(txn, self.alloc, value.seed)).retired_through);
+                const reference = try outbox.create(txn, self.alloc, value.seed, value.outcome, value.prepared);
                 var issuer_fence_buf: [128]u8 = undefined;
                 const issuer_fence = try sqlPinIssuerFenceKey(self.registration_issuer orelse 0, &issuer_fence_buf);
                 if (!value.prepared and value.outcome.transaction_id != null and value.outcome.ddl_receipt_json == null and try sqlPinFenceExists(txn, issuer_fence)) {
                     const hex = value.outcome.transaction_id.?;
                     const id = distributed_txn.parseTxnIdHex(hex) catch return error.InvalidArgument;
                     _ = try self.completionReferenceTxn(txn, id, reference, false, floor, .atomic_pin);
-                    try self.registrationOutbox().put(txn, self.alloc, reference, .{ .outcome = value.outcome, .phase = .registered });
+                    try self.registrationOutboxFor(reference).put(txn, self.alloc, reference, .{ .outcome = value.outcome, .phase = .registered });
                 }
                 if (value.local_transaction_id) |id| {
                     // Fold the local handoff into the intent allocation batch:
                     // no remote RPC or intermediate WAL commits are necessary.
                     _ = try self.completionReferenceTxn(txn, id, reference, false, floor, if (value.observe_only) .observe else .prepare);
-                    try self.registrationOutbox().put(txn, self.alloc, reference, .{ .outcome = value.outcome, .prepared = true, .execution_admitted = true, .phase = .registered, .observation = if (value.observe_only) true else null });
+                    try self.registrationOutboxFor(reference).put(txn, self.alloc, reference, .{ .outcome = value.outcome, .prepared = true, .execution_admitted = true, .phase = .registered, .observation = if (value.observe_only) true else null });
                 }
                 if (observation_key) |key| try txn.put(key, &reference);
                 return reference;
             },
-            .put => |value| try self.registrationOutbox().put(txn, self.alloc, value.reference, value.record),
+            .put => |value| try self.registrationOutboxFor(value.reference).put(txn, self.alloc, value.reference, value.record),
             .remove => |reference| {
-                if (try self.registrationOutbox().load(txn, self.alloc, reference)) |loaded| {
+                if (try self.registrationOutboxFor(reference).load(txn, self.alloc, reference)) |loaded| {
                     var previous = loaded;
                     defer previous.deinit();
                     if (previous.value.observation orelse false) {
@@ -1935,22 +1940,23 @@ pub const DurableSessionStore = struct {
                         try self.removeObservedRegistrationTxn(txn, id, reference);
                     }
                 }
-                try self.registrationOutbox().remove(txn, self.alloc, reference);
+                try self.registrationOutboxFor(reference).remove(txn, self.alloc, reference);
             },
             .join => |reference| {
-                var record = (try self.registrationOutbox().load(txn, self.alloc, reference)) orelse return @splat(0);
+                var record = (try self.registrationOutboxFor(reference).load(txn, self.alloc, reference)) orelse return @splat(0);
                 defer record.deinit();
                 if (!record.value.joined) {
                     record.value.joined = true;
-                    try self.registrationOutbox().put(txn, self.alloc, reference, record.value);
+                    try self.registrationOutboxFor(reference).put(txn, self.alloc, reference, record.value);
                 }
                 return reference;
             },
             .retire_local => |value| {
-                const floor = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).retired_through;
+                const outbox = self.registrationOutboxFor(value.reference);
+                const floor = outbox.ownerFloor((try outbox.producer(txn, self.alloc, @splat(0))).retired_through);
                 if (!try self.completionReferenceTxn(txn, value.transaction_id, value.reference, true, floor, .pin)) return error.CompletionUnavailable;
                 try self.removeObservedRegistrationTxn(txn, value.transaction_id, value.reference);
-                try self.registrationOutbox().remove(txn, self.alloc, value.reference);
+                try outbox.remove(txn, self.alloc, value.reference);
             },
         }
         return @splat(0);
@@ -1976,7 +1982,7 @@ pub const DurableSessionStore = struct {
                 break :blk reference;
             },
         };
-        if (action == .create and action.create.reserved) self.reserved_registrations -= 1;
+        if (action == .create and action.create.reserved and !action.create.observe_only) self.reserved_registrations -= 1;
         return result;
     }
     pub fn reserveRegistrations(self: *DurableSessionStore, count: usize) !void {
@@ -2015,11 +2021,8 @@ pub const DurableSessionStore = struct {
         return self.registrationMutation(.{ .create = .{ .seed = seed, .outcome = outcome, .reserved = true, .prepared = true, .local_transaction_id = id } });
     }
     pub fn createLocalObservedRegistration(self: *DurableSessionStore, seed: [8]u8, outcome: @import("../pgwire/completion.zig").Outcome, id: [16]u8) ![16]u8 {
-        if (try self.existingObservationReference(id)) |reference| {
-            self.releaseRegistrations(1);
-            return reference;
-        }
-        return self.registrationMutation(.{ .create = .{ .seed = seed, .outcome = outcome, .reserved = true, .prepared = true, .local_transaction_id = id, .observe_only = true } });
+        if (try self.existingObservationReference(id)) |reference| return reference;
+        return self.registrationMutation(.{ .create = .{ .seed = seed, .outcome = outcome, .prepared = true, .local_transaction_id = id, .observe_only = true } });
     }
 
     pub fn createPreparedRegistration(self: *DurableSessionStore, seed: [8]u8, outcome: @import("../pgwire/completion.zig").Outcome) ![16]u8 {
@@ -2044,12 +2047,12 @@ pub const DurableSessionStore = struct {
             .docstore => |store| blk: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                break :blk try self.registrationOutbox().load(&txn, alloc, reference);
+                break :blk try self.registrationOutboxFor(reference).load(&txn, alloc, reference);
             },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                break :blk try self.registrationOutbox().load(&txn, alloc, reference);
+                break :blk try self.registrationOutboxFor(reference).load(&txn, alloc, reference);
             },
         };
     }
@@ -2073,45 +2076,65 @@ pub const DurableSessionStore = struct {
         };
     }
     pub const ObservationIndexEntry = struct { transaction_id: [16]u8, reference: [16]u8 };
+    pub const ObservationRetirementPage = struct { entries: []ObservationIndexEntry, next_after: ?[]u8 };
 
-    pub fn observationRetirementPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: ?[16]u8, limit: usize) ![]ObservationIndexEntry {
+    pub fn copyObservationRegistrationKey(self: *DurableSessionStore, alloc: std.mem.Allocator, id: [16]u8) ![]u8 {
+        var buf: [128]u8 = undefined;
+        return alloc.dupe(u8, try self.observationRegistrationKey(id, &buf));
+    }
+
+    pub fn observationRetirementPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize) !ObservationRetirementPage {
         var entries: std.ArrayList(ObservationIndexEntry) = .empty;
         errdefer entries.deinit(alloc);
-        if (limit == 0) return entries.toOwnedSlice(alloc);
+        if (limit == 0) return .{ .entries = try entries.toOwnedSlice(alloc), .next_after = null };
         var prefix_buf: [128]u8 = undefined;
         const prefix = try self.observationRegistrationPrefix(&prefix_buf);
-        var key_buf: [128]u8 = undefined;
-        const start = if (after) |id| try self.observationRegistrationKey(id, &key_buf) else null;
         const Scan = struct {
             alloc: std.mem.Allocator,
             entries: *std.ArrayList(ObservationIndexEntry),
             prefix_len: usize,
             limit: usize,
+            inspected: usize = 0,
+            next_after: ?[]u8 = null,
 
             fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
                 const scan: *@This() = @ptrCast(@alignCast(raw));
-                if (value.len != 16) return error.InvalidTransactionSessionRecord;
-                const id = distributed_txn.parseTxnIdHex(key[scan.prefix_len..]) catch return error.InvalidTransactionSessionRecord;
-                try scan.entries.append(scan.alloc, .{ .transaction_id = id, .reference = value[0..16].* });
-                return scan.entries.items.len < scan.limit;
+                scan.inspected += 1;
+                const id = distributed_txn.parseTxnIdHex(key[scan.prefix_len..]) catch null;
+                if (id != null and value.len == 16) {
+                    try scan.entries.append(scan.alloc, .{ .transaction_id = id.?, .reference = value[0..16].* });
+                } else {
+                    std.log.warn("malformed SQL observation index row retained key_bytes={d} value_bytes={d}", .{ key.len, value.len });
+                }
+                if (scan.inspected == scan.limit) {
+                    scan.next_after = try scan.alloc.dupe(u8, key);
+                    return false;
+                }
+                return true;
             }
         };
         var scan = Scan{ .alloc = alloc, .entries = &entries, .prefix_len = prefix.len, .limit = limit };
-        try self.scanPrefixFromWithContext(prefix, start, &scan, Scan.visit);
-        return entries.toOwnedSlice(alloc);
+        errdefer if (scan.next_after) |key| alloc.free(key);
+        try self.scanPrefixFromWithContext(prefix, after, &scan, Scan.visit);
+        return .{ .entries = try entries.toOwnedSlice(alloc), .next_after = scan.next_after };
     }
 
     pub fn registrationFloor(self: *DurableSessionStore) !u64 {
+        return self.registrationFloorFor(@splat(0));
+    }
+
+    pub fn registrationFloorFor(self: *DurableSessionStore, reference: [16]u8) !u64 {
+        const outbox = self.registrationOutboxFor(reference);
         return switch (self.backend) {
             .docstore => |store| blk: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                break :blk (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).retired_through;
+                break :blk outbox.ownerFloor((try outbox.producer(&txn, self.alloc, @splat(0))).retired_through);
             },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                break :blk (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).retired_through;
+                break :blk outbox.ownerFloor((try outbox.producer(&txn, self.alloc, @splat(0))).retired_through);
             },
         };
     }
@@ -12083,4 +12106,43 @@ test "commit requirements inherited defaults strengthen without becoming explici
     var final_view = try final.distributedTables(a);
     defer final_view.deinit();
     for (final_view.tables) |table| try std.testing.expectEqual(if (std.mem.eql(u8, table.table_name, "docs")) db_mod.types.CommitRequires.direct_enrichments else .none, table.commit_requires.?);
+}
+
+test "observation retirement advances beyond malformed index rows within the scan budget" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/observation-retirement" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+
+    const id: [16]u8 = @splat(1);
+    const reference: [16]u8 = @splat(2);
+    var valid_buf: [128]u8 = undefined;
+    const valid = try durable.observationRegistrationKey(id, &valid_buf);
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = try durable.observationRegistrationPrefix(&prefix_buf);
+    const invalid = try std.fmt.allocPrint(alloc, "{s}!", .{prefix});
+    defer alloc.free(invalid);
+    {
+        var write = try store.beginWrite();
+        defer write.abort();
+        try write.put(invalid, "invalid");
+        try write.put(valid, &reference);
+        try write.commit();
+    }
+
+    const first = try durable.observationRetirementPage(alloc, null, 1);
+    defer alloc.free(first.entries);
+    defer if (first.next_after) |key| alloc.free(key);
+    try std.testing.expectEqual(@as(usize, 0), first.entries.len);
+    try std.testing.expectEqualStrings(invalid, first.next_after.?);
+
+    const next = try durable.observationRetirementPage(alloc, first.next_after, 2);
+    defer alloc.free(next.entries);
+    defer if (next.next_after) |key| alloc.free(key);
+    try std.testing.expectEqual(@as(usize, 1), next.entries.len);
+    try std.testing.expectEqual(id, next.entries[0].transaction_id);
+    try std.testing.expectEqual(reference, next.entries[0].reference);
+    try std.testing.expect(next.next_after == null);
 }

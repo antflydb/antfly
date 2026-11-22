@@ -58,6 +58,22 @@ fn change(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, reference
 }
 // Keep permits until diagnostics and disconnect have joined. Taking capacity
 // never allocates an outbox ID; successful reads incur no durable writes.
+pub fn reserveOnOwner(server: *server_mod.ApiHttpServer, completion: *wire.Completion) !void {
+    if (completion.capacity.remaining != 0) return;
+    const store = try registrationStore(server);
+    const desired = 3;
+    store.reserveRegistrations(desired) catch |err| switch (err) {
+        error.SessionLimitExceeded => return error.SqlWriteCapacityUnavailable,
+        else => return err,
+    };
+    completion.capacity = .{ .context = store, .remaining = desired, .release = releaseReservation };
+}
+
+fn releaseReservation(raw: *anyopaque, count: usize) void {
+    const store: *@import("transactions.zig").DurableSessionStore = @ptrCast(@alignCast(raw));
+    store.releaseRegistrations(count);
+}
+
 pub fn reserveJoined(server: *server_mod.ApiHttpServer, completion: *wire.Completion, desired: usize, network: std.Io) !void {
     if (completion.capacity.remaining >= desired) return;
     const io = server_mod.ApiHttpServer.configuredDurableIo(server.cfg) orelse return error.SqlWriteCapacityUnavailable;
@@ -74,17 +90,13 @@ pub fn reserveJoined(server: *server_mod.ApiHttpServer, completion: *wire.Comple
                 job.failure = err;
             };
         }
-        fn release(raw: *anyopaque, count: usize) void {
-            const durable: *@import("transactions.zig").DurableSessionStore = @ptrCast(@alignCast(raw));
-            durable.releaseRegistrations(count);
-        }
     };
     var job = Job{ .store = store, .count = desired - completion.capacity.remaining, .network = network };
     var future = try io.concurrent(Job.run, .{&job});
     job.done.waitUncancelable(network);
     @import("protected_future.zig").wait(io, &future);
     if (job.failure) |err| return err;
-    completion.capacity = .{ .context = store, .remaining = desired, .release = Job.release };
+    completion.capacity = .{ .context = store, .remaining = desired, .release = releaseReservation };
 }
 // Persist the issuer intent and the target proof before the coordinator may
 // seal its plan. A failed/ambiguous preparation never admits the mutation.
@@ -108,9 +120,9 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
             return;
         }
     };
-    if (completion.capacity.remaining == 0 or completion.outcomes.items.len >= wire.max_outcomes) return error.SessionLimitExceeded;
+    if ((!observe_only and completion.capacity.remaining == 0) or completion.outcomes.items.len >= wire.max_outcomes) return error.SessionLimitExceeded;
     const owned_id = try alloc.dupe(u8, &encoded_id);
-    completion.outcomes.append(alloc, .{ .transaction_id = owned_id, .observation = if (observe_only) true else null }) catch |err| {
+    completion.outcomes.append(alloc, .{ .transaction_id = owned_id }) catch |err| {
         alloc.free(owned_id);
         return err;
     };
@@ -131,7 +143,7 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
         if (observe_only) try store.createLocalObservedRegistration(seed, outcome.*, id) else try store.createLocalPreparedRegistration(seed, outcome.*, id)
     else
         try store.createPreparedRegistration(seed, outcome.*);
-    completion.capacity.remaining -= 1;
+    if (!observe_only) completion.capacity.remaining -= 1;
     completion.execution_owned = true;
     @memcpy(encoded, &std.fmt.bytesToHex(reference, .lower));
     outcome.reference_id = encoded;
@@ -268,7 +280,7 @@ fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, com
         }
         const reference = try parseId(outcome.reference_id.?);
         var record = (try store.loadRegistration(alloc, reference)) orelse {
-            if (!(outcome.observation orelse false)) return error.CompletionUnavailable;
+            if (!@import("completion_outbox.zig").isObservation(reference)) return error.CompletionUnavailable;
             discardOutcome(completion, alloc, index);
             continue;
         };
@@ -289,7 +301,7 @@ fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, com
             } else |_| {}
         }
         if (!try store.joinRegistration(reference)) {
-            if (!(outcome.observation orelse false)) return error.CompletionUnavailable;
+            if (!@import("completion_outbox.zig").isObservation(reference)) return error.CompletionUnavailable;
             discardOutcome(completion, alloc, index);
             continue;
         }
@@ -395,7 +407,7 @@ pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, rece
         try context.ensureActive();
         const reference = try parseId(outcome.reference_id orelse return false);
         if (outcome.registration_node_id) |node| {
-            if (!try consumerAction(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .observation = outcome.observation, .action = .status }, true)) return false;
+            if (!try consumerAction(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .action = .status }, true)) return false;
             continue;
         }
         if (outcome.ddl_receipt_json) |encoded| {
@@ -461,7 +473,7 @@ pub fn remaining(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, re
     return .{ .outcomes = try pending.toOwnedSlice(alloc) };
 }
 
-pub const OwnerRequest = struct { transaction_id: [16]u8 = @splat(0), reference_id: [16]u8, action: enum { pin, prepare, observe, quiesce, abandon, status, acknowledge, forget }, consumer_node_id: ?u64 = null, observation: ?bool = null, managed: bool = false, retired_through: u64 = 0 };
+pub const OwnerRequest = struct { transaction_id: [16]u8 = @splat(0), reference_id: [16]u8, action: enum { pin, prepare, observe, quiesce, abandon, status, acknowledge, forget }, consumer_node_id: ?u64 = null, managed: bool = false, retired_through: u64 = 0 };
 // The originating node serializes registration, probing, and acknowledgement.
 // Remote stores retain compact retirement checkpoints, so delayed retries cannot
 // recreate acknowledged proofs, including across process restarts.
@@ -476,9 +488,9 @@ fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, r
     // Observation records are removed only after terminal settlement.
     // Ordinary issued sequences can also denote unpublished discards.
     var record = (try store.loadRegistration(alloc, request.reference_id)) orelse
-        return request.action == .acknowledge or (request.action == .status and (request.observation orelse false));
+        return request.action == .acknowledge or (request.action == .status and @import("completion_outbox.zig").isObservation(request.reference_id));
     defer record.deinit();
-    const floor = try store.registrationFloor();
+    const floor = try store.registrationFloorFor(request.reference_id);
     var outcome = record.value.outcome;
     const hex = std.fmt.bytesToHex(request.reference_id, .lower);
     outcome.reference_id = &hex;
@@ -586,28 +598,48 @@ pub fn ownerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
         .acknowledge => if (request.managed) store.managedCompletion(request.transaction_id, request.reference_id, true, request.retired_through) else store.acknowledgeCompletion(request.transaction_id, request.reference_id),
     };
 }
-// Only pre-existing, unpublished subscriptions are eligible. Dropping one
-// does not assert completion: missing consumer status remains unresolved, and
-// the transaction/job's own recovery and retention rules remain authoritative.
 pub fn retireSettledObservations(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize) !void {
     if (server.txn_sessions.durable == null) return;
     const store = try registrationStore(server);
-    const page = try store.observationRetirementPage(alloc, server.sql_observation_retirement_after, limit);
-    defer alloc.free(page);
+    var page = try store.observationRetirementPage(server.alloc, server.sql_observation_retirement_after, limit);
+    defer server.alloc.free(page.entries);
+    defer if (page.next_after) |key| server.alloc.free(key);
     const deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
-    for (page) |entry| {
+    var last: ?[16]u8 = null;
+    for (page.entries) |entry| {
         const reference = entry.reference;
-        if (@import("antfly_platform").time.monotonicNs() >= deadline) return;
-        server.sql_observation_retirement_after = entry.transaction_id;
+        if (@import("antfly_platform").time.monotonicNs() >= deadline and last != null) {
+            const position = try store.copyObservationRegistrationKey(server.alloc, last.?);
+            if (server.sql_observation_retirement_after) |key| server.alloc.free(key);
+            server.sql_observation_retirement_after = position;
+            return;
+        }
+        last = entry.transaction_id;
         const lock = store.lockRegistration(reference);
         defer lock.unlock();
-        var record = (try store.loadRegistration(alloc, reference)) orelse continue;
+        var record = (store.loadRegistration(alloc, reference) catch |err| switch (err) {
+            error.CompletionWrongOwner, error.InvalidTransactionSessionRecord => {
+                std.log.warn("invalid SQL observation registration retained: {s}", .{@errorName(err)});
+                continue;
+            },
+            else => return err,
+        }) orelse continue;
         defer record.deinit();
         if (!(record.value.observation orelse false)) continue;
+        const id = if (record.value.outcome.transaction_id) |hex|
+            parseId(hex) catch null
+        else
+            null;
+        if (id == null or !std.mem.eql(u8, &id.?, &entry.transaction_id)) {
+            std.log.warn("mismatched SQL observation registration retained", .{});
+            continue;
+        }
         if (record.value.phase == .acknowledging or try store.completionReferenceSettled(entry.transaction_id, reference))
             try store.retireLocalPreparedRegistration(reference, entry.transaction_id);
     }
-    if (page.len < limit) server.sql_observation_retirement_after = null;
+    if (server.sql_observation_retirement_after) |key| server.alloc.free(key);
+    server.sql_observation_retirement_after = page.next_after;
+    page.next_after = null;
 }
 
 pub fn recoverUnpublished(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize) !void {

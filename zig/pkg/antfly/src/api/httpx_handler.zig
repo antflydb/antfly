@@ -1016,9 +1016,13 @@ pub const AntflyApiHandler = struct {
         server: ?*http_server_mod.ApiHttpServer = null,
         value: @import("../pgwire/completion.zig").Completion = .{},
         reports_existing_commit: bool = false,
+        reserve_on_prepare: bool = false,
         fn prepareTransaction(raw: *anyopaque, id: [16]u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try @import("sql_completion.zig").prepareTransaction(self.server orelse return error.DurabilityUnavailable, self.alloc, &self.value, id);
+            const server = self.server orelse return error.DurabilityUnavailable;
+            const protocol = @import("sql_completion.zig");
+            if (self.reserve_on_prepare) try protocol.reserveOnOwner(server, &self.value);
+            try protocol.prepareTransaction(server, self.alloc, &self.value, id);
         }
         fn prepareMetadata(raw: *anyopaque, owner: operation_contract.SQLCompletionOwner) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1064,7 +1068,9 @@ pub const AntflyApiHandler = struct {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
         try establishExecutionDeadlines(ctx);
-        if (try self.admitCompletion(ctx)) |response| return response;
+        if (!std.mem.eql(u8, http_server_mod.stripApiPrefix(ctx.request.uri.path), "/sql")) {
+            if (try self.admitCompletion(ctx)) |response| return response;
+        }
         var response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
         errdefer response.deinit();
         try self.completeSQLResponse(ctx, &response);
@@ -7189,7 +7195,9 @@ pub const AntflyApiHandler = struct {
         try response.headers.set("X-Antfly-SQL-Completion", encoded);
     }
     fn executeSQLMode(self: *AntflyApiHandler, ctx: *httpx.Context, mode: SQLPreparedMode, resource_id: ?[]const u8) !httpx.Response {
-        if (try self.admitCompletion(ctx)) |response| return response;
+        if (mode != .statement) {
+            if (try self.admitCompletion(ctx)) |response| return response;
+        }
         const completion = try requestCompletion(ctx);
         return self.finishOwnedSQLResponse(ctx, try self.executeSQLModeOwned(ctx, mode, resource_id, completion));
     }
@@ -7335,6 +7343,18 @@ pub const AntflyApiHandler = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
+        if (mode == .statement) {
+            const observe_retry = (request.session_id != null or request.connection_id != null) and (request.parameters orelse &.{}).len == 0 and
+                @import("../pgwire/session_commands.zig").isCommit(request.statement orelse "");
+            if (observe_retry and ctx.header("X-Antfly-SQL-Fence") != null and
+                ctx.header("X-Antfly-SQL-Probe") == null and ctx.header("X-Antfly-SQL-Settlement") == null)
+            {
+                const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+                owned.server = self.api_server;
+                owned.reserve_on_prepare = true;
+            } else if (try self.admitCompletion(ctx)) |response| return response;
+        }
+
         const execution_limits = sqlExecutionLimits(ctx) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL execution budget" });
         const read_requirements = request.read_requirements orelse @import("antfly_local_sources").sql_read_requirements.Requirements{};
         read_requirements.validate(.sql) catch |err| return ctx.status(if (err == error.UnsupportedReadVisibility) @as(u16, 501) else @as(u16, 400)).json(sql_wire.SQLDiagnostic{ .code = if (err == error.UnsupportedReadVisibility) "0A000" else "22023", .message = "invalid or unsupported SQL read requirements" });
@@ -15709,6 +15729,9 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         const completion = try AntflyApiHandler.requestCompletion(&ctx);
         try std.testing.expect(!completion.unknown);
         try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+        const max_window = @import("completion_outbox.zig").max_window;
+        try durable.reserveRegistrations(max_window);
+        defer durable.releaseRegistrations(max_window);
         var retry_ctx = httpx.Context.init(alloc, std.testing.io, &request);
         defer retry_ctx.deinit();
         var retry_response = try handler.executeSQL(&retry_ctx);
@@ -15734,15 +15757,16 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(txn_id, .lower), diagnostic.value.transaction_id.?);
 
     const observations = try durable.observationRetirementPage(alloc, null, 8);
-    defer alloc.free(observations);
-    try std.testing.expectEqual(@as(usize, 1), observations.len);
-    const reference = observations[0].reference;
+    defer alloc.free(observations.entries);
+    defer if (observations.next_after) |key| alloc.free(key);
+    try std.testing.expectEqual(@as(usize, 1), observations.entries.len);
+    const reference = observations.entries[0].reference;
     _ = (try server.txn_sessions.recordTerminalAbort(alloc, txn_id)).?;
     var registration = (try durable.loadRegistration(alloc, reference)).?;
     defer registration.deinit();
     registration.value.phase = .acknowledging;
     try durable.putRegistration(reference, registration.value);
-    try std.testing.expect(try durable.managedCompletion(txn_id, reference, true, try durable.registrationFloor()));
+    try std.testing.expect(try durable.managedCompletion(txn_id, reference, true, try durable.registrationFloorFor(reference)));
 
     const completions = @import("sql_completion.zig");
     try completions.retireSettledObservations(&server, alloc, 8);
@@ -15751,11 +15775,18 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     const observed_outcome: @import("../pgwire/completion.zig").Outcome = .{
         .reference_id = &reference_hex,
         .registration_node_id = node,
-        .observation = true,
     };
     try std.testing.expect(try completions.settled(&server, alloc, .{ .outcomes = &.{observed_outcome} }, .{}));
-    var ordinary_outcome = observed_outcome;
-    ordinary_outcome.observation = null;
+    var foreign_reference = reference;
+    foreign_reference[0] ^= 1;
+    const foreign_hex = std.fmt.bytesToHex(foreign_reference, .lower);
+    var foreign_outcome = observed_outcome;
+    foreign_outcome.reference_id = &foreign_hex;
+    try std.testing.expectError(error.CompletionWrongOwner, completions.settled(&server, alloc, .{ .outcomes = &.{foreign_outcome} }, .{}));
+    const ordinary = try durable.createRegistration(@splat(2), .{ .transaction_id = &std.fmt.bytesToHex(txn_id, .lower) });
+    try durable.removeRegistration(ordinary);
+    const ordinary_hex = std.fmt.bytesToHex(ordinary, .lower);
+    const ordinary_outcome: @import("../pgwire/completion.zig").Outcome = .{ .reference_id = &ordinary_hex, .registration_node_id = node };
     try std.testing.expect(!try completions.settled(&server, alloc, .{ .outcomes = &.{ordinary_outcome} }, .{}));
 }
 
