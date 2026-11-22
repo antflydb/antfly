@@ -857,3 +857,31 @@ func createTestZip(t *testing.T, files map[string][]byte) string {
 	}
 	return path
 }
+
+func TestCorpusReaderBudgetUsesExecutionPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reader.json")
+	if err := os.WriteFile(path, []byte(`{"provider":"antfly","model":"lightonai/LightOnOCR-3-4B:revision","max_tokens":8192}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, DefaultInferenceURL, path, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset := indexes[corpusTextIndex].(map[string]any)["enrichments"].([]any)[0].(map[string]any)
+	if got := asset["execution"].(map[string]any)["max_output_tokens_per_item"]; got != uint32(8192) {
+		t.Fatalf("budget = %v", got)
+	}
+	before := corpusDescription(indexes, 25)
+	asset["execution"].(map[string]any)["max_output_tokens_per_item"] = uint32(16384)
+	if corpusDescription(indexes, 25) != before {
+		t.Fatal("execution-only change invalidated resume identity")
+	}
+	var producer map[string]any
+	if err := json.Unmarshal([]byte(asset["producer_json"].(string)), &producer); err != nil {
+		t.Fatal(err)
+	}
+	reader := producer["config"].(map[string]any)["ocr"].(map[string]any)["reader"].(map[string]any)
+	if _, ok := reader["max_tokens"]; ok {
+		t.Fatal("execution budget leaked into recipe")
+	}
+}
