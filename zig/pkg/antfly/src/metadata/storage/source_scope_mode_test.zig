@@ -100,21 +100,98 @@ pub fn run(a: A) !void {
     defer if (forged) |record| metadata.freeReplicationSourceStatus(a, record);
     try std.testing.expect(forged == null);
     try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
+    const bootstrap_digest = control.nativeBootstrapCatalogDigest(table);
     var original = cutover;
     original.phase = control.native_bootstrap_preparing_phase;
     original.cutover_authority_id = 1;
     original.slot_name = "slot_old";
     original.publication_name = "pub_old";
+    var previous_schema = table;
+    previous_schema.schema_json = "{\"version\":1}";
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = control.nativeBootstrapCatalogDigest(previous_schema),
+        .record = original,
+    } });
+    {
+        const stale = try store.getReplicationSourceStatus(a, group, table.table_id, 0);
+        defer if (stale) |record| metadata.freeReplicationSourceStatus(a, record);
+        try std.testing.expect(stale == null);
+    }
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = bootstrap_digest,
         .record = original,
     } });
     original.phase = control.native_bootstrap_snapshot_phase;
     original.cutover_mode = "exported_snapshot";
     original.prepared_checkpoint = "lsn:0/1000";
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = original,
+    } });
+    var unarmed = original;
+    unarmed.phase = control.native_bootstrap_applying_phase;
+    unarmed.updated_at_ms = 90;
+    unarmed.pending_snapshot_page = .{
+        .end_offset = 1,
+        .checkpoint = "snapshot_keyset:[1]",
+        .payload_digest = @splat(63),
+        .managed_dispatch = true,
+    };
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = bootstrap_digest,
+        .record = unarmed,
+    } });
+    var replaced_table = table;
+    replaced_table.replication_sources_json = "[]";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = replaced_table });
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = replaced_table } });
+    {
+        const retained_config = (try store.getTable(a, group, table.table_id)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeTable(a, retained_config);
+        try std.testing.expectEqualStrings(table.replication_sources_json, retained_config.replication_sources_json);
+    }
+    const aborted_job: @import("antfly_local_sources").storage_history_recovery_wire.Request = .{
+        .owner = authority.owner,
+        .transaction_id = try control.nativeSnapshotPageId(unarmed, 0),
+        .admission_digest = @splat(82),
+        .coordinator_locator = "checkpoint",
+        .resolution_timestamp_ns = unarmed.updated_at_ms * std.time.ns_per_ms + 1,
+    };
+    const aborted_job_bytes = try std.json.Stringify.valueAlloc(a, aborted_job, .{});
+    defer a.free(aborted_job_bytes);
+    var retained_first = unarmed;
+    retained_first.pending_snapshot_page.?.recovery_job = aborted_job_bytes;
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = bootstrap_digest,
+        .record = retained_first,
+    } });
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = bootstrap_digest,
+        .record = original,
+        .completed_page = unarmed.pending_snapshot_page.?.payload_digest,
+    } });
+    {
+        const retained = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, retained);
+        try std.testing.expectEqualStrings(control.native_bootstrap_applying_phase, retained.phase);
+        try std.testing.expectEqualStrings(aborted_job_bytes, retained.pending_snapshot_page.?.recovery_job);
+    }
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = bootstrap_digest,
+        .record = original,
+        .completed_page = control.digest(aborted_job_bytes),
+    } });
+    {
+        const reset = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, reset);
+        try std.testing.expectEqualStrings(control.native_bootstrap_snapshot_phase, reset.phase);
+        try std.testing.expectEqualStrings(aborted_job_bytes, reset.snapshot_cleanup_job);
+        try std.testing.expectEqual(@as(u64, 0), reset.snapshot_offset);
+    }
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = bootstrap_digest,
+        .record = original,
+        .released_page = control.digest(aborted_job_bytes),
     } });
     var successor = cutover;
     successor.phase = control.native_bootstrap_preparing_phase;
@@ -122,16 +199,22 @@ pub fn run(a: A) !void {
     successor.retired_slot_name = original.slot_name;
     successor.retired_publication_name = original.publication_name;
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = successor,
     } });
+    {
+        const claimed = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, claimed);
+        try std.testing.expectEqual(successor.cutover_authority_id, claimed.cutover_authority_id);
+        try std.testing.expect(claimed.pending_snapshot_page == null);
+    }
     try store.applyStandaloneCommand(group, .{ .complete_replication_source_retirement = successor });
     var snapshot_status = cutover;
     snapshot_status.cutover_mode = "exported_snapshot";
     snapshot_status.phase = control.native_bootstrap_snapshot_phase;
     snapshot_status.prepared_checkpoint = "lsn:0/1234";
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = snapshot_status,
     } });
     var publication_status = snapshot_status;
@@ -149,13 +232,13 @@ pub fn run(a: A) !void {
     var ahead = publication_status;
     ahead.snapshot_offset += 1;
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = ahead,
     } });
     var changed_cursor = publication_status;
     changed_cursor.checkpoint = "snapshot_keyset:[42]";
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = changed_cursor,
     } });
     {
@@ -170,11 +253,11 @@ pub fn run(a: A) !void {
     applying.updated_at_ms = 100;
     applying.pending_snapshot_page = .{ .end_offset = 1, .checkpoint = "snapshot_keyset:[42]", .payload_digest = @splat(55), .final = true };
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = applying,
     } });
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = snapshot_status,
     } });
     {
@@ -190,14 +273,14 @@ pub fn run(a: A) !void {
     invalid_replacement.retired_slot_name = applying.slot_name;
     invalid_replacement.retired_publication_name = applying.publication_name;
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = invalid_replacement,
     } });
     var reissued = applying;
     reissued.updated_at_ms = 200;
     reissued.pending_snapshot_page.?.payload_digest = @splat(56);
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = reissued,
     } });
     {
@@ -218,7 +301,7 @@ pub fn run(a: A) !void {
     var armed = applying;
     armed.pending_snapshot_page.?.recovery_job = job_bytes;
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = armed,
     } });
     {
@@ -232,13 +315,13 @@ pub fn run(a: A) !void {
     wrong_page.snapshot_offset = 1;
     wrong_page.checkpoint = "snapshot_keyset:[43]";
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = wrong_page,
         .completed_page = @splat(55),
     } });
     wrong_page.checkpoint = "snapshot_keyset:[42]";
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = wrong_page,
         .completed_page = @splat(56),
     } });
@@ -253,14 +336,14 @@ pub fn run(a: A) !void {
     applying.pending_snapshot_page = null;
     applying.checkpoint = "snapshot_keyset:[42]";
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = applying,
         .completed_page = @splat(55),
     } });
     publication_status.snapshot_offset = applying.snapshot_offset;
     publication_status.checkpoint = applying.checkpoint;
     const bytes = try store_mod.encodeTransitionCommand(a, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = publication_status,
     } });
     defer a.free(bytes);
@@ -283,7 +366,7 @@ pub fn run(a: A) !void {
     store = try Store.init(a, .{ .root_dir = path });
     opened = true;
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = publication_status,
         .released_page = @splat(98),
     } });
@@ -293,7 +376,7 @@ pub fn run(a: A) !void {
         try std.testing.expectEqualStrings(job_bytes, saved.snapshot_cleanup_job);
     }
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
-        .catalog_digest = actor.catalog,
+        .catalog_digest = bootstrap_digest,
         .record = publication_status,
         .released_page = control.digest(job_bytes),
     } });

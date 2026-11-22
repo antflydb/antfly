@@ -34,6 +34,13 @@ pub fn nativeBootstrapCanReplaceExport(phase: []const u8) bool {
     return std.mem.eql(u8, phase, native_bootstrap_preparing_phase) or
         std.mem.eql(u8, phase, native_bootstrap_snapshot_phase);
 }
+pub fn nativeBootstrapCanReplaceStatus(record: anytype) bool {
+    if (record.snapshot_offset != 0 or record.stream_checkpoint.len != 0) return false;
+    if (nativeBootstrapCanReplaceExport(record.phase)) return true;
+    if (!std.mem.eql(u8, record.phase, native_bootstrap_applying_phase)) return false;
+    const page = record.pending_snapshot_page orelse return false;
+    return page.managed_dispatch and page.recovery_job.len == 0;
+}
 pub fn isNativeBootstrapPhase(phase: []const u8) bool {
     return nativeBootstrapCanReplaceExport(phase) or
         std.mem.eql(u8, phase, native_bootstrap_applying_phase) or
@@ -799,6 +806,36 @@ pub fn nativeSourceProviderBinding(status: anytype) ![32]u8 {
         hash.update(&length);
         hash.update(identifier);
     }
+    return hash.finalResult();
+}
+
+pub fn nativeBootstrapCatalogDigest(table: anytype) Digest {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:native-postgres-bootstrap-catalog:v1");
+    var table_id: [8]u8 = undefined;
+    std.mem.writeInt(u64, &table_id, table.table_id, .big);
+    hash.update(&table_id);
+    hashField(&hash, table.name);
+    hashField(&hash, table.schema_json);
+    hashField(&hash, table.replication_sources_json);
+    hashField(&hash, @tagName(table.storage.engine));
+    return hash.finalResult();
+}
+
+/// Commit and capture adapters correlate the same immutable provider page.
+pub fn nativeSnapshotPageDigest(cutover: anytype, start_offset: u64, end_offset: u64, final: bool, cursor: []const u8, encoded_rows: []const u8) !Digest {
+    if (end_offset <= start_offset or cursor.len == 0 or encoded_rows.len == 0)
+        return error.InvalidSourceControl;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:native-postgres-snapshot-payload:v1");
+    hash.update(&try nativeSnapshotPageId(cutover, start_offset));
+    var end: [8]u8 = undefined;
+    std.mem.writeInt(u64, &end, end_offset, .big);
+    hash.update(&end);
+    hash.update(&.{@intFromBool(final)});
+    hashField(&hash, cutover.prepared_checkpoint);
+    hashField(&hash, cursor);
+    hashField(&hash, encoded_rows);
     return hash.finalResult();
 }
 

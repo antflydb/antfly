@@ -1407,12 +1407,13 @@ pub const ReplicationSourceStatusRecord = struct {
         checkpoint: []const u8,
         payload_digest: [32]u8,
         final: bool = false,
+        managed_dispatch: bool = false,
         recovery_job: []const u8 = "",
 
         pub fn eql(left: ?SnapshotPage, right: ?SnapshotPage) bool {
             const a = left orelse return right == null;
             const b = right orelse return false;
-            return a.end_offset == b.end_offset and a.final == b.final and std.mem.eql(u8, a.checkpoint, b.checkpoint) and
+            return a.end_offset == b.end_offset and a.final == b.final and a.managed_dispatch == b.managed_dispatch and std.mem.eql(u8, a.checkpoint, b.checkpoint) and
                 std.mem.eql(u8, &a.payload_digest, &b.payload_digest) and
                 std.mem.eql(u8, a.recovery_job, b.recovery_job);
         }
@@ -2588,6 +2589,7 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
             .end_offset = page.end_offset,
             .payload_digest = page.payload_digest,
             .final = page.final,
+            .managed_dispatch = page.managed_dispatch,
             .checkpoint = checkpoint_copy,
             .recovery_job = try alloc.dupe(u8, page.recovery_job),
         };

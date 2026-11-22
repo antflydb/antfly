@@ -17134,7 +17134,7 @@ pub const RaftApplyStore = struct {
         const table = try decodeTableRecord(alloc, encoded_table);
         errdefer metadata_table_manager.freeTable(alloc, table);
         if (!std.mem.eql(u8, table.name, table_name)) return error.InvalidDerivedCatalogIndex;
-        if (try tableHasSourceWorkTxn(&txn, group_id, table_id)) return error.TableTransitionActive;
+        if (try tableHasSourceWorkTxn(self.alloc, &txn, group_id, table_id)) return error.TableTransitionActive;
         if (try self.relationalDropBlockedTxn(&txn, group_id, table))
             return error.ConstraintRetirementRequired;
 
@@ -22878,19 +22878,45 @@ pub const RaftApplyStore = struct {
         }
     }
 
-    fn tableHasSourceWorkTxn(txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
+    fn nativeBootstrapDefinitionChanged(before: metadata.TableRecord, after: metadata.TableRecord) bool {
+        return !std.mem.eql(u8, before.name, after.name) or
+            !std.mem.eql(u8, before.schema_json, after.schema_json) or
+            !std.mem.eql(u8, before.replication_sources_json, after.replication_sources_json) or
+            before.storage.engine != after.storage.engine;
+    }
+
+    fn tableHasNativeBootstrapWorkTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
+        var buffer: [224]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&buffer, "\x00\x00__metadata__:metadata_replication_source_status:{d}:{d}:", .{ group_id, table_id });
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var next = try cursor.seekAtOrAfter(prefix);
+        while (next) |row| : (next = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            const status = try decodeReplicationSourceStatusRecord(a, row.value);
+            defer metadata_table_manager.freeReplicationSourceStatus(a, status);
+            if (status.snapshot_cleanup_job.len != 0 or
+                (source_control.isNativeBootstrapPhase(status.phase) and
+                    !std.mem.eql(u8, status.phase, source_control.native_bootstrap_prepared_phase))) return true;
+        }
+        return false;
+    }
+
+    fn tableHasSourceWorkTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
         var buffer: [256]u8 = undefined;
         const key = try source_control.workKey(&buffer, group_id, table_id);
-        const work = (try stagingGet(txn, key)) orelse return false;
-        if (work.len != @sizeOf(u64)) return error.InvalidSourceControl;
-        return std.mem.readInt(u64, work[0..8], .little) != 0;
+        if (try stagingGet(txn, key)) |work| {
+            if (work.len != @sizeOf(u64)) return error.InvalidSourceControl;
+            if (std.mem.readInt(u64, work[0..8], .little) != 0) return true;
+        }
+        return tableHasNativeBootstrapWorkTxn(a, txn, group_id, table_id);
     }
 
     /// Admission and mutation share the caller's transaction. In particular,
     /// rejection must precede logical unbinding: Raft commits rejected commands
     /// as no-ops, while standalone aborts and exposes the precise policy error.
     fn removeTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, expected_generation: u64) !void {
-        if (try tableHasSourceWorkTxn(txn, group_id, table_id)) return error.TableTransitionActive;
+        if (try tableHasSourceWorkTxn(self.alloc, txn, group_id, table_id)) return error.TableTransitionActive;
         if (try self.fkGenerationTableLockedTxn(txn, group_id, table_id)) return error.TableTransitionActive;
         const fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
         if (fence.active()) return error.TableTransitionActive;
@@ -22963,6 +22989,9 @@ pub const RaftApplyStore = struct {
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
             retained = existing;
+            if (nativeBootstrapDefinitionChanged(existing, record) and
+                try tableHasNativeBootstrapWorkTxn(self.alloc, txn, group_id, record.table_id)) return;
+
             metadata_table_manager.validateObjectTableMutation(self.alloc, existing, record) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return,
@@ -24233,7 +24262,7 @@ pub const RaftApplyStore = struct {
                 }
             },
             .drop => |drop| {
-                if (try tableHasSourceWorkTxn(txn, group_id, drop.table_id)) return;
+                if (try tableHasSourceWorkTxn(self.alloc, txn, group_id, drop.table_id)) return;
                 if (try self.fkGenerationTableLockedTxn(txn, group_id, drop.table_id)) return;
                 const fence = try self.loadTableTransitionFenceTxn(txn, group_id, drop.table_id);
                 if (fence.active() or fence.generation != drop.expected_transition_generation) return;
@@ -24507,14 +24536,15 @@ pub const RaftApplyStore = struct {
         var table_buffer: [160]u8 = undefined;
         const table_key = try tableKeyForGroup(&table_buffer, group_id, record.table_id);
         const table = try decodeTableRecord(a, (try stagingGet(txn, table_key)) orelse return);
-        if (!std.mem.eql(u8, &digest, &source_control.digest(table.replication_sources_json))) return;
+        if (!std.mem.eql(u8, &digest, &source_control.nativeBootstrapCatalogDigest(table))) return;
         var status_buffer: [224]u8 = undefined;
         const key = try replicationSourceStatusKeyForGroup(&status_buffer, group_id, record.table_id, record.source_ordinal);
         validateNativeReplicationBootstrap(record) catch return;
         if (record.snapshot_cleanup_job.len != 0 or (released_page != null and completed_page != null)) return;
         if (completed_page != null and (record.pending_snapshot_page != null or
             (!std.mem.eql(u8, record.phase, source_control.native_bootstrap_applying_phase) and
-                !std.mem.eql(u8, record.phase, source_control.native_bootstrap_prepared_phase)))) return;
+                !std.mem.eql(u8, record.phase, source_control.native_bootstrap_prepared_phase) and
+                !std.mem.eql(u8, record.phase, source_control.native_bootstrap_snapshot_phase)))) return;
         const raw = try stagingGet(txn, key);
         if (released_page) |digest_to_release| {
             var observed = try decodeReplicationSourceStatusRecord(a, raw orelse return);
@@ -24527,9 +24557,7 @@ pub const RaftApplyStore = struct {
         if (std.mem.eql(u8, record.phase, source_control.native_bootstrap_preparing_phase)) {
             if (raw) |bytes| {
                 const previous = try decodeReplicationSourceStatusRecord(a, bytes);
-                if (!source_control.nativeBootstrapCanReplaceExport(previous.phase) or
-                    previous.snapshot_offset != 0 or previous.stream_checkpoint.len != 0)
-                    return;
+                if (!source_control.nativeBootstrapCanReplaceStatus(previous) or previous.snapshot_cleanup_job.len != 0) return;
                 if (replicationCutoverAuthorityIdentityEqual(previous, record)) return;
                 if (previous.retired_cutover_authority_id != 0 or
                     record.retired_cutover_authority_id != previous.cutover_authority_id or
@@ -24565,12 +24593,21 @@ pub const RaftApplyStore = struct {
             const same_offset = current.snapshot_offset == record.snapshot_offset;
             const preparing_stream = std.mem.eql(u8, record.phase, source_control.native_bootstrap_prepared_phase);
             if (discovering and !same_offset) return;
+            if (applying and completed_page != null and std.mem.eql(u8, record.phase, source_control.native_bootstrap_snapshot_phase)) {
+                const pending = current.pending_snapshot_page orelse return;
+                if (!same_offset or current.snapshot_offset != 0 or !std.mem.eql(u8, current.checkpoint, record.checkpoint) or
+                    !pending.managed_dispatch or pending.recovery_job.len == 0 or
+                    !std.meta.eql(completed_page.?, source_control.digest(pending.recovery_job))) return;
+                var reset = record;
+                reset.snapshot_cleanup_job = pending.recovery_job;
+                return self.putReplicationSourceStatusTxn(txn, group_id, key, reset);
+            }
             if (applying and !preparing_stream and !std.mem.eql(u8, record.phase, source_control.native_bootstrap_applying_phase)) return;
             if (same_offset and !std.mem.eql(u8, current.checkpoint, record.checkpoint)) return;
             if (current.pending_snapshot_page) |pending| {
                 if (same_offset and completed_page == null and pending.recovery_job.len == 0) {
                     if (record.pending_snapshot_page) |armed| {
-                        if (armed.recovery_job.len == 0 or armed.end_offset != pending.end_offset or armed.final != pending.final or
+                        if (armed.recovery_job.len == 0 or armed.end_offset != pending.end_offset or armed.final != pending.final or armed.managed_dispatch != pending.managed_dispatch or
                             !std.mem.eql(u8, armed.checkpoint, pending.checkpoint) or
                             !std.meta.eql(armed.payload_digest, pending.payload_digest) or
                             record.updated_at_ms != current.updated_at_ms) return;
@@ -24741,6 +24778,12 @@ pub const RaftApplyStore = struct {
             // command's rejection receipt.
             if (!try metadata_table_manager.privacyProgressOnly(self.alloc, expected, replacement))
                 try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
+            return;
+        }
+        if (nativeBootstrapDefinitionChanged(current, replacement) and
+            try tableHasNativeBootstrapWorkTxn(self.alloc, txn, group_id, current.table_id))
+        {
+            try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
             return;
         }
         if (!try admitIndexAliasTableTxn(self, txn, group_id, replacement)) {
@@ -32774,7 +32817,7 @@ fn appendReplicationSourceStatusRecord(
         try out.append(alloc, 1);
         try appendInt(alloc, out, u64, page.end_offset);
         try out.appendSlice(alloc, &page.payload_digest);
-        try out.append(alloc, @intFromBool(page.final));
+        try out.append(alloc, @as(u8, @intFromBool(page.final)) | (@as(u8, @intFromBool(page.managed_dispatch)) << 1));
         try appendRequiredString(alloc, out, page.checkpoint);
         if (page.recovery_job.len != 0) try appendRequiredString(alloc, out, page.recovery_job);
     } else if (record.snapshot_cleanup_job.len != 0) {
@@ -33742,17 +33785,15 @@ fn readReplicationSourceStatusRecord(
         if (digest_end > encoded.len) return error.InvalidMetadataTransitionEncoding;
         const payload_digest = encoded[pos.*..][0..32].*;
         pos.* = digest_end;
-        const final = switch (try readInt(encoded, pos, u8)) {
-            0 => false,
-            1 => true,
-            else => return error.InvalidMetadataTransitionEncoding,
-        };
+        const flags = try readInt(encoded, pos, u8);
+        if (flags > 3) return error.InvalidMetadataTransitionEncoding;
         const page_checkpoint = try readRequiredString(alloc, encoded, pos);
         errdefer alloc.free(page_checkpoint);
         break :blk .{
             .end_offset = end_offset,
             .payload_digest = payload_digest,
-            .final = final,
+            .final = flags & 1 != 0,
+            .managed_dispatch = flags & 2 != 0,
             .checkpoint = page_checkpoint,
             .recovery_job = if (pos.* < encoded.len) try readRequiredString(alloc, encoded, pos) else try alloc.dupe(u8, ""),
         };

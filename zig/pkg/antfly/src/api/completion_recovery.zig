@@ -84,7 +84,7 @@ pub const Recovery = struct {
         return self.runBound(a, job.owner, fence, locator.table_name, job.transaction_id, job, null, context);
     }
     /// Release only a completed transaction whose owning cursor is durable.
-    pub fn releaseRetained(self: Recovery, a: A, job: local.storage_history_recovery_wire.Request, original: Context) !void {
+    pub fn releaseRetained(self: Recovery, a: A, job: local.storage_history_recovery_wire.Request, terminal: enum { committed, aborted }, original: Context) !void {
         try job.validate();
         var context = try original.platformDeadline();
         context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
@@ -102,7 +102,8 @@ pub const Recovery = struct {
         try observed.value.validate(query.binding());
         const decision = observed.value.decision orelse return;
         if (!std.mem.eql(u8, &decision.admission.digest, &job.admission_digest)) return error.SourceTransactionIdentityConflict;
-        if (decision.record.status != .committed) return error.SourceOutcomeUnresolved;
+        const expected_status: @TypeOf(decision.record.status) = if (terminal == .committed) .committed else .aborted;
+        if (decision.record.status != expected_status) return error.SourceOutcomeUnresolved;
         try self.checkpoint(context);
         try self.participants.acknowledgeRetainedCoordinator(a, job.owner, fence, job.coordinator_locator, job.transaction_id, context);
     }
@@ -469,11 +470,11 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     };
     const before_release = fake.acknowledgments;
     page_job.admission_digest[0] ^= 1;
-    try std.testing.expectError(error.SourceTransactionIdentityConflict, recovery.releaseRetained(a, page_job, .{}));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, recovery.releaseRetained(a, page_job, .committed, .{}));
     try std.testing.expectEqual(before_release, fake.acknowledgments);
     page_job.admission_digest = admission.digest();
     fake.expect_coordinator_release = true;
-    try recovery.releaseRetained(a, page_job, .{});
+    try recovery.releaseRetained(a, page_job, .committed, .{});
     fake.expect_coordinator_release = false;
     try std.testing.expectEqual(before_release + 1, fake.acknowledgments);
     fake.resolved[1] = false;
@@ -529,6 +530,15 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(.aborted, try recovery.runRetained(a, retained, .{}));
     try std.testing.expectEqual(@as(usize, 8), fake.resolves);
     try std.testing.expectEqual(@as(usize, 4), fake.publishes);
+
+    const before_abort_release = fake.acknowledgments;
+    retained.abort_before_ns = 0;
+    try std.testing.expectError(error.SourceOutcomeUnresolved, recovery.releaseRetained(a, retained, .committed, .{}));
+    try std.testing.expectEqual(before_abort_release, fake.acknowledgments);
+    fake.expect_coordinator_release = true;
+    try recovery.releaseRetained(a, retained, .aborted, .{});
+    fake.expect_coordinator_release = false;
+    try std.testing.expectEqual(before_abort_release + 1, fake.acknowledgments);
 
     // The normal coordinator uses the same retained two-owner state. A
     // visibility-only retry must finish both barriers, preserve simultaneous
