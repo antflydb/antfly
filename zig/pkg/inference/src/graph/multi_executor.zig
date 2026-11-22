@@ -213,7 +213,7 @@ pub fn executeDeviceOutputs(
     if (auditing) try transfer_audit.begin(&audit);
     defer if (auditing) transfer_audit.end();
     const result = try executeMultiDeviceImpl(allocator, graph, plan, mesh, options, stats);
-    audit.recordStats(stats);
+    if (auditing) audit.recordStats(stats);
     return result;
 }
 

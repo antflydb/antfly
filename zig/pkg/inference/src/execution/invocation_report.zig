@@ -190,8 +190,8 @@ pub const Report = struct {
                 report.program_workspace = owned.workspace;
                 report.program_host_workspace = owned.host_workspace;
             }
-            if (report.transfers == null) {
-                report.transfers = .{ .upload_calls = program.actual_upload_calls, .upload_bytes = program.actual_upload_bytes, .download_calls = program.actual_download_calls, .download_bytes = program.actual_download_bytes, .host_accesses = program.device_host_accesses, .host_access_bytes = program.device_host_access_bytes, .index_metadata_host_accesses = program.index_metadata_host_accesses, .index_metadata_host_access_bytes = program.index_metadata_host_access_bytes };
+            if (report.transfers == null and program.actual_device_copy_calls != null) {
+                report.transfers = .{ .upload_calls = program.actual_upload_calls, .upload_bytes = program.actual_upload_bytes, .download_calls = program.actual_download_calls, .download_bytes = program.actual_download_bytes, .device_copy_calls = program.actual_device_copy_calls, .device_copy_bytes = program.actual_device_copy_bytes, .host_accesses = program.device_host_accesses, .host_access_bytes = program.device_host_access_bytes, .index_metadata_host_accesses = program.index_metadata_host_accesses, .index_metadata_host_access_bytes = program.index_metadata_host_access_bytes };
                 report.transfers_scope = .last_program_only;
             }
         }
@@ -412,4 +412,27 @@ test "coverage publication preserves absence and corresponding program precedenc
     try std.testing.expectEqual(.latest_entered_native_call_prepared_metadata, native.payload_admission_coverage.?.scope);
     try std.testing.expectEqual(@as(u64, 19), native.payload_admission_coverage.?.value.complete.epoch);
     try std.testing.expectEqual(@import("owned_coverage.zig").Reason.alias, program.payload_admission_coverage.?.value.compatibility);
+}
+
+test "program transfers retain audited device copy counts and distinguish unavailable samples" {
+    const std = @import("std");
+    var diagnostics = @import("diagnostics.zig").Diagnostics{};
+    diagnostics.configure(true);
+    var program: @import("stats.zig").ExecutionStats = .{};
+    diagnostics.publish(.{ .execution = program });
+    try std.testing.expect(diagnostics.snapshot().?.report.?.transfers == null);
+    var audit = @import("transfer_audit.zig").Audit{};
+    audit.recordStats(&program);
+    diagnostics.publish(.{ .execution = program });
+    try std.testing.expectEqual(@as(?u64, 0), diagnostics.snapshot().?.report.?.transfers.?.device_copy_calls);
+    try @import("transfer_audit.zig").begin(&audit);
+    @import("transfer_audit.zig").deviceCopy(64);
+    @import("transfer_audit.zig").deviceCopy(16);
+    @import("transfer_audit.zig").end();
+    audit.recordStats(&program);
+    diagnostics.publish(.{ .execution = program });
+    const report = diagnostics.snapshot().?.report.?;
+    try std.testing.expectEqual(.last_program_only, report.transfers_scope);
+    try std.testing.expectEqual(@as(?u64, 2), report.transfers.?.device_copy_calls);
+    try std.testing.expectEqual(@as(?u64, 80), report.transfers.?.device_copy_bytes);
 }

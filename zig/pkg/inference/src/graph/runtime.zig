@@ -424,12 +424,12 @@ pub const Runtime = struct {
         defer if (auditing) transfer_audit.end();
         try self.executeImplInto(allocator, graph, options, operation_scope.token(), output);
         errdefer output.deinit(self);
-        audit.recordStats(&output.stats);
         operation_scope.finish() catch |err| {
             operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             return err;
         };
         if (profile_owned) try options.region_execution_profile.?.finishSubmission();
+        if (auditing) audit.recordStats(&output.stats);
         return;
     }
 
