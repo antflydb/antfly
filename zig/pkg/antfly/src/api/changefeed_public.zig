@@ -805,15 +805,31 @@ pub fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Sourc
         const state = parsed.value;
         if (routes.validateInstalledRoutes(state)) |_| return else |_| {}
         const mutation = candidate: {
+            var split_finalizing = false;
             for (state.roots) |root| {
                 const physical = root.physical orelse continue;
                 if (root.split_handoff != null) continue;
                 const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
                 for (snapshot.split_transitions) |split| {
-                    if (split.phase != .finalized or split.source_group_id != physical.group_id or split.table_contract.table_id != table_id) continue;
+                    if (split.source_group_id != physical.group_id or split.table_contract.table_id != table_id) continue;
                     _ = routes.findPhysical(table_id, split.destination_group_id, split.destination_group_id) catch continue;
+                    if (split.phase == .cutover_pending or split.phase == .finalizing) {
+                        split_finalizing = true;
+                        continue;
+                    }
+                    if (split.phase != .finalized) continue;
                     break :candidate try source.prepareSplitHandoff(a, routes, root, split, request);
                 }
+            }
+            if (split_finalizing) return error.TopologyChanged;
+            // Routing and diagnostic snapshots are acquired independently.
+            // An observed route missing from the older view cannot disprove
+            // the existence of its finalized split record.
+            for (routes.roots) |route| {
+                for (snapshot.ranges) |range| {
+                    if (range.table_id == route.fence.table_id and range.group_id == route.fence.route.group_id and range.range_id == route.physical_range_id)
+                        break;
+                } else return error.TopologyChanged;
             }
             return error.ChangefeedResynchronizationRequired;
         };

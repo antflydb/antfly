@@ -861,6 +861,9 @@ pub const CatalogRetainedStream = struct {
             // publisher independently rechecks the slot and can still admit
             // new work within its retained-history and spool budgets.
             self.reclaimHistory(cleanup_registry) catch |err| {
+                // A moving route vector must be qualified before preparing a
+                // new spool against it. Already published spools still drain.
+                if (err == error.TopologyChanged) return;
                 if (!publicationRetryable(err)) return err;
             };
             const cleanup = @import("../metadata/pg_spool_cleanup.zig").cleanup(host.service, cleanup_registry, allocator, host.id, .{}, self.context) catch |err| {
