@@ -894,7 +894,7 @@ pub fn driveRoot(client: *MetadataClient, policy: anytype, a: A, state: control.
         try enrollment.drive(client, policy, policy.source.controls, a, state.id, namespace, request);
     if (progress and pending.stage == .dispatching and result.status == .unproven)
         result = try enrollment.resumeProgress(client, policy, policy.source.controls, a, state.id, namespace, pending.sequence, request);
-    if ((command == .capture_bootstrap or progress) and (result.status == .accepted or result.status == .superseded))
+    if ((command == .enroll or command == .capture_bootstrap or progress) and (result.status == .accepted or result.status == .superseded))
         result = try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request);
     switch (result.status) {
         .settled => {

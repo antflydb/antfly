@@ -1547,11 +1547,17 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         "stream_checkpoint did not persist across restart\n"
         f"before={stream_checkpoint_before_restart!r} after={matching_after_restart!r}"
     )
-    status_after_restart = _metadata_status(stateful_api)
-    assert (
-        status_after_restart.get("projected_replication_source_statuses_streaming", 0)
-        >= 1
+
+    def projected_streaming_after_restart() -> dict[str, Any] | None:
+        status = _metadata_status(stateful_api)
+        if status.get("projected_replication_source_statuses_streaming", 0) >= 1:
+            return status
+        return None
+
+    status_after_restart = wait_until(
+        projected_streaming_after_restart, timeout_s=30.0, interval_s=0.25
     )
+    assert status_after_restart, _metadata_replication_status_records(stateful_api)
     assert (
         status_after_restart.get(
             "projected_replication_source_statuses_exact_cutover", 0

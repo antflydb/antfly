@@ -1364,7 +1364,12 @@ pub const CatalogSlotEnrollment = struct {
                         const table = for (tables) |selected| {
                             if (selected.table_id == route.fence.table_id) break selected;
                         } else return error.ChangefeedResynchronizationRequired;
-                        try roots.enrollRoot(&client, &policy, work, state, route, table.policy_revision, maintenance);
+                        roots.enrollRoot(&client, &policy, work, state, route, table.policy_revision, maintenance) catch |err| {
+                            if (err != error.MetadataMutationOutcomeUnknown) return err;
+                            // The next iteration reloads the durable intent and
+                            // reconciles an accepted grant before advancing.
+                            try request.io.sleep(.fromMilliseconds(25), .awake);
+                        };
                         break;
                     } else {
                         const cut = if (state.roots.len == 1) singleRootCut(state, root, authority) else roots.qualifyEnrollmentCut(work, source, &policy, &captured, state, maintenance) catch |err| switch (err) {
