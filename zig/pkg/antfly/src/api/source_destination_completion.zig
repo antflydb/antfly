@@ -67,7 +67,16 @@ pub fn recover(
     const record = current.artifact_control.?.current orelse return;
 
     if (current.pending) |pending| {
-        if (record.phase == .garbage) return;
+        if (record.phase == .garbage) {
+            const retained = record.recovery orelse return error.SourceOutcomeUnresolved;
+            if (!std.meta.eql(record.reservation, pending.identity(binding)) or
+                !std.meta.eql(retained.digest, pending.plan_digest) or !std.mem.eql(u8, retained.bytes, pending.delivery_manifest))
+                return error.SourceTransactionIdentityConflict;
+            var parsed = try @import("source_destination_plan.zig").parse(a, retained.bytes, retained.digest);
+            defer parsed.deinit();
+            const fence = try retainedRoute(admission.coordinator.recovery, a, parsed.value, context);
+            return reclaim(svc, a, current, catalog_digest, try parsed.value.transfer(fence, admission.artifacts), context);
+        }
         var grant = try @import("source_destination_admission.zig").Grant.init(a, binding, pending, record);
         defer grant.deinit();
         const manifest = grant.manifest.value;
@@ -113,10 +122,14 @@ pub fn recover(
         } }, context);
     }
     if (record.phase == .garbage) {
-        const transfer = try manifest.transfer(fence, admission.artifacts);
-        const proof = (try transfer.reclaim(a, record, context)) orelse return;
-        try mutate(svc, a, binding, catalog_digest, current, .{ .reclaim_artifact = .{ .reservation_digest = record.reservation, .proof = proof } }, context);
+        try reclaim(svc, a, current, catalog_digest, try manifest.transfer(fence, admission.artifacts), context);
     }
+}
+
+fn reclaim(svc: anytype, a: std.mem.Allocator, state: source.State, catalog_digest: source.Digest, transfer: @import("source_plan_delivery.zig").Transfer, context: Context) !void {
+    const record = state.artifact_control.?.current.?;
+    const proof = (try transfer.reclaim(a, record, context)) orelse return;
+    try mutate(svc, a, state.scope.?, catalog_digest, state, .{ .reclaim_artifact = .{ .reservation_digest = record.reservation, .proof = proof } }, context);
 }
 
 fn retainedRoute(recovery_worker: recovery.Recovery, a: std.mem.Allocator, manifest: @import("source_destination_plan.zig").Manifest, context: Context) !metadata.CatalogRouteFence {
