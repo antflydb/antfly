@@ -20678,12 +20678,19 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     // The same complete event ABI drives preflight and actual arena lookup.
     const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
     const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), storage.bytes)) orelse return null;
-    defer arena.noteUse(&self.ctx);
+    const capture = arena.graph == null and !arena.disabled;
+    const capture_scope = if (capture) blk: {
+        const scope = try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
+        // Prove the lexical source bank is disjoint before any queued copies.
+        try SourceLinearTemporary.validateArenaCapture(self, &scope);
+        break :blk scope;
+    } else null;
     const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
     var published_directly = false;
     const input_bank = try audioBufferView(arena.buffers[0], 0, storage.scratch_offset);
+    defer arena.noteUse(&self.ctx);
     for (inputs, spans) |ct, span| {
         const destination = try audioBufferView(input_bank, span.offset, span.bytes);
         try copyFromDeviceTracked(self, destination, tensorFromCt(ct).buffer, span.bytes);
@@ -20719,11 +20726,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             stable[count] = borrowed;
             count += 1;
         }
-        const capture = arena.graph == null and !arena.disabled;
-        var scope = try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
-        // The stable input copies are queued before recording. No command in
-        // this scope needs the disjoint, lexically owned source bank.
-        if (capture) try SourceLinearTemporary.validateArenaCapture(self, &scope);
+        var scope = capture_scope orelse try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
         if (!capture and output.bytes == output_bytes) {
             try scope.bindPublishedOutput(tensorFromCt(out).buffer.ptr, output_bytes);
             published_directly = true;
