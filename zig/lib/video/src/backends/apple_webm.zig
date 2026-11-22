@@ -258,8 +258,8 @@ pub fn planReplay(reader: *const media.webm.Reader, indexed: pictures.Index, sel
     if (indexed.pictures.len == 0) return error.EmptyVideo;
     var first = selected[0];
     var last = first;
-    for (selected, 0..) |id, slot| {
-        if (id >= indexed.pictures.len or std.mem.indexOfScalar(usize, selected[0..slot], id) != null) return error.InvalidPacketIndex;
+    for (selected) |id| {
+        if (id >= indexed.pictures.len) return error.InvalidPacketIndex;
         first = @min(first, id);
         last = @max(last, id);
     }
@@ -294,6 +294,11 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     if (indexed.reader != reader or indexed.operating_point != 0) return error.InvalidVideoIndex;
     const config = if (continuation) |owner| try owner.validateIndex(reader, indexed) else try validate(reader, indexed);
     const cursor = if (continuation) |owner| if (owner.native != null) owner.next_packet else null else null;
+    // Actual submissions use unique outputs; metadata planning may include
+    // repeated presentation slots that reuse the same decoded surface.
+    for (selected, 0..) |id, slot| {
+        if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) return error.InvalidPacketIndex;
+    }
     const plan = try planReplay(reader, indexed, selected, options, cursor);
     const retained_owner = if (plan.preserve) null else continuation;
     const restart = plan.restart;

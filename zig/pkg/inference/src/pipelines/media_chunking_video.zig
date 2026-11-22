@@ -253,22 +253,43 @@ pub const Owner = struct {
         const stop = self.timeline.last;
         return std.math.cast(i64, @divFloor((stop - self.origin) * std.time.ns_per_s + self.reader.track.timescale - 1, self.reader.track.timescale)) orelse error.TimestampOverflow;
     }
+    pub const Selection = struct {
+        logical: [32]usize = undefined,
+        packets: [32]usize = undefined,
+        len: usize = 0,
+    };
+
+    pub fn select(self: *Owner, policy: video.sampling.TimestampPolicy) !Selection {
+        const ids = try self.timeline.select(self.allocator, self.reader.track.timescale, policy, self.reader.input.control, true);
+        defer self.allocator.free(ids);
+        var selection = Selection{ .len = ids.len };
+        @memcpy(selection.logical[0..ids.len], ids);
+        for (ids, selection.packets[0..ids.len]) |id, *packet| {
+            packet.* = if (self.logical) |index| index.pictures[id].first_packet else id;
+        }
+        return selection;
+    }
+
     pub fn prepare(self: *Owner, policy: video.sampling.TimestampPolicy) !Window {
+        const selection = try self.select(policy);
+        return (try self.prepareSelected(policy, &selection, true)).?;
+    }
+
+    // A page boundary checks the same dependency and coded-byte limits
+    // without constructing or binding a decoder window.
+    pub fn prepareSelected(self: *Owner, policy: video.sampling.TimestampPolicy, selection: *const Selection, materialize: bool) !?Window {
         const a = self.allocator;
-        const selected = try self.timeline.select(a, self.reader.track.timescale, policy, self.reader.input.control, true);
-        defer a.free(selected);
-        var selected_packets: [32]usize = undefined;
-        const packets = selected_packets[0..selected.len];
+        const selected = selection.logical[0..selection.len];
+        const packets = selection.packets[0..selection.len];
         var storage: [32]video.decode_plan.Run = undefined;
         var count: usize = 0;
-        for (selected, packets) |id, *packet| {
-            packet.* = if (self.logical) |index| index.pictures[id].first_packet else id;
+        for (packets) |packet| {
             if (self.reader.track.codec == .avc) continue;
             const start = if (self.reader.track.codec == .hevc)
-                try video.hevc_restart.startFor(self.reader.packets, self.hevc_predecessors, packet.*)
+                try video.hevc_restart.startFor(self.reader.packets, self.hevc_predecessors, packet)
             else
-                packet.*;
-            storage[count] = .{ .first = start, .last = packet.* };
+                packet;
+            storage[count] = .{ .first = start, .last = packet };
             count += 1;
         }
         if (self.reader.track.codec == .avc) {
@@ -281,7 +302,7 @@ pub const Owner = struct {
                 unique[n] = packet;
                 n += 1;
             }
-            var plan = try video.decode_plan.create(a, self.reader, unique[0..n], .{ .seek_cache = if (self.seek_cache) |*cache| cache else null, .portable_config = true, .headers_only = true, .max_decode_packets = self.limits.max_dependency_packets, .max_run_packets = self.limits.max_dependency_packets });
+            var plan = try video.decode_plan.create(a, self.reader, unique[0..n], .{ .seek_cache = if (self.seek_cache) |*cache| cache else null, .portable_config = true, .headers_only = true, .packet_budget_error = error.ChunkDependencyBudgetExceeded, .max_decode_packets = self.limits.max_dependency_packets, .max_run_packets = self.limits.max_dependency_packets });
             defer plan.deinit();
             count = 0;
             for (plan.runs) |run| {
@@ -336,14 +357,19 @@ pub const Owner = struct {
             total_packets += run.last - run.first + 1;
             if (total_packets > self.limits.max_dependency_packets) return error.ChunkDependencyBudgetExceeded;
             for (self.reader.packets[run.first .. run.last + 1]) |packet| coded_bytes += packet.size;
-            if (self.registry) |registry| {
-                const prefix = registry.bootstrap(staging, run.first, i != 0 and self.reader.track.inband_parameter_sets) catch |err| return if (err == error.OutOfMemory) scratch.denied orelse err else err;
-                prefix_storage[prefix_count] = .{ .index = local, .bytes = prefix };
-                prefix_count += 1;
-                coded_bytes = try std.math.add(u64, coded_bytes, prefix.len);
-            }
             if (coded_bytes > self.limits.max_coded_window_bytes) return error.ChunkCodedWindowBudgetExceeded;
+            if (self.registry) |registry| {
+                const bootstrap = try registry.planBootstrap(run.first, i != 0 and self.reader.track.inband_parameter_sets);
+                coded_bytes = try std.math.add(u64, coded_bytes, bootstrap.size);
+                if (coded_bytes > self.limits.max_coded_window_bytes) return error.ChunkCodedWindowBudgetExceeded;
+                if (materialize) {
+                    const prefix = bootstrap.materialize(staging) catch |err| return if (err == error.OutOfMemory) scratch.denied orelse err else err;
+                    prefix_storage[prefix_count] = .{ .index = local, .bytes = prefix };
+                    prefix_count += 1;
+                }
+            }
         }
+        if (!materialize) return null;
         const options = video.live_windows.Options{ .max_packets = self.limits.max_dependency_packets, .stream = .{ .max_bytes = self.limits.max_coded_window_bytes, .admission_pool = self.pool, .control = self.reader.input.control } };
         var window = try video.live_windows.borrowRuns(a, self.reader, runs, options);
         errdefer window.deinit();

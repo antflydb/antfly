@@ -57,6 +57,47 @@ pub const Target = struct {
     pub fn receiptRecipeIdentity(self: Target, a: std.mem.Allocator, receipt: Result) ![64]u8 {
         return if (self.hasDiarization()) self.speakerRecipeIdentity(a, receipt.model_identity, receipt.model_revision, receipt.speaker_model_revision orelse "") else self.recipeIdentity(a, receipt.model_identity, receipt.model_revision);
     }
+    /// Sorted repair windows, owned by the request arena and shared by
+    /// planning, frame preparation, and final output execution.
+    pub const Mask = struct {
+        windows: []const Window,
+
+        pub fn compile(a: std.mem.Allocator, target: Target) !Mask {
+            if (!target.execute or target.skip_windows.len == 0) return .{ .windows = &.{} };
+            const windows = try a.dupe(Window, target.skip_windows);
+            std.mem.sort(Window, windows, {}, struct {
+                fn less(_: void, left: Window, right: Window) bool {
+                    return order(left, right) == .lt;
+                }
+            }.less);
+            return .{ .windows = windows };
+        }
+
+        fn order(left: Window, right: Window) std.math.Order {
+            const ordinal = std.math.order(left.ordinal, right.ordinal);
+            return if (ordinal == .eq) std.math.order(left.sub_index, right.sub_index) else ordinal;
+        }
+
+        fn contains(self: Mask, match: Window) bool {
+            var lo: usize = 0;
+            var hi = self.windows.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                switch (order(self.windows[mid], match)) {
+                    .lt => lo = mid + 1,
+                    .gt => hi = mid,
+                    .eq => return true,
+                }
+            }
+            return false;
+        }
+    };
+
+    pub fn wantsWithMask(self: Target, mask: ?Mask, ordinal: u64, sub_index: u32) bool {
+        if (mask) |compiled| return self.execute and !compiled.contains(.{ .ordinal = ordinal, .sub_index = sub_index });
+        return self.wants(ordinal, sub_index);
+    }
+
     pub fn wants(self: Target, ordinal: u64, sub_index: u32) bool {
         if (!self.execute) return false;
         for (self.skip_windows) |window| if (window.ordinal == ordinal and window.sub_index == sub_index) return false;
@@ -548,4 +589,22 @@ test "model aware media diarization recipes bind speaker bytes and clustering wi
     try std.testing.expectError(error.InvalidChunkOutput, missing.validate(voices));
     const projection = try project(arena.allocator(), &.{.{ .chunk_id = 0, .outputs = &.{receipt} }});
     try std.testing.expectEqualStrings("", projection.text);
+}
+
+test "model aware media compiled masks preserve unsorted and duplicate receipt coordinates" {
+    const a = std.testing.allocator;
+    const windows = [_]Target.Window{
+        .{ .ordinal = 7, .sub_index = 2 },
+        .{ .ordinal = 1, .sub_index = 3 },
+        .{ .ordinal = 7, .sub_index = 0 },
+        .{ .ordinal = 7, .sub_index = 2 },
+    };
+    var target = Target{ .name = "labels", .model = "fixture", .kind = .classify, .skip_windows = &windows };
+    const compiled = try Target.Mask.compile(a, target);
+    defer a.free(compiled.windows);
+    for (0..10) |ordinal| for (0..5) |slot| {
+        try std.testing.expectEqual(target.wants(ordinal, @intCast(slot)), target.wantsWithMask(compiled, ordinal, @intCast(slot)));
+    };
+    target.execute = false;
+    try std.testing.expect(!target.wantsWithMask(compiled, 0, 0));
 }

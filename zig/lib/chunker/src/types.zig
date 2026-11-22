@@ -256,6 +256,7 @@ pub const ChunkPage = struct {
     pub const Terminal = enum {
         coded_window_budget_exceeded,
         empty_video_window,
+        dependency_window_budget_exceeded,
 
         pub fn fromCode(code: []const u8) ?Terminal {
             inline for (std.meta.tags(Terminal)) |reason| {
@@ -264,10 +265,20 @@ pub const ChunkPage = struct {
             return null;
         }
 
+        pub fn fromError(err: anyerror) ?Terminal {
+            return switch (err) {
+                error.ChunkCodedWindowBudgetExceeded => .coded_window_budget_exceeded,
+                error.ChunkDependencyBudgetExceeded => .dependency_window_budget_exceeded,
+                error.EmptyVideoWindow => .empty_video_window,
+                else => null,
+            };
+        }
+
         pub fn failure(self: Terminal) anyerror {
             return switch (self) {
                 .coded_window_budget_exceeded => error.ChunkCodedWindowBudgetExceeded,
                 .empty_video_window => error.EmptyVideoWindow,
+                .dependency_window_budget_exceeded => error.ChunkDependencyBudgetExceeded,
             };
         }
     };

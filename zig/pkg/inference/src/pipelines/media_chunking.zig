@@ -38,7 +38,7 @@ pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { ordinal: ?u64 = null, replay_required: bool = true, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { ordinal: ?u64 = null, replay_required: bool = true, metadata_pictures: []const usize = &.{}, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
 };
 pub const Preflight = struct { video_plan: ?@import("embedding_gemma2_video.zig").Plan = null, input_tokens: usize, picture_count: ?u32 = null, selected_pictures: ?[]const u64 = null, picture_basis: ?planning.PictureBasis = null };
 pub const Output = struct { vector: []f32, input_tokens: usize };
@@ -76,6 +76,9 @@ pub const Request = struct {
     index_cache: ?*@import("media_index_cache.zig").Cache = null,
     index_cache_admission: ?@import("media_index_cache.zig").Cache.Admission = null,
     outputs: ?output_types.Config = null,
+    output_masks: ?[]const output_types.Target.Mask = null,
+    /// Resolved audio consumers work from the audio plane even in video windows.
+    audio_output_targets: u16 = 0,
     output_executor: ?OutputExecutor = null,
     transcribe_boundary: bool = false,
     audio_boundary: bool = false,
@@ -142,6 +145,8 @@ pub const Runner = struct {
     pool: media.admission.Pool,
     ordinal: u64 = 0,
     stopped: bool = false,
+    boundary_target_index: usize = 0,
+    selective_video: bool = false,
     page_box: ?[4]f64 = null,
     page_rotation: ?i32 = null,
     audio_provider: ?@import("media_chunking_audio.zig").Provider = null,
@@ -150,6 +155,7 @@ pub const Runner = struct {
         try control.check();
         if (request.outputs) |config| {
             try config.validate();
+            if (request.output_masks) |masks| if (masks.len != config.targets.len) return error.InvalidChunkOutputs;
             if (request.output_executor == null) return error.InvalidChunkOutputs;
         }
         if (request.observe_only) {
@@ -180,7 +186,11 @@ pub const Runner = struct {
         var self = Runner{ .allocator = a, .executor = executor, .request = request, .control = control, .sink = sink, .summary = .{ .identity = identity, .start_ordinal = start, .next_ordinal = start }, .pool = .{ .limits = .{ .host_bytes = request.max_working_bytes } } };
         if (request.outputs) |config| {
             self.summary.output_count = config.targets.len;
-            for (config.targets, 0..) |target, i| self.summary.output_counts[i] = .{ .name = target.name, .required = target.required };
+            for (config.targets, 0..) |target, i| {
+                self.summary.output_counts[i] = .{ .name = target.name, .required = target.required };
+                if (std.mem.eql(u8, target.name, config.boundary_model)) self.boundary_target_index = i;
+                self.selective_video = self.selective_video or !target.execute or target.skip_windows.len != 0;
+            }
         }
         return self;
     }
@@ -237,7 +247,7 @@ pub const Runner = struct {
         try descriptor.coordinates.validate();
         var id: [85]u8 = undefined;
         var item = Item{ .identity = self.summary.identity, .context = if (self.executor.describe) |describe| describe(self.executor.context) else null, .descriptor = descriptor, .id = self.summary.identity.cursor(ordinal, &id), .mime_type = mime };
-        const execute_boundary = self.request.execute and if (self.request.outputs) |config| (try config.boundary()).wants(ordinal, 0) else true;
+        const execute_boundary = self.request.execute and self.boundaryWants(ordinal);
         if (execute_boundary) {
             if (ready == null) result = self.executor.embed(self.executor.context, self.allocator, payload) catch |err| blk: {
                 // A busy provider is admission pressure, including after an
@@ -297,7 +307,7 @@ pub const Runner = struct {
                 for (item.outputs) |value| {
                     if (!std.mem.eql(u8, value.name, target.name)) continue;
                     try value.validate(target);
-                    if (value.status == .skipped and target.wants(ordinal, value.sub_index)) return error.InvalidChunkOutput;
+                    if (value.status == .skipped and self.outputWants(target, index, ordinal, value.sub_index)) return error.InvalidChunkOutput;
                     if (value.kind != target.kind or value.required != target.required or !std.mem.eql(u8, value.model, target.model) or value.sub_index != seen) return error.InvalidChunkOutput;
                     seen += 1;
                     if (value.status == .failed) {
@@ -992,30 +1002,7 @@ pub const Runner = struct {
         defer apple_continuation.deinit();
         var binding = @import("embedding_gemma2_video.zig").WebmProjectionBinding{ .reader = reader };
         const webm = @import("embedding_gemma2_video.zig").WebmInput{ .reader = reader, .index = &indexed, .timeline = .{ .index = &indexed, .value = timeline }, .projection_binding = &binding, .continuation = &continuation, .apple_continuation = &apple_continuation };
-        const base = self.ordinal;
-        self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, webm) catch |err| {
-            self.summary.page_terminal = switch (err) {
-                error.ChunkReplayUnavailable => .coded_window_budget_exceeded,
-                error.EmptyVideoWindow => .empty_video_window,
-                else => return err,
-            };
-            return self.summary.page_terminal.?.failure();
-        };
-        if (self.request.validate_next_video_page and self.stopped and self.request.max_chunks != 0 and self.summary.emitted >= self.request.max_chunks) {
-            var next = try self.videoCursor(snapshot.duration);
-            try next.seekVideo(self.summary.next_ordinal - base);
-            if (try next.next()) |shape| {
-                _ = self.planDurableWebmWindow(webm, self.videoTimestampPolicy(shape), try std.math.add(u64, base, shape.ordinal)) catch |err| {
-                    // Keep the acknowledged prefix independent of the
-                    // replayability of the following ordinal.
-                    self.summary.page_terminal = switch (err) {
-                        error.ChunkReplayUnavailable => .coded_window_budget_exceeded,
-                        error.EmptyVideoWindow => .empty_video_window,
-                        else => return err,
-                    };
-                };
-            }
-        }
+        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, webm);
     }
 
     const VideoSource = struct { bytes: []const u8, reader: ?*const media.mp4.Reader, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput };
@@ -1028,6 +1015,7 @@ pub const Runner = struct {
         failure: ?anyerror = null,
         measured: ?Preflight = null,
         measured_allocator: ?std.mem.Allocator = null,
+        metadata_pictures: [32]usize = undefined,
         fn deinit(self: *@This()) void {
             if (self.ahead) |ahead| ahead.deinit();
             if (self.initialized) if (self.payload.video.prepared_outputs) |prepared| prepared.deinit(prepared.context);
@@ -1041,13 +1029,11 @@ pub const Runner = struct {
     }
     fn planDurableWebmWindow(self: *const Runner, input: @import("embedding_gemma2_video.zig").WebmInput, policy: video.sampling.TimestampPolicy, ordinal: u64) !struct { input: ?@import("embedding_gemma2_video.zig").WebmInput, replay_required: bool } {
         const limit = self.request.limits.max_coded_window_bytes;
-        const selective = if (self.request.outputs) |config| for (config.targets) |target| {
-            if (!target.execute or target.skip_windows.len != 0) break true;
-        } else false else false;
+        const selective = self.selective_video;
         var planned = @import("embedding_gemma2_video.zig").planWebmWindow(input, policy, if (selective) std.math.maxInt(usize) else limit, self.control) catch |err| switch (err) {
             error.ResourceLimitExceeded => return error.ChunkReplayUnavailable,
             error.EmptyVideoWindow => {
-                if (!selective or try self.videoReplayNeeded(ordinal, 1)) return err;
+                if (!selective or self.videoReplayNeeded(ordinal, 1)) return err;
                 return .{ .input = null, .replay_required = false };
             },
             else => return err,
@@ -1055,56 +1041,88 @@ pub const Runner = struct {
         // Published ordinals can be replayed by a fresh process. Warm
         // execution is an optimization for these cold-replayable windows.
         const window = &planned.window.?;
-        const replay_required = !selective or try self.videoReplayNeeded(ordinal, window.count);
+        const replay_required = !selective or self.videoReplayNeeded(ordinal, window.count);
         if (replay_required and window.cold_bytes > limit) return error.ChunkReplayUnavailable;
         window.replay.coded_bytes = limit;
         return .{ .input = planned, .replay_required = replay_required };
     }
-    fn videoReplayNeeded(self: *const Runner, ordinal: u64, pictures: usize) !bool {
+    fn outputWants(self: *const Runner, target: output_types.Target, index: usize, ordinal: u64, sub_index: u32) bool {
+        return target.wantsWithMask(if (self.request.output_masks) |masks| masks[index] else null, ordinal, sub_index);
+    }
+
+    fn boundaryWants(self: *const Runner, ordinal: u64) bool {
         const config = self.request.outputs orelse return true;
-        if (self.request.execute and (try config.boundary()).wants(ordinal, 0)) return true;
+        const index = self.boundary_target_index;
+        return self.outputWants(config.targets[index], index, ordinal, 0);
+    }
+
+    fn videoReplayNeeded(self: *const Runner, ordinal: u64, pictures: usize) bool {
+        const config = self.request.outputs orelse return true;
+        if (self.request.execute and self.boundaryWants(ordinal)) return true;
         if (!self.request.execute_outputs) return false;
-        for (config.targets) |target| switch (target.kind) {
-            .embedding => if (target.wants(ordinal, 0)) return true,
-            .classify => for (0..pictures) |slot| {
-                if (target.wants(ordinal, @intCast(slot))) return true;
-            },
-            .transcribe, .diarize => {},
-        };
+        for (config.targets, 0..) |target, index| {
+            if (self.request.audio_output_targets & (@as(u16, 1) << @as(u4, @intCast(index))) != 0) continue;
+            switch (target.kind) {
+                .embedding => if (self.outputWants(target, index, ordinal, 0)) return true,
+                .classify => for (0..pictures) |slot| {
+                    if (self.outputWants(target, index, ordinal, @intCast(slot))) return true;
+                },
+                .transcribe, .diarize => {},
+            }
+        }
         return false;
     }
     fn videoCursor(self: *const Runner, duration: i128) !planning.Temporal {
         const end = std.math.cast(i64, duration) orelse return error.TimestampOverflow;
         return .{ .kind = .video, .end_ns = end, .policy = self.request.policy, .model = self.executor.model, .picture_tokens = 142 };
     }
-    fn prepareVideoSlot(self: *Runner, source: VideoSource, slot: *VideoSlot) !void {
+    fn prepareVideoSlot(self: *Runner, source: VideoSource, slot: *VideoSlot, materialize: bool) !void {
         var shape = &slot.shape;
         shape.coordinates.start_tick = std.math.cast(i64, @as(i128, source.origin) + @divFloor(@as(i128, shape.coordinates.start_ns.?) * source.timescale, std.time.ns_per_s)) orelse return error.TimestampOverflow;
         shape.coordinates.end_tick = std.math.cast(i64, @as(i128, source.origin) + @divFloor(@as(i128, shape.coordinates.end_ns.?) * source.timescale + std.time.ns_per_s - 1, std.time.ns_per_s)) orelse return error.TimestampOverflow;
         shape.coordinates.timescale = source.timescale;
         const policy = self.videoTimestampPolicy(shape.*);
         if (source.owner) |owner| {
-            slot.window = try owner.prepare(policy);
+            const selective = self.selective_video;
+            const selection = owner.select(policy) catch |err| empty: {
+                if (err != error.EmptyVideoWindow or !selective or self.videoReplayNeeded(shape.ordinal, 1)) return err;
+                break :empty @TypeOf(owner.*).Selection{};
+            };
+            if (selective and !self.videoReplayNeeded(shape.ordinal, @max(1, selection.len))) {
+                if (materialize) {
+                    @memcpy(slot.metadata_pictures[0..selection.len], selection.packets[0..selection.len]);
+                    slot.payload = .{ .video = .{ .ordinal = shape.ordinal, .bytes = &.{}, .policy = policy, .replay_required = false, .metadata_pictures = slot.metadata_pictures[0..selection.len] } };
+                    slot.initialized = true;
+                }
+                return;
+            }
+            slot.window = (try owner.prepareSelected(policy, &selection, materialize)) orelse return;
             errdefer {
                 slot.window.?.deinit();
                 slot.window = null;
             }
             const window = &slot.window.?;
             try window.bind(policy, &self.pool);
-            if (window.selection) |*selection| {
-                selection.continuation = &owner.continuation;
-                selection.packet_base = window.packet_base;
+            if (window.selection) |*bound| {
+                bound.continuation = &owner.continuation;
+                bound.packet_base = window.packet_base;
             }
-            slot.payload = .{ .video = .{ .ordinal = shape.ordinal, .bytes = &.{}, .reader = &window.coded.reader, .policy = policy, .source_timestamps = true, .selection = if (window.selection) |*selection| selection else null, .packet_base = window.packet_base } };
+            slot.payload = .{ .video = .{ .ordinal = shape.ordinal, .bytes = &.{}, .reader = &window.coded.reader, .policy = policy, .source_timestamps = true, .selection = if (window.selection) |*bound| bound else null, .packet_base = window.packet_base } };
         } else {
             const webm = if (source.webm) |input| try self.planDurableWebmWindow(input, policy, shape.ordinal) else null;
+            if (!materialize) return;
             slot.payload = .{ .video = .{ .ordinal = shape.ordinal, .bytes = source.bytes, .reader = source.reader, .webm = if (webm) |planned| planned.input else null, .replay_required = if (webm) |planned| planned.replay_required else true, .policy = policy } };
         }
         slot.initialized = true;
     }
     fn measurePayload(self: *const Runner, payload: Payload) !?Preflight {
-        if (payload == .video and !payload.video.replay_required and payload.video.webm == null) {
-            return .{ .input_tokens = 0, .picture_count = 0 };
+        if (payload == .video and !payload.video.replay_required) {
+            const input_video = payload.video;
+            const ids = if (input_video.webm) |*input| input.window.?.ids[0..input.window.?.count] else input_video.metadata_pictures;
+            if (ids.len == 0) return .{ .input_tokens = 0, .picture_count = 0 };
+            const pictures = try self.allocator.alloc(u64, ids.len);
+            for (pictures, ids) |*out, id| out.* = id;
+            return .{ .input_tokens = 0, .picture_count = @intCast(ids.len), .selected_pictures = pictures, .picture_basis = if (input_video.webm != null) .logical else .packet_assembly };
         }
         if (self.executor.preflight) |measure| return try measure(self.executor.context, payload);
         return null;
@@ -1152,7 +1170,8 @@ pub const Runner = struct {
         }
         fn perform(self: *@This()) void {
             const next = self.work orelse return;
-            if (!next.initialized) self.runner.prepareVideoSlot(self.source, next) catch |err| {
+            if (next.failure != null) return;
+            if (!next.initialized) self.runner.prepareVideoSlot(self.source, next, true) catch |err| {
                 if (@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return;
                 next.failure = err;
                 return;
@@ -1163,7 +1182,8 @@ pub const Runner = struct {
                     return;
                 };
                 if (self.second) |second| {
-                    if (!second.initialized) self.runner.prepareVideoSlot(self.source, second) catch |err| {
+                    if (second.failure != null) return;
+                    if (!second.initialized) self.runner.prepareVideoSlot(self.source, second, true) catch |err| {
                         if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) second.failure = err;
                         return;
                     };
@@ -1204,10 +1224,13 @@ pub const Runner = struct {
                     slot.shape = (try cursor.next()) orelse break;
                     known[index] = true;
                 }
-                if (slot.failure) |err| return err;
-                if (!slot.initialized) self.prepareVideoSlot(source, slot) catch |err| {
+                if (slot.failure) |err| {
+                    if (count == 0 or videoTerminal(err) == null) return err;
+                    break;
+                }
+                if (!slot.initialized) self.prepareVideoSlot(source, slot, true) catch |err| {
                     if (count == 0) return err;
-                    if (err == error.ChunkReplayUnavailable or err == error.EmptyVideoWindow) {
+                    if (videoTerminal(err) != null) {
                         slot.failure = err;
                     } else if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return err;
                     break;
@@ -1303,6 +1326,32 @@ pub const Runner = struct {
         if (owner) |state| state.continuation.session = self.executor.video_session;
         const source = VideoSource{ .bytes = bytes, .reader = reader, .origin = origin, .timescale = timescale, .owner = owner, .webm = webm };
         var cursor = try self.videoCursor(duration);
+        const base = self.ordinal;
+        self.emitVideoWindows(source, &cursor) catch |err| {
+            const terminal = videoTerminal(err) orelse return err;
+            self.summary.page_terminal = terminal;
+            return terminal.failure();
+        };
+        if (!self.request.validate_next_video_page or !self.stopped or self.request.max_chunks == 0 or self.summary.emitted < self.request.max_chunks) return;
+
+        // The batch scheduler may already have advanced its private cursor.
+        // Seek from acknowledged coverage and validate without decoding.
+        var next = try self.videoCursor(duration);
+        try next.seekVideo(self.summary.next_ordinal - base);
+        if (try next.next()) |shape| {
+            var slot = VideoSlot{ .shape = shape };
+            self.prepareVideoSlot(source, &slot, false) catch |err| {
+                self.summary.page_terminal = videoTerminal(err) orelse return err;
+            };
+        }
+    }
+
+    fn videoTerminal(err: anyerror) ?chunker.types.ChunkPage.Terminal {
+        if (err == error.ChunkReplayUnavailable) return .coded_window_budget_exceeded;
+        return chunker.types.ChunkPage.Terminal.fromError(err);
+    }
+
+    fn emitVideoWindows(self: *Runner, source: VideoSource, cursor: *planning.Temporal) !void {
         const end = cursor.end_ns;
         try self.control.check();
         try cursor.seekVideo(self.summary.start_ordinal -| self.ordinal);
@@ -1311,7 +1360,7 @@ pub const Runner = struct {
             const boundary = try config.boundary();
             break :masked !boundary.execute or boundary.skip_windows.len != 0;
         } else false;
-        if (self.request.execute and !selective and self.executor.embed_video_batch != null) return self.videoBatches(source, &cursor);
+        if (self.request.execute and !selective and self.executor.embed_video_batch != null) return self.videoBatches(source, cursor);
         var slots = [_]VideoSlot{ .{}, .{} };
         defer for (&slots) |*slot| slot.deinit();
         var active: usize = 0;
@@ -1323,7 +1372,7 @@ pub const Runner = struct {
             }
             const current = &slots[active];
             if (current.failure) |err| return err;
-            if (!current.initialized) try self.prepareVideoSlot(source, current);
+            if (!current.initialized) try self.prepareVideoSlot(source, current, true);
             current.payload.video.ahead = current.ahead;
             if (self.executor.prepare_video_outputs != null) try self.cacheVideoPreflight(current);
             const next_shape = if (self.request.max_chunks != 0 and self.summary.emitted + 1 >= self.request.max_chunks) null else try cursor.next();
@@ -1520,6 +1569,17 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     try gap.webmWindowsSnapshot(&reader, &gap_snapshot);
     try std.testing.expectEqual(@as(usize, 3), gap_seen);
     try std.testing.expect(gap.summary.page_terminal == null);
+    const audio_targets = [_]output_types.Target{
+        masked_request.outputs.?.targets[0],
+        .{ .name = "waveform", .model = "test", .kind = .classify },
+    };
+    var audio_request = masked_request;
+    audio_request.outputs.?.targets = &audio_targets;
+    audio_request.execute_outputs = true;
+    audio_request.audio_output_targets = 1 << 1;
+    const audio_runner = try Runner.init(a, audio_request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+    try std.testing.expect(!audio_runner.videoReplayNeeded(1, 1));
+    try std.testing.expect(audio_runner.videoReplayNeeded(2, 1));
     pictures[1].pts = second;
     var token: [85]u8 = undefined;
     request.continuation = page.summary.identity.cursor(page.summary.next_ordinal, &token);
@@ -1527,6 +1587,76 @@ test "model aware media WebM page suppresses a warm-only next ordinal" {
     try std.testing.expectError(error.ChunkCodedWindowBudgetExceeded, resumed.webmWindowsSnapshot(&reader, &snapshot));
     try std.testing.expectEqual(chunker.types.ChunkPage.Terminal.coded_window_budget_exceeded, resumed.summary.page_terminal.?);
     try std.testing.expectEqual(@as(usize, 0), resumed.summary.emitted);
+}
+
+test "model aware media publishes staged windows before a speculative terminal failure" {
+    const a = std.testing.allocator;
+    const second = std.time.ns_per_s;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = "12345" }, .identity = "lookahead" };
+    var packets: [4]media.webm.Packet = undefined;
+    var pictures: [4]video.webm_pictures.Picture = undefined;
+    for (&packets, &pictures, 0..) |*packet, *picture, i| {
+        const pts: i64 = @intCast(i * second);
+        packet.* = .{ .cluster_offset = 0, .offset = i, .size = if (i == 3) 2 else 1, .pts = pts, .duration_ns = second, .sync = false, .discardable = false, .invisible = false };
+        picture.* = .{ .pts = pts, .duration = second, .packet_index = i, .width = 16, .height = 16 };
+    }
+    packets[0].sync = true;
+    var reader = media.webm.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .number = 1, .codec = .vp9, .width = 16, .height = 16 }, .packets = &packets, .cues = &.{}, .timestamp_scale_ns = 1_000_000 };
+    const index = video.webm_pictures.Index{ .allocator = a, .pictures = &pictures, .reader = &reader };
+    const replay = try video.apple_webm.planReplay(&reader, index, &.{ 0, 1, 0 }, .{}, null);
+    try std.testing.expectEqual(@as(usize, 1), replay.end);
+    var timeline = try index.presentationTimeline(a, .{});
+    defer timeline.deinit();
+    const snapshot = @import("media_index_cache.zig").Cache.WebmSnapshot{ .index = index, .timeline = timeline, .origin = 0, .duration = 4 * second };
+    var result = Qualification{};
+    var executor = result.executor();
+    const Batch = struct {
+        fn start(_: *anyopaque, _: Payload, _: *media.admission.Pool) !?*@import("embedding_gemma2.zig").VideoAhead {
+            return null;
+        }
+        fn embed(raw: *anyopaque, a_out: std.mem.Allocator, group: []const Payload) ![]Output {
+            const hook = group[group.len - 1].video.prepared.?;
+            try hook.ready(hook.context);
+            const rows = try a_out.alloc(Output, group.len);
+            errdefer a_out.free(rows);
+            var made: usize = 0;
+            errdefer for (rows[0..made]) |row| a_out.free(row.vector);
+            for (rows, group) |*row, payload| {
+                row.* = try Qualification.embed(raw, a_out, payload);
+                made += 1;
+            }
+            return rows;
+        }
+    };
+    executor.start_video = Batch.start;
+    executor.embed_video_batch = Batch.embed;
+    var request = Request{ .input = .{ .binary = .{ .mime_type = "video/webm", .data = "12345" } }, .policy = .{ .window_ns = second, .step_ns = second } };
+    request.limits.max_coded_window_bytes = 4;
+    var runner = try Runner.init(a, request, executor, .{}, .{ .context = &result, .accept = Qualification.accept });
+    try std.testing.expectError(error.ChunkCodedWindowBudgetExceeded, runner.webmWindowsSnapshot(&reader, &snapshot));
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1, 2 }, result.ordinals[0..result.seen]);
+    try std.testing.expectEqual(@as(u64, 3), runner.summary.next_ordinal);
+}
+
+test "model aware media packet windows validate the next coded budget without consuming the prefix" {
+    const a = std.testing.allocator;
+    const second = std.time.ns_per_s;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = "123" }, .identity = "packet-prefix" };
+    var packets = [_]media.mp4.Packet{
+        .{ .offset = 0, .size = 1, .dts = 0, .media_pts = 0, .pts = 0, .duration = 1, .sync = true },
+        .{ .offset = 1, .size = 2, .dts = 1, .media_pts = 1, .pts = 1, .duration = 1, .sync = true },
+    };
+    var reader = media.mp4.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .codec = .mjpeg, .id = 1, .timescale = 1, .width = 16, .height = 16, .avcc = &.{}, .nal_length_bytes = 0, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } }, .packets = &packets, .limits = .{} };
+    var result = Qualification{};
+    var request = Request{ .input = .{ .binary = .{ .mime_type = "video/quicktime", .data = "123" } }, .policy = .{ .window_ns = second, .step_ns = second }, .max_chunks = 1 };
+    request.limits.max_coded_window_bytes = 1;
+    var runner = try Runner.init(a, request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+    var owner = try @import("media_chunking_video.zig").Owner.init(a, &reader, &runner.pool, request.limits);
+    defer owner.deinit();
+    try runner.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
+    try std.testing.expectEqual(@as(u64, 1), runner.summary.next_ordinal);
+    try std.testing.expectEqual(chunker.types.ChunkPage.Terminal.coded_window_budget_exceeded, runner.summary.page_terminal.?);
+    try std.testing.expectEqual(@as(u64, 0), source.total_bytes);
 }
 
 test "model aware media inline AV1 MP4 uses the visible picture timeline and honors packet ceilings" {

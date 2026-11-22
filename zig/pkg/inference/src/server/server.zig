@@ -15757,6 +15757,15 @@ pub const Node = struct {
         if (request.outputs) |outputs_config| if (request.output_executor == null) {
             var consumers = try MediaOutputExecution.init(self, a, io, supplied, outputs_config, request.allow_partial);
             defer consumers.deinit(a);
+            var mask_arena = std.heap.ArenaAllocator.init(a);
+            defer mask_arena.deinit();
+            var masks: [16]lib_chunker.outputs.Target.Mask = undefined;
+            for (outputs_config.targets, masks[0..outputs_config.targets.len], 0..) |output, *mask, index| {
+                mask.* = try lib_chunker.outputs.Target.Mask.compile(mask_arena.allocator(), output);
+                if (consumers.resolved[index].uses_audio) request.audio_output_targets |= @as(u16, 1) << @as(u4, @intCast(index));
+            }
+            request.output_masks = masks[0..outputs_config.targets.len];
+            consumers.masks = request.output_masks;
             request.output_executor = .{ .context = &consumers, .execute = MediaOutputExecution.execute };
             const boundary = try outputs_config.boundary();
             request.transcribe_boundary = boundary.kind == .transcribe or boundary.kind == .diarize;
@@ -50634,7 +50643,7 @@ const MediaFramePreparationCache = struct {
             frame.patches = try a.dupe(f32, frame.patches);
             execution.video_frames[slot] = frame;
             for (value.pixels, 0..) |pixels, index| if (pixels) |values| {
-                if (index >= execution.initialized or !execution.needsFramePixels(execution.config.targets[index], slot)) continue;
+                if (index >= execution.initialized or !execution.needsFramePixels(index, slot)) continue;
                 execution.prepared_frames[index][slot] = try a.dupe(f32, values);
             };
             return execution.frameComplete(slot);
@@ -50775,6 +50784,7 @@ const MediaOutputExecution = struct {
     io: std.Io,
     control: InferenceExecutionControl,
     config: outputs.Config,
+    masks: ?[]const outputs.Target.Mask = null,
     resolved: [16]Resolved = undefined,
     initialized: usize = 0,
     allocator: std.mem.Allocator = undefined,
@@ -50885,22 +50895,26 @@ const MediaOutputExecution = struct {
         self.video_frames = @splat(null);
         self.video_failure = null;
     }
-    fn wantsFrame(self: *const MediaOutputExecution, target: outputs.Target, slot: usize) bool {
-        return if (self.frame_ordinal) |ordinal| target.wants(ordinal, @intCast(slot)) else target.execute;
+    fn mask(self: *const MediaOutputExecution, index: usize) ?outputs.Target.Mask {
+        return if (self.masks) |masks| masks[index] else null;
     }
-    fn needsFramePixels(self: *const MediaOutputExecution, target: outputs.Target, slot: usize) bool {
-        if (self.wantsFrame(target, slot)) return true;
+    fn wantsFrame(self: *const MediaOutputExecution, index: usize, slot: usize) bool {
+        const target = self.config.targets[index];
+        return if (self.frame_ordinal) |ordinal| target.wantsWithMask(self.mask(index), ordinal, @intCast(slot)) else target.execute;
+    }
+    fn needsFramePixels(self: *const MediaOutputExecution, index: usize, slot: usize) bool {
+        if (self.wantsFrame(index, slot)) return true;
         // Held/repeated pictures may only be observed once by the decoder.
         // Prepare a representative if any of its output slots needs pixels.
         if (slot < self.picture_ids.len) for (self.picture_ids, 0..) |picture, other| {
-            if (picture == self.picture_ids[slot] and self.wantsFrame(target, other)) return true;
+            if (picture == self.picture_ids[slot] and self.wantsFrame(index, other)) return true;
         };
         return false;
     }
     fn frameComplete(self: *const MediaOutputExecution, slot: usize) bool {
         if (self.video_frames[slot] == null and (self.capture_primary or self.hasVideoEmbeddingConsumers())) return false;
-        for (self.config.targets, self.resolved[0..self.initialized], 0..) |target, resolved, index| {
-            if (!self.needsFramePixels(target, slot) or resolved.failure != null) continue;
+        for (self.resolved[0..self.initialized], 0..) |resolved, index| {
+            if (!self.needsFramePixels(index, slot) or resolved.failure != null) continue;
             const profile = resolved.classifier_profile orelse continue;
             if (profile.input == .pixels and self.prepared_frames[index][slot] == null and self.frame_errors[index] == null) return false;
         }
@@ -50911,8 +50925,8 @@ const MediaOutputExecution = struct {
         if (slot >= 32 or self.frame_arena == null) return error.InvalidInputShape;
         const a = self.frame_arena.?.allocator();
         if (self.frameComplete(slot)) return;
-        const pixel_consumers = for (self.config.targets, self.resolved[0..self.initialized]) |target, resolved| {
-            if (self.needsFramePixels(target, slot) and resolved.failure == null) if (resolved.classifier_profile) |profile| if (profile.input == .pixels) break true;
+        const pixel_consumers = for (self.resolved[0..self.initialized], 0..) |resolved, index| {
+            if (self.needsFramePixels(index, slot) and resolved.failure == null) if (resolved.classifier_profile) |profile| if (profile.input == .pixels) break true;
         } else false;
         defer if (self.frame_cache) |cache| if (slot < self.picture_ids.len) {
             cache.insert(self, cache.allocator, slot, self.picture_ids[slot]) catch {};
@@ -50937,8 +50951,8 @@ const MediaOutputExecution = struct {
             }
         }
         const pixels = displayed orelse return;
-        for (self.config.targets, self.resolved[0..self.initialized], 0..) |target, resolved, index| {
-            if (!self.needsFramePixels(target, slot) or resolved.failure != null or self.frame_errors[index] != null or self.prepared_frames[index][slot] != null) continue;
+        for (self.resolved[0..self.initialized], 0..) |resolved, index| {
+            if (!self.needsFramePixels(index, slot) or resolved.failure != null or self.frame_errors[index] != null or self.prepared_frames[index][slot] != null) continue;
             const profile = resolved.classifier_profile orelse continue;
             if (profile.input != .pixels) continue;
             // Equal preprocessing contracts share the same arena-owned tensor,
@@ -51406,7 +51420,7 @@ const MediaOutputExecution = struct {
             if (shared_embedding) try validateMediaOutputGeneration(resolved.identity, resolved.revision, self.resolved[boundary_index].identity, self.resolved[boundary_index].revision);
             if (target.kind == .embedding and (index == boundary_index or shared_embedding)) {
                 var value = base;
-                if (!target.wants(descriptor.ordinal, 0)) {
+                if (!target.wantsWithMask(self.mask(index), descriptor.ordinal, 0)) {
                     value.status = .skipped;
                     try results.append(a, value);
                     continue;
@@ -51425,7 +51439,7 @@ const MediaOutputExecution = struct {
             }
             if (payload == .video and resolved.classifier_profile != null and resolved.classifier_profile.?.input == .pixels) {
                 const pictures = descriptor.coordinates.selected_pictures orelse {
-                    if (payload.video.replay_required or descriptor.coordinates.picture_count != 0 or target.wants(descriptor.ordinal, 0)) return error.InvalidChunkCoordinates;
+                    if (payload.video.replay_required or descriptor.coordinates.picture_count != 0 or target.wantsWithMask(self.mask(index), descriptor.ordinal, 0)) return error.InvalidChunkCoordinates;
                     var value = base;
                     value.status = .skipped;
                     try results.append(a, value);
@@ -51440,7 +51454,7 @@ const MediaOutputExecution = struct {
                 for (pictures, 0..) |picture, slot| {
                     var value = base;
                     value.sub_index = @intCast(slot);
-                    if (!target.wants(descriptor.ordinal, value.sub_index)) {
+                    if (!target.wantsWithMask(self.mask(index), descriptor.ordinal, value.sub_index)) {
                         value.status = .skipped;
                         try results.append(a, value);
                         continue;
@@ -51512,7 +51526,7 @@ const MediaOutputExecution = struct {
                     value.sub_index = window.sub_index;
                     value.start_ns = window.start_ns;
                     value.end_ns = @min(window.end_ns, descriptor.coordinates.end_ns orelse window.end_ns);
-                    if (!target.wants(descriptor.ordinal, window.sub_index)) {
+                    if (!target.wantsWithMask(self.mask(index), descriptor.ordinal, window.sub_index)) {
                         value.status = .skipped;
                         try results.append(a, value);
                         continue;
@@ -51529,7 +51543,7 @@ const MediaOutputExecution = struct {
                 }
             } else {
                 var value = base;
-                if (!target.wants(descriptor.ordinal, 0)) {
+                if (!target.wantsWithMask(self.mask(index), descriptor.ordinal, 0)) {
                     value.status = .skipped;
                     try results.append(a, value);
                     continue;
@@ -51551,7 +51565,7 @@ const MediaOutputExecution = struct {
         const classification = @import("../pipelines/media_classification.zig");
         if (self.frame_errors[index] != null or pictures.len < 2 or pictures.len > 32) return null;
         for (pictures, 0..) |_, slot| {
-            if (target.wants(ordinal, @intCast(slot))) break;
+            if (target.wantsWithMask(self.mask(index), ordinal, @intCast(slot))) break;
         } else {
             const rows = try a.alloc([]outputs.Label, pictures.len);
             @memset(rows, @constCast(&[_]outputs.Label{}));
@@ -51561,7 +51575,7 @@ const MediaOutputExecution = struct {
         // existing batch path; healthy frames never re-enter classifier work.
         var frames: [32][]const f32 = undefined;
         for (pictures, 0..) |picture, slot| {
-            if (!target.wants(ordinal, @intCast(slot))) {
+            if (!target.wantsWithMask(self.mask(index), ordinal, @intCast(slot))) {
                 frames[slot] = &.{};
                 continue;
             }
@@ -51578,7 +51592,7 @@ const MediaOutputExecution = struct {
         defer handle.release();
         const loaded = handle.get();
         try validateLoadedMediaRevision(resolved.revision, loaded.resolution_revision);
-        const rows = try classification.classifyPreparedFramesSelected(a, loaded.session, resolved.classifier_profile.?, loaded.manifest.id2label orelse return error.UnsupportedMediaClassifier, frames[0..pictures.len], target, ordinal, self.control);
+        const rows = try classification.classifyPreparedFramesSelected(a, loaded.session, resolved.classifier_profile.?, loaded.manifest.id2label orelse return error.UnsupportedMediaClassifier, frames[0..pictures.len], target, self.mask(index), ordinal, self.control);
         errdefer {
             for (rows) |row| {
                 for (row) |label| a.free(label.label);

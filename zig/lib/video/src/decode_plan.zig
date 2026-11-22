@@ -28,6 +28,7 @@ pub const Options = struct {
     /// Metadata-only consumers do not need to pin complete IDR payloads.
     headers_only: bool = false,
     /// Split adjacent IDR runs before exceeding a decoder's dependency bound.
+    packet_budget_error: anyerror = error.ResourceLimitExceeded,
     max_run_packets: usize = std.math.maxInt(usize),
     max_selections: usize = 64,
     max_decode_packets: usize = 500_000,
@@ -323,7 +324,7 @@ pub fn create(allocator: std.mem.Allocator, reader: *media.mp4.Reader, selection
     for (sorted) |index| {
         try reader.input.control.check();
         const first = try builder.start(index);
-        if (index - first + 1 > options.max_run_packets) return error.ResourceLimitExceeded;
+        if (index - first + 1 > options.max_run_packets) return options.packet_budget_error;
         if (runs.items.len != 0) {
             const last = &runs.items[runs.items.len - 1];
             if (first == last.first) {
@@ -350,7 +351,7 @@ pub fn create(allocator: std.mem.Allocator, reader: *media.mp4.Reader, selection
     runs.shrinkRetainingCapacity(kept);
     var submissions: usize = 0;
     for (runs.items) |run| submissions = std.math.add(usize, submissions, run.last - run.first + 1) catch return error.ResourceLimitExceeded;
-    if (submissions > options.max_decode_packets) return error.ResourceLimitExceeded;
+    if (submissions > options.max_decode_packets) return options.packet_budget_error;
     const owned_runs = try runs.toOwnedSlice(allocator);
     errdefer allocator.free(owned_runs);
     return .{ .allocator = allocator, .selection = copied, .runs = owned_runs, .anchors = try builder.anchors.toOwnedSlice(allocator), .stamp = Stamp.init(reader), .submitted_packets = submissions, .probe_candidates = builder.probe_candidates, .probe_bytes = builder.probe_bytes, .skipped_packets = sorted[sorted.len - 1] + 1 - submissions };

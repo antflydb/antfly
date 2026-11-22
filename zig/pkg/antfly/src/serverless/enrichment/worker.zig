@@ -2057,7 +2057,8 @@ fn buildDenseEmbeddingAlloc(
 }
 
 fn isRecoverableEnrichmentError(err: anyerror) bool {
-    return err == EnrichmentError.MissingSparseEmbeddingName or
+    return chunking.inference.ChunkPage.Terminal.fromError(err) != null or
+        err == EnrichmentError.MissingSparseEmbeddingName or
         err == EnrichmentError.MissingChunkEmbeddingName or
         err == EnrichmentError.RequiredSparseModelUnavailable or
         err == EnrichmentError.RequiredChunkEmbeddingModelUnavailable or
@@ -3647,6 +3648,13 @@ test "serverless required dense batches preserve ordering and unwind partial all
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "model aware media serverless scan classifies blocked windows as document failures" {
+    for (std.meta.tags(chunking.inference.ChunkPage.Terminal)) |terminal| {
+        try std.testing.expect(isRecoverableEnrichmentError(terminal.failure()));
+    }
+    try std.testing.expect(!isRecoverableEnrichmentError(error.ChunkRequestFailed));
 }
 
 test "model aware media serverless chunks use the shared paged provider and retain recipes" {

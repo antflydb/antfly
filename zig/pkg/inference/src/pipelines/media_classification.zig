@@ -224,7 +224,7 @@ pub fn classifyPreparedFrames(a: std.mem.Allocator, session: backends.Session, p
 
 /// Keep batching for the outstanding subset while leaving accepted frames out
 /// of tensor construction and backend inference. Empty rows are skipped slots.
-pub fn classifyPreparedFramesSelected(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, frames: []const []const f32, target: outputs.Target, ordinal: u64, control: Control) ![][]outputs.Label {
+pub fn classifyPreparedFramesSelected(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, frames: []const []const f32, target: outputs.Target, mask: ?outputs.Target.Mask, ordinal: u64, control: Control) ![][]outputs.Label {
     try control.check();
     if (frames.len == 0 or frames.len > 32) return error.InvalidInputShape;
     const rows = try a.alloc([]outputs.Label, frames.len);
@@ -233,7 +233,7 @@ pub fn classifyPreparedFramesSelected(a: std.mem.Allocator, session: backends.Se
     var selected: [32][]const f32 = undefined;
     var slots: [32]usize = undefined;
     var count: usize = 0;
-    for (frames, 0..) |frame, i| if (target.wants(ordinal, @intCast(i))) {
+    for (frames, 0..) |frame, i| if (target.wantsWithMask(mask, ordinal, @intCast(i))) {
         selected[count] = frame;
         slots[count] = i;
         count += 1;
@@ -551,7 +551,7 @@ test "model aware media frame classifiers batch compatible tensors with one mode
     var mask: [31]outputs.Target.Window = undefined;
     for (&mask, 0..) |*window, i| window.* = .{ .ordinal = 9, .sub_index = @intCast(i) };
     const target = outputs.Target{ .name = "events", .kind = .classify, .model = "model", .top_k = 1, .skip_windows = &mask };
-    const selected = try classifyPreparedFramesSelected(a, fake.session(), profile, &.{ "negative", "positive" }, &frames32, target, 9, .{});
+    const selected = try classifyPreparedFramesSelected(a, fake.session(), profile, &.{ "negative", "positive" }, &frames32, target, null, 9, .{});
     defer {
         for (selected) |row| {
             for (row) |label| a.free(label.label);

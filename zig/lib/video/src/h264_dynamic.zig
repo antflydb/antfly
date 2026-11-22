@@ -509,28 +509,44 @@ pub const Session = struct {
     pub fn bootstrapBefore(self: *Session, a: std.mem.Allocator, index: usize) ![]u8 {
         return self.bootstrap(a, index, false);
     }
-    pub fn bootstrap(self: *Session, a: std.mem.Allocator, index: usize, include_original: bool) ![]u8 {
+    pub const Bootstrap = struct {
+        sequences: [32]?Parameter = @splat(null),
+        pictures: [256]?Parameter = @splat(null),
+        length: u3,
+        include_original: bool,
+        size: usize = 0,
+
+        pub fn materialize(self: *const Bootstrap, a: std.mem.Allocator) ![]u8 {
+            const bytes = try a.alloc(u8, self.size);
+            var cursor: usize = 0;
+            for (self.sequences) |item| if (item) |parameter| if (self.include_original or !parameter.original) writeParameter(bytes, &cursor, self.length, parameter.bytes);
+            for (self.pictures) |item| if (item) |parameter| if (self.include_original or !parameter.original) writeParameter(bytes, &cursor, self.length, parameter.bytes);
+            return bytes;
+        }
+
+        fn count(self: *Bootstrap, parameters: []const ?Parameter) !void {
+            const max_size = (@as(u64, 1) << (@as(u6, self.length) * 8)) - 1;
+            for (parameters) |item| if (item) |parameter| if (self.include_original or !parameter.original) {
+                if (parameter.bytes.len > max_size) return error.ResourceLimitExceeded;
+                self.size = try std.math.add(usize, self.size, self.length + parameter.bytes.len);
+            };
+        }
+    };
+
+    pub fn planBootstrap(self: *const Session, index: usize, include_original: bool) !Bootstrap {
         if (!self.valid or index > self.packet_configs.len) return error.InvalidPacketIndex;
-        var sequence: [32]?Parameter = @splat(null);
-        var picture: [256]?Parameter = @splat(null);
-        for (&sequence, &self.sequence_versions) |*slot, *versions| slot.* = versions.before(index);
-        for (&picture, &self.picture_versions) |*slot, *versions| slot.* = versions.before(index);
-        var size: usize = 0;
-        const length = self.length_bytes;
-        for (sequence) |item| if (item) |parameter| if (include_original or !parameter.original) {
-            if (parameter.bytes.len > (@as(u64, 1) << (@as(u6, length) * 8)) - 1) return error.ResourceLimitExceeded;
-            size = try std.math.add(usize, size, length + parameter.bytes.len);
-        };
-        for (picture) |item| if (item) |parameter| if (include_original or !parameter.original) {
-            if (parameter.bytes.len > (@as(u64, 1) << (@as(u6, length) * 8)) - 1) return error.ResourceLimitExceeded;
-            size = try std.math.add(usize, size, length + parameter.bytes.len);
-        };
-        if (size > self.options.max_parameter_bytes) return error.ResourceLimitExceeded;
-        const bytes = try a.alloc(u8, size);
-        var cursor: usize = 0;
-        for (sequence) |item| if (item) |parameter| if (include_original or !parameter.original) writeParameter(bytes, &cursor, length, parameter.bytes);
-        for (picture) |item| if (item) |parameter| if (include_original or !parameter.original) writeParameter(bytes, &cursor, length, parameter.bytes);
-        return bytes;
+        var plan = Bootstrap{ .length = self.length_bytes, .include_original = include_original };
+        for (&plan.sequences, &self.sequence_versions) |*slot, *versions| slot.* = versions.before(index);
+        for (&plan.pictures, &self.picture_versions) |*slot, *versions| slot.* = versions.before(index);
+        try plan.count(&plan.sequences);
+        try plan.count(&plan.pictures);
+        if (plan.size > self.options.max_parameter_bytes) return error.ResourceLimitExceeded;
+        return plan;
+    }
+
+    pub fn bootstrap(self: *Session, a: std.mem.Allocator, index: usize, include_original: bool) ![]u8 {
+        const plan = try self.planBootstrap(index, include_original);
+        return plan.materialize(a);
     }
     /// Allocate the new selector table before changing any retained state.
     pub fn rebase(self: *Session, removed: usize) !void {
