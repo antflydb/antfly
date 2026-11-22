@@ -192,19 +192,23 @@ class QualificationTest(unittest.TestCase):
                 side_effect=OSError("HTTP 404"),
             ) as probe,
         ):
-            argv = (args, [case], case, 1, ["llama-server"], "http://localhost", "q4")
+            argv = (args, [case], case, 1, ["llama-server"], "http://localhost")
             timing = run_pass(*argv, record_memory=False)
-            self.assertEqual(spawn.call_args.args[0], ["llama-server", "--no-slots"])
+            timing_command = spawn.call_args.args[0]
+            self.assertEqual(timing_command[:2], ["llama-server", "--alias"])
+            self.assertEqual(timing_command[-1], "--no-slots")
             self.assertTrue(spawn.call_args.kwargs["start_new_session"])
             self.assertIsNone(timing.error)
             self.assertIsNone(request.call_args.kwargs["on_submit"])
             probe.assert_not_called()
 
             memory = run_pass(*argv, record_memory=True)
+            memory_command = spawn.call_args.args[0]
             self.assertEqual(
-                spawn.call_args.args[0],
-                ["/usr/bin/time", "-l", "llama-server", "--slots"],
+                memory_command[:4], ["/usr/bin/time", "-l", "llama-server", "--alias"]
             )
+            self.assertEqual(memory_command[-1], "--slots")
+            self.assertNotEqual(timing_command[-2], memory_command[-2])
             self.assertEqual(
                 memory.error, "llama.cpp /slots preflight failed: HTTP 404"
             )
@@ -226,6 +230,18 @@ class QualificationTest(unittest.TestCase):
             kill_group.call_args_list,
             [call(29, signal.SIGTERM), call(29, signal.SIGKILL)],
         )
+
+    def test_shutdown_sweeps_group_even_if_known_child_exits(self):
+        proc = Mock(pid=29)
+        with (
+            patch("benchmark_llama_memory.child_pid", return_value=30),
+            patch("benchmark_llama_memory.os.kill") as kill_process,
+            patch("benchmark_llama_memory.os.killpg") as kill_group,
+        ):
+            shutdown_pass(proc, record_memory=True)
+        kill_process.assert_called_once_with(30, signal.SIGTERM)
+        proc.wait.assert_called_once_with(timeout=20)
+        kill_group.assert_called_once_with(29, signal.SIGKILL)
 
     def test_shutdown_escalates_to_group_if_known_child_does_not_exit(self):
         proc = Mock(pid=29)
@@ -252,7 +268,6 @@ class QualificationTest(unittest.TestCase):
                 1,
                 ["llama-server"],
                 "http://localhost",
-                "q4",
                 record_memory=True,
             )
         self.assertEqual(memory.error, "spawn failed")

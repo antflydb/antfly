@@ -173,9 +173,8 @@ def shutdown_pass(proc, record_memory):
         signal_pass_group(proc, signal.SIGKILL)
         proc.wait(timeout=10)
     else:
-        if pid is None:
-            # The wrapper may have exited while descendants survived SIGTERM.
-            signal_pass_group(proc, signal.SIGKILL)
+        # The launcher can exit while server descendants still own the listener.
+        signal_pass_group(proc, signal.SIGKILL)
 
 
 def wait_ready(proc, url, alias):
@@ -497,15 +496,12 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", args.port))
         port = listener.getsockname()[1]
-    alias = "ocr-" + uuid.uuid4().hex
     command = [
         args.binary,
         "--model",
         str(model),
         "--mmproj",
         str(projector),
-        "--alias",
-        alias,
         "--reasoning",
         "off",
         "--host",
@@ -534,10 +530,10 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
         command += ["--image-max-tokens", str(profile.image_max_tokens)]
     url = f"http://127.0.0.1:{port}"
     timing = run_pass(
-        args, cases, grounding_case, parallel, command, url, alias, record_memory=False
+        args, cases, grounding_case, parallel, command, url, record_memory=False
     )
     memory = run_pass(
-        args, cases, grounding_case, parallel, command, url, alias, record_memory=True
+        args, cases, grounding_case, parallel, command, url, record_memory=True
     )
     scored, ok, quality_pages, quality_qualified = score_pass(
         args, cases, grounding_case, timing.rows, timing.grounding, timing.error
@@ -605,9 +601,9 @@ class BenchmarkPass:
     log: str
 
 
-def run_pass(
-    args, cases, grounding_case, parallel, command, url, alias, *, record_memory
-):
+def run_pass(args, cases, grounding_case, parallel, command, url, *, record_memory):
+    alias = "ocr-" + uuid.uuid4().hex
+    command = [*command, "--alias", alias]
     phase = ("load", 0)
     phase_changed = threading.Condition()
     sampled_peaks = {}
