@@ -162,6 +162,11 @@ cursor, current phase, outstanding delivery count and expiry with
 already issued to the client. Delete the feed to release its retention grants.
 The metadata maintenance worker propagates durable native acknowledgments and
 resumes bounded collection when a client disconnects after an ACK.
+An idle response keeps the same cursor. Under native history pressure, an
+ordered root's leader can reset public feeds that hold its retention floor.
+The worker starts checking at 75 percent of the retained and reserved byte
+budget. Consumers of a reset feed must resynchronize. The hard root budget
+still applies during bursts that outrun the maintenance and collection passes.
 
 Extend a streaming feed with `POST /db/v1/changefeeds/{id}/renew` and a
 JSON `expires_at` Unix timestamp in seconds. A successful reply confirms the

@@ -202,6 +202,7 @@ pub const GrantIdentity = struct {
     policy_revision: u64,
     include_bootstrap: bool = false,
     include_cut: bool = false,
+    include_pressure: bool = false,
 
     pub fn jsonStringify(self: GrantIdentity, jw: anytype) !void {
         try jw.beginObject();
@@ -215,6 +216,10 @@ pub const GrantIdentity = struct {
         }
         if (self.include_cut) {
             try jw.objectField("include_cut");
+            try jw.write(true);
+        }
+        if (self.include_pressure) {
+            try jw.objectField("include_pressure");
             try jw.write(true);
         }
         try jw.endObject();
@@ -244,6 +249,7 @@ pub const GrantObservation = union(enum) {
         limit: u64,
         bootstrap: ?BootstrapObservation = null,
         quiescent_latest: ?u64 = null,
+        holds_pressure_floor: bool = false,
 
         pub fn jsonStringify(self: Active, jw: anytype) !void {
             try jw.beginObject();
@@ -258,6 +264,10 @@ pub const GrantObservation = union(enum) {
             if (self.quiescent_latest) |latest| {
                 try jw.objectField("quiescent_latest");
                 try jw.write(latest);
+            }
+            if (self.holds_pressure_floor) {
+                try jw.objectField("holds_pressure_floor");
+                try jw.write(true);
             }
             try jw.endObject();
         }
@@ -290,6 +300,12 @@ pub fn observeGrant(txn: anytype, requested: GrantIdentity) !GrantObservation {
                 result.bootstrap = .{ .digest = pin.digest, .expires_at_seconds = pin.expires_at_seconds };
             }
         }
+        // A quarter of the root budget remains available to native producers
+        // while the metadata owner fences and retires the lagging public lease.
+        if (requested.include_pressure and consumer.acknowledged < physical.latest and
+            consumer.acknowledged == physical.floor() and
+            physical.retained_bytes +| physical.reserved_bytes >= physical.limit - physical.limit / 4)
+            result.holds_pressure_floor = true;
         if (requested.include_cut) result.quiescent_latest = history.requireBootstrapCut(txn, requested.namespace) catch |err| switch (err) {
             error.HistoryPreparedTransactionsPresent => null,
             else => return err,

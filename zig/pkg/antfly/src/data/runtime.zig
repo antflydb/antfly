@@ -5936,6 +5936,8 @@ pub const DataServer = struct {
     background_jobs_shutdown: std.atomic.Value(bool) = .init(false),
     changefeed_maintenance_active: std.atomic.Value(bool) = .init(false),
     changefeed_maintenance_after: ?@import("../metadata/changefeed_control.zig").Id = null,
+    changefeed_pressure_after: ?@import("../metadata/changefeed_control.zig").Id = null,
+    changefeed_pressure_due_ms: u64 = 0,
     changefeed_maintenance_due_ms: std.atomic.Value(u64) = .init(0),
     // Preparation may own up to 16 MiB per transaction. Bound concurrency as
     // well as queued observation bytes, independent of local shard count.
@@ -24780,6 +24782,34 @@ pub const DataServer = struct {
             };
         }
         self.changefeed_maintenance_after = page.next;
+        const leadership = self.group_leadership_source orelse return;
+        const monotonic_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
+        if (monotonic_ms < self.changefeed_pressure_due_ms) return;
+        self.changefeed_pressure_due_ms = monotonic_ms +| 5_000;
+        const pressure_page = remote.scanChangefeedMaintenance(self.alloc, .{
+            .now = now,
+            .after = self.changefeed_pressure_after,
+            .pressure = true,
+        }, request) catch |err| switch (err) {
+            error.InvalidChangefeed, error.UnexpectedHttpStatus, error.DeadlineExceeded => return,
+            else => return err,
+        };
+        for (pressure_page.items()) |id| {
+            try request.ensureActive();
+            feeds.probeNativeFeedPressure(metadata, self.historyRootsSource(), leadership, self.alloc, id, request) catch |err| switch (err) {
+                error.ChangefeedConflict,
+                error.ChangefeedResynchronizationRequired,
+                error.InvalidHistoryAdmission,
+                error.GroupLeaderUnavailable,
+                error.ReadUnavailable,
+                error.StorageReadTemporarilyUnavailable,
+                => {},
+                else => return err,
+            };
+            self.changefeed_pressure_after = id;
+        }
+        self.changefeed_pressure_after = pressure_page.next;
+        if (pressure_page.next != null) self.changefeed_pressure_due_ms = monotonic_ms +| 1_000;
     }
 
     fn requestAutoBulkFinishBackground(self: *DataServer) !void {

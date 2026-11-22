@@ -1830,7 +1830,9 @@ test "external lake filesystem WAL group commit folds pending transactions into 
     feed_state = try (feed_control.Mutation{ .seal = .{ .cut = @splat(7), .provider_context = provider_context, .catalog_starts = &.{.{ .namespace = namespace, .through = first_position.through }} } }).apply(a, feed_state, .{ .incarnation = authority, .sequence = 4 });
     const initial = feed_state.acknowledged_cursor;
     var policy = visibility;
-    var provider: changes.Provider(@TypeOf(schemas), @TypeOf(visibility)) = .{ .namespace = namespace, .binding = binding, .options = options, .metadata = last, .schemas = schemas, .policy = &policy };
+    var group_cache: changes.GroupCache = .{};
+    defer group_cache.deinit();
+    var provider: changes.Provider(@TypeOf(schemas), @TypeOf(visibility)) = .{ .namespace = namespace, .binding = binding, .options = options, .metadata = last, .schemas = schemas, .policy = &policy, .group_cache = &group_cache };
     const prepared_page = try provider.prepare(a, feed_state, initial, .{ .events = 1 }, .{});
     try std.testing.expectEqual(@as(u64, 3), prepared_page.advances[0].position.sequence);
     try std.testing.expectEqual(@as(u32, 1), prepared_page.events);

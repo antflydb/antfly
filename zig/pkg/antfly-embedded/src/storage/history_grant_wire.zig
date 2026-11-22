@@ -42,6 +42,7 @@ pub const Request = struct {
         }
         if (self.identity.include_bootstrap) hash.update("\x01");
         if (self.identity.include_cut) hash.update("\x02");
+        if (self.identity.include_pressure) hash.update("\x03");
         return hash.finalResult();
     }
 };
@@ -66,6 +67,8 @@ pub const Reply = struct {
                 if (!std.mem.eql(u8, &consumer.id, &request.identity.consumer) or consumer.epoch == 0 or consumer.expires_at_seconds == 0 or
                     consumer.policy_revision != request.identity.policy_revision or consumer.acknowledged < consumer.start or value.limit == 0 or value.grant == 0) return error.HistoryCorrupt;
                 if ((value.grant == request.identity.sequence) != (self.observation == .active)) return error.HistoryCorrupt;
+                if (value.holds_pressure_floor and (!request.identity.include_pressure or self.observation != .active))
+                    return error.HistoryCorrupt;
                 if (value.quiescent_latest) |latest| {
                     if (!request.identity.include_cut or self.observation != .active or latest < consumer.acknowledged) return error.HistoryCorrupt;
                 }
@@ -131,6 +134,12 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try cut_reply.validate(cut_request);
         cut_reply.observation.active.quiescent_latest = 0;
         try std.testing.expectError(error.HistoryCorrupt, cut_reply.validate(cut_request));
+        cut_reply.observation.active.quiescent_latest = null;
+        cut_reply.observation.active.holds_pressure_floor = true;
+        try std.testing.expectError(error.HistoryCorrupt, cut_reply.validate(cut_request));
+        cut_request.identity.include_pressure = true;
+        cut_reply.request_digest = cut_request.digest();
+        try cut_reply.validate(cut_request);
         try std.testing.expectError(error.HistoryCorrupt, decodeReply(a, "{}", original_request));
         try std.testing.expectError(error.InvalidHistoryAdmission, decodeRequest(a, "{}"));
         const duplicate = try std.fmt.allocPrint(a, "{s},\"version\":1}}", .{encoded[0 .. encoded.len - 1]});

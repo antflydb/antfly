@@ -1762,6 +1762,52 @@ pub fn maintainNativeFeed(metadata: config.Port, source: source_api.Source, io: 
     return maintainNativeFeedWithSpool(metadata, source, io, a, id, null, null, request);
 }
 
+pub fn probeNativeFeedPressure(metadata: config.Port, source: source_api.Source, leadership: anytype, a: A, id: control.Id, request: Context) !void {
+    try requireMaintenancePrincipal(request);
+    var client: config.Client = .{ .port = metadata };
+    var parsed = try load(&client, a, id, request);
+    defer parsed.deinit();
+    const state = parsed.value;
+    const now = clock.realtimeNs() / std.time.ns_per_s;
+    if (!state.needsPressureProbe(now) or state.roots.len == 0) return;
+    const definition = state.definition.?;
+    var captured = try source.capturePhysical(a, definition, request);
+    defer captured.deinit();
+    const first = (now / 5) % state.roots.len;
+    var probes: usize = 0;
+    for (0..state.roots.len) |index| {
+        const item = state.roots[(first + index) % state.roots.len];
+        if (item.released or item.consumer_epoch == 0 or item.pending_control != null or isIcebergRoot(definition, item.namespace)) continue;
+        const route = captured.findInstalled(item) catch continue;
+        if (!leadership.isLocalLeader(route.fence.route.group_id)) continue;
+        if (probes == 4) break;
+        probes += 1;
+        const selected = for (definition.tables) |table| {
+            if (table.table_id == route.fence.table_id) break table;
+        } else return error.ChangefeedResynchronizationRequired;
+        const observed = try source.grants.read(a, route.fence, route.table_name, .{
+            .version = 1,
+            .identity = .{
+                .namespace = item.storageNamespace(),
+                .authority = state.authority,
+                .consumer = state.consumerId(),
+                .definition = definition.identity(),
+                .sequence = item.grant_sequence,
+                .policy_revision = selected.policy_revision,
+                .include_pressure = true,
+            },
+        }, request);
+        if (observed == .active and observed.active.holds_pressure_floor and
+            observed.active.consumer.epoch == item.consumer_epoch and
+            observed.active.consumer.acknowledged >= item.acknowledged.sequence)
+        {
+            // A client ACK or lease transition invalidates this revision.
+            try change(&client, a, state, .{ .reset = .quota }, request);
+            return;
+        }
+    }
+}
+
 pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Source, io: std.Io, a: A, id: control.Id, spool_registry: ?@import("../metadata/pg_spool_artifacts.zig").Registry, catalog_owner: ?CatalogFeedOwner, request: Context) !void {
     var client: config.Client = .{ .port = metadata };
     var parsed = try load(&client, a, id, request);

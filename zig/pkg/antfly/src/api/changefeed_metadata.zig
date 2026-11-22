@@ -26,7 +26,24 @@ pub const path = "/internal/v1/catalog/changefeed-state-v1";
 pub const max_wire_bytes = control.max_state_bytes * 6 + 4096;
 pub const max_scan_wire_bytes = 16 * 1024;
 pub const Action = enum { read, authority, mutate, scan_maintenance };
-pub const ScanRequest = struct { now: u64, after: ?control.Id = null };
+pub const ScanRequest = struct {
+    now: u64,
+    after: ?control.Id = null,
+    pressure: bool = false,
+
+    pub fn jsonStringify(self: ScanRequest, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("now");
+        try jw.write(self.now);
+        try jw.objectField("after");
+        try jw.write(self.after);
+        if (self.pressure) {
+            try jw.objectField("pressure");
+            try jw.write(true);
+        }
+        try jw.endObject();
+    }
+};
 pub const ScanReply = struct {
     request: ScanRequest,
     ids: []const control.Id,
@@ -261,7 +278,7 @@ pub const ScanPort = struct {
                 const self: *Service = @ptrCast(@alignCast(raw));
                 try self.ensureLinearizableReadWithContext(context);
                 const store = self.projectedStore() orelse return error.MissingMetadataStore;
-                return store.scanChangefeedMaintenance(a, self.metadata_group_id, input.now, input.after);
+                return store.scanChangefeedCandidates(a, self.metadata_group_id, input.now, input.after, input.pressure);
             }
         };
         return .{ .ptr = svc, .scan_fn = Adapter.scan };

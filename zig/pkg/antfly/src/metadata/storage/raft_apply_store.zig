@@ -15917,6 +15917,10 @@ pub const RaftApplyStore = struct {
     /// Only identity candidates leave this read transaction. The driver must
     /// reread each identity and use its current CAS revision before mutating.
     pub fn scanChangefeedMaintenance(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, now: u64, after: ?changefeed_control.Id) !changefeed_control.MaintenanceScan {
+        return self.scanChangefeedCandidates(a, group_id, now, after, false);
+    }
+
+    pub fn scanChangefeedCandidates(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, now: u64, after: ?changefeed_control.Id, pressure: bool) !changefeed_control.MaintenanceScan {
         if (group_id == 0 or now == 0) return error.InvalidChangefeed;
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
@@ -15943,7 +15947,7 @@ pub const RaftApplyStore = struct {
             defer parsed.deinit();
             if (!std.mem.eql(u8, &parsed.value.id, &id) or parsed.value.phase == .empty)
                 return error.ChangefeedCorrupt;
-            if (parsed.value.needsMaintenance(now)) {
+            if (if (pressure) parsed.value.needsPressureProbe(now) else parsed.value.needsMaintenance(now)) {
                 scan.ids[scan.count] = id;
                 scan.count += 1;
             }

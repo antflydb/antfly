@@ -399,6 +399,16 @@ pub const State = struct {
         };
     }
 
+    pub fn needsPressureProbe(self: State, now: u64) bool {
+        if (self.slot != null or (self.phase != .streaming and self.phase != .bootstrap) or self.expiryDue(now)) return false;
+        const definition = self.definition orelse return false;
+        if (definition.events != 1) return false;
+        for (definition.tables) |table| {
+            if (table.contract == .native_document or table.contract == .native_relational) return true;
+        }
+        return false;
+    }
+
     pub fn needsMaintenance(self: State, now: u64) bool {
         return switch (self.phase) {
             .closing => true,
@@ -2139,6 +2149,22 @@ test "changefeed control policy reset expires cursors and changes consumer epoch
     bootstrap = try step(scratch, bootstrap, .{ .expire = 500 });
     try std.testing.expectEqual(Reset.bootstrap_expired, bootstrap.reset_reason);
     try std.testing.expectError(error.ChangefeedLeaseExpired, step(scratch, bootstrap, .{ .renew = .{ .now = 501, .expires_at = 1100 } }));
+}
+
+test "public feed pressure reset stops probes and allows absent-root retirement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testState(a, .now);
+    const retire: Mutation = .{ .retire_absent_public_root = testNamespace(7) };
+    try std.testing.expect(state.needsPressureProbe(200));
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, retire));
+    state = try step(a, state, .{ .reset = .quota });
+    try std.testing.expect(!state.needsPressureProbe(200));
+    try std.testing.expect(state.needsMaintenance(200));
+    state = try step(a, state, retire);
+    try std.testing.expect(state.roots[0].released);
+    try std.testing.expect(!state.needsMaintenance(200));
 }
 
 test "changefeed control verifies complete table enrollment owner rebinding and corruption" {
