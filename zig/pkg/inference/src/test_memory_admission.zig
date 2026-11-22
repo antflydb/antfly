@@ -20,5 +20,5 @@ test {
     _ = @import("server/admission_diagnostics.zig");
     _ = @import("backends/admitted_allocator.zig");
     _ = @import("pipelines/preprocessing_memory.zig");
-    _ = @import("pipelines/embedding_gemma2_admission.zig");
+    _ = @import("execution/embedding_gemma2_admission.zig");
 }

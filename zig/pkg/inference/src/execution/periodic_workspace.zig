@@ -13,7 +13,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Physical workspace for fixed-address iteration replay. Each ordinal has
+//! an independent bank with its own backing lifetime. Providers bind the
+//! admitted lengths before capture and own fence and allocation retirement.
 const std = @import("std");
+const run_memory = @import("../runtime/tier/memory.zig");
+
+const default_temp_arena_admission_budget_bytes: usize = 512 * 1024 * 1024;
+
+/// Resolve a non-optional physical-footprint ceiling. An explicit arena limit
+/// can narrow, but never widen, request-level scratch or backend/combined
+/// memory policy. Without a request budget (diagnostic backends and unit
+/// tests), retain a conservative bounded default instead of treating zero as
+/// unlimited.
+pub fn admissionBudget(
+    configured_bytes: ?usize,
+    run_budget: ?*const run_memory.RunBudget,
+) usize {
+    var admission_budget = configured_bytes orelse default_temp_arena_admission_budget_bytes;
+    const budget = run_budget orelse return admission_budget;
+
+    const scratch_limit = budget.limits.scratch_limit_bytes;
+    if (configured_bytes == null and scratch_limit != 0) {
+        admission_budget = scratch_limit;
+    } else if (scratch_limit != 0) {
+        admission_budget = @min(admission_budget, scratch_limit);
+    }
+
+    // `backend_scratch_bytes` is the request's estimate for this same scratch
+    // domain and would double-count the arena. We only subtract independently
+    // resident weight/KV reservations when calculating remaining headroom.
+    const backend_non_scratch = std.math.add(
+        usize,
+        budget.backend_weight_bytes,
+        budget.backend_kv_bytes,
+    ) catch std.math.maxInt(usize);
+    if (budget.limits.backend_limit_bytes != 0) {
+        admission_budget = @min(
+            admission_budget,
+            budget.limits.backend_limit_bytes -| backend_non_scratch,
+        );
+    }
+    if (budget.limits.combined_limit_bytes != 0) {
+        const combined_non_arena = std.math.add(
+            usize,
+            budget.hostTotalBytes(),
+            backend_non_scratch,
+        ) catch std.math.maxInt(usize);
+        admission_budget = @min(
+            admission_budget,
+            budget.limits.combined_limit_bytes -| combined_non_arena,
+        );
+    }
+    return admission_budget;
+}
 
 /// Admission result for the current one-buffer-per-allocation arena layout.
 /// Every learned allocation ordinal owns a distinct `cuMemAlloc` address, so
@@ -299,6 +352,36 @@ pub const TempArenaPlanner = struct {
         try self.candidate_lengths.appendSlice(allocator, self.current_lengths.items);
     }
 };
+
+test "CUDA temp arena admission budget is bounded without a run budget" {
+    try std.testing.expectEqual(
+        default_temp_arena_admission_budget_bytes,
+        admissionBudget(null, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), admissionBudget(0, null));
+    try std.testing.expectEqual(@as(usize, 1234), admissionBudget(1234, null));
+}
+
+test "CUDA temp arena admission budget cannot widen request memory policy" {
+    var budget = run_memory.RunBudget.init(.{
+        .host_limit_bytes = 1_000,
+        .backend_limit_bytes = 300,
+        .combined_limit_bytes = 250,
+        .scratch_limit_bytes = 200,
+    });
+    budget.host_kv_bytes = 30;
+    budget.backend_weight_bytes = 100;
+    budget.backend_kv_bytes = 50;
+    // Combined non-arena bytes are 30 + 100 + 50, leaving 70. The scratch,
+    // backend, and explicit ceilings are all wider and therefore cannot win.
+    try std.testing.expectEqual(@as(usize, 70), admissionBudget(null, &budget));
+    try std.testing.expectEqual(@as(usize, 70), admissionBudget(500, &budget));
+    try std.testing.expectEqual(@as(usize, 40), admissionBudget(40, &budget));
+
+    budget.limits.combined_limit_bytes = 0;
+    // Backend non-arena bytes leave 150, narrower than the 200 scratch cap.
+    try std.testing.expectEqual(@as(usize, 150), admissionBudget(null, &budget));
+}
 
 test "CUDA temp arena planner requires repeatability and a pinned validation iteration" {
     var planner: TempArenaPlanner = .{};

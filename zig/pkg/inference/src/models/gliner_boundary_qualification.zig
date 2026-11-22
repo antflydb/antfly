@@ -36,7 +36,7 @@ const artifact = @import("gliner_boundary_artifact.zig");
 pub const policy_version: u32 = 1;
 // The original table nearly filled 64 bits; exact wrapper profiles require
 // more entries. Geometry remains u64 and each row still matches independently.
-const CandidateMask = u128;
+const CandidateMask = u256;
 pub const max_entries: usize = @bitSizeOf(CandidateMask);
 pub const Backend = enum { native, metal, cuda, pjrt_cpu_f32, pjrt_cpu_bf16, pjrt_cuda_f32, pjrt_cuda_bf16_vendor, pjrt_cuda_bf16_deterministic };
 
@@ -686,8 +686,8 @@ const family_profiles = blk: {
 const family_decide_features = Features.initMany(&.{ .classification_single, .classification_context, .schema_descriptions, .word_whitespace, .overlap_flat, .offset_utf8, .decoder_auto, .single_window, .confidence });
 const family_decide_lengths = familyLengths(.{ .min = 74, .max = 81 }, .{ .min = 14, .max = 17 }, .{ .min = 97, .max = 167 });
 
-fn multilingualEntries() [family_profiles.len * 4 + 2]Entry {
-    var entries: [family_profiles.len * 4 + 2]Entry = undefined;
+fn multilingualEntries() [family_profiles.len * 5 + 3]Entry {
+    var entries: [family_profiles.len * 5 + 3]Entry = undefined;
     var index: usize = 0;
     for ([_]bundle.Identity{ fastino_gliner25_multi_v1, fastino_gliner25_multi_decide }) |identity| {
         for ([_]Backend{ .native, .metal }) |backend| {
@@ -697,7 +697,11 @@ fn multilingualEntries() [family_profiles.len * 4 + 2]Entry {
             }
         }
     }
-    for ([_]Backend{ .native, .metal }) |backend| {
+    for (family_profiles) |profile| {
+        entries[index] = .{ .identity = fastino_gliner25_multi_decide, .backend = .cuda, .features = profile.features, .lengths = profile.lengths };
+        index += 1;
+    }
+    for ([_]Backend{ .native, .metal, .cuda }) |backend| {
         entries[index] = .{ .identity = fastino_gliner25_multi_decide, .backend = backend, .features = family_decide_features, .lengths = family_decide_lengths };
         index += 1;
     }
@@ -1007,9 +1011,12 @@ fn narrowEntries(entries: []const Entry, candidates: *Candidates, observed: Leng
     // unreviewed request shape, not a bounded-length rejection.
     if (previous == 0) return error.UnsupportedGlinerBoundaryRuntime;
     var remaining: CandidateMask = 0;
-    for (entries, 0..) |entry, index| {
+    var pending = previous;
+    while (pending != 0) {
+        const index = @ctz(pending);
         const bit = @as(CandidateMask, 1) << @intCast(index);
-        if (previous & bit != 0 and entry.lengths.contains(observed)) remaining |= bit;
+        pending ^= bit;
+        if (entries[index].lengths.contains(observed)) remaining |= bit;
     }
     candidates.* = @fromBackingInt(remaining);
     if (remaining == 0) return blamedLengthDimension(entries, previous, observed);
@@ -1145,11 +1152,7 @@ test "GLiNER multilingual production qualification binds exact artifacts and ind
         changed = identity;
         changed.weight.sha256[0] = '0';
         try std.testing.expect(!hasQualifiedIdentity(changed));
-        if (equalIdentity(identity, fastino_gliner25_multi_v1)) {
-            for (family_profiles) |profile| try require(identity, .cuda, profile.features, profile.lengths);
-        } else {
-            try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, family_profiles[0].features, family_profiles[0].lengths));
-        }
+        for (family_profiles) |profile| try require(identity, .cuda, profile.features, profile.lengths);
         if (!equalIdentity(identity, fastino_gliner25_multi_decide))
             try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.long_document)));
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.classification_multi)));
@@ -1159,6 +1162,7 @@ test "GLiNER multilingual production qualification binds exact artifacts and ind
     try std.testing.expect(!hasQualifiedTypedDecisionIdentity(fastino_gliner25_base_v1));
     try require(fastino_gliner25_multi_decide, .native, family_decide_features, family_decide_lengths);
     try require(fastino_gliner25_multi_decide, .metal, family_decide_features, family_decide_lengths);
+    try require(fastino_gliner25_multi_decide, .cuda, family_decide_features, family_decide_lengths);
     var outside = family_decide_lengths;
     outside.padded_sequence_tokens = Range.exact(299);
     try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(fastino_gliner25_multi_decide, .native, family_decide_features, outside));
@@ -1333,14 +1337,10 @@ test "boundary qualification rejects malformed or oversized tables before matchi
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&rows, row.identity, .native, row.features, row.lengths));
     var invalid_selection: Candidates = @fromBackingInt(@as(CandidateMask, 1) << (max_entries - 1));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, narrowEntries(&.{row}, &invalid_selection, row.lengths));
-    // Even test-supplied synthetic selections cannot access a production row:
-    // the public narrow() always checks against the real production table, so
-    // this bit index instead lands on the real fastino single-window row,
-    // whose tight request_items=[1,1] rejects testLengths()'s {1,4} -- a
-    // bounded-length rejection against the real row, still not a route to
-    // pretending the synthetic `row` was ever reviewed.
-    var synthetic = try startEntries(&.{row}, row.identity, .native, row.features);
-    try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, synthetic.narrow(row.lengths));
+    // An index supplied by synthetic tests must still be within the real
+    // production table when narrowed through the public API.
+    var invalid_production_selection: Candidates = @fromBackingInt(@as(CandidateMask, 1) << @intCast(production_entries.len));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, invalid_production_selection.narrow(row.lengths));
 }
 
 test "boundary qualification range matching has no saturating or overflow acceptance" {
@@ -1453,7 +1453,7 @@ test "CUDA boundary multi profiles retain exact artifacts independent tasks and 
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(entry.identity, .cuda, union_features, entry.lengths));
     }
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(fastino_gliner25_multi_v1, .cuda, Features.initOne(.long_document)));
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(fastino_gliner25_multi_decide, .cuda, family_profiles[0].features, family_profiles[0].lengths));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(fastino_gliner25_multi_decide, .cuda, Features.initOne(.long_document)));
 }
 
 test "CUDA boundary batch rows preserve per-item limits and exclude long documents and other backends" {

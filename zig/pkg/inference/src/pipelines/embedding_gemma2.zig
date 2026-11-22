@@ -637,8 +637,7 @@ fn nativeTextGroup(session: Session, group: Group, options: Options) bool {
     return true;
 }
 
-pub const textEncoderWorkspace = @import("embedding_gemma2_admission.zig").textEncoderWorkspace;
-const nativeTextEncoderRequest = @import("embedding_gemma2_admission.zig").nativeTextEncoderRequest;
+const text_admission = @import("../execution/embedding_gemma2_admission.zig");
 
 const ExecutionBounds = struct { sequence: usize, host: usize, workspace: usize };
 /// Preserve the conservative path for uninspected media. Known video/text
@@ -940,12 +939,12 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     }
     inspection_scope.deinit();
     const phase = if (native_text)
-        ExecutionBounds{ .sequence = count, .host = bounds.host, .workspace = try textEncoderWorkspace(count) }
+        ExecutionBounds{ .sequence = count, .host = bounds.host, .workspace = try text_admission.textEncoderWorkspace(count) }
     else
         try videoBackboneBounds(session.backend() == .metal, count, bounds.workspace);
     const phase_host = @min(bounds.host, @max(bounded.live, phase.host));
     if (native_text) {
-        native_run = try native_allocator.?.admitRun(try nativeTextEncoderRequest(input_bytes, count, options.dimensions));
+        native_run = try native_allocator.?.admitRun(try text_admission.nativeTextEncoderRequest(input_bytes, count, options.dimensions));
     } else {
         try lane.retain(.{ .batch = 1, .sequence = count, .input_bytes = input_bytes, .backend_input_bytes = if (session.backend() == .metal) count * 512 * 4 else null, .preprocessing_complete = session.backend() == .metal, .workspace_planned = session.backend() == .metal, .host_preprocess_bytes = phase_host, .workspace_bytes = phase.workspace, .output_bytes = options.dimensions * @sizeOf(f32) });
     }
@@ -1480,24 +1479,6 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     return .{ .vectors = result_vectors, .input_tokens = counts, .execution = if (items.len > 1) .native_batch else .serial, .shared_vision_batches = shared_vision_batches };
 }
 
-pub fn preparedCohortCount(lengths: []const usize, maximum: usize) usize {
-    return preparedCohortCountForBackend(lengths, maximum, false);
-}
-pub fn preparedCohortCountForBackend(lengths: []const usize, maximum: usize, compact: bool) usize {
-    var count: usize = 0;
-    var tokens: usize = 0;
-    var longest: usize = 0;
-    for (lengths[0..@min(lengths.len, @min(maximum, 4))]) |length| {
-        if (length == 0 or length > 8192) break;
-        const next = @max(longest, length);
-        if (if (compact) tokens + length > 8192 else next * (count + 1) > 8192 or (count > 0 and next * (count + 1) * 4 > (tokens + length) * 5)) break;
-        longest = next;
-        tokens += length;
-        count += 1;
-    }
-    return count;
-}
-
 // Ticket-local planning memory and inspection leases outlive composition.
 const CohortGroupPlan = struct {
     memory: @import("../runtime/bounded_allocator.zig").BoundedAllocator,
@@ -1775,7 +1756,7 @@ const CohortReady = struct {
         while (offset < prepared) {
             var lengths: [4]usize = undefined;
             for (rows[offset..prepared], lengths[0 .. prepared - offset]) |row, *length| length.* = row.ids.len;
-            var take = preparedCohortCountForBackend(lengths[0 .. prepared - offset], 4, encoder.compactRowsEnabled(cb.kind() == .metal));
+            var take = text_admission.cohortCount(lengths[0 .. prepared - offset], 4, encoder.compactRowsEnabled(cb.kind() == .metal));
             if (take == 0) return error.EmbeddingInputTooLong;
             const plan = ReadyRequest{ .backend = cb.kind(), .rows = rows[offset..prepared], .inputs = inputs, .host = host, .retained = retained, .prepared = prepared, .max_tokens = options.max_tokens, .dimensions = options.dimensions, .force = force };
             var request = try plan.request(take);
@@ -5216,13 +5197,13 @@ test "embeddinggemma2 video packed windows retain independent masks padding and 
 }
 
 test "embeddinggemma2 prepared cohorts bound padding total rows and invalid shapes" {
-    try std.testing.expectEqual(@as(usize, 2), preparedCohortCount(&.{ 16, 17, 8192 }, 4));
-    try std.testing.expectEqual(@as(usize, 2), preparedCohortCount(&.{ 4096, 4096, 4096 }, 4));
-    try std.testing.expectEqual(@as(usize, 1), preparedCohortCount(&.{ 8192, 8192 }, 4));
-    try std.testing.expectEqual(@as(usize, 0), preparedCohortCount(&.{8193}, 4));
-    try std.testing.expectEqual(@as(usize, 0), preparedCohortCount(&.{0}, 4));
-    try std.testing.expectEqual(@as(usize, 0), preparedCohortCount(&.{}, 4));
-    try std.testing.expectEqual(@as(usize, 1), preparedCohortCount(&.{ 32, 32 }, 1));
+    try std.testing.expectEqual(@as(usize, 2), text_admission.cohortCount(&.{ 16, 17, 8192 }, 4, false));
+    try std.testing.expectEqual(@as(usize, 2), text_admission.cohortCount(&.{ 4096, 4096, 4096 }, 4, false));
+    try std.testing.expectEqual(@as(usize, 1), text_admission.cohortCount(&.{ 8192, 8192 }, 4, false));
+    try std.testing.expectEqual(@as(usize, 0), text_admission.cohortCount(&.{8193}, 4, false));
+    try std.testing.expectEqual(@as(usize, 0), text_admission.cohortCount(&.{0}, 4, false));
+    try std.testing.expectEqual(@as(usize, 0), text_admission.cohortCount(&.{}, 4, false));
+    try std.testing.expectEqual(@as(usize, 1), text_admission.cohortCount(&.{ 32, 32 }, 1, false));
 }
 
 test "embeddinggemma2 direct composition spans video markers and unwinds allocation failures" {
@@ -5646,10 +5627,10 @@ test "embeddinggemma2 media templates require immutable tokenizer generations" {
 }
 
 test "embeddinggemma2 compact cohort policy uses active rows while portable policy bounds padding" {
-    try std.testing.expectEqual(@as(usize, 2), preparedCohortCountForBackend(&.{ 1024, 7168 }, 4, true));
-    try std.testing.expectEqual(@as(usize, 1), preparedCohortCountForBackend(&.{ 1024, 7168 }, 4, false));
-    try std.testing.expectEqual(@as(usize, 3), preparedCohortCountForBackend(&.{ 32, 1024, 4096, 4096 }, 4, true));
-    try std.testing.expectEqual(@as(usize, 1), preparedCohortCountForBackend(&.{ 8192, 1 }, 4, true));
+    try std.testing.expectEqual(@as(usize, 2), text_admission.cohortCount(&.{ 1024, 7168 }, 4, true));
+    try std.testing.expectEqual(@as(usize, 1), text_admission.cohortCount(&.{ 1024, 7168 }, 4, false));
+    try std.testing.expectEqual(@as(usize, 3), text_admission.cohortCount(&.{ 32, 1024, 4096, 4096 }, 4, true));
+    try std.testing.expectEqual(@as(usize, 1), text_admission.cohortCount(&.{ 8192, 1 }, 4, true));
 }
 
 test "embeddinggemma2 Metal direct packed rows exclude NaN padding and preserve original positions" {

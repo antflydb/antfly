@@ -362,6 +362,10 @@ required_symbols=(
   termite_elementwise_broadcast_f32
   termite_primitive_where_f32
   termite_primitive_batched_dot_f32
+  termite_short_row_matmul_f32
+  termite_tiled_row_matmul_f32
+  termite_wide_tiled_row_matmul_f32
+  termite_head_major_attention_f32
   termite_primitive_reduce_f32
   termite_primitive_broadcast_f32
   termite_layer_norm_backward_f32

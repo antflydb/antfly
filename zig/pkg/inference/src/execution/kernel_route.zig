@@ -110,6 +110,7 @@ pub const Prepare = struct {
     /// from an ambient operation; unknown/raw callers remain conservative.
     metadata_authority: ?@import("backend_operation.zig").Borrowed = null,
     host_readonly_inputs: [3]bool = @splat(false),
+    integer_literal_inputs: [3]bool = @splat(false),
     allocator: std.mem.Allocator,
     /// Exact target callback-table identity; a generic caller cannot substitute
     /// the backend default table for a derived/wrapped implementation.

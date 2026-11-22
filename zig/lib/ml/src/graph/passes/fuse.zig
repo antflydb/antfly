@@ -756,24 +756,68 @@ fn fuseLinearPairs(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult
         // builder-emitted `vjp_alternate` decompositions.
         if (any_vjp_alternate) continue;
 
-        // Build the concat tree. concat_prim is binary, so chain it.
-        var combined_weight_id = members[0].weight_id;
-        var combined_out_dim: u32 = members[0].out_dim;
-        for (members[1..]) |m| {
-            const new_total = combined_out_dim + m.out_dim;
-            // Weight shape is [out_dim, in_dim]; we concat along axis 0.
-            const new_shape = Shape.init(weight_dtype, &.{
-                @intCast(new_total),
-                @intCast(key.in_dim),
-            });
-            combined_weight_id = try work.addNode(.{
-                .op = .{ .concat_prim = .{ .axis = 0 } },
-                .output_shape = new_shape,
-                .inputs = .{ combined_weight_id, m.weight_id, null_node, null_node },
-                .num_inputs = 2,
-            });
-            combined_out_dim = new_total;
+        // A literal group must fold into a single reusable weight. Groups
+        // mixing literals and live matrix inputs keep separate projections.
+        var literal_count: usize = 0;
+        var total_columns: u64 = 0;
+        for (members) |member| {
+            const weight = work.node(member.weight_id);
+            if (weight.op == .constant or (weight.op == .transpose and weight.op.transpose.num_axes == 2 and
+                std.mem.eql(u8, weight.op.transpose.perm[0..2], &.{ 1, 0 }) and work.node(weight.inputs[0]).op == .constant))
+                literal_count += 1;
+            total_columns += member.out_dim;
         }
+        if (total_columns > std.math.maxInt(u32)) continue;
+        if (literal_count != 0 and (literal_count != members.len or
+            total_columns * key.in_dim > @import("const_fold.zig").max_folded_constant_bytes / weight_dtype.byteSize())) continue;
+
+        const combined_out_dim: u32 = @intCast(total_columns);
+        const combined_weight_id = if (literal_count == members.len) literal: {
+            const width: usize = key.in_dim;
+            const element_bytes = weight_dtype.byteSize();
+            const packed_weights = try allocator.alloc(u8, @as(usize, combined_out_dim) * width * element_bytes);
+            defer allocator.free(packed_weights);
+            var offset: usize = 0;
+            for (members) |member| {
+                const weight = work.node(member.weight_id);
+                const element_count = @as(usize, member.out_dim) * width;
+                const length = element_count * element_bytes;
+                const destination = packed_weights[offset..][0..length];
+                const attrs = if (weight.op == .constant) weight.op.constant else work.node(weight.inputs[0]).op.constant;
+                if (attrs.data_len != element_count or attrs.data_offset > work.constant_pool.items.len or
+                    length > work.constant_pool.items.len - attrs.data_offset) return error.InvalidShape;
+                const source = work.constant_pool.items[attrs.data_offset..][0..length];
+                switch (weight.op) {
+                    .constant => @memcpy(destination, source),
+                    .transpose => {
+                        for (0..member.out_dim) |column| {
+                            for (0..width) |row| {
+                                const src = (row * member.out_dim + column) * element_bytes;
+                                const dst = (column * width + row) * element_bytes;
+                                @memcpy(destination[dst..][0..element_bytes], source[src..][0..element_bytes]);
+                            }
+                        }
+                    },
+                    else => unreachable,
+                }
+                offset += length;
+            }
+            var builder = Builder.init(work);
+            break :literal try builder.tensorConstBytes(packed_weights, Shape.init(weight_dtype, &.{ combined_out_dim, key.in_dim }));
+        } else dynamic: {
+            var weight_id = members[0].weight_id;
+            var columns = members[0].out_dim;
+            for (members[1..]) |member| {
+                columns += member.out_dim;
+                weight_id = try work.addNode(.{
+                    .op = .{ .concat_prim = .{ .axis = 0 } },
+                    .output_shape = Shape.init(weight_dtype, &.{ columns, key.in_dim }),
+                    .inputs = .{ weight_id, member.weight_id, null_node, null_node },
+                    .num_inputs = 2,
+                });
+            }
+            break :dynamic weight_id;
+        };
 
         // Single fused_linear_no_bias on the concatenated weight,
         // tagged with the per-projection split sizes so a grouped-
@@ -1144,7 +1188,7 @@ fn fuseMatmulNoBias(allocator: std.mem.Allocator, work: *Graph, reachable: []con
     for (0..count) |i| {
         if (i >= reachable.len or !reachable[i]) continue;
         const mm_id: NodeId = @intCast(i);
-        const mm_node = work.node(mm_id);
+        const mm_node = work.node(mm_id).*;
         const dot_attrs = switch (mm_node.op) {
             .dot_general => |a| a,
             else => continue,
@@ -1162,39 +1206,40 @@ fn fuseMatmulNoBias(allocator: std.mem.Allocator, work: *Graph, reachable: []con
         if (input_id == null_node or rhs_id == null_node) continue;
         if (rhs_id >= count) continue;
 
-        var weight_id: NodeId = null_node;
-        if (dot_attrs.rhs_contracting[0] == 0) {
-            // rhs must be `transpose(W, [1, 0])` for the result to be X @ W^T.
-            const rhs_node = work.node(rhs_id);
-            const wt_attrs = switch (rhs_node.op) {
-                .transpose => |a| a,
-                else => continue,
-            };
-            if (wt_attrs.num_axes != 2) continue;
-            if (wt_attrs.perm[0] != 1 or wt_attrs.perm[1] != 0) continue;
-            weight_id = rhs_node.inputs[0];
-        } else if (dot_attrs.rhs_contracting[0] == 1) {
-            weight_id = rhs_id;
-        } else {
-            continue;
-        }
-        if (weight_id == null_node or weight_id >= count) continue;
-
         const out_shape = mm_node.output_shape;
-        const rows_i64 = out_shape.dim(0);
-        const out_dim_i64 = out_shape.dim(1);
-        if (rows_i64 <= 0 or out_dim_i64 <= 0) continue;
-
         const in_shape = work.node(input_id).output_shape;
         if (in_shape.rank() != 2) continue;
-        const in_dim_i64 = in_shape.dim(1);
-        if (in_dim_i64 <= 0) continue;
+        const rows = std.math.cast(u32, out_shape.dim(0)) orelse continue;
+        const out_dim = std.math.cast(u32, out_shape.dim(1)) orelse continue;
+        const in_dim = std.math.cast(u32, in_shape.dim(1)) orelse continue;
+        if (rows == 0 or out_dim == 0 or in_dim == 0) continue;
+
+        const rhs_node = work.node(rhs_id).*;
+        const weight_id = switch (dot_attrs.rhs_contracting[0]) {
+            0 => switch (rhs_node.op) {
+                .transpose => |attrs| if (attrs.num_axes == 2 and std.mem.eql(u8, attrs.perm[0..2], &.{ 1, 0 }))
+                    rhs_node.inputs[0]
+                else
+                    continue,
+                .constant => blk: {
+                    if (!rhs_node.output_shape.eq(Shape.init(.f32, &.{ in_dim, out_dim })) or
+                        in_shape.dtype != .f32 or out_shape.dtype != .f32 or
+                        @as(u64, in_dim) * out_dim > @import("const_fold.zig").max_folded_constant_bytes / @sizeOf(f32)) continue;
+                    var builder = Builder.init(work);
+                    break :blk try builder.transpose(rhs_id, &.{ 1, 0 });
+                },
+                else => continue,
+            },
+            1 => rhs_id,
+            else => continue,
+        };
+        if (weight_id == null_node) continue;
 
         const fused_id = try work.addNode(.{
             .op = .{ .fused_linear_no_bias = .{
-                .rows = @intCast(rows_i64),
-                .in_dim = @intCast(in_dim_i64),
-                .out_dim = @intCast(out_dim_i64),
+                .rows = rows,
+                .in_dim = in_dim,
+                .out_dim = out_dim,
             } },
             .output_shape = out_shape,
             .inputs = .{ input_id, weight_id, null_node, null_node },
@@ -2254,39 +2299,37 @@ fn fuseTransposeIntoDot(allocator: std.mem.Allocator, work: *Graph, reachable: [
             .dot_general => |a| a,
             else => continue,
         };
-        // Only handle the simple 2-D matmul form (no batch, single
-        // contracting axis) — composing transposes through batched dot
-        // semantics needs care that's out of scope here.
-        if (dot_attrs.num_contracting != 1 or dot_attrs.num_batch != 0) continue;
+        if (dot_attrs.num_contracting != 1) continue;
 
         const rhs_id = dot.inputs[1];
         if (rhs_id == null_node or rhs_id >= count) continue;
         const rhs = work.node(rhs_id);
-        const rhs_t_attrs = switch (rhs.op) {
+        const attrs = switch (rhs.op) {
             .transpose => |a| a,
             else => continue,
         };
-        if (rhs_t_attrs.num_axes != 2) continue;
-        if (rhs_t_attrs.perm[0] != 1 or rhs_t_attrs.perm[1] != 0) continue;
-        const bare_w = rhs.inputs[0];
-        if (bare_w == null_node or bare_w >= count) continue;
+        const rank = rhs.output_shape.rank();
+        if (rank < 2 or attrs.num_axes != rank or dot_attrs.num_batch != rank - 2) continue;
+        if (attrs.perm[rank - 2] != rank - 1 or attrs.perm[rank - 1] != rank - 2) continue;
+        for (0..rank - 2) |axis| {
+            if (attrs.perm[axis] != axis or dot_attrs.rhs_batch[axis] != axis) break;
+        } else {
+            const bare_w = rhs.inputs[0];
+            if (bare_w == null_node or bare_w >= count) continue;
+            const old_axis = dot_attrs.rhs_contracting[0];
+            if (old_axis != rank - 2 and old_axis != rank - 1) continue;
+            var new_attrs = dot_attrs;
+            new_attrs.rhs_contracting[0] = attrs.perm[old_axis];
 
-        // Original rhs_contracting axis 0 means we contracted W^T's axis 0.
-        // After dropping the transpose, that's W's axis 1.
-        const old_rhs_axis = dot_attrs.rhs_contracting[0];
-        const new_rhs_axis: u8 = if (old_rhs_axis == 0) 1 else 0;
-
-        var new_attrs = dot_attrs;
-        new_attrs.rhs_contracting[0] = new_rhs_axis;
-
-        const new_id = try work.addNode(.{
-            .op = .{ .dot_general = new_attrs },
-            .output_shape = dot.output_shape,
-            .inputs = .{ dot.inputs[0], bare_w, null_node, null_node },
-            .num_inputs = 2,
-        });
-        try redirects.append(allocator, .{ .from = dot_id, .to = new_id });
-        num_rewrites += 1;
+            const new_id = try work.addNode(.{
+                .op = .{ .dot_general = new_attrs },
+                .output_shape = dot.output_shape,
+                .inputs = .{ dot.inputs[0], bare_w, null_node, null_node },
+                .num_inputs = 2,
+            });
+            try redirects.append(allocator, .{ .from = dot_id, .to = new_id });
+            num_rewrites += 1;
+        }
     }
 
     return .{ .redirects = redirects, .num_rewrites = num_rewrites };
@@ -2959,7 +3002,14 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
 
         // K^T = transpose(K), optionally wrapped in the same scalar scaling
         // patterns as Q.
-        const scaled_kt = try findScaledTransposeTensor(work, kt_id);
+        const kt_shape = work.node(kt_id).output_shape;
+        const direct_k = kt_shape.rank() >= 3 and scores_dg.rhs_contracting[0] == kt_shape.rank() - 1;
+        const scaled_kt = if (direct_k) blk: {
+            // A previous fixed-point iteration may have absorbed K's final
+            // matrix transpose into the dot's contraction axis.
+            const direct = findPrescaledTensor(work, kt_id);
+            break :blk ScaledTransposeTensor{ .k_id = direct.base_id, .scale = direct.scale };
+        } else try findScaledTransposeTensor(work, kt_id);
         const k_id = scaled_kt.k_id;
         if (k_id == null_node) continue;
 
@@ -2977,6 +3027,23 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
         if (q_rank != 3 and q_rank != 4) continue;
         if (k_shape.rank() != q_rank) continue;
         if (v_shape.rank() != q_rank) continue;
+
+        if (direct_k) {
+            if (probs_id != first_input or scores_dg.num_batch != q_rank - 2 or dg_attrs.num_batch != q_rank - 2 or
+                scores_dg.lhs_contracting[0] != q_rank - 1 or
+                q_shape.dim(q_rank - 1) != k_shape.dim(q_rank - 1) or
+                k_shape.dim(q_rank - 1) != v_shape.dim(q_rank - 1) or
+                q_shape.dim(q_rank - 2) != k_shape.dim(q_rank - 2) or
+                k_shape.dim(q_rank - 2) != v_shape.dim(q_rank - 2) or
+                dg_attrs.lhs_contracting[0] != q_rank - 1 or dg_attrs.rhs_contracting[0] != q_rank - 2) continue;
+            var canonical = true;
+            for (0..q_rank - 2) |axis| {
+                if (scores_dg.lhs_batch[axis] != axis or scores_dg.rhs_batch[axis] != axis or
+                    dg_attrs.lhs_batch[axis] != axis or dg_attrs.rhs_batch[axis] != axis or
+                    q_shape.dims[axis] != k_shape.dims[axis] or k_shape.dims[axis] != v_shape.dims[axis]) canonical = false;
+            }
+            if (!canonical) continue;
+        }
 
         var batch: u32 = undefined;
         var num_heads: u32 = undefined;
@@ -3311,6 +3378,13 @@ fn approxEqScale(a: f32, b: f32) bool {
 }
 
 // ── Graph Reconstruction ──────────────────────────────────────────────
+
+/// Rebuild a caller-authored set of inference replacements in topological
+/// order. The redirect table contains one entry per node, with unchanged
+/// nodes mapping to themselves.
+pub fn rebuildWithRedirects(allocator: std.mem.Allocator, graph: *const Graph, redirects: []const NodeId) !FuseResult {
+    return rebuild(allocator, graph, redirects, 0);
+}
 
 fn rebuild(
     allocator: std.mem.Allocator,
@@ -4118,6 +4192,24 @@ test "fuse detects SDPA pattern: matmul-scale-softmax-matmul" {
         }
     }
     try std.testing.expect(found_sdpa);
+}
+
+test "fuse SDPA with the key transpose already represented by contracting axes" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const shape = Shape.init(.f32, &.{ 2, 4, 8 });
+    const q = try builder.parameter("q", shape);
+    const k = try builder.parameter("k", shape);
+    const v = try builder.parameter("v", shape);
+    const scores = try builder.matmul3DTransB(q, k);
+    const scale = try builder.scalarConst(.f32, 1.0 / @sqrt(8.0));
+    const probabilities = try builder.softmax(try builder.mul(scores, scale));
+    try graph.markOutput(try builder.matmul3D(probabilities, v));
+    var result = try fuse(a, &graph);
+    defer result.deinit();
+    try std.testing.expect(result.graph.node(result.graph.outputs.items[0]).op == .fused_sdpa);
 }
 
 test "fuse detects SDPA pattern: 4D dynamic additive bias is preserved" {
@@ -5203,6 +5295,23 @@ test "fuse folds transpose into dot_general" {
     // The matmul-no-bias matcher promotes the dot to fused_linear_no_bias,
     // so a bare dot_general may not survive; if it does, axis is 1.
     try std.testing.expect(rhs_axis == 255 or rhs_axis == 1);
+}
+
+test "fuse absorbs the right-hand matrix transpose in a batched dot" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const lhs = try builder.parameter("lhs", Shape.init(.f32, &.{ 3, 4, 5 }));
+    const rhs = try builder.parameter("rhs", Shape.init(.f32, &.{ 3, 7, 5 }));
+    const transposed = try builder.transpose(rhs, &.{ 0, 2, 1 });
+    try graph.markOutput(try builder.matmul3D(lhs, transposed));
+    var result = try fuse(a, &graph);
+    defer result.deinit();
+    const output = result.graph.node(result.graph.outputs.items[0]);
+    try std.testing.expectEqual(@as(u8, 2), output.op.dot_general.rhs_contracting[0]);
+    try std.testing.expect(result.graph.node(output.inputs[1]).op == .parameter);
+    try std.testing.expect(output.output_shape.eq(Shape.init(.f32, &.{ 3, 4, 7 })));
 }
 
 test "fuse rewrites add(x, neg(y)) to sub(x, y)" {

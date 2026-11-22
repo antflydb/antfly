@@ -261,7 +261,7 @@ pub fn run(init: std.process.Init, source_model: anytype, a: std.mem.Allocator, 
         defer cleanup.finish();
         var permit = try encoder.admitInputs(&.{input}, request_allocator, control);
         defer permit.deinit();
-        try stages.prepareEncoderPermit(encoder, destination, null, control, true, &permit);
+        try stages.prepareEncoderPermit(encoder, destination, null, control, .incremental, &permit);
         var encoded = try stages.encodeForIncrementalWithPermit(request_allocator, encoder, destination, &.{input}, null, control, &permit);
         // EncoderOutputs holds its complete resources. Release any residual
         // permit-only admission before receiver timing and terminal snapshots.
@@ -401,7 +401,7 @@ pub fn run(init: std.process.Init, source_model: anytype, a: std.mem.Allocator, 
             }
             // Required logits readback belongs to the consumer, after the
             // separate strict encoder-transfer audit has ended.
-            var row = try decoder.step(&.{ 0, 1 }, null, null);
+            var row = try decoder.step(&.{ 0, 1 }, 0, null, null);
             var row_open = true;
             defer if (row_open) row.deinit();
             if (row.logits.len != config.vocab_size) return error.InvalidLogitsShape;

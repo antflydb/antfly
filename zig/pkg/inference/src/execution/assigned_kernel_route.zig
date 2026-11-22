@@ -98,7 +98,7 @@ fn planesDense(backend: ops.ComputeBackend, logical: ml.graph.Shape, planes: []c
 pub fn bindingDense(backend: ops.ComputeBackend, binding: route.Binding, expected: ml.graph.Shape) bool {
     return switch (binding) {
         .imported_host => |host| host.target == backend.kind() and shapeEqual(host.logical, expected),
-        .imported_device => |device| backend.kind() == .cuda and device.implementation.context == backend.ptr and device.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and expected.dtype == .f32 and shapeEqual(device.logical, expected),
+        .imported_device => |device| backend.kind() == .cuda and device.implementation.context == backend.ptr and device.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and (expected.dtype == .f32 or expected.dtype == .i32 or expected.dtype == .i64) and shapeEqual(device.logical, expected),
         .planned => |planned| planesDense(backend, planned.logical, planned.planes, expected),
         .resident => |resident| resident.implementation.context == backend.ptr and resident.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and planesDense(backend, resident.logical, resident.planes, expected),
         .tensor => |known| actualDense(backend, known, expected),
@@ -307,7 +307,7 @@ pub const NativeProgramBinding = struct {
 /// Native calls only after its exact canonical table check. Other providers,
 /// dynamic recipes and foreign/private route owners keep ordinary dispatch.
 pub fn bindNativeProgram(selected: *const route.Owned, backend: ops.ComputeBackend, descriptor: *const ops.kernel_descriptor.Descriptor, slot: route.OutputSlot) !?NativeProgramBinding {
-    if (backend.vtable != &@import("../ops/native_compute.zig").vtable_impl or !belongsTo(selected, backend)) return null;
+    if (!@import("../ops/native_compute.zig").isCanonicalVTable(backend.vtable) or !belongsTo(selected, backend)) return null;
     const owner: *const Direct = @ptrCast(@alignCast(selected.context));
     if (!owner.immutable_resources) return null;
     try validateDescriptor(selected, descriptor);

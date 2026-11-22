@@ -13,12 +13,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A bounded allocation/free trace for stream-owned graph arenas. Offsets
-//! overlap only after the preceding consumer is submitted on the same stream.
+//! A sealed physical workspace recipe for sequential stream submission.
+//! The same offsets govern capacity admission and ordinary or captured
+//! dispatch. Storage can overlap only after its previous consumer is enqueued
+//! on the same stream. Backend owners retain and retire the actual allocation.
 const std = @import("std");
 // CUDA device addresses are 64-bit tokens, independent of host pointer width.
 const DevicePointer = u64;
 pub const limit = 128 * 1024 * 1024;
+pub const alignment = 256;
+
+pub const Layout = struct {
+    bytes: usize,
+    scratch_offset: usize,
+    events: usize,
+    output: ?struct { offset: usize, bytes: usize },
+};
 const Allocation = struct { bytes: usize, offset: usize, pointer: DevicePointer, live: bool = true };
 const Event = struct { slot: usize, allocate: bool };
 pub const Plan = struct {
@@ -27,7 +37,8 @@ pub const Plan = struct {
     count: usize = 0,
     event_count: usize = 0,
     peak: usize = 0,
-    output: usize = 0,
+    output: ?usize = null,
+    sealed: bool = false,
     valid: bool = true,
     fn event(self: *Plan, slot: usize, is_alloc: bool) void {
         if (self.event_count == self.events.len) {
@@ -38,17 +49,17 @@ pub const Plan = struct {
         self.event_count += 1;
     }
     pub fn allocate(self: *Plan, bytes: usize, pointer: DevicePointer) void {
-        if (!self.valid) return;
+        if (!self.valid or self.sealed) return;
         if (self.count == self.allocations.len or bytes > limit) {
             self.valid = false;
             return;
         }
-        const extent = std.mem.alignForward(usize, bytes, 256);
+        const extent = std.mem.alignForward(usize, bytes, alignment);
         var offset: usize = 0;
         while (true) {
             var next = offset;
-            for (self.allocations[0..self.count]) |a| if (a.live and offset < a.offset + std.mem.alignForward(usize, a.bytes, 256) and a.offset < offset + extent) {
-                next = @max(next, a.offset + std.mem.alignForward(usize, a.bytes, 256));
+            for (self.allocations[0..self.count]) |a| if (a.live and offset < a.offset + std.mem.alignForward(usize, a.bytes, alignment) and a.offset < offset + extent) {
+                next = @max(next, a.offset + std.mem.alignForward(usize, a.bytes, alignment));
             };
             if (next == offset) break;
             offset = next;
@@ -63,7 +74,7 @@ pub const Plan = struct {
         self.peak = @max(self.peak, offset + extent);
     }
     pub fn release(self: *Plan, pointer: DevicePointer) void {
-        if (!self.valid) return;
+        if (!self.valid or self.sealed) return;
         for (self.allocations[0..self.count], 0..) |*a, i| if (a.live and a.pointer == pointer) {
             a.live = false;
             self.event(i, false);
@@ -71,19 +82,35 @@ pub const Plan = struct {
         };
     }
     pub fn finishNoOutput(self: *Plan) bool {
-        for (self.allocations[0..self.count]) |a| if (a.live) {
-            self.valid = false;
-        };
+        return self.seal(null);
+    }
+
+    pub fn finish(self: *Plan, pointer: DevicePointer) bool {
+        return self.seal(pointer);
+    }
+
+    fn seal(self: *Plan, expected: ?DevicePointer) bool {
+        if (self.sealed) return false;
+        for (self.allocations[0..self.count], 0..) |allocation, index| {
+            if (!allocation.live) continue;
+            if (expected != allocation.pointer or self.output != null) self.valid = false;
+            self.output = index;
+        }
+        self.valid = self.valid and (expected == null) == (self.output == null);
+        self.sealed = self.valid;
         return self.valid;
     }
-    pub fn finish(self: *Plan, pointer: DevicePointer) bool {
-        var live: usize = 0;
-        for (self.allocations[0..self.count], 0..) |a, i| if (a.live) {
-            live += 1;
-            if (a.pointer == pointer) self.output = i else self.valid = false;
+
+    pub fn layout(self: *const Plan, prefix_bytes: usize) !Layout {
+        if (!self.sealed or !self.valid or self.peak == 0 or prefix_bytes % alignment != 0 or
+            prefix_bytes > limit or self.peak > limit - prefix_bytes) return error.InvalidExecutionPlan;
+        const output = if (self.output) |index| self.allocations[index] else null;
+        return .{
+            .bytes = prefix_bytes + self.peak,
+            .scratch_offset = prefix_bytes,
+            .events = self.event_count,
+            .output = if (output) |region| .{ .offset = prefix_bytes + region.offset, .bytes = region.bytes } else null,
         };
-        self.valid = self.valid and live == 1;
-        return self.valid;
     }
 };
 pub const Scope = struct {
@@ -98,6 +125,14 @@ pub const Scope = struct {
     output_bytes: usize = 0,
     output_active: bool = false,
     output_taken: bool = false,
+    /// Bind the funded byte range before recording or submitting any kernels.
+    pub fn bind(plan: *Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
+        if (backing == 0 or backing % alignment != 0 or layout.bytes > backing_bytes or
+            backing > @as(DevicePointer, std.math.maxInt(DevicePointer)) - @as(DevicePointer, layout.bytes) or
+            !std.meta.eql(layout, try plan.layout(layout.scratch_offset))) return error.InvalidExecutionPlan;
+        return .{ .plan = plan, .base = backing + layout.scratch_offset };
+    }
+
     pub fn owns(self: *const Scope, pointer: DevicePointer) bool {
         return self.base != 0 and pointer >= self.base and pointer - self.base < self.plan.peak;
     }
@@ -167,4 +202,21 @@ test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
     const allocated = try scope.allocate(256);
     try std.testing.expectEqual(address, allocated);
     try std.testing.expect(scope.owns(allocated));
+}
+
+test "stream workspace binds the exact sealed layout and retains its published span" {
+    var plan: Plan = .{};
+    try std.testing.expectError(error.InvalidExecutionPlan, plan.layout(0));
+    plan.allocate(4, 1000);
+    try std.testing.expect(plan.finish(1000));
+    const layout = try plan.layout(alignment);
+    try std.testing.expectEqual(2 * alignment, layout.bytes);
+    try std.testing.expectEqual(alignment, layout.output.?.offset);
+    try std.testing.expectEqual(@as(usize, 4), layout.output.?.bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, plan.layout(1));
+    try std.testing.expectError(error.InvalidExecutionPlan, Scope.bind(&plan, layout, 0x1000, layout.bytes - 1));
+    var scope = try Scope.bind(&plan, layout, 0x1000, layout.bytes);
+    try std.testing.expectEqual(@as(DevicePointer, 0x1100), try scope.allocate(4));
+    plan.release(1000);
+    try std.testing.expectEqualDeep(layout, try plan.layout(alignment));
 }

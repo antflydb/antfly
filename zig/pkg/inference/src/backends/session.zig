@@ -65,6 +65,9 @@ pub const ResidentOutputs = struct {
     // Ordinary outputs allocate no shared holder; view producers promote once.
     resource_hold: ?Session.ModelLifetime.ResourcePin = null,
     retirement_shell: ?@import("../execution/resource_retirement.zig").PreparedCharge = null,
+    // Independent physical output leases may require a fresh cleanup epoch
+    // on the final outside release, after the producer's epoch has sealed.
+    physical_backing_requires_epoch: bool = false,
 
     pub const BackendOwnerCleanupServices = struct {
         accepts: *const fn (*const ResidentOutputs) bool,
@@ -237,10 +240,10 @@ pub const ResidentOutputs = struct {
     /// False leaves the source owning the same already-executed result; callers
     /// may materialize that result, but must never replay its invocation.
     pub fn prepareResidentConsumer(self: *ResidentOutputs, current: @import("../execution/cleanup_context.zig").Context) !bool {
-        if (comptime @import("build_options").enable_native) if (self.backend.vtable == &@import("../ops/native_compute.zig").vtable_impl and self.backend.operationToken() == null) {
+        if (@import("../ops/native_compute.zig").isCanonicalVTable(self.backend.vtable) and self.backend.operationToken() == null) {
             if (current.operation != null) return false;
             return true;
-        };
+        }
         const services = self.backend_owner_cleanup_services orelse return false;
         if (services.detach_dense_f32 == null or !services.accepts(self)) return false;
         const operation = current.operation orelse return false;
@@ -287,13 +290,27 @@ pub const ResidentOutputs = struct {
     pub fn deinitWithBoundary(self: *ResidentOutputs, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
         self.deinitWithCleanup(.{ .boundary = boundary });
     }
+    noinline fn deinitOutsidePhysical(self: *ResidentOutputs) void {
+        const fatal = @import("antfly_platform").inference_process_supervisor.restartWorker;
+        const model = self.model_retention orelse fatal();
+        var sink = model.retainRetirementSink() catch fatal();
+        defer sink.release();
+        var guard = sink.enter() catch fatal();
+        defer guard.finish();
+        var epoch = guard.retainEpoch() catch fatal();
+        defer epoch.release();
+        self.deinitWithCleanup(.{ .boundary = &epoch });
+    }
+
     pub fn deinitWithCleanup(self: *ResidentOutputs, current: @import("../execution/cleanup_context.zig").Context) void {
+        if (self.resource_hold == null and self.physical_backing_requires_epoch and current.outside_execution)
+            return self.deinitOutsidePhysical();
         const boundary = current.boundary;
         // A missing current B is not the explicit raw outside API contract.
         // Validate before clearing a published pin, decrementing any owner or
         // invoking a backend callback on an admitted/retained concrete owner.
         if (!current.outside_execution and boundary == null and
-            (self.resource_lease != null or self.resource_hold != null or self.backend_owner_cleanup_services != null))
+            (self.resource_lease != null or self.resource_hold != null or self.backend_owner_cleanup_services != null or self.physical_backing_requires_epoch))
             @import("antfly_platform").inference_process_supervisor.restartWorker();
         if (self.resource_hold) |pin| {
             self.outputs = &.{};
@@ -610,9 +627,8 @@ pub const RunAdmission = struct {
         if (request.workspace_planned and request.workspace_bytes == 0) return error.ResourceLimitExceeded;
         const declared_workspace = @max(request.workspace_bytes, try self.profiledWorkspace(request));
         const mandatory_static = if (!request.workspace_planned and self.static_workspace_kind == .mandatory) self.static_workspace_bytes else 0;
-        const opaque_workspace = try addBytes(@max(declared_workspace, mandatory_static), self.opaque_workspace_bytes);
+        const declared_floor = @max(declared_workspace, mandatory_static);
         const legacy_workspace = @max(@max(dynamic_workspace, declared_workspace), if (request.workspace_planned) @as(usize, 0) else self.static_workspace_bytes);
-        const workspace = try addBytes(legacy_workspace, self.opaque_workspace_bytes);
         const resident_input_bytes = try addBytes(
             try addBytes(request.host_preprocess_bytes, input_bytes),
             try self.profiledHostScratch(request),
@@ -636,16 +652,13 @@ pub const RunAdmission = struct {
         const retained_backend_credit = if (self.backend_workspace_reserved)
             0
         else
-            @min(workspace, request.retained_backend_workspace_bytes);
+            @min(legacy_workspace, request.retained_backend_workspace_bytes);
+        // A prepaid arena or a retained frame covers its own declared work.
+        // Independent provider scratch is outside either owner's envelope.
         const compatibility: memory.AdmissionAmounts = switch (self.backend_class) {
-            .cpu => .{ .host_scratch_bytes = workspace },
+            .cpu => .{ .host_scratch_bytes = try addBytes(legacy_workspace, self.opaque_workspace_bytes) },
             .gpu => .{
-                // Request IO remains protected host storage. Device staging,
-                // activations and outputs share this compatibility workspace.
-                .backend_scratch_bytes = if (self.backend_workspace_reserved)
-                    0
-                else
-                    workspace - retained_backend_credit,
+                .backend_scratch_bytes = try addBytes(if (self.backend_workspace_reserved) 0 else legacy_workspace - retained_backend_credit, self.opaque_workspace_bytes),
             },
         };
         const required = try protected.merge(compatibility);
@@ -653,8 +666,8 @@ pub const RunAdmission = struct {
             .protected = protected,
             .compatibility = compatibility,
             .opaque_compatibility = switch (self.backend_class) {
-                .cpu => .{ .host_scratch_bytes = opaque_workspace },
-                .gpu => .{ .backend_scratch_bytes = if (self.backend_workspace_reserved) 0 else opaque_workspace - @min(opaque_workspace, request.retained_backend_workspace_bytes) },
+                .cpu => .{ .host_scratch_bytes = try addBytes(declared_floor, self.opaque_workspace_bytes) },
+                .gpu => .{ .backend_scratch_bytes = try addBytes(if (self.backend_workspace_reserved) 0 else declared_floor - @min(declared_floor, retained_backend_credit), self.opaque_workspace_bytes) },
             },
             .required = required,
             .retained_host_credit = request.pre_admitted_host_bytes,
@@ -2655,6 +2668,7 @@ pub const Session = struct {
                 const active = control orelse return err;
                 if (active.deadline_ns == null) return err;
                 try active.check();
+                if (comptime @import("builtin").single_threaded) return err;
                 std.Thread.yield() catch {};
                 continue;
             };
@@ -3000,53 +3014,6 @@ pub const Session = struct {
         return bytes;
     }
 
-    /// Detach a lone surviving row from larger immutable host-cache columns.
-    /// All candidates must be exclusive; reserve old/new overlap before copying
-    /// and commit only after every copy and ownership descriptor succeeds.
-    pub fn compactExclusiveRows(self: Session, allocator: std.mem.Allocator, tensors: []Tensor, minimum_saving: usize, control: ?InferenceExecutionControl) !bool {
-        var count: usize = 0;
-        var bytes: usize = 0;
-        var saving: usize = 0;
-        for (tensors) |tensor| {
-            const storage = tensor.shared_storage orelse continue;
-            if (tensor.data.len == 0 or tensor.data.len > storage.len / 2) continue;
-            const lifetime = tensor.lifetime orelse return false;
-            const exclusive = lifetime.is_exclusive orelse return false;
-            if (!exclusive(lifetime.context) or tensor.dtype != .f32 or !std.mem.startsWith(u8, tensor.name, "present.")) return false;
-            count += 1;
-            bytes = try addBytes(bytes, try addBytes(tensor.data.len, try mulBytes(tensor.shape.len, @sizeOf(i64))));
-            saving = try addBytes(saving, storage.len - tensor.data.len);
-        }
-        if (count == 0 or saving < minimum_saving) return false;
-        if (control) |active| try active.check();
-        var lease: ?memory.AdmissionLease = if (self.run_admission) |admission| try admission.acquireAmounts(.{
-            .host_kv_bytes = bytes,
-            .host_scratch_bytes = try addBytes(@sizeOf(OutputAdmission), try mulBytes(count, @sizeOf(Tensor) + @sizeOf(usize) + @sizeOf(OutputAdmission.Entry) + @sizeOf(OutputCredits.Entry))),
-        }) else null;
-        defer if (lease) |*active| active.release();
-        const copies = try allocator.alloc(Tensor, count);
-        defer allocator.free(copies);
-        const indices = try allocator.alloc(usize, count);
-        defer allocator.free(indices);
-        var initialized: usize = 0;
-        errdefer for (copies[0..initialized]) |*copy| copy.deinit();
-        for (tensors, 0..) |tensor, index| {
-            const storage = tensor.shared_storage orelse continue;
-            if (tensor.data.len == 0 or tensor.data.len > storage.len / 2) continue;
-            if (control) |active| try active.check();
-            copies[initialized] = try Tensor.initFloat32(allocator, tensor.name, tensor.shape, tensor.asFloat32());
-            indices[initialized] = index;
-            initialized += 1;
-        }
-        if (control) |active| try active.check();
-        _ = try attachOutputAdmission(copies, allocator, &lease, self.resourcePin());
-        for (copies, indices) |copy, index| {
-            tensors[index].deinit();
-            tensors[index] = copy;
-        }
-        return true;
-    }
-
     /// Allocation-free planning against permanent session limits. This is not
     /// a reservation: live pressure is still checked by admit at execution.
     /// Callers must include all retained input storage, without lease credits.
@@ -3216,14 +3183,15 @@ pub const Session = struct {
         defer if (protection) |*scope| scope.deinit();
         var metadata = std.heap.ArenaAllocator.init(allocator);
         defer metadata.deinit();
-        const info = try metadata.allocator().alloc(TensorInfo, inputs.len);
+        var stage_info: [8]TensorInfo = undefined;
+        const info = if (inputs.len <= stage_info.len) stage_info[0..inputs.len] else try metadata.allocator().alloc(TensorInfo, inputs.len);
         for (inputs, self.inputInfo(), info) |input, declared, *actual| {
             actual.* = switch (input) {
                 .host => |host| .{ .name = host.name, .dtype = host.dtype, .shape = host.shape },
                 .resident => |value| .{
                     .name = declared.name,
                     .dtype = declared.dtype,
-                    .shape = try value.backend.tensorShape(value.value, metadata.allocator()),
+                    .shape = try stageInputShape(value, metadata.allocator()),
                 },
             };
         }
@@ -3237,6 +3205,14 @@ pub const Session = struct {
         permit.lease = null;
         self.pinResident(&outputs);
         return outputs;
+    }
+
+    fn stageInputShape(value: ResidentInput, allocator: std.mem.Allocator) ![]const i64 {
+        // Reuse the producer's existing dimensions only after the receiving
+        // call verifies them against the actual tensor. A backend without a
+        // metadata match hook keeps the ordinary shape query.
+        if (value.shape.len != 0 and (try value.backend.tensorShapeMatches(value.value, value.shape) orelse false)) return value.shape;
+        return value.backend.tensorShape(value.value, allocator);
     }
 
     /// Multi-entry models declare their logical stage ABI alongside the
@@ -3786,6 +3762,7 @@ pub const PreparedSource = struct {
     /// SAME original permit. No Source field interprets model/tree/cache keys.
     /// Every optional decline precedes math and leaves original untouched.
     fn prepareNativeMatrixCallOutsideExecution(self: *PreparedSource, original: *RunPermit, preprocessing: ?*const RunPermit, inputs: []const Tensor, geometry: ops.kernel_descriptor.NativeMatrixScratchGeometry) !bool {
+        if (comptime !@import("build_options").enable_native) return false;
         const adapter = @import("../execution/architecture_session.zig");
         const source = original.session;
         const policy = source.run_admission orelse return false;
@@ -4230,6 +4207,7 @@ pub const PreparedSource = struct {
     }
 
     fn bindNativeWeightControl(self: *PreparedSource, include_weights: bool) !void {
+        if (comptime !@import("build_options").enable_native) return;
         const weights = include_weights and self.sourceSession().nativeWeightPreparationReceiver();
         const panels = self.sourceSession().nativePanelPreparationReceiver();
         if (!weights and !panels) return;
@@ -4286,7 +4264,7 @@ pub const PreparedSource = struct {
         const value = if (outputs.*) |*actual| actual else return error.MissingSourceOutputs;
         if (self.usesPrepaidWorkspace()) {
             if (comptime !@import("build_options").enable_native) return error.InvalidSourceWorkspace;
-            if (value.backend.vtable != &@import("../ops/native_compute.zig").vtable_impl or value.backend.operationToken() != null) return error.InvalidSourceWorkspace;
+            if (!@import("../ops/native_compute.zig").isCanonicalVTable(value.backend.vtable) or value.backend.operationToken() != null) return error.InvalidSourceWorkspace;
             if (self.selectedPermit().lease == null or value.resource_lease != null) return error.InvalidSourceWorkspace;
             const model = self.source_model orelse return error.MissingSourceModelLifetime;
             if (value.model_retention != model) return error.ResidentOutputsOwnerChanged;
@@ -4476,6 +4454,7 @@ pub const PreparedSource = struct {
     }
 
     pub fn borrowNativeMatrixScratchCall(loan: *const @import("../execution/invocation_context.zig").NativeWeights, cb: *const ops.ComputeBackend, expected_data: *const @import("../ops/native_compute.zig").WeightStore) !?*@import("../execution/architecture_session.zig").NativeMatrixScratchReceiver {
+        if (comptime !@import("build_options").enable_native) return error.UnsupportedBackend;
         if (loan.access != nativeWeightAccess or loan.prepare_dense != nativeDensePreparation or loan.prepare_projection != nativeProjectionPreparation) return error.ForeignNativeWeightModel;
         const self: *PreparedSource = @ptrCast(@alignCast(loan.ptr));
         if (self.phase != .executing or self.native_weight_paused) return error.ForeignNativeWeightModel;
@@ -4616,6 +4595,7 @@ pub const PreparedSource = struct {
         finished = true;
     }
     fn nativeDensePreparation(raw: *anyopaque, cb: *const ops.ComputeBackend, request: *const ops.NativeLinearPreparation) anyerror!?ops.NativeLinearPrepared {
+        if (comptime !@import("build_options").enable_native) return error.UnsupportedBackend;
         const self: *PreparedSource = @ptrCast(@alignCast(raw));
         if (self.phase != .executing or self.native_weight_paused) return error.NativeWeightPreparationReentered;
         const current = self.epoch() orelse return error.MissingCurrentCleanupEpoch;
@@ -4719,6 +4699,7 @@ pub const PreparedSource = struct {
         return .{ .policy_signature = signature, .selected_mask = mask, .ready_mask = ready_mask, .fallback_direct = fallback };
     }
     fn nativeProjectionPreparation(raw: *anyopaque, cb: *const ops.ComputeBackend, request: *const ops.LinearTripleInvocation) anyerror!bool {
+        if (comptime !@import("build_options").enable_native) return error.UnsupportedBackend;
         const self: *PreparedSource = @ptrCast(@alignCast(raw));
         if (self.phase != .executing or self.native_weight_paused) return error.NativeWeightPreparationReentered;
         const current = self.epoch() orelse return error.MissingCurrentCleanupEpoch;
@@ -4765,6 +4746,7 @@ pub const PreparedSource = struct {
         return error.ResourceTemporarilyUnavailable;
     }
     fn nativeWeightAccess(raw: *anyopaque, cb: *const ops.ComputeBackend, name: []const u8, access: @import("../execution/invocation_context.zig").NativeWeights.Access) anyerror!?ops.CT {
+        if (comptime !@import("build_options").enable_native) return error.UnsupportedBackend;
         const self: *PreparedSource = @ptrCast(@alignCast(raw));
         if (self.phase != .executing or self.native_weight_paused) return error.NativeWeightPreparationReentered;
         const source = self.sourceSession();
@@ -5774,10 +5756,16 @@ pub const RunPermit = struct {
     }
 
     fn runStageInputsWithinBoundary(self: *RunPermit, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+        if (self.prepared) |*selected| if (selected.validate_stage_controls) |validate| {
+            try validate(selected, inputs);
+            selected.stage_controls_validated = true;
+        };
         const shared = self.session.shared_compute_context.?;
         const backend = shared.stableBackend();
-        const resident = try allocator.alloc(ResidentInput, inputs.len);
-        defer allocator.free(resident);
+        var stage_inputs: [8]ResidentInput = undefined;
+        const allocate = inputs.len > stage_inputs.len;
+        const resident = if (allocate) try allocator.alloc(ResidentInput, inputs.len) else stage_inputs[0..inputs.len];
+        defer if (allocate) allocator.free(resident);
         var initialized: usize = 0;
         defer for (inputs[0..initialized], resident[0..initialized]) |input, value| {
             if (input == .host) backend.free(value.value);
@@ -5786,7 +5774,7 @@ pub const RunPermit = struct {
             if (control) |active| try active.check();
             value.* = switch (input) {
                 .host => |host| .{
-                    .value = try shared.importHostTensor(allocator, &host),
+                    .value = try shared.importReadOnlyHostTensor(allocator, &host),
                     .backend = backend,
                     .shape = host.shape,
                     .estimated_bytes = host.data.len,
@@ -6499,75 +6487,6 @@ test "forced run admission denials are counted and recover" {
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }
 
-test "session output admission row compaction rolls back allocation and capacity failures" {
-    const Source = struct {
-        tensor: Tensor,
-        permit: RunPermit,
-        released: bool = false,
-        fn exclusive(_: *anyopaque) bool {
-            return true;
-        }
-        fn release(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            std.debug.assert(!self.released);
-            self.tensor.deinit();
-            self.permit.deinit();
-            self.released = true;
-        }
-        fn check(allocator: std.mem.Allocator, deny: bool, cancel: bool) !void {
-            const Source = @This();
-            const CancelAfterCopy = struct {
-                checks: usize = 0,
-                fn check(raw: ?*anyopaque) !void {
-                    const self: *@This() = @ptrCast(@alignCast(raw.?));
-                    self.checks += 1;
-                    if (self.checks == 3) return error.InferenceCancelled;
-                }
-            };
-            var cancellation = CancelAfterCopy{};
-            var controller = memory.AdmissionController{};
-            defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
-            const session = Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{
-                .controller = &controller,
-                .backend_class = .cpu,
-                .limits = .{ .host_limit_bytes = if (deny) 64 else 0 },
-                .static_workspace_bytes = 1,
-                .check_live_memory = false,
-            } };
-            var source = Source{
-                .tensor = try Tensor.initFloat32(std.testing.allocator, "present.0.decoder.key", &.{ 4, 2 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }),
-                .permit = try session.admitHostPreprocess(48),
-            };
-            var row = source.tensor.borrowedView(source.tensor.name);
-            row.data = source.tensor.data[0..8];
-            row.shape = &.{ 1, 2 };
-            row.shared_storage = source.tensor.data;
-            row.lifetime = .{ .context = &source, .release = Source.release, .is_exclusive = Source.exclusive };
-            defer row.deinit();
-            const slice = @as([*]Tensor, @ptrCast(&row))[0..1];
-            const compacted = session.compactExclusiveRows(allocator, slice, 0, if (cancel) .{ .ptr = &cancellation, .check_fn = CancelAfterCopy.check } else null) catch |err| {
-                try std.testing.expect(!source.released);
-                try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row.asFloat32());
-                if (deny) {
-                    try std.testing.expect(err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable);
-                    return;
-                }
-                if (cancel) {
-                    try std.testing.expectEqual(error.InferenceCancelled, err);
-                    return;
-                }
-                return err;
-            };
-            try std.testing.expect(!deny and !cancel and compacted and source.released);
-            try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row.asFloat32());
-            try std.testing.expectEqual(@as(usize, 24), controller.snapshot().hostTotalBytes());
-        }
-    };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Source.check, .{ false, false });
-    try Source.check(std.testing.allocator, true, false);
-    try Source.check(std.testing.allocator, false, true);
-}
-
 test "session output admission coalesces cache column callbacks" {
     const Probe = struct {
         retains: usize = 0,
@@ -6936,6 +6855,36 @@ test "run request plan preserves exact protected compatibility and uncredited pe
             try std.testing.expectEqual(@as(usize, if (kind == .cpu) 2288 else 240), plan.required.host_scratch_bytes);
             try std.testing.expectEqual(@as(usize, if (kind == .cpu) 2304 else 256), (try plan.uncredited()).host_scratch_bytes);
         }
+    }
+}
+
+test "opaque provider workspace is independent of prepared and prepaid workspace" {
+    var controller = memory.AdmissionController{};
+    const request: RunRequest = .{
+        .batch = 1,
+        .sequence = 1,
+        .input_bytes = 4,
+        .output_bytes = 4,
+        .workspace_planned = true,
+        .workspace_bytes = 64,
+        .retained_backend_workspace_bytes = 128,
+    };
+    var admission: RunAdmission = .{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .limits = .{},
+        .static_workspace_bytes = 0,
+        .opaque_workspace_bytes = 32,
+        .check_live_memory = false,
+    };
+    for ([_]bool{ false, true }) |reserved| {
+        admission.backend_workspace_reserved = reserved;
+        const plan = try admission.planRequest(request, &.{});
+        try std.testing.expectEqual(@as(usize, 32), plan.required.backend_scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 32), plan.opaque_compatibility.backend_scratch_bytes);
+        try std.testing.expectEqual(@as(usize, if (reserved) 0 else 64), plan.retained_backend_credit);
+        try std.testing.expect(try plan.required.fitsLimits(.{ .backend_limit_bytes = 32 }));
+        try std.testing.expect(!try plan.required.fitsLimits(.{ .backend_limit_bytes = 31 }));
     }
 }
 

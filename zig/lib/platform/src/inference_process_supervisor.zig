@@ -22,6 +22,7 @@ const lifeline_env = "ANTFLY_INFERENCE_SUPERVISOR_LIFELINE";
 pub const restart_exit_code: u8 = 86;
 
 pub fn restartWorker() noreturn {
+    if (comptime builtin.os.tag == .freestanding) @trap();
     @import("process.zig").exitImmediately(restart_exit_code);
 }
 
