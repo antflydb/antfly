@@ -69,7 +69,7 @@ pub const SplitCut = struct {
             if (err == error.NotFound) return null;
             return err;
         };
-        const cut = try decode(raw);
+        const cut = try SplitCut.decode(raw);
         if (cut.successor_group != group or !std.mem.eql(u8, &cut.boundary, &boundary)) return error.HistoryCorrupt;
         return cut;
     }

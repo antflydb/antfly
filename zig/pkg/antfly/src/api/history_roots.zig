@@ -263,10 +263,7 @@ pub const Source = struct {
     pub fn prepareRetiredSplitHandoff(self: Source, a: A, captured: *const Captured, state: control.State, stored: control.Root, context: Context) !?control.Mutation {
         const physical = stored.physical orelse return null;
         if (stored.released or stored.split_handoff != null or stored.merge_drain != null) return null;
-        const predecessor = captured.findInstalled(stored) catch |err| switch (err) {
-            error.ChangefeedResynchronizationRequired => return null,
-            else => return err,
-        };
+        const predecessor = captured.findInstalled(stored) catch return null;
         const port = self.split_cut orelse return error.ChangefeedCapabilityUnsupported;
         const owners = self.artifact_owners orelse return error.ChangefeedCapabilityUnsupported;
         var generation: ?u64 = null;
