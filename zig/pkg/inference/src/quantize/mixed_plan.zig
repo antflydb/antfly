@@ -58,15 +58,70 @@ pub const Item = struct {
 /// Tensors a runtime executes as one fused kernel, which accepts only some
 /// format combinations. The allocator treats a group as one item: every
 /// member in one shared format from `uniform_formats` (any measured format
-/// when null), or one of `extra_combos` (formats in member order). Splitting
-/// such tensors otherwise falls off the fused path; on Metal decode,
-/// mismatched FFN gate/up leave the fused block entirely.
+/// when null), or one of `extra_combos` (formats in member order). A group
+/// with a `kind` takes its formats from `fusionRule` for the selected
+/// `FusionTarget` instead. Splitting such tensors otherwise falls off the
+/// fused path; on Metal decode, mismatched FFN gate/up leave the fused block.
 pub const Group = struct {
     name: []const u8,
     members: []const []const u8,
+    kind: ?FusionKind = null,
     uniform_formats: ?[]const []const u8 = null,
     extra_combos: []const []const []const u8 = &.{},
 };
+
+/// The fused kernels a plan should stay on.
+pub const FusionKind = enum {
+    /// FFN gate and up projections (members: gate, up).
+    gate_up,
+    /// Attention Q, K and V projections (members: q, k, v).
+    qkv,
+};
+
+/// Which runtime's fusions a plan keeps. `portable` keeps only combinations
+/// fused on both Metal and CUDA, so one file is fast on either.
+pub const FusionTarget = enum { portable, metal, cuda };
+
+pub const FusionRule = struct {
+    uniform: []const []const u8,
+    extra: []const []const []const u8 = &.{},
+};
+
+const q4_q8_formats: []const []const u8 = &.{ "q4_0", "q4_k", "q8_0" };
+const metal_block_formats: []const []const u8 = &.{ "q4_0", "q4_k", "q5_k", "q6_k", "q8_0" };
+const metal_qkv_extra: []const []const []const u8 = &.{&.{ "q5_k", "q4_k", "q4_k" }};
+
+/// Format combinations each runtime fuses, from its dispatch code:
+/// - Metal FFN gate/up: one shared format admitted by
+///   `directQuantizedBlockFormatForKind`; otherwise the layer leaves the
+///   fused quantized decode block (`directQuantizedBlockFormatForRequest`).
+/// - Metal Q/K/V: `tryApplyQuantizedRuntimeLinearQkv` fuses all q4_0, all
+///   q4_k, all q8_0, or q5_k/q4_k/q4_k; other mixes run three matmuls.
+/// - CUDA FFN gate/up: `linearNoBiasPair` fuses both q8_0, q4_0 or q4_k;
+///   other pairs run two matmuls (`linear_pair_fallbacks`).
+/// - CUDA Q/K/V: `linearNoBiasQkv` fuses all q8_0, q4_0 or q4_k.
+pub fn fusionRule(kind: FusionKind, target: FusionTarget) FusionRule {
+    return switch (target) {
+        .portable, .cuda => .{ .uniform = q4_q8_formats },
+        .metal => switch (kind) {
+            .gate_up => .{ .uniform = metal_block_formats },
+            .qkv => .{ .uniform = q4_q8_formats, .extra = metal_qkv_extra },
+        },
+    };
+}
+
+/// Whether `formats` (in member order) runs fused on `target`.
+pub fn fusedComboAllowed(kind: FusionKind, target: FusionTarget, formats: []const []const u8) bool {
+    const rule = fusionRule(kind, target);
+    if (allSame(formats) and containsFormat(rule.uniform, formats[0])) return true;
+    for (rule.extra) |combo| {
+        if (combo.len != formats.len) continue;
+        var same = true;
+        for (combo, formats) |x, y| same = same and std.mem.eql(u8, x, y);
+        if (same) return true;
+    }
+    return false;
+}
 
 pub const SensitivityFile = struct {
     schema: []const u8,
@@ -435,6 +490,8 @@ pub const SelectOptions = struct {
     untied: bool = false,
     /// Only consider these formats; null keeps every measured candidate.
     formats: ?[]const []const u8 = null,
+    /// Fusion rules for groups that declare a `kind`.
+    fusion_target: FusionTarget = .portable,
 };
 
 /// One format per input tensor, aligned with the `items` passed to `select`.
@@ -519,15 +576,18 @@ pub fn select(
         var candidates = std.ArrayListUnmanaged(Candidate).empty;
         var combos = std.ArrayListUnmanaged([]const []const u8).empty;
         // Uniform combinations: a format every member was measured in.
+        const rule: ?FusionRule = if (group.kind) |kind| fusionRule(kind, options.fusion_target) else null;
+        const uniform_formats = if (rule) |r| r.uniform else group.uniform_formats;
+        const extra_combos = if (rule) |r| r.extra else group.extra_combos;
         for (items[members[0]].candidates) |first| {
-            if (group.uniform_formats) |allowed| {
+            if (uniform_formats) |allowed| {
                 if (!containsFormat(allowed, first.format)) continue;
             }
             const combo = try a.alloc([]const u8, members.len);
             @memset(combo, first.format);
             try appendCombo(a, items, members, combo, options, &candidates, &combos);
         }
-        for (group.extra_combos) |combo| {
+        for (extra_combos) |combo| {
             if (combo.len != members.len) return error.InvalidGroup;
             try appendCombo(a, items, members, combo, options, &candidates, &combos);
         }
@@ -730,6 +790,9 @@ pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--untied")) {
             options.untied = true;
+        } else if (std.mem.eql(u8, arg, "--fusion-target") and i + 1 < args.len) {
+            options.fusion_target = std.meta.stringToEnum(FusionTarget, args[i + 1]) orelse return usage();
+            i += 1;
         } else {
             return usage();
         }
@@ -766,8 +829,8 @@ pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
     defer allocator.free(json);
     if (output_path) |out| {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = json });
-        std.debug.print("wrote plan to {s}: {d} tensors, {d} groups{s}, {d} bytes, {d:.4} bits/weight, loss {e}\n", .{
-            out,                   items.len,                 parsed.value.groups.len, if (options.untied) " ignored" else "",
+        std.debug.print("wrote plan to {s}: {d} tensors, {d} groups ({s}), {d} bytes, {d:.4} bits/weight, loss {e}\n", .{
+            out,                   items.len,                 parsed.value.groups.len, if (options.untied) "ignored" else @tagName(options.fusion_target),
             selection.total_bytes, selection.bitsPerWeight(), selection.total_loss,
         });
     } else {
@@ -777,14 +840,15 @@ pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
 
 fn usage() error{InvalidArguments} {
     std.debug.print(
-        \\usage: antfly inference quantize-plan --sensitivity <file.json> (--bits-per-weight <x> | --budget-bytes <n>) [--formats <csv>] [--untied] [--output <plan.json>]
+        \\usage: antfly inference quantize-plan --sensitivity <file.json> (--bits-per-weight <x> | --budget-bytes <n>) [--formats <csv>] [--fusion-target portable|metal|cuda | --untied] [--output <plan.json>]
         \\
         \\Chooses one format per tensor from a sensitivity file so the summed loss is
         \\smallest within the budget. The budget covers only the tensors the file lists.
         \\Tensors in a group (fused kernels such as FFN gate/up and attention Q/K/V)
-        \\get one of the group's allowed format combinations; --untied ignores groups
-        \\for backends without those fusions. --formats limits the candidates, e.g. to
-        \\the formats a target backend has fast routes for.
+        \\get a format combination the target runtime fuses: portable (default) keeps
+        \\only combinations fused on both Metal and CUDA, metal or cuda one runtime's.
+        \\--untied ignores groups for backends without those fusions. --formats limits
+        \\the candidates, e.g. to the formats a target backend has fast routes for.
         \\Apply the plan with: antfly inference export <model-dir> --target gguf --format <base> --quantize-plan <plan.json>
         \\
     , .{});
@@ -1085,6 +1149,40 @@ test "select honors extra combinations and the format filter" {
     try std.testing.expectError(error.GroupHasNoCandidates, select(allocator, &odd, &qkv, 1000, .{}));
     const missing = [_]Group{.{ .name = "bad", .members = &.{ "q", "nope" } }};
     try std.testing.expectError(error.InvalidGroup, select(allocator, &items, &missing, 1000, .{}));
+}
+
+test "fusion rules differ by target and portable is their intersection" {
+    try std.testing.expect(fusedComboAllowed(.qkv, .metal, &.{ "q5_k", "q4_k", "q4_k" }));
+    try std.testing.expect(!fusedComboAllowed(.qkv, .cuda, &.{ "q5_k", "q4_k", "q4_k" }));
+    try std.testing.expect(!fusedComboAllowed(.qkv, .metal, &.{ "q6_k", "q6_k", "q6_k" }));
+    try std.testing.expect(fusedComboAllowed(.gate_up, .metal, &.{ "q6_k", "q6_k" }));
+    try std.testing.expect(!fusedComboAllowed(.gate_up, .cuda, &.{ "q6_k", "q6_k" }));
+    try std.testing.expect(!fusedComboAllowed(.gate_up, .metal, &.{ "q4_k", "q6_k" }));
+    for ([_]FusionKind{ .gate_up, .qkv }) |kind| {
+        const members: usize = if (kind == .qkv) 3 else 2;
+        for ([_][]const u8{ "q4_0", "q4_k", "q5_k", "q6_k", "q8_0" }) |format| {
+            var combo: [3][]const u8 = .{ format, format, format };
+            const portable = fusedComboAllowed(kind, .portable, combo[0..members]);
+            const both = fusedComboAllowed(kind, .metal, combo[0..members]) and fusedComboAllowed(kind, .cuda, combo[0..members]);
+            try std.testing.expectEqual(both, portable);
+        }
+    }
+
+    const allocator = std.testing.allocator;
+    const candidates = [_]Candidate{
+        .{ .format = "q4_k", .bytes = 100, .loss = 10 },
+        .{ .format = "q6_k", .bytes = 150, .loss = 1 },
+        .{ .format = "q8_0", .bytes = 200, .loss = 0.5 },
+    };
+    const items = [_]Item{ testItem("blk.0.ffn_gate.weight", 400, &candidates), testItem("blk.0.ffn_up.weight", 400, &candidates) };
+    const groups = [_]Group{.{ .name = "blk.0.ffn_gate_up.weight", .members = &.{ "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight" }, .kind = .gate_up }};
+    var metal = try select(allocator, &items, &groups, 300, .{ .fusion_target = .metal });
+    defer metal.deinit();
+    try std.testing.expectEqualStrings("q6_k", metal.formats[0]);
+    var portable = try select(allocator, &items, &groups, 300, .{});
+    defer portable.deinit();
+    try std.testing.expectEqualStrings("q4_k", portable.formats[0]);
+    try std.testing.expectEqualStrings("q4_k", portable.formats[1]);
 }
 
 test "parse rejects unknown schemas and duplicate names" {

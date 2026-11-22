@@ -265,7 +265,7 @@ antfly inference export <model-dir> --target gguf --format q4_k \
 # 2. Allocate: one format per tensor, least summed loss within the budget.
 antfly inference quantize-plan --sensitivity sensitivity.json \
   --bits-per-weight 5.0 --output plan.json        # or --budget-bytes <n>
-  # [--formats q4_k,q6_k,q8_0] limits candidates; [--untied] ignores fused groups
+  # [--fusion-target portable|metal|cuda | --untied] [--formats q4_k,q6_k,q8_0]
 
 # 3. Export with the plan.
 antfly inference export <model-dir> --target gguf --format q4_k \
@@ -292,29 +292,19 @@ kernels: every tensor runs its own format's matmul, and Metal's fused decode
 block already takes a separate format for attention output, FFN gate/up, FFN
 down and PLE. Two fusions constrain formats across tensors:
 
-- FFN gate and up must share a format (`q4_0`, `q4_k`, `q5_k`, `q6_k` or
-  `q8_0`); otherwise the layer leaves the fused block
-  (`directQuantizedBlockFormatForRequest`) for slower per-op dispatch. For a
-  different fallback off the fused frame, `GEMMA4.md` measured about 5 tok/s
-  against about 52; the cost of this one has not been measured.
-- Attention Q/K/V fuse only as all `q4_0`, all `q4_k`, all `q8_0`, or
-  `q5_k`/`q4_k`/`q4_k` (`tryApplyQuantizedRuntimeLinearQkv`); other mixes run
-  as three separate matmuls.
+| Group | Metal fuses | CUDA fuses |
+|---|---|---|
+| FFN gate + up | one shared `q4_0`/`q4_k`/`q5_k`/`q6_k`/`q8_0`; otherwise the layer leaves the fused block | both `q4_0`, `q4_k` or `q8_0`; otherwise two matmuls |
+| Attention Q/K/V | all `q4_0`, `q4_k` or `q8_0`, or `q5_k`/`q4_k`/`q4_k`; otherwise three matmuls | all `q4_0`, `q4_k` or `q8_0`; otherwise three matmuls |
 
 `--quantize-sensitivity` writes these as `groups` (found by GGUF name,
 including `ffn_gate_exps`/`ffn_up_exps`), and `quantize-plan` gives each group
-one allowed combination. `--untied` drops the constraint for backends without
-these fusions, such as CPU encoders. `--quantize-plan` prints a warning for
-every group a plan splits. The default candidates are exactly the formats the
-fused block accepts.
-
-On Qwen3-0.6B (197 planned tensors, 56 groups, `weight_sse` loss), an untied
-5.5-bit plan split 29 groups; the tied plan split none, at 3%, 14% and 32% more
-proxy loss at 5.0, 5.5 and 6.0 bits. The cost grows with the budget because
-Q/K/V cannot rise past `q5_k`/`q4_k`/`q4_k` without jumping to `q8_0`: a fused
-QKV route for uniform `q5_k` or `q6_k` is the kernel these plans would use
-next. Measure decode speed and output-space loss on the target device before
-adding it.
+one combination its `--fusion-target` fuses: `portable` (default, fused on both
+runtimes), `metal` or `cuda`. `--untied` ignores groups. `--quantize-plan`
+prints a warning for every group a plan leaves unfused on Metal or CUDA. The
+rules and their dispatch-code sources are in `mixed_plan.fusionRule`; the
+design, measurements and qualification plan are in
+`docs/design/inference/mixed-precision-quantization.md`.
 
 Loss sources:
 
@@ -328,7 +318,11 @@ Loss sources:
   other planned tensor dense) and records the mean `1 - cos` against the dense
   model over a corpus. Its `evaluate` command compares plans with uniform
   formats by cosine loss and nearest-neighbor recall at equal file size.
-  Decoders would use token KL, Whisper WER, and GLiNER span F1 in the same way.
+  `scripts/quant_plan/torch_lm_sensitivity.py` does the same for decoders with
+  next-token KL against the dense model; Whisper (WER) and GLiNER (span F1)
+  would follow the same pattern. `scripts/quant_plan/bench_variants.py`
+  exports uniform and planned variants and reports decode speed, greedy
+  agreement and fusion fallback counters on Metal, CUDA or CPU.
 
 `scripts/quant_plan/torch_embedding_sensitivity.py` is the faster equivalent:
 it exports each candidate format once, uniformly, and swaps Antfly's

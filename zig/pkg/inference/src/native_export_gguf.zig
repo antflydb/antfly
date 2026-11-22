@@ -5569,8 +5569,9 @@ fn writeDenseRecordTransposed2d(
     try file.writeStreamingAll(io, transposed);
 }
 
-/// The formats Metal's fused decode block accepts (`fused_block_formats`),
-/// so default candidates never leave a layer without a fast route.
+/// The formats Metal's fused decode block accepts
+/// (`directQuantizedBlockFormatForKind`), so default candidates never leave a
+/// layer without a fast route there.
 const default_sensitivity_formats = "q4_0,q4_k,q5_k,q6_k,q8_0";
 
 fn parseSensitivityFormats(allocator: std.mem.Allocator, csv: []const u8) ![]QuantizationMode {
@@ -5692,18 +5693,11 @@ fn writeWeightSensitivity(
 }
 
 /// Tensors that runtimes execute as one fused kernel, found by GGUF name
-/// (llama.cpp naming: blk.N.ffn_gate*/ffn_up*, blk.N.attn_q/k/v). On Metal
-/// decode a layer stays in the fused quantized block only when FFN gate and
-/// up share a format (`directQuantizedBlockFormatForRequest`), and Q/K/V fuse
-/// only as all-q4_0, all-q4_k, all-q8_0 or q5_k/q4_k/q4_k
-/// (`tryApplyQuantizedRuntimeLinearQkv`). Plans keep these groups together
-/// unless `quantize-plan --untied` is used.
-const qkv_uniform_formats: []const []const u8 = &.{ "q4_0", "q4_k", "q8_0" };
-const qkv_extra_combos: []const []const []const u8 = &.{&.{ "q5_k", "q4_k", "q4_k" }};
-/// Formats `directQuantizedBlockFormatForKind` admits for the fused block.
-const fused_block_formats: []const []const u8 = &.{ "q4_0", "q4_k", "q5_k", "q6_k", "q8_0" };
-
-const FusedGroupKind = enum { gate_up, qkv };
+/// (llama.cpp naming: blk.N.ffn_gate*/ffn_up*, blk.N.attn_q/k/v). Which
+/// format combinations each runtime fuses lives in
+/// `mixed_plan.fusionRule`; plans keep these groups on them unless
+/// `quantize-plan --untied` is used.
+const FusedGroupKind = mixed_plan.FusionKind;
 
 fn fusedGroupSiblings(buffer: *[3][256]u8, name: []const u8) ?struct { kind: FusedGroupKind, members: [3][]const u8, len: usize } {
     if (!std.mem.startsWith(u8, name, "blk.")) return null;
@@ -5748,38 +5742,35 @@ fn fusedTensorGroups(arena: std.mem.Allocator, items: []const mixed_plan.Item) !
         try groups.append(arena, .{
             .name = group_name,
             .members = members,
-            .uniform_formats = if (siblings.kind == .qkv) qkv_uniform_formats else fused_block_formats,
-            .extra_combos = if (siblings.kind == .qkv) qkv_extra_combos else &.{},
+            .kind = siblings.kind,
         });
     }
     return groups.toOwnedSlice(arena);
 }
 
-/// Report planned formats that split a fused group; the export still works
-/// but runs those tensors outside the fused kernels.
+/// Report planned formats that leave a fused kernel on Metal or CUDA; the
+/// export still works but runs those tensors as separate matmuls.
 fn warnSplitFusedGroups(plan: *const ExportPlan) void {
     var buffer: [3][256]u8 = undefined;
     for (plan.tensors) |tensor| {
         const siblings = fusedGroupSiblings(&buffer, tensor.output_name) orelse continue;
-        var modes: [3]QuantizationMode = undefined;
+        var formats: [3][]const u8 = undefined;
         for (siblings.members[0..siblings.len], 0..) |member, i| {
-            modes[i] = for (plan.tensors) |other| {
-                if (std.mem.eql(u8, other.output_name, member)) break other.quantization;
+            formats[i] = for (plan.tensors) |other| {
+                if (std.mem.eql(u8, other.output_name, member)) break @tagName(other.quantization);
             } else return;
         }
-        const ok = switch (siblings.kind) {
-            .gate_up => modes[0] == modes[1] and
-                (modes[0] == .q4_0 or modes[0] == .q4_k or modes[0] == .q5_k or modes[0] == .q6_k or modes[0] == .q8_0),
-            .qkv => (modes[0] == modes[1] and modes[1] == modes[2] and
-                (modes[0] == .q4_0 or modes[0] == .q4_k or modes[0] == .q8_0)) or
-                (modes[0] == .q5_k and modes[1] == .q4_k and modes[2] == .q4_k),
-        };
-        if (!ok) print("warning: {s} and its fused siblings use {s}/{s}{s}{s}; Metal decode runs them outside the fused kernel\n", .{
+        const combo = formats[0..siblings.len];
+        const metal = mixed_plan.fusedComboAllowed(siblings.kind, .metal, combo);
+        const cuda = mixed_plan.fusedComboAllowed(siblings.kind, .cuda, combo);
+        if (metal and cuda) continue;
+        print("warning: {s} and its fused siblings use {s}/{s}{s}{s}; not fused on {s}\n", .{
             tensor.output_name,
-            @tagName(modes[0]),
-            @tagName(modes[1]),
+            formats[0],
+            formats[1],
             if (siblings.len == 3) "/" else "",
-            if (siblings.len == 3) @tagName(modes[2]) else "",
+            if (siblings.len == 3) formats[2] else "",
+            if (!metal and !cuda) "Metal or CUDA" else if (!metal) "Metal" else "CUDA",
         });
     }
 }
@@ -9542,7 +9533,8 @@ test "fused tensor groups follow GGUF names and keep plans on fused kernels" {
     try std.testing.expectEqual(@as(usize, 3), groups.len);
     try std.testing.expectEqualStrings("blk.0.attn_qkv", groups[0].name);
     try std.testing.expectEqual(@as(usize, 3), groups[0].members.len);
-    try std.testing.expectEqual(@as(usize, 1), groups[0].extra_combos.len);
+    try std.testing.expectEqual(mixed_plan.FusionKind.qkv, groups[0].kind.?);
+    try std.testing.expectEqual(mixed_plan.FusionKind.gate_up, groups[1].kind.?);
     try std.testing.expectEqualStrings("blk.0.ffn_gate_up.weight", groups[1].name);
     try std.testing.expectEqualStrings("blk.1.ffn_gate_up_exps.weight", groups[2].name);
     try std.testing.expectEqualStrings("blk.1.ffn_up_exps.weight", groups[2].members[1]);
@@ -9556,8 +9548,8 @@ test "fused tensor groups follow GGUF names and keep plans on fused kernels" {
     try std.testing.expectEqualStrings("q4_k", untied.formats[3]);
     try std.testing.expectEqualStrings("q5_k", untied.formats[4]);
 
-    // Tied: q takes the fused q5_k/q4_k/q4_k combination, and up cannot move without gate.
-    var tied = try mixed_plan.select(allocator, &items, groups, budget, .{});
+    // Tied for Metal: q takes the fused q5_k/q4_k/q4_k combination, and up cannot move without gate.
+    var tied = try mixed_plan.select(allocator, &items, groups, budget, .{ .fusion_target = .metal });
     defer tied.deinit();
     try std.testing.expectEqualStrings("q5_k", tied.formats[0]);
     try std.testing.expectEqualStrings("q4_k", tied.formats[1]);
@@ -9567,9 +9559,24 @@ test "fused tensor groups follow GGUF names and keep plans on fused kernels" {
 
     // With room for everything, Q/K/V still take a fused combination (q8_0),
     // never uniform q5_k/q6_k.
-    var roomy = try mixed_plan.select(allocator, &items, groups, 9 * 272, .{});
+    var roomy = try mixed_plan.select(allocator, &items, groups, 9 * 272, .{ .fusion_target = .metal });
     defer roomy.deinit();
     for (roomy.formats[0..3]) |format| try std.testing.expectEqualStrings("q8_0", format);
+
+    // Portable (the default): CUDA does not fuse q5_k/q4_k/q4_k, so q keeps
+    // q4_k and every group stays fused on both runtimes.
+    var portable = try mixed_plan.select(allocator, &items, groups, budget, .{});
+    defer portable.deinit();
+    for (groups) |group| {
+        var combo: [3][]const u8 = undefined;
+        for (group.members, 0..) |member, m| {
+            for (items, portable.formats) |item, format| {
+                if (std.mem.eql(u8, item.name, member)) combo[m] = format;
+            }
+        }
+        try std.testing.expect(mixed_plan.fusedComboAllowed(group.kind.?, .metal, combo[0..group.members.len]));
+        try std.testing.expect(mixed_plan.fusedComboAllowed(group.kind.?, .cuda, combo[0..group.members.len]));
+    }
 }
 
 test "mixed-precision flags parse and require a sensitivity target for formats" {
