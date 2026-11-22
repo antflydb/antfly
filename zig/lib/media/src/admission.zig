@@ -47,15 +47,18 @@ pub const Pool = struct {
         self.reclaimer = value;
     }
 
-    fn reclaim(self: *Pool, requested: Resources, existing_host_bytes: u64) bool {
+    fn reclaim(self: *Pool, requested: Resources, existing: Resources) bool {
         if (requested.host_bytes > self.limits.host_bytes or requested.device_bytes > self.limits.device_bytes or requested.commands > self.limits.commands) return false;
-        const growth = requested.host_bytes -| existing_host_bytes;
+        const growth = requested.host_bytes -| existing.host_bytes;
         if (growth == 0) return false;
         while (!self.reclaim_lock.tryLock()) std.atomic.spinLoopHint();
         defer self.reclaim_lock.unlock();
         const reclaimer = self.reclaimer orelse return false;
+        const used = self.snapshot();
+        if (requested.device_bytes -| existing.device_bytes > self.limits.device_bytes -| used.device_bytes or
+            requested.commands -| existing.commands > self.limits.commands -| used.commands) return false;
         // Another video worker may already have reclaimed the optional data.
-        if (growth <= self.limits.host_bytes -| self.snapshot().host_bytes) return true;
+        if (growth <= self.limits.host_bytes -| used.host_bytes) return true;
         return reclaimer.release(reclaimer.context);
     }
     fn lock(self: *Pool) void {
@@ -68,7 +71,7 @@ pub const Pool = struct {
     /// retry through its scheduler, retaining its original cancellation deadline.
     pub fn acquire(self: *Pool, requested: Resources) !Token {
         return self.acquireOnce(requested) catch |err| {
-            if (!self.reclaim(requested, 0)) return err;
+            if (!self.reclaim(requested, .{})) return err;
             return self.acquireOnce(requested);
         };
     }
@@ -98,7 +101,7 @@ pub const Token = struct {
     pub fn resize(self: *Token, requested: Resources) !void {
         self.resizeOnce(requested) catch |err| {
             const pool = self.pool orelse return err;
-            if (!pool.reclaim(requested, self.resources.host_bytes)) return err;
+            if (!pool.reclaim(requested, self.resources)) return err;
             return self.resizeOnce(requested);
         };
     }
@@ -289,3 +292,30 @@ pub const TrackedAllocator = struct {
         self.restore(self.live);
     }
 };
+
+test "host reclaim waits until device and command capacity are available" {
+    const Optional = struct {
+        token: Token,
+        calls: usize = 0,
+        fn release(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.token.deinit();
+            return true;
+        }
+    };
+    var pool = Pool{ .limits = .{ .host_bytes = 10, .device_bytes = 2, .commands = 2 } };
+    var optional = Optional{ .token = try pool.acquire(.{ .host_bytes = 8 }) };
+    defer optional.token.deinit();
+    var peer = try pool.acquire(.{ .device_bytes = 1, .commands = 1 });
+    defer peer.deinit();
+    var video = try pool.acquire(.{ .device_bytes = 1, .commands = 1 });
+    defer video.deinit();
+    pool.setReclaimer(.{ .context = &optional, .release = Optional.release });
+    defer pool.setReclaimer(null);
+    try std.testing.expectError(error.SharedAdmissionExceeded, pool.acquire(.{ .host_bytes = 4, .commands = 1 }));
+    try std.testing.expectError(error.SharedAdmissionExceeded, video.resize(.{ .host_bytes = 4, .device_bytes = 2, .commands = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), optional.calls);
+    try video.resize(.{ .host_bytes = 4, .device_bytes = 1, .commands = 1 });
+    try std.testing.expectEqual(@as(usize, 1), optional.calls);
+}

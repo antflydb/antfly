@@ -111,7 +111,7 @@ pub const ObjectRange = struct {
 pub const ReadAhead = struct {
     allocator: std.mem.Allocator,
     upstream: source.Range,
-    /// Optional explicit upper bound for direct upstream requests.
+    /// Optional explicit upper bound for each upstream request.
     max_request_bytes: ?usize = null,
     window_bytes: usize = 256 * 1024,
     max_bytes: u64 = 64 * 1024 * 1024,
@@ -189,9 +189,8 @@ pub const ReadAhead = struct {
         if (out.len == 0) return 0;
         const cached = self.copyCached(offset, out);
         if (cached == out.len) return cached;
-        const size: usize = @intCast(@min(out.len - cached, self.max_bytes -| self.charged_bytes));
-        if (size == 0) return error.RemoteReadBudgetExceeded;
-        return cached + try self.fetchAt(offset + cached, out[cached..][0..size], size, control);
+        const suffix = out[cached..];
+        return cached + try self.readRequired(offset + cached, suffix, self.max_request_bytes orelse suffix.len, control);
     }
 
     fn fetchAt(self: *ReadAhead, offset: u64, out: []u8, minimum: usize, control: source.Control) !usize {
@@ -226,15 +225,15 @@ pub const ReadAhead = struct {
         if (cached >= minimum) return cached;
         const suffix = out[cached..];
         const required = minimum - cached;
-        if (cached != 0 and required > self.window_bytes) return cached + try self.readRequired(offset + cached, suffix[0..required], control);
+        const limit = self.max_request_bytes orelse if (self.upstream.accepts_full_read_size) required else self.window_bytes;
+        if (required > @min(self.window_bytes, limit)) return cached + try self.readRequired(offset + cached, suffix[0..required], limit, control);
         return cached + try self.fillWindow(offset + cached, suffix, required, @max(required, fill_bytes -| cached), control);
     }
 
     // Required bytes can exceed the cache capacity. Read directly into the
     // caller's admitted buffer without evicting the existing window.
-    fn readRequired(self: *ReadAhead, offset: u64, out: []u8, control: source.Control) !usize {
+    fn readRequired(self: *ReadAhead, offset: u64, out: []u8, limit: usize, control: source.Control) !usize {
         if (out.len > self.max_bytes -| self.charged_bytes) return error.RemoteReadBudgetExceeded;
-        const limit = self.max_request_bytes orelse if (self.upstream.accepts_full_read_size) out.len else self.window_bytes;
         if (limit == 0) return error.RemoteReadBudgetExceeded;
         if (1 + (out.len - 1) / limit > self.max_reads -| self.reads) return error.RemoteRequestBudgetExceeded;
         var done: usize = 0;
@@ -270,7 +269,7 @@ pub const ReadAhead = struct {
         const append = self.valid < self.window_bytes and minimum <= self.window_bytes - self.valid and offset >= self.start and offset - self.start == self.valid;
         const retained = if (append) self.valid else 0;
         const fill = if (self.prefetch_limited) @min(fill_bytes, out.len) else fill_bytes;
-        const fetch: usize = @intCast(@min(fill, self.window_bytes - retained, self.upstream.length - offset, self.max_bytes -| self.charged_bytes));
+        const fetch: usize = @intCast(@min(fill, self.window_bytes - retained, self.upstream.length - offset, self.max_bytes -| self.charged_bytes, self.max_request_bytes orelse self.window_bytes));
         if (fetch == 0) return error.RemoteReadBudgetExceeded;
         self.valid = retained;
         if (!append) self.start = offset;
@@ -752,4 +751,40 @@ test "oversized overlap uses one admitted provider request and rejects a known b
             try std.testing.expectEqual(@as(usize, 2), cache.reads);
         }
     }
+}
+
+test "cold and isolated reads honor the provider cap independently of cache capacity" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            try std.testing.expect(out.len <= 6);
+            @memcpy(out, "abcdefghijklmn"[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var cache = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 14 },
+        .window_bytes = 4,
+        .max_request_bytes = 6,
+        .max_reads = 1,
+    };
+    defer cache.deinit();
+    var input = source.Source{ .allocator = std.testing.allocator, .identity = "capped", .storage = .{ .range = cache.range() } };
+    var cold = try input.readSparse(8, 6);
+    defer cold.deinit();
+    try std.testing.expectEqualSlices(u8, "ijklmn", cold.bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.reads);
+
+    cache.max_reads = 4;
+    var forward = try input.read(10, 4);
+    defer forward.deinit();
+    var isolated = try input.readIsolated(0, 8);
+    defer isolated.deinit();
+    try std.testing.expectEqualSlices(u8, "abcdefgh", isolated.bytes);
+    try std.testing.expectEqual(@as(usize, 4), cache.reads);
+    var reused = try input.readSparse(10, 4);
+    defer reused.deinit();
+    try std.testing.expectEqualSlices(u8, "klmn", reused.bytes);
+    try std.testing.expectEqual(@as(usize, 4), cache.reads);
 }

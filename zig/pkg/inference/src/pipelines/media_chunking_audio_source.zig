@@ -224,6 +224,7 @@ pub const Track = struct {
         try control.check();
         const identity = @import("media_index_cache.zig").Cache.audioKey(source, max_packets, max_bytes);
         if (self.bindCached(source, null, identity)) return self;
+        const directory = try builder.borrowDirectory();
         const flight = if (admission != null) if (identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null else null;
         defer if (flight) |lease| lease.deinit();
         if (flight != null and self.bindCached(source, null, identity)) return self;
@@ -232,7 +233,7 @@ pub const Track = struct {
         defer scope.deinit();
         const Seek = @import("media_audio_seek.zig").Index;
         const quota: ?Seek.Admission = if (admission) |value| .{ .context = value.context, .acquire = value.acquire } else null;
-        const index = try Seek.initWebmDirectory(a, try builder.borrowDirectory(), source, max_packets, max_bytes, directory_bytes, quota);
+        const index = try Seek.initWebmDirectory(a, directory, source, max_packets, max_bytes, directory_bytes, quota);
         self.installRangeWebm(source, index, identity, admission);
         return self;
     }
