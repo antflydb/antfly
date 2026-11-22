@@ -16,6 +16,16 @@
 //! Nonblocking shared admission. Share one Pool across request-local readers and
 //! preparers. Tokens are move-only and release only after resource destruction.
 const std = @import("std");
+/// Synchronous, request-local eviction of optional storage. The evicted
+/// allocations must be independent of the allocation being retried.
+pub const Reclaimer = struct {
+    context: *anyopaque,
+    release: *const fn (*anyopaque) bool,
+    pub fn reclaim(self: ?Reclaimer) bool {
+        const owner = self orelse return false;
+        return owner.release(owner.context);
+    }
+};
 pub const Resources = struct {
     host_bytes: u64 = 0,
     device_bytes: u64 = 0,
@@ -156,6 +166,7 @@ pub const TrackedAllocator = struct {
     limit: usize,
     live: usize = 0,
     denied: ?anyerror = null,
+    reclaimer: ?Reclaimer = null,
     pub fn allocator(self: *@This()) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
@@ -177,6 +188,9 @@ pub const TrackedAllocator = struct {
     }
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.allocate(len, alignment, ra) orelse if (Reclaimer.reclaim(self.reclaimer)) self.allocate(len, alignment, ra) else null;
+    }
+    fn allocate(self: *@This(), len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const next = std.math.add(usize, self.live, len) catch {
             self.denied = error.ResourceLimitExceeded;
             return null;

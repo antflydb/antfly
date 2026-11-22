@@ -462,7 +462,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
             });
             return error.InferenceCapabilitiesStale;
         }
-        if (paged and resp.status.code == 409) {
+        if (paged and (resp.status.code == 400 or resp.status.code == 409)) {
             if (std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, resp.body orelse "", .{ .ignore_unknown_fields = true })) |failure| {
                 defer failure.deinit();
                 return remoteChunkFailure(failure.value.@"error");
@@ -491,6 +491,10 @@ fn validateModelChunks(alloc: Allocator, cfg: chunking_types.Config, chunks: []c
         defer config.deinit();
         if (cfg.embedding) |legacy| config.value = try config.value.includingEmbedding(config.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
         const boundary = try config.value.boundary();
+        var masks: [16]inference_chunker.outputs.Target.Mask = undefined;
+        for (config.value.targets, masks[0..config.value.targets.len]) |target, *mask| {
+            mask.* = try inference_chunker.outputs.Target.Mask.compile(config.arena.allocator(), target);
+        }
         for (chunks) |chunk| {
             const metadata = chunk.metadata orelse return error.ModelAwareChunkProviderRequired;
             if (!std.mem.eql(u8, metadata.model, boundary.model)) return error.InvalidChunkOutput;
@@ -506,11 +510,11 @@ fn validateModelChunks(alloc: Allocator, cfg: chunking_types.Config, chunks: []c
             };
             var results = try std.json.parseFromSlice([]inference_chunker.outputs.Result, a, results_json, .{});
             defer results.deinit();
-            for (config.value.targets) |target| {
+            for (config.value.targets, masks[0..config.value.targets.len]) |target, mask| {
                 var seen: usize = 0;
                 for (results.value) |result| if (std.mem.eql(u8, result.name, target.name)) {
                     try result.validate(target);
-                    if (result.status == .skipped and target.wants(metadata.descriptor.ordinal, result.sub_index)) return error.InvalidChunkOutput;
+                    if (result.status == .skipped and target.wantsWithMask(mask, metadata.descriptor.ordinal, result.sub_index)) return error.InvalidChunkOutput;
                     if (result.sub_index != seen) return error.InvalidChunkOutput;
                     if (result.status == .failed and !cfg.page) return error.IncompleteChunkCoverage;
                     seen += 1;
@@ -809,18 +813,27 @@ fn responsePolicy(raw: @TypeOf(@as(inference_api.ChunkEmbeddingResponse, undefin
 }
 
 fn parseModelChunkResponse(a: Allocator, body: []const u8, replay: ?chunking_types.Replay) ![]RemoteChunk {
-    return parseModelChunks(a, body, replay, false);
-}
-
-fn parseModelChunks(a: Allocator, body: []const u8, replay: ?chunking_types.Replay, paged: bool) ![]RemoteChunk {
     var parsed = try std.json.parseFromSlice(inference_api.ChunkEmbeddingResponse, a, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    const response = parsed.value;
+    return decodeModelChunks(a, parsed.value, replay, false);
+}
+
+fn modelPageTerminal(response: inference_api.ChunkEmbeddingResponse) ?ChunkPage.Terminal {
+    if (response.data.len == 0 or response.next_continuation != null or (response.source_complete orelse false) or !std.mem.eql(u8, response.status, "failed")) return null;
+    const failure = response.@"error" orelse return null;
+    return ChunkPage.Terminal.fromCode(failure.code);
+}
+
+fn decodeModelChunks(a: Allocator, response: inference_api.ChunkEmbeddingResponse, replay: ?chunking_types.Replay, paged: bool) ![]RemoteChunk {
+    if (response.data.len == 0) if (response.@"error") |failure| {
+        if (ChunkPage.Terminal.fromCode(failure.code)) |terminal| return terminal.failure();
+    };
+    const terminal = modelPageTerminal(response);
     if (paged) {
-        if (response.@"error") |failure| return remoteChunkFailure(failure.code);
-        if ((!std.mem.eql(u8, response.status, "complete") and !std.mem.eql(u8, response.status, "partial")) or response.start_ordinal < 0 or response.covered_through_ordinal < response.start_ordinal or response.covered_through_ordinal - response.start_ordinal != response.data.len) return error.IncompleteChunkCoverage;
+        if (response.@"error") |failure| if (terminal == null) return remoteChunkFailure(failure.code);
+        if ((terminal == null and !std.mem.eql(u8, response.status, "complete") and !std.mem.eql(u8, response.status, "partial")) or response.start_ordinal < 0 or response.covered_through_ordinal < response.start_ordinal or response.covered_through_ordinal - response.start_ordinal != response.data.len) return error.IncompleteChunkCoverage;
     } else if (replay) |expected| {
-        if ((!std.mem.eql(u8, response.status, "complete") and !std.mem.eql(u8, response.status, "partial")) or response.gaps.len != 0 or response.data.len != 1 or response.@"error" != null or response.start_ordinal != expected.ordinal or response.covered_through_ordinal != expected.ordinal + 1 or !std.mem.eql(u8, expected.plan_id, response.plan_id) or !std.mem.eql(u8, expected.source_fingerprint, response.source_fingerprint) or !std.mem.eql(u8, expected.source_version, response.source_version)) return error.InvalidChunkReplay;
+        if ((terminal == null and !std.mem.eql(u8, response.status, "complete") and !std.mem.eql(u8, response.status, "partial")) or response.gaps.len != 0 or response.data.len != 1 or (response.@"error" != null and terminal == null) or response.start_ordinal != expected.ordinal or response.covered_through_ordinal != expected.ordinal + 1 or !std.mem.eql(u8, expected.plan_id, response.plan_id) or !std.mem.eql(u8, expected.source_fingerprint, response.source_fingerprint) or !std.mem.eql(u8, expected.source_version, response.source_version)) return error.InvalidChunkReplay;
     } else if (!std.mem.eql(u8, response.status, "complete") or response.next_continuation != null or response.gaps.len != 0 or response.start_ordinal != 0 or response.covered_through_ordinal != response.data.len) return error.IncompleteChunkCoverage;
     if (response.source_fingerprint.len != 64 or response.plan_id.len != 64 or response.model_identity.len != 64 or response.source_version.len == 0 or response.dimensions < 0) return error.InvalidChunkerResponse;
     var plan: [32]u8 = undefined;
@@ -1307,6 +1320,10 @@ test "model aware media transport retains vector provenance and rejects incomple
 }
 
 fn remoteChunkFailure(code: []const u8) anyerror {
+    if (ChunkPage.Terminal.fromCode(code)) |terminal| return terminal.failure();
+    inline for (.{ error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded }) |err| {
+        if (std.mem.eql(u8, code, @errorName(err))) return err;
+    }
     if (std.mem.eql(u8, code, "StaleChunkContinuation") or std.mem.eql(u8, code, "SourceVersionChanged")) return error.StaleChunkContinuation;
     if (std.mem.eql(u8, code, "EmbeddingIdentityMismatch")) return error.EmbeddingIdentityMismatch;
     return error.ChunkRequestFailed;
@@ -1315,8 +1332,11 @@ fn remoteChunkFailure(code: []const u8) anyerror {
 fn parseModelChunkPage(a: Allocator, body: []const u8, cfg: chunking_types.Config) !ChunkPage {
     var parsed = try std.json.parseFromSlice(inference_api.ChunkEmbeddingResponse, a, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    const r = parsed.value;
-    const chunks = try parseModelChunks(a, body, cfg.replay, true);
+    return decodeModelChunkPage(a, parsed.value, cfg);
+}
+
+fn decodeModelChunkPage(a: Allocator, r: inference_api.ChunkEmbeddingResponse, cfg: chunking_types.Config) !ChunkPage {
+    const chunks = try decodeModelChunks(a, r, cfg.replay, true);
     errdefer freeRemoteChunks(a, chunks);
     const plan = try a.dupe(u8, r.plan_id);
     errdefer a.free(plan);
@@ -1332,13 +1352,13 @@ fn parseModelChunkPage(a: Allocator, body: []const u8, cfg: chunking_types.Confi
         defer a.free(outputs_json);
         observation = try (RemoteMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .text, .start_byte = 0, .end_byte = 0 } }, .inference_id = item.descriptor.id, .source_fingerprint = r.source_fingerprint, .source_version = r.source_version, .plan_id = r.plan_id, .model = r.model, .model_identity = r.model_identity, .model_revision = r.model_revision, .task_type = r.task_type, .dimensions = @intCast(r.dimensions), .policy = try responsePolicy(r.policy), .outputs_json = outputs_json }).clone(a);
     }
-    const page = ChunkPage{ .observation = observation, .chunks = chunks, .plan_id = plan, .source_fingerprint = source, .source_version = version, .start_ordinal = @intCast(r.start_ordinal), .covered_through_ordinal = @intCast(r.covered_through_ordinal), .complete = r.source_complete orelse (std.mem.eql(u8, r.status, "complete") and r.next_continuation == null) };
+    const page = ChunkPage{ .observation = observation, .chunks = chunks, .plan_id = plan, .source_fingerprint = source, .source_version = version, .start_ordinal = @intCast(r.start_ordinal), .covered_through_ordinal = @intCast(r.covered_through_ordinal), .complete = r.source_complete orelse (std.mem.eql(u8, r.status, "complete") and r.next_continuation == null), .terminal = modelPageTerminal(r) };
     if (r.next_continuation) |next| {
         if (page.complete) return error.InvalidChunkerResponse;
         var buffer: [85]u8 = undefined;
         const expected = try std.fmt.bufPrint(&buffer, "{s}:{d}", .{ page.plan_id, page.covered_through_ordinal });
         if (!std.mem.eql(u8, expected, next)) return error.InvalidChunkerResponse;
-    } else if (!page.complete and observation == null) return error.IncompleteChunkCoverage;
+    } else if (!page.complete and observation == null and page.terminal == null) return error.IncompleteChunkCoverage;
     var gaps: usize = 0;
     for (chunks) |chunk| if (chunk.metadata.?.embedding_error != null) {
         gaps += 1;
@@ -1350,6 +1370,7 @@ fn parseModelChunkPage(a: Allocator, body: []const u8, cfg: chunking_types.Confi
 
 pub fn validateChunkPage(a: Allocator, cfg: chunking_types.Config, page: ChunkPage) !void {
     const start = if (cfg.replay) |position| position.ordinal else 0;
+    if (page.terminal != null and (page.complete or page.observation != null or page.chunks.len == 0)) return error.InvalidChunkerResponse;
     if (page.observation != null) {
         if (page.plan_id.len != 64 or page.source_fingerprint.len != 64 or page.source_version.len == 0) return error.InvalidChunkerResponse;
         var digest: [32]u8 = undefined;
@@ -1398,6 +1419,18 @@ test "model aware media pages preserve continuation coverage and partial output 
     var resumed = cfg;
     resumed.replay = .{ .plan_id = page.plan_id, .source_fingerprint = page.source_fingerprint, .source_version = page.source_version, .ordinal = 1 };
     try std.testing.expectError(error.IncompleteChunkCoverage, parseModelChunkPage(a, partial, resumed));
+    for (std.meta.tags(ChunkPage.Terminal)) |terminal| {
+        try std.testing.expectEqual(terminal.failure(), remoteChunkFailure(@errorName(terminal.failure())));
+    }
+    try std.testing.expectEqual(error.RemoteReadBudgetExceeded, remoteChunkFailure("RemoteReadBudgetExceeded"));
+    try std.testing.expectEqual(error.RemoteRequestBudgetExceeded, remoteChunkFailure("RemoteRequestBudgetExceeded"));
+    const terminal_body = try std.mem.replaceOwned(u8, a, model_page_fixture, "\"status\":\"complete\"", "\"status\":\"failed\",\"source_complete\":false,\"error\":{\"code\":\"ChunkCodedWindowBudgetExceeded\",\"message\":\"unreplayable next window\"}");
+    defer a.free(terminal_body);
+    var terminal_page = try parseModelChunkPage(a, terminal_body, cfg);
+    defer terminal_page.deinit(a);
+    try std.testing.expectEqual(ChunkPage.Terminal.coded_window_budget_exceeded, terminal_page.terminal.?);
+    try std.testing.expectEqual(@as(usize, 1), terminal_page.chunks.len);
+    try std.testing.expect(!terminal_page.complete);
     const empty = try std.mem.replaceOwned(u8, a, partial, "\"covered_through_ordinal\":1", "\"covered_through_ordinal\":0");
     defer a.free(empty);
     try std.testing.expectError(error.IncompleteChunkCoverage, parseModelChunkPage(a, empty, cfg));
@@ -1455,8 +1488,7 @@ fn parseModelChunkStream(a: Allocator, body: []const u8, cfg: chunking_types.Con
     if (start.start_ordinal != response.start_ordinal or !std.meta.eql(start.policy, response.policy) or response.data.len != 0) return error.InvalidChunkerResponse;
     if (start.dimensions) |dimensions| if (dimensions != response.dimensions) return error.InvalidChunkerResponse;
     response.data = items.items;
-    const encoded = try std.json.Stringify.valueAlloc(temporary, response, .{});
-    return parseModelChunkPage(a, encoded, cfg);
+    return decodeModelChunkPage(a, response, cfg);
 }
 
 test "model aware media NDJSON acknowledges only matching terminal coverage" {

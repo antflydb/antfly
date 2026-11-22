@@ -561,7 +561,7 @@ const CublasLtLibrary = struct {
     handle: CublasLtHandle,
 
     fn open() !CublasLtLibrary {
-        var lib = try openAny(&cublaslt_names);
+        var lib = try openCublasLt(&cublaslt_names);
         errdefer lib.close();
         const fns = CublasLtTable{
             .create = try lookup(&lib, @TypeOf(@as(CublasLtTable, undefined).create), "cublasLtCreate"),
@@ -671,12 +671,26 @@ const cublas_names = [_][]const u8{
     "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublas.so.13.4.0.1",
 };
 
-const cublaslt_names = [_][]const u8{
+const cublaslt_names = [_][:0]const u8{
     "libcublasLt.so.13",
     "libcublasLt.so",
     "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublasLt.so.13",
     "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublasLt.so.13.4.0.1",
 };
+
+pub fn openCublasLt(names: []const [:0]const u8) !std.DynLib {
+    const builtin = @import("builtin");
+    for (names) |name| {
+        if (comptime builtin.os.tag == .linux and builtin.link_libc and builtin.link_mode == .dynamic and std.options.allow_stack_tracing) {
+            // Zig caches ELF address ranges and unwind sections across dlclose.
+            // An NVDEC callback can reuse a cuBLASLt address and walk stale
+            // .eh_frame data. Keep the mapping stable across CUDA contexts.
+            if (std.c.dlopen(name, .{ .LAZY = true, .NODELETE = true })) |handle|
+                return .{ .inner = .{ .handle = handle } };
+        } else if (std.DynLib.openZ(name)) |library| return library else |_| {}
+    }
+    return error.CudaLibrariesUnavailable;
+}
 
 fn openAny(names: []const []const u8) !std.DynLib {
     for (names) |name| {

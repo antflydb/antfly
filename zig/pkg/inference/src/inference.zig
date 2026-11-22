@@ -482,6 +482,10 @@ test "raw CUDA attention differential surface reports output drift" {
     try std.testing.expectError(error.InvalidHeadDim, cuda_attention_diff.parseConfig(&.{ "--head-dim", "128" }));
 }
 
+test "model aware media WebM response declarations" {
+    if (!build_options.skip_openapi) _ = @import("server/chunk_response.zig");
+}
+
 // Keep model-family tests reachable under compile-time test filtering.
 test "embeddinggemma2 declarations compile" {
     std.testing.refAllDecls(architectures.embedding_gemma2);

@@ -17,7 +17,7 @@ const std = @import("std");
 const context = @import("context.zig");
 const driver = @import("driver.zig");
 
-const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("scalar_clamp.ptx"), .{ .clamp = "scalar_clamp", .widen = "widen_16bit" });
+const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("scalar_clamp.ptx"), .{ .clamp = "scalar_clamp", .widen = "widen_16bit", .split = "split_bf16_terms", .split_rounded = "split_rounded_terms", .finish_projection = "finish_projection" });
 
 pub const Kernel = struct {
     program: Program = .{},
@@ -28,6 +28,37 @@ pub const Kernel = struct {
 
     pub fn prepare(self: *Kernel, ctx: *context.CudaContext) !void {
         try self.program.init(ctx);
+    }
+
+    pub fn finishProjection(self: *Kernel, ctx: *context.CudaContext, output: driver.CUdeviceptr, correction: driver.CUdeviceptr, input: driver.CUdeviceptr, weights: driver.CUdeviceptr, rows: usize, in_dim: usize, out_dim: usize, bf16: bool) !void {
+        const count = try std.math.mul(usize, rows, out_dim);
+        if (in_dim == 0 or in_dim > std.math.maxInt(u32) or count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        if (count == 0) return;
+        try self.prepare(ctx);
+        var dst = output;
+        var addend = correction;
+        var src = input;
+        var w = weights;
+        var n: u32 = @intCast(count);
+        var inner: u32 = @intCast(in_dim);
+        var cols: u32 = @intCast(out_dim);
+        var format: u32 = @intFromBool(bf16);
+        var args = [_]?*anyopaque{ &dst, &addend, &src, &w, &n, &inner, &cols, &format };
+        try ctx.launchKernel(self.program.function(.finish_projection), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
+        ctx.noteKernelLaunch();
+    }
+
+    pub fn splitProjector(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, outputs: [3]driver.CUdeviceptr, count: usize, bf16: bool, nearest_even: bool) !void {
+        if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        if (count == 0) return;
+        try self.prepare(ctx);
+        var src = input;
+        var planes = outputs;
+        var n: u32 = @intCast(count);
+        var format: u32 = @intFromBool(bf16);
+        var args = [_]?*anyopaque{ &src, &planes[0], &planes[1], &planes[2], &n, &format };
+        try ctx.launchKernel(if (nearest_even) self.program.function(.split_rounded) else self.program.function(.split), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
+        ctx.noteKernelLaunch();
     }
 
     pub fn widen16Bit(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, output: driver.CUdeviceptr, count: usize, bf16: bool) !void {

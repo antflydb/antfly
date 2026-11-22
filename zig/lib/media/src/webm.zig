@@ -81,7 +81,7 @@ pub const Packet = struct {
     invisible: bool,
     discardable: bool,
 };
-const Element = struct { id: u32, payload: u64, end: u64, unknown: bool };
+pub const Element = struct { id: u32, payload: u64, end: u64, unknown: bool };
 pub const Cue = struct { pts: i64, cluster_offset: u64, packet_index: usize };
 fn segmentChild(id: u32) bool {
     return switch (id) {
@@ -89,9 +89,10 @@ fn segmentChild(id: u32) bool {
         else => false,
     };
 }
-const Scan = struct {
+pub const Scan = struct {
     input: *source.Source,
     limits: Limits,
+    clock: ?*@import("timeline.zig").SampleClock = null,
     elements: usize = 0,
     fn header(self: *Scan, offset: u64, parent_end: u64) !Element {
         var element = try self.rawHeader(offset, parent_end);
@@ -109,12 +110,12 @@ const Scan = struct {
         element.end = cursor;
         return element;
     }
-    fn rawHeader(self: *Scan, offset: u64, parent_end: u64) !Element {
+    pub fn rawHeader(self: *Scan, offset: u64, parent_end: u64) !Element {
         try self.input.control.check();
         if (offset >= parent_end or parent_end > self.input.length()) return error.MalformedMedia;
         if (self.elements >= self.limits.max_elements) return error.ResourceLimitExceeded;
         self.elements += 1;
-        var lease = try self.input.read(offset, @intCast(@min(12, parent_end - offset)));
+        var lease = try self.input.readSparse(offset, @intCast(@min(12, parent_end - offset)));
         defer lease.deinit();
         const id = try ebml.readElementId(lease.bytes, 0);
         const size = try ebml.readVint(lease.bytes, id.len);
@@ -125,12 +126,20 @@ const Scan = struct {
     }
     fn uint(self: *Scan, element: Element) !u64 {
         if (element.unknown or element.end - element.payload > 8) return error.MalformedMedia;
-        var lease = try self.input.read(element.payload, @intCast(element.end - element.payload));
+        var lease = try self.input.readSparse(element.payload, @intCast(element.end - element.payload));
         defer lease.deinit();
         return ebml.readUint(lease.bytes);
     }
 };
+/// Original clock of an adapted track. Packet timestamps for codec callbacks stay in nanoseconds.
+pub const SourceTimeline = struct {
+    pub const Sample = struct { pts: i64, duration: u32 };
+    timescale: u32,
+    edit: @import("timeline.zig").Edit,
+    samples: []Sample,
+};
 pub const Reader = struct {
+    source_timeline: ?SourceTimeline = null,
     allocator: std.mem.Allocator,
     input: *source.Source,
     metadata: source.Lease,
@@ -143,9 +152,32 @@ pub const Reader = struct {
     /// fractional precision for FPS sampling rather than infer rounded block PTS.
     duration_seconds: ?f64 = null,
     pub fn init(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
-        var index_reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = limits.max_index_bytes }) else @import("admission.zig").Token{};
-        errdefer index_reservation.deinit();
-        var scan = Scan{ .input = input, .limits = limits };
+        return scanSource(allocator, input, limits, null);
+    }
+    pub fn sampleClock(a: std.mem.Allocator, input: *source.Source, limits: Limits) !@import("timeline.zig").SampleClock {
+        var clock = @import("timeline.zig").SampleClock{ .scale = std.time.ns_per_s };
+        var metadata = try scanSource(a, input, limits, &clock);
+        defer metadata.deinit();
+        return clock;
+    }
+    fn scanSource(allocator: std.mem.Allocator, input: *source.Source, limits: Limits, clock: ?*@import("timeline.zig").SampleClock) !Reader {
+        var memory = @import("admission.zig").TrackedAllocator{
+            .backing = allocator,
+            .reservation = if (input.admission_pool) |pool| try pool.acquire(.{}) else .{},
+            // Packet and cue capacity obey the index limit. The pool admits
+            // moving-growth overlap against the request's working budget.
+            .limit = limits.max_index_bytes *| 2,
+        };
+        errdefer memory.reservation.deinit();
+        var result = readIndex(memory.allocator(), input, limits, clock) catch |err|
+            return if (err == error.OutOfMemory) memory.denied orelse err else err;
+        result.allocator = allocator;
+        result.index_reservation = memory.reservation;
+        return result;
+    }
+
+    fn readIndex(allocator: std.mem.Allocator, input: *source.Source, limits: Limits, clock: ?*@import("timeline.zig").SampleClock) !Reader {
+        var scan = Scan{ .input = input, .limits = limits, .clock = clock };
         var cursor: u64 = 0;
         const file_header = try scan.header(cursor, input.length());
         if (file_header.id != 0x1a45dfa3 or file_header.unknown) return error.MalformedMedia;
@@ -249,6 +281,10 @@ pub const Reader = struct {
                 }
             }
         }
+        if (clock) |result| {
+            if (result.count == 0) return error.EmptyVideoTrack;
+            return .{ .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = &.{}, .cues = &.{}, .timestamp_scale_ns = scale };
+        }
         if (packets.items.len == 0) return error.EmptyVideoTrack;
         var cues: std.ArrayList(Cue) = .empty;
         errdefer cues.deinit(allocator);
@@ -266,9 +302,10 @@ pub const Reader = struct {
         for (cues.items, 0..) |cue, i| if (i != 0 and cue.pts == cues.items[i - 1].pts) return error.MalformedMedia;
         const owned_cues = try cues.toOwnedSlice(allocator);
         errdefer allocator.free(owned_cues);
-        return .{ .cues = owned_cues, .index_reservation = index_reservation, .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = try packets.toOwnedSlice(allocator), .timestamp_scale_ns = scale, .duration_seconds = duration_seconds };
+        return .{ .cues = owned_cues, .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = try packets.toOwnedSlice(allocator), .timestamp_scale_ns = scale, .duration_seconds = duration_seconds };
     }
     pub fn deinit(self: *Reader) void {
+        if (self.source_timeline) |timeline| self.allocator.free(timeline.samples);
         self.allocator.free(self.packets);
         self.allocator.free(self.cues);
         self.metadata.deinit();
@@ -530,7 +567,7 @@ fn parseColour(bytes: []const u8, limits: Limits, control: source.Control, eleme
 }
 fn appendBlock(allocator: std.mem.Allocator, scan: *Scan, packets: *std.ArrayList(Packet), track: Track, element: Element, time: u64, scale: u64, duration: ?u64, group_sync: bool, cluster_offset: u64) !void {
     if (element.unknown or element.end - element.payload < 4) return error.MalformedMedia;
-    var lease = try scan.input.read(element.payload, @intCast(@min(12, element.end - element.payload)));
+    var lease = try scan.input.readSparse(element.payload, @intCast(@min(12, element.end - element.payload)));
     defer lease.deinit();
     const number = try ebml.readVint(lease.bytes, 0);
     if (number.is_unknown) return error.MalformedMedia;
@@ -544,7 +581,9 @@ fn appendBlock(allocator: std.mem.Allocator, scan: *Scan, packets: *std.ArrayLis
     const pts = std.math.cast(i64, nanoseconds) orelse return error.TimestampOverflow;
     const offset = element.payload + number.len + 3;
     const size = std.math.cast(usize, element.end - offset) orelse return error.ResourceLimitExceeded;
-    if (size == 0 or size > scan.limits.max_packet_bytes or packets.items.len >= scan.limits.max_packets or packets.items.len + 1 > scan.limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
+    const count = if (scan.clock) |clock| clock.count else packets.items.len;
+    if (size == 0 or size > scan.limits.max_packet_bytes or count >= scan.limits.max_packets or count + 1 > scan.limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
+    if (scan.clock) |clock| return clock.include(pts);
     if (packets.items.len == packets.capacity) {
         const capacity = @min(scan.limits.max_index_bytes / @sizeOf(Packet), @min(scan.limits.max_packets, @max(@as(usize, 16), try std.math.mul(usize, packets.capacity, 2))));
         try packets.ensureTotalCapacityPrecise(allocator, capacity);

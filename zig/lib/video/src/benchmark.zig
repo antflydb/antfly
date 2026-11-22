@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
     if (path) |name| {
         file = try std.Io.Dir.cwd().openFile(init.io, name, .{});
         provider = .{ .file = file.?, .io = init.io };
-        input.storage = .{ .range = .{ .context = &provider, .read_at = media.source.FileRange.readAt, .length = (try file.?.stat(init.io)).size } };
+        input.storage = .{ .range = provider.range((try file.?.stat(init.io)).size) };
         input.identity = name;
         input.limits.max_total_bytes = 1024 * 1024 * 1024;
     }

@@ -75,6 +75,43 @@ test "mp4 video packet index matches independent ffprobe B-frame VFR rotation an
     }
 }
 
+test "mp4 walks an inactive visual track without applying its clean aperture" {
+    const bytes = clips[0];
+    const moov = findMoov(bytes);
+    const movie = try iso.readBox(bytes, moov);
+    try std.testing.expectEqual(bytes.len, movie.end);
+    const start = std.mem.indexOf(u8, movie.payload, "trak").? - 4;
+    const primary = try iso.readBox(movie.payload, start);
+    const secondary = try a.alloc(u8, primary.data.len + 40);
+    defer a.free(secondary);
+    const sample = std.mem.indexOf(u8, primary.data, "avc1").? - 4;
+    const insert = (try iso.readBox(primary.data, sample)).end;
+    @memcpy(secondary[0..insert], primary.data[0..insert]);
+    @memcpy(secondary[insert + 40 ..], primary.data[insert..]);
+    const aperture = secondary[insert..][0..40];
+    std.mem.writeInt(u32, aperture[0..4], 40, .big);
+    @memcpy(aperture[4..8], "clap");
+    for ([_]u32{ 16, 1, 16, 1, 0, 1, 0, 1 }, 0..) |value, n|
+        std.mem.writeInt(u32, aperture[8 + n * 4 ..][0..4], value, .big);
+    for ([_][]const u8{ "trak", "mdia", "minf", "stbl", "stsd", "avc1" }) |name| {
+        const length = secondary[std.mem.indexOf(u8, primary.data, name).? - 4 ..][0..4];
+        std.mem.writeInt(u32, length, std.mem.readInt(u32, length, .big) + 40, .big);
+    }
+    const id = std.mem.indexOf(u8, secondary, "tkhd").? + 16;
+    std.mem.writeInt(u32, secondary[id..][0..4], 2, .big);
+    const combined = try std.mem.concat(a, u8, &.{ bytes, secondary });
+    defer a.free(combined);
+    std.mem.writeInt(u32, combined[moov..][0..4], @intCast(movie.data.len + secondary.len), .big);
+    var src = input(combined);
+    var reader = try mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u32, 1), reader.track.id);
+    // Make the second track the first eligible video and enforce its aperture.
+    const handler = std.mem.indexOf(u8, combined[moov..], "vide").? + moov;
+    @memcpy(combined[handler..][0..4], "soun");
+    try std.testing.expectError(error.UnsupportedDisplayGeometry, mp4.probeTrack(combined, .{}, .{}));
+}
+
 test "mp4 tail metadata range reads skip mdat and retain packets across later reads" {
     const Provider = struct {
         bytes: []const u8,
@@ -117,6 +154,8 @@ test "mp4 video malformed tables, metadata/index limits and fragment rejection r
     try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_metadata_bytes = 1 }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
     try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1 }));
+    try std.testing.expectError(error.DecoderEnvelopeExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1, .track_limit_error = error.DecoderEnvelopeExceeded }));
+    try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_index_bytes = 1, .track_limit_error = error.DecoderEnvelopeExceeded }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
     try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_index_bytes = 1 }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
@@ -245,6 +284,8 @@ test "fragmented mp4 bad offsets missing tfdt and admission failures release met
     try std.testing.expectEqual(@as(usize, 0), bad.retained_bytes);
     var src = input(fragmented_clip);
     try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1 }));
+    try std.testing.expectError(error.DecoderEnvelopeExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1, .track_limit_error = error.DecoderEnvelopeExceeded }));
+    try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_index_bytes = 1, .track_limit_error = error.DecoderEnvelopeExceeded }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
 }
 
