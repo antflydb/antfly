@@ -2679,6 +2679,38 @@ pub fn metadataApplyStoreProjection(
             defer handle.store.freeReplicationSourceStatuses(alloc, value);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .native_root_producer_cohort_sealed => blk: {
+            const key = request.key.slice();
+            if (key.len <= 32 or key.len > 32 + 255) break :blk .invalid_argument;
+            const sealed = handle.store.nativeRootProducerCohortSealed(request.group_id, key[32..], key[0..32].*) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, sealed);
+        },
+        .native_root_producer_cohort => blk: {
+            if (request.key.len == 0 or request.key.len > 255) break :blk .invalid_argument;
+            const ready = handle.store.nativeRootProducerCohortReady(alloc, request.group_id, request.key.slice()) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, ready);
+        },
+        .native_snapshot_capture => blk: {
+            const ordinal = std.math.cast(u32, request.arg1) orelse break :blk .invalid_argument;
+            const key = request.key.slice();
+            if (key.len != 9 or key[8] > 1) break :blk .invalid_argument;
+            const record = (handle.store.getReplicationSourceStatus(alloc, request.group_id, request.arg0, ordinal) catch |err|
+                break :blk storageOwnerStatusFromError(err)) orelse break :blk metadataProjectionJson(alloc, out_json, @as(?u8, null));
+            defer metadata_table_manager.freeReplicationSourceStatus(alloc, record);
+            var page = (handle.store.observeNativeSnapshotCapture(alloc, request.group_id, record, std.mem.readInt(u64, key[0..8], .little), key[8] != 0) catch |err|
+                break :blk storageOwnerStatusFromError(err)) orelse break :blk metadataProjectionJson(alloc, out_json, @as(?u8, null));
+            defer page.deinit();
+            break :blk metadataProjectionJson(alloc, out_json, page.value);
+        },
+        .native_snapshot_rows => blk: {
+            const ordinal = std.math.cast(u32, request.arg1) orelse break :blk .invalid_argument;
+            const value = handle.store.getNativeSnapshotRows(alloc, request.group_id, request.arg0, ordinal) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer if (value) |rows| alloc.free(rows);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .replication_source_status => blk: {
             const ordinal = std.math.cast(u32, request.arg1) orelse break :blk .invalid_argument;
             const value = handle.store.getReplicationSourceStatus(alloc, request.group_id, request.arg0, ordinal) catch |err|

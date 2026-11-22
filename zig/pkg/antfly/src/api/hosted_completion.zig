@@ -54,8 +54,12 @@ pub const Hosted = struct {
         const artifact = @import("source_plan_operations.zig").wire;
         const scope_read = @import("source_scope_operations.zig").wire;
         const scope_control = @import("source_scope_control_operations.zig").wire;
+        const producer_read = @import("source_producer_closure_operations.zig").wire;
+        const producer_control = @import("source_producer_control_operations.zig").wire;
         return .{
             .coordinator = self.coordinator(),
+            .producer_reads = .{ .ptr = self, .read_fn = Routed(producer_read.Query, producer_read.Observation, "fetchGroupSourceProducerClosureObservation").read },
+            .producer_controls = .{ .ptr = self, .execute_fn = Routed(producer_control.Request, producer_control.Reply, "fetchGroupSourceProducerClose").read },
             .scope_reads = .{ .ptr = self, .read_fn = Routed(scope_read.Query, scope_read.Observation, "fetchGroupSourceScopeObservation").read },
             .scope_controls = .{ .ptr = self, .execute_fn = Routed(scope_control.Request, scope_control.Reply, "fetchGroupSourceScopeControl").read },
             .checkpoints = .{ .ptr = self, .read_fn = Routed(checkpoint.Request, checkpoint.Reply, "fetchGroupSourceCheckpointObservation").read },

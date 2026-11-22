@@ -20,6 +20,8 @@ import json
 import platform
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 
 import requests
@@ -70,10 +72,18 @@ def deliver(client, feed, cursor, expected):
     return cursor, bytes_read
 
 
+def measure_delivery(consumer, expected, committed):
+    client, feed, cursor = consumer
+    next_cursor, response_bytes = deliver(client, feed, cursor, expected)
+    lag_ms = (time.monotonic() - committed) * 1000
+    return next_cursor, response_bytes, lag_ms
+
+
 def run(binary, rows, batch_size, fanout):
     server = StatefulAntflyServer(str(binary), "127.0.0.1", 0, auth_enabled=True)
     try:
-        with requests.Session() as client:
+        with ExitStack() as resources:
+            client = resources.enter_context(requests.Session())
             client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
             table = f"{server.api_url}/tables/changefeed_bench"
             feeds = f"{server.api_url}/changefeeds"
@@ -87,7 +97,14 @@ def run(binary, rows, batch_size, fanout):
                     json={"tables": ["changefeed_bench"], "include": "rows"},
                     headers={"Idempotency-Key": f"benchmark-{consumer}"},
                 ).json()
-                consumers.append((f"{feeds}/{result['id']}", result["cursor"]))
+                consumer_client = resources.enter_context(requests.Session())
+                consumer_client.auth = client.auth
+                consumers.append(
+                    (consumer_client, f"{feeds}/{result['id']}", result["cursor"])
+                )
+            executor = resources.enter_context(
+                ThreadPoolExecutor(max_workers=max(1, fanout - 1))
+            )
             before = allocated_bytes(server.replica_root)
             write_seconds = 0.0
             lag_ms = []
@@ -106,31 +123,39 @@ def run(binary, rows, batch_size, fanout):
                 committed = time.monotonic()
                 write_seconds += committed - write_start
                 # Leave the last consumer unacknowledged until restart.
-                for index, (feed, cursor) in enumerate(consumers[:-1]):
-                    next_cursor, read = deliver(client, feed, cursor, len(batch))
-                    lag_ms.append((time.monotonic() - committed) * 1000)
+                pending = [
+                    executor.submit(measure_delivery, consumer, len(batch), committed)
+                    for consumer in consumers[:-1]
+                ]
+                for index, delivery in enumerate(pending):
+                    next_cursor, read, lag = delivery.result()
+                    lag_ms.append(lag)
                     delivered_bytes += read
-                    consumers[index] = (feed, next_cursor)
+                    consumer_client, feed, _ = consumers[index]
+                    consumers[index] = (consumer_client, feed, next_cursor)
             elapsed = time.monotonic() - started
             retained = allocated_bytes(server.replica_root) - before
             restart_seconds = None
             catch_up_seconds = None
             if consumers:
-                feed, cursor = consumers[-1]
+                consumer_client, feed, cursor = consumers[-1]
                 restart_start = time.monotonic()
                 server.restart()
                 restart_seconds = time.monotonic() - restart_start
                 catch_up_start = time.monotonic()
-                _, read = deliver(client, feed, cursor, rows)
+                _, read = deliver(consumer_client, feed, cursor, rows)
                 catch_up_seconds = time.monotonic() - catch_up_start
                 delivered_bytes += read
-                for feed, _ in consumers:
+                for _, feed, _ in consumers:
                     call(client, "DELETE", feed)
             return {
                 "consumers": fanout,
                 "active_consumers": max(0, fanout - 1),
                 "write_rows_per_second": rows / write_seconds,
                 "write_and_deliver_rows_per_second": rows / elapsed,
+                "active_consumer_events_per_second": rows
+                * max(0, fanout - 1)
+                / elapsed,
                 "acknowledged_batch_lag_ms_median": statistics.median(lag_ms)
                 if lag_ms
                 else None,

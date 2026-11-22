@@ -50,7 +50,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 128 adds source recovery scope lookup to the metadata owner.
 // Version 129 supports first source binding after an ordered native drain check.
 // Version 130 decodes native PostgreSQL bootstrap certification in metadata apply.
-pub const abi_version: u32 = 130;
+// Version 131 exposes the private retained native snapshot page read.
+pub const abi_version: u32 = 131;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -517,6 +518,10 @@ pub const MetadataProjectionKind = enum(u32) {
     /// Nonwaiting observation/reconciliation of the shared durable HA outbox.
     poll_ha_outbox = 76,
     catalog_table_projection = 77,
+    native_snapshot_rows = 78,
+    native_snapshot_capture = 79,
+    native_root_producer_cohort = 80,
+    native_root_producer_cohort_sealed = 81,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };

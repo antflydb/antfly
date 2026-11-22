@@ -26,24 +26,30 @@ pub const checkpoint_authority = @import("source_checkpoint_authority.zig");
 pub const protocol_version: u16 = 101;
 pub const closing_protocol_version: u16 = 115;
 pub const native_bootstrap_protocol_version: u16 = 130;
+pub const scoped_snapshot_protocol_version: u16 = 131;
 pub const native_bootstrap_preparing_phase = "native_bootstrap_preparing";
 pub const native_bootstrap_snapshot_phase = "native_bootstrap_snapshot";
+pub const native_bootstrap_retry_phase = "native_bootstrap_retry";
 pub const native_bootstrap_applying_phase = "native_bootstrap_applying";
 pub const native_bootstrap_prepared_phase = "native_bootstrap_prepared";
+pub const native_bootstrap_reseed_phase = "native_bootstrap_reseed_pending";
 pub fn nativeBootstrapCanReplaceExport(phase: []const u8) bool {
     return std.mem.eql(u8, phase, native_bootstrap_preparing_phase) or
         std.mem.eql(u8, phase, native_bootstrap_snapshot_phase);
 }
 pub fn nativeBootstrapCanReplaceStatus(record: anytype) bool {
     if (record.snapshot_offset != 0 or record.stream_checkpoint.len != 0) return false;
-    if (nativeBootstrapCanReplaceExport(record.phase)) return true;
+    if (nativeBootstrapCanReplaceExport(record.phase) or
+        std.mem.eql(u8, record.phase, native_bootstrap_reseed_phase)) return true;
     if (!std.mem.eql(u8, record.phase, native_bootstrap_applying_phase)) return false;
     const page = record.pending_snapshot_page orelse return false;
     return page.managed_dispatch and page.recovery_job.len == 0;
 }
 pub fn isNativeBootstrapPhase(phase: []const u8) bool {
     return nativeBootstrapCanReplaceExport(phase) or
+        std.mem.eql(u8, phase, native_bootstrap_reseed_phase) or
         std.mem.eql(u8, phase, native_bootstrap_applying_phase) or
+        std.mem.eql(u8, phase, native_bootstrap_retry_phase) or
         std.mem.eql(u8, phase, native_bootstrap_prepared_phase);
 }
 pub const manifest_protocol_version: u16 = 116;
@@ -218,6 +224,7 @@ pub const State = struct {
     closing: bool = false,
     scope_fencing: bool = false,
     native_bootstrap_checkpoint: ?[]const u8 = null,
+    native_bootstrap_first_page: ?Digest = null,
     manifest_retention: bool = false,
     retirement_receipt: []const u8 = "",
     retired_reservation_digest: Digest = @splat(0),
@@ -225,6 +232,15 @@ pub const State = struct {
     checkpoint_authority: ?source_contract.checkpoint_authority.Spec = null,
     pub fn jsonStringify(self: State, stream: anytype) @TypeOf(stream.*).Error!void {
         return writeArtifactFields(self, stream);
+    }
+
+    fn requireInitialBootstrapCheckpoint(self: State, checkpoint: []const u8) !void {
+        if (self.native_bootstrap_first_page) |page| {
+            const first = nativeSnapshotScopedCheckpoint(page);
+            if (!std.mem.eql(u8, &first, checkpoint)) return error.SourceCheckpointConflict;
+        } else if (self.native_bootstrap_checkpoint) |expected| {
+            if (!std.mem.eql(u8, expected, checkpoint)) return error.SourceCheckpointConflict;
+        }
     }
 
     pub fn validate(self: State) !void {
@@ -240,6 +256,9 @@ pub const State = struct {
         if (self.native_bootstrap_checkpoint) |checkpoint| {
             if (!self.scope_fencing or !text(checkpoint, 1024, false)) return error.InvalidSourceControl;
         }
+        if (self.native_bootstrap_first_page) |digest_value| {
+            if (self.native_bootstrap_checkpoint == null or !nonzero(digest_value)) return error.InvalidSourceControl;
+        }
         if (self.scope_fencing and (self.checkpoint_authority == null or self.scope == null or self.scope.?.destination != .native)) return error.InvalidSourceControl;
         if (self.committed.sequence > self.accepted.sequence) return error.InvalidSourceControl;
         for ([_]Frontier{ self.accepted, self.committed }) |frontier| {
@@ -252,9 +271,7 @@ pub const State = struct {
         if (self.pending) |pending| {
             try pending.validate();
             if (pending.sequence == 1) {
-                if (self.native_bootstrap_checkpoint) |checkpoint| {
-                    if (!std.mem.eql(u8, checkpoint, pending.checkpoint)) return error.InvalidSourceControl;
-                }
+                self.requireInitialBootstrapCheckpoint(pending.checkpoint) catch return error.InvalidSourceControl;
             }
             if (pending.retain_manifest != self.manifest_retention) return error.InvalidSourceControl;
             if (self.scope == null or pending.destination != self.scope.?.destination) return error.SourceBindingConflict;
@@ -335,11 +352,26 @@ pub const Replan = struct {
     }
 };
 
+pub const ScopedSnapshotCut = struct {
+    provider_checkpoint: []const u8,
+    first_page: Digest,
+};
+
+const native_snapshot_checkpoint_prefix = "native_snapshot_page:";
+pub fn nativeSnapshotScopedCheckpoint(page: Digest) [native_snapshot_checkpoint_prefix.len + 64]u8 {
+    return native_snapshot_checkpoint_prefix.* ++ std.fmt.bytesToHex(page, .lower);
+}
+
+pub fn isNativeSnapshotScopedCheckpoint(checkpoint: []const u8) bool {
+    return std.mem.startsWith(u8, checkpoint, native_snapshot_checkpoint_prefix);
+}
+
 pub const Mutation = union(enum) {
     /// Stop new grants while preserving original recovery and cleanup debt.
     close: void,
     enable_scope_fencing: void,
     certify_native_bootstrap: []const u8,
+    certify_native_snapshot_pages: ScopedSnapshotCut,
     configure: Scope,
     bind_checkpoint: checkpoint_authority.Spec,
     fence_checkpoint: struct { authority_digest: Digest, proof: Digest },
@@ -368,6 +400,7 @@ pub const Mutation = union(enum) {
         switch (self) {
             .close, .enable_scope_fencing => {},
             .certify_native_bootstrap => |checkpoint| if (!text(checkpoint, 1024, false)) return error.InvalidSourceControl,
+            .certify_native_snapshot_pages => |cut| if (!text(cut.provider_checkpoint, 1024, false) or !nonzero(cut.first_page)) return error.InvalidSourceControl,
             .configure, .reseed => |scope| try scope.validate(),
             .bind_checkpoint => |authority| {
                 try authority.validate();
@@ -405,16 +438,24 @@ pub const Mutation = union(enum) {
                 if (state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false)) return error.SourcePendingWork;
                 next.scope_fencing = true;
             },
-            .certify_native_bootstrap => |checkpoint| {
+            .certify_native_bootstrap, .certify_native_snapshot_pages => {
+                const checkpoint = switch (self) {
+                    .certify_native_bootstrap => |checkpoint| checkpoint,
+                    .certify_native_snapshot_pages => |cut| cut.provider_checkpoint,
+                    else => unreachable,
+                };
+                const first_page: ?Digest = if (self == .certify_native_snapshot_pages) self.certify_native_snapshot_pages.first_page else null;
                 if (!state.scope_fencing or state.closing or state.retired) return error.SourceBindingConflict;
                 if (state.native_bootstrap_checkpoint) |prior| {
-                    if (!std.mem.eql(u8, prior, checkpoint)) return error.SourceCheckpointConflict;
+                    if (!std.mem.eql(u8, prior, checkpoint) or !std.meta.eql(state.native_bootstrap_first_page, first_page))
+                        return error.SourceCheckpointConflict;
                     return state;
                 }
                 if (state.pending != null or state.accepted.sequence != 0 or
                     state.outstanding.len != 0 or state.artifact_control.?.current != null)
                     return error.SourcePendingWork;
                 next.native_bootstrap_checkpoint = try a.dupe(u8, checkpoint);
+                next.native_bootstrap_first_page = first_page;
             },
             .close => {
                 if (state.scope == null) return error.SourceBindingConflict;
@@ -473,12 +514,7 @@ pub const Mutation = union(enum) {
                 if (state.outstanding.len == max_outstanding or
                     acceptance_credit > max_outstanding_encoded_bytes - outstandingBytes(state.outstanding)) return error.SourceAdmissionBackpressure;
                 if (reservation.sequence != (std.math.add(u64, state.accepted.sequence, 1) catch return error.SourceReceiptExpired)) return error.SourceReceiptExpired;
-                if (state.accepted.sequence == 0) {
-                    if (state.native_bootstrap_checkpoint) |bootstrap| {
-                        if (!std.mem.eql(u8, bootstrap, reservation.checkpoint))
-                            return error.SourceCheckpointConflict;
-                    }
-                }
+                if (state.accepted.sequence == 0) try state.requireInitialBootstrapCheckpoint(reservation.checkpoint);
                 if (!predecessor(reservation.expected_checkpoint, state.accepted)) return error.SourceCheckpointConflict;
                 if (reservation.artifact) |spec| {
                     next.artifact_control = try (state.artifact_control orelse artifact_control.State{}).reserve(reservation.identity(scope), spec, scope.identity());
@@ -809,6 +845,33 @@ pub fn nativeSourceProviderBinding(status: anytype) ![32]u8 {
     return hash.finalResult();
 }
 
+pub fn nativeBootstrapSourceId(table_id: u64, ordinal: u32, definition: Digest) Digest {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:native-postgres-source:v1");
+    var input: [12]u8 = undefined;
+    std.mem.writeInt(u64, input[0..8], table_id, .big);
+    std.mem.writeInt(u32, input[8..12], ordinal, .big);
+    hash.update(&input);
+    hash.update(&definition);
+    return hash.finalResult();
+}
+
+pub fn sourceMayWriteNativeDestination(source: std.json.Value, default_table: []const u8, destination: []const u8) !bool {
+    if (source != .object) return error.InvalidReplicationSourceConfig;
+    const routes = source.object.get("routes") orelse return std.mem.eql(u8, default_table, destination);
+    if (routes == .null) return std.mem.eql(u8, default_table, destination);
+    if (routes != .array) return error.InvalidReplicationSourceConfig;
+    if (routes.array.items.len == 0) return std.mem.eql(u8, default_table, destination);
+    var may_write = false;
+    for (routes.array.items) |route| {
+        if (route != .object) return error.InvalidReplicationSourceConfig;
+        const target = route.object.get("target_table") orelse return error.InvalidReplicationSourceConfig;
+        if (target != .string or target.string.len == 0) return error.InvalidReplicationSourceConfig;
+        may_write = may_write or std.mem.eql(u8, target.string, destination);
+    }
+    return may_write;
+}
+
 pub fn nativeBootstrapCatalogDigest(table: anytype) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly:native-postgres-bootstrap-catalog:v1");
@@ -849,6 +912,20 @@ pub fn nativeSnapshotPageId(cutover: anytype, row_offset: u64) ![16]u8 {
         std.mem.writeInt(u64, &value, number, .big);
         hash.update(&value);
     }
+    var id = hash.finalResult()[0..16].*;
+    if (std.mem.allEqual(u8, &id, 0)) id[15] = 1;
+    return id;
+}
+
+pub fn nativeSnapshotTransactionId(cutover: anytype, row_offset: u64) ![16]u8 {
+    const page_id = try nativeSnapshotPageId(cutover, row_offset);
+    if (cutover.snapshot_page_attempt == 0) return page_id;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:native-postgres-snapshot-attempt:v1");
+    hash.update(&page_id);
+    var attempt: [4]u8 = undefined;
+    std.mem.writeInt(u32, &attempt, cutover.snapshot_page_attempt, .big);
+    hash.update(&attempt);
     var id = hash.finalResult()[0..16].*;
     if (std.mem.allEqual(u8, &id, 0)) id[15] = 1;
     return id;
@@ -1195,7 +1272,7 @@ test "source control replans only proven unadmitted delivery while retaining log
 fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
-        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "native_bootstrap_checkpoint")) @field(value, name) != null else true;
+        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "native_bootstrap_checkpoint") or std.mem.eql(u8, name, "native_bootstrap_first_page")) @field(value, name) != null else true;
         if (include) {
             try stream.objectField(name);
             try stream.write(@field(value, name));
@@ -1207,6 +1284,7 @@ pub fn requiredProtocol(mutation: Mutation) u16 {
     return switch (mutation) {
         .close, .enable_scope_fencing => closing_protocol_version,
         .certify_native_bootstrap => native_bootstrap_protocol_version,
+        .certify_native_snapshot_pages => scoped_snapshot_protocol_version,
         .bind_checkpoint, .fence_checkpoint => checkpoint_authority.protocol_version,
         .reserve => |reservation| if (reservation.retain_manifest) manifest_protocol_version else if (reservation.artifact != null) artifact_control.protocol_version else protocol_version,
         .replan => |plan| if (plan.retain_manifest) manifest_protocol_version else if (plan.artifact != null) artifact_control.protocol_version else protocol_version,
@@ -1479,6 +1557,18 @@ test "source control scope fencing pins idle bindings until closing retirement a
     state = try (Mutation{ .enable_scope_fencing = {} }).apply(ca, state);
     try std.testing.expect(hasWork(state));
     try std.testing.expectEqual(state.revision, (try (Mutation{ .enable_scope_fencing = {} }).apply(ca, state)).revision);
+    const first_page: Digest = @splat(8);
+    const certify_pages: Mutation = .{ .certify_native_snapshot_pages = .{ .provider_checkpoint = "lsn:0/1234", .first_page = first_page } };
+    try std.testing.expectEqual(scoped_snapshot_protocol_version, requiredProtocol(certify_pages));
+    const pages = try certify_pages.apply(ca, state);
+    try std.testing.expectError(error.SourceCheckpointConflict, pages.requireInitialBootstrapCheckpoint("lsn:0/1234"));
+    try pages.requireInitialBootstrapCheckpoint(&nativeSnapshotScopedCheckpoint(first_page));
+    const encoded_pages = try encode(ca, pages);
+    var decoded_pages = try parse(ca, encoded_pages);
+    defer decoded_pages.deinit();
+    try std.testing.expectEqual(first_page, decoded_pages.value.native_bootstrap_first_page.?);
+    try std.testing.expectEqualStrings("lsn:0/1234", decoded_pages.value.native_bootstrap_checkpoint.?);
+
     const certify: Mutation = .{ .certify_native_bootstrap = "lsn:0/1234" };
     try std.testing.expectEqual(native_bootstrap_protocol_version, requiredProtocol(certify));
     state = try certify.apply(ca, state);

@@ -68,6 +68,39 @@ pub const Admission = struct {
     scope_reads: ?@import("source_scope_operations.zig").Port = null,
     scope_controls: ?@import("source_scope_control_operations.zig").Port = null,
 
+    producer_reads: ?@import("source_producer_closure_operations.zig").Port = null,
+    producer_controls: ?@import("source_producer_control_operations.zig").Port = null,
+
+    fn requestNonce(a: A) ![16]u8 {
+        var io_impl = std.Io.Threaded.init(a, .{});
+        defer io_impl.deinit();
+        var nonce: [16]u8 = undefined;
+        try @import("antfly_platform").entropy.fill(io_impl.io(), &nonce);
+        if (std.mem.allEqual(u8, &nonce, 0)) nonce[0] = 1;
+        return nonce;
+    }
+
+    fn requireProducerClosure(self: Admission, a: A, fence: metadata.CatalogRouteFence, table: []const u8, owner: local.storage_transaction_completion.RoutedOwner, context: Context) !void {
+        const reads = self.producer_reads orelse return error.ChangefeedCapabilityUnsupported;
+        const controls = self.producer_controls orelse return error.ChangefeedCapabilityUnsupported;
+        const query: @import("source_producer_closure_operations.zig").wire.Query = .{
+            .version = 1,
+            .owner = owner,
+            .minimum_applied_index = 1,
+        };
+        const observed = try reads.read(a, fence, table, query, context);
+        try observed.validate(query);
+        if (observed.closure != null) return;
+        const command: @import("source_producer_control_operations.zig").wire.Request = .{
+            .version = 1,
+            .owner = owner,
+            .request_id = try requestNonce(a),
+        };
+        const result = try controls.execute(a, fence, table, command, context);
+        try result.validate(command, try command.digest(a));
+        if (!result.closed()) return error.SourceOutcomeUnresolved;
+    }
+
     pub fn requireScope(self: Admission, a: A, fence: metadata.CatalogRouteFence, table: []const u8, intent: local.storage_source_scope_control.Intent, context: Context) !void {
         const reads = self.scope_reads orelse return error.ChangefeedCapabilityUnsupported;
         const controls = self.scope_controls orelse return error.ChangefeedCapabilityUnsupported;
@@ -80,34 +113,68 @@ pub const Admission = struct {
         };
         const observed = try reads.read(a, fence, table, query, context);
         try observed.validate(query);
-        if (observed.record) |record| {
-            if (!std.meta.eql(record.spec, intent.spec) or record.phase != .active)
-                return error.SourceBindingConflict;
-            return;
-        }
-        var io_impl = std.Io.Threaded.init(a, .{});
-        defer io_impl.deinit();
-        var nonce: [16]u8 = undefined;
-        try @import("antfly_platform").entropy.fill(io_impl.io(), &nonce);
-        if (std.mem.allEqual(u8, &nonce, 0)) nonce[0] = 1;
+        if (try scopeReached(observed, intent)) return;
+        if (intent.action == .bind) try self.requireProducerClosure(a, fence, table, intent.owner, context);
         const input: @import("source_scope_control_operations.zig").wire.Request = .{
             .version = 1,
-            .request_id = nonce,
+            .request_id = try requestNonce(a),
             .operation = .submit,
             .intent = intent,
         };
         const result = try controls.execute(a, fence, table, input, context);
         try result.validate(input, try input.digest(a));
         if (!result.confirmed()) return error.SourceOutcomeUnresolved;
-        if (result.command.?.version != 2) return error.SourceBindingConflict;
+        const expected_version: u8 = if (intent.action == .bind) 2 else 1;
+        if (result.command.?.version != expected_version) return error.SourceBindingConflict;
         switch (result.outcome.?) {
-            .applied => {},
+            .applied => |applied| if (!try scopeReached(applied, intent)) return error.SourceOutcomeUnresolved,
             .rejected => |rejection| switch (rejection) {
                 .pending => return error.SourcePendingWork,
                 else => return error.SourceBindingConflict,
             },
             .superseded => unreachable,
         }
+    }
+
+    pub fn dropClosedScope(self: Admission, a: A, fence: metadata.CatalogRouteFence, table: []const u8, closing: local.storage_source_scope_control.Intent, context: Context) !void {
+        if (closing.action != .close) return error.SourceBindingConflict;
+        try closing.validate();
+        const reads = self.scope_reads orelse return error.ChangefeedCapabilityUnsupported;
+        const query: local.storage_source_scope_control.Query = .{
+            .version = 1,
+            .owner = closing.owner,
+            .domain = closing.spec.domain(),
+            .minimum_applied_index = 1,
+        };
+        const observed = try reads.read(a, fence, table, query, context);
+        try observed.validate(query);
+        const record = observed.record orelse return self.requireScope(a, fence, table, closing, context);
+        if (!std.meta.eql(record.spec, closing.spec)) return error.SourceBindingConflict;
+        var drop = closing;
+        drop.action = .{ .drop = record.closed_at orelse return error.SourcePendingWork };
+        try self.requireScope(a, fence, table, drop, context);
+    }
+
+    fn scopeReached(observed: local.storage_source_scope_control.Observation, intent: local.storage_source_scope_control.Intent) !bool {
+        if (observed.record) |record| {
+            if (!std.meta.eql(record.spec, intent.spec)) return error.SourceBindingConflict;
+            return switch (intent.action) {
+                .bind => if (record.phase == .active) true else error.SourceBindingConflict,
+                .close => switch (record.phase) {
+                    .active => false,
+                    .closing => error.SourcePendingWork,
+                    .closed => true,
+                },
+                .drop => |closed_at| if (record.phase != .closed)
+                    error.SourcePendingWork
+                else if (!std.meta.eql(record.closed_at.?, closed_at))
+                    error.SourceBindingConflict
+                else
+                    false,
+            };
+        }
+        return intent.action != .bind and observed.header.strict and
+            observed.header.metadata_floor >= intent.minimum_metadata_index;
     }
 
     fn grantFromState(a: A, state: source.State) !Grant {

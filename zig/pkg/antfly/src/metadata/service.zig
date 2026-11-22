@@ -3824,7 +3824,7 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         },
         else => {},
     }
-    if (command == .publish_native_replication_bootstrap) return @import("source_control.zig").native_bootstrap_protocol_version;
+    if (command == .publish_native_replication_bootstrap or command == .seal_native_root_producer_cohort) return @import("source_control.zig").native_bootstrap_protocol_version;
     if (command == .apply_source_control) return @import("source_control.zig").requiredProtocolEncoded(command.apply_source_control);
     if (command == .apply_changefeed_control) return @import("changefeed_control.zig").requiredProtocolEncoded(command.apply_changefeed_control);
     if (command == .apply_pg_publication) return metadata_topology_protocol.pg_publication_version;
@@ -10763,10 +10763,11 @@ pub const MetadataHttpService = struct {
             const current = (try store.getReplicationSourceStatus(service.alloc, service.metadata_group_id, expected.table_id, expected.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
             defer metadata_table_manager.freeReplicationSourceStatus(service.alloc, current);
             if (!replicationCutoverAuthorityMatches(current, expected) or
+                !std.meta.eql(current.native_bootstrap_catalog_digest, catalog.nativeBootstrapCatalogDigest(table)) or
                 !std.mem.eql(u8, current.phase, expected.phase) or current.snapshot_offset != expected.snapshot_offset or
                 !std.mem.eql(u8, current.checkpoint, expected.checkpoint) or
                 !std.mem.eql(u8, current.prepared_checkpoint, expected.prepared_checkpoint) or
-                current.updated_at_ms != expected.updated_at_ms or
+                current.updated_at_ms != expected.updated_at_ms or current.snapshot_page_attempt != expected.snapshot_page_attempt or
                 !metadata_table_manager.ReplicationSourceStatusRecord.SnapshotPage.eql(current.pending_snapshot_page, expected.pending_snapshot_page) or
                 !std.mem.eql(u8, current.snapshot_cleanup_job, expected.snapshot_cleanup_job))
                 return error.ReplicationCutoverAuthorityLost;
@@ -10802,7 +10803,7 @@ pub const MetadataHttpService = struct {
         };
         var guard: NativeSnapshotPageGuard = .{ .service = self, .table = table, .record = record };
         const control = @import("source_control.zig");
-        try guard.recovery(&hosted).releaseRetained(a, job.value, if (std.mem.eql(u8, record.phase, control.native_bootstrap_snapshot_phase)) .aborted else .committed, context);
+        try guard.recovery(&hosted).releaseRetained(a, job.value, if (std.mem.eql(u8, record.phase, control.native_bootstrap_snapshot_phase) or std.mem.eql(u8, record.phase, control.native_bootstrap_retry_phase)) .aborted else .committed, context);
         try NativeSnapshotPageGuard.check(&guard, context);
         var cleared = record;
         cleared.snapshot_cleanup_job = "";
@@ -10818,6 +10819,151 @@ pub const MetadataHttpService = struct {
         defer metadata_table_manager.freeReplicationSourceStatus(a, observed);
         if (std.mem.eql(u8, observed.snapshot_cleanup_job, record.snapshot_cleanup_job))
             return error.SourceOutcomeUnresolved;
+    }
+
+    pub fn captureNativeReplicationSnapshotPage(
+        self: *MetadataHttpService,
+        table: metadata_table_manager.TableRecord,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+        rows: []const u8,
+        deadline_ns: ?u64,
+    ) !void {
+        try ensureCdcWorkPermit(self);
+        const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
+        const command: metadata_storage.TransitionCommand = .{ .publish_native_replication_bootstrap = .{
+            .catalog_digest = @import("source_control.zig").nativeBootstrapCatalogDigest(table),
+            .record = record,
+            .captured_rows = rows,
+            .capture_only = true,
+        } };
+        try ensureCoordinatedDecoderWithContext(self, command, context);
+        const receipt = try self.proposeTransitionCommandWithReceipt(command);
+        try self.waitForTransitionAppliedWithContext(receipt, context);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const captured = (try store.observeNativeSnapshotCapture(self.alloc, self.metadata_group_id, record, record.snapshot_offset, false)) orelse return error.SourceAdmissionBackpressure;
+        defer {
+            self.alloc.free(captured.page.checkpoint);
+            self.alloc.free(captured.page.recovery_job);
+            self.alloc.free(captured.rows);
+        }
+        if (!metadata_table_manager.ReplicationSourceStatusRecord.SnapshotPage.eql(captured.page, record.pending_snapshot_page) or
+            !std.mem.eql(u8, captured.rows, rows))
+            return error.SourcePayloadConflict;
+    }
+
+    pub fn replayNativeReplicationSnapshotCapture(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, deadline_ns: ?u64) !bool {
+        if (record.snapshot_cleanup_job.len != 0) return false;
+        if (record.pending_snapshot_page) |pending| if (pending.recovery_job.len != 0) return false;
+        try ensureCdcWorkPermit(self);
+        const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
+        var guard: NativeSnapshotPageGuard = .{ .service = self, .table = table, .record = record };
+        try NativeSnapshotPageGuard.check(&guard, context);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const captured = (try store.observeNativeSnapshotCapture(a, self.metadata_group_id, record, record.snapshot_offset, true)) orelse return false;
+        defer {
+            a.free(captured.page.checkpoint);
+            a.free(captured.page.recovery_job);
+            a.free(captured.rows);
+        }
+        const control = @import("source_control.zig");
+        if (!captured.sealed or !captured.page.managed_dispatch or captured.page.recovery_job.len != 0) return error.SourceControlCorrupt;
+        const definition = try control.definitionDigest(a, table.replication_sources_json, record.source_ordinal);
+        const id = control.nativeBootstrapSourceId(table.table_id, record.source_ordinal, definition);
+        const raw = try control.readOnService(self, a, table.table_id, id, context);
+        defer a.free(raw);
+        var actor = try control.parse(a, raw);
+        defer actor.deinit();
+        const scoped = actor.value.native_bootstrap_first_page != null;
+        if (!scoped and record.snapshot_offset == 0 and record.pending_snapshot_page == null) {
+            _ = try self.ensureTableTopologyProtocolReadyWithContext(context, control.scoped_snapshot_protocol_version);
+            if (!actor.value.scope_fencing) {
+                try self.advanceNativeReplicationSnapshotActor(a, table, record, context);
+            } else {
+                const scope = actor.value.scope orelse return error.SourceBindingConflict;
+                try control.mutateOnService(self, a, .{
+                    .table_id = scope.table_id,
+                    .source_id = scope.source_id,
+                    .expected_revision = actor.value.revision,
+                    .expected_binding = scope.identity(),
+                    .expected_catalog_digest = control.digest(table.replication_sources_json),
+                    .mutation = .{ .certify_native_snapshot_pages = .{
+                        .provider_checkpoint = record.prepared_checkpoint,
+                        .first_page = captured.page.payload_digest,
+                    } },
+                }, context);
+            }
+            return true;
+        }
+        var applying = record;
+        applying.phase = control.native_bootstrap_applying_phase;
+        if (record.pending_snapshot_page) |pending| {
+            if (!metadata_table_manager.ReplicationSourceStatusRecord.SnapshotPage.eql(pending, captured.page))
+                return error.SourcePayloadConflict;
+        } else {
+            applying.updated_at_ms = @max(record.updated_at_ms, platform_time.realtimeNs() / std.time.ns_per_ms);
+            applying.pending_snapshot_page = captured.page;
+            try self.publishNativeReplicationBootstrapDurable(table, applying, null, captured.rows, deadline_ns);
+        }
+        if (scoped) {
+            if (!try self.deliverNativeScopedSnapshotPage(a, table, applying, captured.rows, actor.value, context)) return true;
+        } else {
+            try metadata_replication_backfill.replayNativeSnapshotRows(self, a, table, applying, captured.rows, self.destination_authorizer, deadline_ns);
+        }
+        var progressed = applying;
+        if (captured.page.final) progressed.phase = control.native_bootstrap_prepared_phase;
+        progressed.snapshot_offset = captured.page.end_offset;
+        progressed.checkpoint = captured.page.checkpoint;
+        progressed.pending_snapshot_page = null;
+        progressed.snapshot_page_attempt = 0;
+        try self.publishNativeReplicationBootstrapDurable(table, progressed, captured.page.payload_digest, "", deadline_ns);
+        return true;
+    }
+
+    fn deliverNativeScopedSnapshotPage(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, encoded_rows: []const u8, state: @import("source_control.zig").State, context: api_operation.RequestContext) !bool {
+        const control = @import("source_control.zig");
+        const scope = state.scope orelse return error.SourceBindingConflict;
+        const authority = state.checkpoint_authority orelse return error.SourceBindingConflict;
+        const page = record.pending_snapshot_page orelse return error.SourcePendingWork;
+        if (state.closing or state.retired or !std.meta.eql(scope.provider, try control.nativeSourceProviderBinding(record)))
+            return error.SourceBindingConflict;
+        const checkpoint = control.nativeSnapshotScopedCheckpoint(page.payload_digest);
+        if (std.mem.eql(u8, state.committed.checkpoint, &checkpoint)) return true;
+        const catalog_digest = control.digest(table.replication_sources_json);
+        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        var router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+        var hosted: @import("../api/hosted_completion.zig").Hosted = .{
+            .catalog = catalog,
+            .router = router.router(),
+            .executor = self.raft.host.http_host.request_executor,
+            .secret = self.internal_service_secret,
+            .issuer = self.internal_service_issuer,
+            .provision_policy = true,
+        };
+        const admission = hosted.sourceAdmission();
+        const completion = @import("../api/source_destination_completion.zig");
+        if (state.artifact_control.?.current) |artifact| {
+            try completion.recover(self, admission, a, scope, catalog_digest, context);
+            if (artifact.phase != .reserved) return false;
+        }
+        var snapshot = try @import("source_scope_capture.zig").readOnService(self, a, .{
+            .metadata_group_id = authority.owner.metadata_group_id,
+            .metadata_incarnation = authority.owner.metadata_incarnation,
+            .actor_table_id = scope.table_id,
+            .source_id = scope.source_id,
+            .minimum_applied_index = 1,
+        }, context);
+        defer snapshot.deinit(a);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const requests = try metadata_replication_backfill.compileNativeSnapshotRequests(&arena, table, record, encoded_rows, self.destination_authorizer);
+        try completion.stage(self, admission, a, scope, catalog_digest, .{
+            .batch_id = &checkpoint,
+            .checkpoint = &checkpoint,
+            .expected_checkpoint = if (state.accepted.sequence == 0) null else state.accepted.checkpoint,
+            .payload_digest = page.payload_digest,
+            .accepted_at_ns = platform_time.realtimeNs(),
+        }, requests, snapshot, context);
+        return false;
     }
 
     pub fn recoverNativeReplicationSnapshotPage(
@@ -10844,7 +10990,14 @@ pub const MetadataHttpService = struct {
         };
         var guard: NativeSnapshotPageGuard = .{ .service = self, .table = table, .record = record };
         const control = @import("source_control.zig");
-        const outcome = try guard.recovery(&hosted).runRetained(a, job.value, context);
+        var outcome = try guard.recovery(&hosted).runRetained(a, job.value, context);
+        if (outcome == .unproven or outcome == .pending) {
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            const rows = (try store.getNativeSnapshotRows(a, self.metadata_group_id, record.table_id, record.source_ordinal)) orelse return error.SourcePendingWork;
+            defer a.free(rows);
+            try metadata_replication_backfill.replayNativeSnapshotRows(self, a, table, record, rows, self.destination_authorizer, deadline_ns);
+            outcome = .complete;
+        }
         try NativeSnapshotPageGuard.check(&guard, context);
         var progressed = record;
         switch (outcome) {
@@ -10852,17 +11005,37 @@ pub const MetadataHttpService = struct {
                 if (page.final) progressed.phase = control.native_bootstrap_prepared_phase;
                 progressed.snapshot_offset = page.end_offset;
                 progressed.checkpoint = page.checkpoint;
+                progressed.snapshot_page_attempt = 0;
             },
             .aborted => {
-                if (record.snapshot_offset != 0 or !page.managed_dispatch) return;
-                progressed.phase = control.native_bootstrap_snapshot_phase;
+                if (!page.managed_dispatch) return;
+                const store = self.projectedStore() orelse return error.MissingMetadataStore;
+                if (try store.observeNativeSnapshotCapture(a, self.metadata_group_id, record, record.snapshot_offset, true)) |capture| {
+                    defer {
+                        a.free(capture.page.checkpoint);
+                        a.free(capture.page.recovery_job);
+                        a.free(capture.rows);
+                    }
+                    if (!std.meta.eql(capture.page.payload_digest, page.payload_digest))
+                        return error.SourcePayloadConflict;
+                    progressed.phase = control.native_bootstrap_retry_phase;
+                    progressed.snapshot_page_attempt = try std.math.add(u32, record.snapshot_page_attempt, 1);
+                } else {
+                    if (record.snapshot_offset != 0) return;
+                    progressed.phase = control.native_bootstrap_snapshot_phase;
+                }
             },
             else => return,
         }
         progressed.pending_snapshot_page = null;
         progressed.updated_at_ms = @max(record.updated_at_ms, platform_time.realtimeNs() / std.time.ns_per_ms);
         const decision_proof = if (outcome == .aborted) control.digest(page.recovery_job) else page.payload_digest;
-        try self.publishNativeReplicationBootstrapDurable(table, progressed, decision_proof, deadline_ns);
+        try self.publishNativeReplicationBootstrapDurable(table, progressed, decision_proof, "", deadline_ns);
+    }
+
+    pub fn admitFreshNativeReplicationBootstrap(self: *MetadataHttpService, deadline_ns: ?u64) !void {
+        try ensureCdcWorkPermit(self);
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(.{ .deadline_ns = deadline_ns }, @import("source_control.zig").scoped_snapshot_protocol_version);
     }
 
     pub fn commitNativeReplicationSnapshotPage(
@@ -10888,7 +11061,7 @@ pub const MetadataHttpService = struct {
             .issuer = self.internal_service_issuer,
             .provision_policy = true,
         };
-        const coordinator = hosted.coordinator();
+        var coordinator = hosted.coordinator();
         var prepared = try @import("../api/distributed_txn.zig").prepareRetainedCommit(a, coordinator, transaction_id, begin_ns, requests, context);
         defer prepared.deinit();
         const commit_version = try std.math.add(u64, begin_ns, 1);
@@ -10904,16 +11077,20 @@ pub const MetadataHttpService = struct {
         defer a.free(encoded);
         var armed = record;
         if (armed.pending_snapshot_page == null or !armed.pending_snapshot_page.?.managed_dispatch) return error.SourcePendingWork;
+        const retained_job = armed.pending_snapshot_page.?.recovery_job;
+        if (retained_job.len != 0 and !std.mem.eql(u8, retained_job, encoded))
+            return error.SourceTransactionIdentityConflict;
         armed.pending_snapshot_page.?.recovery_job = encoded;
-        try self.publishNativeReplicationBootstrapDurable(table, armed, null, deadline_ns);
+        try self.publishNativeReplicationBootstrapDurable(table, armed, null, "", deadline_ns);
         try ensureCdcWorkPermit(self);
         var guard: NativeSnapshotPageGuard = .{ .service = self, .table = table, .record = armed };
         try NativeSnapshotPageGuard.check(&guard, context);
-        const outcome = try coordinator.commitPrepared(a, &prepared, commit_version, sync, context);
+        coordinator.recovery = guard.recovery(&hosted);
+        const outcome = try coordinator.commitSnapshotPagePrepared(a, &prepared, commit_version, sync, context);
         if (outcome.propagation_pending or outcome.visibility_pending) return error.SourceOutcomeUnresolved;
     }
 
-    pub fn publishNativeReplicationBootstrapDurable(self: *MetadataHttpService, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, completed_page: ?[32]u8, deadline_ns: ?u64) !void {
+    pub fn publishNativeReplicationBootstrapDurable(self: *MetadataHttpService, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, completed_page: ?[32]u8, captured_rows: []const u8, deadline_ns: ?u64) !void {
         try ensureCdcWorkPermit(self);
         const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
         try context.ensureActive();
@@ -10921,6 +11098,7 @@ pub const MetadataHttpService = struct {
             .catalog_digest = @import("source_control.zig").nativeBootstrapCatalogDigest(table),
             .record = record,
             .completed_page = completed_page,
+            .captured_rows = captured_rows,
         } };
         try ensureCoordinatedDecoderWithContext(self, command, context);
         const receipt = try self.proposeTransitionCommandWithReceipt(command);
@@ -10929,7 +11107,7 @@ pub const MetadataHttpService = struct {
         const observed = (try store.getReplicationSourceStatus(self.alloc, self.metadata_group_id, record.table_id, record.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
         defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, observed);
         if (!replicationCutoverAuthorityMatches(observed, record) or
-            !std.mem.eql(u8, observed.phase, record.phase) or observed.snapshot_offset != record.snapshot_offset or
+            !std.mem.eql(u8, observed.phase, record.phase) or observed.snapshot_offset != record.snapshot_offset or observed.snapshot_page_attempt != record.snapshot_page_attempt or
             !std.mem.eql(u8, observed.prepared_checkpoint, record.prepared_checkpoint) or
             (std.mem.eql(u8, record.phase, @import("source_control.zig").native_bootstrap_applying_phase) and observed.updated_at_ms != record.updated_at_ms) or
             !metadata_table_manager.ReplicationSourceStatusRecord.SnapshotPage.eql(observed.pending_snapshot_page, record.pending_snapshot_page) or
@@ -11007,6 +11185,262 @@ pub const MetadataHttpService = struct {
         return store.legacyReplicationSourceIntakeAllowed(self.alloc, self.metadata_group_id, table_id, ordinal, definition);
     }
 
+    pub fn installNativeReplicationSnapshotActor(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, deadline_ns: ?u64) !void {
+        const control = @import("source_control.zig");
+        if (!std.mem.eql(u8, record.phase, control.native_bootstrap_prepared_phase) or
+            record.pending_snapshot_page != null or record.snapshot_cleanup_job.len != 0) return;
+        return self.advanceNativeReplicationSnapshotActor(a, table, record, .{ .deadline_ns = deadline_ns });
+    }
+
+    fn advanceNativeReplicationSnapshotActor(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, context: api_operation.RequestContext) !void {
+        const control = @import("source_control.zig");
+        var guard: NativeSnapshotPageGuard = .{ .service = self, .table = table, .record = record };
+        try NativeSnapshotPageGuard.check(&guard, context);
+        const definition = try control.definitionDigest(a, table.replication_sources_json, record.source_ordinal);
+        const id = control.nativeBootstrapSourceId(table.table_id, record.source_ordinal, definition);
+        const raw = try control.readOnService(self, a, table.table_id, id, context);
+        defer a.free(raw);
+        var state = try control.parse(a, raw);
+        defer state.deinit();
+        if (state.value.retired or state.value.closing or state.value.scope_fencing) return;
+        const provider = try control.nativeSourceProviderBinding(record);
+        const catalog_digest = control.digest(table.replication_sources_json);
+
+        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        var router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+        var hosted: @import("../api/hosted_completion.zig").Hosted = .{
+            .catalog = catalog,
+            .router = router.router(),
+            .executor = self.raft.host.http_host.request_executor,
+            .secret = self.internal_service_secret,
+            .issuer = self.internal_service_issuer,
+            .provision_policy = true,
+        };
+        const key = std.fmt.bytesToHex(id, .lower);
+        const routed = try api_table_catalog.routedGroupSnapshotUntil(a, catalog, table.name, &key, context.deadline_ns);
+        const fence = routed.fence() orelse return error.TopologyChanged;
+        if (fence.table_id != table.table_id) return error.ReplicationSourceConfigChanged;
+        const observed = try hosted.coordinator().owners.read(a, fence, table.name, .{
+            .version = 1,
+            .expected_table_binding = @import("changefeed_control.zig").tableBinding(table),
+        }, context);
+        const scope: control.Scope = .{
+            .table_id = table.table_id,
+            .source_id = id,
+            .source_ordinal = record.source_ordinal,
+            .generation = 1,
+            .definition = definition,
+            .provider = provider,
+            .destination = .native,
+            .destination_binding = @import("native_source_delivery.zig").binding(observed.owner.namespace),
+        };
+        if (state.value.scope) |configured| {
+            if (!std.meta.eql(configured, scope)) return error.SourceBindingConflict;
+        }
+        const authority: control.checkpoint_authority.Spec = .{
+            .binding = scope.identity(),
+            .table_name = table.name,
+            .owner = observed.owner,
+        };
+        const mutation: control.Mutation = if (state.value.scope == null)
+            .{ .configure = scope }
+        else if (state.value.checkpoint_authority == null)
+            .{ .bind_checkpoint = authority }
+        else blk: {
+            if (!state.value.checkpoint_authority.?.sameAuthority(authority)) return error.SourceBindingConflict;
+            break :blk .{ .enable_scope_fencing = {} };
+        };
+        try NativeSnapshotPageGuard.check(&guard, context);
+        try control.mutateOnService(self, a, .{
+            .table_id = scope.table_id,
+            .source_id = scope.source_id,
+            .expected_revision = state.value.revision,
+            .expected_binding = scope.identity(),
+            .expected_catalog_digest = catalog_digest,
+            .mutation = mutation,
+        }, context);
+    }
+
+    pub fn sealNativeRootProducerCohort(self: *MetadataHttpService, table_name: []const u8, owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner, context: api_operation.RequestContext) !void {
+        try owner.validate();
+        if (owner.metadata_group_id != self.metadata_group_id) return error.SourceBindingConflict;
+        const incarnation = (try self.metadataIncarnation()) orelse return error.MetadataIncarnationUnavailable;
+        if (!std.meta.eql(owner.metadata_incarnation, incarnation)) return error.InvalidMetadataIncarnation;
+        const table_id = std.mem.readInt(u64, owner.namespace[0..8], .big);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        if (try store.nativeRootProducerCohortSealed(self.metadata_group_id, table_name, owner.table_binding)) return;
+        const command: metadata_storage.TransitionCommand = .{ .seal_native_root_producer_cohort = .{
+            .table_id = table_id,
+            .table_binding = owner.table_binding,
+        } };
+        try ensureCoordinatedDecoderWithContext(self, command, context);
+        const receipt = try self.proposeTransitionCommandWithReceipt(command);
+        try self.waitForTransitionAppliedWithContext(receipt, context);
+        if (!try store.nativeRootProducerCohortSealed(self.metadata_group_id, table_name, owner.table_binding))
+            return error.SourcePendingWork;
+    }
+
+    pub fn awaitNativeReplicationSourceReseed(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, ordinal: u32) !void {
+        const control = @import("source_control.zig");
+        const context: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| 24 * std.time.ns_per_s };
+        try self.ensureLinearizableReadWithContext(context);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const source_status = (try store.getReplicationSourceStatus(a, self.metadata_group_id, table.table_id, ordinal)) orelse return;
+        defer metadata_table_manager.freeReplicationSourceStatus(a, source_status);
+        if (!control.isNativeBootstrapPhase(source_status.phase)) return;
+        if (!std.mem.eql(u8, source_status.phase, control.native_bootstrap_prepared_phase) or
+            !std.meta.eql(source_status.native_bootstrap_catalog_digest, control.nativeBootstrapCatalogDigest(table)))
+            return error.TableTransitionActive;
+
+        const definition = try control.definitionDigest(a, table.replication_sources_json, ordinal);
+        const id = control.nativeBootstrapSourceId(table.table_id, ordinal, definition);
+        const catalog_digest = control.digest(table.replication_sources_json);
+        const provider = try control.nativeSourceProviderBinding(source_status);
+        while (platform_time.monotonicNs() < context.deadline_ns.?) {
+            const raw = try control.readOnService(self, a, table.table_id, id, context);
+            defer a.free(raw);
+            var parsed = try control.parse(a, raw);
+            defer parsed.deinit();
+            const state = parsed.value;
+            const scope = state.scope orelse return error.TableTransitionActive;
+            if (!std.meta.eql(scope.definition, definition) or !std.meta.eql(scope.provider, provider) or
+                state.native_bootstrap_checkpoint == null) return error.TableTransitionActive;
+            if (state.retired and !control.hasWork(state)) return;
+            if (!state.closing and state.pending == null and state.outstanding.len == 0 and state.artifact_control.?.current == null) {
+                control.mutateOnService(self, a, .{
+                    .table_id = scope.table_id,
+                    .source_id = scope.source_id,
+                    .expected_revision = state.revision,
+                    .expected_binding = scope.identity(),
+                    .expected_catalog_digest = catalog_digest,
+                    .mutation = .{ .close = {} },
+                }, context) catch |err| switch (err) {
+                    error.SourceControlConflict, error.MetadataMutationOutcomeUnknown => {},
+                    else => return err,
+                };
+            }
+            platform_time.sleepNs(100 * std.time.ns_per_ms);
+        }
+        return error.TableTransitionActive;
+    }
+
+    fn retireNativeReplicationSourceRoots(
+        self: *MetadataHttpService,
+        a: std.mem.Allocator,
+        catalog: api_table_catalog.CatalogSource,
+        admission: @import("../api/source_destination_admission.zig").Admission,
+        table: metadata_table_manager.TableRecord,
+        state: @import("source_control.zig").State,
+        context: api_operation.RequestContext,
+    ) !void {
+        const local = @import("antfly_local_sources");
+        const authority = state.checkpoint_authority orelse return error.SourceBindingConflict;
+        const scope = state.scope orelse return error.SourceBindingConflict;
+        if (!state.closing or state.native_bootstrap_checkpoint == null)
+            return error.SourceBindingConflict;
+        var snapshot = try @import("source_scope_capture.zig").readOnService(self, a, .{
+            .metadata_group_id = authority.owner.metadata_group_id,
+            .metadata_incarnation = authority.owner.metadata_incarnation,
+            .actor_table_id = scope.table_id,
+            .source_id = scope.source_id,
+            .minimum_applied_index = 1,
+        }, context);
+        defer snapshot.deinit(a);
+        if (snapshot.actor_revision != state.revision) return error.SourceBindingConflict;
+        if (state.retired) try snapshot.requireDrop() else try snapshot.requireClose();
+
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const definitions = try std.json.parseFromSlice(std.json.Value, scratch, table.replication_sources_json, .{ .duplicate_field_behavior = .@"error" });
+        if (definitions.value != .array or scope.source_ordinal >= definitions.value.array.items.len)
+            return error.SourceBindingConflict;
+        const definition = definitions.value.array.items[scope.source_ordinal];
+        const direct = try @import("source_control.zig").sourceMayWriteNativeDestination(definition, table.name, table.name);
+        var names: std.StringArrayHashMapUnmanaged(void) = .empty;
+        try names.put(scratch, authority.table_name, {});
+        if (direct) try names.put(scratch, table.name, {});
+        if (definition.object.get("routes")) |routes| {
+            if (routes == .array) for (routes.array.items) |route| {
+                try names.put(scratch, route.object.get("target_table").?.string, {});
+            };
+        }
+
+        const Root = struct {
+            name: []const u8,
+            fence: metadata_api.CatalogRouteFence,
+            owner: local.storage_transaction_completion.RoutedOwner,
+        };
+        var roots: std.ArrayListUnmanaged(Root) = .empty;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var revision: ?u64 = null;
+        var found_checkpoint = false;
+        for (names.keys()) |name| {
+            try context.ensureActive();
+            var routing = (try api_table_catalog.authoritativeTableRoutingSnapshot(scratch, catalog, name, context.deadline_ns)) orelse return error.TopologyChanged;
+            defer routing.deinit(scratch);
+            if (!routing.coversKeyspace() or routing.snapshot.value.metadata_group_id != authority.owner.metadata_group_id or
+                !std.meta.eql(routing.snapshot.value.metadata_incarnation, @as(?[32]u8, authority.owner.metadata_incarnation)))
+                return error.TopologyChanged;
+            if (revision) |prior| {
+                if (routing.snapshot.value.catalog_revision != prior) return error.TopologyChanged;
+            } else revision = routing.snapshot.value.catalog_revision;
+            const target = for (routing.snapshot.value.tables) |entry| {
+                if (entry.table_id == routing.table_id) break entry;
+            } else return error.TopologyChanged;
+            const binding = @import("changefeed_control.zig").tableBinding(target);
+            // A hosted bind requires a prior durable cohort seal. After
+            // the actor's closing cut, an unsealed root has no admitted bind
+            // to fence. Keep its legacy producer policy intact.
+            const sealed = try store.nativeRootProducerCohortSealed(self.metadata_group_id, name, binding);
+            if (!sealed and !std.mem.eql(u8, name, authority.table_name)) continue;
+            for (routing.ranges) |range| {
+                const route = routing.resolveRouteForKey(range.start_key) orelse return error.TopologyChanged;
+                const fence = routing.fenceForRoute(route);
+                const captured = try admission.coordinator.owners.read(a, fence, name, .{
+                    .version = 1,
+                    .expected_table_binding = binding,
+                }, context);
+                found_checkpoint = found_checkpoint or std.meta.eql(captured.owner, authority.owner);
+                if (sealed) try roots.append(scratch, .{ .name = name, .fence = fence, .owner = captured.owner });
+            }
+        }
+        if (!found_checkpoint) return error.TopologyChanged;
+        var proof = std.crypto.hash.sha2.Sha256.init(.{});
+        proof.update("antfly:native-postgres-source-retirement:v1");
+        proof.update(&scope.identity());
+        for (roots.items) |root| {
+            try context.ensureActive();
+            const intent: local.storage_source_scope_control.Intent = .{
+                .version = 1,
+                .owner = root.owner,
+                .spec = snapshot.spec,
+                .minimum_metadata_index = snapshot.cut.index,
+                .action = .close,
+            };
+            if (state.retired) {
+                try admission.dropClosedScope(a, root.fence, root.name, intent, context);
+            } else {
+                try admission.requireScope(a, root.fence, root.name, intent, context);
+            }
+            proof.update(&root.owner.digest());
+        }
+        const digest = proof.finalResult();
+        const receipt = std.fmt.bytesToHex(digest, .lower);
+        const control = @import("source_control.zig");
+        try control.mutateOnService(self, a, .{
+            .table_id = scope.table_id,
+            .source_id = scope.source_id,
+            .expected_revision = state.revision,
+            .expected_binding = scope.identity(),
+            .expected_catalog_digest = control.digest(table.replication_sources_json),
+            .mutation = if (state.retired)
+                .{ .fence_checkpoint = .{ .authority_digest = authority.digest(), .proof = digest } }
+            else
+                .{ .retire = .{ .receipt = &receipt } },
+        }, context);
+    }
+
     pub fn recoverNativeReplicationSource(self: *MetadataHttpService, a: std.mem.Allocator, runner: *metadata_replication_backfill.StreamingReplicationRunner, table: metadata_table_manager.TableRecord, ordinal: u32, deadline_ns: ?u64) !void {
         try ensureCdcWorkPermit(self);
         const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
@@ -11028,7 +11462,7 @@ pub const MetadataHttpService = struct {
         defer a.free(raw);
         var state = try control.parse(a, raw);
         defer state.deinit();
-        if (!std.meta.eql(state.value.scope, @as(?control.Scope, scope)) or state.value.retired or !state.value.scope_fencing)
+        if (!std.meta.eql(state.value.scope, @as(?control.Scope, scope)) or !state.value.scope_fencing)
             return error.SourceBindingConflict;
         const admission = hosted.sourceAdmission();
         if (state.value.artifact_control.?.current) |record| {
@@ -11040,10 +11474,19 @@ pub const MetadataHttpService = struct {
             var latest = try control.parse(a, after);
             defer latest.deinit();
             if (latest.value.revision != state.value.revision) return;
-        } else if (state.value.pending != null or state.value.outstanding.len != 0 or state.value.closing) return;
+        } else if (state.value.pending != null or state.value.outstanding.len != 0) return;
+        if (state.value.closing) {
+            try self.retireNativeReplicationSourceRoots(a, catalog, admission, table, state.value, context);
+            return;
+        }
         const source_status = (try store.getReplicationSourceStatus(a, self.metadata_group_id, scope.table_id, ordinal)) orelse return;
         defer metadata_table_manager.freeReplicationSourceStatus(a, source_status);
         try ensureCdcWorkPermit(self);
+        if (state.value.native_bootstrap_checkpoint != null and state.value.accepted.sequence == 0) {
+            try self.ensureLinearizableReadWithContext(context);
+            if (!try store.nativeRootProducerCohortReady(a, self.metadata_group_id, state.value.checkpoint_authority.?.table_name))
+                return error.SourcePendingWork;
+        }
         if (state.value.native_bootstrap_checkpoint == null and
             std.mem.eql(u8, source_status.phase, control.native_bootstrap_prepared_phase))
         {

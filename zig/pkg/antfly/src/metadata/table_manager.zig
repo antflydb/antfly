@@ -1402,6 +1402,8 @@ pub const ReplicationSourceStatusRecord = struct {
     /// Published before the page can reach the destination transaction path.
     pending_snapshot_page: ?SnapshotPage = null,
     snapshot_cleanup_job: []const u8 = "",
+    snapshot_page_attempt: u32 = 0,
+    native_bootstrap_catalog_digest: [32]u8 = @splat(0),
     pub const SnapshotPage = struct {
         end_offset: u64,
         checkpoint: []const u8,
@@ -1418,6 +1420,12 @@ pub const ReplicationSourceStatusRecord = struct {
                 std.mem.eql(u8, a.recovery_job, b.recovery_job);
         }
     };
+};
+
+pub const CapturedNativeSnapshotPage = struct {
+    page: ReplicationSourceStatusRecord.SnapshotPage,
+    rows: []const u8,
+    sealed: bool = false,
 };
 
 pub const ShuffleJoinLeaseRecord = struct {
@@ -2622,6 +2630,8 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .retired_cutover_authority_id = record.retired_cutover_authority_id,
         .retired_slot_name = retired_slot_name,
         .retired_publication_name = retired_publication_name,
+        .native_bootstrap_catalog_digest = record.native_bootstrap_catalog_digest,
+        .snapshot_page_attempt = record.snapshot_page_attempt,
         .snapshot_cleanup_job = cleanup,
         .pending_snapshot_page = pending,
         .updated_at_ms = record.updated_at_ms,

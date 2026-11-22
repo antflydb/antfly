@@ -1847,6 +1847,44 @@ def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_coll
         == pg_cdc_source["slot_name"]
     ), "required exact cutover adopted or removed the caller's logical slot"
 
+    catalog_digest = physical_status["native_bootstrap_catalog_digest"]
+    assert any(catalog_digest) and catalog_digest != "\x00" * 32
+    bootstrap_checkpoint = physical_status["prepared_checkpoint"]
+    assert bootstrap_checkpoint
+    _run_psql(f"""
+        begin;
+        update {pg_cdc_source["table_name"]} set tier = 'platinum' where id = 'user-1';
+        insert into {pg_cdc_source["table_name"]} (id, name, tier)
+        values ('user-2', 'Bob', 'silver');
+        commit;
+        """)
+
+    def committed_stream_status():
+        for status in _metadata_replication_status_records(stateful_api):
+            if (
+                int(status.get("table_id", 0)) == table_id
+                and int(status.get("source_ordinal", -1)) == 0
+                and status.get("phase") == "streaming"
+                and status.get("stream_checkpoint")
+                and status["stream_checkpoint"] != bootstrap_checkpoint
+            ):
+                return status
+        return None
+
+    committed = wait_until(committed_stream_status, timeout_s=30.0, interval_s=0.25)
+    assert committed is not None, (
+        "post-cutover PostgreSQL transaction did not advance its committed checkpoint\n"
+        f"{_metadata_replication_statuses(stateful_api)}\n"
+        f"{_server_logs(stateful_api)}"
+    )
+    assert committed["prepared_checkpoint"] == bootstrap_checkpoint
+    assert _lookup_doc_if(
+        stateful_api, table_name, "user-1", lambda doc: doc.get("tier") == "platinum"
+    )
+    assert _lookup_doc_if(
+        stateful_api, table_name, "user-2", lambda doc: doc.get("name") == "Bob"
+    )
+
     exact_required_status = _metadata_status(stateful_api)
     assert (
         exact_required_status.get(
@@ -1871,6 +1909,106 @@ def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_coll
             "projected_replication_source_statuses_reseed_recommended", 0
         )
         == 0
+    )
+
+    # The first source has now closed legacy producer intake on the target.
+    # A second source must write its snapshot through its own scoped grant.
+    routed_table = f"cdc_routed_after_close_{time.time_ns()}"
+    _create_table_public(
+        stateful_api,
+        routed_table,
+        {
+            "num_shards": 1,
+            "replication_sources": [
+                {
+                    "type": "postgres",
+                    "dsn": _pg_dsn(),
+                    "postgres_table": pg_cdc_source["table_name"],
+                    "key_template": "id",
+                    "require_exact_cutover": True,
+                    "routes": [
+                        {
+                            "target_table": table_name,
+                            "key_template": "routed-{{id}}",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    routed_id = _metadata_table_id(stateful_api, routed_table)
+    assert routed_id is not None
+
+    def routed_status():
+        for status in _metadata_replication_status_records(stateful_api):
+            if (
+                int(status.get("table_id", 0)) == routed_id
+                and status.get("phase") == "streaming"
+            ):
+                return status
+        return None
+
+    routed = wait_until(routed_status, timeout_s=60.0, interval_s=0.25)
+    assert routed is not None, (
+        "routed source did not bootstrap after legacy intake closed\n"
+        f"{_metadata_replication_statuses(stateful_api)}\n"
+        f"{_server_logs(stateful_api)}"
+    )
+    pg_cdc_source["cleanup_slot_names"].append(routed["slot_name"])
+    pg_cdc_source["cleanup_publication_names"].append(routed["publication_name"])
+    assert _lookup_doc_if(
+        stateful_api,
+        table_name,
+        "routed-user-1",
+        lambda doc: doc.get("tier") == "platinum",
+    )
+    assert _lookup_doc_if(
+        stateful_api, table_name, "routed-user-2", lambda doc: doc.get("name") == "Bob"
+    )
+
+    previous_routed_authority = routed["cutover_authority_id"]
+    metadata_name = next(
+        row["name"]
+        for row in _metadata_admin_snapshot_json(stateful_api)["tables"]
+        if int(row["table_id"]) == routed_id
+    )
+    _reseed_exact_cutover(stateful_api, metadata_name, 0)
+    routed_after_reseed = wait_until(
+        lambda: next(
+            (
+                status
+                for status in _metadata_replication_status_records(stateful_api)
+                if int(status.get("table_id", 0)) == routed_id
+                and status.get("phase") == "streaming"
+                and status.get("cutover_authority_id") != previous_routed_authority
+            ),
+            None,
+        ),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert routed_after_reseed is not None, (
+        "routed source did not resume after reseed\n"
+        f"{_metadata_replication_statuses(stateful_api)}\n"
+        f"{_server_logs(stateful_api)}"
+    )
+    pg_cdc_source["cleanup_slot_names"].append(routed_after_reseed["slot_name"])
+    pg_cdc_source["cleanup_publication_names"].append(
+        routed_after_reseed["publication_name"]
+    )
+    _run_psql(f"""
+        insert into {pg_cdc_source["table_name"]} (id, name, tier)
+        values ('user-3', 'Carol', 'bronze');
+        """)
+    assert wait_until(
+        lambda: _lookup_doc_if(
+            stateful_api,
+            table_name,
+            "routed-user-3",
+            lambda doc: doc.get("name") == "Carol",
+        ),
+        timeout_s=30.0,
+        interval_s=0.25,
     )
 
 
@@ -1963,6 +2101,9 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
         )
         assert table_detail["replication_sources"][0]["require_exact_cutover"] is True
 
+        if stateful_api._server is not None:
+            stateful_api.restart_server()
+
         snapshot_doc = wait_until(
             lambda: _lookup_doc_if(
                 stateful_api,
@@ -2007,6 +2148,25 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
         assert new_physical_publication_name != new_publication_name
         assert "_af_" in new_physical_slot_name
         assert "_af_" in new_physical_publication_name
+        assert (
+            _psql_scalar_best_effort(
+                f"""select
+                    not exists (
+                        select from pg_replication_slots
+                        where slot_name = '{initial_slot_name}'
+                    ) and not exists (
+                        select from pg_publication
+                        where pubname = '{initial_publication_name}'
+                    ) and exists (
+                        select from pg_replication_slots
+                        where slot_name = '{pg_cdc_source["slot_name"]}'
+                    ) and exists (
+                        select from pg_publication
+                        where pubname = '{pg_cdc_source["publication_name"]}'
+                    );"""
+            )
+            == "t"
+        ), "reseed did not isolate provider resource cleanup to the retired authority"
 
         _run_psql(f"""
             insert into {pg_cdc_source["table_name"]} (id, name, tier)

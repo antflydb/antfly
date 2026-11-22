@@ -1037,6 +1037,35 @@ pub const RaftApplyStore = struct {
         alloc.free(values);
     }
 
+    pub fn nativeRootProducerCohortSealed(self: *RaftApplyStore, group_id: u64, destination: []const u8, binding: [32]u8) !bool {
+        if (destination.len == 0 or destination.len > 255) return error.InvalidSourceControl;
+        var key: [32 + 255]u8 = undefined;
+        @memcpy(key[0..32], &binding);
+        @memcpy(key[32..][0..destination.len], destination);
+        return try self.projection(bool, .{ .kind = .native_root_producer_cohort_sealed, .group_id = group_id, .key = .fromSlice(key[0 .. 32 + destination.len]) });
+    }
+
+    pub fn nativeRootProducerCohortReady(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, destination: []const u8) !bool {
+        return try self.projectionWithAllocator(bool, alloc, .{ .kind = .native_root_producer_cohort, .group_id = group_id, .key = .fromSlice(destination) });
+    }
+
+    pub fn observeNativeSnapshotCapture(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, record: metadata.ReplicationSourceStatusRecord, offset: u64, require_sealed: bool) !?metadata.CapturedNativeSnapshotPage {
+        var key: [9]u8 = undefined;
+        std.mem.writeInt(u64, key[0..8], offset, .little);
+        key[8] = @intFromBool(require_sealed);
+        return try self.projectionWithAllocator(?metadata.CapturedNativeSnapshotPage, alloc, .{
+            .kind = .native_snapshot_capture,
+            .group_id = group_id,
+            .arg0 = record.table_id,
+            .arg1 = record.source_ordinal,
+            .key = .fromSlice(&key),
+        });
+    }
+
+    pub fn getNativeSnapshotRows(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32) !?[]u8 {
+        return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .native_snapshot_rows, .group_id = group_id, .arg0 = table_id, .arg1 = ordinal });
+    }
+
     pub fn getReplicationSourceStatus(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32) !?metadata.ReplicationSourceStatusRecord {
         return try self.projectionWithAllocator(?metadata.ReplicationSourceStatusRecord, alloc, .{ .kind = .replication_source_status, .group_id = group_id, .arg0 = table_id, .arg1 = ordinal });
     }

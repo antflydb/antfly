@@ -215,7 +215,7 @@ pub const Coordinator = struct {
     /// Admit the original qualified plan, without consulting rows or rebuilding
     /// input. Expired captured route leases fail at the participant port.
     pub fn commitPrepared(self: Coordinator, a: A, prepared: *const Prepared, commit_version: u64, sync_level: types.SyncLevel, original: Context) !Result {
-        return self.commitPreparedMode(a, prepared, commit_version, sync_level, original, false);
+        return self.commitPreparedMode(a, prepared, commit_version, sync_level, original, .ordinary);
     }
 
     /// Source actors call this only after observing their sealed metadata grant
@@ -225,10 +225,19 @@ pub const Coordinator = struct {
     /// index visibility is independent of source commitment.
     pub fn commitSourcePrepared(self: Coordinator, a: A, prepared: *const Prepared, commit_version: u64, original: Context) !Result {
         if (prepared.plan.source_scope == null or prepared.plan.source_purpose == null or !prepared.plan.source_checkpoint_receipts) return error.UnsupportedOperation;
-        return self.commitPreparedMode(a, prepared, commit_version, .write, original, true);
+        return self.commitPreparedMode(a, prepared, commit_version, .write, original, .source);
     }
 
-    fn commitPreparedMode(self: Coordinator, a: A, prepared: *const Prepared, commit_version: u64, sync_level: types.SyncLevel, original: Context, source_recovery: bool) !Result {
+    /// Only the snapshot worker may call this after requalifying its durable
+    /// page and the original coordinator's immutable admission.
+    pub fn commitSnapshotPagePrepared(self: Coordinator, a: A, prepared: *const Prepared, commit_version: u64, sync_level: types.SyncLevel, original: Context) !Result {
+        if (!prepared.plan.retain_terminal or !prepared.plan.legacy_producer or prepared.plan.source_scope != null or
+            prepared.plan.source_purpose != null or self.recovery.guard == null)
+            return error.UnsupportedOperation;
+        return self.commitPreparedMode(a, prepared, commit_version, sync_level, original, .snapshot_page);
+    }
+
+    fn commitPreparedMode(self: Coordinator, a: A, prepared: *const Prepared, commit_version: u64, sync_level: types.SyncLevel, original: Context, mode: enum { ordinary, source, snapshot_page }) !Result {
         const plan = &prepared.plan;
         if (commit_version <= plan.begin_timestamp or prepared.routes.len != plan.participants.len or prepared.routes.len == 0 or prepared.coordinator_index >= prepared.routes.len) return error.InvalidTxnRecord;
         const captured = prepared.routes;
@@ -243,14 +252,18 @@ pub const Coordinator = struct {
         var dispatch = observed.value.decision == null;
         if (observed.value.decision) |existing| {
             if (!std.mem.eql(u8, &existing.admission.digest, &plan.admission.digest())) return error.SourceTransactionIdentityConflict;
-            if (source_recovery and (existing.record.begin_timestamp != plan.begin_timestamp or existing.record.created_at_ns != plan.created_at_ns or !std.meta.eql(existing.record.source_scope, plan.source_scope) or !std.meta.eql(existing.record.source_purpose, plan.source_purpose))) return error.SourceTransactionIdentityConflict;
+            if (mode != .ordinary and (existing.record.begin_timestamp != plan.begin_timestamp or existing.record.created_at_ns != plan.created_at_ns or !std.meta.eql(existing.record.source_scope, plan.source_scope) or !std.meta.eql(existing.record.source_purpose, plan.source_purpose))) return error.SourceTransactionIdentityConflict;
             switch (existing.record.status) {
-                .pending => if (source_recovery) {
+                .pending => if (mode != .ordinary) {
                     dispatch = true;
                 } else return error.CommitDecisionUnknown,
                 .aborted => return error.DecisionConflict,
                 .committed => if (existing.record.commit_version != commit_version) return error.SourceTransactionIdentityConflict,
             }
+        }
+        if (mode == .snapshot_page) {
+            const guard = self.recovery.guard.?;
+            try guard.check_fn(guard.ptr, context);
         }
         if (dispatch) {
             // Every owner, complete payload, and quota reservation size has

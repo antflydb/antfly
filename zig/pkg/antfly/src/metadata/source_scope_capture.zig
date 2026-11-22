@@ -101,6 +101,7 @@ pub fn capture(a: A, query: Query, applied_index: u64, incarnation: [32]u8, deco
     if (decoder_version < control.closing_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
     try state.validate();
     if (state.native_bootstrap_checkpoint != null and decoder_version < control.native_bootstrap_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
+    if (state.native_bootstrap_first_page != null and decoder_version < control.scoped_snapshot_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
     const source = state.scope orelse return error.SourceBindingConflict;
     const authority = state.checkpoint_authority orelse return error.SourceBindingConflict;
     if (!state.scope_fencing or source.destination != .native or source.table_id != query.actor_table_id or !std.meta.eql(source.source_id, query.source_id) or authority.owner.metadata_group_id != query.metadata_group_id or !std.meta.eql(authority.owner.metadata_incarnation, incarnation)) return error.SourceBindingConflict;

@@ -1639,6 +1639,7 @@ pub fn prepareRetainedCommit(
     };
     var result = (try coordinator.prepare(a, transaction_id, begin_timestamp, inputs, context)) orelse
         return error.ChangefeedCapabilityUnsupported;
+    result.plan.created_at_ns = begin_timestamp;
     result.plan.retain_terminal = true;
     return result;
 }

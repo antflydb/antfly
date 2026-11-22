@@ -231,13 +231,20 @@ pub fn stage(
         if (!lifecycle.native_bootstrap_certified or
             !std.meta.eql(lifecycle.spec, (try @import("../metadata/source_scope_binding.zig").spec(current)).?))
             return error.SourceBindingConflict;
-        for (prepared.routes) |participant| try admission.requireScope(a, participant.fence, participant.table_name, .{
-            .version = 1,
-            .owner = participant.owner,
-            .spec = lifecycle.spec,
-            .minimum_metadata_index = lifecycle.cut.index,
-            .action = .bind,
-        }, context);
+        const Service = @typeInfo(@TypeOf(svc)).pointer.child;
+        if (comptime !@hasDecl(Service, "sealNativeRootProducerCohort")) return error.ChangefeedCapabilityUnsupported;
+        for (prepared.routes) |participant| {
+            try svc.sealNativeRootProducerCohort(participant.table_name, participant.owner, context);
+        }
+        for (prepared.routes) |participant| {
+            try admission.requireScope(a, participant.fence, participant.table_name, .{
+                .version = 1,
+                .owner = participant.owner,
+                .spec = lifecycle.spec,
+                .minimum_metadata_index = lifecycle.cut.index,
+                .action = .bind,
+            }, context);
+        }
     }
     const route = prepared.routes[prepared.coordinator_index];
     if (current.pending) |pending| {

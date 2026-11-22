@@ -75,7 +75,8 @@ pub fn run(a: A) !void {
         .cutover_config_fingerprint = @splat(8),
         .cutover_provider_identity = @splat(9),
     };
-    const source: control.Scope = .{ .table_id = table.table_id, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = try control.definitionDigest(a, table.replication_sources_json, 0), .provider = try control.nativeSourceProviderBinding(cutover), .destination = .native, .destination_binding = @splat(3) };
+    const definition = try control.definitionDigest(a, table.replication_sources_json, 0);
+    const source: control.Scope = .{ .table_id = table.table_id, .source_id = control.nativeBootstrapSourceId(table.table_id, 0, definition), .source_ordinal = 0, .generation = 1, .definition = definition, .provider = try control.nativeSourceProviderBinding(cutover), .destination = .native, .destination_binding = @splat(3) };
     const actor: Actor = .{ .a = a, .store = &store, .scope = source, .catalog = control.digest(table.replication_sources_json) };
     try std.testing.expect(try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
     try actor.apply(.{ .configure = source });
@@ -100,6 +101,7 @@ pub fn run(a: A) !void {
     defer if (forged) |record| metadata.freeReplicationSourceStatus(a, record);
     try std.testing.expect(forged == null);
     try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
+    try std.testing.expect(!try store.nativeRootProducerCohortReady(a, group, table.name));
     const bootstrap_digest = control.nativeBootstrapCatalogDigest(table);
     var original = cutover;
     original.phase = control.native_bootstrap_preparing_phase;
@@ -131,25 +133,29 @@ pub fn run(a: A) !void {
     var unarmed = original;
     unarmed.phase = control.native_bootstrap_applying_phase;
     unarmed.updated_at_ms = 90;
+    const captured_rows = "[{\"id\":1}]";
     unarmed.pending_snapshot_page = .{
         .end_offset = 1,
         .checkpoint = "snapshot_keyset:[1]",
-        .payload_digest = @splat(63),
+        .payload_digest = try control.nativeSnapshotPageDigest(unarmed, 0, 1, false, "snapshot_keyset:[1]", captured_rows),
         .managed_dispatch = true,
     };
-    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+    const captured_command = try store_mod.encodeTransitionCommand(a, .{ .publish_native_replication_bootstrap = .{
         .catalog_digest = bootstrap_digest,
         .record = unarmed,
+        .captured_rows = captured_rows,
     } });
-    var replaced_table = table;
-    replaced_table.replication_sources_json = "[]";
-    try store.applyStandaloneCommand(group, .{ .upsert_table = replaced_table });
-    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = replaced_table } });
-    {
-        const retained_config = (try store.getTable(a, group, table.table_id)) orelse return error.TestUnexpectedResult;
-        defer metadata.freeTable(a, retained_config);
-        try std.testing.expectEqualStrings(table.replication_sources_json, retained_config.replication_sources_json);
-    }
+    defer a.free(captured_command);
+    var decoded_capture = (try store_mod.decodeTransitionCommand(a, captured_command)) orelse return error.TestUnexpectedResult;
+    defer decoded_capture.deinit(a);
+    try store.applyStandaloneCommand(group, decoded_capture);
+    store.deinit();
+    opened = false;
+    store = try Store.init(a, .{ .root_dir = path });
+    opened = true;
+    const reopened_rows = (try store.getNativeSnapshotRows(a, group, unarmed.table_id, unarmed.source_ordinal)) orelse return error.TestUnexpectedResult;
+    defer a.free(reopened_rows);
+    try std.testing.expectEqualStrings(captured_rows, reopened_rows);
     const aborted_job: @import("antfly_local_sources").storage_history_recovery_wire.Request = .{
         .owner = authority.owner,
         .transaction_id = try control.nativeSnapshotPageId(unarmed, 0),
@@ -188,6 +194,8 @@ pub fn run(a: A) !void {
         try std.testing.expectEqualStrings(aborted_job_bytes, reset.snapshot_cleanup_job);
         try std.testing.expectEqual(@as(u64, 0), reset.snapshot_offset);
     }
+    try std.testing.expect(try store.getNativeSnapshotRows(a, group, unarmed.table_id, unarmed.source_ordinal) == null);
+
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
         .catalog_digest = bootstrap_digest,
         .record = original,
@@ -208,6 +216,7 @@ pub fn run(a: A) !void {
         try std.testing.expectEqual(successor.cutover_authority_id, claimed.cutover_authority_id);
         try std.testing.expect(claimed.pending_snapshot_page == null);
     }
+    try std.testing.expect(try store.readNativeSnapshotCapture(a, group, original, 0) == null);
     try store.applyStandaloneCommand(group, .{ .complete_replication_source_retirement = successor });
     var snapshot_status = cutover;
     snapshot_status.cutover_mode = "exported_snapshot";
@@ -217,6 +226,75 @@ pub fn run(a: A) !void {
         .catalog_digest = bootstrap_digest,
         .record = snapshot_status,
     } });
+    var capture_first = snapshot_status;
+    capture_first.phase = control.native_bootstrap_applying_phase;
+    capture_first.updated_at_ms = unarmed.updated_at_ms;
+    capture_first.pending_snapshot_page = unarmed.pending_snapshot_page;
+    capture_first.pending_snapshot_page.?.payload_digest = try control.nativeSnapshotPageDigest(snapshot_status, 0, 1, false, "snapshot_keyset:[1]", captured_rows);
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = bootstrap_digest,
+        .record = capture_first,
+        .captured_rows = captured_rows,
+        .capture_only = true,
+    } });
+    try std.testing.expect(try store.readNativeSnapshotCapture(a, group, snapshot_status, 0) == null);
+    var false_empty = snapshot_status;
+    false_empty.phase = control.native_bootstrap_prepared_phase;
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = bootstrap_digest,
+        .record = false_empty,
+    } });
+    {
+        const raw = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, raw);
+        try std.testing.expectEqualStrings(control.native_bootstrap_snapshot_phase, raw.phase);
+    }
+    const certify_pages: control.Mutation = .{ .certify_native_snapshot_pages = .{
+        .provider_checkpoint = snapshot_status.prepared_checkpoint,
+        .first_page = capture_first.pending_snapshot_page.?.payload_digest,
+    } };
+    try actor.apply(certify_pages);
+    {
+        var actor_state = try actor.read();
+        defer actor_state.deinit();
+        try std.testing.expect(actor_state.value.native_bootstrap_first_page == null);
+    }
+    var last_capture = capture_first;
+    last_capture.snapshot_offset = 1;
+    last_capture.pending_snapshot_page.?.end_offset = 2;
+    last_capture.pending_snapshot_page.?.checkpoint = "snapshot_keyset:[2]";
+    last_capture.pending_snapshot_page.?.final = true;
+    const last_rows = "[{\"id\":2}]";
+    last_capture.pending_snapshot_page.?.payload_digest = try control.nativeSnapshotPageDigest(snapshot_status, 1, 2, true, "snapshot_keyset:[2]", last_rows);
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = bootstrap_digest,
+        .record = last_capture,
+        .captured_rows = last_rows,
+        .capture_only = true,
+    } });
+    {
+        var first_capture = (try store.readNativeSnapshotCapture(a, group, snapshot_status, 0)) orelse return error.TestUnexpectedResult;
+        defer first_capture.deinit();
+        try std.testing.expectEqualStrings(captured_rows, first_capture.value.rows);
+        var final_capture = (try store.readNativeSnapshotCapture(a, group, snapshot_status, 1)) orelse return error.TestUnexpectedResult;
+        defer final_capture.deinit();
+        try std.testing.expectEqualStrings(last_rows, final_capture.value.rows);
+        try std.testing.expect(final_capture.value.page.final);
+        const saved = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, saved);
+        try std.testing.expectEqual(@as(u64, 0), saved.snapshot_offset);
+    }
+    {
+        const original_actor = try store.getSourceControl(a, group, source.table_id, source.source_id);
+        defer a.free(original_actor);
+        try actor.apply(certify_pages);
+        var actor_state = try actor.read();
+        defer actor_state.deinit();
+        try std.testing.expectEqual(certify_pages.certify_native_snapshot_pages.first_page, actor_state.value.native_bootstrap_first_page.?);
+        var key_buffer: [256]u8 = undefined;
+        const key = try control.keyForGroup(&key_buffer, group, source.table_id, source.source_id);
+        try store.store.put(key, original_actor);
+    }
     var publication_status = snapshot_status;
     publication_status.phase = control.native_bootstrap_prepared_phase;
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
@@ -359,6 +437,7 @@ pub fn run(a: A) !void {
         try std.testing.expect(pending_cleanup.value.native_bootstrap_checkpoint == null);
         const saved = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
         defer metadata.freeReplicationSourceStatus(a, saved);
+        try std.testing.expect(!try store.nativeRootProducerCohortReady(a, group, table.name));
         try std.testing.expectEqualStrings(job_bytes, saved.snapshot_cleanup_job);
     }
     store.deinit();
@@ -380,6 +459,48 @@ pub fn run(a: A) !void {
         .record = publication_status,
         .released_page = control.digest(job_bytes),
     } });
+    try std.testing.expect(try store.nativeRootProducerCohortReady(a, group, table.name));
+    const routed_source: metadata.TableRecord = .{
+        .name = "external-source",
+        .table_id = 8,
+        .replication_sources_json = "[{\"type\":\"postgres\",\"routes\":[{\"target_table\":\"docs\"}]}]",
+    };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = routed_source });
+    try std.testing.expect(!try store.nativeRootProducerCohortReady(a, group, table.name));
+    const table_binding = @import("../changefeed_control.zig").tableBinding(table);
+    const seal: store_mod.TransitionCommand = .{ .seal_native_root_producer_cohort = .{ .table_id = table.table_id, .table_binding = table_binding } };
+    try store.applyStandaloneCommand(group, seal);
+    try std.testing.expect(!try store.nativeRootProducerCohortSealed(group, table.name, table_binding));
+    const routed_fence = try store.getTableTransitionFence(group, routed_source.table_id);
+    try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = routed_source.table_id, .expected_transition_generation = routed_fence.generation } });
+    try store.applyStandaloneCommand(group, seal);
+    try std.testing.expect(try store.nativeRootProducerCohortSealed(group, table.name, table_binding));
+    try store.applyStandaloneCommand(group, .{ .upsert_table = routed_source });
+    const rejected_source = try store.getTable(a, group, routed_source.table_id);
+    defer if (rejected_source) |record| metadata.freeTable(a, record);
+    try std.testing.expect(rejected_source == null);
+    var scoped_source = routed_source;
+    scoped_source.schema_json = "{}";
+    scoped_source.replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"require_exact_cutover\":true,\"routes\":[{\"target_table\":\"docs\"}]}]";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = scoped_source });
+    const before_activation = try store.getTable(a, group, scoped_source.table_id);
+    defer if (before_activation) |record| metadata.freeTable(a, record);
+    try std.testing.expect(before_activation == null);
+    const topology = @import("../topology_protocol.zig");
+    const activation = try std.json.Stringify.valueAlloc(a, topology.Activation{
+        .version = control.scoped_snapshot_protocol_version,
+        .incarnation = incarnation,
+        .member_count = 1,
+        .membership_fingerprint = @splat(9),
+    }, .{});
+    defer a.free(activation);
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = scoped_source });
+    const admitted = (try store.getTable(a, group, scoped_source.table_id)) orelse return error.TestUnexpectedResult;
+    defer metadata.freeTable(a, admitted);
+    try std.testing.expectEqualStrings(scoped_source.replication_sources_json, admitted.replication_sources_json);
+    const cleanup_fence = try store.getTableTransitionFence(group, scoped_source.table_id);
+    try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = scoped_source.table_id, .expected_transition_generation = cleanup_fence.generation } });
     try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
     store.deinit();
     opened = false;
@@ -389,6 +510,61 @@ pub fn run(a: A) !void {
     defer restored.deinit();
     try std.testing.expect(restored.value.scope_fencing and !restored.value.closing);
     try std.testing.expectEqualStrings("lsn:0/1234", restored.value.native_bootstrap_checkpoint.?);
+    {
+        const before = try store.listReplicationSourceStatuses(a, group);
+        defer store.freeReplicationSourceStatuses(a, before);
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+        try std.testing.expectEqualStrings(control.native_bootstrap_prepared_phase, before[0].phase);
+        var key_buffer: [256]u8 = undefined;
+        const key = try control.keyForGroup(&key_buffer, group, source.table_id, source.source_id);
+        var state = restored.value;
+        state.accepted = .{
+            .sequence = 1,
+            .checkpoint = "lsn:0/1234",
+            .reservation_digest = @splat(5),
+            .receipt_digest = control.digest("bootstrap-receipt"),
+            .reference = "bootstrap-receipt",
+        };
+        state.outstanding = &.{.{
+            .sequence = state.accepted.sequence,
+            .checkpoint = state.accepted.checkpoint,
+            .reservation_digest = state.accepted.reservation_digest,
+            .payload_digest = @splat(9),
+            .receipt = state.accepted.reference,
+        }};
+        const accepted = try control.encode(a, state);
+        defer a.free(accepted);
+        try store.store.put(key, accepted);
+        const uncommitted = try store.listReplicationSourceStatuses(a, group);
+        defer store.freeReplicationSourceStatuses(a, uncommitted);
+        try std.testing.expectEqualStrings(control.native_bootstrap_prepared_phase, uncommitted[0].phase);
+        state.outstanding = &.{};
+        state.committed = .{
+            .sequence = 2,
+            .checkpoint = "lsn:0/2345",
+            .reservation_digest = @splat(6),
+            .receipt_digest = control.digest("receipt"),
+            .reference = "receipt",
+        };
+        state.accepted = state.committed;
+        const progressed = try control.encode(a, state);
+        defer a.free(progressed);
+        try store.store.put(key, progressed);
+        const statuses = try store.listReplicationSourceStatuses(a, group);
+        defer store.freeReplicationSourceStatuses(a, statuses);
+        try std.testing.expectEqual(@as(usize, 1), statuses.len);
+        try std.testing.expectEqualStrings("streaming", statuses[0].phase);
+        try std.testing.expectEqualStrings("lsn:0/2345", statuses[0].checkpoint);
+        try std.testing.expectEqualStrings("lsn:0/2345", statuses[0].stream_checkpoint);
+        try std.testing.expectEqualStrings("lsn:0/1234", statuses[0].prepared_checkpoint);
+        const raw = (try store.getReplicationSourceStatus(a, group, source.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, raw);
+        try std.testing.expectEqualStrings(control.native_bootstrap_prepared_phase, raw.phase);
+        try std.testing.expectEqualStrings("", raw.stream_checkpoint);
+        const original_state = try control.encode(a, restored.value);
+        defer a.free(original_state);
+        try store.store.put(key, original_state);
+    }
     try actor.expectWork(1);
     try std.testing.expect(!try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
     try actor.apply(.{ .close = {} });
@@ -416,8 +592,28 @@ pub fn run(a: A) !void {
     defer metadata.freeTable(a, retained_table);
     try installed.apply(.{ .retire = .{ .receipt = "native-cohort-closed" } });
     try installed.expectWork(1);
+    try std.testing.expectEqualDeep(@as(?control.Scope, source), try target.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition));
+    var replacement = retained_table;
+    replacement.replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\",\"slot_name\":\"reseed_slot\",\"publication_name\":\"reseed_pub\",\"require_exact_cutover\":true}]";
+    const replace: store_mod.TransitionCommand = .{ .compare_and_replace_table = .{ .expected = retained_table, .replacement = replacement } };
+    try target.applyStandaloneCommand(group, replace);
+    const before_fence = (try target.getTable(a, group, source.table_id)) orelse return error.TestUnexpectedResult;
+    defer metadata.freeTable(a, before_fence);
+    try std.testing.expectEqualStrings(table.replication_sources_json, before_fence.replication_sources_json);
+
     try installed.apply(.{ .fence_checkpoint = .{ .authority_digest = authority.digest(), .proof = @splat(5) } });
     try installed.expectWork(0);
+    try target.applyStandaloneCommand(group, replace);
+    const after_fence = (try target.getTable(a, group, source.table_id)) orelse return error.TestUnexpectedResult;
+    defer metadata.freeTable(a, after_fence);
+    try std.testing.expectEqualStrings(replacement.replication_sources_json, after_fence.replication_sources_json);
+    const reseed = (try target.getReplicationSourceStatus(a, group, source.table_id, 0)) orelse return error.TestUnexpectedResult;
+    defer metadata.freeReplicationSourceStatus(a, reseed);
+    try std.testing.expectEqualStrings(control.native_bootstrap_reseed_phase, reseed.phase);
+    try std.testing.expectEqual(publication_status.cutover_authority_id, reseed.cutover_authority_id);
+    try std.testing.expectEqualStrings(publication_status.slot_name, reseed.slot_name);
+    try std.testing.expectEqual(control.nativeBootstrapCatalogDigest(replacement), reseed.native_bootstrap_catalog_digest);
+    try std.testing.expect(try target.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition) == null);
     try std.testing.expect(!try target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
     // A bounded census must never turn an incomplete/corrupt scan into intake
     // permission. Exercise the real cursor and persisted actor prefix.

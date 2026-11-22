@@ -164,10 +164,12 @@ uv run --project e2e/antfly python e2e/antfly/bench_changefeed.py zig-out/bin/an
 
 A macOS arm64 debug run with one metadata node, one data node, and one table
 root gave the following results. At each nonzero fan-out, one consumer stayed
-offline until both servers restarted. Active consumers pulled and acknowledged
-each batch serially. Lag includes the pull and durable acknowledgement. The
-replica allocation column measures whole replica directory growth during the
-workload. The no-feed baseline provides a comparison for the retention cost.
+offline until both servers restarted. These results used serial pulls. The
+current benchmark runs active consumers concurrently and also reports their
+aggregate delivered events per second. Lag includes the pull and durable
+acknowledgement. The replica allocation column measures whole replica
+directory growth during the workload. The no-feed baseline provides a
+comparison for the retention cost.
 
 | Consumers | Write rows/s | Write and deliver rows/s | Median batch ACK lag | Replica growth | Restart | Offline catch-up |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -298,10 +300,27 @@ The CDC status model tracks:
 Metadata status/admin also surface reseed guidance: an aggregate
 `projected_replication_source_statuses_reseed_recommended` count and
 per-source `replication_source_action_hints` in admin snapshot output. An
-explicit metadata-admin reseed path handles exact cutover: it rotates one
-Postgres replication source onto a fresh derived slot/publication, forces
-`require_exact_cutover = true`, and clears the old source status so the next
-leader-owned CDC round starts a fresh exact-cutover snapshot on the new slot.
+explicit metadata-admin reseed path rotates one PostgreSQL source onto a
+fresh derived slot and publication and requires exact cutover. On hosted
+native storage, the request waits for the old scoped actor to retire and
+fence its participating roots. The catalog records the replacement and
+retains the old provider authority in the same update. The replacement
+worker removes the superseded Antfly-managed resources under the provider
+lock.
+
+Hosted native sources that set `require_exact_cutover = true` capture the
+exported snapshot in durable pages before applying it. Scoped snapshot
+transactions advance the durable snapshot offset one committed page at a
+time. The stream begins at the provider checkpoint after the final page.
+Public progress retains the original snapshot cut in `prepared_checkpoint`
+and reports the committed provider cut in `stream_checkpoint`. A new routed
+source can use this path after a destination closes legacy CDC intake.
+
+Capture is bounded to 4,096 pages and 256 MiB of retained page data per
+export. An oversized capture reports backpressure and leaves the streaming
+checkpoint unadvanced. Before a capture is sealed, recovery may need to
+restart the provider export. Once sealed, recovery replays the retained
+pages without reopening the original export.
 
 ## Testing
 

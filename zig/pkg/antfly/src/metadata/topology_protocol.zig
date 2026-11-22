@@ -185,7 +185,7 @@ pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
 pub const compact_session_compare_version: u16 = 128;
 pub const spliced_session_record_version: u16 = 129;
 /// Version 130 certifies the initial scoped native PostgreSQL checkpoint.
-pub const current_version: u16 = @import("source_control.zig").native_bootstrap_protocol_version;
+pub const current_version: u16 = @import("source_control.zig").scoped_snapshot_protocol_version;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
@@ -261,6 +261,7 @@ pub const max_create_definition_bytes: usize = 2 * 1024 * 1024;
 /// Defense in depth on the final encoded Raft command. This includes the
 /// definition, generated range records, and codec overhead.
 pub const max_transition_command_bytes: usize = 3 * 1024 * 1024;
+pub const max_native_snapshot_page_bytes: usize = max_transition_command_bytes - 128 * 1024;
 /// Multi-command catalog workflows emit legacy primitive entries as one
 /// locally atomic Raft batch. Encoded bytes, rather than an arbitrary entry
 /// count, are the resource and replication bound: compact removals for a valid

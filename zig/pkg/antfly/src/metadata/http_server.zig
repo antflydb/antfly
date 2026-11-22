@@ -1933,8 +1933,6 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceReseedReplicationSourceExactCutover(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        svc.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
-        defer svc.cdc_runtime_mutex.unlock(std.Options.debug_io);
         return try reseedReplicationSourceExactCutoverForService(service.MetadataHttpService, svc, alloc, table_name, source_ordinal, flushMetadataHttpServiceMutation);
     }
 
@@ -5104,18 +5102,34 @@ fn reseedReplicationSourceExactCutoverForService(
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    const updated = try cloneTableWithReseededExactCutoverSource(alloc, table.*, source_ordinal);
-    defer alloc.free(updated.table.replication_sources_json);
+    var updated = try cloneTableWithReseededExactCutoverSource(alloc, table.*, source_ordinal);
+    const unsealed = updated.table.replication_sources_json;
+    defer alloc.free(unsealed);
     errdefer {
         alloc.free(updated.slot_name);
         alloc.free(updated.publication_name);
     }
-    // Catalog publication is the fencing point. The old runtime observes the
-    // changed source config and loses authority before it can publish further
-    // work. The replacement runtime atomically claims a fresh authority and
-    // durably retires the superseded slot/publication under the provider lock.
-    // Performing provider cleanup here would race both owners and would leave
-    // no durable retry intent after a process crash.
+    const authorization = @import("antfly_local_sources").api_stored_destination_authorization;
+    updated.table.replication_sources_json = try authorization.resealReplicationSourceReplacementAlloc(
+        alloc,
+        table.replication_sources_json,
+        unsealed,
+        source_ordinal,
+        table.name,
+        svc.destination_authorizer,
+    );
+    defer alloc.free(updated.table.replication_sources_json);
+    // The hosted worker must be able to advance retirement while the
+    // request waits. Hold its mutex only for the catalog publication.
+    if (comptime ServiceType == service.MetadataHttpService) {
+        try svc.awaitNativeReplicationSourceReseed(alloc, table.*, source_ordinal);
+        svc.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+    }
+    defer if (comptime ServiceType == service.MetadataHttpService) {
+        svc.cdc_runtime_mutex.unlock(std.Options.debug_io);
+    };
+    // The replacement runtime claims a new authority and cleans up the
+    // superseded provider resources under the same provider lock.
     try svc.replaceTableDefinition(table.*, updated.table);
     try flushFn(svc);
     return .{
