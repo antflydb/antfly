@@ -6921,7 +6921,7 @@ pub const Node = struct {
         var prepared_ocr: ?*PreparedOcrRequest = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
             const publication_bytes = if (model.session.backend() == .cuda) generation.nativeCudaVisionPublicationBytes(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), 1) catch 0 else 0;
-            vision_publication = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control);
+            vision_publication = try VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), PreparedOcrRequest.pinned_input_upload_capacity) catch 0
             else
@@ -9540,13 +9540,13 @@ pub const Node = struct {
                 var tight = limits;
                 tight.backend_limit_bytes = primary.amounts.backendTotalBytes();
                 try std.testing.expect(tight.backend_limit_bytes != 0);
-                var denied = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 2, tight, control);
+                var denied = try VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 2, tight, control);
                 defer if (denied) |*unexpected| unexpected.deinit();
                 try std.testing.expect(denied == null);
                 try std.testing.expect(std.meta.eql(original_primary, primary.*));
                 try std.testing.expectEqualDeep(before_optional, controller.snapshot());
             }
-            vision_publication = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 2, limits, control);
+            vision_publication = try VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 2, limits, control);
             if (model.session.backend() == .cuda and vision_publication == null) return error.MissingQualifiedPublicationFunding;
             const upload_bytes = if (model.session.backend() == .cuda) try qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(cfg, &.{fixture}, .{}, PreparedOcrRequest.pinned_input_upload_capacity) else 0;
             prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithUploadBytes(model.session, primary, upload_bytes, model.nativeGenerationMutex(), &model.native_reader_execution_lane, control);
@@ -10225,7 +10225,7 @@ pub const Node = struct {
             if (publication_bytes != 0) {
                 const Prepare = struct {
                     fn run(bytes: usize, selected: @import("../backends/session.zig").Session, primary: *runtime.tier.memory.AdmissionLease, active: InferenceExecutionControl) !?VisionPublication {
-                        return generation.prepareNativeVisionPublication(selected, primary, bytes, 1, selected.run_admission.?.limits, active);
+                        return VisionPublication.prepareVisionPublication(selected, primary, bytes, 1, selected.run_admission.?.limits, active);
                     }
                 };
                 vision_publication = admission.withSupplementalOutside(limits, control, publication_bytes, Prepare.run) catch |err| switch (err) {
@@ -18590,7 +18590,7 @@ pub const Node = struct {
         var prepared_generation: ?*PreparedGeneration = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
             const publication_bytes = if (backend_kind == .cuda and !cooperative_cuda and draft_model_for_generation == null) generation.nativeCudaVisionPublicationBytes(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), 1) catch 0 else 0;
-            vision_publication = generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control) catch |err| return inferenceFailureResponse(ctx, err);
+            vision_publication = VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control) catch |err| return inferenceFailureResponse(ctx, err);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), PreparedGeneration.pinned_input_upload_capacity) catch 0
             else

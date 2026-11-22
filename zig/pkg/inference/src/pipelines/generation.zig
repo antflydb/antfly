@@ -253,18 +253,6 @@ pub fn nativeCudaVisionPublicationBytes(allocator: std.mem.Allocator, model_dir:
     return qwen3vl_projector.planResidentFeaturePublicationBytes(config, images, limits);
 }
 
-pub fn prepareNativeVisionPublication(session: @import("../backends/session.zig").Session, primary: *runtime.tier.memory.AdmissionLease, bytes: usize, copies: usize, limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !(if (build_options.enable_cuda) ?@import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else ?void) {
-    if (comptime !build_options.enable_cuda) return null;
-    if (comptime build_options.enable_cuda) {
-        if (bytes == 0 or copies == 0 or copies > 2) return null;
-        var requirements: [2]@import("../execution/prepared_storage_admission.zig").Requirement = undefined;
-        for (requirements[0..copies]) |*entry| entry.* = .{ .backend = .cuda, .class = .activation, .bytes = bytes };
-        const metadata = try std.math.mul(usize, copies, @sizeOf(ops.physical_storage.Lease) + 2 * @sizeOf(@import("../ops/cuda/cuda_compute.zig").CudaTensor) + 3 * @sizeOf(i64));
-        const Supplement = @import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage;
-        return Supplement.prepare(Supplement.requestSession(session, limits), primary, requirements[0..copies], .{ .consumer_metadata_bytes = metadata }, control);
-    }
-}
-
 /// The fallback owner is selected only without an external projector or the
 /// integrated Qwen3-VL architecture contract. Other media owners budget their
 /// own routes; do not prepay this owner's credit for those paths.
