@@ -310,9 +310,37 @@ def grounding_quality_passes(row, case):
     )
 
 
-def record_phase_sample(peaks, current_phase, read_memory):
+ACTIVE_MEMORY_PHASES = ("serve", "grounding")
+
+
+def active_slot_tasks(url):
+    slots = read_json(url + "/slots", timeout=1)
+    if not isinstance(slots, list) or not all(
+        isinstance(slot, dict) and isinstance(slot.get("is_processing"), bool)
+        for slot in slots
+    ):
+        raise ValueError("llama.cpp /slots did not return slot status")
+    return {(slot["id"], slot["id_task"]) for slot in slots if slot["is_processing"]}
+
+
+def read_active_memory(read_memory, read_active_tasks):
+    try:
+        before = read_active_tasks()
+        if not before:
+            return None
+        values = read_memory()
+        # A shared task ID proves that execution spanned the memory read.
+        return values if values and before & read_active_tasks() else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def record_phase_sample(peaks, current_phase, read_memory, read_active_tasks):
     phase = current_phase()
-    values = read_memory()
+    if phase[0] in ACTIVE_MEMORY_PHASES:
+        values = read_active_memory(read_memory, read_active_tasks)
+    else:
+        values = read_memory()
     if values and phase == current_phase():
         phase_peaks = peaks.setdefault(phase[0], {})
         for key, value in values.items():
@@ -404,6 +432,7 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
         "99",
         "--parallel",
         str(parallel),
+        "--slots",
         "--ctx-size",
         str(profile.context_per_slot * parallel),
         "--ubatch-size",
@@ -456,9 +485,14 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
                     observed = phase
                     if observed[0] == "finished":
                         return
-                record_phase_sample(sampled_peaks, lambda: phase, read_memory)
+                record_phase_sample(
+                    sampled_peaks,
+                    lambda: phase,
+                    read_memory,
+                    lambda: active_slot_tasks(url),
+                )
                 # Wake on HTTP submission even if the periodic poll just ran.
-                interval = 0.01 if observed[0] in ("serve", "grounding") else 0.10
+                interval = 0.01 if observed[0] in ACTIVE_MEMORY_PHASES else 0.10
                 with phase_changed:
                     phase_changed.wait_for(lambda: phase != observed, interval)
 
@@ -627,6 +661,7 @@ def main():
         "rounds": args.rounds,
         "grounding_case": args.grounding_case if grounding_case else None,
         "grounding_only": args.grounding_only,
+        "active_memory_sampling": "llama.cpp slot probes bracket process samples",
         "runs": [],
     }
     for size in args.size:

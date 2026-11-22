@@ -1317,6 +1317,8 @@ pub fn isHostedInferenceEndpoint(url: []const u8) bool {
 const hosted_inference_timeout_ms: u64 = 120_000;
 const hosted_ocr_response_bytes: usize = 2 * 1024 * 1024;
 const hosted_ocr_result_bytes: usize = 16 * 1024 * 1024;
+const hosted_ocr_response_body_bytes: usize = 32 * 1024 * 1024;
+const hosted_ocr_initial_response_units: usize = 1;
 const hosted_extraction_working_bytes: usize = 32 * 1024 * 1024;
 const hosted_extraction_result_bytes: usize = 8 * 1024 * 1024;
 const hosted_extraction_max_windows: usize = 128;
@@ -1326,18 +1328,25 @@ fn accountHostedUpstreamReply(total: *usize, bytes: usize, limit: usize) !void {
     total.* += bytes;
 }
 
-fn serializeHostedExtraction(allocator: std.mem.Allocator, response: std.json.Value, output_limit: usize) ![]u8 {
-    // Size before allocating so the response owns one exact-size buffer.
+fn hostedJsonSize(response: anytype) u64 {
     var scratch: [1024]u8 = undefined;
     var counter = std.Io.Writer.Discarding.init(&scratch);
     std.json.Stringify.value(response, .{}, &counter.writer) catch unreachable;
-    const bytes = std.math.cast(usize, counter.fullCount()) orelse return error.ExtractorResponseTooLarge;
-    if (bytes > output_limit) return error.ExtractorResponseTooLarge;
+    return counter.fullCount();
+}
+
+fn serializeSizedJson(allocator: std.mem.Allocator, response: anytype, bytes: usize) ![]u8 {
     const result = try allocator.alloc(u8, bytes);
     errdefer allocator.free(result);
     var writer: std.Io.Writer = .fixed(result);
-    std.json.Stringify.value(response, .{}, &writer) catch return error.ExtractorResponseTooLarge;
+    try std.json.Stringify.value(response, .{}, &writer);
     return result;
+}
+
+fn serializeHostedExtraction(allocator: std.mem.Allocator, response: std.json.Value, output_limit: usize) ![]u8 {
+    const bytes = hostedJsonSize(response);
+    if (bytes > output_limit) return error.ExtractorResponseTooLarge;
+    return serializeSizedJson(allocator, response, @intCast(bytes));
 }
 
 fn hostedReadTokens(requested: ?i64, configured: ?i64, ceiling: usize) !usize {
@@ -23992,6 +24001,7 @@ pub const Node = struct {
         indexes: []const ?usize,
         admission: ReadRequestAdmission,
         reserved_units: *usize,
+        transferred_units: *usize,
         supplied: InferenceExecutionControl,
     ) !httpx.Response {
         const control = hostedInferenceControl(supplied);
@@ -24031,7 +24041,7 @@ pub const Node = struct {
             validateEncodedImageMime(mime, bytes) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
             page.mime = image_pipeline.mimeEssenceForEncoded(bytes) orelse
                 return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia);
-            const units = @max(reserved_units.*, decoded.requiredUnits());
+            const units = @max(reserved_units.*, decoded.requiredUnits() +| hosted_ocr_initial_response_units);
             if (try self.growSlotUnits(ctx, reserved_units.*, units)) |response| return response;
             reserved_units.* = units;
             var prefix_buffer: [128]u8 = undefined;
@@ -24088,12 +24098,30 @@ pub const Node = struct {
             result.* = .{ .object = "read", .status = "complete", .index = @intCast(index), .text = reply.items[0].text };
         }
         const usage = checkedHostedReadUsage(prompt_tokens, completion_tokens) catch return ctx.status(502).json(.{ .@"error" = "INVALID_READER_USAGE" });
-        return ctx.json(api.ReadResponse{
+        const result: api.ReadResponse = .{
             .object = "list",
             .model = body.model,
             .data = results,
             .usage = if (measured) usage else null,
-        });
+        };
+        const body_size = hostedJsonSize(result);
+        if (body_size > hosted_ocr_response_body_bytes)
+            return ctx.status(502).json(.{ .@"error" = "READER_OUTPUT_TOO_LARGE" });
+        const response_units = admissionUnitsFor(@intCast(body_size), read_admission_bytes_per_unit);
+        const target_units = reserved_units.* +| (response_units -| hosted_ocr_initial_response_units);
+        if (target_units != reserved_units.*) {
+            if (try self.growSlotUnits(ctx, reserved_units.*, target_units)) |response| return response;
+            reserved_units.* = target_units;
+        }
+        try ctx.setHeader("content-type", "application/json");
+        const units = self.inference_admission.capacityUnits(response_units);
+        const owned = try serializeSizedJson(ctx.allocator, result, @intCast(body_size));
+        _ = ctx.response.bodyOwned(ctx.allocator, owned);
+        var response = try ctx.response.build();
+        errdefer response.deinit();
+        response.body_allocator = try self.hostedResponseOwner(ctx.allocator, ctx.allocator, units);
+        transferred_units.* = units;
+        return response;
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -24254,15 +24282,21 @@ pub const Node = struct {
                     });
             }
         }
-        const admission = readRequestAdmission(self, (body.images orelse @as([]const api.ImageURL, &.{})).len, inline_source_bytes, max_tokens);
+        var admission = readRequestAdmission(self, (body.images orelse @as([]const api.ImageURL, &.{})).len, inline_source_bytes, max_tokens);
+        // Reserve space for ordinary responses before launching upstream work.
+        if (hosted_reader != null) admission.units +|= hosted_ocr_initial_response_units;
         if (try self.acquireSlotUnits(ctx, admission.units)) |resp| return resp;
         var reserved_units = admission.units;
-        defer self.releaseSlotUnits(reserved_units);
+        var transferred_units: usize = 0;
+        defer {
+            const remaining = self.inference_admission.capacityUnits(reserved_units) - transferred_units;
+            if (remaining != 0) self.releaseSlotUnits(remaining);
+        }
         self.metrics.incRequest("read");
         defer self.metrics.decActive();
 
         if (hosted_reader) |cfg|
-            return self.readHostedImages(ctx, body, cfg, max_tokens.?, attachments, attachment_indexes, admission, &reserved_units, execution_control);
+            return self.readHostedImages(ctx, body, cfg, max_tokens.?, attachments, attachment_indexes, admission, &reserved_units, &transferred_units, execution_control);
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
@@ -26931,7 +26965,7 @@ pub const Node = struct {
 
     // The HTTP response owns both the buffer and its remaining admission
     // charge. All response teardown paths free through this allocator.
-    const HostedExtractionBodyOwner = struct {
+    const HostedResponseBodyOwner = struct {
         node: *Node,
         backing: std.mem.Allocator,
         units: usize,
@@ -26944,13 +26978,20 @@ pub const Node = struct {
         };
 
         fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, return_address: usize) void {
-            const self: *HostedExtractionBodyOwner = @ptrCast(@alignCast(raw));
+            const self: *HostedResponseBodyOwner = @ptrCast(@alignCast(raw));
             const backing = self.backing;
             backing.rawFree(bytes, alignment, return_address);
             self.node.releaseSlotUnits(self.units);
             backing.destroy(self);
         }
     };
+
+    fn hostedResponseOwner(self: *Node, backing: std.mem.Allocator, owner_allocator: std.mem.Allocator, units: usize) !std.mem.Allocator {
+        if (units == 0) return backing;
+        const owner = try owner_allocator.create(HostedResponseBodyOwner);
+        owner.* = .{ .node = self, .backing = backing, .units = units };
+        return .{ .ptr = owner, .vtable = &HostedResponseBodyOwner.vtable };
+    }
 
     fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl, registered: ?@import("antfly_structured").extraction.Config) !GeneratedExtractionBody {
         var quota: httpx.QuotaAllocator = .{ .backing = allocator, .limit = hosted_extraction_working_bytes };
@@ -27063,11 +27104,9 @@ pub const Node = struct {
         const bytes = try serializeHostedExtraction(output_allocator, response, hosted_extraction_result_bytes);
         errdefer output_allocator.free(bytes);
         const units = self.inference_admission.capacityUnits(admissionUnitsFor(bytes.len, read_admission_bytes_per_unit));
-        if (units == 0) return .{ .bytes = bytes, .owner = allocator };
-        const owner = try output_allocator.create(HostedExtractionBodyOwner);
-        owner.* = .{ .node = self, .backing = allocator, .units = units };
+        const owner = try self.hostedResponseOwner(allocator, output_allocator, units);
         transferred_units = units;
-        return .{ .bytes = bytes, .owner = .{ .ptr = owner, .vtable = &HostedExtractionBodyOwner.vtable } };
+        return .{ .bytes = bytes, .owner = owner };
     }
 
     fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
@@ -49799,6 +49838,9 @@ test "hosted image reader routes the inference API alias to chat completions" {
     try std.testing.expectEqual(@as(usize, 2), reply.value.data.len);
     try std.testing.expectEqual(@as(i64, 1), reply.value.data[1].index);
     try std.testing.expectEqual(@as(i64, 16), reply.value.usage.?.total_tokens);
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightUnits());
+    response.releaseBody();
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }
 
 test "audio read rejects mixed inputs and unsupported options before model admission" {

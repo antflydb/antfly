@@ -111,10 +111,26 @@ class QualificationTest(unittest.TestCase):
             phase = ("idle", 3)
             return metrics
 
-        record_phase_sample(peaks, lambda: phase, read_across_transition)
+        record_phase_sample(peaks, lambda: phase, read_across_transition, lambda: set())
         self.assertEqual(peaks, {})
-        record_phase_sample(peaks, lambda: phase, lambda: metrics)
+        record_phase_sample(peaks, lambda: phase, lambda: metrics, lambda: set())
         self.assertEqual(peaks, {"idle": metrics})
+
+    def test_active_sample_requires_same_task_on_both_sides(self):
+        metrics = {"rss_bytes": 100, "physical_footprint_bytes": 70}
+        for slots, expected in (
+            ([set()], {}),
+            ([{(0, 4)}, set()], {}),
+            ([{(0, 4)}, {(0, 5)}], {}),
+            ([{(0, 4)}, {(0, 4), (1, 5)}], {"grounding": metrics}),
+        ):
+            with self.subTest(slots=slots):
+                peaks = {}
+                read_slots = iter(slots).__next__
+                record_phase_sample(
+                    peaks, lambda: ("grounding", 1), lambda: metrics, read_slots
+                )
+                self.assertEqual(peaks, expected)
 
     def test_memory_phase_starts_at_http_submission(self):
         calls = []
