@@ -1074,16 +1074,14 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
 /// (pre-swap) writer/reader state for what is now a different generation
 /// at this path. The next `ensureRegion` call lazily reopens a fresh region
 /// against `new_path`, exactly mirroring `ensureFd`'s own lazy-reopen shape.
-pub fn rebind(entry: *Entry, io: Io, new_path: []const u8) !void {
-    if (!std.meta.eql(entry.identity, try file_identity.nativePathIdentity(new_path))) return error.FileBusy;
+pub fn prepareRebind(entry: *Entry, io: Io, file: Io.File, new_path: []const u8) ![]u8 {
+    if (!std.meta.eql(entry.identity, try file_identity.nativeFileIdentity(file.handle))) return error.FileBusy;
+    // Rename replaces the destination basename, including a symlink.
+    return canonicalParentJoin(std.heap.page_allocator, io, new_path);
+}
+
+pub fn installRebind(entry: *Entry, io: Io, owned: []u8) void {
     const page = std.heap.page_allocator;
-    // Canonicalize here too, for the exact reason `open` does: the next
-    // `ensureRegion`/`ensureFd` reopens lazily, at some later and
-    // otherwise unconstrained point, against whatever is cached in
-    // `entry.path` -- so it must already be an absolute, symlink-resolved
-    // path by the time this call returns, not a relative spelling that
-    // depended on this call's own cwd.
-    const owned = try canonicalPathAlloc(page, io, new_path);
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
     page.free(entry.path);
@@ -1259,7 +1257,16 @@ test "rebind closes an already-open region instead of carrying it across the pat
     try Io.Dir.cwd().access(io, old_region_sidecar, .{});
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, new_region_sidecar, .{}));
 
-    try rebind(entry, io, new_path);
+    const binding = prepare: {
+        const source = try Io.Dir.cwd().openFile(io, old_path, .{});
+        defer source.close(io);
+        break :prepare try prepareRebind(entry, io, source, new_path);
+    };
+    Io.Dir.rename(Io.Dir.cwd(), old_path, Io.Dir.cwd(), new_path, io) catch |err| {
+        std.heap.page_allocator.free(binding);
+        return err;
+    };
+    installRebind(entry, io, binding);
     // The gap this closes: a stale `region` must not survive the rebind,
     // so the next `ensureRegion` reopens fresh against `new_path` rather
     // than going on serving the old sidecar's mapping.
@@ -1327,7 +1334,16 @@ test "ensureRegion's lazy reopen after rebind uses the original directory, not a
         region.acquireWriter(own_pid);
         region.releaseWriter();
     }
-    try rebind(entry, io, "new.data");
+    const binding = prepare: {
+        const source = try Io.Dir.cwd().openFile(io, "old.data", .{});
+        defer source.close(io);
+        break :prepare try prepareRebind(entry, io, source, "new.data");
+    };
+    Io.Dir.rename(Io.Dir.cwd(), "old.data", Io.Dir.cwd(), "new.data", io) catch |err| {
+        std.heap.page_allocator.free(binding);
+        return err;
+    };
+    installRebind(entry, io, binding);
     try std.testing.expect(entry.region == null);
 
     // Move cwd somewhere else entirely before the lazy reopen runs.

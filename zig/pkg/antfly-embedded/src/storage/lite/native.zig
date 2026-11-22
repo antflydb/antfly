@@ -23554,6 +23554,12 @@ pub const NativeFile = struct {
         if (std.mem.eql(u8, self.path, prepared.path)) return error.InvalidNativeSnapshotPath;
 
         const io = self.runtimeIo();
+        const prepared_entry = prepared.inode_lock_ref.load(.acquire);
+        var binding: ?[]u8 = if (prepared_entry) |entry|
+            try inode_lock.prepareRebind(entry, io, prepared.file, self.path)
+        else
+            null;
+        defer if (binding) |owned| std.heap.page_allocator.free(owned);
         try prepared.preparePrivatePublication(self.path);
         try renameFilePath(io, prepared.path, self.path);
         self.releaseLifetimeWriterRegion();
@@ -23581,23 +23587,12 @@ pub const NativeFile = struct {
         // ever change which entry a *future* acquire resolves to, never
         // which one an in-flight one releases against.
         const self_entry = self.inode_lock_ref.load(.acquire);
-        const prepared_entry = prepared.inode_lock_ref.load(.acquire);
+        if (binding) |owned| {
+            inode_lock.installRebind(prepared_entry.?, io, owned);
+            binding = null;
+        }
         self.inode_lock_ref.store(prepared_entry, .release);
         prepared.inode_lock_ref.store(self_entry, .release);
-        // Tell the entry now reachable at `self.path` that its path
-        // moved: a lazy fd reopen inside it (`ensureFd`, only reached if
-        // `entry.fd` had gone back to `null`) must use the name the file
-        // is reachable at *now*, not the one it was opened under
-        // originally. `prepared`'s post-swap entry (if any) now refers to
-        // the retired file the rename just replaced -- unlinked,
-        // reachable by no path at all (its fd, if `entry.fd` is already
-        // populated, stays valid regardless; `prepared.path`, the old
-        // staging name, was never a name for this file and would be
-        // actively wrong to rebind to). `prepared` is always closed by
-        // its caller shortly after this call adopts its contents, well
-        // before anything could need a lazy reopen there.
-        if (prepared_entry) |entry| inode_lock.rebind(entry, io, self.path) catch {};
-        if (self.inode_lock_ref.load(.acquire)) |entry| std.debug.assert(std.meta.eql(entry.identity, try storage_file_identity.nativeFileIdentity(self.file.handle)));
         const retired_header = self.header;
         self.header = prepared.header;
         prepared.header = retired_header;
