@@ -216,7 +216,7 @@ def test_pg_recvlogical_resume_after_restart(
         ]
 
     @contextmanager
-    def stream(output, *, expect_disconnect=False):
+    def stream(output, *, expect_disconnect=False, expect_forbidden=False):
         with output.with_suffix(".log").open("wb") as log:
             reader = subprocess.Popen(stream_command(output), env=env, stderr=log)
             try:
@@ -233,7 +233,11 @@ def test_pg_recvlogical_resume_after_restart(
                     reader.kill()
                     reader.wait()
             output_log = output.with_suffix(".log").read_text()
-            if expect_disconnect:
+            if expect_forbidden:
+                assert reader.returncode != 0 and "forbidden" in output_log.lower(), (
+                    output_log
+                )
+            elif expect_disconnect:
                 assert reader.returncode != 0 and "disconnected" in output_log
             else:
                 assert reader.returncode == 0, output_log
@@ -1037,28 +1041,31 @@ def test_pg_recvlogical_resume_after_restart(
             recreation_errors.clear()
             assert wait_until(recreate_slot, timeout_s=60), sorted(recreation_errors)
             replacement = tmp_path / "replacement-generation.bin"
-            with stream(replacement) as reader:
-                sql(
-                    "INSERT INTO smoke (id, content) VALUES (18, 'post-truncate-generation')",
-                    retry_uncommitted=True,
-                )
-                assert wait_until(
-                    lambda: (
-                        reader.poll() is None
-                        and replacement.exists()
-                        and b"post-truncate-generation" in replacement.read_bytes()
-                    ),
-                    timeout_s=25,
-                )
             rule = f"{server.url}/auth/v1/users/admin/row-filters/smoke"
             admin_auth = ("admin", harness.AUTH_BOOTSTRAP_PASSWORD)
-            requests.put(
-                rule,
-                auth=admin_auth,
-                json={"term": {"id": 18}},
-                timeout=15,
-            ).raise_for_status()
+            filter_installed = False
             try:
+                with stream(replacement, expect_forbidden=True) as reader:
+                    sql(
+                        "INSERT INTO smoke (id, content) VALUES (18, 'post-truncate-generation')",
+                        retry_uncommitted=True,
+                    )
+                    assert wait_until(
+                        lambda: (
+                            reader.poll() is None
+                            and replacement.exists()
+                            and b"post-truncate-generation" in replacement.read_bytes()
+                        ),
+                        timeout_s=25,
+                    )
+                    requests.put(
+                        rule,
+                        auth=admin_auth,
+                        json={"term": {"id": 18}},
+                        timeout=15,
+                    ).raise_for_status()
+                    filter_installed = True
+                    assert wait_until(lambda: reader.poll() is not None, timeout_s=20)
                 filtered_output = tmp_path / "filtered-slot.bin"
                 filtered = subprocess.run(
                     stream_command(filtered_output),
@@ -1071,7 +1078,10 @@ def test_pg_recvlogical_resume_after_restart(
                 assert "forbidden" in filtered.stderr.lower()
                 assert not filtered_output.exists() or not filtered_output.read_bytes()
             finally:
-                requests.delete(rule, auth=admin_auth, timeout=15).raise_for_status()
+                if filter_installed:
+                    requests.delete(
+                        rule, auth=admin_auth, timeout=15
+                    ).raise_for_status()
         slot("--drop-slot")
         assert catalog_slot() == []
         sql("DROP PUBLICATION changes")
