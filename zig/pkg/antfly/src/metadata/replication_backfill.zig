@@ -461,7 +461,7 @@ pub const SnapshotBackfillRunner = struct {
         );
 
         const control = @import("source_control.zig");
-        const phase_snapshot = if (self.protected_native_bootstrap) control.native_bootstrap_snapshot_phase else "snapshot";
+        var phase_snapshot: []const u8 = if (self.protected_native_bootstrap) control.native_bootstrap_snapshot_phase else "snapshot";
         const phase_complete = if (self.protected_native_bootstrap) control.native_bootstrap_prepared_phase else "cutover_prepared";
         const config = foreign_mod.Config{
             .kind = .postgres,
@@ -901,7 +901,7 @@ pub const SnapshotBackfillRunner = struct {
             effective_publication_name,
         );
         try checkProgressCutoverAuthority(
-            false,
+            null,
             self.alloc,
             status_sink,
             table,
@@ -988,7 +988,7 @@ pub const SnapshotBackfillRunner = struct {
         while (true) {
             try self.checkpointWork();
             try checkProgressCutoverAuthority(
-                self.protected_native_bootstrap,
+                if (self.protected_native_bootstrap) phase_snapshot else null,
                 self.alloc,
                 status_sink,
                 table,
@@ -1035,7 +1035,7 @@ pub const SnapshotBackfillRunner = struct {
             defer result.deinit(self.alloc);
             try self.checkpointWork();
             try checkProgressCutoverAuthority(
-                self.protected_native_bootstrap,
+                if (self.protected_native_bootstrap) phase_snapshot else null,
                 self.alloc,
                 status_sink,
                 table,
@@ -1067,6 +1067,17 @@ pub const SnapshotBackfillRunner = struct {
                 );
             }
 
+            if (self.protected_native_bootstrap and std.mem.eql(u8, phase_snapshot, control.native_bootstrap_snapshot_phase)) {
+                // Persist the possibility of destination effects before
+                // dispatch, even if a crash prevents recording page progress.
+                var applying = prepared_status;
+                applying.phase = control.native_bootstrap_applying_phase;
+                applying.updated_at_ms = ioNowMillis(self.io);
+                try self.publishNativeSnapshotStatus(status_sink, table, applying);
+                phase_snapshot = applying.phase;
+                try self.checkpointWork();
+            }
+
             if (lake_owner) |owner| {
                 if (result.rows.len > lake_catalog.row_commit.max_bootstrap_rows - summary.final_offset) return error.LakeWriteTooLarge;
                 const stage_page = owner.stage_snapshot_page orelse return error.UnsupportedReplicationRoute;
@@ -1090,7 +1101,7 @@ pub const SnapshotBackfillRunner = struct {
                 for (result.rows) |row| {
                     try self.checkpointWork();
                     try checkProgressCutoverAuthority(
-                        self.protected_native_bootstrap,
+                        if (self.protected_native_bootstrap) phase_snapshot else null,
                         self.alloc,
                         status_sink,
                         table,
@@ -1138,7 +1149,7 @@ pub const SnapshotBackfillRunner = struct {
             try self.checkpointWork();
 
             try checkProgressCutoverAuthority(
-                self.protected_native_bootstrap,
+                if (self.protected_native_bootstrap) phase_snapshot else null,
                 self.alloc,
                 status_sink,
                 table,
@@ -1230,7 +1241,7 @@ pub const SnapshotBackfillRunner = struct {
 
         try self.checkpointWork();
         try checkProgressCutoverAuthority(
-            self.protected_native_bootstrap,
+            if (self.protected_native_bootstrap) phase_snapshot else null,
             self.alloc,
             status_sink,
             table,
@@ -1246,7 +1257,7 @@ pub const SnapshotBackfillRunner = struct {
         try finishBackfillBulkIngestWindow(self.alloc, self.write_source, bulk_ingest_tables.items);
         try self.checkpointWork();
         try checkProgressCutoverAuthority(
-            self.protected_native_bootstrap,
+            if (self.protected_native_bootstrap) phase_snapshot else null,
             self.alloc,
             status_sink,
             table,
@@ -3652,7 +3663,7 @@ fn callCompleteCutoverRetirementDurable(
 }
 
 fn checkProgressCutoverAuthority(
-    protected_native_bootstrap: bool,
+    protected_phase: ?[]const u8,
     alloc: Allocator,
     status_sink: anytype,
     table: metadata_table_manager.TableRecord,
@@ -3665,7 +3676,7 @@ fn checkProgressCutoverAuthority(
     cutover_config_fingerprint: [cutover_config_fingerprint_len]u8,
     cutover_provider_identity: foreign_mod.ExactCutoverIntent.ProviderIdentity,
 ) !void {
-    if (!protected_native_bootstrap) try requireLegacyOwnership(status_sink, alloc, table, source_ordinal);
+    if (protected_phase == null) try requireLegacyOwnership(status_sink, alloc, table, source_ordinal);
     if (cutover_authority_id == 0) return;
     try callCheckCutoverAuthority(
         status_sink,
@@ -3673,7 +3684,7 @@ fn checkProgressCutoverAuthority(
         .{
             .table_id = table.table_id,
             .source_ordinal = source_ordinal,
-            .phase = if (protected_native_bootstrap) @import("source_control.zig").native_bootstrap_snapshot_phase else "configured",
+            .phase = protected_phase orelse "configured",
             .source_kind = parsed.type_name,
             .external_table = parsed.postgres_table,
             .slot_name = slot_name,
@@ -4920,6 +4931,8 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     try std.testing.expectEqualStrings(control.native_bootstrap_prepared_phase, final_status.phase);
     try std.testing.expectEqualStrings(control.native_bootstrap_snapshot_phase, status_sink.records.items[1].phase);
     try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[1].snapshot_offset);
+    try std.testing.expectEqualStrings(control.native_bootstrap_applying_phase, status_sink.records.items[2].phase);
+    try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[2].snapshot_offset);
     try std.testing.expectEqual(@as(u64, 2), final_status.snapshot_offset);
     runner.protected_native_bootstrap = false;
     try std.testing.expect(final_status.cutover_intent_id != 0);

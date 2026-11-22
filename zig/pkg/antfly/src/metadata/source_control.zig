@@ -27,9 +27,11 @@ pub const protocol_version: u16 = 101;
 pub const closing_protocol_version: u16 = 115;
 pub const native_bootstrap_protocol_version: u16 = 130;
 pub const native_bootstrap_snapshot_phase = "native_bootstrap_snapshot";
+pub const native_bootstrap_applying_phase = "native_bootstrap_applying";
 pub const native_bootstrap_prepared_phase = "native_bootstrap_prepared";
 pub fn isNativeBootstrapPhase(phase: []const u8) bool {
     return std.mem.eql(u8, phase, native_bootstrap_snapshot_phase) or
+        std.mem.eql(u8, phase, native_bootstrap_applying_phase) or
         std.mem.eql(u8, phase, native_bootstrap_prepared_phase);
 }
 pub const manifest_protocol_version: u16 = 116;

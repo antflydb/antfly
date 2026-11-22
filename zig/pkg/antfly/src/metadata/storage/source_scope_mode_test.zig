@@ -144,6 +144,29 @@ pub fn run(a: A) !void {
         try std.testing.expectEqual(snapshot_status.snapshot_offset, protected.snapshot_offset);
         try std.testing.expectEqualStrings(snapshot_status.checkpoint, protected.checkpoint);
     }
+    var applying = snapshot_status;
+    applying.phase = control.native_bootstrap_applying_phase;
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = applying,
+    } });
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = snapshot_status,
+    } });
+    {
+        const protected = (try store.getReplicationSourceStatus(a, group, table.table_id, 0)) orelse return error.TestUnexpectedResult;
+        defer metadata.freeReplicationSourceStatus(a, protected);
+        try std.testing.expectEqualStrings(control.native_bootstrap_applying_phase, protected.phase);
+    }
+    applying.snapshot_offset = 1;
+    applying.checkpoint = "snapshot_keyset:[42]";
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = applying,
+    } });
+    publication_status.snapshot_offset = applying.snapshot_offset;
+    publication_status.checkpoint = applying.checkpoint;
     const bytes = try store_mod.encodeTransitionCommand(a, .{ .publish_native_replication_bootstrap = .{
         .catalog_digest = actor.catalog,
         .record = publication_status,

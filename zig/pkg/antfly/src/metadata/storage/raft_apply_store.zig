@@ -24527,13 +24527,18 @@ pub const RaftApplyStore = struct {
                 !std.mem.eql(u8, current.cutover_mode, "exported_snapshot_pending") or
                 current.prepared_checkpoint.len != 0 or current.snapshot_offset != 0 or
                 record.snapshot_offset != 0) return;
-        } else if (std.mem.eql(u8, current.phase, source_control.native_bootstrap_snapshot_phase)) {
+        } else {
+            const discovering = std.mem.eql(u8, current.phase, source_control.native_bootstrap_snapshot_phase);
+            const applying = std.mem.eql(u8, current.phase, source_control.native_bootstrap_applying_phase);
+            if (!discovering and !applying) return;
             if (!std.mem.eql(u8, current.prepared_checkpoint, record.prepared_checkpoint) or
                 current.snapshot_offset > record.snapshot_offset) return;
             const same_offset = current.snapshot_offset == record.snapshot_offset;
-            if (std.mem.eql(u8, record.phase, source_control.native_bootstrap_prepared_phase) and !same_offset) return;
+            const preparing_stream = std.mem.eql(u8, record.phase, source_control.native_bootstrap_prepared_phase);
+            if ((discovering or preparing_stream) and !same_offset) return;
+            if (applying and !preparing_stream and !std.mem.eql(u8, record.phase, source_control.native_bootstrap_applying_phase)) return;
             if (same_offset and !std.mem.eql(u8, current.checkpoint, record.checkpoint)) return;
-        } else return;
+        }
         try self.putReplicationSourceStatusTxn(txn, group_id, key, record);
     }
 
