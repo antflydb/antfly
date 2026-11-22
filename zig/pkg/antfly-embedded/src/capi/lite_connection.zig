@@ -2528,9 +2528,22 @@ pub const Owner = struct {
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
             if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
+            const file = &current.owned_lite_backend.?.native_docstore.?.file;
+            const maintenance_references_clear = current.maintenance_references == 0 or
+                (current == self.maintenance_turn_root and current.maintenance_references == 1);
+            const can_reuse = !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and
+                maintenance_references_clear and !needsOutcomeReconciliation(current) and
+                file.adoptionEpoch() == current.lite_refresh_adoption_epoch;
+            if (can_reuse) {
+                if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |inode| {
+                    self.reader_coordinator.observeCurrent(inode, file.headerFingerprint());
+                    if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
+                        try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                    return current;
+                }
+            }
             var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
-            const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const probe_inode = (try probe.file.stat(probe.runtime())).inode;
             // Establish the fenced tip before opening any new read pins.
             // Existing readers of an unknown peer publication remain poisoned.
@@ -2563,8 +2576,6 @@ pub const Owner = struct {
             // with the reference it is itself holding. Treat that one
             // self-held reference as if it were absent; a reference any
             // other caller holds on `current` still forces a reopen below.
-            const maintenance_references_clear = current.maintenance_references == 0 or
-                (current == self.maintenance_turn_root and current.maintenance_references == 1);
             // An uncertain publication can fail before writing anything, so an
             // unchanged header does not prove the runtime is reusable: reopen
             // to reconcile from durable state.

@@ -2547,9 +2547,34 @@ pub const Region = struct {
         self.publishLogStateWithPublisher(state, 0);
     }
 
+    /// A fair lease is ready once its own claim has published the WAL cut.
+    /// A different live publisher may belong to an earlier lease.
+    pub fn hasReadyLogWriter(self: *const Region) bool {
+        const holder = self.header().writer_holder.load(.acquire);
+        if (holder == 0) return false;
+        const state = self.readLogStateChecked() orelse return false;
+        const publisher = self.logPublisher().load(.seq_cst);
+        if (@as(u32, @truncate(publisher)) != holderLivenessSlot(holder) or
+            @as(u32, @truncate(publisher >> 32)) != holderClaimGeneration(holder)) return false;
+        return self.isLogStateLive(state) and publisher == self.logPublisher().load(.seq_cst) and
+            holder == self.header().writer_holder.load(.acquire);
+    }
+
+    pub fn writerClaim(self: *const Region) u128 {
+        return self.header().writer_holder.load(.acquire);
+    }
+
     pub fn publishReadyLogState(self: *Region, state: LogState) void {
-        const nonce = logNonces(self.mapping, self.header().max_readers)[self.own_liveness_slot].load(.acquire);
-        const publisher = (@as(u128, nonce) << 64) | (@as(u128, self.own_liveness_generation) << 32) | self.own_liveness_slot;
+        self.publishReadyLogStateForClaim(state, null);
+    }
+
+    pub fn publishReadyLogStateForClaim(self: *Region, state: LogState, own_claim: ?u128) void {
+        const holder = self.writerClaim();
+        const owns_fair_claim = holder != 0 and holder == own_claim and holderLivenessSlot(holder) < self.header().max_readers;
+        const slot = if (owns_fair_claim) holderLivenessSlot(holder) else self.own_liveness_slot;
+        const claim = if (owns_fair_claim) holderClaimGeneration(holder) else self.own_liveness_generation;
+        const nonce = logNonces(self.mapping, self.header().max_readers)[slot].load(.acquire);
+        const publisher = (@as(u128, nonce) << 64) | (@as(u128, claim) << 32) | slot;
         self.publishLogStateWithPublisher(state, publisher);
     }
 
