@@ -23,6 +23,7 @@ import ctypes
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from html.parser import HTMLParser
+from http.client import HTTPException
 from itertools import groupby
 import json
 import os
@@ -89,8 +90,11 @@ def read_json(url, body=None, timeout=120, *, on_submit=None):
     request = Request(url, data=data, headers={"Content-Type": "application/json"})
     if on_submit is not None:
         on_submit()
-    with urlopen(request, timeout=timeout) as result:
-        return json.load(result)
+    try:
+        with urlopen(request, timeout=timeout) as result:
+            return json.load(result)
+    except HTTPException as error:
+        raise OSError(f"HTTP protocol error for {request.selector}: {error}") from error
 
 
 def memory_peak(log, label):
@@ -177,11 +181,12 @@ def request_case(url, case, alias, prompt="", *, on_submit=None):
         if not isinstance(text, str):
             raise ValueError("OCR response content is not text")
     except HTTPError as error:
-        return {
-            "case": case["name"],
-            "http_status": error.code,
-            "message": error.read().decode()[:1500],
-        }
+        with error:
+            try:
+                message = error.read(1500).decode(errors="replace")
+            except (OSError, HTTPException) as body_error:
+                message = f"Could not read error response: {body_error}"
+        return {"case": case["name"], "http_status": error.code, "message": message}
     except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
         return {
             "case": case["name"],
@@ -335,22 +340,37 @@ def active_slot_tasks(url, expected_slots):
 def read_active_memory(read_memory, read_active_tasks):
     before = read_active_tasks()
     if not before:
-        return None
+        return None, 0
     values = read_memory()
-    # A shared task ID proves that execution spanned the memory read.
-    return values if values and before & read_active_tasks() else None
+    # Shared task IDs verify slot occupancy throughout the memory read.
+    return values, len(before & read_active_tasks()) if values else 0
 
 
-def record_phase_sample(peaks, current_phase, read_memory, read_active_tasks):
+def update_peaks(peaks, values):
+    for key, value in values.items():
+        peaks[key] = max(peaks.get(key, 0), value)
+
+
+def record_phase_sample(
+    peaks, task_peaks, current_phase, read_memory, read_active_tasks
+):
     phase = current_phase()
-    if phase[0] in ACTIVE_MEMORY_PHASES:
-        values = read_active_memory(read_memory, read_active_tasks)
+    active = phase[0] in ACTIVE_MEMORY_PHASES
+    if active:
+        values, tasks = read_active_memory(read_memory, read_active_tasks)
+        if not tasks:
+            return
     else:
         values = read_memory()
-    if values and phase == current_phase():
-        phase_peaks = peaks.setdefault(phase[0], {})
-        for key, value in values.items():
-            phase_peaks[key] = max(phase_peaks.get(key, 0), value)
+    if not values or phase != current_phase():
+        return
+    if (
+        active
+        and values.get("rss_bytes", 0) > 0
+        and values.get("physical_footprint_bytes", 0) > 0
+    ):
+        update_peaks(task_peaks.setdefault(phase[0], {}).setdefault(tasks, {}), values)
+    update_peaks(peaks.setdefault(phase[0], {}), values)
 
 
 def missing_memory_phases(peaks, phases):
@@ -377,6 +397,26 @@ def required_memory_phases(args, grounding_case):
     return phases
 
 
+def required_memory_occupancy(args, cases, grounding_case, parallel):
+    requested = {}
+    if not args.grounding_only:
+        requested["serve"] = min(parallel, len(cases) * args.rounds)
+    if grounding_case is not None:
+        requested["grounding"] = 1
+    return requested
+
+
+def memory_occupancy_report(task_peaks, required):
+    highest = {phase: max(task_peaks.get(phase, {}), default=0) for phase in required}
+    missing = [phase for phase, count in required.items() if highest[phase] < count]
+    return {
+        "required_verified_tasks_by_phase": required,
+        "max_verified_tasks_by_phase": highest,
+        "sampled_peak_bytes_by_phase_and_occupancy": task_peaks,
+        "missing_memory_occupancy_phases": missing,
+    }
+
+
 def run_profile(args, cases, grounding_case, size, profile, parallel):
     try:
         return measure_profile(args, cases, grounding_case, size, profile, parallel)
@@ -396,6 +436,9 @@ def run_profile(args, cases, grounding_case, size, profile, parallel):
             "peak_physical_footprint_bytes": None,
             "sampled_peak_bytes_by_phase": {},
             "missing_memory_phases": required_memory_phases(args, grounding_case),
+            **memory_occupancy_report(
+                {}, required_memory_occupancy(args, cases, grounding_case, parallel)
+            ),
             "warm_idle": None,
             "slot_probe_errors": {},
             "memory_workload_qualified": False,
@@ -478,6 +521,11 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
     memory_valid = memory_measurement_valid(
         memory.sampled_peaks, phases, peak_rss, peak_footprint
     )
+    occupancy = memory_occupancy_report(
+        memory.task_peaks,
+        required_memory_occupancy(args, cases, grounding_case, parallel),
+    )
+    memory_valid = memory_valid and not occupancy["missing_memory_occupancy_phases"]
     return {
         "qualified": quality_qualified and memory_workload_qualified and memory_valid,
         "quality_qualified": quality_qualified,
@@ -490,6 +538,7 @@ def measure_profile(args, cases, grounding_case, size, profile, parallel):
         "peak_physical_footprint_bytes": peak_footprint,
         "sampled_peak_bytes_by_phase": memory.sampled_peaks,
         "missing_memory_phases": missing_memory_phases(memory.sampled_peaks, phases),
+        **occupancy,
         "warm_idle": memory.idle,
         "slot_probe_errors": memory.slot_probe_errors,
         "memory_workload_qualified": memory_workload_qualified,
@@ -519,6 +568,7 @@ class BenchmarkPass:
     elapsed: float | None
     idle: dict | None
     sampled_peaks: dict
+    task_peaks: dict
     slot_probe_errors: dict
     error: str | None
     log: str
@@ -530,6 +580,7 @@ def run_pass(
     phase = ("load", 0)
     phase_changed = threading.Condition()
     sampled_peaks = {}
+    task_peaks = {}
     slot_probe_errors = {}
 
     def read_slots():
@@ -548,118 +599,129 @@ def run_pass(
     grounding = None
     failure = None
 
-    with tempfile.TemporaryFile() as log:
-        if record_memory:
-            command = ["/usr/bin/time", "-l", *command, "--slots"]
-        else:
-            command = [*command, "--no-slots"]
-        proc = subprocess.Popen(command, stdout=log, stderr=log)
-
-        def sample():
-            pid = None
-
-            def read_memory():
-                nonlocal pid
-                pid = pid or child_pid(proc.pid)
-                return process_memory(pid) if pid else None
-
-            while True:
-                with phase_changed:
-                    observed = phase
-                    if observed[0] == "finished":
-                        return
-                try:
-                    record_phase_sample(
-                        sampled_peaks, lambda: phase, read_memory, read_slots
-                    )
-                except (OSError, ValueError) as error:
-                    entry = slot_probe_errors.setdefault(
-                        observed[0], {"count": 0, "first_error": str(error)}
-                    )
-                    entry["count"] += 1
-                # Wake on HTTP submission even if the periodic poll just ran.
-                interval = 0.01 if observed[0] in ACTIVE_MEMORY_PHASES else 0.10
-                with phase_changed:
-                    phase_changed.wait_for(lambda: phase != observed, interval)
-
-        sampler = threading.Thread(target=sample) if record_memory else None
-        if sampler is not None:
-            sampler.start()
-        try:
-            wait_ready(proc, url, alias)
-            set_phase("warmup")
-            warmup = request_case(url, cases[0], alias)
-            if warmup.get("finish") != "stop":
-                raise RuntimeError(f"Warm-up request failed: {warmup}")
-            set_phase("idle")
+    output = ""
+    try:
+        with tempfile.TemporaryFile() as log:
             if record_memory:
-                try:
-                    read_slots()
-                except (OSError, ValueError) as error:
-                    slot_probe_errors["preflight"] = {
-                        "count": 1,
-                        "first_error": str(error),
-                    }
-                    raise RuntimeError(
-                        f"llama.cpp /slots preflight failed: {error}"
-                    ) from error
-                pid = child_pid(proc.pid)
-                idle = process_memory(pid) if pid else None
-            serve_submit = (lambda: set_phase("serve")) if record_memory else None
-            grounding_submit = (
-                (lambda: set_phase("grounding")) if record_memory else None
-            )
-            if not args.grounding_only:
-                with ThreadPoolExecutor(max_workers=parallel) as pool:
-                    start = time.perf_counter()
-                    rows = list(
-                        pool.map(
-                            lambda case: request_case(
-                                url, case, alias, on_submit=serve_submit
-                            ),
-                            cases * args.rounds,
+                command = ["/usr/bin/time", "-l", *command, "--slots"]
+            else:
+                command = [*command, "--no-slots"]
+            proc = subprocess.Popen(command, stdout=log, stderr=log)
+
+            def sample():
+                pid = None
+
+                def read_memory():
+                    nonlocal pid
+                    pid = pid or child_pid(proc.pid)
+                    return process_memory(pid) if pid else None
+
+                while True:
+                    with phase_changed:
+                        observed = phase
+                        if observed[0] == "finished":
+                            return
+                    try:
+                        record_phase_sample(
+                            sampled_peaks,
+                            task_peaks,
+                            lambda: phase,
+                            read_memory,
+                            read_slots,
                         )
-                    )
-                    elapsed = time.perf_counter() - start
-                    set_phase("idle")
-            if grounding_case:
-                grounding = request_case(
-                    url,
-                    grounding_case,
-                    alias,
-                    "grounding",
-                    on_submit=grounding_submit,
-                )
-                set_phase("idle")
-        except (OSError, RuntimeError, ValueError, KeyError) as error:
-            failure = str(error)
-        finally:
-            set_phase("finished")
+                    except (OSError, ValueError) as error:
+                        entry = slot_probe_errors.setdefault(
+                            observed[0], {"count": 0, "first_error": str(error)}
+                        )
+                        entry["count"] += 1
+                    # Wake on HTTP submission even if the periodic poll just ran.
+                    interval = 0.01 if observed[0] in ACTIVE_MEMORY_PHASES else 0.10
+                    with phase_changed:
+                        phase_changed.wait_for(lambda: phase != observed, interval)
+
+            sampler = threading.Thread(target=sample) if record_memory else None
             if sampler is not None:
-                sampler.join()
-            pid = child_pid(proc.pid) if record_memory else proc.pid
-            if pid:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                sampler.start()
             try:
-                proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
+                wait_ready(proc, url, alias)
+                set_phase("warmup")
+                warmup = request_case(url, cases[0], alias)
+                if warmup.get("finish") != "stop":
+                    raise RuntimeError(f"Warm-up request failed: {warmup}")
+                set_phase("idle")
+                if record_memory:
+                    try:
+                        read_slots()
+                    except (OSError, ValueError) as error:
+                        slot_probe_errors["preflight"] = {
+                            "count": 1,
+                            "first_error": str(error),
+                        }
+                        raise RuntimeError(
+                            f"llama.cpp /slots preflight failed: {error}"
+                        ) from error
+                    pid = child_pid(proc.pid)
+                    idle = process_memory(pid) if pid else None
+                serve_submit = (lambda: set_phase("serve")) if record_memory else None
+                grounding_submit = (
+                    (lambda: set_phase("grounding")) if record_memory else None
+                )
+                if not args.grounding_only:
+                    with ThreadPoolExecutor(max_workers=parallel) as pool:
+                        start = time.perf_counter()
+                        rows = list(
+                            pool.map(
+                                lambda case: request_case(
+                                    url, case, alias, on_submit=serve_submit
+                                ),
+                                cases * args.rounds,
+                            )
+                        )
+                        elapsed = time.perf_counter() - start
+                        set_phase("idle")
+                if grounding_case:
+                    grounding = request_case(
+                        url,
+                        grounding_case,
+                        alias,
+                        "grounding",
+                        on_submit=grounding_submit,
+                    )
+                    set_phase("idle")
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
+                failure = str(error)
+            finally:
+                set_phase("finished")
+                if sampler is not None:
+                    sampler.join()
+                pid = child_pid(proc.pid) if record_memory else proc.pid
                 if pid:
                     try:
-                        os.kill(pid, signal.SIGKILL)
+                        os.kill(pid, signal.SIGTERM)
                     except ProcessLookupError:
                         pass
-                proc.wait(timeout=10)
-            log.seek(0)
-            output = log.read().decode(errors="replace")
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    if pid:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    proc.wait(timeout=10)
+                log.seek(0)
+                output = log.read().decode(errors="replace")
+    except (OSError, subprocess.SubprocessError) as error:
+        failure = (
+            str(error) if failure is None else f"{failure}; cleanup failed: {error}"
+        )
     return BenchmarkPass(
         rows=rows,
         grounding=grounding,
         elapsed=elapsed,
         idle=idle,
         sampled_peaks=sampled_peaks,
+        task_peaks=task_peaks,
         slot_probe_errors=slot_probe_errors,
         error=failure,
         log=output,
@@ -771,6 +833,12 @@ def main():
                         "missing phase samples="
                         + ",".join(run["missing_memory_phases"])
                         if run["missing_memory_phases"]
+                        else ""
+                    ),
+                    (
+                        "missing verified occupancy="
+                        + ",".join(run["missing_memory_occupancy_phases"])
+                        if run["missing_memory_occupancy_phases"]
                         else ""
                     ),
                     flush=True,

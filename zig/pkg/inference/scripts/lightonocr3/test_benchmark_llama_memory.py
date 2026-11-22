@@ -15,6 +15,7 @@
 
 """Quality gates for the llama.cpp OCR memory benchmark."""
 
+from http.client import IncompleteRead
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -25,6 +26,7 @@ from benchmark_llama_memory import (
     active_slot_tasks,
     grounding_quality_passes,
     memory_measurement_valid,
+    memory_occupancy_report,
     missing_memory_phases,
     quality_passes,
     read_json,
@@ -90,7 +92,7 @@ class QualificationTest(unittest.TestCase):
 
     def test_setup_failure_records_a_result_row(self):
         profile = Profile("bf16")
-        args = SimpleNamespace(models_dir=Path("."), grounding_only=False)
+        args = SimpleNamespace(models_dir=Path("."), grounding_only=False, rounds=1)
         for failure in (FileNotFoundError("weights"), OSError("address in use")):
             with (
                 self.subTest(failure=failure),
@@ -113,9 +115,11 @@ class QualificationTest(unittest.TestCase):
             phase = ("idle", 3)
             return metrics
 
-        record_phase_sample(peaks, lambda: phase, read_across_transition, lambda: set())
+        record_phase_sample(
+            peaks, {}, lambda: phase, read_across_transition, lambda: set()
+        )
         self.assertEqual(peaks, {})
-        record_phase_sample(peaks, lambda: phase, lambda: metrics, lambda: set())
+        record_phase_sample(peaks, {}, lambda: phase, lambda: metrics, lambda: set())
         self.assertEqual(peaks, {"idle": metrics})
 
     def test_active_sample_requires_same_task_on_both_sides(self):
@@ -130,9 +134,28 @@ class QualificationTest(unittest.TestCase):
                 peaks = {}
                 read_slots = iter(slots).__next__
                 record_phase_sample(
-                    peaks, lambda: ("grounding", 1), lambda: metrics, read_slots
+                    peaks, {}, lambda: ("grounding", 1), lambda: metrics, read_slots
                 )
                 self.assertEqual(peaks, expected)
+
+    def test_verified_occupancy_uses_only_tasks_bracketing_the_sample(self):
+        metrics = {"rss_bytes": 100, "physical_footprint_bytes": 70}
+        task_peaks = {}
+        slots = iter([{(0, 4), (1, 5)}, {(0, 4), (1, 6)}])
+        record_phase_sample(
+            {}, task_peaks, lambda: ("serve", 1), lambda: metrics, slots.__next__
+        )
+        report = memory_occupancy_report(task_peaks, {"serve": 2})
+        self.assertEqual(report["max_verified_tasks_by_phase"], {"serve": 1})
+        self.assertEqual(report["missing_memory_occupancy_phases"], ["serve"])
+        self.assertEqual(task_peaks, {"serve": {1: metrics}})
+
+    def test_truncated_http_response_is_a_reportable_io_error(self):
+        with patch("benchmark_llama_memory.urlopen") as open_request:
+            response = open_request.return_value.__enter__.return_value
+            response.read.side_effect = IncompleteRead(b"{", 10)
+            with self.assertRaisesRegex(OSError, "HTTP protocol error for /slots"):
+                read_json("http://localhost/slots")
 
     def test_slots_schema_validates_width_and_active_task_ids(self):
         slots = [{"id": 0, "is_processing": False}]
@@ -182,6 +205,25 @@ class QualificationTest(unittest.TestCase):
                 {"count": 1, "first_error": "HTTP 404"},
             )
             self.assertIsNone(memory.grounding)
+
+    def test_memory_process_launch_failure_is_scoped_to_that_pass(self):
+        with patch(
+            "benchmark_llama_memory.subprocess.Popen",
+            side_effect=OSError("spawn failed"),
+        ):
+            memory = run_pass(
+                SimpleNamespace(),
+                [],
+                None,
+                1,
+                ["llama-server"],
+                "http://localhost",
+                "q4",
+                record_memory=True,
+            )
+        self.assertEqual(memory.error, "spawn failed")
+        self.assertEqual(memory.task_peaks, {})
+        self.assertEqual(memory.rows, [])
 
     def test_memory_phase_starts_at_http_submission(self):
         calls = []
