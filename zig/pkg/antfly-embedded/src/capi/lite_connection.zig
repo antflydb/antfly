@@ -2615,10 +2615,8 @@ pub const Owner = struct {
             // prove no primary/index root moved; that is sufficient on a
             // non-redo file, which has no logical watermark separate from
             // the physical one for `sequence_unchanged` to protect.
-            const fast2_metadata_unchanged = try file.runtimeMetadataUnchanged(probe);
-            const fast2_index_unchanged = try loadedIndexInputsUnchanged(current, file, probe);
             if (!self.foreground_runtime_stale and !adopted_unseen and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
-                fast2_metadata_unchanged and fast2_index_unchanged)
+                try file.runtimeMetadataUnchanged(probe) and try loadedIndexInputsUnchanged(current, file, probe))
             {
                 // Lease bookkeeping and unpublished shadow files do not change
                 // a serving runtime. Reopening it would publish another lease
