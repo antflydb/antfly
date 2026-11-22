@@ -226,7 +226,10 @@ pub const ReadAhead = struct {
                 if (self.valid - retained >= required) break;
                 return error.RemoteRequestBudgetExceeded;
             }
-            const n = try self.fetchAt(self.start + self.valid, self.buffer.?[self.valid..wanted], control);
+            const n = self.fetchAt(self.start + self.valid, self.buffer.?[self.valid..wanted], control) catch |err| {
+                if (self.valid - retained >= required and (err == error.RemoteReadBudgetExceeded or err == error.RemoteRequestBudgetExceeded)) break;
+                return err;
+            };
             self.valid += n;
         }
         try control.check();
@@ -355,6 +358,31 @@ test "remote prefetch returns demanded bytes on the last short upstream request"
     defer lease.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1 }, lease.bytes);
     try std.testing.expectEqual(@as(usize, 8), cache.valid);
+}
+
+test "remote prefetch tolerates upstream quota only after satisfying demand" {
+    const Provider = struct {
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            const failure: *const anyerror = @ptrCast(@alignCast(raw));
+            if (offset != 0) return failure.*;
+            const count = @min(8, out.len);
+            @memset(out[0..count], 1);
+            return count;
+        }
+    };
+    for ([_]anyerror{ error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded, error.SourceVersionChanged }) |failure| {
+        var upstream_error = failure;
+        var cache = ReadAhead{ .allocator = std.testing.allocator, .upstream = .{ .context = &upstream_error, .read_at = Provider.read, .length = 1024 } };
+        defer cache.deinit();
+        var out: [4]u8 = undefined;
+        if (failure == error.SourceVersionChanged) {
+            try std.testing.expectError(failure, ReadAhead.readAt(&cache, 0, &out, .{}));
+        } else {
+            try std.testing.expectEqual(out.len, try ReadAhead.readAt(&cache, 0, &out, .{}));
+            try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1 }, &out);
+            try std.testing.expectError(failure, ReadAhead.readAt(&cache, 64, &out, .{}));
+        }
+    }
 }
 
 test "remote isolated look-behind preserves the forward cache" {

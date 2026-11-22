@@ -594,7 +594,9 @@ pub const Runner = struct {
         defer self.finishSpeakers();
         try self.prepareSpeakers(provider);
         if (provider.sample_rate == 0) return error.UnsupportedAudioFormat;
-        const end: i64 = std.math.cast(i64, @divFloor(@as(u128, provider.samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate)) orelse return error.TimestampOverflow;
+        const final = if (provider.final_samples) |length| length(provider.context) else provider.samples;
+        const ceiling_ns = @divFloor(@as(u128, final orelse provider.samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate);
+        const end = std.math.cast(i64, ceiling_ns) orelse if (final == null) std.math.maxInt(i64) else return error.TimestampOverflow;
         var cursor = planning.Temporal{ .kind = .audio, .end_ns = end, .policy = self.request.policy, .model = self.executor.model, .picture_tokens = 0 };
         const plan = @import("media_audio_plan.zig");
         const speaker_plan_key = blk: {
@@ -634,14 +636,27 @@ pub const Runner = struct {
                 self.stopped = true;
                 break;
             }
-            if (!self.request.policy.audio_speaker_turns or self.executor.model.min_audio_ns > 0) if (provider.probe) |probe| {
-                // A bounded tail lookahead preserves the same minimum-duration
-                // final-window policy as a provider with a known total length.
-                const first: usize = @intCast(@divFloor(@as(u128, @intCast(cursor.offset_ns)) * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s));
-                const lookahead_ns = @as(u128, @intCast(cursor.offset_ns)) + @as(u128, @intCast(@min(self.request.policy.window_ns, self.executor.model.max_audio_ns))) + @as(u128, @intCast(self.executor.model.min_audio_ns));
-                const stop = std.math.cast(usize, @divFloor(lookahead_ns * provider.sample_rate, std.time.ns_per_s) + 1) orelse return error.TimestampOverflow;
-                if (try probe(provider.context, first, stop)) |samples| cursor.end_ns = @intCast(@divFloor(@as(u128, samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate));
-            };
+            const skip_acknowledged = self.ordinal < self.summary.start_ordinal and self.request.policy.audio_pause_ns == 0 and !self.request.policy.audio_speaker_turns and (self.executor.audio_tokens != null or self.executor.preflight == null);
+            var probed: ?@import("media_chunking_audio.zig").Lease = null;
+            defer if (probed) |*lease| lease.deinit(self.allocator);
+            var probed_first: usize = 0;
+            if ((!self.request.policy.audio_speaker_turns or self.executor.model.min_audio_ns > 0) and (provider.probe != null or provider.probe_window != null)) {
+                // Look ahead for the minimum-duration final window. Providers
+                // that decode during the probe can lend those samples to emit.
+                probed_first = @intCast(@min(provider.samples, @divFloor(@as(u128, @intCast(cursor.offset_ns)) * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)));
+                const window_end_ns = @as(u128, @intCast(cursor.offset_ns)) + @as(u128, @intCast(@min(self.request.policy.window_ns, self.executor.model.max_audio_ns)));
+                const lookahead_ns = window_end_ns + @as(u128, @intCast(self.executor.model.min_audio_ns));
+                const stop: usize = @intCast(@min(provider.samples, @divFloor(lookahead_ns * provider.sample_rate, std.time.ns_per_s) + 1));
+                const discovered = if (provider.probe_window) |probe| discovered: {
+                    // Acknowledged windows only need enough tail data to
+                    // reconstruct an EOF-adjusted boundary.
+                    const probe_first = if (skip_acknowledged) @max(probed_first, stop -| 1) else probed_first;
+                    const retain_end = if (skip_acknowledged) probe_first else @as(usize, @intCast(@min(stop, @divFloor(window_end_ns * provider.sample_rate, std.time.ns_per_s))));
+                    probed = try probe(provider.context, self.allocator, probe_first, @max(probe_first, retain_end), stop);
+                    break :discovered if (provider.final_samples) |length| length(provider.context) else null;
+                } else try provider.probe.?(provider.context, probed_first, stop);
+                if (discovered) |samples| cursor.end_ns = std.math.cast(i64, @divFloor(@as(u128, samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate)) orelse return error.TimestampOverflow;
+            }
             const planned = (try cursor.next()) orelse break;
             var descriptor = planned;
             var speaker_cut = false;
@@ -649,7 +664,7 @@ pub const Runner = struct {
                 const analysis = self.request.speaker_analysis.?;
                 if (analysis.ensure) |ensure| try ensure(analysis.context, self.allocator, descriptor.coordinates.start_ns.?, descriptor.coordinates.end_ns.?, true);
                 if (analysis.samples) |length| {
-                    if (length(analysis.context)) |samples| cursor.end_ns = @intCast(@divFloor(@as(u128, samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate));
+                    if (length(analysis.context)) |samples| cursor.end_ns = std.math.cast(i64, @divFloor(@as(u128, samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate)) orelse return error.TimestampOverflow;
                 }
                 const turn = try analysis.boundary.?(analysis.context, descriptor.coordinates.start_ns.?, descriptor.coordinates.end_ns.?);
                 speaker_cut = turn.end_ns < descriptor.coordinates.end_ns.?;
@@ -657,7 +672,7 @@ pub const Runner = struct {
                 descriptor.coordinates.speaker_index = turn.speaker_index;
                 cursor.offset_ns = turn.end_ns;
             }
-            const first: usize = @intCast(@divFloor(@as(u128, @intCast(descriptor.coordinates.start_ns.?)) * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s));
+            const first: usize = @intCast(@min(provider.samples, @divFloor(@as(u128, @intCast(descriptor.coordinates.start_ns.?)) * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)));
             var last: usize = @intCast(@min(provider.samples, @divFloor(@as(u128, @intCast(descriptor.coordinates.end_ns.?)) * provider.sample_rate + (if (speaker_cut) @as(u128, std.time.ns_per_s / 2) else 0), std.time.ns_per_s)));
             if (last <= first) continue;
             if (self.request.max_chunks != 0 and self.summary.emitted >= self.request.max_chunks) {
@@ -685,14 +700,28 @@ pub const Runner = struct {
                     cursor.offset_ns = stop - self.request.policy.overlap_ns;
                 }
             }
-            if (self.ordinal < self.summary.start_ordinal and self.request.policy.audio_pause_ns == 0 and !self.request.policy.audio_speaker_turns and (self.executor.audio_tokens != null or self.executor.preflight == null)) {
+            if (skip_acknowledged) {
+                const actual_samples = if (provider.final_samples) |length| length(provider.context) orelse provider.samples else provider.samples;
+                if (last < actual_samples) {
+                    const stop: i64 = @intCast(@divFloor(@as(u128, last) * std.time.ns_per_s, provider.sample_rate));
+                    if (stop <= descriptor.coordinates.start_ns.? + self.request.policy.overlap_ns) return error.ChunkUnitTooLarge;
+                    cursor.offset_ns = stop - self.request.policy.overlap_ns;
+                }
                 self.ordinal = try std.math.add(u64, self.ordinal, 1);
                 continue;
             }
-            var window = try provider.read(provider.context, self.allocator, first, last);
+            var window = reused: {
+                if (probed) |lease| if (first >= probed_first and last - probed_first <= lease.pcm.samples.len) {
+                    break :reused @import("media_chunking_audio.zig").Lease{ .pcm = .{ .samples = lease.pcm.samples[first - probed_first .. last - probed_first], .sample_rate = lease.pcm.sample_rate } };
+                };
+                // Release obsolete lookahead before another allocation.
+                if (probed) |*lease| lease.deinit(self.allocator);
+                probed = null;
+                break :reused try provider.read(provider.context, self.allocator, first, last);
+            };
             defer window.deinit(self.allocator);
             if (provider.final_samples) |length| if (length(provider.context)) |samples| {
-                cursor.end_ns = @intCast(@divFloor(@as(u128, samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate));
+                cursor.end_ns = std.math.cast(i64, @divFloor(@as(u128, samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate)) orelse return error.TimestampOverflow;
             };
             last = first + window.pcm.samples.len;
             if (last == first) break;
@@ -1598,6 +1627,45 @@ test "model aware media video windows use original MP4 and WebM timing and stop 
     try std.testing.expect((try runner.run()).complete);
     try std.testing.expect(result.kinds[@backingInt(planning.Kind.video)] >= 2);
 }
+test "model aware media reuses audio lookahead and reconstructs an acknowledged tail" {
+    const Audio = @import("media_chunking_audio.zig");
+    const Input = struct {
+        pcm: [750]f32 = @splat(0.25),
+        finalized: bool = false,
+        first: usize = 0,
+        fn probe(raw: *anyopaque, _: std.mem.Allocator, first: usize, last: usize, _: usize) !?Audio.Lease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.first = first;
+            self.finalized = true;
+            return .{ .pcm = .{ .samples = self.pcm[@min(first, self.pcm.len)..@min(last, self.pcm.len)], .sample_rate = 1000 } };
+        }
+        fn length(raw: *anyopaque) ?usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.finalized) self.pcm.len else null;
+        }
+        fn read(_: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !Audio.Lease {
+            return error.DuplicateAudioRead;
+        }
+    };
+    const a = std.testing.allocator;
+    var source = Input{};
+    const provider = Audio.Provider{ .context = &source, .samples = std.math.maxInt(usize) / 2, .sample_rate = 1000, .read = Input.read, .probe_window = Input.probe, .final_samples = Input.length };
+    var result = Qualification{};
+    const sink = Sink{ .context = &result, .accept = Qualification.accept };
+    var request = Request{ .input = .{ .binary = .{ .mime_type = "audio/webm", .data = "fixture" } }, .policy = .{ .window_ns = std.time.ns_per_s } };
+    var runner = try Runner.init(a, request, result.executor(), .{}, sink);
+    try runner.soundWindows(provider);
+    try std.testing.expectEqual(@as(usize, 1), result.seen);
+    try std.testing.expectEqual(@as(i64, 750 * std.time.ns_per_ms), result.last_end);
+    var token: [85]u8 = undefined;
+    request.continuation = runner.summary.identity.cursor(runner.summary.next_ordinal, &token);
+    source.finalized = false;
+    runner = try Runner.init(a, request, result.executor(), .{}, sink);
+    try runner.soundWindows(provider);
+    try std.testing.expectEqual(@as(usize, 1000), source.first);
+    try std.testing.expectEqual(@as(usize, 1), result.seen);
+}
+
 test "model aware media remote audio pressure preserves acknowledged coverage" {
     const a = std.testing.allocator;
     const Audio = @import("media_chunking_audio.zig");

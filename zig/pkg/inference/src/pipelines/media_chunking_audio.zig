@@ -40,6 +40,9 @@ pub const Provider = struct {
     fork: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!Fork = null,
     final_samples: ?*const fn (*anyopaque) ?usize = null,
     probe: ?*const fn (*anyopaque, usize, usize) anyerror!?usize = null,
+    /// Retains PCM for [first, last) while probing through lookahead.
+    /// An empty retained interval only discovers the end of the stream.
+    probe_window: ?*const fn (*anyopaque, std.mem.Allocator, usize, usize, usize) anyerror!?Lease = null,
     sample_rate: u32,
     read: *const fn (*anyopaque, std.mem.Allocator, usize, usize) anyerror!Lease,
 };
