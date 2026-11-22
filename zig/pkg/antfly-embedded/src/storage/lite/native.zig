@@ -10925,16 +10925,27 @@ pub const NativeFile = struct {
         else
             null;
 
-        if (!probe and !torn and !redo.validate_full_prefix) {
-            // The local registry can prove the overlay already contains
-            // this run. Recheck its final record against the durable seal
-            // to restore the cursor and checkpoint without rereading it all.
-            if (persisted) |seal| {
-                if (seal.frontier.sequence > covered and redo.shared.appliedThrough() >= seal.frontier.sequence) {
+        if (!probe and !torn) {
+            if (persisted) |seal| if (region) |mapped| {
+                const frontier = seal.frontier;
+                const published = mapped.readLogStateChecked();
+                const corroborated = if (published) |state|
+                    state.checkpoint_sequence == redo.checkpoint_sequence and
+                        state.durable_sequence == frontier.sequence and state.durable_offset == frontier.end_offset and
+                        state.segment == (if (self.activeCheckpoint().redo_rotation) |rotation| rotation.active else 0) and
+                        mapped.hasSyncedFrontier(frontier.sequence, frontier.generation, frontier.end_offset, self.durability_policy == .full_fsync)
+                else
+                    false;
+                if ((!redo.validate_full_prefix or corroborated) and frontier.sequence > covered) {
                     if (try self.redoResumeCursor(io, entry, floor, self.header)) |cursor| {
-                        if (cursor.last_sequence == seal.frontier.sequence and cursor.tail == seal.frontier.end_offset and cursor.salt == seal.frontier.generation) {
+                        if (cursor.last_sequence > covered and cursor.last_sequence <= frontier.sequence and
+                            cursor.tail <= frontier.end_offset and cursor.salt == frontier.generation and
+                            (corroborated or (cursor.last_sequence == frontier.sequence and cursor.tail == frontier.end_offset)) and
+                            redo.shared.appliedThrough() >= cursor.last_sequence)
+                        {
                             if (cursor.last_record_start) |start| {
                                 if (start < cursor.tail) {
+                                    // Verify the boundary record and every new record.
                                     start_offset = start;
                                     floor = cursor.last_sequence - 1;
                                 }
@@ -10942,7 +10953,7 @@ pub const NativeFile = struct {
                         }
                     }
                 }
-            }
+            };
         }
 
         if (builtin.is_test and !probe and start_offset == 0) {
@@ -10989,7 +11000,7 @@ pub const NativeFile = struct {
         defer scan_ctx.staged.deinit(self.allocator);
         defer scan_ctx.records.deinit(self.allocator);
         const base = self.header.redoOffset();
-        const replay_prefix: *const @TypeOf(redo_log.replayBounded) = if (start_offset == 0)
+        const replay_prefix: *const @TypeOf(redo_log.replayBounded) = if (start_offset == 0 or persisted != null)
             redo_log.replayBufferedPrefix
         else
             redo_log.replayBounded;
@@ -22390,7 +22401,7 @@ pub const NativeFile = struct {
     fn publishCommittedSequenceToInode(self: *NativeFile) void {
         if (self.inode_lock_ref.load(.acquire)) |entry| {
             inode_lock.publishCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
-            if (self.redo) |*redo| if (redo.writer.salt) |salt| if (redo.writer.last_sequence) |last| if (redo.writer.tail != 0)
+            if (self.redo) |*redo| if (redo.writer.salt) |salt| if (redo.writer.last_sequence) |last| if (redo.writer.tail != 0 and last <= redo.syncedSequence())
                 inode_lock.publishRedoAppendCursor(entry, self.runtimeIo(), .{
                     .log_offset = redo.writer.base_offset,
                     .capacity = redo.writer.capacity,
@@ -40931,7 +40942,7 @@ test "lite redo handoff replaces an unsealed deferred record despite a retained 
     try std.testing.expect(try reader.getDocumentAlloc(a, "only-unsealed") == null);
 }
 
-test "lite redo handoff validates middle records across leases" {
+test "lite redo untrusted handoff validates middle records across leases" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -40954,8 +40965,19 @@ test "lite redo handoff validates middle records across leases" {
         }
     }
 
+    {
+        var lease = try lockWriterPathWithIo(a, io, path);
+        defer lease.close();
+        test_stale_writer_full_scans = 0;
+        try writer.beginTransaction();
+        writer.abortTransaction();
+        try std.testing.expectEqual(@as(u32, 0), test_stale_writer_full_scans);
+    }
+
     var lease = try lockWriterPathWithIo(a, io, path);
     defer lease.close();
+    const region = (try writer.regionForInode()).?;
+    region.resetSyncedFrontierForTest();
     const zeros: [redo_log.header_len]u8 = @splat(0);
     try writer.file.writePositionalAll(io, &zeros, damaged);
     try std.testing.expectError(error.NativeRedoLogCorrupt, writer.beginTransaction());

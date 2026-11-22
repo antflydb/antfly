@@ -6,6 +6,7 @@ class SyncLevel(StrEnum):
     FULL_INDEX = "full_index"
     FULL_TEXT = "full_text"
     PROPOSE = "propose"
+    QUERY = "query"
     WRITE = "write"
 
     def __str__(self) -> str:

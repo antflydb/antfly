@@ -1845,6 +1845,13 @@ immediately before the redo extent. Each frontier records the run salt,
 last covered sequence, and end offset. The shared lock region continues
 to supply the fast path for concurrent readers.
 
+A detached writer can resume from a process-local cursor when the active
+extent, run salt, and durable frontier agree with the shared publication
+and its sync proof. It verifies the cursor's boundary record and the new
+suffix. A cursor with missing or conflicting evidence requires a full
+retained-prefix scan before append. Trusted handoff does not reread
+previously verified middle records.
+
 On cold recovery the frontier bounds replay. Unless the disk checkpoint
 has already folded the promised sequence, recovery must reach the
 frontier's sequence, ending offset, and run salt. Later bytes can be
