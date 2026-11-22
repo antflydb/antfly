@@ -10950,6 +10950,108 @@ extern "C" __global__ void termite_gemma4_small_ple_projection_q8_1_f32(float* d
 }
 // tile-codegen:end projection.direct.26 family
 
+// tile-codegen:begin projection.direct.27 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_short_row_matmul_f32(ANTFLY_CUDA_SHORT_ROW_MATMUL_PARAMS) {
+    // For few-row projections, distribute the reduction over eight warps.
+    // Each warp reads contiguous RHS columns in the row-major weight.
+    __shared__ float partial[8][32];
+    const unsigned int lane = threadIdx.x % 32u;
+    const unsigned int warp = threadIdx.x / 32u;
+    const unsigned int tiles = (n - 1u) / 32u + 1u;
+    const unsigned int row_batch = blockIdx.x / tiles;
+    const unsigned int batch = row_batch / m;
+    const unsigned int col = (blockIdx.x % tiles) * 32u + lane;
+
+    float sum = 0.0f;
+    if (col < n) {
+        for (unsigned int inner = warp; inner < k; inner += 8u) {
+            sum += lhs[(size_t)row_batch * k + inner] *
+                rhs[((size_t)batch * k + inner) * n + col];
+        }
+    }
+    partial[warp][lane] = sum;
+    __syncthreads();
+    if (warp == 0u && col < n) {
+        for (unsigned int other = 1; other < 8u; ++other) sum += partial[other][lane];
+        output[(size_t)row_batch * n + col] = epilogue != 0u ? termite_decoder_activation_f32(sum, epilogue) : sum;
+    }
+}
+
+// tile-codegen:end projection.direct.27 family
+
+// tile-codegen:begin projection.direct.28 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_tiled_row_matmul_f32(ANTFLY_CUDA_SHORT_ROW_MATMUL_PARAMS) {
+    __shared__ float lhs_tile[8][32];
+    __shared__ float rhs_tile[32][32];
+    const unsigned int lane = threadIdx.x % 32u;
+    const unsigned int warp = threadIdx.x / 32u;
+    const unsigned int col = blockIdx.x * 32u + lane;
+    const unsigned int row = blockIdx.y * 8u + warp;
+    float sum = 0.0f;
+    for (unsigned int start = 0; start < k; start += 32u) {
+        const unsigned int lhs_col = start + lane;
+        lhs_tile[warp][lane] = row < m && lhs_col < k ? lhs[(size_t)row * k + lhs_col] : 0.0f;
+        for (unsigned int inner = warp; inner < 32u; inner += 8u) {
+            const unsigned int rhs_row = start + inner;
+            rhs_tile[inner][lane] = col < n && rhs_row < k ? rhs[(size_t)rhs_row * n + col] : 0.0f;
+        }
+        __syncthreads();
+        const unsigned int active = min(32u, k - start);
+        for (unsigned int inner = 0; inner < active; ++inner)
+            sum += lhs_tile[warp][inner] * rhs_tile[inner][lane];
+        __syncthreads();
+    }
+    if (row < m && col < n) output[(size_t)row * n + col] = epilogue != 0u ? termite_decoder_activation_f32(sum, epilogue) : sum;
+}
+
+// tile-codegen:end projection.direct.28 family
+
+// tile-codegen:begin projection.direct.29 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_wide_tiled_row_matmul_f32(ANTFLY_CUDA_SHORT_ROW_MATMUL_PARAMS) {
+    __shared__ float lhs_tile[32][32];
+    __shared__ float rhs_tile[32][64];
+    const unsigned int lid = threadIdx.x;
+    const unsigned int lane = lid % 32u;
+    const unsigned int warp = lid / 32u;
+    const unsigned int col = blockIdx.x * 64u + lane;
+    const unsigned int first_row = blockIdx.y * 32u + warp * 4u;
+    float sum[4][2] = {};
+    for (unsigned int start = 0; start < k; start += 32u) {
+        for (unsigned int i = lid; i < 1024u; i += 256u) {
+            const unsigned int row = blockIdx.y * 32u + i / 32u;
+            const unsigned int inner = start + i % 32u;
+            lhs_tile[i / 32u][i % 32u] = row < m && inner < k ? lhs[(size_t)row * k + inner] : 0.0f;
+        }
+        for (unsigned int i = lid; i < 2048u; i += 256u) {
+            const unsigned int rhs_col = blockIdx.x * 64u + i % 64u;
+            const unsigned int inner = start + i / 64u;
+            rhs_tile[i / 64u][i % 64u] = rhs_col < n && inner < k ? rhs[(size_t)inner * n + rhs_col] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll 4
+        for (unsigned int inner = 0; inner < min(32u, k - start); ++inner) {
+            const float r0 = rhs_tile[inner][lane];
+            const float r1 = rhs_tile[inner][lane + 32u];
+            #pragma unroll
+            for (unsigned int rr = 0; rr < 4u; ++rr) {
+                const float a = lhs_tile[warp * 4u + rr][inner];
+                sum[rr][0] += a * r0;
+                sum[rr][1] += a * r1;
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned int rr = 0; rr < 4u; ++rr) {
+        const unsigned int row = first_row + rr;
+        if (row < m && col < n)
+            output[(size_t)row * n + col] = epilogue != 0u ? termite_decoder_activation_f32(sum[rr][0], epilogue) : sum[rr][0];
+        if (row < m && col + 32u < n)
+            output[(size_t)row * n + col + 32u] = epilogue != 0u ? termite_decoder_activation_f32(sum[rr][1], epilogue) : sum[rr][1];
+    }
+}
+// tile-codegen:end projection.direct.29 family
+
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn(
     unsigned char* dst_q8,
     const unsigned char* q8_input,
@@ -14030,7 +14132,60 @@ score += qr1 * k1;
     dst[q_base + lane] = value0 * inv_sum;
     dst[q_base + lane + 32u] = value1 * inv_sum;
 }
+
 // tile-codegen:end attention.direct.30 family
+
+// tile-codegen:begin attention.direct.31 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_head_major_attention_f32(ANTFLY_CUDA_HEAD_MAJOR_ATTENTION_PARAMS) {
+    extern __shared__ float probabilities[];
+    __shared__ float denominator;
+    const unsigned int row = blockIdx.x;
+    const unsigned int head_batch = row / query_rows;
+    const unsigned int query = row % query_rows;
+    const unsigned int lane = threadIdx.x % 32u;
+    const unsigned int warp = threadIdx.x / 32u;
+    const size_t key_base = (size_t)head_batch * key_rows * head_dim;
+    const size_t bias_base = (size_t)(head_batch / heads) * bias_batch_stride
+        + (size_t)(head_batch % heads) * bias_head_stride + (size_t)query * bias_query_stride;
+    for (unsigned int key = warp; key < key_rows; key += 4u) {
+        float dot = 0.0f;
+        for (unsigned int d = lane; d < head_dim; d += 32u) {
+            const size_t key_index = key_contract_last
+                ? (size_t)key * head_dim + d
+                : (size_t)d * key_rows + key;
+            dot += q[(size_t)row * head_dim + d] * k[key_base + key_index];
+        }
+        dot = antfly_warp_reduce_sum_f32(dot);
+        if (lane == 0u) {
+            float score = __fmul_rn(dot, score_scale);
+            if (bias != nullptr) score += bias[bias_base + (size_t)key * bias_key_stride];
+            probabilities[key] = score;
+        }
+    }
+    __syncthreads();
+    // Match the primitive softmax's ordered denominator reduction.
+    if (threadIdx.x == 0u) {
+        float max_score = -3.402823466e+38f;
+        for (unsigned int key = 0; key < key_rows; ++key) max_score = fmaxf(max_score, probabilities[key]);
+        float sum = 0.0f;
+        for (unsigned int key = 0; key < key_rows; ++key) {
+            const float weight = expf(probabilities[key] - max_score);
+            probabilities[key] = weight;
+            sum += weight;
+        }
+        denominator = sum;
+    }
+    __syncthreads();
+    for (unsigned int key = threadIdx.x; key < key_rows; key += blockDim.x) probabilities[key] /= denominator;
+    __syncthreads();
+    for (unsigned int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float value = 0.0f;
+        for (unsigned int key = 0; key < key_rows; ++key)
+            value += probabilities[key] * v[key_base + (size_t)key * head_dim + d];
+        output[(size_t)row * head_dim + d] = value;
+    }
+}
+// tile-codegen:end attention.direct.31 family
 
 
 // FP16-storage DeBERTa-v3 encoder prefill attention.  Unlike the F32 fused

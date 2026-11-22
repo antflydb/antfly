@@ -189,11 +189,17 @@ pub const Selection = struct {
             var changed = false;
             if (pool.literal_store) |store| for (store.literals, 0..) |literal, index| {
                 if (!self.literal_enabled[index] or store.backends[literal.backend_index].kind() == .native) continue;
-                for (literal.consumers) |consumer| if (consumer >= self.routes.len or self.routes[consumer] == null) {
+                for (literal.consumers) |consumer| {
+                    if (consumer < self.routes.len) {
+                        if (self.routes[consumer] != null) continue;
+                        if (pool.regionForNode(consumer)) |installed| {
+                            if (std.mem.indexOfScalar(NodeId, installed.owner.input_nodes, literal.node) != null) continue;
+                        }
+                    }
                     self.literal_enabled[index] = false;
                     changed = true;
                     break;
-                };
+                }
             };
             // Legacy lazy consumers may materialize their input wrapper. Never
             // freeze its affine planes for another exact consumer in that case.
@@ -204,6 +210,9 @@ pub const Selection = struct {
                 for (stable, 0..) |*safe, source| {
                     for (self.alias_index.?.uses(@intCast(source))) |consumer| {
                         if (pool.plan.slotForNode(consumer) == null or self.routes[consumer] != null) continue;
+                        // A covered operation has no ordinary interpreter
+                        // dispatch that could materialize a metadata view.
+                        if (pool.regionForNode(consumer) != null) continue;
                         const exact_alias = if (self.alias_index.?.aliasForNode(consumer)) |next|
                             self.alias_enabled[next] and self.plane_counts[consumer] == 1
                         else
@@ -383,14 +392,22 @@ pub const Selection = struct {
             const prepare = functions.prepareKernelRoute orelse continue;
             var incoming: [3]route.Binding = undefined;
             var witnesses: [3]bool = @splat(false);
+            var integer_literals: [3]bool = @splat(false);
             var output_witnessed = true;
             for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |input, index| {
                 const retained = self.retainedInput(pool, input);
                 incoming[index] = retained.value;
                 witnesses[index] = retained.witnessed;
+                if (retained.witnessed) if (pool.literal_store) |store| {
+                    const literal = store.node_indices[input];
+                    if (literal != ml.graph.null_node and self.literal_enabled[literal]) {
+                        const dtype = store.literals[literal].shape.dtype;
+                        integer_literals[index] = dtype == .i32 or dtype == .i64;
+                    }
+                };
                 output_witnessed = output_witnessed and witnesses[index];
             }
-            const owned = (try prepare(backend.ptr, .{ .metadata_authority = authority, .allocator = self.allocator, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .descriptor = &kernel.descriptor, .host_readonly_inputs = readOnlyHostInputs(pool, node), .inputs = incoming[0..kernel.descriptor.input_count], .inputs_witnessed = witnesses, .output = self.output(pool, node, 0) })) orelse continue;
+            const owned = (try prepare(backend.ptr, .{ .metadata_authority = authority, .allocator = self.allocator, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .descriptor = &kernel.descriptor, .host_readonly_inputs = readOnlyHostInputs(pool, node), .integer_literal_inputs = integer_literals, .inputs = incoming[0..kernel.descriptor.input_count], .inputs_witnessed = witnesses, .output = self.output(pool, node, 0) })) orelse continue;
             self.routes[node] = owned;
             const required = owned.requirements;
             if (required.auxiliaries.count > ops.kernel_descriptor.max_auxiliaries) return error.InvalidPreparedKernelRequirements;
@@ -427,7 +444,25 @@ pub const Selection = struct {
             const slot = pool.plan.slotForNode(node).?;
             const source = self.retainedInput(pool, alias.source);
             const incoming = source.value;
-            if (slot.backend != .native and (incoming != .planned or incoming.planned.planes.len != 1 or @import("metadata_alias.zig").activationRoot(&pool.plan, alias.source, slot.backend) == null)) {
+            const root = @import("metadata_alias.zig").fullSpanRoot(&pool.plan, alias.source, slot.backend);
+            const device_input = if (slot.backend == .cuda and root != null and root.?.kind == .runtime_input)
+                self.inputs.find(root.?.node_id)
+            else
+                null;
+            const static_input = if (slot.backend == .cuda and root != null and root.?.kind == .runtime_input and device_input == null)
+                if (pool.immutable_bindings) |bindings| bindings.find(root.?.node_id) else null
+            else
+                null;
+            const owned_gpu_root = if (root) |value| switch (value.kind) {
+                .allocation => true,
+                .constant => slot.backend == .cuda and value.desc.shape.dtype == .f32 and source.witnessed,
+                .runtime_input => (device_input != null and device_input.? == .imported_device) or (static_input != null and static_input.? == .tensor),
+                else => false,
+            } else false;
+            if (slot.backend != .native and (!owned_gpu_root or
+                (incoming != .planned and incoming != .imported_device and (incoming != .tensor or static_input == null)) or
+                (incoming == .planned and incoming.planned.planes.len != 1)))
+            {
                 // Preserve the existing ordinary GPU reshape facts/dispatch.
                 // No exact retained Frame hook is claimed for external inputs.
                 self.alias_enabled[alias_index] = false;
@@ -439,11 +474,30 @@ pub const Selection = struct {
                 if (!functions.accepts(backend.vtable) or functions.createMetadataAlias == null) continue;
                 // Public host facts describe import semantics, not a retained
                 // aliasable CT. Its ordinary ingress/legacy owner stays opaque.
-                const primary = try @import("dense_alias.zig").primary(incoming, backend, alias.input);
-                const plane = alias.apply(primary orelse continue) orelse continue;
+                const primary = if (incoming == .imported_device) direct: {
+                    if (alias.input.dtype != .f32 or !@import("assigned_kernel_route.zig").bindingDense(backend, incoming, alias.input)) break :direct null;
+                    const plane = try densePlane(alias.input, backend, .primary, self.epoch);
+                    self.planes[alias.source][0] = plane;
+                    self.plane_counts[alias.source] = 1;
+                    self.planes_witnessed[alias.source] = true;
+                    break :direct plane;
+                } else try @import("dense_alias.zig").primary(incoming, backend, alias.input);
+                var backing = primary orelse continue;
+                if (incoming == .tensor and slot.backend == .cuda) {
+                    const verify = functions.physicalReplayImmutableSupported orelse continue;
+                    const query = functions.storageOwnership orelse continue;
+                    var access = ownership.ReadOnly{};
+                    if (!(try verify(backend.ptr, incoming.tensor.value, alias.input)) or
+                        try query(backend.ptr, incoming.tensor.value, access.visitor()) != .complete or !access.value) continue;
+                    backing.storage_epoch = self.epoch;
+                    self.planes[alias.source][0] = backing;
+                    self.plane_counts[alias.source] = 1;
+                    self.planes_witnessed[alias.source] = true;
+                }
+                const plane = alias.apply(backing) orelse continue;
                 self.planes[node][0] = plane;
                 self.plane_counts[node] = 1;
-                self.planes_witnessed[node] = source.witnessed;
+                self.planes_witnessed[node] = source.witnessed or (slot.backend == .cuda and incoming == .tensor);
                 return true;
             }
             // A declined Native affine alias must not regain stale facts.

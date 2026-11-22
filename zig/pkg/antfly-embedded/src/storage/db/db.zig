@@ -619,6 +619,10 @@ pub const OpenOptions = struct {
     /// owner; opening a namespace must not rebuild an unrelated projection.
     defer_derived_replay_on_open: bool = false,
     table_storage: ?table_storage_mod.Settings = null,
+    /// Upgrade writable non-Lite journals to the single-record credit format.
+    /// Set false before the upgrade when rollback to a v3-only binary is required.
+    /// Deployments can also set ANTFLY_KEEP_REPLAY_CREDIT_V3=true.
+    enable_protected_replay_credit: bool = true,
     open_mode: OpenOptions.OpenMode = .writer,
     /// An authenticated restore decoder needs rows and schema layouts, never
     /// source projections. Do not open intentionally omitted index artifacts.
@@ -4510,6 +4514,16 @@ pub const DB = struct {
                 db.scheduleGeneratedArtifactCleanup();
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) _ = try db.drainStandaloneGraphEndpointCleanup();
+            // Switch formats after startup validation and recovery have
+            // succeeded. An earlier open failure leaves the old reader
+            // able to reopen the journal.
+            if (opts.enable_protected_replay_credit and
+                !platform.env.getenvBool("ANTFLY_KEEP_REPLAY_CREDIT_V3") and
+                !openModeRequiresReadOnlyBackends(opts.open_mode) and
+                !db.core.store.sharedReplayLane())
+            {
+                try db.core.store.enableProtectedReplayCredit();
+            }
             profile.total_ns = monotonicTimeNs() - open_started_ns;
             if (openProfileEnabled()) {
                 logOpenProfile(path, opts.open_mode, db.start_index_workers, profile);
@@ -47171,6 +47185,13 @@ pub const DB = struct {
         if (resident >= primary_sequence) return true;
         const applied = @max(resident, try self.core.loadAppliedSequence(alloc, index_name));
         if (applied >= primary_sequence) return true;
+        // Direct text projections can use the indexed hint lane to ignore
+        // unrelated replay. Artifact inputs have their own revision frontier.
+        if (self.core.textIndexEntry(index_name)) |entry| {
+            if (entry.source_artifact_names.len == 0 and entry.chunk_name == null) {
+                if (try self.core.store.replayHintRecordBetween(.full_text, applied, primary_sequence)) |pending| return !pending;
+            }
+        }
         return (try self.managedIndexReplayTargetSequence(alloc, index_name, .full_text, applied)) <= applied;
     }
 
@@ -107696,6 +107717,38 @@ test "WS5 hosted replay retirement is leader-gated: the leader bounds the journa
             try std.testing.expectEqual(entries_before.len, entries_after.len);
         }
     }
+}
+
+test "db replay credit format defaults to v4 on non-Lite storage" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db-protected-credit");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const version = try db.core.store.get(alloc, &internal_keys.replay_journal_format_version_key);
+    defer alloc.free(version);
+    try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_protected_credit), internal_keys.decodeReplayJournalFormatVersion(version));
+}
+
+test "db replay credit format preserves v3 when explicitly requested" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db-compatible-credit");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{
+        .enable_protected_replay_credit = false,
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+    try db.core.store.appendReplayOpaque(alloc, db.core.store.nextReplaySequence(1), "compatible");
+
+    const version = try db.core.store.get(alloc, &internal_keys.replay_journal_format_version_key);
+    defer alloc.free(version);
+    try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_current), internal_keys.decodeReplayJournalFormatVersion(version));
 }
 
 test "WS5 runUntilIdle drains journal retirement to completion at credit capacity" {

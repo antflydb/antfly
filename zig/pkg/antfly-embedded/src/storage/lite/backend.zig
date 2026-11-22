@@ -74,6 +74,7 @@ pub const EngineSelection = enum {
 };
 
 pub const OpenOptions = struct {
+    redo_recovery_base: ?native.RedoRecoveryCursor = null,
     externally_locked: bool = false,
     reclamation: docstore.reclamation.Options = .{},
     engine: EngineSelection = .auto,
@@ -642,7 +643,7 @@ pub const Handle = struct {
                     .replay_layout = "native_replay_lanes_in_document_catalog",
                     .index_layout = native_index_layout,
                     .index_namespace = native_index_base_path,
-                    .format_version = native.format_version,
+                    .format_version = file.header.diskFormatVersion(),
                     .page_size = file.header.page_size,
                     .active_checkpoint = file.header.active_checkpoint,
                     .checkpoint_sequence = checkpoint.commit_sequence,
@@ -820,6 +821,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
         .io = opts.io,
+        .redo_recovery_base = opts.redo_recovery_base,
         .ride_along_idle_ns = opts.ride_along_idle_ns,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
@@ -997,9 +999,7 @@ fn nativeVacuumReport(handle: *Handle, cancel: ?*const maintenance.CancelToken) 
 
 fn nativeStableSnapshot(handle: *Handle, dest_path: []const u8, replace: bool) !StableSnapshotReport {
     const store = handle.native_docstore.?;
-    store.mutex.lock();
-    defer store.mutex.unlock();
-    return try store.file.copyStableSnapshotToPath(dest_path, replace);
+    return try store.copyStableSnapshot(dest_path, replace);
 }
 
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
@@ -1390,7 +1390,7 @@ test "lite backend reports native storage status from active checkpoint" {
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.replay_layout);
     try std.testing.expectEqualStrings(native_index_layout, status.index_layout);
     try std.testing.expectEqualStrings(native_index_base_path, status.index_namespace.?);
-    try std.testing.expectEqual(native.format_version, status.format_version.?);
+    try std.testing.expectEqual(handle.native_docstore.?.file.header.diskFormatVersion(), status.format_version.?);
     try std.testing.expectEqual(native.default_page_size, status.page_size.?);
     try std.testing.expectEqual(handle.native_docstore.?.file.header.active_checkpoint, status.active_checkpoint.?);
     try std.testing.expectEqual(checkpoint.commit_sequence, status.checkpoint_sequence.?);
@@ -1565,7 +1565,7 @@ test "lite backend auto rejects invalid native headers without fallback" {
     {
         var encoded: [native.header_size]u8 = undefined;
         native.encodeHeader(&encoded, .{});
-        std.mem.writeInt(u32, encoded[native.magic.len..][0..4], native.format_version + 1, .little);
+        std.mem.writeInt(u32, encoded[native.magic.len..][0..4], native.segmented_redo_format_version + 1, .little);
         var file = try std.Io.Dir.cwd().createFile(std.testing.io, unsupported_version_path, .{});
         defer file.close(std.testing.io);
         try file.writePositionalAll(std.testing.io, &encoded, 0);

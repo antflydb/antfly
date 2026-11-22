@@ -4149,7 +4149,7 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     defer if (projector_frame) cb.decoderRuntimeCancelFrame() catch {};
     // Preserve the source GEMM's physical reduction extent until pooling.
     const source_bf16 = sourcePixelStorage(cb.kind(), cfg) == .bf16 and sourceSpatialPoolSelected(cb.kind(), cfg, try cb.sourceScalarStorage(.linear));
-    if (!source_bf16) if (source_sequence) |physical| {
+    if (@import("build_options").enable_cuda and !source_bf16) if (source_sequence) |physical| {
         const logical = geometry.grid_x * geometry.grid_y;
         const compact = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.sourceImageRows(cb, hidden, batch, physical, logical, logical, cfg.vision_hidden, 0);
         cb.free(hidden);
@@ -6133,6 +6133,7 @@ fn sourceVisionSequence(cb: *const ComputeBackend, cfg: Config, geometry: Geomet
 }
 
 fn sourcePatchProjection(cb: *const ComputeBackend, cfg: Config, patches: CT, weight: CT, geometry: Geometry, batch: usize) !CT {
+    if (comptime !@import("build_options").enable_cuda) return cb.linearNoBias(patches, weight, batch * geometry.grid_x * geometry.grid_y, cfg.patch_size * cfg.patch_size * 3, cfg.vision_hidden);
     const logical = try std.math.mul(usize, geometry.grid_x, geometry.grid_y);
     const width = cfg.patch_size * cfg.patch_size * 3;
     const physical = try sourceVisionSequence(cb, cfg, geometry) orelse return sourceLinearNoBias(cb, cfg, patches, weight, batch * logical, width, cfg.vision_hidden);
@@ -6928,11 +6929,11 @@ fn addPositionEmbeddingsBatchTensor(cb: *const ComputeBackend, allocator: std.me
         const storage = sourcePixelStorage(cb.kind(), cfg);
         const offsets = try publishSourceStoredTensor(cb, storage, try cb.add(x, y));
         defer cb.free(offsets);
-        if (try sourceVisionSequence(cb, cfg, geometry)) |physical| {
+        if (@import("build_options").enable_cuda) if (try sourceVisionSequence(cb, cfg, geometry)) |physical| {
             const source_offsets = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.sourceImageRows(cb, offsets, batch, sequence, physical, sequence, cfg.vision_hidden, 0);
             defer cb.free(source_offsets);
             return publishSourceStoredTensor(cb, storage, try cb.add(input, source_offsets));
-        }
+        };
         return publishSourceStoredTensor(cb, storage, try cb.add(input, offsets));
     }
     if ((cb.kind() == .cuda or cb.kind() == .metal or cb.kind() == .graph) and cb.vtable.takeRows != null and cb.vtable.reshapeOp != null and cb.vtable.transposeOp != null) {

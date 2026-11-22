@@ -19,6 +19,28 @@
 const std = @import("std");
 const DType = @import("../backends/tensor.zig").DType;
 
+pub const Bounds = struct {
+    min: i64,
+    max: i64,
+
+    pub fn read(reader: Reader) !?Bounds {
+        if (reader.len == 0) return null;
+        const first = try reader.at(0);
+        var bounds: Bounds = .{ .min = first, .max = first };
+        for (1..reader.len) |i| {
+            const value = try reader.at(i);
+            bounds.min = @min(bounds.min, value);
+            bounds.max = @max(bounds.max, value);
+        }
+        return bounds;
+    }
+
+    pub fn validate(self: Bounds, extent: usize) !void {
+        const limit = std.math.cast(i64, extent) orelse return error.InvalidTensorShape;
+        if (self.min < -limit or self.max >= limit) return error.IndexOutOfBounds;
+    }
+};
+
 pub const Reader = struct {
     dtype: DType,
     bytes: []const u8,
@@ -78,4 +100,16 @@ test "index metadata preserves unaligned full-width integers and legacy float er
     try std.testing.expectEqual(@as(usize, 4), try legacy.normalized(1, 5));
     for (2..floats.len) |index| try std.testing.expectError(error.InvalidIndex, legacy.at(index));
     try std.testing.expectError(error.InvalidTensorShape, Reader.init(.i64, unaligned[0..3]));
+}
+
+test "immutable index bounds agree with exact gather validation" {
+    const inputs = [_][]const i64{ &.{}, &.{-3}, &.{ 2, -3 }, &.{3}, &.{std.math.minInt(i64)}, &.{16_777_217} };
+    for (inputs) |values| {
+        const reader = try Reader.init(.i64, std.mem.sliceAsBytes(values));
+        const bounds = try Bounds.read(reader);
+        for ([_]usize{ 0, 1, 3, 16_777_217, 16_777_218 }) |extent| {
+            const actual = if (bounds) |range| range.validate(extent) else {};
+            try std.testing.expectEqual(reader.validate(extent), actual);
+        }
+    }
 }

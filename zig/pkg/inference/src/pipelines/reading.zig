@@ -1238,7 +1238,7 @@ pub const ReadingPipeline = struct {
         const encoder = self.vision_encoder.withAdmissionControl(self.execution_control);
         var permit = try preparation.admitRun(encoder, try encoder.planRun(inputs, null));
         defer permit.deinit();
-        try stage_runtime.prepareEncoderPermit(encoder, self.decoder, null, self.execution_control, false, &permit);
+        try stage_runtime.prepareEncoderPermit(encoder, self.decoder, null, self.execution_control, .vocabulary_row, &permit);
         return stage_runtime.encodeForFinalRowWithPermit(self.allocator, encoder, self.decoder, inputs, null, self.execution_control, &permit);
     }
 
@@ -1683,7 +1683,7 @@ pub const ReadingPipeline = struct {
         while (dec_len < max_len) {
             const decoder_run_start = nowNs();
             if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
-            var row = try numerical.step(dec_ids[0..dec_len], null, null);
+            var row = try numerical.stepFullPrefix(dec_ids[0..dec_len], null);
             defer row.deinit();
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;

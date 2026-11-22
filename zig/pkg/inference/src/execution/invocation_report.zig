@@ -48,6 +48,7 @@ pub const Report = struct {
     metal_command_waits: ?u64 = null,
     /// Actual accepted driver API/topology units, not completed device kernels.
     cuda: ?runtime.Cuda = null,
+    cuda_periodic_workspace: ?runtime.PeriodicWorkspace = null,
     resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
     terminal_native_bodies: ?@import("runtime_observation.zig").NativeBodies = null,
@@ -104,6 +105,9 @@ pub const Report = struct {
     /// A compatibility reason is not a numerical fallback or a quota grant.
     payload_admission_coverage: ?PayloadAdmissionCoverage = null,
     metal_region_policy: ?MetalRegionPolicy = null,
+    metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
+    /// Available from the corresponding successfully published physical Frame.
+    assigned_regions: ?@import("stats.zig").AssignedRegions = null,
     owned_program_fallbacks: ?ProgramFallbacks = null,
     program_output_copies: ?ProgramOutputCopies = null,
     fallback_detail_scope: enum { invocation_errors_and_corresponding_program_only } = .invocation_errors_and_corresponding_program_only,
@@ -132,6 +136,8 @@ pub const Report = struct {
         report.stage_placement = value.stage_placement;
         report.decoder_route = value.decoder_route;
         report.device_memory = value.runtime.device_memory;
+        report.cuda_periodic_workspace = value.runtime.cuda_periodic_workspace;
+        report.metal_serial_workspace = value.runtime.metal_serial_workspace;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {
@@ -168,6 +174,7 @@ pub const Report = struct {
         if (value.execution) |program| {
             if (program.prepared_payload_coverage) |coverage| report.payload_admission_coverage = .{ .scope = .corresponding_program_last_finished_frame_prepared_metadata, .value = coverage };
             if (program.metal_region_policy_observed) report.metal_region_policy = MetalRegionPolicy.init(program);
+            report.assigned_regions = program.assigned_regions;
             report.owned_program_fallbacks = ProgramFallbacks.init(program);
             report.program_output_copies = .{ .total_owned = program.graph_output_owned_copies, .planned_literal = program.planned_literal_output_copies, .opaque_metal_graph_output = program.opaque_graph_output_copies };
             report.program_storage_scope = @tagName(value.execution_scope);

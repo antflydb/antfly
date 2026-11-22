@@ -2484,6 +2484,10 @@ pub const KernelModule = struct {
     elementwise_f32: driver_mod.CUfunction = null,
     elementwise_broadcast_f32: driver_mod.CUfunction = null,
     primitive_where_f32: driver_mod.CUfunction = null,
+    head_major_attention_f32: driver_mod.CUfunction = null,
+    tiled_row_matmul_f32: driver_mod.CUfunction = null,
+    wide_tiled_row_matmul_f32: driver_mod.CUfunction = null,
+    short_row_matmul_f32: driver_mod.CUfunction = null,
     primitive_batched_dot_f32: driver_mod.CUfunction = null,
     silu_multiply_f32: driver_mod.CUfunction = null,
     activation_multiply_f32: driver_mod.CUfunction = null,
@@ -6708,6 +6712,93 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, count, &params);
     }
 
+    pub fn launchHeadMajorAttention(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        output: buffer_mod.DeviceBuffer,
+        inputs: [4]buffer_mod.DeviceBuffer,
+        problem: @import("../kernel_descriptor.zig").HeadMajorAttention,
+    ) driver_mod.Error!void {
+        if ((problem.input_count != 3 and problem.input_count != 4) or problem.query_rows == 0 or
+            problem.key_rows == 0 or problem.key_rows > 1024 or problem.heads == 0 or problem.head_dim == 0 or
+            problem.head_dim > 256 or problem.batch_heads == 0 or problem.batch_heads % problem.heads != 0)
+            return error.InvalidCudaState;
+        const function = self.head_major_attention_f32 orelse return error.CudaKernelUnavailable;
+        for (inputs[0..problem.input_count], problem.input_shapes[0..problem.input_count]) |buffer, shape| {
+            try checkBytes(buffer, @intCast(shape.numElements() orelse return error.InvalidCudaState));
+        }
+        const rows = try checkedTensorElements(problem.batch_heads, problem.query_rows);
+        try checkBytes(output, try checkedTensorElements(rows, problem.head_dim));
+        var arguments: launch_abi.ArgumentsFor("HEAD_MAJOR_ATTENTION") = .{
+            .output = output.ptr,
+            .q = inputs[0].ptr,
+            .k = inputs[1].ptr,
+            .v = inputs[2].ptr,
+            .bias = if (problem.input_count == 4) inputs[3].ptr else 0,
+            .query_rows = problem.query_rows,
+            .key_rows = problem.key_rows,
+            .heads = problem.heads,
+            .head_dim = problem.head_dim,
+            .score_scale = problem.score_scale,
+            .key_contract_last = @intFromBool(problem.key_contract_last),
+            .bias_batch_stride = problem.bias_strides[0],
+            .bias_head_stride = problem.bias_strides[1],
+            .bias_query_stride = problem.bias_strides[2],
+            .bias_key_stride = problem.bias_strides[3],
+        };
+        var params = launch_abi.fieldsFor("HEAD_MAJOR_ATTENTION", &arguments);
+        try ctx.launchKernel(function, try toU32(rows), 1, 1, 128, 1, 1, 4 * problem.key_rows, ctx.stream, &params, null);
+    }
+
+    pub fn supportsShortRowMatmul(self: *const KernelModule, rows: usize, width: usize, columns: usize) bool {
+        return self.short_row_matmul_f32 != null and rows <= 4 and width >= 128 and columns >= 256;
+    }
+
+    pub fn supportsTiledRowMatmul(self: *const KernelModule, rows: usize, width: usize, columns: usize) bool {
+        return self.tiled_row_matmul_f32 != null and rows > 4 and rows <= 256 and width >= 64 and columns >= 64;
+    }
+
+    pub const MatmulEpilogue = enum(u32) { none = 0, relu = 3 };
+
+    pub fn launchRowMatmul(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        output: buffer_mod.DeviceBuffer,
+        lhs: buffer_mod.DeviceBuffer,
+        rhs: buffer_mod.DeviceBuffer,
+        batch_count: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        epilogue: MatmulEpilogue,
+    ) driver_mod.Error!void {
+        const tiled = batch_count == 1 and self.supportsTiledRowMatmul(m, k, n);
+        if (!tiled and !self.supportsShortRowMatmul(m, k, n)) return error.CudaKernelUnavailable;
+        const wide = tiled and m >= 16 and n >= 1024 and self.wide_tiled_row_matmul_f32 != null;
+        const function = (if (wide) self.wide_tiled_row_matmul_f32 else if (tiled) self.tiled_row_matmul_f32 else self.short_row_matmul_f32) orelse return error.CudaKernelUnavailable;
+        const rows = try checkedTensorElements(batch_count, m);
+        try checkBytes(lhs, try checkedTensorElements(rows, k));
+        try checkBytes(rhs, try checkedTensorElements(try checkedTensorElements(batch_count, k), n));
+        try checkBytes(output, try checkedTensorElements(rows, n));
+        if (rows == 0) return;
+        var arguments: launch_abi.ArgumentsFor("SHORT_ROW_MATMUL") = .{
+            .output = output.ptr,
+            .lhs = lhs.ptr,
+            .rhs = rhs.ptr,
+            .m = try toU32(m),
+            .n = try toU32(n),
+            .k = try toU32(k),
+            .epilogue = @backingInt(epilogue),
+        };
+        var params = launch_abi.fieldsFor("SHORT_ROW_MATMUL", &arguments);
+        const columns_per_block: usize = if (wide) 64 else 32;
+        const rows_per_block: usize = if (wide) 32 else 8;
+        const column_tiles = (n - 1) / columns_per_block + 1;
+        const grid_x = if (tiled) column_tiles else try checkedTensorElements(rows, column_tiles);
+        const grid_y = if (tiled) (m - 1) / rows_per_block + 1 else 1;
+        try ctx.launchKernel(function, try toU32(grid_x), try toU32(grid_y), 1, 256, 1, 1, 0, ctx.stream, &params, null);
+    }
+
     pub fn launchPrimitiveBatchedDotF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -6722,6 +6813,8 @@ pub const KernelModule = struct {
         rhs_contract_last: bool,
     ) driver_mod.Error!void {
         const function = self.primitive_batched_dot_f32 orelse return error.CudaKernelUnavailable;
+        if (lhs_contract_last and !rhs_contract_last and self.supportsShortRowMatmul(m, k, n))
+            return self.launchRowMatmul(ctx, output, lhs, rhs, batch_count, m, n, k, .none);
         const lhs_count = try checkedTensorElements(try checkedTensorElements(batch_count, m), k);
         const rhs_count = try checkedTensorElements(try checkedTensorElements(batch_count, n), k);
         const output_count = try checkedTensorElements(try checkedTensorElements(batch_count, m), n);
@@ -17301,7 +17394,8 @@ pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
     defer module.unload(&ctx);
 
     try module.requireGemma4DecoderPrimitives();
-    try smokePrimitiveBatchedDotF32(allocator, &ctx, &module);
+    try smokePrimitiveBatchedDotF32(allocator, &ctx, &module, 3, 4);
+    try smokePrimitiveBatchedDotF32(allocator, &ctx, &module, 259, 131);
     try smokeBf16WeightPrimitives(allocator, &ctx, &module);
     try smokeAddMulScalarF32(allocator, &ctx, &module);
     try smokeRmsNormAddMulScalarF32(allocator, &ctx, &module);
@@ -17323,11 +17417,11 @@ fn smokePrimitiveBatchedDotF32(
     allocator: std.mem.Allocator,
     ctx: *context_mod.CudaContext,
     module: *KernelModule,
+    n: usize,
+    k: usize,
 ) !void {
     const batch_count: usize = 2;
     const m: usize = 2;
-    const n: usize = 3;
-    const k: usize = 4;
     const lhs_count = batch_count * m * k;
     const rhs_count = batch_count * n * k;
     const output_count = batch_count * m * n;
@@ -17353,7 +17447,7 @@ fn smokePrimitiveBatchedDotF32(
             for (0..batch_count) |batch| {
                 for (0..m) |row| {
                     for (0..k) |inner| {
-                        const logical_value = @as(f32, @floatFromInt(1 + batch * 17 + row * 5 + inner)) * 0.125;
+                        const logical_value = @as(f32, @floatFromInt(1 + (batch * 17 + row * 5 + inner) % 17)) * 0.125;
                         const index = if (lhs_contract_last)
                             (batch * m + row) * k + inner
                         else
@@ -17363,7 +17457,7 @@ fn smokePrimitiveBatchedDotF32(
                 }
                 for (0..k) |inner| {
                     for (0..n) |col| {
-                        const logical_value = @as(f32, @floatFromInt(1 + batch * 13 + inner * 3 + col)) * -0.0625;
+                        const logical_value = @as(f32, @floatFromInt(1 + (batch * 13 + inner * 3 + col) % 19)) * -0.0625;
                         const index = if (rhs_contract_last)
                             (batch * n + col) * k + inner
                         else
