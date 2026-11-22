@@ -20657,22 +20657,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
     var published_directly = false;
-    var stable: [20]CT = undefined;
-    var count: usize = 0;
-    defer for (stable[0..count]) |ct| freeTensor(self, ct);
     const input_bank = try audioBufferView(arena.buffers[0], 0, storage.scratch_offset);
     for (inputs, spans) |ct, span| {
-        const t = tensorFromCt(ct);
-        const buffer = try audioBufferView(input_bank, span.offset, span.bytes);
-        try copyFromDeviceTracked(self, buffer, t.buffer, span.bytes);
-        const shape = try self.allocator.dupe(i64, t.shape);
-        const borrowed = createTensor(self, buffer, shape, t.elem_count) catch |err| {
-            self.allocator.free(shape);
-            return err;
-        };
-        tensorFromCt(borrowed).owns_buffer = false;
-        stable[count] = borrowed;
-        count += 1;
+        const destination = try audioBufferView(input_bank, span.offset, span.bytes);
+        try copyFromDeviceTracked(self, destination, tensorFromCt(ct).buffer, span.bytes);
     }
     // Collect only completed events, with no new stream/device wait.
     if (arena.timing_replay) |replay| if (arena.timing) |pair| {
@@ -20690,6 +20678,21 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         try arena.launch(&self.ctx);
         self.audio_graph_replays += 1;
     } else {
+        // Replay uses the recorded addresses directly. The synchronous body
+        // needs handles only while it encodes and can borrow input metadata.
+        var stable: [20]CT = undefined;
+        var count: usize = 0;
+        defer for (stable[0..count]) |ct| freeTensor(self, ct);
+        for (inputs, spans) |ct, span| {
+            const input = tensorFromCt(ct);
+            const buffer = try audioBufferView(input_bank, span.offset, span.bytes);
+            const borrowed = try createTensor(self, buffer, input.shape, input.elem_count);
+            const view = tensorFromCt(borrowed);
+            view.owns_buffer = false;
+            view.owns_shape = false;
+            stable[count] = borrowed;
+            count += 1;
+        }
         // Subsampling has recreated the ordinary source-linear bank in this
         // invocation. Complete its queued producer and retire it BEFORE the
         // bounded arena host body, especially before CUDA capture starts.

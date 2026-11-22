@@ -222,6 +222,25 @@ test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
     try std.testing.expect(scope.owns(allocated));
 }
 
+test "stream workspace redirects only the sealed publication slot" {
+    var plan: Plan = .{};
+    plan.allocate(64, 0x1000);
+    plan.release(0x1000);
+    plan.allocate(64, 0x2000);
+    try std.testing.expect(plan.finish(0x2000));
+    const layout = try plan.layout(0);
+    var scope = try Scope.bind(&plan, layout, 0x1000, layout.bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x1000, 64));
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x2000, 32));
+    try scope.bindPublishedOutput(0x2000, 64);
+    try std.testing.expectEqual(@as(DevicePointer, 0x1000), try scope.allocate(64));
+    scope.release(0x1000);
+    try std.testing.expectEqual(@as(DevicePointer, 0x2000), try scope.allocate(64));
+    try std.testing.expect(scope.complete());
+    scope.release(0x2000);
+    try std.testing.expect(!scope.complete());
+}
+
 test "stream workspace binds the exact sealed layout and retains its published span" {
     var plan: Plan = .{};
     try std.testing.expectError(error.InvalidExecutionPlan, plan.layout(0));
