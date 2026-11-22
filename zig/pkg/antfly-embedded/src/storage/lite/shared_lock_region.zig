@@ -2598,6 +2598,10 @@ pub const Region = struct {
 
     /// Test support: a region whose log publication was never made (one
     /// reinitialized after every process exited).
+    pub fn resetSyncedFrontierForTest(self: *Region) void {
+        self.frontierProofField(u32, 20).store(0, .release);
+    }
+
     pub fn resetLogStateForTest(self: *Region) void {
         const hdr = self.header();
         const publishing = hdr.log_generation.load(.acquire) | 1;
