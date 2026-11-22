@@ -20689,12 +20689,6 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
     var published_directly = false;
-    const input_bank = try audioBufferView(arena.buffers[0], 0, storage.scratch_offset);
-    defer arena.noteUse(&self.ctx);
-    for (inputs, spans) |ct, span| {
-        const destination = try audioBufferView(input_bank, span.offset, span.bytes);
-        try copyFromDeviceTracked(self, destination, tensorFromCt(ct).buffer, span.bytes);
-    }
     // Collect only completed events, with no new stream/device wait.
     if (arena.timing_replay) |replay| if (arena.timing) |pair| {
         var ms: f32 = 0;
@@ -20703,22 +20697,33 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             arena.timing_replay = null;
         }
     };
-    if (arena.timing == null) arena.timing = self.ctx.createProfileEventPair() catch null;
-    if (arena.timing_replay == null) if (arena.timing) |pair| try self.ctx.recordProfileStart(pair);
     const capture_sample = arena.graph == null;
     const replay = arena.graph != null and arena.preferReplay();
+    const stable_inputs = replay or capture;
+    const input_bank = if (stable_inputs) try audioBufferView(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
+    defer arena.noteUse(&self.ctx);
+    if (arena.timing == null) arena.timing = self.ctx.createProfileEventPair() catch null;
+    if (arena.timing_replay == null) if (arena.timing) |pair| try self.ctx.recordProfileStart(pair);
+    if (stable_inputs) for (inputs, spans) |ct, span| {
+        const destination = try audioBufferView(input_bank, span.offset, span.bytes);
+        try copyFromDeviceTracked(self, destination, tensorFromCt(ct).buffer, span.bytes);
+    };
     if (replay) {
         try arena.launch(&self.ctx);
         self.audio_graph_replays += 1;
     } else {
-        // Replay uses the recorded addresses directly. The synchronous body
-        // needs handles only while it encodes and can borrow input metadata.
+        // Eager execution borrows the same logical input spans from the caller.
+        // Recording binds them to the cache's fixed addresses.
+        var scope = capture_scope orelse try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
         var stable: [20]CT = undefined;
         var count: usize = 0;
         defer for (stable[0..count]) |ct| freeTensor(self, ct);
         for (inputs, spans) |ct, span| {
             const input = tensorFromCt(ct);
-            const buffer = try audioBufferView(input_bank, span.offset, span.bytes);
+            const source = if (capture) input_bank else input.buffer;
+            const offset = if (capture) span.offset else 0;
+            const buffer = try audioBufferView(source, offset, span.bytes);
+            if (!capture and span.bytes != 0 and !scope.disjointBacking(buffer.ptr, span.bytes)) return error.InvalidExecutionPlan;
             const borrowed = try createTensor(self, buffer, input.shape, input.elem_count);
             const view = tensorFromCt(borrowed);
             view.owns_buffer = false;
@@ -20726,7 +20731,6 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             stable[count] = borrowed;
             count += 1;
         }
-        var scope = capture_scope orelse try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
         if (!capture and output.bytes == output_bytes) {
             try scope.bindPublishedOutput(tensorFromCt(out).buffer.ptr, output_bytes);
             published_directly = true;
