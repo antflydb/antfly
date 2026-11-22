@@ -147,16 +147,9 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
 /// Audio expansion is measured after projection because its token count varies
 /// with the clip and projector metadata.
 pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
-    // Gemma 4 declares dynamic image geometry rather than mm_tokens_per_image.
-    // Fund its expanded decoder rows before selecting a scratch/chunk budget;
-    // a text-only estimate otherwise turns each image into many tiny chunks.
-    const image_rows: usize = if (config.usesGemma4Channels())
-        gemma4_projector.default_max_image_tokens
-    else
-        config.mm_tokens_per_image;
-    var allowance: usize = if (image_rows == 0) 0 else nativeGenerationImageCount(messages) *| (image_rows +| 1);
+    var allowance = nativeGenerationImageTokenAllowance(messages, config);
     for (messages) |message| if (message.video_bytes != null) {
-        allowance +|= 60 * (70 + 10);
+        allowance +|= gemma4_video.token_allowance;
     };
     return allowance;
 }
@@ -177,8 +170,16 @@ test "dynamic image admission funds expanded rows without shortening the text wi
 
 test "video prompt allowance is independent of the image token setting" {
     const messages = [_]Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
-    try std.testing.expectEqual(@as(usize, 4800), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma }));
-    try std.testing.expectEqual(@as(usize, 4800), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma, .mm_tokens_per_image = 280 }));
+    try std.testing.expectEqual(@as(usize, 2848), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma }));
+    try std.testing.expectEqual(@as(usize, 2848), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma, .mm_tokens_per_image = 280 }));
+    try std.testing.expectEqual(@as(usize, 1120), try nativeGenerationPromptTokenLimit(.{ .family = .gemma, .max_position_embeddings = 4096 }, null, 128, 0, nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma })));
+    const short = [_]Message{.{ .role = "user", .content = "describe", .video_bytes = @embedFile("../testdata/video/h264-two-pps.mp4") }};
+    const config = gpt_mod.Config{ .family = .gemma, .max_position_embeddings = 4096 };
+    const actual = try nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &short, config, .generic, null);
+    try std.testing.expectEqual(@as(usize, 79), actual.token_allowance);
+    const limit = try nativeGenerationPromptTokenLimit(config, null, 128, 0, nativeGenerationPreliminaryMediaTokenAllowance(&short, config));
+    try std.testing.expectEqual(@as(usize, 1579), try estimateNativeGenerationPromptTokenCount(1500, actual.token_allowance, config, null, 128, 0));
+    try std.testing.expectEqual(limit, try estimateNativeGenerationPromptTokenCount(limit - 1, actual.token_allowance, config, null, 128, 0));
     const rendered = try formatMessages(std.testing.allocator, &messages);
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "<|video|> describe") != null);
@@ -288,6 +289,32 @@ pub fn nativeGenerationMediaAdmissionForBackend(
     backend: qwen3vl_projector.AdmissionBackend,
     projector_file: ?*const @import("../gguf/format.zig").File,
 ) !NativeGenerationMediaAdmission {
+    return nativeGenerationMediaAdmissionControlled(allocator, model_dir, messages, config, backend, projector_file, .{});
+}
+
+pub fn nativeGenerationMediaAdmissionControlled(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    messages: []const Message,
+    config: gpt_mod.Config,
+    backend: qwen3vl_projector.AdmissionBackend,
+    projector_file: ?*const @import("../gguf/format.zig").File,
+    control: InferenceExecutionControl,
+) !NativeGenerationMediaAdmission {
+    return nativeGenerationMediaAdmissionWithInspection(allocator, model_dir, messages, config, backend, projector_file, control, null);
+}
+
+pub fn nativeGenerationMediaAdmissionWithInspection(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    messages: []const Message,
+    config: gpt_mod.Config,
+    backend: qwen3vl_projector.AdmissionBackend,
+    projector_file: ?*const @import("../gguf/format.zig").File,
+    control: InferenceExecutionControl,
+    inspection: ?*@import("embedding_gemma2_video.zig").InspectionScope,
+) !NativeGenerationMediaAdmission {
+    try control.check();
     if (config.family == .qwen3_vl or config.hasQwen35VisionArchitectureContract()) {
         const images = try collectImagesInPromptOrder(allocator, messages);
         defer allocator.free(images);
@@ -313,7 +340,7 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         defer allocator.free(images);
         return .{ .token_allowance = image_count *| (max_image_tokens +| 1), .host_scratch_bytes = try qwen2vl_mm.imageWorkingBytes(images, prep_config) };
     }
-    var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+    var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationImageTokenAllowance(messages, config) };
     if (projector_file) |file| if (messagesHaveAudio(messages)) {
         const inputs = try collectAudioInPromptOrder(allocator, messages);
         defer allocator.free(inputs);
@@ -321,8 +348,15 @@ pub fn nativeGenerationMediaAdmissionForBackend(
     };
     // CUDA decodes on the device. Portable decoding runs in host memory, and
     // CUDA's fallback to it admits that memory only when the fallback happens.
-    if (backend != .cuda) for (messages) |message| if (message.video_bytes) |bytes| {
-        const reserved = gemma4_video.reservation(allocator, bytes);
+    for (messages) |message| if (message.video_bytes) |bytes| {
+        // Malformed inputs retain the decoder's detailed diagnostic. The
+        // scheduling estimate is permitted to be conservative in that case.
+        admission.token_allowance +|= gemma4_video.promptAllowance(allocator, bytes, control, inspection) catch |err| switch (err) {
+            error.OutOfMemory, error.VideoInputTooLarge, error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded => return err,
+            else => gemma4_video.token_allowance,
+        };
+        if (backend == .cuda) continue;
+        const reserved = try gemma4_video.reservationControlled(bytes, control);
         admission.host_scratch_bytes = reserved.host_bytes;
         admission.backend_scratch_bytes = reserved.surface_bytes;
     };
@@ -345,10 +379,12 @@ pub fn nativeGenerationAdmissionMediaTokenAllowance(
 /// dynamic image preprocessing determines the exact expanded prompt length.
 pub fn nativeGenerationPreliminaryMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
     if (config.family == .qwen3_5 or config.family == .qwen3_vl or config.usesGemma4Channels()) return 0;
-    // Video's sixty-frame allowance is an admission bound, not the clip's
-    // actual expansion. The fully expanded prompt is validated before KV use.
-    for (messages) |message| if (message.video_bytes != null) return 0;
-    return nativeGenerationMediaTokenAllowance(messages, config);
+    return nativeGenerationImageTokenAllowance(messages, config);
+}
+
+fn nativeGenerationImageTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
+    const rows: usize = if (config.usesGemma4Channels()) gemma4_projector.default_max_image_tokens else config.mm_tokens_per_image;
+    return if (rows == 0) 0 else nativeGenerationImageCount(messages) *| (rows +| 1);
 }
 
 fn nativeGenerationImageCount(messages: []const Message) usize {
@@ -2665,6 +2701,8 @@ pub const NativeGenerationPipeline = struct {
     /// Borrowed invocation budget; portable video scratch is additional to the
     /// generation estimate and must also respect offline CLI memory limits.
     media_run_budget: ?*runtime.tier.memory.RunBudget = null,
+    transport_inspection: ?*@import("embedding_gemma2_video.zig").InspectionScope = null,
+    executor_prompt_limit: ?usize = null,
     /// Borrowed process credit for media preparation, held until generate returns.
     media_prepaid: @import("preprocessing_memory.zig").Credit = .{},
     /// An operator's scratch cap. Zero leaves the automatic cap free to grow.
@@ -2698,6 +2736,9 @@ pub const NativeGenerationPipeline = struct {
     /// Local diagnostics may request the complete generated sequence. Serving
     /// callers must keep the default so private Gemma4 channel tokens stay hidden.
     return_raw_token_ids: bool = false,
+    /// Optional caller-owned vocabulary row for offline first-token qualification.
+    /// Receives the final, softcapped prefill logits consumed by the sampler.
+    prefill_logits_out: ?[]f32 = null,
     print_timing: bool = false,
     failure_trace: ?*GenerationFailureTrace = null,
     model_dir: ?[]const u8 = null,
@@ -3469,7 +3510,7 @@ pub const NativeGenerationPipeline = struct {
                         null;
                     defer if (request_projector) |store| store.close();
                     const projector = self.projector_store orelse request_projector.?;
-                    var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, .{ .session = self.session, .run_budget = self.media_run_budget, .explicit_scratch_limit = self.explicit_scratch_limit }, allocator, projector, bytes) else null;
+                    var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, .{ .session = self.session, .run_budget = self.media_run_budget, .explicit_scratch_limit = self.explicit_scratch_limit, .transport_inspection = self.transport_inspection }, allocator, projector, bytes) else null;
                     defer if (projected_video) |*video| video.deinit();
                     var projected_images = if (self.usesPjrtSession() and images.len != 0) gemma4_projector.PromptImageInput{ .backend = &self.cb, .allocator = allocator, .projector = projector, .images = images, .data = .{ .host = try @import("../execution/media_projection.zig").companionImages(self.session.?, allocator, images, self.execution_control) } } else try gemma4_projector.PromptImageInput.begin(&self.cb, allocator, projector, images);
                     defer projected_images.deinit();
@@ -3660,6 +3701,10 @@ pub const NativeGenerationPipeline = struct {
             speculative_bonus_tokens,
         );
 
+        if (self.executor_prompt_limit) |limit| {
+            if (prompt_token_count > limit) return error.InferenceInputTokensExceeded;
+        }
+
         // Build token sequence. Add slack only when speculative decoding is
         // active; the bonus token can write one position past max_tokens.
         const max_tokens = requested_max_tokens;
@@ -3767,7 +3812,7 @@ pub const NativeGenerationPipeline = struct {
 
         // Prefill
         try setWorkloadProfileRegime(&self.cb, .prefill);
-        const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
+        const allow_prefill_greedy_token = !use_speculative or draft_is_gemma4_mtp;
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         if (self.usesPjrtSession()) {
             if (prepared_qwen3vl_prompt) |*prepared| {
@@ -3831,6 +3876,11 @@ pub const NativeGenerationPipeline = struct {
         if (self.failure_trace) |trace| trace.mark(.decode);
         defer if (prefill_last_logits) |logits| allocator.free(logits);
         defer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
+        if (self.prefill_logits_out) |dest| {
+            const row = prefill_last_logits orelse return error.MissingLogitCapture;
+            if (dest.len != self.gpt_config.vocab_size or dest.len != row.len) return error.InvalidLogitCapture;
+            @memcpy(dest, row);
+        }
         if (config.qwen3vl_parity_logits_path) |path| {
             if (prepared_qwen3vl_prompt == null or prefill_last_logits == null or
                 prefill_last_logits.?.len != self.gpt_config.vocab_size)
@@ -4943,7 +4993,7 @@ pub const NativeGenerationPipeline = struct {
                 const is_last_chunk = attempt.final;
                 const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
                 defer phase_timer.finish();
-                const wants_greedy = is_last_chunk and allow_resident_greedy_token and isPureGreedyConfig(config) and config.grammar == null;
+                const wants_greedy = is_last_chunk and request.allow_resident_greedy and isPureGreedyConfig(config) and config.grammar == null;
                 var compiled_prefill = self.prefillRuntime(decode_state, null);
                 const output = compiled_prefill.runCompiledChunk(.{ .token_ids = chunk, .total_sequence_length = total_chunk_end, .output = if (wants_greedy) .greedy_token else if (is_last_chunk) .last_logits else .kv_only }) catch |err| {
                     debugGenerationStage("executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}", .{ attempt.start, attempt.end, @errorName(err) });
@@ -4988,7 +5038,7 @@ pub const NativeGenerationPipeline = struct {
                 .checkpoint_resume = self.checkpoint_resume != null,
                 .backend = self.cb.kind(),
                 .pure_greedy = isPureGreedyConfig(config) and config.grammar == null,
-                .resident_greedy_allowed = allow_resident_greedy_token,
+                .resident_greedy_allowed = request.allow_resident_greedy,
                 .first_token_enabled = enableCudaPrefillFirstToken(),
                 .coalesce_token_limit = cudaPrefillFirstTokenCoalesceTokenLimit(),
             });
@@ -5161,7 +5211,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn prefillNeedsHostLogits(self: *NativeGenerationPipeline, config: GenerationConfig) bool {
-        return self.checkpoint_prepare != null or config.token_observer != null or
+        return self.prefill_logits_out != null or self.checkpoint_prepare != null or config.token_observer != null or
             config.qwen3vl_parity_json_path != null or config.qwen3vl_parity_logits_path != null or
             firstTokenTopKTraceCount() > 0 or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE") or
             platform.env.getenv("TERMITE_METAL_DUMP_GENERATE_LOGITS_F32") != null or
@@ -11566,6 +11616,13 @@ test "cuda prefill greedy token path is pure greedy only" {
     try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, grammar, true, false, true));
 }
 
+test "prefill logits capture requires host output for text and prepared media" {
+    var row: [4]f32 = undefined;
+    var pipeline = NativeGenerationPipeline{ .allocator = std.testing.allocator, .cb = undefined, .tokenizer = undefined, .gpt_config = .{}, .prefill_logits_out = &row };
+    try std.testing.expect(pipeline.prefillNeedsHostLogits(.{}));
+    try std.testing.expect(!pipeline.promptRequest(.{}, 1, 1, 0, true, false).allow_resident_greedy);
+}
+
 test "direct prepared prefill serializes multimodal CUDA and Metal execution" {
     var mutex: std.atomic.Mutex = .unlocked;
     try std.testing.expect(directPrefillExecutionMutex(true, false, false, &mutex) == &mutex);
@@ -16174,11 +16231,11 @@ test "native generation dynamic media admission preserves the full context bound
     const config = gpt_mod.Config{ .max_position_embeddings = 131072 };
     const messages = [_]Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
     try std.testing.expectEqual(@as(usize, 0), nativeGenerationPreliminaryMediaTokenAllowance(&messages, config));
-    try std.testing.expectEqual(@as(usize, 4800), nativeGenerationMediaTokenAllowance(&messages, config));
-    try std.testing.expectEqual(@as(usize, 131040), try estimateNativeGenerationPromptTokenCount(130744, 4800, config, null, 32, 0));
-    try std.testing.expectEqual(@as(usize, 4900), try estimateNativeGenerationPromptTokenCount(100, 4800, config, null, 32, 0));
-    try std.testing.expectEqual(@as(usize, 65504), try estimateNativeGenerationPromptTokenCount(65000, 4800, config, .{ .max_position_embeddings = 65536 }, 32, 0));
-    try std.testing.expectError(error.PromptTooLong, estimateNativeGenerationPromptTokenCount(131041, 4800, config, null, 32, 0));
+    const allowance = nativeGenerationMediaTokenAllowance(&messages, config);
+    try std.testing.expectEqual(@as(usize, 131040), try estimateNativeGenerationPromptTokenCount(130744, allowance, config, null, 32, 0));
+    try std.testing.expectEqual(100 + allowance, try estimateNativeGenerationPromptTokenCount(100, allowance, config, null, 32, 0));
+    try std.testing.expectEqual(@as(usize, 65504), try estimateNativeGenerationPromptTokenCount(65000, allowance, config, .{ .max_position_embeddings = 65536 }, 32, 0));
+    try std.testing.expectError(error.PromptTooLong, estimateNativeGenerationPromptTokenCount(131041, allowance, config, null, 32, 0));
     // An exact expanded input still must fit; no truncation or spare output
     // token waiver accompanies the conservative pre-execution estimate.
     try validateNativeGenerationPromptTokenCount(131040, config, null, 32, 0);

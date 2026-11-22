@@ -16,6 +16,7 @@
 pub const live_coordinator = @import("live_coordinator.zig");
 pub const validated_frames = @import("validated_frames.zig");
 pub const live_windows = @import("live_windows.zig");
+pub const transport_seek = @import("transport_seek.zig");
 pub const transport_avc = @import("transport_avc.zig");
 pub const h264_pictures = @import("h264_pictures.zig");
 pub const webm_pictures = @import("webm_pictures.zig");
@@ -42,6 +43,7 @@ pub const windows = @import("windows.zig");
 pub const apple_jobs = @import("apple_jobs.zig");
 pub const tone = @import("tone.zig");
 pub const display = @import("display.zig");
+pub const packet_sampling = @import("packet_sampling.zig");
 pub const sampling = @import("sampling.zig");
 test {
     _ = mp4_coded;
@@ -52,6 +54,7 @@ test {
     _ = live_coordinator;
     _ = live_windows;
     _ = transport_avc;
+    _ = transport_seek;
     _ = codecs;
     _ = @import("codecs/test.zig");
     _ = webm_pictures;
@@ -73,6 +76,7 @@ test {
     _ = apple_webm;
     _ = @import("backends/apple_test.zig");
     _ = sampling;
+    _ = packet_sampling;
     _ = display;
     _ = tone;
     _ = @import("sampling_test.zig");

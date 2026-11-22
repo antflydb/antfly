@@ -331,6 +331,8 @@ pub fn decode(a: std.mem.Allocator, identity: [32]u8, bytes: []const u8) !Snapsh
 /// Append records are synced before success; torn suffixes recover the last
 /// verified state. Old snapshot-only files remain readable.
 pub const Store = struct {
+    const quota_mod = @import("media_checkpoint_quota.zig");
+    frame_retention: quota_mod.Manager = .{},
     mutexes: [256]std.Io.Mutex = @splat(.init),
     pub const max_records = 65; // one base plus at most 64 delta records
     const trailer_bytes = 112;
@@ -338,14 +340,35 @@ pub const Store = struct {
     pub const max_file_bytes = 40 + 2 * (max_encoded_bytes + record_overhead);
     /// Internally derived canonical delta; value is its merge with base_digest.
     pub const Update = struct { base_digest: [32]u8, delta: Snapshot };
-    pub const Context = struct { store: *Store, io: std.Io, models_dir: []const u8 };
+    pub const Context = struct {
+        store: *Store,
+        io: std.Io,
+        models_dir: []const u8,
+        directory: enum { windows, flac_frames } = .windows,
+
+        fn directoryName(self: Context) []const u8 {
+            return switch (self.directory) {
+                .windows => ".antfly-audio-plans",
+                .flac_frames => ".antfly-flac-frames",
+            };
+        }
+        fn pathFor(self: Context, buffer: []u8, identity: [32]u8, suffix: []const u8) ![]const u8 {
+            if (self.directory == .flac_frames and !std.mem.eql(u8, suffix, ".lock")) {
+                return std.fmt.bufPrint(buffer, "{s}/{s}/{s}{s}", .{ self.models_dir, self.directoryName(), std.fmt.bytesToHex(identity, .lower), if (std.mem.eql(u8, suffix, ".plan")) ".bin" else ".tmp" });
+            }
+            return std.fmt.bufPrint(buffer, "{s}/{s}/{x:0>2}{s}", .{ self.models_dir, self.directoryName(), identity[0], suffix });
+        }
+    };
     fn path(buffer: []u8, root: []const u8, identity: [32]u8, temporary: bool) ![]const u8 {
         return std.fmt.bufPrint(buffer, "{s}/.antfly-audio-plans/{x:0>2}{s}", .{ root, identity[0], if (temporary) ".pending" else ".plan" });
     }
     pub fn load(context: Context, a: std.mem.Allocator, identity: [32]u8) !Snapshot {
         if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const bytes = try readPrefix(context.io, a, try path(&buffer, context.models_dir, identity, false));
+        const bytes = readPrefix(context.io, a, try context.pathFor(&buffer, identity, ".plan")) catch |err| legacy: {
+            if (err != error.FileNotFound or context.directory != .flac_frames) return err;
+            break :legacy try readPrefix(context.io, a, try std.fmt.bufPrint(&buffer, "{s}/{s}/{x:0>2}.plan", .{ context.models_dir, context.directoryName(), identity[0] }));
+        };
         defer a.free(bytes);
         if (bytes.len < 40 or !std.mem.eql(u8, bytes[0..8], "AFAP0003")) return decode(a, identity, bytes);
         if (!std.mem.eql(u8, bytes[8..40], &identity)) return error.InvalidAudioPlan;
@@ -431,11 +454,11 @@ pub const Store = struct {
     }
     /// Caller-derived updates can append after checking only the committed
     /// trailer. A changed owner, collision or old encoding takes the merge path.
-    fn append(context: Context, a: std.mem.Allocator, identity: [32]u8, value: Snapshot, update: Update) !bool {
+    fn append(context: Context, a: std.mem.Allocator, identity: [32]u8, value: Snapshot, update: Update, quota: ?*quota_mod.Gate) !bool {
         if (value.stride == 0 or update.delta.stride == 0) return false;
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
         if (comptime @import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return false;
-        const name = try path(&buffer, context.models_dir, identity, false);
+        const name = try context.pathFor(&buffer, identity, ".plan");
         if (std.mem.indexOfScalar(u8, name, 0) != null) return false;
         var terminated_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
         const terminated = try std.fmt.bufPrintSentinel(&terminated_buffer, "{s}", .{name}, 0);
@@ -453,8 +476,10 @@ pub const Store = struct {
         const bytes = try frame(a, identity, update.delta, update.base_digest, value.digest(), count + 1);
         defer a.free(bytes);
         if (bytes.len > max_file_bytes - stat.size) return false;
+        if (quota) |gate| try gate.reserve(bytes.len, 0);
         try file.writePositionalAll(context.io, bytes, stat.size);
         try file.sync(context.io);
+        if (quota) |gate| try gate.commit(0, bytes.len, false);
         return true;
     }
     pub fn save(context: Context, a: std.mem.Allocator, identity: [32]u8, value: Snapshot) !void {
@@ -466,12 +491,14 @@ pub const Store = struct {
         const mutex = &context.store.mutexes[identity[0]];
         try mutex.lock(context.io);
         defer mutex.unlock(context.io);
+        var quota = if (context.directory == .flac_frames) try context.store.frame_retention.openDirectory(context.io, context.models_dir, context.directoryName(), identity) else null;
+        defer if (quota) |*gate| gate.deinit();
         var directory: [std.fs.max_path_bytes]u8 = undefined;
-        try std.Io.Dir.cwd().createDirPath(context.io, try std.fmt.bufPrint(&directory, "{s}/.antfly-audio-plans", .{context.models_dir}));
+        try std.Io.Dir.cwd().createDirPath(context.io, try std.fmt.bufPrint(&directory, "{s}/{s}", .{ context.models_dir, context.directoryName() }));
         var lock_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const lock_file = try std.Io.Dir.cwd().createFile(context.io, try std.fmt.bufPrint(&lock_buffer, "{s}/.antfly-audio-plans/{x:0>2}.lock", .{ context.models_dir, identity[0] }), .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true });
+        const lock_file = try std.Io.Dir.cwd().createFile(context.io, try context.pathFor(&lock_buffer, identity, ".lock"), .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true });
         defer lock_file.close(context.io);
-        if (update) |change| if (try append(context, a, identity, value, change)) return;
+        if (update) |change| if (try append(context, a, identity, value, change, if (quota) |*gate| gate else null)) return;
         var merged = Buffer{};
         var previous_digest: ?[32]u8 = null;
         if (load(context, a, identity)) |previous| {
@@ -484,11 +511,13 @@ pub const Store = struct {
         if (previous_digest) |prior| if (std.mem.eql(u8, &prior, &digest)) return;
         var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var pending_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const target = try path(&target_buffer, context.models_dir, identity, false);
-        const pending = try path(&pending_buffer, context.models_dir, identity, true);
+        const target = try context.pathFor(&target_buffer, identity, ".plan");
+        const pending = try context.pathFor(&pending_buffer, identity, ".pending");
         const bytes = try frame(a, identity, merged.snapshot(), @splat(0), digest, 1);
         defer a.free(bytes);
         defer std.Io.Dir.cwd().deleteFile(context.io, pending) catch {};
+        const old_size = if (quota != null) (if (std.Io.Dir.cwd().statFile(context.io, target, .{ .follow_symlinks = false })) |stat| (if (stat.kind == .file) @as(?u64, stat.size) else null) else |_| null) else null;
+        if (quota) |*gate| try gate.reserve(40 + bytes.len, @intFromBool(old_size == null));
         {
             const file = try std.Io.Dir.cwd().createFile(context.io, pending, .{});
             defer file.close(context.io);
@@ -500,6 +529,7 @@ pub const Store = struct {
             try file.sync(context.io);
         }
         try std.Io.Dir.cwd().rename(pending, .cwd(), target, context.io);
+        if (quota) |*gate| try gate.commit(old_size orelse 0, 40 + bytes.len, old_size == null);
     }
 };
 
@@ -939,4 +969,25 @@ test "model aware media journal recovery benchmark compares replay with a compac
             std.debug.print("journal recovery round={d} mode={d} loads=50 elapsed_ns={d}\n", .{ round, mode, elapsed });
         }
     }
+}
+
+test "model aware media FLAC checkpoint quota retains sources sharing a lock bucket" {
+    const a = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const root = try dir.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var store = Store{};
+    const context = Store.Context{ .store = &store, .io = std.testing.io, .models_dir = root, .directory = .flac_frames };
+    const first: [32]u8 = @splat(1);
+    var second = first;
+    second[31] = 2;
+    try Store.save(context, a, first, .{ .points = &.{.{ .ordinal = 10, .offset_ns = 123 }} });
+    try Store.save(context, a, second, .{ .points = &.{.{ .ordinal = 11, .offset_ns = 456 }} });
+    const left = try Store.load(context, a, first);
+    defer left.deinit(a);
+    const right = try Store.load(context, a, second);
+    defer right.deinit(a);
+    try std.testing.expectEqual(@as(i64, 123), left.points[0].offset_ns);
+    try std.testing.expectEqual(@as(i64, 456), right.points[0].offset_ns);
 }

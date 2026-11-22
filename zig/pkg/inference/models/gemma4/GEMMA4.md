@@ -14,18 +14,103 @@ source zig/pkg/inference/scripts/gemma4/gemma4_e4b_qat_l4_qualified.env
 
 This profile enables the qualified projector, resident audio, and SM89 small
 decode paths. It differs from the earlier HTTP profile in the same directory.
-Qualification used an 8192-token context, greedy decoding, and eight text,
-image, audio, and video cases. All cases passed first-step logit gates against
-unmodified Transformers (cosine >= 0.9999, relative L2 <= 0.02, identical
+The historical L4 qualification at `5a7d9f7e29` used an 8192-token context,
+greedy decoding, and eight text, image, audio, and video cases. All cases
+passed first-step logit gates against unmodified Transformers (cosine >= 0.9999, relative L2 <= 0.02, identical
 argmax), and all 585 reference decisions through EOS or the output budget
-matched. These gates apply to the explicit profile, not bare process defaults.
+matched. The individual timings and source identity are in the
+[L4 qualification receipt](https://github.com/antflydb/antfly/blob/830aebdd9b/zig/lib/pjrt/tools/gemma4-l4-speed-qualification.json).
 
-Three rotated comparison rounds put the seven text/image/audio cases within
-1.9% of llama.cpp median latency; video was 15.4% faster. Image and 1-second
+NVDEC and portable decoding share MP4 frame selection. Both take the first
+presented picture at or after each one-second target, uniformly cap targets
+at 32, and emit a repeated selection once. MP4 edit bounds apply before
+sampling, and prompt timestamps are relative to the content start. A picture
+starting exactly at the edit supplies the zero-time target. Otherwise
+the latest picture still on screen supplies it. HEVC pictures with a cleared
+`pic_output_flag` remain decode dependencies and never enter sampling.
+When an AV1 sample contains multiple coded frames, NVDEC receives them
+individually. The first visible output at the selected timestamp supplies the frame.
+
+On CUDA devices with compute capability 8.0 or newer, 16×16 video patches
+with zero mean and unit standard deviation use the same bicubic RGB8 resize
+for NVDEC and portable decoding. Set `ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC=0`
+to select bilinear video resizing on both routes. The image resize setting
+applies to still images. The CUDA resize writes one matrix row per patch,
+with channel-major pixels for the GGUF projector.
+
+The L4 serving profile uses the original nearest-even activation rounding.
+Losslessly converted BF16 weights take one F16 product, native F16 weights
+take two products, and remaining BF16 weights use the configured term count.
+The final addition uses F32. A nonfinite result is recomputed directly from
+the original F32 activations and the stored weights. For inner dimensions of at least
+128, a warp reads contiguous coefficients and reduces their products in
+parallel. If its F32 partial sums overflow, it repeats that dot product in F64.
+Shorter dots retain the original sequential F32 accumulation order.
+
+The offline GB10 residual candidate retains native BF16 weights. A
+single CUDA kernel splits each F32 activation into two or three BF16 terms
+toward zero, preserving a finite leading term through the maximum F32 value.
+cuBLASLt multiplies each term and accumulates the products in F32. If the
+scratch allocation exceeds the device budget, the tiled kernel consumes F32
+activations directly. Native F16 weights use that tiled path as well.
+Outside residual mode, lossless F16 conversion can reuse the existing BF16
+weight allocation.
+
+At that L4 checkpoint, three rotated comparison rounds put the seven text,
+image, and audio cases within 1.9% of llama.cpp median latency. Video was
+15.4% faster. Image and 1-second
 audio remained 1.3% and 1.9% slower. The native core measurement excludes HTTP
 and cold loading, and does not replace the published Circus protocol. After
 priming all modalities, GPU memory peaked at about 15.0 GiB native versus
-6.6 GiB for llama.cpp. Other devices and Metal hardware were not qualified.
+6.6 GiB for llama.cpp.
+
+## GB10 projector qualification
+
+For the offline E4B compact projector on SM121, use the L4 base settings
+and select three BF16 activation terms. Run these commands from the repository root.
+
+```sh
+source zig/pkg/inference/scripts/gemma4/gemma4_e4b_qat_l4_qualified.env
+export ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL_TERMS=3
+```
+
+The `bench-gemma4-core-build` runner constructs structured media prompts and
+captures the vocabulary row consumed by the sampler. With the automatic GB10
+decoder at `0b94bdff50`, two terms gave a video cosine of 0.999895 against
+FP32 Transformers. Three terms raised it to 0.999903 and passed all eight
+first-step gates. Across three fixed-budget repetitions, each case produced
+the same tokens. The compact projector matched 581 of 585 teacher-forced CPU
+decisions through EOS or budget. Short text differed at token 206, page summary
+at token 102, and video at tokens 55 and 61. Image matched all 64 decisions.
+Median image and video latency on the shared GB10 was 2.72 s and 2.79 s,
+respectively. [GB10 native-plan qualification receipt](../../scripts/gemma4/qualification/e4b-qat-gb10-projector-native-plan-20261121.json)
+
+At `0275381f84`, all eight first-step logit rows were byte-identical to
+`0b94bdff50`, and all 24 timed runs matched its prompt counts and output
+tokens. On the shared GB10, three warm runs gave median image and video
+latencies of 1.22 s and 1.26 s. The one-second audio case took 1.09 s
+against 1.06 s in the earlier run. [GB10 checkpoint receipt](../../scripts/gemma4/qualification/e4b-qat-gb10-projector-0275381f84.json)
+
+At the earlier `94ae2691eb` checkpoint, the compact projector matched 578 of
+585 CPU decisions through EOS or the output budget. The original
+GB10 route matched 579. Both routes missed the same four text and two video
+decisions. The compact route also missed image token 17, with a reference
+logit gap of 0.00595. Three BF16 terms made the same choice. GB10 serving
+retains its original projector. On the shared GB10, three warm repeats put
+median image latency at 3.73 s (baseline 7.29 s) and video at 4.22 s
+(baseline 7.65 s). Audio latency improved by 1.4–5.6% across the three clip
+lengths. Text medians ranged from 0.04% to 1.2% above baseline.
+
+To reproduce the suite, use `gemma4_inputs.make_fixtures` with
+`gemma4_cases.json` and run `gemma4_cpu.py` from the recorded oracle revision.
+For first-step comparisons, set one output token and a `logits_path` per case.
+For timing, restore the original output budgets and remove the logit paths.
+Use the model's complete multimodal config for the independent reference and
+pass the timed result to `--native-tokens` with `--all-native-steps`.
+The [GB10 receipt](../../scripts/gemma4/qualification/e4b-qat-gb10-projector-20261121.json)
+records the software, input hashes, per-case gates, and timing samples.
+
+## Offline qualification tools
 
 The native `bench-gemma4-core-build` target supports offline generation and
 first-step logit capture. The small decode kernels also have a standalone

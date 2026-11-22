@@ -17,6 +17,7 @@
 const std = @import("std");
 const media = @import("antfly_media");
 const h264 = @import("h264.zig");
+pub const max_configuration_bytes: usize = 2 * @as(usize, std.math.maxInt(u16)) + 11;
 pub const Options = struct {
     transport: media.transport_stream.Limits = .{},
     stream: media.stream.Options = .{},
@@ -158,23 +159,42 @@ fn accessUnits(a: std.mem.Allocator, demux: media.transport_stream.Demux, option
     return .{ .allocator = a, .packets = packets, .reservation = reservation };
 }
 pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transport_stream.Demux, options: Options) !Reader {
+    return normalizeDemux(a, identity, demux, options, null, null);
+}
+
+const Description = struct {
+    track: media.mp4.Track,
+    backing: *media.stream.Snapshot,
+};
+
+fn trackForConfiguration(a: std.mem.Allocator, avcc: []const u8, options: Options) !media.mp4.Track {
+    const config = try h264.configParse(a, avcc);
+    defer config.groups.deinit(a);
+    if (config.width > options.index.max_dimension or config.height > options.index.max_dimension) return error.ResourceLimitExceeded;
+    return media.mp4.Track{ .codec = .avc, .inband_parameter_sets = true, .id = 1, .timescale = 90000, .width = @intCast(config.width), .height = @intCast(config.height), .avcc = avcc, .nal_length_bytes = 4, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
+}
+
+fn normalizeDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transport_stream.Demux, options: Options, description: ?Description, initial_description: ?[]const u8) !Reader {
     if (demux.packets.len == 0 or demux.packets.len > options.transport.max_packets) return error.ResourceLimitExceeded;
     try options.stream.control.check();
     if (options.configuration) |bytes| if (bytes.len > options.stream.max_bytes) return error.ResourceLimitExceeded;
     // Two u16-length parameter sets plus AVCC overhead. Config parsing copies
     // RBSP bytes and may retain an FMO map: at least one coded bit per map entry
     // bounds that map by eight times the parameter bytes.
-    const config_bound = @max(@min(@as(usize, 131081), try std.math.add(usize, demux.bytes.len, 11)), if (options.configuration) |bytes| bytes.len else 0);
-    var config_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(usize, config_bound, 12) }) else media.admission.Token{};
-    defer config_reservation.deinit();
     var units = try accessUnits(a, demux, options);
     defer units.deinit();
-    const avcc = try configuration(a, demux, options);
-    defer a.free(avcc);
-    const config = try h264.configParse(a, avcc);
-    defer config.groups.deinit(a);
-    if (config.width > options.index.max_dimension or config.height > options.index.max_dimension) return error.ResourceLimitExceeded;
-    const normalized_bound = @min(options.stream.max_bytes, try std.math.add(usize, avcc.len, try std.math.add(usize, demux.bytes.len, demux.bytes.len / 4)));
+    var extracted: ?[]u8 = null;
+    defer if (extracted) |avcc| a.free(avcc);
+    var config_reservation = media.admission.Token{};
+    defer config_reservation.deinit();
+    const track = if (description) |shared| shared.track else blk: {
+        const config_bound = @max(@min(max_configuration_bytes, try std.math.add(usize, demux.bytes.len, 11)), if (options.configuration) |bytes| bytes.len else 0);
+        if (options.stream.admission_pool) |pool| config_reservation = try pool.acquire(.{ .host_bytes = try std.math.mul(usize, config_bound, 12) });
+        extracted = if (initial_description) |initial| try a.dupe(u8, initial) else try configuration(a, demux, options);
+        break :blk try trackForConfiguration(a, extracted.?, options);
+    };
+    const config_prefix = extracted orelse &.{};
+    const normalized_bound = @min(options.stream.max_bytes, try std.math.add(usize, config_prefix.len, try std.math.add(usize, demux.bytes.len, demux.bytes.len / 4)));
     const packet_bytes = try std.math.mul(usize, units.packets.len, @sizeOf(media.mp4.Packet));
     // Normalization capacity is bounded by actual input, not a blanket stream
     // maximum. Snapshot storage has its own reservation during copy overlap.
@@ -185,31 +205,13 @@ pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transp
     var normalized: std.ArrayList(u8) = .empty;
     var normalized_live = true;
     defer if (normalized_live) normalized.deinit(a);
-    try normalized.appendSlice(a, avcc);
+    try normalized.appendSlice(a, config_prefix);
     for (units.packets, 0..) |packet, i| {
         try options.stream.control.check();
         const offset = normalized.items.len;
-        var nals = Nals{ .bytes = demux.bytes[packet.offset..][0..packet.size], .control = options.stream.control };
-        var sync = false;
-        var auds: usize = 0;
-        var count: usize = 0;
-        while (try nals.next()) |nal| {
-            try options.stream.control.check();
-            count += 1;
-            if (count > 4096) return error.ResourceLimitExceeded;
-            if (nal[0] & 31 == 9) auds += 1;
-            // More than one independently delimited picture needs additional
-            // timestamp mapping; do not assign a PES clock to every picture.
-            if (auds > 1) return error.AmbiguousTransportPictureTiming;
-            if (nal[0] & 31 == 5) sync = true;
-            if (nal.len + 4 > options.stream.max_bytes -| normalized.items.len) return error.ResourceLimitExceeded;
-            var prefix: [4]u8 = undefined;
-            std.mem.writeInt(u32, &prefix, std.math.cast(u32, nal.len) orelse return error.ResourceLimitExceeded, .big);
-            try normalized.appendSlice(a, &prefix);
-            try normalized.appendSlice(a, nal);
-        }
-        const size = normalized.items.len - offset;
-        if (size == 0 or size > options.index.max_packet_bytes) return error.ResourceLimitExceeded;
+        const unit = try walkUnit(a, demux.bytes[packet.offset..][0..packet.size], options, .{ .normalized = &normalized });
+        const size = unit.size;
+        const sync = unit.sync;
         const duration: u32 = if (i + 1 < units.packets.len)
             std.math.cast(u32, @as(i128, units.packets[i + 1].dts) - packet.dts) orelse return error.InvalidSamplingMetadata
         else
@@ -219,16 +221,77 @@ pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transp
     }
     const snapshot = try media.stream.Snapshot.copy(a, identity, &.{normalized.items}, options.stream);
     errdefer snapshot.deinit();
-    var metadata = try snapshot.input.read(0, avcc.len);
+    var result_track = track;
+    var metadata: media.source.Lease = .{ .bytes = &.{}, .source = null };
+    if (description) |shared| {
+        shared.backing.retain();
+        snapshot.description_owner = shared.backing;
+    } else {
+        metadata = try snapshot.input.read(0, config_prefix.len);
+        result_track.avcc = metadata.bytes;
+    }
     errdefer metadata.deinit();
     normalized.deinit(a);
     normalized_live = false;
     try reservation.resize(.{ .host_bytes = packets.len * @sizeOf(media.mp4.Packet) });
-    const track = media.mp4.Track{ .codec = .avc, .inband_parameter_sets = true, .id = 1, .timescale = 90000, .width = @intCast(config.width), .height = @intCast(config.height), .avcc = metadata.bytes, .nal_length_bytes = 4, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
-    return .{ .snapshot = snapshot, .reader = .{ .allocator = a, .input = &snapshot.input, .metadata = metadata, .index_reservation = reservation, .track = track, .packets = packets, .limits = options.index }, .next_state = demux.next_state };
+    return .{ .snapshot = snapshot, .reader = .{ .allocator = a, .input = &snapshot.input, .metadata = metadata, .index_reservation = reservation, .track = result_track, .packets = packets, .limits = options.index }, .next_state = demux.next_state };
+}
+
+/// Synchronous index consumer. Receives elementary offsets and borrowed NALs
+/// while the access unit is resident in the demuxer's lookahead buffer.
+pub const IndexSink = struct {
+    context: *anyopaque,
+    track: *const fn (*anyopaque, media.mp4.Track) anyerror!void,
+    nal: *const fn (*anyopaque, usize, []const u8) anyerror!void,
+    packet: *const fn (*anyopaque, media.mp4.Packet) anyerror!void,
+};
+
+const UnitSink = union(enum) {
+    normalized: *std.ArrayList(u8),
+    index: struct { sink: IndexSink, origin: usize },
+};
+fn walkUnit(a: std.mem.Allocator, bytes: []const u8, options: Options, target: UnitSink) !struct { size: usize, sync: bool } {
+    var nals = Nals{ .bytes = bytes, .control = options.stream.control };
+    var size: usize = 0;
+    var sync = false;
+    var has_aud = false;
+    var has_vcl = false;
+    var count: usize = 0;
+    while (try nals.next()) |nal| {
+        try options.stream.control.check();
+        count += 1;
+        if (count > 4096) return error.ResourceLimitExceeded;
+        const kind = nal[0] & 31;
+        if (kind == 9) {
+            if (nal.len != 2 or nal[0] & 0x60 != 0 or nal[1] & 31 != 16) return error.MalformedVideoPacket;
+            if (has_aud) return error.AmbiguousTransportPictureTiming;
+            if (count != 1) return error.MalformedAnnexB;
+            has_aud = true;
+        }
+        has_vcl = has_vcl or kind == 1 or kind == 2 or kind == 5;
+        sync = sync or kind == 5;
+        const used = if (target == .normalized) target.normalized.items.len else size;
+        if (nal.len + 4 > options.stream.max_bytes -| used) return error.ResourceLimitExceeded;
+        size += 4 + nal.len;
+        switch (target) {
+            .index => |index| try index.sink.nal(index.sink.context, index.origin + (@intFromPtr(nal.ptr) - @intFromPtr(bytes.ptr)), nal),
+            .normalized => |out| {
+                var prefix: [4]u8 = undefined;
+                std.mem.writeInt(u32, &prefix, std.math.cast(u32, nal.len) orelse return error.ResourceLimitExceeded, .big);
+                try out.appendSlice(a, &prefix);
+                try out.appendSlice(a, nal);
+            },
+        }
+    }
+    if (has_aud and !has_vcl) return error.IncompleteVideoPicture;
+    if (size == 0 or size > options.index.max_packet_bytes) return error.ResourceLimitExceeded;
+    return .{ .size = size, .sync = sync };
 }
 
 pub const StreamOptions = struct {
+    /// A single clip has one sample description. Subsequent in-band SPS/PPS
+    /// remain in the normalized payload and the decoder resolves activation.
+    retain_initial_description: bool = false,
     video: Options = .{},
     epoch: usize = 0,
     first_ordinal: usize = 0,
@@ -238,7 +301,11 @@ pub const StreamOptions = struct {
 /// into the active AU/lookahead buffer. Output segments own their packet data.
 /// One consumer; entered failures are terminal, with caller-managed replay.
 pub const Stream = struct {
-    const Anchor = struct { offset: usize, packet: media.transport_stream.Packet, ordinal: usize };
+    const Delivery = union(enum) {
+        segments: struct { context: *anyopaque, accept: *const fn (*anyopaque, *media.http_stream.FragmentDelivery) anyerror!void },
+        index: IndexSink,
+    };
+    const Anchor = struct { offset: usize, packet: media.transport_stream.Packet, timed_index: usize };
     allocator: std.mem.Allocator,
     options: StreamOptions,
     identity: []u8,
@@ -252,15 +319,22 @@ pub const Stream = struct {
     scan_cursor: usize = 0,
     mode: enum { unknown, aud, pes } = .unknown,
     clock: ?Anchor = null,
+    description: ?Description = null,
+    timed_pes: usize = 0,
     next_pes: usize = 0,
     payload_bytes: usize = 0,
     published: usize = 0,
     last_duration: ?u32 = null,
     ended: bool = false,
     active: bool = false,
-    context: *anyopaque,
-    accept: *const fn (*anyopaque, *media.http_stream.FragmentDelivery) anyerror!void,
+    delivery: Delivery,
     pub fn init(a: std.mem.Allocator, identity: []const u8, options: StreamOptions, context: *anyopaque, accept: *const fn (*anyopaque, *media.http_stream.FragmentDelivery) anyerror!void) !Stream {
+        return initDelivery(a, identity, options, .{ .segments = .{ .context = context, .accept = accept } });
+    }
+    pub fn initIndex(a: std.mem.Allocator, identity: []const u8, options: Options, sink: IndexSink) !Stream {
+        return initDelivery(a, identity, .{ .video = options }, .{ .index = sink });
+    }
+    fn initDelivery(a: std.mem.Allocator, identity: []const u8, options: StreamOptions, delivery: Delivery) !Stream {
         try options.video.stream.control.check();
         if (identity.len > options.max_identity_bytes or options.video.index.max_packet_bytes == 0) return error.ResourceLimitExceeded;
         const au_limit = @min(options.video.index.max_packet_bytes, options.video.stream.max_bytes);
@@ -287,7 +361,7 @@ pub const Stream = struct {
         const token = if (pool) |value| try value.acquire(.{}) else media.admission.Token{};
         var saved = options;
         saved.video.configuration = null;
-        return .{ .allocator = a, .options = saved, .identity = owned, .identity_reservation = id_token, .configuration = cfg, .configuration_reservation = cfg_token, .fixed_reservation = fixed, .workspace = .{ .backing = a, .limit = bound, .reservation = token }, .context = context, .accept = accept };
+        return .{ .allocator = a, .options = saved, .identity = owned, .identity_reservation = id_token, .configuration = cfg, .configuration_reservation = cfg_token, .fixed_reservation = fixed, .workspace = .{ .backing = a, .limit = bound, .reservation = token }, .delivery = delivery };
     }
     pub fn deinit(self: *Stream) void {
         self.bytes.deinit(self.workspace.allocator());
@@ -300,6 +374,8 @@ pub const Stream = struct {
         self.identity = &.{};
         if (self.configuration) |value| self.allocator.free(value);
         self.configuration = null;
+        if (self.description) |shared| shared.backing.deinit();
+        self.description = null;
         self.configuration_reservation.deinit();
         self.identity_reservation.deinit();
         self.fixed_reservation.deinit();
@@ -336,10 +412,11 @@ pub const Stream = struct {
         const active_limit = @min(self.options.video.index.max_packet_bytes, self.options.video.stream.max_bytes);
         const bound = try std.math.add(usize, active_limit, self.options.video.transport.max_pes_bytes);
         if (pes.bytes.len > bound -| self.bytes.items.len) return error.ResourceLimitExceeded;
-        const anchor = Anchor{ .offset = self.bytes.items.len, .packet = pes.packet, .ordinal = pes.ordinal };
+        const anchor = Anchor{ .offset = self.bytes.items.len, .packet = pes.packet, .timed_index = self.timed_pes };
         try self.anchors.append(self.workspace.allocator(), anchor);
         try self.bytes.appendSlice(self.workspace.allocator(), pes.bytes);
         self.next_pes += 1;
+        if (pes.packet.has_timestamp) self.timed_pes += 1;
         self.payload_bytes += pes.bytes.len;
         try self.scan();
     }
@@ -370,7 +447,11 @@ pub const Stream = struct {
                 return;
             }
             if (self.mode == .unknown) self.mode = if (kind == 9) .aud else .pes;
-            if (self.clock == null) self.clock = try self.clockAt(0);
+            if (self.clock == null) {
+                const first = try self.clockAt(if (self.mode == .aud) nal.at else 0);
+                if (first.timed_index != self.published) return error.AmbiguousTransportPictureTiming;
+                self.clock = first;
+            }
             if (kind == 9) {
                 if (self.mode != .aud) return error.AmbiguousTransportPictureTiming;
                 if (self.bytes.items[nal.payload] & 0x60 != 0 or self.bytes.items[nal.payload + 1] & 31 != 16) return error.MalformedVideoPacket;
@@ -384,7 +465,7 @@ pub const Stream = struct {
                     };
                     if (!only_zero) {
                         const next = try self.clockAt(nal.at);
-                        if (next.ordinal == self.clock.?.ordinal) return error.AmbiguousTransportPictureTiming;
+                        if (next.timed_index != self.clock.?.timed_index + 1) return error.AmbiguousTransportPictureTiming;
                         const duration = try durationBetween(self.clock.?.packet.dts, next.packet.dts);
                         try self.publish(nal.at, duration, false);
                         const payload = nal.payload - nal.at;
@@ -414,16 +495,7 @@ pub const Stream = struct {
         if (self.bytes.items.len == 0) self.anchors.clearRetainingCapacity();
     }
     fn publish(self: *Stream, count: usize, duration: u32, complete: bool) !void {
-        if (self.published >= self.options.video.transport.max_packets or count > self.options.video.index.max_packet_bytes) return error.ResourceLimitExceeded;
-        const ordinal = try std.math.add(usize, self.options.first_ordinal, self.published);
-        const length = std.fmt.count("{s}/au/{d}", .{ self.identity, ordinal });
-        if (length > self.options.max_identity_bytes) return error.ResourceLimitExceeded;
-        var id_token = if (self.options.video.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = length }) else media.admission.Token{};
-        var owners_live = true;
-        errdefer if (owners_live) id_token.deinit();
-        const identity = try self.allocator.alloc(u8, length);
-        errdefer if (owners_live) self.allocator.free(identity);
-        _ = try std.fmt.bufPrint(identity, "{s}/au/{d}", .{ self.identity, ordinal });
+        if (self.published >= @min(self.options.video.transport.max_packets, self.options.video.index.max_samples) or count > self.options.video.index.max_packet_bytes) return error.ResourceLimitExceeded;
         const clock = self.clock orelse return error.AmbiguousTransportPictureTiming;
         var packet = clock.packet;
         packet.offset = 0;
@@ -434,16 +506,45 @@ pub const Stream = struct {
         options.configuration = self.configuration;
         options.single_access_unit_duration_ticks = duration;
         options.last_duration_ticks = duration;
-        var source = try fromDemux(self.allocator, identity, demux, options);
+        if (self.delivery == .index) {
+            const index = self.delivery.index;
+            const a = self.workspace.allocator();
+            if (self.published == 0) {
+                const avcc = try configuration(a, demux, options);
+                defer a.free(avcc);
+                if (options.configuration) |expected| if (!std.mem.eql(u8, expected, avcc)) return error.SourceVersionChanged;
+                try index.track(index.context, try trackForConfiguration(a, avcc, options));
+            }
+            const unit = try walkUnit(a, demux.bytes, options, .{ .index = .{ .sink = index, .origin = self.payload_bytes - self.bytes.items.len } });
+            if (duration == 0) return error.InvalidSamplingMetadata;
+            try index.packet(index.context, .{ .offset = 0, .size = @intCast(unit.size), .pts = packet.pts, .dts = packet.dts, .media_pts = packet.pts, .media_dts = packet.dts, .duration = duration, .sync = unit.sync });
+            self.published += 1;
+            self.last_duration = duration;
+            return;
+        }
+        const ordinal = try std.math.add(usize, self.options.first_ordinal, self.published);
+        const length = std.fmt.count("{s}/au/{d}", .{ self.identity, ordinal });
+        if (length > self.options.max_identity_bytes) return error.ResourceLimitExceeded;
+        var id_token = if (self.options.video.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = length }) else media.admission.Token{};
+        var owners_live = true;
+        errdefer if (owners_live) id_token.deinit();
+        const identity = try self.allocator.alloc(u8, length);
+        errdefer if (owners_live) self.allocator.free(identity);
+        _ = try std.fmt.bufPrint(identity, "{s}/au/{d}", .{ self.identity, ordinal });
+        var source = try normalizeDemux(self.allocator, identity, demux, options, self.description, if (self.options.retain_initial_description) self.configuration else null);
         errdefer if (owners_live) source.deinit();
-        if (self.configuration) |config| if (!std.mem.eql(u8, config, source.reader.track.avcc)) return error.SourceVersionChanged;
+        if (self.description == null) if (self.configuration) |config| if (!std.mem.eql(u8, config, source.reader.track.avcc)) return error.SourceVersionChanged;
         var cfg: ?[]u8 = null;
         var cfg_token = media.admission.Token{};
         defer {
             if (cfg) |value| self.allocator.free(value);
             cfg_token.deinit();
         }
-        if (self.configuration == null) {
+        if (self.options.retain_initial_description and self.description == null) {
+            source.snapshot.retain();
+            self.description = .{ .backing = source.snapshot, .track = source.reader.track };
+        }
+        if (!self.options.retain_initial_description and self.configuration == null) {
             if (options.stream.admission_pool) |pool| cfg_token = try pool.acquire(.{ .host_bytes = source.reader.track.avcc.len });
             cfg = try self.allocator.dupe(u8, source.reader.track.avcc);
         }
@@ -462,7 +563,7 @@ pub const Stream = struct {
     }
     fn deliver(self: *Stream, delivery: *media.http_stream.FragmentDelivery) !void {
         defer if (delivery.segment) |*owner| owner.deinit();
-        self.accept(self.context, delivery) catch |err| {
+        self.delivery.segments.accept(self.delivery.segments.context, delivery) catch |err| {
             if (delivery.acknowledged) self.published += 1;
             return err;
         };
@@ -478,11 +579,68 @@ pub const Stream = struct {
     fn finishEntered(self: *Stream, final_duration_ticks: ?u32) !void {
         try self.options.video.stream.control.check();
         if (self.bytes.items.len == 0 or self.clock == null) return error.EmptyVideo;
+        if (self.clock.?.timed_index + 1 != self.timed_pes) return error.AmbiguousTransportPictureTiming;
         const duration = final_duration_ticks orelse self.options.video.last_duration_ticks orelse self.last_duration orelse self.options.video.single_access_unit_duration_ticks orelse return error.MissingTransportDuration;
         if (duration == 0) return error.InvalidSamplingMetadata;
         try self.publish(self.bytes.items.len, duration, true);
     }
 };
+
+/// Build an immutable random-access view while keeping only one PES and AU
+/// in flight. Each completed AU transfers its payload to the segmented index.
+pub fn indexClip(a: std.mem.Allocator, identity: []const u8, bytes: []const u8, options: Options) !*@import("live_windows.zig").Builder {
+    var source = media.source.Source{ .allocator = a, .identity = identity, .storage = .{ .borrowed = bytes }, .control = options.stream.control };
+    return indexSource(a, &source, options);
+}
+
+pub fn indexSource(a: std.mem.Allocator, source: *media.source.Source, options: Options) !*@import("live_windows.zig").Builder {
+    const windows = @import("live_windows.zig");
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        options: windows.Options,
+        owner: ?*windows.Builder = null,
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const segment = delivery.segment.?;
+            if (self.owner == null) self.owner = try windows.Builder.init(self.allocator, segment, &.{}, self.options);
+            try self.owner.?.append(segment, self.options);
+        }
+    };
+    const packet_limit = @min(options.transport.max_packets, options.index.max_samples, options.index.max_index_bytes / @sizeOf(media.mp4.Packet));
+    var collector = Collector{ .allocator = a, .options = .{ .stream = options.stream, .max_packets = packet_limit, .max_units = packet_limit } };
+    errdefer if (collector.owner) |owner| owner.deinit();
+    var units = try Stream.init(a, source.identity, .{ .video = options, .retain_initial_description = true }, &collector, Collector.accept);
+    defer if (!units.ended) units.deinit();
+    try scanSource(a, source, options, &units, units.consumer());
+    return collector.owner orelse error.EmptyVideo;
+}
+
+pub fn scanSource(a: std.mem.Allocator, source: *media.source.Source, options: Options, units: *Stream, consumer_: media.transport_stream.Consumer) !void {
+    return scanSourceReclaiming(a, source, options, units, consumer_, null);
+}
+
+pub fn scanSourceReclaiming(a: std.mem.Allocator, source: *media.source.Source, options: Options, units: *Stream, consumer_: media.transport_stream.Consumer, reclaimer: ?media.admission.Reclaimer) !void {
+    if (source.length() > options.transport.max_bytes) return error.ResourceLimitExceeded;
+    var demux = try media.transport_stream.Stream.init(a, .{}, options.transport, options.stream.control, options.stream.admission_pool, consumer_);
+    defer if (!demux.ended) demux.deinit();
+    demux.workspace.reclaimer = reclaimer;
+    switch (source.storage) {
+        .borrowed => |bytes| try demux.push(bytes),
+        .range => {
+            const chunk = @min(256 * 1024, source.limits.max_read_bytes, source.limits.max_retained_bytes);
+            if (chunk == 0) return error.ResourceLimitExceeded;
+            var offset: u64 = 0;
+            while (offset < source.length()) {
+                var lease = try source.readReclaiming(offset, @intCast(@min(source.length() - offset, chunk)), reclaimer);
+                defer lease.deinit();
+                try demux.push(lease.bytes);
+                offset += lease.bytes.len;
+            }
+        },
+    }
+    _ = try demux.finish();
+    try units.finish(options.last_duration_ticks);
+}
 
 /// Request-local state for HLS TS video. Media controls the transport and AES;
 /// this adapter supplies codec configuration and the existing packet-reader ABI.
@@ -1140,4 +1298,36 @@ test "native TS HTTP cancellation after acknowledged delivery releases session a
     const result = (try reader.streamNext(&capture, Capture.accept)).?;
     try std.testing.expectEqual(@as(usize, 1), result.replayed);
     try std.testing.expect(reader.ended());
+}
+
+test "native TS clip index shares its description and enforces aggregate sample limits" {
+    const bytes = @embedFile("../testdata/transport/closed.ts");
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.ResourceLimitExceeded, indexClip(a, "limited", bytes, .{ .index = .{ .max_samples = 1 } }));
+    const clip = try indexClip(a, "clip", bytes, .{});
+    defer clip.deinit();
+    try std.testing.expect(clip.owners.items.len > 1);
+    for (clip.owners.items[1..], clip.reader.packets[1..]) |owner, packet| {
+        try std.testing.expectEqual(clip.owners.items[0], owner.description_owner.?);
+        try std.testing.expectEqual(packet.size, owner.bytes.len);
+    }
+}
+
+test "native TS incremental AVC rejects orphan timed continuations at boundaries and EOF" {
+    const a = std.testing.allocator;
+    var demux = try media.transport_stream.demux(a, @embedFile("../testdata/transport/closed.ts"), .{}, .{}, .{}, null);
+    defer demux.deinit();
+    for ([_]bool{ false, true }) |at_eof| {
+        var capture = AuCapture{};
+        defer capture.deinit();
+        var normal = try Stream.init(a, "orphan", .{}, &capture, AuCapture.accept);
+        defer normal.deinit();
+        var first = demux.packets[0];
+        first.size -= 7;
+        try normal.push(.{ .bytes = demux.bytes[0..first.size], .packet = first, .ordinal = 0 });
+        const orphan = media.transport_stream.Packet{ .offset = first.size, .size = 7, .pts = first.pts + 1, .dts = first.dts + 1 };
+        try normal.push(.{ .bytes = demux.bytes[first.size..][0..7], .packet = orphan, .ordinal = 1 });
+        const next = demux.packets[1];
+        if (at_eof) try std.testing.expectError(error.AmbiguousTransportPictureTiming, normal.finish(1)) else try std.testing.expectError(error.AmbiguousTransportPictureTiming, normal.push(.{ .bytes = demux.bytes[next.offset..][0..next.size], .packet = next, .ordinal = 2 }));
+    }
 }
