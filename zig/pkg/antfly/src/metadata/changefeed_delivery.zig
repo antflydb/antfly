@@ -163,8 +163,12 @@ pub fn pull(svc: anytype, adapter: anytype, a: A, id: control.Id, before: contro
 pub fn acknowledge(svc: anytype, adapter: anytype, a: A, id: control.Id, cursor: control.Digest, request: anytype) !control.Parsed {
     for (0..4) |_| {
         var before = try load(svc, a, id, request);
+        _ = active(adapter, before.value, request) catch |err| {
+            before.deinit();
+            return err;
+        };
+        if (equal(before.value.acknowledged_cursor, cursor)) return before;
         defer before.deinit();
-        _ = try active(adapter, before.value, request);
         mutate(svc, a, before.value, .{ .acknowledge = cursor }, request) catch |err| switch (err) {
             error.ChangefeedConflict => continue,
             error.MetadataMutationOutcomeUnknown => {},
@@ -297,6 +301,9 @@ test "idle feed delivery keeps the original cursor and consumes no metadata prop
         try std.testing.expectEqual(initial.value.latest_cursor, heartbeat.cursor);
         try std.testing.expectEqual(initial.value.latest_delivery, heartbeat.sequence);
     }
+    try std.testing.expectEqual(@as(u64, 0), svc.proposals);
+    var unchanged = try acknowledge(&svc, &adapter, a, initial.value.id, initial.value.latest_cursor, TestRequest{});
+    defer unchanged.deinit();
     try std.testing.expectEqual(@as(u64, 0), svc.proposals);
     adapter.idle = false;
     var delivered = try pull(&svc, &adapter, a, initial.value.id, initial.value.latest_cursor, .{}, TestRequest{});
