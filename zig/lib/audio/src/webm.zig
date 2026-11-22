@@ -477,6 +477,22 @@ fn buildOggPackets(allocator: std.mem.Allocator, headers: [3][]const u8, access_
 /// does not parse, so a FLAC track can only be placed by its start offset:
 /// an internal gap in a WebM/FLAC recording still closes up. No recorder in
 /// the formats this decoder targets writes FLAC that way.
+fn needsFlacTimeline(demuxed: DemuxedAudio, info: flac.StreamInfo) !bool {
+    if (demuxed.padding.len != 0) return true;
+    const first_time = demuxed.access_unit_times_ns[0];
+    const delay = nsToFrames(demuxed.codec_delay_ns, info.sample_rate);
+    const leading = container.playbackGap(first_time, delay, info.sample_rate, 0);
+    var origin: ?u64 = null;
+    for (demuxed.access_unit_times_ns[1..], demuxed.access_units[1..]) |time, unit| {
+        if (time <= first_time) continue;
+        if (origin == null) origin = try flac.frameStart(info, demuxed.access_units[0]);
+        const raw = try flac.frameStart(info, unit);
+        const offset = std.math.cast(usize, raw -| origin.?) orelse return error.UnsupportedAudioFormat;
+        if (container.playbackGap(time, delay, info.sample_rate, leading +| offset) != 0) return true;
+    }
+    return false;
+}
+
 fn flacPlaybackCounts(info: flac.StreamInfo, units: []const []const u8, total: ?usize, counts: []usize) !usize {
     if (units.len == 0 or counts.len != units.len) return error.UnsupportedAudioFormat;
     const origin = try flac.frameStart(info, units[0]);
@@ -515,8 +531,8 @@ fn decodeFlacTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !Decoded
 
     const decoded = try flac.decodeInterleaved(allocator, native);
     errdefer allocator.free(decoded.samples);
-    const counts = if (demuxed.padding.len != 0) counts: {
-        const info = try flac.parseStreamInfo(native);
+    const info = try flac.parseStreamInfo(native);
+    const counts = if (try needsFlacTimeline(demuxed, info)) counts: {
         const frames = try allocator.alloc(usize, demuxed.access_units.len);
         errdefer allocator.free(frames);
         _ = try flacPlaybackCounts(info, demuxed.access_units, decoded.samples.len / decoded.channels, frames);
@@ -992,13 +1008,13 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
             try native.appendSlice(a, demuxed.codec_private);
             for (demuxed.access_units) |unit| try native.appendSlice(a, unit);
             const info = try flac.parseStreamInfo(native.items);
-            if (demuxed.padding.len != 0) {
+            if (try needsFlacTimeline(demuxed, info)) {
                 const declared = std.math.cast(usize, info.total_samples) orelse return error.UnsupportedAudioFormat;
                 const delay = nsToFrames(demuxed.codec_delay_ns, info.sample_rate);
                 const prefix = try flacPlaybackCounts(info, demuxed.access_units, if (declared == 0) null else declared, frames);
                 const padding = demuxed.padding;
-                const last = padding[padding.len - 1];
-                const trim = if (declared == 0 and last.end == frames.len and last.ns > 0) nsToFrames(@intCast(last.ns), info.sample_rate) else 0;
+                const last = if (padding.len != 0) padding[padding.len - 1] else null;
+                const trim = if (last) |block| (if (declared == 0 and block.end == frames.len and block.ns > 0) nsToFrames(@intCast(block.ns), info.sample_rate) else 0) else 0;
                 const pending: ?PendingFlacTail = if (trim != 0) .{ .allocator = a, .limit = try std.math.mul(usize, trim, info.channels) } else null;
                 var timeline: TimelineSink = if (declared != 0)
                     try TimelineSink.init(sink, demuxed.access_unit_times_ns, frames, info.sample_rate, info.channels, delay, declared, padding)
@@ -2208,4 +2224,16 @@ test "streaming audio webm FLAC padding emits before opening the final packet" {
     var emitted: usize = 0;
     try std.testing.expectError(error.UnsupportedAudioFormat, visitInterleaved(a, bytes, .{ .context = &emitted, .write = Count.write }));
     try std.testing.expect(emitted != 0);
+}
+
+test "streaming audio webm FLAC keeps a pause without padding" {
+    const a = std.testing.allocator;
+    const bytes = try buildPaddedFlacTestBlocksAlloc(a, tone_flac_bytes, true, &.{}, .{ .packet = 1, .ms = 200 });
+    defer a.free(bytes);
+    var expected = try decodeInterleaved(a, bytes);
+    defer expected.deinit();
+    const info = try flac.parseStreamInfo(tone_flac_bytes);
+    const pause_end = info.sample_rate / 5;
+    try std.testing.expectEqual((@as(usize, @intCast(info.total_samples)) + pause_end - info.max_block_size) * info.channels, expected.samples.len);
+    try expectStreaming(a, bytes, expected);
 }

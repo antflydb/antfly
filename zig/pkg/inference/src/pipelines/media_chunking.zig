@@ -371,6 +371,9 @@ pub const Runner = struct {
             .video => {}, // Original source + interval is the replay recipe.
         };
         try self.sink.accept(self.sink.context, item);
+        if (borrowed_audio) |lease| if (lease.pcm.samples.len != 0) if (self.audio_provider) |provider| {
+            acknowledgeAudioStart(provider, item.descriptor.coordinates.end_ns.? -| self.request.policy.overlap_ns);
+        };
         if (self.request.speaker_analysis) |analysis| if (analysis.checkpoint) |save| save(analysis.context, false);
         self.summary.emitted += 1;
         self.summary.output_counts = coverage;
@@ -584,10 +587,25 @@ pub const Runner = struct {
             try analysis.prepare(analysis.context, self.allocator, provider, self.request.max_working_bytes, self.summary.identity.source, self.request.source_version, cacheable);
         }
     }
+    fn acknowledgeAudioStart(provider: @import("media_chunking_audio.zig").Provider, offset_ns: i64) void {
+        const acknowledge = provider.acknowledge_frame_start orelse return;
+        const ns: u128 = @intCast(@max(0, offset_ns));
+        const sample: usize = @intCast(@min(provider.samples, @divFloor(ns * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)));
+        acknowledge(provider.context, sample);
+    }
+
+    fn restoreAudioFrames(self: *Runner, provider: @import("media_chunking_audio.zig").Provider, frames: *@import("media_chunking_audio.zig").FrameCheckpointSession) void {
+        if (self.request.audio_plan_store) |store| if (provider.restore_frames) |restore| restore(provider.context, self.allocator, store, frames);
+    }
+
+    fn saveAudioFrames(self: *Runner, provider: @import("media_chunking_audio.zig").Provider, frames: *@import("media_chunking_audio.zig").FrameCheckpointSession) void {
+        if (self.request.audio_plan_store) |store| if (provider.save_frames) |save| save(provider.context, self.allocator, store, frames);
+    }
+
     fn soundWindows(self: *Runner, provider: @import("media_chunking_audio.zig").Provider) !void {
         var frames: @import("media_chunking_audio.zig").FrameCheckpointSession = .{};
-        if (self.request.audio_plan_store) |store| if (provider.restore_frames) |restore| restore(provider.context, self.allocator, store, &frames);
-        defer if (self.request.audio_plan_store) |store| if (provider.save_frames) |save| save(provider.context, self.allocator, store, &frames);
+        self.restoreAudioFrames(provider, &frames);
+        defer self.saveAudioFrames(provider, &frames);
         self.emitSoundWindows(provider) catch |err| {
             if (!self.stopPageOnReadPressure(err)) return err;
         };
@@ -790,7 +808,7 @@ pub const Runner = struct {
                 const stop: i64 = @intCast(@divFloor(@as(u128, last) * std.time.ns_per_s, provider.sample_rate));
                 if (stop <= descriptor.coordinates.start_ns.? + self.request.policy.overlap_ns) return error.ChunkUnitTooLarge;
                 cursor.offset_ns = stop - self.request.policy.overlap_ns;
-            }
+            } else cursor.offset_ns = cursor.end_ns;
             if (last <= first) continue;
             if (plan_key != null) {
                 checkpoints.append(.{ .ordinal = self.ordinal, .offset_ns = if (self.request.policy.audio_speaker_turns) descriptor.coordinates.start_ns.? else planned.coordinates.start_ns.? });
@@ -798,10 +816,7 @@ pub const Runner = struct {
             }
             const emitted = self.summary.emitted;
             if (!try self.emit(descriptor, .{ .pcm = .{ .samples = window.pcm.samples[0 .. last - first], .sample_rate = provider.sample_rate } }, "audio/wav")) break;
-            if (self.summary.emitted != emitted and last < actual_samples) if (provider.acknowledge_frame_start) |acknowledge| {
-                const next_sample: usize = @intCast(@min(actual_samples, @divFloor(@as(u128, @intCast(cursor.offset_ns)) * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)));
-                acknowledge(provider.context, next_sample);
-            };
+            if (self.summary.emitted != emitted and last < actual_samples) acknowledgeAudioStart(provider, cursor.offset_ns);
         }
     }
     fn pdfCancelled(raw: ?*const anyopaque) bool {
@@ -935,6 +950,7 @@ pub const Runner = struct {
     const VideoAudio = struct {
         source: *media.source.Source,
         track: ?@import("media_chunking_audio_source.zig").Track = null,
+        frames: @import("media_chunking_audio.zig").FrameCheckpointSession = .{},
     };
 
     fn ordinalNeedsAudio(self: *const Runner, ordinal: u64) bool {
@@ -957,7 +973,16 @@ pub const Runner = struct {
             return;
         };
         self.audio_provider = owner.track.?.provider();
+        self.restoreAudioFrames(self.audio_provider.?, &owner.frames);
         try self.prepareSpeakers(self.audio_provider.?);
+    }
+
+    fn finishVideoAudio(self: *Runner, owner: *VideoAudio) void {
+        self.finishSpeakers();
+        if (self.audio_provider) |provider| self.saveAudioFrames(provider, &owner.frames);
+        self.video_audio = null;
+        self.audio_provider = null;
+        if (owner.track) |*track| track.deinit();
     }
 
     fn movieSource(self: *Runner, physical: *media.source.Source, bytes: []const u8) !void {
@@ -971,12 +996,7 @@ pub const Runner = struct {
         };
         var audio_owner = VideoAudio{ .source = source };
         self.video_audio = if (self.request.needs_audio) &audio_owner else null;
-        defer if (audio_owner.track) |*track| track.deinit();
-        defer self.finishSpeakers();
-        defer {
-            self.video_audio = null;
-            self.audio_provider = null;
-        }
+        defer self.finishVideoAudio(&audio_owner);
         const count = self.request.limits.max_index_packets;
         const Cache = @import("media_index_cache.zig").Cache;
         const container: Cache.Container = if (transport) .transport else if (webm) .webm else .mp4;
@@ -1676,6 +1696,88 @@ test "model aware media reuses audio lookahead and reconstructs an acknowledged 
     try runner.soundWindows(provider);
     try std.testing.expectEqual(@as(usize, 999), source.first);
     try std.testing.expectEqual(@as(usize, 1), result.seen);
+}
+
+test "model aware media wholly padded FLAC tail does not add an overlapping window" {
+    const a = std.testing.allocator;
+    const codecs = @import("inference_audio");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.flac", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    const info = try codecs.flac.parseStreamInfo(bytes);
+    const packet_count = try std.math.divCeil(usize, @intCast(info.total_samples), info.max_block_size);
+    const padding = try a.alloc(i64, packet_count);
+    defer a.free(padding);
+    @memset(padding, 0);
+    const raw_boundary = (packet_count - 1) * info.max_block_size;
+    const window_ns: i64 = @intCast(try std.math.divCeil(u128, @as(u128, raw_boundary) * std.time.ns_per_s, info.sample_rate));
+    const tail_ns: i64 = @intCast(try std.math.divCeil(u128, @as(u128, info.total_samples - raw_boundary) * std.time.ns_per_s, info.sample_rate));
+    const Index = @import("media_audio_seek.zig").Index;
+    for ([_]i64{ tail_ns, -tail_ns }) |trim| for ([_]bool{ false, true }) |unknown| {
+        padding[packet_count - 1] = trim;
+        const webm = try codecs.webm.buildPaddedFlacTestBlocksAlloc(a, bytes, unknown, padding, null);
+        defer a.free(webm);
+        var source = media.source.Source{ .allocator = a, .identity = "fully-padded-flac", .storage = .{ .borrowed = webm } };
+        var index = try Index.initWebmSource(a, &source, 1024, 1024 * 1024, null);
+        defer index.deinit();
+        var reader = @import("media_audio_seek.zig").Reader{ .index = &index, .source = &source };
+        var result = Qualification{};
+        var runner = try Runner.init(a, .{ .input = .{ .binary = .{ .mime_type = "audio/webm", .data = webm } }, .policy = .{ .window_ns = window_ns, .overlap_ns = @divFloor(window_ns, 4) } }, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+        try runner.soundWindows(reader.provider());
+        try std.testing.expectEqual(@as(usize, 1), result.seen);
+        try std.testing.expectEqual(window_ns, result.last_end);
+    };
+}
+
+test "model aware media video output restores FLAC frame anchors on a cold track" {
+    const a = std.testing.allocator;
+    const codecs = @import("inference_audio");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.flac", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    const webm = try codecs.webm.buildFlacTestBlocksAlloc(a, bytes, false, std.math.maxInt(usize));
+    defer a.free(webm);
+    const info = try codecs.flac.parseStreamInfo(bytes);
+    const frame_ns: i64 = @intCast(@as(u128, info.max_block_size) * std.time.ns_per_s / info.sample_rate);
+    const window_ns = 2 * frame_ns;
+    const Transport = struct {
+        bytes: []const u8,
+        floor: u64 = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: media.source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset < self.floor) return error.RemoteReadBudgetExceeded;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var transport = Transport{ .bytes = webm };
+    var source = media.source.Source{ .allocator = a, .identity = "video-audio-flac", .storage = .{ .range = .{ .context = &transport, .read_at = Transport.read, .length = webm.len, .immutable_binding = @splat(91) } } };
+    const directory = try media.webm_audio.Directory.init(a, &source, .{});
+    defer directory.deinit();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var store = @import("media_audio_plan.zig").Store{};
+    var request = Request{ .input = .{ .binary = .{ .mime_type = "video/webm", .data = webm } }, .native_source = &source, .source_version = "v1", .needs_audio = true, .audio_plan_store = .{ .store = &store, .io = std.testing.io, .models_dir = root }, .policy = .{ .window_ns = window_ns, .overlap_ns = frame_ns, .step_ns = frame_ns } };
+    var result = Qualification{};
+    const sink = Sink{ .context = &result, .accept = Qualification.accept };
+    var token: [85]u8 = undefined;
+    for (0..2) |page| {
+        var runner = try Runner.init(a, request, result.executor(), .{}, sink);
+        runner.ordinal = runner.summary.start_ordinal;
+        var owner = Runner.VideoAudio{ .source = &source };
+        runner.video_audio = &owner;
+        defer runner.finishVideoAudio(&owner);
+        if (page == 1) {
+            try runner.prepareVideoAudio();
+            transport.floor = directory.packets[0].offset + 1;
+        }
+        const start_ns = @as(i64, @intCast(page)) * frame_ns;
+        const end_ns = start_ns + window_ns;
+        const descriptor = planning.Descriptor{ .ordinal = runner.ordinal, .input_tokens = 1, .coordinates = .{ .kind = .video, .start_ns = start_ns, .end_ns = end_ns, .picture_count = 1 } };
+        try std.testing.expect(try runner.emit(descriptor, .{ .video = .{ .bytes = webm, .policy = .{ .start_ns = start_ns, .end_ns = end_ns, .step_ns = @intCast(frame_ns) } } }, "video/webm"));
+        request.continuation = runner.summary.identity.cursor(runner.summary.next_ordinal, &token);
+    }
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1 }, result.ordinals[0..result.seen]);
 }
 
 test "model aware media remote audio pressure preserves acknowledged coverage" {

@@ -260,7 +260,9 @@ const WebmFlac = struct {
         var gaps: std.ArrayList(Gap) = .empty;
         defer gaps.deinit(a);
         var inserted: usize = 0;
-        if (directory.padding.len != 0) {
+        if (directory.padding.len != 0 or for (extents[1..]) |extent| {
+            if (extent.packet.time_ns > extents[0].packet.time_ns) break true;
+        } else false) {
             var packet: usize = 0;
             var padding_index: usize = 0;
             var timeline = leading;
@@ -362,7 +364,22 @@ const WebmFlac = struct {
 
     fn probeStop(self: WebmFlac, sample: usize) usize {
         const raw = self.rawAt(self.compactAt(sample), false);
-        return if (raw > self.tail_group_start) raw +| self.tail_trim else raw;
+        if (sample < self.leading) return raw;
+        const next_gap = self.gapAfter(sample);
+        // A window ending in known silence cannot end at EOF, even when
+        // that silence maps to the first raw sample of a fully padded tail.
+        if (next_gap < self.gaps.len and sample >= self.gaps[next_gap].first) return raw;
+        if (self.tail_trim != 0 and raw >= self.tail_group_start) {
+            // At the first sample of a positive final trim, EOF is
+            // ambiguous until the group proves it has a surviving sample.
+            return raw +| self.tail_trim +| @as(usize, @intFromBool(raw == self.tail_group_start));
+        }
+        if (self.cuts.len != 0) {
+            const cut = self.cuts[self.cuts.len - 1];
+            const tail = self.extents[self.extents.len - 1].first;
+            if (raw == cut.first and tail < cut.end) return cut.end +| 1;
+        }
+        return raw;
     }
 
     fn frames(ns: u64, rate: u32) usize {
@@ -445,13 +462,16 @@ const WebmFlac = struct {
                 while (cut_index < self.cuts.len and self.cuts[cut_index].end <= extent.first) cut_index += 1;
                 if (index + 1 < self.extents.len and cut_index < self.cuts.len and self.cuts[cut_index].first <= extent.first and self.cuts[cut_index].end >= stop.?) continue;
             }
-            var point = try self.frame_directory.seek(index, begin, control);
-            if (persisted) |snapshot| if (snapshot.nearest(begin)) |anchor| {
-                const offset: u64 = @intCast(anchor.offset_ns);
-                if (offset >= extent.packet.offset and offset - extent.packet.offset < extent.packet.size and anchor.ordinal >= extent.first and (point == null or anchor.ordinal > point.?.sample)) {
-                    point = .{ .block = index, .sample = @intCast(anchor.ordinal), .offset = @intCast(offset - extent.packet.offset) };
-                }
-            };
+            var point: ?FramePoint = null;
+            if (extent.first < begin) {
+                point = try self.frame_directory.seek(index, begin, control);
+                if (persisted) |snapshot| if (snapshot.nearest(begin)) |anchor| {
+                    const offset: u64 = @intCast(anchor.offset_ns);
+                    if (offset >= extent.packet.offset and offset - extent.packet.offset < extent.packet.size and anchor.ordinal >= extent.first and (point == null or anchor.ordinal > point.?.sample)) {
+                        point = .{ .block = index, .sample = @intCast(anchor.ordinal), .offset = @intCast(offset - extent.packet.offset) };
+                    }
+                };
+            }
             var at: usize = if (point) |saved| saved.offset else 0;
             var position = if (point) |saved| saved.sample else extent.first;
             var indexed = position;
@@ -1105,6 +1125,34 @@ test "model aware media FLAC gap parity skips discarded packets and defers tail 
     var silence = try provider.read(provider.context, a, gap_start, gap_start + 512);
     defer silence.deinit(a);
     try std.testing.expectEqualSlices(f32, expected.samples[gap_start..][0..512], silence.pcm.samples);
+}
+
+test "model aware media unpadded FLAC keeps interior timestamp gaps" {
+    const a = std.testing.allocator;
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.flac", a, .limited(1024 * 1024));
+    defer a.free(encoded);
+    var norm = try audio.decode(a, encoded, .{});
+    defer norm.deinit();
+    for ([_]bool{ false, true }) |unknown| {
+        const webm = try audio.webm.buildPaddedFlacTestBlocksAlloc(a, encoded, unknown, &.{}, .{ .packet = 1, .ms = 200 });
+        defer a.free(webm);
+        var expected = try audio.decode(a, webm, .{});
+        defer expected.deinit();
+        const block: usize = (try audio.flac.parseStreamInfo(encoded)).max_block_size;
+        const pause_end = @as(usize, norm.sample_rate) / 5;
+        try std.testing.expectEqual(norm.samples.len + pause_end - block, expected.samples.len);
+        try std.testing.expectEqualSlices(f32, norm.samples[0..block], expected.samples[0..block]);
+        for (expected.samples[block..pause_end]) |value| try std.testing.expectEqual(@as(f32, 0), value);
+        try std.testing.expectEqualSlices(f32, norm.samples[block..], expected.samples[pause_end..]);
+        var source = media.source.Source{ .allocator = a, .identity = "unpadded-flac-gap", .storage = .{ .borrowed = webm } };
+        var index = try Index.initWebmSource(a, &source, 1024, 1024 * 1024, null);
+        defer index.deinit();
+        var reader = Reader{ .index = &index, .source = &source };
+        const provider = reader.provider();
+        var actual = try provider.read(provider.context, a, block - 1, pause_end + 1);
+        defer actual.deinit(a);
+        try std.testing.expectEqualSlices(f32, expected.samples[block - 1 .. pause_end + 1], actual.pcm.samples);
+    }
 }
 
 test "model aware media FLAC reads and indexes individual frames within a WebM block" {
