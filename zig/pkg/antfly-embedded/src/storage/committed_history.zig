@@ -748,7 +748,13 @@ pub fn readProjectedFrameCompletion(a: A, txn: anytype, root_generation: u64, he
     const certificate = parsed.value.certificate;
     const manifest = certificate.manifest;
     if (!std.mem.eql(u8, &manifest.transaction_id, &header.transaction_id)) return error.HistoryCorrupt;
-    const owner = try manifest.admission().recoveryOwner(header.namespace);
+    const plan_key = completion.admission_prefix.* ++ header.transaction_id;
+    const plan_raw = (try optional(txn, &plan_key)) orelse return error.HistoryCorrupt;
+    var plan = try completion.parseAdmission(a, plan_raw);
+    defer plan.deinit();
+    if (!std.mem.eql(u8, &plan.value.digest, &manifest.admission().digest())) return error.HistoryCorrupt;
+    const member = try plan.value.localMember(header.namespace);
+    const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
     const acknowledgement = try readCompletionPublication(a, txn, header.namespace, root_generation, .{
         .version = 1,
         .owner = owner,
@@ -759,7 +765,8 @@ pub fn readProjectedFrameCompletion(a: A, txn: anytype, root_generation: u64, he
     });
     const publication = acknowledgement.publication orelse return error.HistoryCorrupt;
     for (certificate.resolutions) |resolution| {
-        if (!std.mem.eql(u8, &resolution.namespace, &header.namespace)) continue;
+        if (!std.mem.eql(u8, &resolution.namespace, &header.namespace) or
+            !std.mem.eql(u8, &resolution.owner_fence, &member.owner_fence)) continue;
         const effects = switch (resolution.outcome) {
             .effects => |effects| effects,
             .no_effect => return error.HistoryCorrupt,
@@ -798,6 +805,8 @@ fn completionPublication(a: A, txn: anytype, physical_namespace: frame.Namespace
     var plan = try completion.parseAdmission(a, plan_raw);
     defer plan.deinit();
     if (!std.mem.eql(u8, &plan.value.digest, &manifest.admission().digest())) return error.DecisionConflict;
+    const local_member = try plan.value.localMember(physical_namespace);
+    if (!std.mem.eql(u8, &local_member.owner_fence, &owner.digest())) return error.InvalidParticipant;
     const receipt_key = completion.resolutionKey(id);
     const receipt_raw = (try optional(txn, &receipt_key)) orelse return error.SourceOutcomeUnresolved;
     var local = try completion.parseResolution(a, manifest, receipt_raw);
@@ -808,7 +817,9 @@ fn completionPublication(a: A, txn: anytype, physical_namespace: frame.Namespace
     const request: wire.Request = .{ .authority = .raft, .namespace = physical_namespace, .transaction_id = id, .owner_fence = owner.digest(), .manifest_digest = manifest.digest(), .commit_version = manifest.commit_version, .minimum_applied_index = 1 };
     _ = try wire.Reply.init(request, .{ .term = std.mem.readInt(u64, marker[0..8], .little), .index = std.mem.readInt(u64, marker[8..16], .little) }, local.value.resolution);
     var found = false;
-    for (certificate.resolutions) |receipt| if (std.mem.eql(u8, &receipt.namespace, &physical_namespace)) {
+    for (certificate.resolutions) |receipt| if (std.mem.eql(u8, &receipt.namespace, &physical_namespace) and
+        std.mem.eql(u8, &receipt.owner_fence, &local_member.owner_fence))
+    {
         if (!std.mem.eql(u8, &receipt.digest(), &local.value.digest)) return error.DecisionConflict;
         found = true;
         break;
