@@ -610,6 +610,33 @@ def test_pg_recvlogical_resume_after_restart(
         assert created[3] == created[4] and "/" in created[4]
         assert created[5] == "reserved"
         assert catalog_slot(plugin="wrong_plugin") == []
+        if not export_snapshot and not multi_table and not cross_node:
+            for options in (
+                "proto_version '2'",
+                "proto_version '1', binary 'true'",
+                "proto_version '1', streaming 'parallel'",
+                "proto_version '1', two_phase 'true'",
+            ):
+                rejected = subprocess.run(
+                    [
+                        psql,
+                        *connection[:-1],
+                        "dbname=default replication=database",
+                        "-X",
+                        "-v",
+                        "VERBOSITY=verbose",
+                        "-c",
+                        "START_REPLICATION SLOT smoke_slot LOGICAL 0/0 "
+                        f"({options}, publication_names 'changes')",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                assert rejected.returncode != 0
+                assert "ERROR:  0A000: UnsupportedReplicationOption" in rejected.stderr
+                assert catalog_slot() == [created]
         first = tmp_path / "first.bin"
         with stream(first, expect_disconnect=cross_node and not topology) as reader:
             insert = (
