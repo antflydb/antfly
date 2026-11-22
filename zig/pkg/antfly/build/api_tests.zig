@@ -1092,6 +1092,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("provisioned-native-history-test", "Verify provisioned native history identity, resident leases and writer reopen").dependOn(&b.addRunArtifact(native_history_root_tests).step);
     const ordered_history_tests = b.addTest(.{ .root_module = write_implementation_module, .filters = &.{ "ordered history consumer", "history page wire", "history grant wire" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("ordered-history-consumer-test", "Verify atomic Raft retention outcomes, replay, rejection and reopen").dependOn(&b.addRunArtifact(ordered_history_tests).step);
+    const artifact_policy_local_filters = &.{ "enrichment shorthand local PUT", "privacy reprocess continuations" };
+    const artifact_policy_local_tests = b.addTest(.{
+        .root_module = write_implementation_module,
+        .filters = artifact_policy_local_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-artifact-execution-policy-local-api-test", "Verify native producer PUT normalization and policy cursor transport")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_policy_local_tests, artifact_policy_local_filters).step);
+
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
         .target = target,

@@ -10935,7 +10935,7 @@ pub const DB = struct {
         artifact_name: []const u8,
     ) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifact", .{ self, alloc, doc_key, artifact_name });
-        return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false);
+        return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false, false);
     }
 
     fn reprocessDocumentArtifactWithCompletionWait(
@@ -10944,13 +10944,16 @@ pub const DB = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
         wait_for_completion: bool,
+        only_incomplete: bool,
     ) !bool {
-        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse {
+            if (only_incomplete) return error.InvalidArgument;
             return self.reprocessEmbeddingArtifactIssue(alloc, .{
                 .artifact_kind = .embedding,
                 .doc_key = doc_key,
                 .artifact_name = artifact_name,
             }, wait_for_completion);
+        };
         defer cfg.deinit(alloc);
         // A missing producer definition means this artifact cannot currently be
         // regenerated. A missing source document is a distinct, actionable
@@ -10962,6 +10965,7 @@ pub const DB = struct {
         const force_artifacts = [_][]const u8{artifact_name};
         var producer = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
         defer producer.deinit(alloc);
+        if (only_incomplete and producer.type != .document_extraction) return error.InvalidArgument;
         // Document extraction persists a config-fenced target generation with
         // this source mutation. Replay owns provider work, including cold starts
         // and retries; accepting it must never wait for remote OCR. Other asset
@@ -10974,6 +10978,7 @@ pub const DB = struct {
         }, null, .{
             .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
+            .force_only_incomplete_assets = only_incomplete,
         });
         return true;
     }
@@ -12905,7 +12910,7 @@ pub const DB = struct {
     ) !bool {
         return switch (issue.artifact_kind) {
             .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue, true),
-            .asset => try self.reprocessDocumentArtifactWithCompletionWait(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name, true),
+            .asset => try self.reprocessDocumentArtifactWithCompletionWait(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name, true, false),
             .chunk => try self.reprocessChunkArtifactIssue(alloc, issue),
             .graph, .full_text, .algebraic => false,
         };
@@ -19907,6 +19912,14 @@ pub const DB = struct {
         return result;
     }
 
+    fn appendArtifactReprocessFailure(alloc: Allocator, failures: *std.ArrayListUnmanaged(types.DocumentArtifactReprocessFailure), document: []const u8, err: anyerror) !void {
+        const key = try alloc.dupe(u8, document);
+        errdefer alloc.free(key);
+        const code = try alloc.dupe(u8, @errorName(err));
+        errdefer alloc.free(code);
+        try failures.append(alloc, .{ .key = key, .error_code = code });
+    }
+
     pub fn reprocessDocumentArtifactRange(
         self: *DB,
         alloc: Allocator,
@@ -19939,6 +19952,12 @@ pub const DB = struct {
             (try self.getEnrichment(alloc, .embedding, artifact_name)) orelse return error.NotFound;
         defer cfg.deinit(alloc);
 
+        if (req.selection == .incomplete) {
+            if (cfg.kind != .asset) return error.InvalidArgument;
+            var producer = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+            defer producer.deinit(alloc);
+            if (producer.type != .document_extraction) return error.InvalidArgument;
+        }
         var effective_req = req;
         if (req.shard_cursors.len > 0) {
             if (req.shard_cursors.len != 1) return error.InvalidArgument;
@@ -19948,6 +19967,7 @@ pub const DB = struct {
                 .from_key = cursor.next_key,
                 .resume_from_key = true,
                 .to_key = req.to_key,
+                .selection = req.selection,
                 .limit = if (cursor.limit != 0) cursor.limit else req.limit,
             };
         }
@@ -19977,14 +19997,32 @@ pub const DB = struct {
         const process_len = @min(scanned.documents.len, @as(usize, @intCast(limit)));
         for (scanned.documents[0..process_len]) |doc| {
             result.scanned += 1;
-            const handled = self.reprocessDocumentArtifact(alloc, doc.id, artifact_name) catch |err| switch (err) {
+            if (effective_req.selection == .incomplete) {
+                // Select against published coverage, not repair counters or
+                // merge convergence: a converged PDF can contain failed pages.
+                const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc.id, "asset", artifact_name);
+                defer alloc.free(key);
+                if (try self.core.getStoreValue(alloc, key)) |manifest| {
+                    defer alloc.free(manifest);
+                    const complete = @import("enrichment/document_extraction_completion.zig").isComplete(alloc, manifest) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => {
+                            result.failed += 1;
+                            try appendArtifactReprocessFailure(alloc, &failures, doc.id, err);
+                            continue;
+                        },
+                    };
+                    if (complete) {
+                        result.skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            const handled = self.reprocessDocumentArtifactWithCompletionWait(alloc, doc.id, artifact_name, false, effective_req.selection == .incomplete) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     result.failed += 1;
-                    try failures.append(alloc, .{
-                        .key = try alloc.dupe(u8, doc.id),
-                        .error_code = try alloc.dupe(u8, @errorName(err)),
-                    });
+                    try appendArtifactReprocessFailure(alloc, &failures, doc.id, err);
                     continue;
                 },
             };
@@ -55795,8 +55833,10 @@ test "db document extraction failure manifest preserves prior artifacts" {
         "RemoteDocumentFetchFailed",
         "remote content download failed",
         "remote_content_download",
+        "{\"max_output_tokens_per_item\":8192}",
     );
     defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"execution\":{\"max_output_tokens_per_item\":8192}") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"chunk_count\":1") != null);
@@ -93733,6 +93773,59 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     try std.testing.expect(embedding.len > 0);
 }
 
+test "db execution policy retains legacy local asset publications" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("policy-reuse");
+    defer tmp.cleanup();
+    var fake = TestAssetProducer{};
+    var db = try DB.open(a, tmp.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "policy-test", .asset_producer = fake.producer() } });
+    var db_open = true;
+    defer if (db_open) db.close();
+    var cfg = types.EnrichmentConfig{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"first\"}}", .execution = .{ .max_output_tokens_per_item = 64 } };
+    try db.addEnrichment(cfg);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged input\"}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const calls = fake.generator_calls;
+    try std.testing.expect(calls > 0);
+    try std.testing.expectError(error.InvalidArgument, db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "summary", false, true));
+    try std.testing.expectEqual(calls, fake.generator_calls);
+
+    const local = @import("artifact_local_publication.zig");
+    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "summary");
+    defer a.free(artifact);
+    const receipt_key = try local.key(a, artifact);
+    defer a.free(receipt_key);
+    const output = try db.core.store.get(a, artifact);
+    defer a.free(output);
+    // Simulate a receipt accepted by the released policy-dependent writer.
+    const old = local.encode(local.legacyRecipe(db.core.index_manager.getEnrichment(.asset, "summary").?), "unchanged input", output);
+    try db.core.store.put(receipt_key, &old);
+    cfg.execution = .{ .max_output_tokens_per_item = 8192 };
+    _ = try db.upsertEnrichment(cfg);
+    db.close();
+    db_open = false;
+    db = try DB.open(a, tmp.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "policy-test", .asset_producer = fake.producer() } });
+    db_open = true;
+    var restored = (try db.getEnrichment(a, .asset, "summary")).?;
+    defer restored.deinit(a);
+    try std.testing.expectEqual(@as(?u32, 8192), restored.execution.?.max_output_tokens_per_item);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged input\",\"unrelated\":1}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(calls, fake.generator_calls);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const entry = db.core.index_manager.getEnrichment(.asset, "summary").?;
+        try local.requireCompatible(a, &read, artifact, local.recipe(entry), local.legacyRecipe(entry), "unchanged input", output);
+        try std.testing.expectError(error.EnrichmentSourceChanged, local.requireCompatible(a, &read, artifact, local.recipe(entry), local.legacyRecipe(entry), "changed input", output));
+    }
+    cfg.producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"second\"}}";
+    _ = try db.upsertEnrichment(cfg);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged input\",\"unrelated\":2}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    try std.testing.expect(fake.generator_calls > calls);
+}
+
 test "db document extraction manifest inspection and reprocess API" {
     const alloc = std.testing.allocator;
 
@@ -93916,6 +94009,56 @@ test "db document extraction manifest inspection and reprocess API" {
     var range_after_b = (try db.getDocumentArtifactManifest(alloc, "doc:b", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer range_after_b.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), range_after_b.generation);
+
+    // A non-semantic update must leave accepted generations untouched.
+    var producer = (try db.getEnrichment(alloc, .asset, "document_units_v1")).?;
+    defer producer.deinit(alloc);
+    const semantic_hash = types.enrichmentConfigHash(producer);
+    producer.execution = .{ .max_output_tokens_per_item = 8192 };
+    try std.testing.expectEqual(semantic_hash, types.enrichmentConfigHash(producer));
+    _ = try db.upsertEnrichment(producer);
+    var incomplete = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .selection = .incomplete });
+    defer incomplete.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), incomplete.skipped);
+    try std.testing.expectEqual(@as(usize, 0), incomplete.reprocessed);
+    try db.runUntilIdle();
+    var kept = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")).?;
+    defer kept.deinit(alloc);
+    try std.testing.expectEqual(range_after_a.generation, kept.generation);
+    // Model completion between the range prefilter and mutation preparation:
+    // the internal recheck must recognize the actual merge_plan manifest.
+    try std.testing.expect(try db.reprocessDocumentArtifactWithCompletionWait(alloc, "doc:a", "document_units_v1", false, true));
+    try db.runUntilIdle();
+    var concurrent = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")).?;
+    defer concurrent.deinit(alloc);
+    try std.testing.expectEqual(kept.generation, concurrent.generation);
+
+    // Publication convergence alone does not make a truncated page complete.
+    const partial_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:b", "asset", "document_units_v1");
+    defer alloc.free(partial_key);
+    var partial = try std.json.parseFromSlice(std.json.Value, alloc, range_after_b.manifest_json, .{});
+    defer partial.deinit();
+    try partial.value.object.put(partial.arena.allocator(), "ocr_failed_count", .{ .integer = 1 });
+    const partial_bytes = try std.json.Stringify.valueAlloc(alloc, partial.value, .{});
+    defer alloc.free(partial_bytes);
+    try db.core.store.put(partial_key, partial_bytes);
+    var retry = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .selection = .incomplete });
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), retry.skipped);
+    try std.testing.expectEqual(@as(usize, 1), retry.reprocessed);
+    try db.runUntilIdle();
+    var repaired = (try db.getDocumentArtifactManifest(alloc, "doc:b", "document_units_v1")).?;
+    defer repaired.deinit(alloc);
+    try std.testing.expectEqual(range_after_b.generation + 1, repaired.generation);
+    try std.testing.expect(std.mem.indexOf(u8, repaired.manifest_json, "\"max_output_tokens_per_item\":8192") != null);
+    // A corrupt manifest is reported without preventing healthy siblings from
+    // being inspected, or guessing a generation and forcing an unsafe retry.
+    try db.core.store.put(partial_key, "{");
+    var corrupt = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .selection = .incomplete });
+    defer corrupt.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), corrupt.failed);
+    try std.testing.expectEqual(@as(usize, 1), corrupt.skipped);
+    try std.testing.expectEqualStrings("InvalidDocumentExtractionManifest", corrupt.failures[0].error_code);
 }
 
 test "db generic artifact repair queue reprocesses document asset artifacts" {
@@ -105088,7 +105231,7 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
             defer a.free(value);
             try db.batchInternal(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .enrichments }, null, .{ .force_generated_artifact_names = &.{"vectors"}, .wait_for_sync_level = false });
         } else {
-            try std.testing.expect(if (synchronous) try db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "vectors", true) else try db.reprocessDocumentArtifact(a, "doc", "vectors"));
+            try std.testing.expect(if (synchronous) try db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "vectors", true, false) else try db.reprocessDocumentArtifact(a, "doc", "vectors"));
             try db.runUntilIdle();
         }
     }

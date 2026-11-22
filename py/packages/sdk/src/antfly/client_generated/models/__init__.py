@@ -383,11 +383,14 @@ from .document_artifact_reprocess_failure import DocumentArtifactReprocessFailur
 from .document_artifact_reprocess_job import DocumentArtifactReprocessJob
 from .document_artifact_reprocess_job_phase import DocumentArtifactReprocessJobPhase
 from .document_artifact_reprocess_job_reprocess_status import DocumentArtifactReprocessJobReprocessStatus
+from .document_artifact_reprocess_job_selection import DocumentArtifactReprocessJobSelection
 from .document_artifact_reprocess_job_start_request import DocumentArtifactReprocessJobStartRequest
+from .document_artifact_reprocess_job_start_request_selection import DocumentArtifactReprocessJobStartRequestSelection
 from .document_artifact_reprocess_response import DocumentArtifactReprocessResponse
 from .document_artifact_reprocess_response_reprocess import DocumentArtifactReprocessResponseReprocess
 from .document_artifact_reprocess_shard_cursor import DocumentArtifactReprocessShardCursor
 from .document_artifact_table_reprocess_request import DocumentArtifactTableReprocessRequest
+from .document_artifact_table_reprocess_request_selection import DocumentArtifactTableReprocessRequestSelection
 from .document_artifact_table_reprocess_response import DocumentArtifactTableReprocessResponse
 from .document_artifact_table_reprocess_response_reprocess import DocumentArtifactTableReprocessResponseReprocess
 from .document_artifact_table_reprocess_response_reprocess_status import (
@@ -3130,11 +3133,14 @@ __all__ = (
     "DocumentArtifactReprocessJob",
     "DocumentArtifactReprocessJobPhase",
     "DocumentArtifactReprocessJobReprocessStatus",
+    "DocumentArtifactReprocessJobSelection",
     "DocumentArtifactReprocessJobStartRequest",
+    "DocumentArtifactReprocessJobStartRequestSelection",
     "DocumentArtifactReprocessResponse",
     "DocumentArtifactReprocessResponseReprocess",
     "DocumentArtifactReprocessShardCursor",
     "DocumentArtifactTableReprocessRequest",
+    "DocumentArtifactTableReprocessRequestSelection",
     "DocumentArtifactTableReprocessResponse",
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",

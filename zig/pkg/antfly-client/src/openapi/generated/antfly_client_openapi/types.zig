@@ -5639,7 +5639,7 @@ pub const ChunkOutputTarget = struct {
     model: []const u8,
     /// False retains this model as a planning boundary while skipping its inference; used for independent output repairs.
     execute: ?bool = null,
-    /// Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped.
+    /// Execution-only repair mask for accepted receipts. A sub_index of 4294967295 skips all outputs at that ordinal. Other entries skip individual sub-windows. Masks leave recipe and boundary identities unchanged.
     skip_windows: ?[]const std.json.Value = null,
     required: ?bool = null,
     model_identity: ?[]const u8 = null,
@@ -12691,7 +12691,7 @@ pub const DocumentArtifactManifest = struct {
     last_error_code: OpenApiOptionalNullable([]const u8) = .absent,
     /// Human-readable last extraction or materialization error summary, when available.
     last_error_message: OpenApiOptionalNullable([]const u8) = .absent,
-    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses.
+    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it.
     manifest_json: ?[]const u8 = null,
     /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
     state_json: OpenApiOptionalNullable([]const u8) = .absent,
@@ -12874,6 +12874,8 @@ pub const DocumentArtifactReprocessFailure = struct {
 };
 
 pub const DocumentArtifactReprocessJob = struct {
+    /// all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+    selection: ?[]const u8 = null,
     /// Server-assigned durable repair job identifier.
     job_id: u64,
     /// Monotonic execution attempt token for the current running pass.
@@ -12919,8 +12921,47 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Unix epoch milliseconds after which the retained job status may be removed.
     expires_at_millis: u64,
 
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "selection", "selection", true },
+        .{ "job_id", "job_id", false },
+        .{ "attempt_id", "attempt_id", false },
+        .{ "table_name", "table_name", false },
+        .{ "artifact_name", "artifact_name", false },
+        .{ "phase", "phase", false },
+        .{ "reprocess_status", "reprocess_status", false },
+        .{ "from_key", "from_key", false },
+        .{ "to_key", "to_key", false },
+        .{ "limit", "limit", false },
+        .{ "next_key", "next_key", false },
+        .{ "scanned", "scanned", false },
+        .{ "reprocessed", "reprocessed", false },
+        .{ "skipped", "skipped", false },
+        .{ "failed", "failed", false },
+        .{ "pending_shards", "pending_shards", false },
+        .{ "failures", "failures", false },
+        .{ "shard_cursors", "shard_cursors", false },
+        .{ "last_error", "last_error", false },
+        .{ "cancel_requested", "cancel_requested", false },
+        .{ "created_at_millis", "created_at_millis", false },
+        .{ "last_updated_at_millis", "last_updated_at_millis", false },
+        .{ "expires_at_millis", "expires_at_millis", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
         try jw.objectField("job_id");
         try jw.write(self.job_id);
         try jw.objectField("attempt_id");
@@ -12989,6 +13030,8 @@ pub const DocumentArtifactReprocessJob = struct {
 
 /// Request to create a durable table artifact reprocess job.
 pub const DocumentArtifactReprocessJobStartRequest = struct {
+    /// all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+    selection: ?[]const u8 = null,
     /// Exclusive lower bound source document key.
     from_key: ?[]const u8 = null,
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
@@ -13000,6 +13043,7 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "selection", "selection", true },
         .{ "from_key", "from_key", true },
         .{ "to_key", "to_key", true },
         .{ "limit", "limit", true },
@@ -13016,6 +13060,10 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
         if (self.from_key) |value| {
             try jw.objectField("from_key");
             try jw.write(value);
@@ -13088,6 +13136,8 @@ pub const DocumentArtifactReprocessShardCursor = struct {
 
 /// Bounded request for reprocessing a derived artifact across source rows in key order.
 pub const DocumentArtifactTableReprocessRequest = struct {
+    /// all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+    selection: ?[]const u8 = null,
     /// Exclusive lower bound source document key. Use the prior response next_key to continue.
     from_key: ?[]const u8 = null,
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
@@ -13099,6 +13149,7 @@ pub const DocumentArtifactTableReprocessRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "selection", "selection", true },
         .{ "from_key", "from_key", true },
         .{ "to_key", "to_key", true },
         .{ "limit", "limit", true },
@@ -13115,6 +13166,10 @@ pub const DocumentArtifactTableReprocessRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
         if (self.from_key) |value| {
             try jw.objectField("from_key");
             try jw.write(value);
@@ -17245,8 +17300,10 @@ pub const ExactSortError = struct {
     }
 };
 
-/// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
+/// Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply.
 pub const ExecutionPolicy = struct {
+    /// Invocation output-token budget for reader/generator assets and document-extraction OCR pages. Overrides producer max_tokens at execution only; it does not change the stored recipe, source fingerprint, or completed outputs. A lower value does not retroactively reject accepted output. Omit to use the producer budget.
+    max_output_tokens_per_item: ?u32 = null,
     /// Maximum items to process in one batch for this operation.
     batch_items: ?i64 = null,
     /// Approximate maximum source bytes to process in one batch for this operation.
@@ -17256,6 +17313,7 @@ pub const ExecutionPolicy = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "max_output_tokens_per_item", "max_output_tokens_per_item", true },
         .{ "batch_items", "batch_items", true },
         .{ "batch_bytes", "batch_bytes", true },
         .{ "max_document_pages", "max_document_pages", true },
@@ -17271,6 +17329,10 @@ pub const ExecutionPolicy = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.max_output_tokens_per_item) |value| {
+            try jw.objectField("max_output_tokens_per_item");
+            try jw.write(value);
+        }
         if (self.batch_items) |value| {
             try jw.objectField("batch_items");
             try jw.write(value);

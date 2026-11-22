@@ -1179,6 +1179,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "import preflights full portable envelope before mutating destination",
             "export and import documents preserve timestamps",
             "portable backup round trips relational rows and schema metadata",
+            "export and import preserves portable schema and catalog metadata",
             "portable backup curation proposal metadata",
             "portable backup native resolver authority",
             "portable backup refuses retained retirement and topology authority without a catalog",
@@ -2615,6 +2616,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-enrichment-shorthand-test", "Validate enrichment shorthand expansion into producer configs")
         .dependOn(&addFilteredTestRunArtifact(b, enrichment_shorthand_api_tests).step);
+
+    const artifact_policy_filters = &.{ "enrichment shorthand", "artifact replacement" };
+    const artifact_policy_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = artifact_policy_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-artifact-execution-policy-api-test", "Verify producer inheritance, typed transcription and policy continuation contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_policy_tests, artifact_policy_filters).step);
 
     const admission_routing_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
@@ -7463,6 +7473,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-protected-backfill-test", "Verify protected model migration batching without model inference")
         .dependOn(&addFilteredTestRunArtifact(b, protected_backfill_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const artifact_policy_storage_filters = &.{
+        "db execution policy",                                                                "db document extraction manifest inspection and reprocess API",
+        "execution budgets preserve extraction fingerprints",                                 "execution policy preserves ordered semantic identity",
+        "ordered artifact inventory producer definition identity binds every provider field", "ordered artifact inventory direct producers carry unchanged input across unrelated row changes",
+    };
+    const artifact_policy_storage_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = artifact_policy_storage_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-artifact-execution-policy-storage-test", "Verify operational policy persistence, immutable authority and incomplete-only retry")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_policy_storage_tests, artifact_policy_storage_filters).step);
+
     const inference_evaluation_tests = b.addTest(.{
         .name = "inference-evaluation-storage-tests",
         .root_module = db_test_mod,

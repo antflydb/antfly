@@ -447,3 +447,58 @@ provider connection and bind its verified Workload Identity principal to the
 source bucket. Self-hosted deployments configure `connections` directly. This
 artifact transport requires a release containing native GCS content fetching;
 GCS external-I/O support in v0.3.0-rc.6 alone is insufficient.
+
+## Raise an OCR budget without regenerating complete files
+
+An output budget belongs under `execution`, not in a replacement OCR recipe.
+For an existing artifact, retain its public descriptor fields and omit the
+write-only producer fields so Antfly preserves the stored recipe and credentials.
+An explicit `transcriber`, `producer`, or `producer_json` replaces the producer;
+only omission inherits it:
+
+```http
+PUT /db/v1/tables/documents/artifacts/document_units_v1/enrichment
+Content-Type: application/json
+
+{
+  "name": "document_units_v1",
+  "kind": "asset",
+  "field": "url",
+  "content_type": "application/json",
+  "execution": {"max_output_tokens_per_item": 8192}
+}
+```
+
+This changes future invocations. It preserves complete existing artifacts,
+including output longer than a subsequently lowered budget. The node/provider's
+request limits still apply. Do not remove `max_tokens` from the old stored
+producer while applying this update: changing the recipe changes its identity.
+
+To retry only missing or incomplete document-extraction artifacts, submit a
+bounded job with an explicit selection:
+
+```http
+POST /db/v1/tables/documents/artifacts/document_units_v1/reprocess-jobs
+Content-Type: application/json
+
+{"selection":"incomplete","limit":25,"advance":false}
+```
+
+Advance and inspect the returned job using its existing job routes. Complete
+artifacts are skipped; converged manifests with failed OCR pages are incomplete.
+The selection survives pagination and job recovery. Selection is per source
+record, so pages within an incomplete multi-page record may be processed again.
+Use `selection: all` only when regeneration of accepted output is intended.
+Omitting selection retains that existing `all` behavior. Other producer kinds
+reject incomplete selection. Upgrade the coordinator and data owners before
+using this field; older owners must not silently interpret it as `all`.
+
+Acceptance is not completion: inspect manifests and all consumer-index readiness
+before declaring recovery successful. Model, prompt, rendering and extraction
+policy changes can invalidate existing results. Chunking, embeddings and graph
+changes rebuild their downstream artifacts while reusing extracted text.
+
+Policy-only updates are persisted separately from the frozen publication catalog,
+so they preserve accepted publication proofs as well as extraction fingerprints.
+Incomplete-only retries inspect coverage and generation from one manifest
+snapshot. Changing a model, prompt or source recipe still changes semantic identity.
