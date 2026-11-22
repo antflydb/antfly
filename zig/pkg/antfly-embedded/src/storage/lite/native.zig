@@ -8477,7 +8477,7 @@ pub const NativeFile = struct {
             // sequence than the data file. The sidecar fence lets a cold
             // opener use the persisted frontier without racing appends.
             const protected = self.header.protected_redo and !self.no_sync;
-            var use_persisted_frontier = protected and self.read_only and sidecar_fence != null;
+            var use_persisted_frontier = protected and (self.writer_lock_file != null or sidecar_fence != null);
             const live_writer = if (scan_region) |r| r.foreignLiveWriter(0) else false;
             if (protected and self.read_only and !holds_authority and sidecar_fence == null and replay_ceiling != null and !live_writer) {
                 switch (self.holdSidecarReadFence(io)) {
@@ -21161,6 +21161,11 @@ pub const NativeFile = struct {
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
         try self.refreshIfWriterBaseStale(true);
         try self.resyncRedoTailUnderAuthority();
+        // Persist a pending physical slot before a new WAL record can
+        // consume the sequence after it. The slot proves the gap on replay.
+        if (self.header.protected_redo and self.durable_header != null and self.pendingPhysicalRedoCheckpoint(self.activeCheckpoint())) {
+            try self.sync();
+        }
         self.debugEnterCommitSpan();
         if (self.lease_managed) {
             if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.claimActiveWriter(entry, @intFromPtr(self));
@@ -22955,6 +22960,12 @@ pub const NativeFile = struct {
         }
     }
 
+    fn pendingPhysicalRedoCheckpoint(self: *const NativeFile, checkpoint: CheckpointSlot) bool {
+        const redo = if (self.redo) |*state| state else return false;
+        return redo.checkpoint_sequence == checkpoint.commit_sequence or
+            (redo.unsynced_from != null and redo.durable_sequence == checkpoint.commit_sequence);
+    }
+
     pub fn sync(self: *NativeFile) !void {
         if (self.redo_frontier_uncertain) return error.OutcomeUnknown;
         if (self.transaction_header != null) return;
@@ -22964,7 +22975,24 @@ pub const NativeFile = struct {
         // `syncIndexContents`/`sync`, a bare durability barrier) holds its
         // own lock across this whole call, unreleased.
         try self.syncIfRequired(null);
-        if (self.durable_header != null) try self.publishCheckpoint(self.activeCheckpoint(), false, null);
+        if (self.durable_header != null) {
+            var checkpoint = self.activeCheckpoint();
+            if (self.redo) |*redo| {
+                if (self.pendingPhysicalRedoCheckpoint(checkpoint)) {
+                    // This sequence belongs to a physical checkpoint.
+                    // Publish the roots and the fold floor together.
+                    const was_checkpointing = redo.checkpointing;
+                    redo.checkpointing = true;
+                    defer redo.checkpointing = was_checkpointing;
+                    checkpoint.redo_folded_through = @max(checkpoint.redo_folded_through, redo.checkpoint_sequence);
+                    try self.publishCheckpoint(checkpoint, false, null);
+                    redo.durable_sequence = @max(redo.durable_sequence, checkpoint.commit_sequence);
+                    if (redo.checkpoint_sequence == checkpoint.commit_sequence) self.publishRedoLogState();
+                    return;
+                }
+            }
+            try self.publishCheckpoint(checkpoint, false, null);
+        }
         self.last_synced_header = self.header;
     }
 
@@ -39717,7 +39745,7 @@ fn expectRedoDocument(file: *NativeFile, key: []const u8, expected: ?[]const u8)
 // reader replays only what the writer published; the next writer, under
 // writer authority, validates the surviving record, syncs it, and
 // publishes it before appending after it.
-test "lite redo log readers replay only what the writer published as durable" {
+test "lite redo log cold readers recover sealed commits despite an older watermark" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -39742,7 +39770,7 @@ test "lite redo log readers replay only what the writer published as durable" {
         var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
         defer reader.close();
         try expectRedoDocument(&reader, "alpha", "one");
-        try expectRedoDocument(&reader, "beta", null);
+        try expectRedoDocument(&reader, "beta", "two");
     }
     {
         var writer = try NativeFile.openWithIo(a, io, path, .{});
@@ -40104,10 +40132,12 @@ test "lite redo cold reader uses the durable frontier ahead of a coherent waterm
     var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
     defer region.close();
     region.publishLogState(old_watermark);
-    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
-    defer reader.close();
-    try expectRedoDocument(&reader, "before", "one");
-    try expectRedoDocument(&reader, "after", "two");
+    for ([_]bool{ true, false }) |read_only| {
+        var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = read_only });
+        defer reader.close();
+        try expectRedoDocument(&reader, "before", "one");
+        try expectRedoDocument(&reader, "after", "two");
+    }
 }
 
 test "lite redo durable frontier recovers acknowledged redo after losing one frontier page" {
@@ -40652,10 +40682,9 @@ test "lite redo log reopens after a ledger-only reclaim follows a log reset" {
     try expectRedoDocument(&reopened, "beta", "two");
 }
 
-// With nothing published, a writer holding the lease (or one that died
-// holding it) may have appended records it never made durable. A cold
-// reader bounds its replay to the checkpoint instead of scanning unbounded.
-test "lite redo log a cold reader does not replay unpublished appends while a writer holds the lease" {
+// The dead holder no longer owns the sidecar lease. A cold reader can
+// consult the persisted frontier even if it has never seen a watermark.
+test "lite redo log a stale dead-writer word does not hide sealed commits" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -40676,7 +40705,7 @@ test "lite redo log a cold reader does not replay unpublished appends while a wr
     {
         var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
         defer reader.close();
-        try expectRedoDocument(&reader, "alpha", null);
+        try expectRedoDocument(&reader, "alpha", "one");
     }
     region.clearWriterForTest();
     var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });

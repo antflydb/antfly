@@ -2278,9 +2278,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn isPersistedRunSource(self: *const @This(), source_index: usize) bool {
             const offset = self.runSourceOffset();
             if (source_index < offset) return false;
-            const run_index = self.run_spans[source_index].current;
-            if (run_index >= self.sequence.count()) return false;
-            const run = self.sequence.at(run_index);
+            const run = self.run_spans[source_index].descriptor orelse return false;
             return run.state == null and run.path != null;
         }
 
