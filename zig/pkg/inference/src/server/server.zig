@@ -24052,9 +24052,6 @@ pub const Node = struct {
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const wire_allocator = platform.allocator.processAllocator(std.heap.smp_allocator);
-        var client = httpx.Client.init(wire_allocator, ctx.io);
-        defer client.deinit();
         const results = try alloc.alloc(api.ReadObject, images.len);
         var batch_bytes: usize = 0;
         var decoded = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
@@ -24098,53 +24095,77 @@ pub const Node = struct {
             if (page.downloaded) |item| live_media_bytes +|= item.data.len +| item.content_type.len;
         }
 
-        const replies = try alloc.alloc(?readers_api.BatchResult, pages.len);
-        @memset(replies, null);
-        defer for (replies) |*slot| {
-            if (slot.*) |*reply| reply.deinit(wire_allocator);
-        };
         const capacity = self.inference_admission.capacity;
         var workers = @min(pages.len, std.math.clamp(@as(usize, cfg.hosted_parallelism), 1, 8));
-        var retained_reply_limit = hosted_ocr_retained_reply_bytes;
+        var wire_budget: usize = 0;
         if (capacity != 0) {
             const prompt_size = hostedJsonSize(body.prompt orelse cfg.prompt orelse "");
             const model_size = hostedJsonSize(cfg.model orelse "");
             const json_overhead = (std.math.cast(usize, prompt_size +| model_size) orelse std.math.maxInt(usize)) +| 4096;
             var dispatch_costs: [max_read_batch_images]usize = undefined;
             const costs = dispatch_costs[0..pages.len];
-            for (pages, costs) |page, *cost| cost.* = hostedOcrDispatchBytes(page, json_overhead);
-            const capacity_bytes = capacity *| read_admission_bytes_per_unit;
-            const plan = hostedOcrDispatchPlan(costs, workers, capacity_bytes -| live_media_bytes -| @sizeOf(readers_api.Result));
-            if (plan.workers == 0) return documentFailureResponse(ctx, error.ReadBatchTooLarge);
-            workers = plan.workers;
-            const dispatch_live_bytes = live_media_bytes +| plan.bytes;
-            const target_units = @max(reserved_units.*, admissionUnitsFor(dispatch_live_bytes +| @sizeOf(readers_api.Result), read_admission_bytes_per_unit));
+            var largest_outbound: usize = 0;
+            // Receive and parse allocations share the same hard live-byte
+            // quota as request construction. This allowance sizes the
+            // reservation and the quota enforces its actual use.
+            const receive_allowance = hosted_ocr_response_bytes * 3;
+            for (pages, costs) |page, *cost| {
+                const outbound = hostedOcrDispatchBytes(page, json_overhead);
+                largest_outbound = @max(largest_outbound, outbound);
+                cost.* = outbound +| receive_allowance;
+            }
+            const available = (capacity *| read_admission_bytes_per_unit) -| live_media_bytes;
+            const plan = hostedOcrDispatchPlan(costs, workers, available);
+            const planned_bytes = if (plan.workers == 0) blk: {
+                // One worker may fit with a smaller reply. Give it the
+                // remaining budget and let the allocator enforce the limit.
+                if (largest_outbound >= available) return documentFailureResponse(ctx, error.ReadBatchTooLarge);
+                workers = 1;
+                break :blk available;
+            } else blk: {
+                workers = plan.workers;
+                break :blk plan.bytes;
+            };
+            const target_units = @max(reserved_units.*, admissionUnitsFor(live_media_bytes +| planned_bytes, read_admission_bytes_per_unit));
             if (target_units != reserved_units.*) {
                 if (try self.growSlotUnits(ctx, reserved_units.*, target_units)) |response| return response;
                 reserved_units.* = target_units;
             }
-            const reserved_bytes = self.inference_admission.capacityUnits(reserved_units.*) *| read_admission_bytes_per_unit;
-            retained_reply_limit = @min(retained_reply_limit, reserved_bytes -| dispatch_live_bytes);
+            wire_budget = (self.inference_admission.capacityUnits(reserved_units.*) *| read_admission_bytes_per_unit) -| live_media_bytes;
         }
+
+        const wire_backing = platform.allocator.processAllocator(std.heap.smp_allocator);
+        var wire_quota: httpx.QuotaAllocator = .{ .backing = wire_backing, .limit = wire_budget };
+        const wire_allocator = if (capacity == 0) wire_backing else wire_quota.allocator();
+        const replies = try alloc.alloc(?readers_api.BatchResult, pages.len);
+        @memset(replies, null);
+        defer for (replies) |*slot| {
+            if (slot.*) |*reply| reply.deinit(wire_allocator);
+        };
         var queue: HostedReadQueue = .{
             .allocator = wire_allocator,
-            .client = &client,
+            .client = undefined,
             .pages = pages,
             .replies = replies,
             .config = cfg,
             .prompt = body.prompt,
             .tokens = tokens,
             .input_limit = self.config.request_limits.max_input_tokens_per_item,
-            .retained_reply_limit = retained_reply_limit,
+            .retained_reply_limit = hosted_ocr_retained_reply_bytes,
             .control = control,
         };
         {
+            var client = httpx.Client.init(wire_allocator, ctx.io);
+            defer client.deinit();
+            queue.client = &client;
             var group = std.Io.Group.init;
             defer group.cancel(ctx.io);
             for (1..workers) |_| group.concurrent(ctx.io, HostedReadQueue.run, .{&queue}) catch break;
             queue.run();
             group.await(ctx.io) catch |err| return documentFailureResponse(ctx, err);
         }
+        if (queue.failure == error.OutOfMemory and wire_quota.exceeded)
+            return ctx.status(502).json(.{ .@"error" = "READER_WORKING_LIMIT_EXCEEDED" });
         if (queue.failure) |err| return switch (err) {
             error.OutOfMemory, error.ReadOutputTruncated, error.DocumentUnresolved, error.Timeout, error.Cancelled, error.Canceled => documentFailureResponse(ctx, err),
             error.InferenceInputTokensExceeded => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "image tokens exceed the deployment limit" }),
@@ -24179,7 +24200,7 @@ pub const Node = struct {
             .usage = if (measured) usage else null,
         };
         const body_size = hostedJsonSize(result);
-        const response_units = hostedOcrResponseUnits(body_size, queue.retained_reply_bytes, inline_source_bytes, capacity) catch
+        const response_units = hostedOcrResponseUnits(body_size, if (capacity == 0) queue.retained_reply_bytes else wire_quota.live, inline_source_bytes, capacity) catch
             return ctx.status(502).json(.{ .@"error" = "READER_OUTPUT_TOO_LARGE" });
         const target_units = @max(response_units.peak, reserved_units.* +| (response_units.response -| hosted_ocr_initial_response_units));
         if (target_units != reserved_units.*) {
@@ -49827,6 +49848,39 @@ test "hosted image reader budgets the largest concurrent dispatch buffers" {
     try std.testing.expectEqual(@as(usize, 0), impossible.workers);
     const page: Node.HostedImagePage = .{ .bytes = "123", .mime = "image/png", .original_uri = "" };
     try std.testing.expect(Node.hostedOcrDispatchBytes(page, 4096) > 4096 + 2 * std.base64.standard.Encoder.calcSize(page.bytes.len));
+}
+
+test "hosted image reader reuses its live quota across dispatch and reply retention" {
+    const reply_size = @sizeOf(readers_api.Result) + 8;
+    var quota: httpx.QuotaAllocator = .{ .backing = std.testing.allocator, .limit = 1024 + reply_size };
+    const a = quota.allocator();
+    const outgoing = try a.alloc(u8, 1024);
+    const items = try a.alloc(readers_api.Result, 1);
+    var reply: readers_api.BatchResult = .{ .items = items, .execution = undefined };
+    items[0] = .{ .text = try a.dupe(u8, "response") };
+    defer reply.deinit(a);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 1));
+    a.free(outgoing);
+
+    var replies: [1]?readers_api.BatchResult = @splat(null);
+    const pages: [1]Node.HostedImagePage = undefined;
+    var queue: Node.HostedReadQueue = .{
+        .allocator = a,
+        .client = undefined,
+        .pages = &pages,
+        .replies = &replies,
+        .config = undefined,
+        .prompt = null,
+        .tokens = 1,
+        .input_limit = null,
+        .control = .{},
+        .retained_reply_limit = hosted_ocr_retained_reply_bytes,
+    };
+    try queue.accept(queue.take().?, reply);
+    try std.testing.expectEqual(reply_size, queue.retained_reply_bytes);
+    try std.testing.expectEqual(reply_size, quota.live);
+    const next = try a.alloc(u8, 1024);
+    a.free(next);
 }
 
 test "hosted image reader stops dispatch when retained metadata exceeds its limit" {
