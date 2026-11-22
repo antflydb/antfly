@@ -2608,7 +2608,7 @@ pub const Owner = struct {
             // Other processes' redo-only commits that changed document rows
             // and full-text index records: catch this runtime up in place.
             if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and
-                !needsOutcomeReconciliation(current) and file.redo != null and fast2_metadata_unchanged and
+                !needsOutcomeReconciliation(current) and file.redo != null and
                 try refreshInPlace(current, file, &probe))
             {
                 if (comptime h.builtin.is_test) _ = self.test_in_place_refresh_count.fetchAdd(1, .release);
