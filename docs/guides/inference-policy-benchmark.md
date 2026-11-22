@@ -69,6 +69,7 @@ python3 zig/tools/benchmark_inference_policies.py \
   --endpoint x86=http://127.0.0.1:18091/ai/v1 \
   --endpoint arm=http://127.0.0.1:18092/ai/v1 \
   --backend x86=native --backend arm=native \
+  --reference-endpoint x86 \
   --hourly-usd x86=0.3438641 --hourly-usd arm=0.218246 \
   --runtime-image ghcr.io/antflydb/antfly@sha256:d0f703b4f4b0333115d5f489ab1b548559f6e3ee2b2dc5757c50ec48b11e1407 \
   --trials 3 --timeout 600
@@ -84,11 +85,27 @@ Do not compare different model sizes as an architecture speedup.
 
 ## Interpret and resume
 
-The first call per policy is retained as warmup and excluded from warm throughput.
-It can include lazy model loading, but OS/GCS caches are uncontrolled; it is not
-a clean cold-start measurement. Endpoint and policy order alternate between
-trials. Each successful request must also report the requested pinned model on
-the expected native/CUDA backend. A readiness check alone cannot satisfy this.
+Each execution epoch warms the pending endpoint/policies again, including after
+resume. Warmup includes any lazy load and is excluded from warm throughput. The
+runner checks the loaded pinned model's instance ID and backend before and after
+every timed call. An idle eviction triggers another untimed warmup; an instance
+change during execution invalidates that sample. The isolated CPU trials disable
+idle expiry while retaining the one-model bound. OS/GCS caches are uncontrolled;
+these are warm-model measurements, not clean cold-cache measurements. Endpoint
+and policy order alternate between trials. Metadata probes and journal commits
+are outside the timed inference call; the request duration includes transport.
+`--response-grace` allows bounded timeout cleanup without extending the inference
+execution deadline.
+
+Embedding cases require an explicit trusted `--reference-endpoint`. Its first
+valid warmup establishes the reference for that fixture/model. Every embedding,
+including later baseline calls, must be finite, have the expected dimensions and
+unit norm, and match that reference. Defaults require cosine >= 0.9999, maximum
+absolute error <= 0.001, and RMSE <= 0.0001. The explicit
+`--embedding-min-cosine`, `--embedding-max-abs-error`, and `--embedding-max-rmse`
+options are recorded in campaign identity. Tolerances and baseline cannot change
+on resume. A unit vector with unrelated contents fails. These checks establish
+reference equivalence, not the semantic quality of an untrusted baseline.
 
 Reports retain durations, fixture hashes, normalized output hashes, numeric usage,
 completion/truncation, failures, and cost per completed result. They omit response
@@ -99,16 +116,43 @@ other failure makes the command fail. Inspect truncated full-budget pages instea
 of counting them as successes. Expected fragments and EOS do not prove full
 transcription accuracy; review the output separately against the source page.
 
-`policy_comparison` pairs only the same endpoint, fixture, and trial. It estimates
+`policy_comparison` pairs only the same endpoint, fixture, trial, execution epoch
+and resident model instance. It estimates
 the old policy's elapsed time as the 4096-token call plus the 8192-token call
 when retry is necessary. This reuses the measured high-budget call; it is not
 a separately executed retry campaign or proof of an exact production speedup.
 Report per-page distributions and completeness, not just a corpus average.
+An interrupted or evicted pair is excluded rather than silently pairing different
+worker incarnations. Coverage includes planned/matched policy pairs, and
+`policy_comparison_complete` and warnings expose missing pairs even when all
+individual timed measurements pass. Start a new campaign when a complete paired
+policy estimate is needed; recorded timed calls are never silently repeated.
 
-Use the identical command with `--resume` after interruption. Already recorded
-attempts are not executed again. Changed fixtures, cases, endpoints, prices,
-runtime identity, or trial counts reject resume. Failures remain in the report;
-start a new report after fixing them. This benchmark does not rerun corpus OCR.
+Use the identical command with `--resume` after interruption. Recorded timed
+attempts are not executed again; only pending work receives fresh warmup. Changed
+fixtures, cases, endpoints, prices, code, runtime identity, tolerances or trial
+counts reject resume. The complete campaign is hashed without retaining fixture
+payloads; only one fixture is encoded at a time. Failures remain in the record;
+start a new campaign after fixing them. This benchmark does not rerun corpus OCR.
+
+The private `<report>.state/` directory is the authoritative checkpoint. An
+exclusive OS lock rejects simultaneous writers before report replay or inference.
+Each measured request and warmup is appended to a checksummed, fsynced journal;
+resume discards only an unterminated tail and rejects committed corruption or
+duplicate measurements. The JSON report is an atomic projection at normal exit
+or handled interruption, not a per-request rewrite. During execution use stdout
+for progress. Keep the state directory with the report for resume; copying only
+the report is insufficient. Reports from the earlier journal-less format are
+rejected without overwriting them; use a new campaign path.
+
+Reference vectors are sensitive derived data. They are stored in separate private,
+checksummed files and loaded one case at a time, never embedded in the report or
+journal. State directories use mode 0700; state files, references and report use
+0600. Public report rows contain only hashes, numeric comparisons, usage and fixed
+error codes. This tool uses POSIX advisory locks and supports macOS/Linux. A
+process crash between inference completion and journal commit can repeat that
+unrecorded request; the journal provides durable recorded-attempt semantics, not
+exactly-once remote execution.
 
 For corpus recovery, inspect native artifact configuration and repair issues,
 then submit a bounded native repair/reprocess job for the affected documents.

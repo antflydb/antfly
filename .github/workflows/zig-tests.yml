@@ -807,6 +807,8 @@ jobs:
           python3 -m unittest discover -s scripts/ci -p test_artifact_exchange.py
           python3 -m unittest discover -s scripts/release -p test_r2_scope_restore.py
           python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
+          python3 -m unittest discover -s zig/tools -p 'test_benchmark_inference_policies.py'
+          python3 -m unittest discover -s zig/tools -p 'test_qualify_cpu_media.py'
           python3 -m unittest discover -s scripts/ci -p test_lite_embedding_bundle.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
@@ -1400,6 +1402,8 @@ jobs:
           python3 -m unittest discover -s scripts/ci -p test_artifact_exchange.py
           python3 -m unittest discover -s scripts/release -p test_r2_scope_restore.py
           python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
+          python3 -m unittest discover -s zig/tools -p 'test_benchmark_inference_policies.py'
+          python3 -m unittest discover -s zig/tools -p 'test_qualify_cpu_media.py'
           python3 -m unittest discover -s scripts/ci -p test_lite_embedding_bundle.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
