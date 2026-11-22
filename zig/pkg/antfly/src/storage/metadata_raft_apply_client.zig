@@ -709,6 +709,11 @@ pub const RaftApplyStore = struct {
         return self.catalogProjection(feed.MaintenanceScan, a, group_id, .{ .changefeed_maintenance = .{ .now = now, .after = after } });
     }
 
+    pub fn scanChangefeedCandidates(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, now: u64, after: ?feed.Id, pressure: bool) !feed.MaintenanceScan {
+        if (!pressure) return self.scanChangefeedMaintenance(a, group_id, now, after);
+        return self.catalogProjection(feed.MaintenanceScan, a, group_id, .{ .changefeed_pressure = .{ .now = now, .after = after } });
+    }
+
     pub fn getSourceControl(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, source_id: source.Digest) ![]u8 {
         return self.catalogProjection([]u8, a, group_id, .{ .source_control = .{ .table_id = table_id, .source_id = source_id } });
     }

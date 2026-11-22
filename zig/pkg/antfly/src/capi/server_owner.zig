@@ -2361,6 +2361,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.scanChangefeedMaintenance(a, group_id, input.now, input.after) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .changefeed_pressure => |input| {
+                    const value = handle.store.scanChangefeedCandidates(a, group_id, input.now, input.after, true) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .source_control => |input| {
                     const value = handle.store.getSourceControl(a, group_id, input.table_id, input.source_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

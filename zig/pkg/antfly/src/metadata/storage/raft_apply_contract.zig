@@ -332,6 +332,7 @@ pub const CatalogProjectionRequest = union(enum) {
     changefeed_control: feed.Id,
     changefeed_authority: void,
     changefeed_maintenance: struct { now: u64, after: ?feed.Id },
+    changefeed_pressure: struct { now: u64, after: ?feed.Id },
     source_control: struct { table_id: u64, source_id: [32]u8 },
     legacy_source_intake: struct { table_id: u64, ordinal: u32, definition: [32]u8 },
     native_source_recovery_scope: struct { table_id: u64, ordinal: u32, definition: [32]u8 },
