@@ -20719,12 +20719,12 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             stable[count] = borrowed;
             count += 1;
         }
-        // Subsampling has recreated the ordinary source-linear bank in this
-        // invocation. Complete its queued producer and retire it BEFORE the
-        // bounded arena host body, especially before CUDA capture starts.
-        try prepareSourceLinearArenaScope(self);
-        var scope = try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
         const capture = arena.graph == null and !arena.disabled;
+        // Recording requires retirement of the ordinary source bank. An
+        // eager scope reads staged inputs on the same stream and can leave
+        // that bank with its existing lexical audioStorage owner.
+        if (capture) try prepareSourceLinearArenaScope(self);
+        var scope = try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
         if (!capture and output.bytes == output_bytes) {
             try scope.bindPublishedOutput(tensorFromCt(out).buffer.ptr, output_bytes);
             published_directly = true;
@@ -21535,7 +21535,7 @@ const SourceLinearTemporary = struct {
         try validateCaptureStorage(self, capture);
         if (self.execution_scope) |scope| {
             if (self.source_linear_scratch.in_use) return error.SourceStorageInUse;
-            if (scope.base != 0 and self.source_linear_scratch.buffer.ptr != 0) return error.CudaGraphCaptureUnsafeTempAlloc;
+            if (capture and scope.base != 0 and self.source_linear_scratch.buffer.ptr != 0) return error.CudaGraphCaptureUnsafeTempAlloc;
         }
         return capture;
     }
@@ -21544,9 +21544,10 @@ const SourceLinearTemporary = struct {
         if (self.execution_scope) |scope| {
             if (self.source_linear_scratch.in_use) return error.SourceStorageInUse;
             if (scope.base != 0) {
-                // Never retire an ordinary physical owner under a bounded
-                // arena/captured host body, even if a caller missed preflight.
-                if (self.source_linear_scratch.buffer.ptr != 0) return error.CudaGraphCaptureUnsafeTempAlloc;
+                // Eager execution uses its assigned span and leaves the
+                // lexical source bank alone. Recording needs stricter custody.
+                if ((actual_capture or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and
+                    self.source_linear_scratch.buffer.ptr != 0) return error.CudaGraphCaptureUnsafeTempAlloc;
                 return .{ .bank = .{ .ptr = try scope.allocate(bytes), .len = bytes, .borrowed = true }, .kind = .captured };
             }
             if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
@@ -60116,7 +60117,7 @@ test "source linear arena precondition refuses retained ordinary storage before 
     var compute = metadataOnlyTestCompute();
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{ .active = true, .buffer = .{ .ptr = 16, .len = 256 } };
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, false));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, true));
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 16), compute.source_linear_scratch.buffer.ptr);
     try std.testing.expect(compute.source_linear_scratch.active and !compute.source_linear_scratch.in_use);
     // A malformed learning scope may not allocate/free while capture is active.
@@ -60195,6 +60196,7 @@ test "public source audio linear recreates input bank through actual learning ca
         if (iteration >= 4) {
             try std.testing.expectEqual(before_calls + 1, run.calls);
             try std.testing.expectEqual(run.output_pointer, tensorFromCt(output).buffer.ptr);
+            try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);
         }
         const actual = try cb.toFloat32(output, std.testing.allocator);
         defer std.testing.allocator.free(actual);
