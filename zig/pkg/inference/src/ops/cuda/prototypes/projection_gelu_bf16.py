@@ -53,51 +53,21 @@ def lighton_vision_up(
 def generate(output, libdevice_path):
     import hashlib
     from pathlib import Path
-    from producer_support import (
-        profiles,
-        compile_program,
-        emit,
-        write_manifest,
-        LIBDEVICE_SHA256,
-    )
+    from producer_support import profiles, compile_program, emit, write_manifest, LIBDEVICE_SHA256
 
-    if (
-        hashlib.sha256(Path(libdevice_path).read_bytes()).hexdigest()
-        != LIBDEVICE_SHA256
-    ):
+    if hashlib.sha256(Path(libdevice_path).read_bytes()).hexdigest() != LIBDEVICE_SHA256:
         raise RuntimeError("Regeneration requires the qualified CUDA 13.0 libdevice")
     records = []
     for spec in profiles("projection_gelu"):
         rounded = spec["bf16"]
         data = compile_program(
             lighton_vision_up,
-            dict(
-                x="*bf16",
-                w="*bf16",
-                bias="*bf16" if rounded else "*fp32",
-                out="*bf16",
-                rows="i32",
-            ),
-            dict(
-                K=spec["hidden"],
-                N=spec["wide"],
-                ROUND_BEFORE=rounded,
-                BM=128,
-                BN=64,
-                BK=32,
-            ),
-            range(4),
-            spec,
-            dict(
-                num_stages=3,
-                enable_fp_fusion=not rounded,
-                extern_libs={"libdevice": str(libdevice_path)},
-            ),
-        )
+            dict(x="*bf16", w="*bf16", bias="*bf16" if rounded else "*fp32", out="*bf16", rows="i32"),
+            dict(K=spec["hidden"], N=spec["wide"], ROUND_BEFORE=rounded, BM=128, BN=64, BK=32),
+            range(4), spec,
+            dict(num_stages=3, enable_fp_fusion=not rounded, extern_libs={"libdevice": str(libdevice_path)}))
         records.append(emit(output, spec, data))
-    write_manifest(
-        output, records, triton=triton.__version__, libdevice_sha256=LIBDEVICE_SHA256
-    )
+    write_manifest(output, records, triton=triton.__version__, libdevice_sha256=LIBDEVICE_SHA256)
 
 
 if __name__ == "__main__":

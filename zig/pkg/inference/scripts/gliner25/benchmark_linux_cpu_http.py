@@ -114,64 +114,39 @@ def receive(base, case, timeout, trace=None):
         except BaseException as body_error:
             if trace is not None:
                 completed = time.perf_counter_ns()
-                trace.update(
-                    error={
-                        "type": type(body_error).__name__,
-                        "message": str(body_error),
-                    },
-                    duration_ns=completed - start,
-                    response_completed_ns=completed,
-                )
+                trace.update(error={"type": type(body_error).__name__, "message": str(body_error)},
+                             duration_ns=completed - start, response_completed_ns=completed)
                 partial = getattr(body_error, "partial", None)
                 if isinstance(partial, bytes):
-                    trace.update(
-                        raw=partial[: 16 * 1024 * 1024 + 1],
-                        response_incomplete=True,
-                        response_truncated=len(partial) > 16 * 1024 * 1024,
-                    )
+                    trace.update(raw=partial[:16 * 1024 * 1024 + 1], response_incomplete=True,
+                                 response_truncated=len(partial) > 16 * 1024 * 1024)
             raise
         if trace is not None:
             completed = time.perf_counter_ns()
-            trace.update(
-                http_status=error.code,
-                raw=body,
-                response_truncated=len(body) > 16 * 1024 * 1024,
-                duration_ns=completed - start,
-                response_completed_ns=completed,
-            )
+            trace.update(http_status=error.code, raw=body, response_truncated=len(body) > 16 * 1024 * 1024,
+                         duration_ns=completed - start, response_completed_ns=completed)
         detail = body[:4096].decode("utf-8", errors="replace")
         raise ValueError(f"{req.full_url}: HTTP {error.code}: {detail}") from error
     except BaseException as error:
         if trace is not None:
             completed = time.perf_counter_ns()
-            trace.update(
-                error={"type": type(error).__name__, "message": str(error)},
-                duration_ns=completed - start,
-                response_completed_ns=completed,
-            )
+            trace.update(error={"type": type(error).__name__, "message": str(error)},
+                         duration_ns=completed - start, response_completed_ns=completed)
             status = getattr(locals().get("response"), "status", None)
             if type(status) is int:
                 trace["http_status"] = status
             partial = getattr(error, "partial", None)
             if isinstance(partial, bytes):
-                trace.update(
-                    raw=partial[: 16 * 1024 * 1024 + 1],
-                    response_incomplete=True,
-                    response_truncated=len(partial) > 16 * 1024 * 1024,
-                )
+                trace.update(raw=partial[:16 * 1024 * 1024 + 1], response_incomplete=True,
+                             response_truncated=len(partial) > 16 * 1024 * 1024)
             elif "raw" in locals():
                 trace.update(raw=raw, response_truncated=len(raw) > 16 * 1024 * 1024)
         raise
     completed = time.perf_counter_ns()
     duration = completed - start
     if trace is not None:
-        trace.update(
-            duration_ns=duration,
-            response_completed_ns=completed,
-            http_status=response.status,
-            raw=raw,
-            response_truncated=False,
-        )
+        trace.update(duration_ns=duration, response_completed_ns=completed,
+                     http_status=response.status, raw=raw, response_truncated=False)
     return {
         "duration_ns": duration,
         "response_completed_ns": completed,
@@ -260,53 +235,30 @@ def bind_arms(path, arms, observe=True):
         build = strict_json(pinned_file(arm["build_receipt"]).read_bytes())
         contract = arm["build_receipt"].get("format", "bounded_decide")
         if contract == "bounded_decide":
-            if (
-                build.get("passed") is not True
-                or build.get("binary_sha256") != arm["binary"]["sha256"]
-                or build.get("source", {}).get("head") != arm["source_commit"]
-                or build.get("source", {}).get("tracked_diff_sha256")
-                != hashlib.sha256(b"").hexdigest()
-            ):
-                raise ValueError(
-                    "arm binary/source differs from clean successful build"
-                )
+            if (build.get("passed") is not True or build.get("binary_sha256") != arm["binary"]["sha256"]
+                    or build.get("source", {}).get("head") != arm["source_commit"]
+                    or build.get("source", {}).get("tracked_diff_sha256") != hashlib.sha256(b"").hexdigest()):
+                raise ValueError("arm binary/source differs from clean successful build")
         elif contract == "guarded_source_map":
             map_path = pinned_file(arm["source_map"])
             if map_path.stat().st_size > 32 * 1024 * 1024:
                 raise ValueError("source map exceeds 32MiB metadata bound")
             source_map = strict_json(map_path.read_bytes())
-            if (
-                not isinstance(source_map, dict)
-                or set(source_map) != {"revision", "files"}
-                or not isinstance(source_map["files"], dict)
-                or not source_map["files"]
-                or any(
-                    not isinstance(name, str)
-                    or not isinstance(digest, str)
-                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-                    for name, digest in source_map["files"].items()
-                )
-            ):
+            if (not isinstance(source_map, dict) or set(source_map) != {"revision", "files"}
+                    or not isinstance(source_map["files"], dict) or not source_map["files"]
+                    or any(not isinstance(name, str) or not isinstance(digest, str)
+                           or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                           for name, digest in source_map["files"].items())):
                 raise ValueError("unsupported guarded source map schema")
-            if (
-                not isinstance(build.get("image"), str)
-                or not build["image"]
-                or build.get("image_sha256") != arm["binary"]["sha256"]
-                or type(build.get("image_bytes")) is not int
-                or build["image_bytes"] != binary.stat().st_size
-            ):
+            if (not isinstance(build.get("image"), str) or not build["image"]
+                    or build.get("image_sha256") != arm["binary"]["sha256"]
+                    or type(build.get("image_bytes")) is not int or build["image_bytes"] != binary.stat().st_size):
                 raise ValueError("guarded build image differs from supplied binary")
-            if (
-                type(build.get("returncode")) is not int
-                or build["returncode"] != 0
-                or build.get("source_unchanged") is not True
-                or build.get("revision") != arm["source_commit"]
-                or build.get("source_map_sha256") != arm["source_map"]["sha256"]
-                or source_map.get("revision") != arm["source_commit"]
-            ):
-                raise ValueError(
-                    "guarded build/source map differs from compiled revision"
-                )
+            if (type(build.get("returncode")) is not int or build["returncode"] != 0 or build.get("source_unchanged") is not True
+                    or build.get("revision") != arm["source_commit"]
+                    or build.get("source_map_sha256") != arm["source_map"]["sha256"]
+                    or source_map.get("revision") != arm["source_commit"]):
+                raise ValueError("guarded build/source map differs from compiled revision")
             source_root = Path(arm["source_root"]).resolve(strict=True)
             noncompiled_tools = {
                 "zig/pkg/inference/scripts/gliner25/benchmark_linux_cpu_http.py",
@@ -315,16 +267,9 @@ def bind_arms(path, arms, observe=True):
             if not any(name.endswith(".zig") for name in source_map["files"]):
                 raise ValueError("source map lacks compiled production sources")
             for source_name, digest in source_map["files"].items():
-                if (
-                    not isinstance(source_name, str)
-                    or Path(source_name).is_absolute()
-                    or ".." in Path(source_name).parts
-                ):
+                if not isinstance(source_name, str) or Path(source_name).is_absolute() or ".." in Path(source_name).parts:
                     raise ValueError("invalid source map path")
-                if source_name in noncompiled_tools or Path(source_name).suffix in (
-                    ".md",
-                    ".rst",
-                ):
+                if source_name in noncompiled_tools or Path(source_name).suffix in (".md", ".rst"):
                     continue
                 # Check all other tracked inputs, including embedded cubin,
                 # fatbin/PTX/MSL, JSON/config, build scripts and dependency files.
@@ -335,67 +280,34 @@ def bind_arms(path, arms, observe=True):
         else:
             raise ValueError("unknown build receipt format")
         configuration = strict_json(pinned_file(arm["configuration"]).read_bytes())
-        if (
-            not isinstance(arm["precision"], str)
-            or not arm["precision"]
-            or not isinstance(arm["thread_budget"], dict)
-            or not arm["thread_budget"]
-            or not isinstance(arm["resource_limits"], dict)
-            or not arm["resource_limits"]
-        ):
-            raise ValueError(
-                "explicit equal precision/thread/resource envelope required"
-            )
+        if (not isinstance(arm["precision"], str) or not arm["precision"]
+                or not isinstance(arm["thread_budget"], dict) or not arm["thread_budget"]
+                or not isinstance(arm["resource_limits"], dict) or not arm["resource_limits"]):
+            raise ValueError("explicit equal precision/thread/resource envelope required")
         # This existing owner resolves actual /models/instances model paths
         # below the launch configuration root, hashes every consumed file, and
         # rechecks loaded instance IDs after hashing. No backend inferred by name.
-        observed = (
-            qualification_identity.model_artifacts(
-                configuration,
-                endpoint,
-                Path(arm["working_directory"]),
-                model_roots=arm.get("model_roots"),
-            )
-            if observe
-            else arm["model_artifacts"]
-        )
+        observed = (qualification_identity.model_artifacts(configuration, endpoint, Path(arm["working_directory"]), model_roots=arm.get("model_roots"))
+                    if observe else arm["model_artifacts"])
         qualification_identity.require_matching_artifacts(
-            {"model_artifacts": arm["model_artifacts"]}, {"model_artifacts": observed}
-        )
-        if any(
-            model["backend"] not in ("native", "metal", "cuda")
-            for model in observed["models"]
-        ):
+            {"model_artifacts": arm["model_artifacts"]}, {"model_artifacts": observed})
+        if any(model["backend"] not in ("native", "metal", "cuda") for model in observed["models"]):
             raise ValueError("unqualified backend in actual loaded model inventory")
         instances = None
         if observe:
-            status, inventory, _ = qualification_identity.q.http(
-                endpoint, "/models/instances"
-            )
+            status, inventory, _ = qualification_identity.q.http(endpoint, "/models/instances")
             if status != 200 or not inventory.get("data"):
                 raise ValueError("loaded instance inventory unavailable")
             instances = sorted(
-                [
-                    {key: item[key] for key in ("id", "model", "backend", "state")}
-                    for item in inventory["data"]
-                ],
+                [{key: item[key] for key in ("id", "model", "backend", "state")} for item in inventory["data"]],
                 key=lambda item: item["id"],
             )
-            if any(
-                not item["id"] or item["state"] != "loaded" for item in instances
-            ) or sorted(
-                (item["model"], item["backend"]) for item in instances
-            ) != sorted(
-                (item["model"], item["backend"]) for item in observed["models"]
-            ):
+            if (any(not item["id"] or item["state"] != "loaded" for item in instances)
+                    or sorted((item["model"], item["backend"]) for item in instances)
+                    != sorted((item["model"], item["backend"]) for item in observed["models"])):
                 raise ValueError("loaded instance changed after artifact binding")
-        bound[name] = dict(
-            arm,
-            model_artifacts_checked=observed,
-            loaded_instances=instances,
-            live_inventory_observed=observe,
-            binary_path=str(binary),
-        )
+        bound[name] = dict(arm, model_artifacts_checked=observed, loaded_instances=instances,
+                           live_inventory_observed=observe, binary_path=str(binary))
     baseline = bound["baseline"]
     for arm in bound.values():
         for key in ("precision", "thread_budget", "resource_limits"):
@@ -403,13 +315,9 @@ def bind_arms(path, arms, observe=True):
                 raise ValueError(f"arm {key} differs")
         qualification_identity.require_matching_artifacts(
             {"model_artifacts": baseline["model_artifacts_checked"]},
-            {"model_artifacts": arm["model_artifacts_checked"]},
-        )
-    return {
-        "receipt_sha256": hashlib.sha256(raw).hexdigest(),
-        "arms": bound,
-        "scope": "pinned controlled launch receipts plus live loaded model inventory; socket/PID, precision execution and device isolation require outer campaign proof",
-    }
+            {"model_artifacts": arm["model_artifacts_checked"]})
+    return {"receipt_sha256": hashlib.sha256(raw).hexdigest(), "arms": bound,
+            "scope": "pinned controlled launch receipts plus live loaded model inventory; socket/PID, precision execution and device isolation require outer campaign proof"}
 
 
 def acceptance(summary, pairs, require_faster=False):
@@ -419,35 +327,19 @@ def acceptance(summary, pairs, require_faster=False):
     no_regression = median <= 1.05 and p95 <= 1.10
     clients = summary.get("client_latency_ns")
     if clients:
-        no_regression = (
-            no_regression
-            and clients["candidate"]["median"] <= 1.05 * clients["baseline"]["median"]
-            and clients["candidate"]["p95"] <= 1.10 * clients["baseline"]["p95"]
-        )
+        no_regression = no_regression and clients["candidate"]["median"] <= 1.05 * clients["baseline"]["median"] and clients["candidate"]["p95"] <= 1.10 * clients["baseline"]["p95"]
     faster = speedup["lower_95"] > 1.0
-    return {
-        "median_ratio": median,
-        "p95_ratio": p95,
-        "limits": {"median": 1.05, "p95": 1.10},
-        "baseline_over_candidate_speedup_ci": speedup,
-        "no_regression_pass": no_regression,
-        "faster_pass": faster,
-        "require_faster": require_faster,
-        "passed": no_regression and (faster or not require_faster),
-    }
+    return {"median_ratio": median, "p95_ratio": p95, "limits": {"median": 1.05, "p95": 1.10},
+            "baseline_over_candidate_speedup_ci": speedup, "no_regression_pass": no_regression,
+            "faster_pass": faster, "require_faster": require_faster,
+            "passed": no_regression and (faster or not require_faster)}
 
 
 def audited_round(base, case, timeout, concurrency, event, metadata):
     traces = [{} for _ in range(concurrency)]
     payload = json.dumps(case["request"], allow_nan=False).encode()
-    event(
-        dict(
-            metadata,
-            status="pending",
-            clients=concurrency,
-            request_body_base64=base64.b64encode(payload).decode(),
-        )
-    )
+    event(dict(metadata, status="pending", clients=concurrency,
+               request_body_base64=base64.b64encode(payload).decode()))
     result = None
     failure = None
     try:
@@ -462,23 +354,9 @@ def audited_round(base, case, timeout, concurrency, event, metadata):
         captured = []
         for trace in traces:
             raw = trace.pop("raw", None)
-            captured.append(
-                dict(
-                    trace,
-                    raw_body_base64=base64.b64encode(raw).decode()
-                    if raw is not None
-                    else None,
-                )
-            )
-        event(
-            dict(
-                metadata,
-                status="failed" if failure else "complete",
-                clients=captured,
-                result=result,
-                error=failure,
-            )
-        )
+            captured.append(dict(trace, raw_body_base64=base64.b64encode(raw).decode() if raw is not None else None))
+        event(dict(metadata, status="failed" if failure else "complete", clients=captured,
+                   result=result, error=failure))
 
 
 def main():
@@ -492,22 +370,10 @@ def main():
     p.add_argument("--pairs", type=int, default=20)
     p.add_argument("--timeout", type=float, default=300)
     p.add_argument("--concurrency", type=int, default=1)
-    p.add_argument(
-        "--arm-receipts",
-        type=Path,
-        help="Schema1 controlled-launch arm receipts, checked before/after",
-    )
+    p.add_argument("--arm-receipts", type=Path, help="Schema1 controlled-launch arm receipts, checked before/after")
     p.add_argument("--enforce-no-regression", action="store_true")
-    p.add_argument(
-        "--load-preflight",
-        action="store_true",
-        help="Explicit untimed, output-validated load before live inventory binding",
-    )
-    p.add_argument(
-        "--require-faster",
-        action="store_true",
-        help="Also require baseline/candidate speedup CI lower95 > 1",
-    )
+    p.add_argument("--load-preflight", action="store_true", help="Explicit untimed, output-validated load before live inventory binding")
+    p.add_argument("--require-faster", action="store_true", help="Also require baseline/candidate speedup CI lower95 > 1")
     args = p.parse_args()
     gated = args.enforce_no_regression or args.require_faster
     if args.load_preflight and not args.arm_receipts:
@@ -575,7 +441,6 @@ def main():
         "samples": [],
         "comparisons": {},
     }
-
     def event(value):
         with (args.output / "attempts.jsonl").open("a") as stream:
             stream.write(json.dumps(value, allow_nan=False) + "\n")
@@ -585,45 +450,19 @@ def main():
     def run_round(arm, case, sample_type, index):
         if not args.arm_receipts:
             return request_round(arms[arm], case, args.timeout, args.concurrency)
-        return audited_round(
-            arms[arm],
-            case,
-            args.timeout,
-            args.concurrency,
-            event,
-            {
-                "arm": arm,
-                "case_id": case["id"],
-                "sample_type": sample_type,
-                "index": index,
-            },
-        )
+        return audited_round(arms[arm], case, args.timeout, args.concurrency, event,
+                             {"arm": arm, "case_id": case["id"], "sample_type": sample_type, "index": index})
 
     report["acceptance_mode"] = "gated" if gated else "report_only"
     report["require_faster"] = args.require_faster
     report["load_preflight"] = args.load_preflight
-    tool_paths = [
-        Path(__file__),
-        Path(paired_benchmark.__file__),
-        Path(qualification_identity.__file__),
-        Path(qualification_identity.q.__file__),
-    ]
-    report["tool_sources_sha256"] = {
-        str(path.resolve()): sha256(path) for path in tool_paths
-    }
-    report["source_scope"] = (
-        "benchmark tool hashes/host commit are separate from each arm's immutable compiled-image source commit"
-    )
-    report["arm_binding_scope"] = (
-        "unavailable"
-        if not args.arm_receipts
-        else "controlled launch receipts plus live inventory"
-    )
+    tool_paths = [Path(__file__), Path(paired_benchmark.__file__), Path(qualification_identity.__file__), Path(qualification_identity.q.__file__)]
+    report["tool_sources_sha256"] = {str(path.resolve()): sha256(path) for path in tool_paths}
+    report["source_scope"] = "benchmark tool hashes/host commit are separate from each arm's immutable compiled-image source commit"
+    report["arm_binding_scope"] = "unavailable" if not args.arm_receipts else "controlled launch receipts plus live inventory"
     try:
         if args.arm_receipts:
-            report["arm_launch_binding"] = bind_arms(
-                args.arm_receipts, arms, observe=False
-            )
+            report["arm_launch_binding"] = bind_arms(args.arm_receipts, arms, observe=False)
             if args.load_preflight:
                 for index, case in enumerate(cases):
                     for arm in arms:
@@ -633,11 +472,7 @@ def main():
             for index in range(args.warmup):
                 order = list(arms)
                 if args.arm_receipts:
-                    order = list(
-                        paired_benchmark.balanced_pair_order(
-                            index + 1, "baseline", "candidate"
-                        )
-                    )
+                    order = list(paired_benchmark.balanced_pair_order(index + 1, "baseline", "candidate"))
                     if args.reference:
                         order += ["reference"]
                 for arm in order:
@@ -647,17 +482,9 @@ def main():
             for pair in range(args.pairs):
                 order = list(arms) if pair % 2 == 0 else list(reversed(arms))
                 if args.arm_receipts:
-                    order = list(
-                        paired_benchmark.balanced_pair_order(
-                            pair + 1, "baseline", "candidate"
-                        )
-                    )
+                    order = list(paired_benchmark.balanced_pair_order(pair + 1, "baseline", "candidate"))
                     if args.reference:
-                        order = (
-                            order + ["reference"]
-                            if pair % 2 == 0
-                            else ["reference"] + order
-                        )
+                        order = order + ["reference"] if pair % 2 == 0 else ["reference"] + order
                 row = {
                     "case_id": case["id"],
                     "pair": pair,
@@ -725,10 +552,7 @@ def main():
             if report["arm_binding_after"] != report["arm_binding_before"]:
                 raise ValueError("immutable arm binding changed during comparison")
         if gated:
-            report["acceptance_passed"] = all(
-                value["acceptance"]["passed"]
-                for value in report["comparisons"].values()
-            )
+            report["acceptance_passed"] = all(value["acceptance"]["passed"] for value in report["comparisons"].values())
         report["status"] = "complete"
     except BaseException as error:
         report["status"] = "failed"
@@ -737,11 +561,7 @@ def main():
             report["acceptance_passed"] = False
         raise
     finally:
-        if (
-            args.arm_receipts
-            and "arm_binding_before" in report
-            and "arm_binding_after" not in report
-        ):
+        if args.arm_receipts and "arm_binding_before" in report and "arm_binding_after" not in report:
             try:
                 report["arm_binding_after"] = bind_arms(args.arm_receipts, arms)
                 if report["arm_binding_after"] != report.get("arm_binding_before"):
@@ -752,10 +572,7 @@ def main():
                 if gated:
                     report["acceptance_passed"] = False
         try:
-            report["tool_sources_after"] = {
-                path: sha256(path) == digest
-                for path, digest in report["tool_sources_sha256"].items()
-            }
+            report["tool_sources_after"] = {path: sha256(path) == digest for path, digest in report["tool_sources_sha256"].items()}
             if not all(report["tool_sources_after"].values()):
                 raise ValueError("benchmark tool or helper source changed")
         except BaseException as error:
@@ -768,12 +585,7 @@ def main():
         )
         paired_benchmark.write_evidence_manifest(args.output)
     print(args.output / "report.json")
-    return (
-        0
-        if report["status"] == "complete"
-        and (not gated or report.get("acceptance_passed"))
-        else 1
-    )
+    return 0 if report["status"] == "complete" and (not gated or report.get("acceptance_passed")) else 1
 
 
 if __name__ == "__main__":

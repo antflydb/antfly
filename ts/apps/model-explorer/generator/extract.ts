@@ -168,13 +168,10 @@ function blankComments(src: string): string {
 export function generatedRegionSpans(source: string): Array<[number, number]> {
   const spans: Array<[number, number]> = [];
   const stack: Array<{ owner: string; start: number }> = [];
-  for (const marker of source.matchAll(
-    /^[ \t]*\/\/ (quant-kernel-codegen|tile-codegen):(begin|end)\b[^\n]*/gm
-  )) {
+  for (const marker of source.matchAll(/^[ \t]*\/\/ (quant-kernel-codegen|tile-codegen):(begin|end)\b[^\n]*/gm)) {
     const owner = marker[1];
     if (marker[2] === "begin") {
-      if (stack.length && stack.at(-1)!.owner !== owner)
-        throw new Error("overlapping generator owners");
+      if (stack.length && stack.at(-1)!.owner !== owner) throw new Error("overlapping generator owners");
       stack.push({ owner, start: marker.index });
     } else {
       const open = stack.pop();

@@ -38,25 +38,15 @@ class Kernel:
         self.tail = c.c_void_p()
         self.merge = c.c_void_p()
         self.call("cuModuleLoad", c.byref(self.m), c.c_char_p(bytes(artifact)))
-        self.call(
-            "cuModuleGetFunction",
-            c.byref(self.f),
-            self.m,
-            c.c_char_p(b"termite_embedding_gemma2_attention_local_flash_bf16"),
-        )
+        self.call("cuModuleGetFunction", c.byref(self.f), self.m,
+                  c.c_char_p(b"termite_embedding_gemma2_attention_local_flash_bf16"))
         result = self.d.cuModuleGetFunction(
-            c.byref(self.merge),
-            self.m,
-            c.c_char_p(b"antfly_attention_split_merge_bf16"),
+            c.byref(self.merge), self.m, c.c_char_p(b"antfly_attention_split_merge_bf16")
         )
         if result == 500:  # CUDA_ERROR_NOT_FOUND: original deployment ABI.
             self.merge = None
-            self.call(
-                "cuModuleGetFunction",
-                c.byref(self.tail),
-                self.m,
-                c.c_char_p(b"termite_embedding_gemma2_attention_bf16"),
-            )
+            self.call("cuModuleGetFunction", c.byref(self.tail), self.m,
+                      c.c_char_p(b"termite_embedding_gemma2_attention_bf16"))
         elif result:
             raise RuntimeError(("cuModuleGetFunction", result))
 
@@ -68,11 +58,7 @@ class Kernel:
         self.dimension256 = None
         if self.merge is not None:
             function = c.c_void_p()
-            result = self.d.cuModuleGetFunction(
-                c.byref(function),
-                self.m,
-                c.c_char_p(b"antfly_attention_efficient_bf16_hd256"),
-            )
+            result = self.d.cuModuleGetFunction(c.byref(function), self.m, c.c_char_p(b"antfly_attention_efficient_bf16_hd256"))
             if result == 0:
                 self.dimension256 = function
             elif result != 500:
@@ -103,26 +89,15 @@ class Kernel:
         batch, sequence, heads, dim = q.shape
         kv_heads = k.shape[2]
         source = sequence if source_sequence is None else source_sequence
-        if (
-            not isinstance(source, int)
-            or isinstance(source, bool)
-            or not 0 < source <= sequence <= 8192
-            or not 0 <= radius <= 8192
-            or batch <= 0
-            or heads != 4
-            or (kv_heads, dim) not in ((2, 256), (1, 512))
-            or k.shape != v.shape
-            or k.shape != (batch, sequence, kv_heads, dim)
-            or out.shape != q.shape
-            or mask.shape != (batch, sequence)
-        ):
+        if (not isinstance(source, int) or isinstance(source, bool)
+                or not 0 < source <= sequence <= 8192 or not 0 <= radius <= 8192
+                or batch <= 0 or heads != 4 or (kv_heads, dim) not in ((2, 256), (1, 512))
+                or k.shape != v.shape or k.shape != (batch, sequence, kv_heads, dim)
+                or out.shape != q.shape or mask.shape != (batch, sequence)):
             raise ValueError("invalid attention geometry")
         if any(not x.is_cuda or not x.is_contiguous() for x in (out, q, k, v, mask)):
             raise ValueError("attention requires contiguous CUDA banks")
-        if (
-            any(x.dtype != torch.bfloat16 for x in (out, q, k, v))
-            or mask.dtype != torch.int64
-        ):
+        if any(x.dtype != torch.bfloat16 for x in (out, q, k, v)) or mask.dtype != torch.int64:
             raise ValueError("invalid attention bank dtype")
         commands, owners = [], [out, q, k, v, mask]
 
@@ -134,27 +109,14 @@ class Kernel:
         integers = lambda values: [c.c_uint(x) for x in values]
         if self.merge is None:
             if source != sequence or workspace is not None:
-                raise ValueError(
-                    "legacy ABI has no separate logical source/workspace contract"
-                )
-            values = pointers((out, q, k, v, mask)) + integers(
-                (batch, sequence, heads, kv_heads, dim, radius)
-            )
+                raise ValueError("legacy ABI has no separate logical source/workspace contract")
+            values = pointers((out, q, k, v, mask)) + integers((batch, sequence, heads, kv_heads, dim, radius))
             if sequence // 64:
-                command(
-                    self.f,
-                    values,
-                    (heads, sequence // 64, batch),
-                    (512, 1, 1),
-                    16 * dim * 2 + 4 * 64 * 16 * 4 + 64 * 16 * 2 + 3 * 64 * 4,
-                )
+                command(self.f, values, (heads, sequence // 64, batch), (512, 1, 1),
+                        16 * dim * 2 + 4 * 64 * 16 * 4 + 64 * 16 * 2 + 3 * 64 * 4)
             if sequence % 64:
-                command(
-                    self.tail,
-                    values + integers((sequence - sequence % 64,)),
-                    (sequence % 64, heads, batch),
-                    (32, 1, 1),
-                )
+                command(self.tail, values + integers((sequence - sequence % 64,)),
+                        (sequence % 64, heads, batch), (32, 1, 1))
         else:
             sms = torch.cuda.get_device_properties(q.device).multi_processor_count
             if sms <= 0:
@@ -162,72 +124,38 @@ class Kernel:
             if source < sequence and bool((mask[:, source:] != 0).any()):
                 raise ValueError("declared physical padding contains a live token")
             all_valid = bool((mask[:, :source] == 1).all())
-            schedule = (
-                0
-                if dim <= 256 and all_valid and (radius == 0 or source < radius)
-                else 1
-            )
+            schedule = 0 if dim <= 256 and all_valid and (radius == 0 or source < radius) else 1
             splits = self.split_count(batch, heads, source, sms) if schedule == 0 else 1
             partial_ptr = lse_ptr = 0
             if splits > 1:
                 count = splits * batch * heads * sequence
                 required = count * (dim + 1)
                 if workspace is None:
-                    workspace = torch.empty(
-                        required, device=q.device, dtype=torch.float32
-                    )
-                elif (
-                    not workspace.is_cuda
-                    or not workspace.is_contiguous()
-                    or workspace.device != q.device
-                    or workspace.dtype != torch.float32
-                    or workspace.numel() < required
-                ):
+                    workspace = torch.empty(required, device=q.device, dtype=torch.float32)
+                elif (not workspace.is_cuda or not workspace.is_contiguous()
+                      or workspace.device != q.device or workspace.dtype != torch.float32
+                      or workspace.numel() < required):
                     raise ValueError("invalid prepared split workspace")
                 start, end = workspace.data_ptr(), workspace.data_ptr() + required * 4
-                if any(
-                    start < tensor.data_ptr() + tensor.numel() * tensor.element_size()
-                    and tensor.data_ptr() < end
-                    for tensor in (out, q, k, v, mask)
-                ):
+                if any(start < tensor.data_ptr() + tensor.numel() * tensor.element_size()
+                       and tensor.data_ptr() < end for tensor in (out, q, k, v, mask)):
                     raise ValueError("split workspace aliases an attention bank")
                 owners.append(workspace)
                 partial_ptr = workspace.data_ptr()
                 lse_ptr = partial_ptr + count * dim * 4
-            values = (
-                pointers((out, q, k, v, mask))
-                + integers(
-                    (batch, sequence, source, heads, kv_heads, dim, radius, schedule)
-                )
-                + [
-                    c.c_uint64(partial_ptr),
-                    c.c_uint64(lse_ptr),
-                    c.c_uint(splits),
-                    c.c_uint64(0),
-                ]
-            )
+            values = (pointers((out, q, k, v, mask))
+                      + integers((batch, sequence, source, heads, kv_heads, dim, radius, schedule))
+                      + [c.c_uint64(partial_ptr), c.c_uint64(lse_ptr), c.c_uint(splits), c.c_uint64(0)])
             key_tile = 64 if schedule == 0 else 128
             shared_prefix = 32 * dim * 2
             if schedule == 1 and self.dimension256 is not None:
                 shared_prefix = max(16 * dim * 2, 16 * dim * 4 - 16 * key_tile * 4)
-            command(
-                self.dimension256
-                if dim == 256 and schedule == 1 and self.dimension256 is not None
-                else self.f,
-                values,
-                (heads, (sequence + 15) // 16, batch * splits),
-                (128, 1, 1),
-                shared_prefix + 16 * key_tile * 6 + 6 * 16 * 4,
-            )
+            command(self.dimension256 if dim == 256 and schedule == 1 and self.dimension256 is not None else self.f, values, (heads, (sequence + 15) // 16, batch * splits), (128, 1, 1),
+                    shared_prefix + 16 * key_tile * 6 + 6 * 16 * 4)
             if splits > 1:
-                values = [
-                    c.c_uint64(out.data_ptr()),
-                    c.c_uint64(partial_ptr),
-                    c.c_uint64(lse_ptr),
-                ] + integers((batch, sequence, heads, dim, splits))
-                command(
-                    self.merge, values, (batch * heads * sequence, 1, 1), (32, 1, 1)
-                )
+                values = ([c.c_uint64(out.data_ptr()), c.c_uint64(partial_ptr), c.c_uint64(lse_ptr)]
+                          + integers((batch, sequence, heads, dim, splits)))
+                command(self.merge, values, (batch * heads * sequence, 1, 1), (32, 1, 1))
         stream = c.c_void_p(torch.cuda.current_stream().cuda_stream)
 
         def invoke():
@@ -235,16 +163,8 @@ class Kernel:
             # every launch; no device allocation or mask classification occurs here.
             _ = owners
             for function, values, arguments, grid, block, shared in commands:
-                self.call(
-                    "cuLaunchKernel",
-                    function,
-                    *integers(grid),
-                    *integers(block),
-                    c.c_uint(shared),
-                    stream,
-                    arguments,
-                    c.c_void_p(),
-                )
+                self.call("cuLaunchKernel", function, *integers(grid), *integers(block),
+                          c.c_uint(shared), stream, arguments, c.c_void_p())
 
         return invoke
 

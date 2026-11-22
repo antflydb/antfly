@@ -341,22 +341,14 @@ class PortableDecideRuntimeTest(unittest.TestCase):
         import csv
         import io
         import zipfile
-
         wheel_dir = root / "wheels"
         wheel_dir.mkdir()
-        payload = {
-            "portable.py": b"trusted = True\n",
-            "portable-1.0.dist-info/METADATA": b"Metadata-Version: 2.4\nName: portable\nVersion: 1.0\n",
-        }
+        payload = {"portable.py": b"trusted = True\n", "portable-1.0.dist-info/METADATA": b"Metadata-Version: 2.4\nName: portable\nVersion: 1.0\n"}
         record = "portable-1.0.dist-info/RECORD"
         output = io.StringIO(newline="")
         writer = csv.writer(output, lineterminator="\n")
         for path, raw in payload.items():
-            digest = (
-                base64.urlsafe_b64encode(hashlib.sha256(raw).digest())
-                .rstrip(b"=")
-                .decode()
-            )
+            digest = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=").decode()
             writer.writerow([path, "sha256=" + digest, len(raw)])
         writer.writerow([record, "", ""])
         payload[record] = output.getvalue().encode()
@@ -364,32 +356,8 @@ class PortableDecideRuntimeTest(unittest.TestCase):
         with zipfile.ZipFile(path, "w") as archive:
             for name, raw in payload.items():
                 archive.writestr(name, raw)
-        files = {
-            name: {
-                "sha256": hashlib.sha256(raw).hexdigest(),
-                "bytes": len(raw),
-                "wheel": path.name,
-                "mode": 0o600,
-            }
-            for name, raw in payload.items()
-        }
-        scope = {
-            "packages": {"portable": "1.0"},
-            "wheels": [
-                {
-                    "name": "portable",
-                    "version": "1.0",
-                    "filename": path.name,
-                    "bytes": path.stat().st_size,
-                    "sha256": benchmark.sha256(path),
-                    "record_sha256": files[record]["sha256"],
-                    "metadata_sha256": files["portable-1.0.dist-info/METADATA"][
-                        "sha256"
-                    ],
-                }
-            ],
-            "files": files,
-        }
+        files = {name: {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw), "wheel": path.name, "mode": 0o600} for name, raw in payload.items()}
+        scope = {"packages": {"portable": "1.0"}, "wheels": [{"name": "portable", "version": "1.0", "filename": path.name, "bytes": path.stat().st_size, "sha256": benchmark.sha256(path), "record_sha256": files[record]["sha256"], "metadata_sha256": files["portable-1.0.dist-info/METADATA"]["sha256"]}], "files": files}
         installed = root / "runtime"
         for name, raw in payload.items():
             destination = installed / name
@@ -402,9 +370,7 @@ class PortableDecideRuntimeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wheels, wheel, installed, scope = self.fixture(Path(tmp))
             self.assertEqual(scope["files"], benchmark._portable_wheels(wheels, scope))
-            self.assertEqual(
-                {"files": 3}, benchmark._portable_tree(installed, scope["files"])
-            )
+            self.assertEqual({"files": 3}, benchmark._portable_tree(installed, scope["files"]))
             (installed / "portable.py").chmod(0o700)
             with self.assertRaisesRegex(benchmark.BenchmarkError, "identity differs"):
                 benchmark._portable_tree(installed, scope["files"])
@@ -454,67 +420,34 @@ class PortableDecideRuntimeTest(unittest.TestCase):
 
     def test_portable_rejects_archive_paths_even_with_matching_artifact_hash(self):
         import zipfile
-
         with tempfile.TemporaryDirectory() as tmp:
             wheels, wheel, _, scope = self.fixture(Path(tmp))
             with zipfile.ZipFile(wheel, "a") as archive:
                 archive.writestr("../escaped.py", b"untrusted")
-            scope["wheels"][0].update(
-                bytes=wheel.stat().st_size, sha256=benchmark.sha256(wheel)
-            )
+            scope["wheels"][0].update(bytes=wheel.stat().st_size, sha256=benchmark.sha256(wheel))
             with self.assertRaisesRegex(benchmark.BenchmarkError, "path escapes"):
                 benchmark._portable_wheels(wheels, scope)
 
     def test_paired_runtime_contract_parser_and_exact_command_forwarding(self):
         import argparse
-
-        required = [
-            "--binary",
-            "binary",
-            "--build-receipt",
-            "build.json",
-            "--model-dir",
-            "model",
-            "--upstream",
-            "source",
-            "--runtime-dir",
-            "runtime",
-            "--output",
-            "output",
-            "--backend",
-            "native",
-        ]
+        required = ["--binary", "binary", "--build-receipt", "build.json", "--model-dir", "model",
+                    "--upstream", "source", "--runtime-dir", "runtime", "--output", "output", "--backend", "native"]
         self.assertIsNone(pairs.parse_args(required).runtime_contract)
-        explicit = pairs.parse_args(
-            required + ["--runtime-contract", "runtime-v2.json"]
-        )
+        explicit = pairs.parse_args(required + ["--runtime-contract", "runtime-v2.json"])
         self.assertEqual(Path("runtime-v2.json").resolve(), explicit.runtime_contract)
         for selected in (None, Path("runtime-v2.json").resolve()):
             with tempfile.TemporaryDirectory() as tmp:
-                args = argparse.Namespace(
-                    python=Path("python"),
-                    backend="native",
-                    model_dir=Path("model"),
-                    upstream=Path("source"),
-                    runtime_dir=Path("runtime"),
-                    runtime_contract=selected,
-                    timeout=1,
-                )
+                args = argparse.Namespace(python=Path("python"), backend="native", model_dir=Path("model"),
+                                          upstream=Path("source"), runtime_dir=Path("runtime"), runtime_contract=selected, timeout=1)
                 captured = []
-
                 def child(command, env, log, timeout):
                     captured.append(command)
                     return 1  # Retain the deliberate child failure; launch nothing.
-
-                with (
-                    mock.patch.object(
-                        pairs.perf, "source_identity", return_value={"source": "fixed"}
-                    ),
-                    mock.patch.object(pairs.perf, "host_context", return_value={}),
-                    mock.patch.object(pairs.perf, "run_child", side_effect=child),
-                    mock.patch.object(pairs.perf, "parse_time", return_value={}),
-                    mock.patch.object(Path, "read_text", return_value=""),
-                ):
+                with mock.patch.object(pairs.perf, "source_identity", return_value={"source": "fixed"}), \
+                     mock.patch.object(pairs.perf, "host_context", return_value={}), \
+                     mock.patch.object(pairs.perf, "run_child", side_effect=child), \
+                     mock.patch.object(pairs.perf, "parse_time", return_value={}), \
+                     mock.patch.object(Path, "read_text", return_value=""):
                     receipt = pairs.run_python(args, Path(tmp) / "out")
                 self.assertFalse(receipt["passed"])
                 if selected is None:
@@ -528,47 +461,23 @@ class PortableDecideRuntimeTest(unittest.TestCase):
         runtime = root / "runtime"
         upstream = root / "upstream"
         external = root / "venv/lib/python3.12/site-packages"
-        origins = {
-            "torch": external / "torch/__init__.py",
-            "pydantic": external / "pydantic/__init__.py",
-            "transformers": runtime / "transformers/__init__.py",
-            "gliner2": upstream / "gliner2/__init__.py",
-        }
-        origins.update(
-            {
-                name: external / name / "__init__.py"
-                for name in ("requests", "urllib3", "charset_normalizer")
-            }
-        )
-
+        origins = {"torch": external / "torch/__init__.py", "pydantic": external / "pydantic/__init__.py",
+                   "transformers": runtime / "transformers/__init__.py", "gliner2": upstream / "gliner2/__init__.py"}
+        origins.update({name: external / name / "__init__.py" for name in ("requests", "urllib3", "charset_normalizer")})
         def find(name):
             return mock.Mock(origin=str(origins[name]))
-
-        with (
-            mock.patch.object(benchmark.importlib.util, "find_spec", side_effect=find),
-            mock.patch.object(benchmark, "sys", mock.Mock(modules={})),
-            mock.patch.object(benchmark, "verify_source", return_value={}),
-        ):
+        with mock.patch.object(benchmark.importlib.util, "find_spec", side_effect=find), mock.patch.object(benchmark, "sys", mock.Mock(modules={})), mock.patch.object(benchmark, "verify_source", return_value={}):
             benchmark.verify_portable_import_sources(runtime, upstream)
             origins["torch"] = root / "foreign/torch/__init__.py"
-            with self.assertRaisesRegex(
-                benchmark.BenchmarkError, "import source differs"
-            ):
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "import source differs"):
                 benchmark.verify_portable_import_sources(runtime, upstream)
 
     def python_archive(self, root, escape=False):
         import tarfile
         import io
-
         path = root / "python.tar.gz"
         with tarfile.open(path, "w:gz") as archive:
-            for name, raw in [
-                ("python/bin/python3.12", b"authenticated executable"),
-                (
-                    "python/lib/__pycache__/ignored.pyc",
-                    b"official precompiled bytecode",
-                ),
-            ]:
+            for name, raw in [("python/bin/python3.12", b"authenticated executable"), ("python/lib/__pycache__/ignored.pyc", b"official precompiled bytecode")]:
                 member = tarfile.TarInfo(name)
                 member.size = len(raw)
                 member.mode = 0o755 if name.endswith("python3.12") else 0o644
@@ -577,14 +486,7 @@ class PortableDecideRuntimeTest(unittest.TestCase):
             link.type = tarfile.SYMTYPE
             link.linkname = "../../outside" if escape else "python3.12"
             archive.addfile(link)
-        return path, {
-            "archive": {
-                "filename": path.name,
-                "bytes": path.stat().st_size,
-                "sha256": benchmark.sha256(path),
-            },
-            "omit_python_bytecode": True,
-        }
+        return path, {"archive": {"filename": path.name, "bytes": path.stat().st_size, "sha256": benchmark.sha256(path)}, "omit_python_bytecode": True}
 
     def test_clean_python_is_derived_from_exact_archive_without_cached_bytecode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -614,37 +516,17 @@ class PortableDecideRuntimeTest(unittest.TestCase):
         text = b'[project]\ndependencies=["portable>=1,<2"]\n'
         project = wheels / "pyproject.toml"
         project.write_bytes(text)
-        recipe = {
-            "source_dependencies": {
-                "revision": benchmark.strict_json(benchmark.CONTRACT)[
-                    "upstream_python"
-                ]["revision"],
-                "pyproject": {
-                    "filename": project.name,
-                    "bytes": len(text),
-                    "sha256": benchmark.sha256(project),
-                },
-                "base_requirements": ["portable>=1,<2"],
-                "local_transformers_exception": {},
-            },
-            "wheels": {"isolated": scope},
-        }
+        recipe = {"source_dependencies": {"revision": benchmark.strict_json(benchmark.CONTRACT)["upstream_python"]["revision"],
+                  "pyproject": {"filename": project.name, "bytes": len(text), "sha256": benchmark.sha256(project)},
+                  "base_requirements": ["portable>=1,<2"], "local_transformers_exception": {}},
+                  "wheels": {"isolated": scope}}
         return project, recipe
 
-    def test_source_base_requirements_and_wheel_metadata_reach_authenticated_checker(
-        self,
-    ):
+    def test_source_base_requirements_and_wheel_metadata_reach_authenticated_checker(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project, recipe = self.source_dependency_fixture(root)
-            with (
-                mock.patch.object(
-                    benchmark,
-                    "_portable_dependency_check",
-                    return_value={"model_imports": False},
-                ) as child,
-                mock.patch.object(benchmark.subprocess, "run") as process,
-            ):
+            with mock.patch.object(benchmark, "_portable_dependency_check", return_value={"model_imports": False}) as child, mock.patch.object(benchmark.subprocess, "run") as process:
                 result = benchmark._portable_source_dependencies(root, recipe)
                 process.assert_not_called()
             self.assertFalse(result["model_imports"])
@@ -652,39 +534,23 @@ class PortableDecideRuntimeTest(unittest.TestCase):
             self.assertEqual(["portable>=1,<2"], payload["base"])
             self.assertEqual({"portable": "1.0"}, payload["versions"])
             self.assertEqual(str(project), payload["pyproject"])
-            self.assertEqual(
-                ["portable-1.0-py3-none-any.whl"],
-                [wheel["filename"] for wheel in payload["wheels"]],
-            )
+            self.assertEqual(["portable-1.0-py3-none-any.whl"], [wheel["filename"] for wheel in payload["wheels"]])
             project.write_bytes(project.read_bytes() + b"# tampered\n")
             with mock.patch.object(benchmark.subprocess, "run") as child:
-                with self.assertRaisesRegex(
-                    benchmark.BenchmarkError, "dependency artifact differs"
-                ):
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "dependency artifact differs"):
                     benchmark._portable_source_dependencies(root, recipe)
                 child.assert_not_called()
 
-    def test_source_dependency_refusal_propagates_without_runtime_or_golden_fallback(
-        self,
-    ):
+    def test_source_dependency_refusal_propagates_without_runtime_or_golden_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _, recipe = self.source_dependency_fixture(root)
-            with mock.patch.object(
-                benchmark,
-                "_portable_dependency_check",
-                side_effect=benchmark.BenchmarkError(
-                    "unsatisfied pinned GLiNER BASE requirement"
-                ),
-            ):
+            with mock.patch.object(benchmark, "_portable_dependency_check", side_effect=benchmark.BenchmarkError("unsatisfied pinned GLiNER BASE requirement")):
                 with self.assertRaisesRegex(benchmark.BenchmarkError, "unsatisfied"):
                     benchmark._portable_source_dependencies(root, recipe)
 
-    def test_torch_virtual_namespaces_require_definition_type_and_registered_singleton(
-        self,
-    ):
+    def test_torch_virtual_namespaces_require_definition_type_and_registered_singleton(self):
         import types
-
         root = Path("authenticated/torch").resolve()
         for name, definition_name, class_name, export, filename in [
             ("torch.ops", "torch._ops", "_Ops", "ops", "_ops.py"),
@@ -692,11 +558,7 @@ class PortableDecideRuntimeTest(unittest.TestCase):
         ]:
             definition = types.ModuleType(definition_name)
             definition.__file__ = str(root / filename)
-            namespace_type = type(
-                class_name,
-                (types.ModuleType,),
-                {"__module__": definition_name, "__file__": filename},
-            )
+            namespace_type = type(class_name, (types.ModuleType,), {"__module__": definition_name, "__file__": filename})
             setattr(definition, class_name, namespace_type)
             namespace = namespace_type(name)
             setattr(definition, export, namespace)
@@ -704,69 +566,38 @@ class PortableDecideRuntimeTest(unittest.TestCase):
             setattr(package, export, namespace)
             modules = {"torch": package, definition_name: definition, name: namespace}
             with mock.patch.object(benchmark, "sys", mock.Mock(modules=modules)):
-                self.assertTrue(
-                    benchmark._portable_torch_virtual(name, namespace, root)
-                )
+                self.assertTrue(benchmark._portable_torch_virtual(name, namespace, root))
                 replacement = namespace_type(name)
                 modules[name] = replacement
-                with self.assertRaisesRegex(
-                    benchmark.BenchmarkError, "registration differs"
-                ):
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "registration differs"):
                     benchmark._portable_torch_virtual(name, replacement, root)
                 foreign = types.ModuleType(name)
                 foreign.__file__ = str(root / filename)
                 modules[name] = foreign
-                with self.assertRaisesRegex(
-                    benchmark.BenchmarkError, "registration differs"
-                ):
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "registration differs"):
                     benchmark._portable_torch_virtual(name, foreign, root)
                 modules[name] = namespace
                 definition.__file__ = str(root.parent / "foreign" / filename)
-                with self.assertRaisesRegex(
-                    benchmark.BenchmarkError, "registration differs"
-                ):
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "registration differs"):
                     benchmark._portable_torch_virtual(name, namespace, root)
-                self.assertFalse(
-                    benchmark._portable_torch_virtual(
-                        "torch.ops.arbitrary", namespace, root
-                    )
-                )
+                self.assertFalse(benchmark._portable_torch_virtual("torch.ops.arbitrary", namespace, root))
 
     def test_v2_dispatch_is_explicit_and_v1_default_unchanged(self):
-        with mock.patch.object(
-            benchmark, "verify_portable_runtime_dir", return_value={"v2": True}
-        ) as portable:
-            self.assertEqual(
-                {"v2": True},
-                benchmark.verify_runtime_dir(Path("runtime"), {"format_version": 2}),
-            )
+        with mock.patch.object(benchmark, "verify_portable_runtime_dir", return_value={"v2": True}) as portable:
+            self.assertEqual({"v2": True}, benchmark.verify_runtime_dir(Path("runtime"), {"format_version": 2}))
             portable.assert_called_once()
         contract = benchmark.strict_json(benchmark.RUNTIME_CONTRACT_1B)
-        with mock.patch.object(
-            benchmark.platform, "python_version", return_value="wrong"
-        ):
+        with mock.patch.object(benchmark.platform, "python_version", return_value="wrong"):
             with self.assertRaisesRegex(benchmark.BenchmarkError, "Python/Unicode"):
                 benchmark.verify_runtime_dir(Path("runtime"), contract)
 
     def test_v2_cannot_change_frozen_numerical_or_version_contract(self):
         original = benchmark.strict_json(benchmark.RUNTIME_CONTRACT_1B)
-        for key in (
-            "python",
-            "unicode",
-            "isolated_packages",
-            "external_packages",
-            "rope_contract",
-            "transformers_distribution",
-        ):
+        for key in ("python", "unicode", "isolated_packages", "external_packages", "rope_contract", "transformers_distribution"):
             changed = json.loads(json.dumps(original))
             changed["format_version"] = 2
             changed["oracle_runtime_decide_1b"][key] = "changed"
-            with (
-                self.subTest(key=key),
-                self.assertRaisesRegex(
-                    benchmark.BenchmarkError, "changes frozen contract"
-                ),
-            ):
+            with self.subTest(key=key), self.assertRaisesRegex(benchmark.BenchmarkError, "changes frozen contract"):
                 benchmark.verify_runtime_dir(Path("runtime"), changed)
 
 

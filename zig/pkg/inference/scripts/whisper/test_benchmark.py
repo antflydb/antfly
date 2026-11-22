@@ -15,7 +15,6 @@
 # limitations under the License.
 
 """Hermetic HTTP transcription comparison controls; no model or server required."""
-
 import base64
 import contextlib
 import importlib.util
@@ -29,9 +28,7 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location(
-    "whisper_benchmark", Path(__file__).with_name("benchmark.py")
-)
+spec = importlib.util.spec_from_file_location("whisper_benchmark", Path(__file__).with_name("benchmark.py"))
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 
@@ -42,13 +39,7 @@ def response(text="hello", status="complete", **extra):
 
 def record(seconds, payload):
     raw = json.dumps(payload).encode()
-    return {
-        "seconds": seconds,
-        "http_status": 200,
-        "response_bytes_base64": base64.b64encode(raw).decode(),
-        "response": payload,
-        "error": None,
-    }
+    return {"seconds": seconds, "http_status": 200, "response_bytes_base64": base64.b64encode(raw).decode(), "response": payload, "error": None}
 
 
 class WhisperBaselineTests(unittest.TestCase):
@@ -65,26 +56,9 @@ class WhisperBaselineTests(unittest.TestCase):
         self.reference = self.root / "reference.txt"
         self.reference.write_text("hello")
         self.output = self.root / "report.json"
-        self.common = [
-            "--audio",
-            str(self.audio),
-            "--reference",
-            str(self.reference),
-            "--output",
-            str(self.output),
-            "--trials",
-            "3",
-            "--warmup",
-            "1",
-        ]
+        self.common = ["--audio", str(self.audio), "--reference", str(self.reference), "--output", str(self.output), "--trials", "3", "--warmup", "1"]
 
-    def run_baseline(
-        self,
-        candidate=(1, 1, 1),
-        baseline=(1, 1, 1),
-        require_faster=False,
-        payloads=None,
-    ):
+    def run_baseline(self, candidate=(1, 1, 1), baseline=(1, 1, 1), require_faster=False, payloads=None):
         positions = {"candidate": 0, "baseline": 0}
         calls = []
 
@@ -97,50 +71,20 @@ class WhisperBaselineTests(unittest.TestCase):
             payload = payloads(url, index) if payloads else response()
             return record(seconds, payload)
 
-        argv = self.common + [
-            "--antfly-url",
-            "candidate",
-            "--baseline-antfly-url",
-            "baseline",
-            "--language",
-            "es",
-            "--timestamps",
-        ]
+        argv = self.common + ["--antfly-url", "candidate", "--baseline-antfly-url", "baseline", "--language", "es", "--timestamps"]
         if require_faster:
             argv.append("--require-faster")
-        with (
-            patch.object(benchmark, "post_record", side_effect=post),
-            patch.object(
-                benchmark,
-                "multipart",
-                side_effect=AssertionError("baseline must not build cpp request"),
-            ),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
+        with patch.object(benchmark, "post_record", side_effect=post), patch.object(benchmark, "multipart", side_effect=AssertionError("baseline must not build cpp request")), contextlib.redirect_stdout(io.StringIO()):
             code = benchmark.main(argv)
         return code, json.loads(self.output.read_text()), calls
 
     def test_identical_request_bytes_balanced_order_and_complete_raw_evidence(self):
         code, report, calls = self.run_baseline()
         self.assertEqual(0, code)
-        self.assertEqual(
-            [
-                "candidate",
-                "baseline",
-                "baseline",
-                "candidate",
-                "candidate",
-                "baseline",
-                "baseline",
-                "candidate",
-            ],
-            [call[0] for call in calls],
-        )
+        self.assertEqual(["candidate", "baseline", "baseline", "candidate", "candidate", "baseline", "baseline", "candidate"], [call[0] for call in calls])
         self.assertEqual(1, len({call[1] for call in calls}))
         packet = json.loads(calls[0][1])
-        self.assertEqual(
-            {"language": "es", "timestamps": True}, packet["audio_options"]
-        )
+        self.assertEqual({"language": "es", "timestamps": True}, packet["audio_options"])
         self.assertEqual("openai/whisper-small", packet["model"])
         self.assertNotIn("temperature", packet)
         self.assertTrue(report["complete"] and report["regression_passed"])
@@ -149,19 +93,14 @@ class WhisperBaselineTests(unittest.TestCase):
             self.assertEqual(4, len(rows))
             self.assertEqual(3, sum(row["phase"] == "measurement" for row in rows))
             for row in rows:
-                self.assertEqual(
-                    response(),
-                    json.loads(base64.b64decode(row["response_bytes_base64"])),
-                )
+                self.assertEqual(response(), json.loads(base64.b64decode(row["response_bytes_base64"])))
                 self.assertEqual("hello", row["text"])
 
     def test_explicit_regression_limits_and_separate_require_faster(self):
         code, report, _ = self.run_baseline(candidate=(1.05, 1.05, 1.05))
         self.assertEqual(0, code)
         self.assertTrue(report["regression_passed"])
-        code, report, _ = self.run_baseline(
-            candidate=(1.05, 1.05, 1.05), require_faster=True
-        )
+        code, report, _ = self.run_baseline(candidate=(1.05, 1.05, 1.05), require_faster=True)
         self.assertEqual(1, code)
         self.assertFalse(report["faster_passed"])
         code, report, _ = self.run_baseline(candidate=(1.06, 1.06, 1.06))
@@ -171,25 +110,14 @@ class WhisperBaselineTests(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual(1, report["candidate_baseline_latency_ratio"]["median"])
         self.assertGreater(report["candidate_baseline_latency_ratio"]["p95"], 1.10)
-        code, report, _ = self.run_baseline(
-            candidate=(0.9, 0.9, 0.9), require_faster=True
-        )
+        code, report, _ = self.run_baseline(candidate=(0.9, 0.9, 0.9), require_faster=True)
         self.assertEqual(0, code)
         self.assertGreater(report["baseline_candidate_speedup_ci"]["lower_95"], 1)
 
     def test_incomplete_error_and_quality_regressions_persist_all_attempts(self):
-        for payload in [
-            response(status="partial"),
-            response(error={"message": "failed"}),
-            {"error": "failed"},
-            {"data": []},
-        ]:
+        for payload in [response(status="partial"), response(error={"message": "failed"}), {"error": "failed"}, {"data": []}]:
             with self.subTest(payload=payload):
-                code, report, calls = self.run_baseline(
-                    payloads=lambda url, index: (
-                        payload if url == "baseline" and index == 1 else response()
-                    )
-                )
+                code, report, calls = self.run_baseline(payloads=lambda url, index: payload if url == "baseline" and index == 1 else response())
                 self.assertEqual(1, code)
                 self.assertFalse(report["complete"] or report["performance_passed"])
                 self.assertEqual(3, len(calls))
@@ -197,21 +125,12 @@ class WhisperBaselineTests(unittest.TestCase):
                 failed = report["measurements"]["baseline_antfly"][1]
                 self.assertEqual(payload, failed["response"])
                 self.assertEqual("failed", failed["state"])
-        code, report, _ = self.run_baseline(
-            candidate=(0.5, 0.5, 0.5),
-            payloads=lambda url, _: response(
-                "wrong" if url == "candidate" else "hello"
-            ),
-        )
+        code, report, _ = self.run_baseline(candidate=(0.5, 0.5, 0.5), payloads=lambda url, _: response("wrong" if url == "candidate" else "hello"))
         self.assertEqual(1, code)
         self.assertFalse(report["quality_passed"] or report["performance_passed"])
 
     def test_interrupted_pending_attempt_remains_in_failed_report(self):
-        with (
-            patch.object(benchmark, "post_record", side_effect=KeyboardInterrupt),
-            contextlib.redirect_stdout(io.StringIO()),
-            self.assertRaises(KeyboardInterrupt),
-        ):
+        with patch.object(benchmark, "post_record", side_effect=KeyboardInterrupt), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
             benchmark.main(self.common + ["--baseline-antfly-url", "baseline"])
         report = json.loads(self.output.read_text())
         self.assertFalse(report["complete"] or report["performance_passed"])
@@ -219,17 +138,11 @@ class WhisperBaselineTests(unittest.TestCase):
         self.assertEqual([], report["measurements"]["baseline_antfly"])
 
     def test_http_failure_retains_exact_body_and_exception(self):
-        failure = urllib.error.HTTPError(
-            "endpoint", 503, "busy", {}, io.BytesIO(b'{"error":"busy"}')
-        )
+        failure = urllib.error.HTTPError("endpoint", 503, "busy", {}, io.BytesIO(b'{"error":"busy"}'))
         with patch.object(benchmark.urllib.request, "urlopen", side_effect=failure):
-            row = benchmark.post_record(
-                "http://example.test", b"{}", "application/json"
-            )
+            row = benchmark.post_record("http://example.test", b"{}", "application/json")
         self.assertEqual(503, row["http_status"])
-        self.assertEqual(
-            b'{"error":"busy"}', base64.b64decode(row["response_bytes_base64"])
-        )
+        self.assertEqual(b'{"error":"busy"}', base64.b64decode(row["response_bytes_base64"]))
         self.assertIsNotNone(row["error"])
         self.assertIsNone(row["response"])
 
@@ -240,12 +153,8 @@ class WhisperBaselineTests(unittest.TestCase):
             def read(self, *args):
                 raise http.client.IncompleteRead(b'{"data":', 17)
 
-        with patch.object(
-            benchmark.urllib.request, "urlopen", return_value=Truncated()
-        ):
-            row = benchmark.post_record(
-                "http://example.test", b"{}", "application/json"
-            )
+        with patch.object(benchmark.urllib.request, "urlopen", return_value=Truncated()):
+            row = benchmark.post_record("http://example.test", b"{}", "application/json")
         self.assertEqual(200, row["http_status"])
         self.assertEqual(b'{"data":', base64.b64decode(row["response_bytes_base64"]))
         self.assertEqual("IncompleteRead", row["error"]["type"])
@@ -259,13 +168,9 @@ class WhisperBaselineTests(unittest.TestCase):
 
         failure = urllib.error.HTTPError("endpoint", 503, "busy", {}, Truncated())
         with patch.object(benchmark.urllib.request, "urlopen", side_effect=failure):
-            row = benchmark.post_record(
-                "http://example.test", b"{}", "application/json"
-            )
+            row = benchmark.post_record("http://example.test", b"{}", "application/json")
         self.assertEqual(503, row["http_status"])
-        self.assertEqual(
-            b'{"error":"bus', base64.b64decode(row["response_bytes_base64"])
-        )
+        self.assertEqual(b'{"error":"bus', base64.b64decode(row["response_bytes_base64"]))
         self.assertEqual("IncompleteRead", row["error"]["type"])
         self.assertIsNone(row["response"])
         self.assertGreaterEqual(row["seconds"], 0)
@@ -277,10 +182,7 @@ class WhisperBaselineTests(unittest.TestCase):
             calls.append(url)
             return (1, response()) if url.endswith("/read") else (2, {"text": "hello"})
 
-        with (
-            patch.object(benchmark, "post", side_effect=post),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
+        with patch.object(benchmark, "post", side_effect=post), contextlib.redirect_stdout(io.StringIO()):
             code = benchmark.main(self.common)
         report = json.loads(self.output.read_text())
         self.assertEqual(0, code)
@@ -292,21 +194,12 @@ class WhisperBaselineTests(unittest.TestCase):
         self.assertEqual({"antfly", "whisper_cpp"}, set(report["measurements"]))
 
     def test_comparison_urls_are_exclusive_and_faster_is_baseline_only(self):
-        for extra in [
-            ["--baseline-antfly-url", "baseline", "--whisper-url", "cpp"],
-            ["--require-faster"],
-        ]:
-            with (
-                self.subTest(extra=extra),
-                contextlib.redirect_stderr(io.StringIO()),
-                self.assertRaises(SystemExit),
-            ):
+        for extra in [["--baseline-antfly-url", "baseline", "--whisper-url", "cpp"], ["--require-faster"]]:
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 benchmark.main(self.common + extra)
         self.assertEqual("", benchmark.extract_antfly_text(response(text="")))
         with self.assertRaises(ValueError):
-            benchmark.extract_antfly_text(
-                {"data": [response()["data"][0], response()["data"][0]]}
-            )
+            benchmark.extract_antfly_text({"data": [response()["data"][0], response()["data"][0]]})
 
 
 if __name__ == "__main__":

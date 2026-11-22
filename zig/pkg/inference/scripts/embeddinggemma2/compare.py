@@ -186,17 +186,11 @@ def vm_counter_order():
 
 def vm_counters():
     darwin = sys.platform == "darwin"
-    raw = (
-        subprocess.check_output(["vm_stat"], text=True, timeout=5)
-        if darwin
-        else Path("/proc/vmstat").read_text()
-    )
+    raw = subprocess.check_output(["vm_stat"], text=True, timeout=5) if darwin else Path("/proc/vmstat").read_text()
     keys = ("Pageouts", "Swapins", "Swapouts") if darwin else tuple(vm_counter_order())
     values = []
     for key in keys:
-        match = re.search(
-            r"^" + key + (r":\s+(\d+)" if darwin else r"\s+(\d+)$"), raw, re.MULTILINE
-        )
+        match = re.search(r"^" + key + (r":\s+(\d+)" if darwin else r"\s+(\d+)$"), raw, re.MULTILINE)
         if not match:
             raise ValueError("missing VM counter " + key)
         values.append(int(match[1]))
@@ -206,20 +200,13 @@ def vm_counters():
 def cuda_identity():
     """Observe the sole actual GPU without guessing multi-device ordinal mapping."""
     try:
-        raw = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=uuid,name,driver_version,pci.bus_id,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=10,
-        )
+        raw = subprocess.check_output([
+            "nvidia-smi", "--query-gpu=uuid,name,driver_version,pci.bus_id,memory.total",
+            "--format=csv,noheader,nounits",
+        ], text=True, timeout=10)
         rows = list(csv.reader(raw.splitlines(), skipinitialspace=True))
         if len(rows) != 1 or len(rows[0]) != 5 or any(not x.strip() for x in rows[0]):
-            raise ValueError(
-                "sole GPU identity required; multi-device selection is unattested"
-            )
+            raise ValueError("sole GPU identity required; multi-device selection is unattested")
         uuid, name, driver, pci, memory = [x.strip() for x in rows[0]]
         if not uuid.startswith("GPU-"):
             raise ValueError("invalid GPU identity")
@@ -232,97 +219,44 @@ def cuda_identity():
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         if visible not in (None, "0", uuid):
             raise ValueError("visible CUDA ordinal cannot be attested")
-        return dict(
-            status="observed",
-            kind="cuda",
-            uuid=uuid,
-            name=name,
-            driver_version=driver,
-            pci_bus_id=pci,
-            memory_mib=memory_mib,
-            memory_capacity_status=memory_status,
-            query_output=raw,
-            visibility={
-                k: os.environ.get(k)
-                for k in (
-                    "CUDA_VISIBLE_DEVICES",
-                    "NVIDIA_VISIBLE_DEVICES",
-                    "CUDA_DEVICE_ORDER",
-                )
-            },
-        )
+        return dict(status="observed", kind="cuda", uuid=uuid, name=name,
+                    driver_version=driver, pci_bus_id=pci, memory_mib=memory_mib,
+                    memory_capacity_status=memory_status, query_output=raw,
+                    visibility={k: os.environ.get(k) for k in
+                                ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")})
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         return dict(status="unavailable", kind="cuda", reason=str(error))
 
 
 def metal_identity():
     try:
-        raw = subprocess.check_output(
-            ["system_profiler", "SPDisplaysDataType", "-json"], text=True, timeout=10
-        )
+        raw = subprocess.check_output(["system_profiler", "SPDisplaysDataType", "-json"], text=True, timeout=10)
         rows = json.loads(raw)["SPDisplaysDataType"]
         if len(rows) != 1 or not rows[0].get("sppci_model"):
             raise ValueError("sole Metal GPU identity required")
-        keys = (
-            "sppci_model",
-            "spdisplays_vendor",
-            "spdisplays_device-id",
-            "spdisplays_metal",
-        )
-        return dict(
-            status="observed", kind="metal", device={k: rows[0].get(k) for k in keys}
-        )
-    except (
-        OSError,
-        subprocess.SubprocessError,
-        ValueError,
-        KeyError,
-        TypeError,
-    ) as error:
+        keys = ("sppci_model", "spdisplays_vendor", "spdisplays_device-id", "spdisplays_metal")
+        return dict(status="observed", kind="metal", device={k: rows[0].get(k) for k in keys})
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
         return dict(status="unavailable", kind="metal", reason=str(error))
 
 
 THREAD_ENVIRONMENT_KEYS = (
-    "VECLIB_MAXIMUM_THREADS",
-    "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "ANTFLY_INFERENCE_CPU_THREADS",
-    "ANTFLY_INFERENCE_BLAS",
+    "VECLIB_MAXIMUM_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS", "ANTFLY_INFERENCE_CPU_THREADS", "ANTFLY_INFERENCE_BLAS",
 )
 
 
 def conditions(backend=None):
     threads = {key: os.environ.get(key) for key in THREAD_ENVIRONMENT_KEYS}
-    identity = dict(
-        platform=sys.platform,
-        node=platform.node(),
-        machine=platform.machine(),
-        release=platform.release(),
-        cpu_count=os.cpu_count(),
-    )
-    result = dict(
-        utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        threads=threads,
-        host_identity=identity,
-    )
+    identity = dict(platform=sys.platform, node=platform.node(), machine=platform.machine(),
+                    release=platform.release(), cpu_count=os.cpu_count())
+    result = dict(utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), threads=threads,
+                  host_identity=identity)
     budget = dict(environment=threads, cpu_count=os.cpu_count())
     if sys.platform == "darwin":
         result.update(
-            hardware=subprocess.check_output(
-                [
-                    "sysctl",
-                    "hw.model",
-                    "hw.memsize",
-                    "hw.ncpu",
-                    "machdep.cpu.brand_string",
-                ],
-                text=True,
-                timeout=5,
-            ),
-            swap=subprocess.check_output(
-                ["sysctl", "vm.swapusage"], text=True, timeout=5
-            ),
+            hardware=subprocess.check_output(["sysctl", "hw.model", "hw.memsize", "hw.ncpu", "machdep.cpu.brand_string"], text=True, timeout=5),
+            swap=subprocess.check_output(["sysctl", "vm.swapusage"], text=True, timeout=5),
             vm_stat=subprocess.check_output(["vm_stat"], text=True, timeout=5),
         )
         budget["affinity"] = "not exposed by Darwin process API"
@@ -331,32 +265,19 @@ def conditions(backend=None):
         result["vmstat"] = Path("/proc/vmstat").read_text()
         result["meminfo"] = Path("/proc/meminfo").read_text()
         cpuinfo = Path("/proc/cpuinfo").read_text()
-        result["hardware"] = sorted(
-            set(
-                line.strip()
-                for line in cpuinfo.splitlines()
-                if line.split(":", 1)[0].strip()
-                in ("model name", "Hardware", "CPU implementer", "CPU part")
-            )
-        )
+        result["hardware"] = sorted(set(line.strip() for line in cpuinfo.splitlines()
+            if line.split(":", 1)[0].strip() in ("model name", "Hardware", "CPU implementer", "CPU part")))
         if not result["hardware"]:
             raise ValueError("Linux CPU hardware identity unavailable")
         fields = {}
         for key in ("MemTotal", "SwapTotal", "SwapFree"):
-            match = re.search(
-                r"^" + key + r":\s+(\d+) kB$", result["meminfo"], re.MULTILINE
-            )
+            match = re.search(r"^" + key + r":\s+(\d+) kB$", result["meminfo"], re.MULTILINE)
             if not match:
                 raise ValueError("missing Linux memory observation " + key)
             fields[key] = int(match[1]) * 1024
-        result["swap"] = {
-            "total_bytes": fields["SwapTotal"],
-            "free_bytes": fields["SwapFree"],
-        }
+        result["swap"] = {"total_bytes": fields["SwapTotal"], "free_bytes": fields["SwapFree"]}
         identity["memory_bytes"] = fields["MemTotal"]
-        identity["boot_id"] = (
-            Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        )
+        identity["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         budget["affinity"] = sorted(os.sched_getaffinity(0))
         # Unified hierarchy membership is process-specific; don't substitute the
         # host root's quota for a nested container's actual cgroup.
@@ -368,27 +289,18 @@ def conditions(backend=None):
             ancestry = list(reversed(quota.parent.parents)) + [quota.parent]
             observations = []
             for directory in ancestry:
-                if (
-                    directory == Path("/sys/fs/cgroup")
-                    or Path("/sys/fs/cgroup") in directory.parents
-                ):
+                if directory == Path("/sys/fs/cgroup") or Path("/sys/fs/cgroup") in directory.parents:
                     entry = directory / "cpu.max"
                     if entry.is_file():
-                        observations.append(
-                            {"path": str(entry), "value": entry.read_text().strip()}
-                        )
+                        observations.append({"path": str(entry), "value": entry.read_text().strip()})
             if observations:
                 budget["cgroup_cpu_max"] = observations
     else:
         raise ValueError("unsupported host observation platform")
     result["thread_budget"] = budget
-    result["device_identity"] = (
-        cuda_identity()
-        if backend in ("cuda", "torch-cuda")
-        else metal_identity()
-        if backend in ("metal", "mps")
-        else {"status": "observed", "kind": "cpu"}
-    )
+    result["device_identity"] = (cuda_identity() if backend in ("cuda", "torch-cuda") else
+                                 metal_identity() if backend in ("metal", "mps") else
+                                 {"status": "observed", "kind": "cpu"})
     return result
 
 
@@ -535,11 +447,7 @@ def media_parts(suite, name):
         return [text, image]
     if name == "image_text":
         return [image, text]
-    return [
-        {"type": "text", "text": "Describe these inputs."},
-        part("audio.wav", "audio/wav"),
-        image,
-    ]
+    return [{"type": "text", "text": "Describe these inputs."}, part("audio.wav", "audio/wav"), image]
 
 
 def post(url, endpoint, body, timeout=600):
@@ -597,11 +505,8 @@ def relocate_assets(suite, asset_root):
         raise ValueError("asset relocation does not support selected media cases")
     assets = suite.get("assets")
     if not isinstance(assets, dict) or any(
-        not isinstance(name, str)
-        or name not in ("image.png", "audio.wav")
-        or Path(name).name != name
-        or "/" in name
-        or "\\" in name
+        not isinstance(name, str) or name not in ("image.png", "audio.wav")
+        or Path(name).name != name or "/" in name or "\\" in name
         for name in assets
     ):
         raise ValueError("unsafe or unsupported suite asset name")
@@ -616,38 +521,19 @@ def relocate_assets(suite, asset_root):
     relocated = dict(assets)
     for name in sorted(required):
         entry = assets.get(name)
-        if (
-            not isinstance(entry, dict)
-            or not isinstance(entry.get("path"), str)
-            or not entry["path"]
-            or not isinstance(entry.get("sha256"), str)
-            or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
-        ):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not entry["path"] or not isinstance(entry.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]):
             raise ValueError("invalid selected media asset declaration")
         path = root / name
-        if (
-            path.is_symlink()
-            or not path.is_file()
-            or path.resolve(strict=True).parent != root
-        ):
+        if path.is_symlink() or not path.is_file() or path.resolve(strict=True).parent != root:
             raise ValueError("unsafe or missing relocated media asset")
         before = path.stat()
         actual = reference.sha256(path)
         after = path.stat()
         fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-        if actual != entry["sha256"] or any(
-            getattr(before, field) != getattr(after, field) for field in fields
-        ):
+        if actual != entry["sha256"] or any(getattr(before, field) != getattr(after, field) for field in fields):
             raise ValueError("relocated media asset changed")
         relocated[name] = dict(entry, path=str(path))
-        proof["assets"].append(
-            {
-                "name": name,
-                "original_path": entry["path"],
-                "path": str(path),
-                "sha256": actual,
-            }
-        )
+        proof["assets"].append({"name": name, "original_path": entry["path"], "path": str(path), "sha256": actual})
     proof.update(root=str(root), applied=True)
     return dict(suite, assets=relocated), proof
 
@@ -1053,9 +939,7 @@ def torch_run(args, suite, result):
                 else "<|image|>\nDescribe this image."
             )
             encoded = processor(
-                text=["title: none | text: " + text],
-                images=[[image]],
-                return_tensors="pt",
+                text=["title: none | text: " + text], images=[[image]], return_tensors="pt"
             )
         else:
             encoded = processor(
@@ -1194,8 +1078,7 @@ def main():
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--artifacts-dir", type=Path)
     parser.add_argument(
-        "--text-only",
-        action="store_true",
+        "--text-only", action="store_true",
         help="Prepare or select text cases without media assets or processors",
     )
     parser.add_argument("--suite", type=Path)
@@ -1206,11 +1089,7 @@ def main():
         help="Gate vectors, rankings and routing against a completed matched runtime result",
     )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--asset-root",
-        type=Path,
-        help="Relocate selected image.png/audio.wav payloads after verifying their declared suite SHA256; keep suite/oracle bytes unchanged",
-    )
+    parser.add_argument("--asset-root", type=Path, help="Relocate selected image.png/audio.wav payloads after verifying their declared suite SHA256; keep suite/oracle bytes unchanged")
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument(
         "--case", action="append", help="Select named cases; may be repeated"
@@ -1241,9 +1120,7 @@ def main():
         parser.error("iterations must be 1..100")
     if args.backend == "prepare":
         if args.asset_root is not None:
-            parser.error(
-                "--asset-root applies to runtime suites; prepare uses --artifacts-dir"
-            )
+            parser.error("--asset-root applies to runtime suites; prepare uses --artifacts-dir")
         if not args.artifacts_dir and not args.text_only:
             parser.error("full prepare requires --artifacts-dir")
         prepare(args.model_dir, args.artifacts_dir, args.output, args.text_only)
@@ -1265,9 +1142,7 @@ def main():
     suite = json.loads(args.suite.read_text())
     if suite["revision"] != reference.REVISION:
         raise ValueError("suite checkpoint revision differs")
-    suite = select_cases(
-        suite, args.case, args.timing_mode == "encoder", args.text_only
-    )
+    suite = select_cases(suite, args.case, args.timing_mode == "encoder", args.text_only)
     suite, asset_relocation = relocate_assets(suite, args.asset_root)
     if args.timing_mode == "encoder" and args.warmups is None:
         args.warmups = 2
@@ -1276,9 +1151,7 @@ def main():
         "status": "running",
         "measurement_mode": args.timing_mode,
         "case_selection": [case["name"] for case in suite["cases"]],
-        "evaluation_scope": "text-only"
-        if all("text" in case for case in suite["cases"])
-        else "text-and-media",
+        "evaluation_scope": "text-only" if all("text" in case for case in suite["cases"]) else "text-and-media",
         "requested_text_only": args.text_only,
         "warmups": args.warmups,
         "long_iterations": args.long_iterations,

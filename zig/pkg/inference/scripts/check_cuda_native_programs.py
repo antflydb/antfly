@@ -59,22 +59,15 @@ def records(text, resources, default_arch=None):
 
 
 def select_programs(parsed, functions):
-    selected = [
-        {key: value for key, value in rows.items() if key[1] in functions}
-        for rows in parsed
-    ]
+    selected = [{key: value for key, value in rows.items() if key[1] in functions} for rows in parsed]
     for rows in selected:
-        assert {key[1] for key in rows} == set(functions), (
-            "missing requested native program"
-        )
+        assert {key[1] for key in rows} == set(functions), "missing requested native program"
     return selected
 
 
 def retired_programs(original, candidate, retired):
     removed = original.keys() - candidate.keys()
-    assert {key[1] for key in removed} == set(retired), (
-        "unexpected or unverified retired entrypoints"
-    )
+    assert {key[1] for key in removed} == set(retired), "unexpected or unverified retired entrypoints"
     assert not any(key[1] in retired for key in candidate), "retired entrypoint remains"
     return removed
 
@@ -101,9 +94,7 @@ def compare(tool, original, candidate, output, functions=None, retired=()):
     original_entries = len(old_code)
     removed = retired_programs(old_code, new_code, retired)
     old_code = {key: value for key, value in old_code.items() if key not in removed}
-    old_resources = {
-        key: value for key, value in old_resources.items() if key not in removed
-    }
+    old_resources = {key: value for key, value in old_resources.items() if key not in removed}
     assert old_code.keys() <= new_code.keys(), "missing existing entrypoints"
     result = {
         "original_entries": original_entries,
@@ -127,26 +118,18 @@ def compare(tool, original, candidate, output, functions=None, retired=()):
         ],
     }
     if functions:
-
         def digest(value):
-            return hashlib.sha256(
-                json.dumps(value, separators=(",", ":")).encode()
-            ).hexdigest()
-
+            return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
         result.update(
             original_image_sha256=hashlib.sha256(original.read_bytes()).hexdigest(),
             candidate_image_sha256=hashlib.sha256(candidate.read_bytes()).hexdigest(),
-            programs=[
-                dict(
-                    arch=key[0],
-                    function=key[1],
-                    original_instructions_sha256=digest(old_code[key]),
-                    candidate_instructions_sha256=digest(new_code[key]),
-                    original_resources_sha256=digest(old_resources[key]),
-                    candidate_resources_sha256=digest(new_resources[key]),
-                )
-                for key in sorted(old_code)
-            ],
+            programs=[dict(
+                arch=key[0], function=key[1],
+                original_instructions_sha256=digest(old_code[key]),
+                candidate_instructions_sha256=digest(new_code[key]),
+                original_resources_sha256=digest(old_resources[key]),
+                candidate_resources_sha256=digest(new_resources[key]),
+            ) for key in sorted(old_code)],
         )
     (output / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
@@ -159,27 +142,11 @@ def main():
     parser.add_argument("--cuobjdump", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--strict", action="store_true")
-    parser.add_argument(
-        "--function",
-        action="append",
-        help="Bind a historical proof to these exact exported programs",
-    )
-    parser.add_argument(
-        "--retired-function",
-        action="append",
-        default=[],
-        help="Require exactly these intentional removals; keep every other entrypoint",
-    )
+    parser.add_argument("--function", action="append", help="Bind a historical proof to these exact exported programs")
+    parser.add_argument("--retired-function", action="append", default=[], help="Require exactly these intentional removals; keep every other entrypoint")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    result = compare(
-        args.cuobjdump,
-        args.original,
-        args.candidate,
-        args.output,
-        args.function,
-        args.retired_function,
-    )
+    result = compare(args.cuobjdump, args.original, args.candidate, args.output, args.function, args.retired_function)
     print(json.dumps(result))
     if args.strict:
         assert not result["changed_instructions"] and not result["changed_resources"], (

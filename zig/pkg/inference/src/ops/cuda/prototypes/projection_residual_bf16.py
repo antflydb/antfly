@@ -64,26 +64,9 @@ def generate(output):
         scalar = "*bf16" if spec["bf16"] else "*fp32"
         data = compile_program(
             lighton_vision_down,
-            dict(
-                x="*bf16",
-                w="*bf16",
-                bias=scalar,
-                residual=scalar,
-                out=scalar,
-                rows="i32",
-            ),
-            dict(
-                K=spec["wide"],
-                N=spec["hidden"],
-                BM=128,
-                BN=64,
-                BK=64,
-                BF16_IO=spec["bf16"],
-            ),
-            range(5),
-            spec,
-            dict(num_stages=3, enable_fp_fusion=False),
-        )
+            dict(x="*bf16", w="*bf16", bias=scalar, residual=scalar, out=scalar, rows="i32"),
+            dict(K=spec["wide"], N=spec["hidden"], BM=128, BN=64, BK=64, BF16_IO=spec["bf16"]),
+            range(5), spec, dict(num_stages=3, enable_fp_fusion=False))
         records.append(emit(output, spec, data))
     write_manifest(output, records)
 

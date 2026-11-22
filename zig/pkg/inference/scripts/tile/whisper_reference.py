@@ -24,30 +24,18 @@ and the transcript). `zig build tile-whisper -- <model> <out-dir>/mel.f32
 --reference <out-dir>` and scripts/tile/run_whisper_opencl.py compare
 against these.
 """
-
 import json, sys, wave
 import numpy as np
 import torch
-from transformers import (
-    WhisperFeatureExtractor,
-    WhisperForConditionalGeneration,
-    WhisperTokenizer,
-)
+from transformers import WhisperFeatureExtractor, WhisperForConditionalGeneration, WhisperTokenizer
 
 model_dir, wav_path, out_dir = sys.argv[1:4]
 torch.set_grad_enabled(False)
 w = wave.open(wav_path)
-audio = (
-    np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
-    / 32768.0
-)
+audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
 fe = WhisperFeatureExtractor.from_pretrained(model_dir)
-feats = fe(
-    audio, sampling_rate=16000, return_tensors="pt"
-).input_features  # [1, 80, 3000]
-model = WhisperForConditionalGeneration.from_pretrained(
-    model_dir, torch_dtype=torch.float32
-).eval()
+feats = fe(audio, sampling_rate=16000, return_tensors="pt").input_features  # [1, 80, 3000]
+model = WhisperForConditionalGeneration.from_pretrained(model_dir, torch_dtype=torch.float32).eval()
 gen = json.load(open(f"{model_dir}/generation_config.json"))
 tok = WhisperTokenizer.from_pretrained(model_dir)
 
@@ -55,19 +43,10 @@ feats.numpy().astype(np.float32).tofile(f"{out_dir}/mel.f32")
 enc = model.model.encoder(feats).last_hidden_state
 enc[0].numpy().astype(np.float32).tofile(f"{out_dir}/encoder_out.f32")
 
-prompt = [
-    50258,
-    50259,
-    50359,
-    50363,
-]  # <|startoftranscript|><|en|><|transcribe|><|notimestamps|>
+prompt = [50258, 50259, 50359, 50363]  # <|startoftranscript|><|en|><|transcribe|><|notimestamps|>
 ids = list(prompt)
 for step in range(100):
-    logits = (
-        model(encoder_outputs=(enc,), decoder_input_ids=torch.tensor([ids]))
-        .logits[0, -1]
-        .clone()
-    )
+    logits = model(encoder_outputs=(enc,), decoder_input_ids=torch.tensor([ids])).logits[0, -1].clone()
     if step == 0:
         logits.numpy().astype(np.float32).tofile(f"{out_dir}/step0_logits.f32")
     logits[gen["suppress_tokens"]] = -float("inf")
@@ -79,24 +58,8 @@ for step in range(100):
         break
 text = tok.decode(ids, skip_special_tokens=True)
 gen_ids = model.generate(feats, language="en", task="transcribe")[0].tolist()
-json.dump(
-    {
-        "prompt": prompt,
-        "tokens": ids,
-        "text": text,
-        "generate_text": tok.decode(gen_ids, skip_special_tokens=True),
-        "suppress_tokens": gen["suppress_tokens"],
-        "begin_suppress_tokens": gen["begin_suppress_tokens"],
-    },
-    open(f"{out_dir}/reference.json", "w"),
-    indent=1,
-)
-print(
-    json.dumps(
-        {
-            "tokens": ids,
-            "text": text,
-            "generate_text": tok.decode(gen_ids, skip_special_tokens=True),
-        }
-    )
-)
+json.dump({"prompt": prompt, "tokens": ids, "text": text,
+           "generate_text": tok.decode(gen_ids, skip_special_tokens=True),
+           "suppress_tokens": gen["suppress_tokens"], "begin_suppress_tokens": gen["begin_suppress_tokens"]},
+          open(f"{out_dir}/reference.json", "w"), indent=1)
+print(json.dumps({"tokens": ids, "text": text, "generate_text": tok.decode(gen_ids, skip_special_tokens=True)}))

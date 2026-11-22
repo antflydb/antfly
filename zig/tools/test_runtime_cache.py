@@ -73,10 +73,9 @@ class RuntimeCacheTest(unittest.TestCase):
             try:
                 identities = {
                     cpu: Path(
-                        f"/sys/devices/system/cpu/cpu{cpu}/regs/identification/midr_el1"
-                    )
-                    .read_text()
-                    .strip()
+                        f"/sys/devices/system/cpu/cpu{cpu}/regs/"
+                        "identification/midr_el1"
+                    ).read_text().strip()
                     for cpu in original_affinity
                 }
             except OSError:
@@ -1879,31 +1878,18 @@ class RuntimeCacheTest(unittest.TestCase):
                     self.own("zig/pkg/inference/src/graph/kernel_source_owner.zig")
                 )
                 if backend == "cuda":
-                    native_templates.append(
-                        self.own(
-                            "zig/pkg/inference/src/ops/cuda/encoder_multimodal.zig"
-                        )
-                    )
-                    native_templates.extend(
-                        self.own("zig/pkg/inference/" + name)
-                        for name in (
-                            "src/graph/cuda_execution_contract.zig",
-                            "src/ops/cuda/recurrent_device_policy.zig",
-                            "src/ops/cuda/kernels/local_relative_attention_program.cuh",
-                            "src/ops/cuda/kernels/source_scalar_programs.cuh",
-                            "src/ops/cuda/kernels/score_softmax_bf16_program.cuh",
-                        )
-                    )
-                native_templates.append(
-                    self.own("zig/pkg/inference/src/tile/whisper_logits.zig")
-                )
+                    native_templates.append(self.own("zig/pkg/inference/src/ops/cuda/encoder_multimodal.zig"))
+                    native_templates.extend(self.own("zig/pkg/inference/" + name) for name in (
+                        "src/graph/cuda_execution_contract.zig",
+                        "src/ops/cuda/recurrent_device_policy.zig",
+                        "src/ops/cuda/kernels/local_relative_attention_program.cuh",
+                        "src/ops/cuda/kernels/source_scalar_programs.cuh",
+                        "src/ops/cuda/kernels/score_softmax_bf16_program.cuh",
+                    ))
+                native_templates.append(self.own("zig/pkg/inference/src/tile/whisper_logits.zig"))
                 native_templates.append(self.own("zig/lib/tile/src/native_math.zig"))
                 if backend == "metal":
-                    native_templates.append(
-                        self.own(
-                            "zig/pkg/inference/src/ops/metal/generated/tile_whisper_logits_partials.msl.h"
-                        )
-                    )
+                    native_templates.append(self.own("zig/pkg/inference/src/ops/metal/generated/tile_whisper_logits_partials.msl.h"))
                 first = self.build(
                     "cache-identity", "runtime-unit-cli", backend=backend
                 )
@@ -1960,17 +1946,11 @@ class RuntimeCacheTest(unittest.TestCase):
                     + domain_paths(f"{backend}_dependencies")
                 )
                 qualifier += sorted(
-                    os.path.relpath(
-                        Path(directory) / name, self.root / "zig/pkg/inference"
-                    )
-                    for source_root in (
-                        self.root / "zig/lib/tile/src",
-                        self.root / "zig/pkg/inference/src/tile",
-                    )
+                    os.path.relpath(Path(directory) / name, self.root / "zig/pkg/inference")
+                    for source_root in (self.root / "zig/lib/tile/src", self.root / "zig/pkg/inference/src/tile")
                     for directory, _, names in os.walk(source_root, followlinks=True)
                     for name in names
-                    if name.endswith((".zig", ".cu", ".metal", ".m"))
-                    and name != "source_inputs.zig"
+                    if name.endswith((".zig", ".cu", ".metal", ".m")) and name != "source_inputs.zig"
                 )
                 self.assertEqual(after[1], self.bundle_digest(qualifier))
                 if backend == "cuda":
@@ -2044,9 +2024,7 @@ class RuntimeCacheTest(unittest.TestCase):
 
                 for template in native_templates:
                     before_template = self.probe(output, label).split()
-                    template.write_bytes(
-                        template.read_bytes() + b"\n// native owner edit\n"
-                    )
+                    template.write_bytes(template.read_bytes() + b"\n// native owner edit\n")
                     output = self.build(
                         "cache-identity", "runtime-unit-cli", backend=backend
                     )

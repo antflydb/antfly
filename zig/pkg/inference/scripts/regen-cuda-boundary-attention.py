@@ -55,6 +55,7 @@ def validate_retained_sources(prior, sources, selected):
                 raise RuntimeError(f"source changed for retained {arch}: {name}")
 
 
+
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -70,12 +71,7 @@ def main():
         type=Path,
         default=Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")),
     )
-    parser.add_argument(
-        "--architectures",
-        nargs="+",
-        choices=tuple(ARCHITECTURES),
-        default=tuple(ARCHITECTURES),
-    )
+    parser.add_argument("--architectures", nargs="+", choices=tuple(ARCHITECTURES), default=tuple(ARCHITECTURES))
     args = parser.parse_args()
     nvcc = args.cuda / "bin/nvcc"
     version = subprocess.check_output([nvcc, "--version"], text=True)
@@ -94,14 +90,11 @@ def main():
         outputs[name] = data
     compiler_by_arch = dict(prior.get("compiler_by_arch", {}))
     for arch, suffix in ARCHITECTURES.items():
-        if any(
-            f"gliner25_boundary_attention_{d}.{suffix}" in outputs for d in DIRECTIONS
-        ):
+        if any(f"gliner25_boundary_attention_{d}.{suffix}" in outputs for d in DIRECTIONS):
             compiler_by_arch.setdefault(arch, prior.get("compiler", version.strip()))
     sources = {
         name: sha((ARTIFACTS / name).read_bytes())
-        for arch in ARCHITECTURES
-        for name in source_files(arch)
+        for arch in ARCHITECTURES for name in source_files(arch)
     }
     if prior:
         validate_retained_sources(prior, sources, args.architectures)
@@ -114,15 +107,7 @@ def main():
                 name = f"gliner25_boundary_attention_{direction}.{ARCHITECTURES[arch]}"
                 out = Path(temp) / name
                 subprocess.run(
-                    [
-                        str(nvcc),
-                        "-cubin",
-                        f"-arch={arch}",
-                        *OPTIONS,
-                        str(source),
-                        "-o",
-                        str(out),
-                    ],
+                    [str(nvcc), "-cubin", f"-arch={arch}", *OPTIONS, str(source), "-o", str(out)],
                     check=True,
                 )
                 outputs[name] = out.read_bytes()
@@ -132,15 +117,11 @@ def main():
         "compiler_by_arch": compiler_by_arch,
         "source_files_by_arch": {arch: source_files(arch) for arch in ARCHITECTURES},
         "profile_by_arch": {
-            arch: "gliner25_boundary_attention_warp_d32_v2"
-            if arch == "sm_120"
-            else "gliner25_boundary_attention_native_d32_v1"
+            arch: "gliner25_boundary_attention_warp_d32_v2" if arch == "sm_120" else "gliner25_boundary_attention_native_d32_v1"
             for arch in ARCHITECTURES
         },
         "profile": "gliner25_boundary_attention_native_d32_v1",
-        "compiler": version.strip()
-        if set(args.architectures) == set(ARCHITECTURES)
-        else prior.get("compiler", version.strip()),
+        "compiler": version.strip() if set(args.architectures) == set(ARCHITECTURES) else prior.get("compiler", version.strip()),
         "options": list(OPTIONS),
         "source_sha256": sources,
         "artifacts": {name: sha(data) for name, data in outputs.items()},

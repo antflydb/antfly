@@ -90,31 +90,19 @@ def render(model: Path) -> str:
         ]
     )
     from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionRotaryEmbedding
-
     vision = whole_config.vision_config
-    if vision.head_dim != 64 or vision.rope_parameters != {
-        "rope_theta": 100.0,
-        "rope_type": "axial",
-    }:
+    if vision.head_dim != 64 or vision.rope_parameters != {"rope_theta": 100.0, "rope_type": "axial"}:
         raise ValueError("unsupported source axial frequency geometry")
-    axial, factor = Gemma4VisionRotaryEmbedding.compute_axial_rope_parameters(
-        vision, device="cpu"
-    )
+    axial, factor = Gemma4VisionRotaryEmbedding.compute_axial_rope_parameters(vision, device="cpu")
     if axial.dtype != torch.float32 or axial.numel() != 16 or factor != 1.0:
         raise ValueError("invalid source axial frequency metadata")
     # Original local capture used Torch2.14.1; validation on another version
     # MUST compare actual original-function bits, never substitute generic pow.
     result.extend(SOURCE_AXIAL_COMMENT.lstrip("\n").splitlines())
-    result.append(
-        "static __device__ __constant__ unsigned int antfly_rotary_axis32_theta100_bits[16] = {"
-    )
+    result.append("static __device__ __constant__ unsigned int antfly_rotary_axis32_theta100_bits[16] = {")
     axial_bits = axial.view(torch.int32).tolist()
     for offset in range(0, 16, 8):
-        result.append(
-            "    "
-            + ", ".join(f"0x{value:08x}u" for value in axial_bits[offset : offset + 8])
-            + ","
-        )
+        result.append("    " + ", ".join(f"0x{value:08x}u" for value in axial_bits[offset:offset+8]) + ",")
     result.extend(["};", ""])
     return "\n".join(result)
 

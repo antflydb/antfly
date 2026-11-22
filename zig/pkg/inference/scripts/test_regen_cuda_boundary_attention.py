@@ -51,14 +51,8 @@ class BoundaryAttentionArtifactsTest(unittest.TestCase):
             set(metadata["source_sha256"]),
             {name for arch in regen.ARCHITECTURES for name in regen.source_files(arch)},
         )
-        self.assertEqual(
-            metadata["source_files_by_arch"],
-            {arch: regen.source_files(arch) for arch in regen.ARCHITECTURES},
-        )
-        self.assertEqual(
-            metadata["profile_by_arch"]["sm_120"],
-            "gliner25_boundary_attention_warp_d32_v2",
-        )
+        self.assertEqual(metadata["source_files_by_arch"], {arch: regen.source_files(arch) for arch in regen.ARCHITECTURES})
+        self.assertEqual(metadata["profile_by_arch"]["sm_120"], "gliner25_boundary_attention_warp_d32_v2")
         for name, expected_hash in {
             **metadata["artifacts"],
             **metadata["source_sha256"],
@@ -70,8 +64,7 @@ class BoundaryAttentionArtifactsTest(unittest.TestCase):
                     self.assertEqual(data[:6], b"\x7fELF\x02\x01")
                     flags = struct.unpack_from("<I", data, 48)[0]
                     self.assertEqual(
-                        (flags >> 8) & 0xFF,
-                        120 if ".sm120." in name else 80 if ".sm80." in name else 89,
+                        (flags >> 8) & 0xFF, 120 if ".sm120." in name else 80 if ".sm80." in name else 89
                     )
                     entry = (
                         b"boundary_backward"
@@ -81,11 +74,7 @@ class BoundaryAttentionArtifactsTest(unittest.TestCase):
                     self.assertIn(entry + b"\x00", data)
 
     def test_partial_regeneration_rejects_changed_retained_sources(self):
-        sources = {
-            name: "current"
-            for arch in regen.ARCHITECTURES
-            for name in regen.source_files(arch)
-        }
+        sources = {name: "current" for arch in regen.ARCHITECTURES for name in regen.source_files(arch)}
         prior = {"source_sha256": dict(sources)}
         regen.validate_retained_sources(prior, sources, ["sm_120"])
         sources[regen.source_name("forward", "sm_80")] = "changed"
