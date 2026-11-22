@@ -26,11 +26,16 @@ pub const checkpoint_authority = @import("source_checkpoint_authority.zig");
 pub const protocol_version: u16 = 101;
 pub const closing_protocol_version: u16 = 115;
 pub const native_bootstrap_protocol_version: u16 = 130;
+pub const native_bootstrap_preparing_phase = "native_bootstrap_preparing";
 pub const native_bootstrap_snapshot_phase = "native_bootstrap_snapshot";
 pub const native_bootstrap_applying_phase = "native_bootstrap_applying";
 pub const native_bootstrap_prepared_phase = "native_bootstrap_prepared";
+pub fn nativeBootstrapCanReplaceExport(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, native_bootstrap_preparing_phase) or
+        std.mem.eql(u8, phase, native_bootstrap_snapshot_phase);
+}
 pub fn isNativeBootstrapPhase(phase: []const u8) bool {
-    return std.mem.eql(u8, phase, native_bootstrap_snapshot_phase) or
+    return nativeBootstrapCanReplaceExport(phase) or
         std.mem.eql(u8, phase, native_bootstrap_applying_phase) or
         std.mem.eql(u8, phase, native_bootstrap_prepared_phase);
 }

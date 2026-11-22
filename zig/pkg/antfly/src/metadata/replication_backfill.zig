@@ -409,7 +409,15 @@ pub const SnapshotBackfillRunner = struct {
         progress_cutover_provider_identity: *foreign_mod.ExactCutoverIntent.ProviderIdentity,
     ) !BackfillSummary {
         try self.checkpointWork();
-        try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
+        const control = @import("source_control.zig");
+        if (self.protected_native_bootstrap) {
+            if (existing_status) |prior| {
+                if (!control.nativeBootstrapCanReplaceExport(prior.phase))
+                    return error.SourcePendingWork;
+                if (prior.snapshot_offset != 0 or prior.stream_checkpoint.len != 0) return error.SourcePendingWork;
+                try callCheckCutoverAuthority(status_sink, table.replication_sources_json, prior);
+            } else try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
+        } else try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer);
         defer parsed.deinit(self.alloc);
         var external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
@@ -460,7 +468,6 @@ pub const SnapshotBackfillRunner = struct {
             .{ table.name, source_ordinal, resolved_dsn.cacheGeneration(), @tagName(resolved_dsn.source) },
         );
 
-        const control = @import("source_control.zig");
         var phase_snapshot: []const u8 = if (self.protected_native_bootstrap) control.native_bootstrap_snapshot_phase else "snapshot";
         const phase_complete = if (self.protected_native_bootstrap) control.native_bootstrap_prepared_phase else "cutover_prepared";
         const config = foreign_mod.Config{
@@ -487,6 +494,8 @@ pub const SnapshotBackfillRunner = struct {
             exactCutoverConfigWasReplaced(status, existing_owns_config)
         else
             false;
+        if (self.protected_native_bootstrap and existing_status != null and !existing_owns_config)
+            return error.ReplicationCutoverAuthorityLost;
         const stored_prepared_checkpoint = if (existing_status) |status|
             if (status.prepared_checkpoint.len > 0) status.prepared_checkpoint else null
         else
@@ -683,13 +692,17 @@ pub const SnapshotBackfillRunner = struct {
                 // started and an async status write must not manufacture proof.
                 var record = ctx.record;
                 record.cutover_provider_identity = provider_identity;
-                try requireLegacyOwnership(ctx.status_sink, ctx.alloc, ctx.table, ctx.record.source_ordinal);
-                try callClaimCutoverStatusDurable(
-                    ctx.status_sink,
-                    ctx.expected_replication_sources_json,
-                    ctx.expected_authority_id,
-                    record,
-                );
+                if (ctx.runner.protected_native_bootstrap) {
+                    try ctx.runner.publishNativeSnapshotStatus(ctx.status_sink, ctx.table, record);
+                } else {
+                    try requireLegacyOwnership(ctx.status_sink, ctx.alloc, ctx.table, ctx.record.source_ordinal);
+                    try callClaimCutoverStatusDurable(
+                        ctx.status_sink,
+                        ctx.expected_replication_sources_json,
+                        ctx.expected_authority_id,
+                        record,
+                    );
+                }
                 ctx.record.cutover_provider_identity = provider_identity;
                 ctx.progress_cutover_mode.clearRetainingCapacity();
                 ctx.progress_cutover_mode.appendSliceAssumeCapacity(
@@ -721,7 +734,7 @@ pub const SnapshotBackfillRunner = struct {
             fn check(ptr: *anyopaque) !void {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
                 try ctx.runner.checkpointWork();
-                try requireLegacyOwnership(ctx.status_sink, ctx.alloc, ctx.table, ctx.record.source_ordinal);
+                if (!ctx.runner.protected_native_bootstrap) try requireLegacyOwnership(ctx.status_sink, ctx.alloc, ctx.table, ctx.record.source_ordinal);
                 try callCheckCutoverAuthority(
                     ctx.status_sink,
                     ctx.expected_replication_sources_json,
@@ -777,7 +790,7 @@ pub const SnapshotBackfillRunner = struct {
                 .cutover_mode = cutover_mode_exported_snapshot_pending,
                 .slot_name = exact_slot_name,
                 .publication_name = exact_publication_name,
-                .phase = "cutover_preparing",
+                .phase = if (self.protected_native_bootstrap) control.native_bootstrap_preparing_phase else "cutover_preparing",
                 .checkpoint = "snapshot_offset:0",
                 .snapshot_offset = 0,
                 .cutover_intent_id = cutover_intent_id,
@@ -901,7 +914,7 @@ pub const SnapshotBackfillRunner = struct {
             effective_publication_name,
         );
         try checkProgressCutoverAuthority(
-            null,
+            if (self.protected_native_bootstrap) control.native_bootstrap_preparing_phase else null,
             self.alloc,
             status_sink,
             table,
@@ -1661,7 +1674,15 @@ pub const SnapshotBackfillCoordinator = struct {
                 }
                 try self.runner.checkpointWork();
                 summary.sources_considered += 1;
-                switch (try legacyIntake(service, self.alloc, table, @intCast(ordinal))) {
+                const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal));
+                const control = @import("source_control.zig");
+                const resume_protected = if (existing) |record|
+                    @hasDecl(Service, "publishNativeReplicationBootstrapDurable") and
+                        control.nativeBootstrapCanReplaceExport(record.phase) and
+                        record.snapshot_offset == 0 and record.stream_checkpoint.len == 0
+                else
+                    false;
+                if (!resume_protected) switch (try legacyIntake(service, self.alloc, table, @intCast(ordinal))) {
                     .allowed => {},
                     .destination_actor => {
                         summary.sources_skipped_destination_actor += 1;
@@ -1671,9 +1692,8 @@ pub const SnapshotBackfillCoordinator = struct {
                         summary.sources_failed += 1;
                         continue;
                     },
-                }
+                };
 
-                const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal));
                 const exact_config_replaced = if (existing) |record| blk: {
                     if (record.cutover_authority_id == 0) break :blk false;
                     var parsed = try parseReplicationSourceConfig(
@@ -1726,7 +1746,9 @@ pub const SnapshotBackfillCoordinator = struct {
                     summary.sources_started += 1;
                 }
 
-                const source_summary = self.runner.runTableSourceFromStatus(service, table, @intCast(ordinal), start_offset, existing) catch |err| {
+                var runner = self.runner;
+                runner.protected_native_bootstrap = runner.protected_native_bootstrap or resume_protected;
+                const source_summary = runner.runTableSourceFromStatus(service, table, @intCast(ordinal), start_offset, existing) catch |err| {
                     if (std.mem.eql(u8, classifyReplicationError(err), "terminal")) {
                         std.log.warn(
                             "metadata cdc snapshot source terminal error table={s} source={d} err={s}",
@@ -4870,7 +4892,9 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             _: ?u64,
         ) !void {
             try std.testing.expect(@import("source_control.zig").isNativeBootstrapPhase(record.phase));
-            try std.testing.expectEqualStrings("lsn:exact", record.prepared_checkpoint);
+            if (std.mem.eql(u8, record.phase, @import("source_control.zig").native_bootstrap_preparing_phase)) {
+                try std.testing.expectEqualStrings("", record.prepared_checkpoint);
+            } else try std.testing.expectEqualStrings("lsn:exact", record.prepared_checkpoint);
             try self.upsertReplicationSourceStatus(record);
         }
 
@@ -4915,13 +4939,25 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
         .protected_native_bootstrap = true,
     };
 
-    _ = try runner.runTableSource(&status_sink, .{
+    const native_table: metadata_table_manager.TableRecord = .{
         .table_id = 11,
         .name = "docs",
         .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
-    }, 0);
+    };
 
-    try std.testing.expectEqual(@as(usize, 1), FakeExecutor.exact_cutover_calls);
+    const Interrupt = struct {
+        fn reach(_: *anyopaque, event: ReplicationLifecycleEvent) !void {
+            if (event.phase == .provider_prepared) return error.TestSnapshotExportLost;
+        }
+    };
+    runner.lifecycle_hook = .{ .ptr = &status_sink, .reach_fn = Interrupt.reach };
+    try std.testing.expectError(error.TestSnapshotExportLost, runner.runTableSource(&status_sink, native_table, 0));
+    runner.lifecycle_hook = null;
+    const interrupted_native = status_sink.records.items[status_sink.records.items.len - 1];
+    const resumed_index = status_sink.records.items.len;
+    try std.testing.expectEqual(@as(usize, 0), FakeExecutor.snapshot_query_calls);
+    _ = try runner.runTableSourceFromStatus(&status_sink, native_table, 0, 0, interrupted_native);
+    try std.testing.expectEqual(@as(usize, 2), FakeExecutor.exact_cutover_calls);
     try std.testing.expectEqual(@as(usize, 0), FakeExecutor.prepare_calls);
     try std.testing.expectEqual(@as(usize, 3), FakeExecutor.snapshot_query_calls);
     try std.testing.expectEqualStrings("lsn:exact", status_sink.records.items[status_sink.records.items.len - 1].prepared_checkpoint);
@@ -4929,14 +4965,14 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     const final_status = status_sink.records.items[status_sink.records.items.len - 1];
     const control = @import("source_control.zig");
     try std.testing.expectEqualStrings(control.native_bootstrap_prepared_phase, final_status.phase);
-    try std.testing.expectEqualStrings(control.native_bootstrap_snapshot_phase, status_sink.records.items[1].phase);
-    try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[1].snapshot_offset);
-    try std.testing.expectEqualStrings(control.native_bootstrap_applying_phase, status_sink.records.items[2].phase);
-    try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[2].snapshot_offset);
+    try std.testing.expectEqualStrings(control.native_bootstrap_snapshot_phase, status_sink.records.items[resumed_index + 2].phase);
+    try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[resumed_index + 2].snapshot_offset);
+    try std.testing.expectEqualStrings(control.native_bootstrap_applying_phase, status_sink.records.items[resumed_index + 3].phase);
+    try std.testing.expectEqual(@as(u64, 0), status_sink.records.items[resumed_index + 3].snapshot_offset);
     try std.testing.expectEqual(@as(u64, 2), final_status.snapshot_offset);
     runner.protected_native_bootstrap = false;
     try std.testing.expect(final_status.cutover_intent_id != 0);
-    try std.testing.expect(final_status.cutover_authority_id != 0);
+    try std.testing.expect(final_status.cutover_authority_id != interrupted_native.cutover_authority_id);
     try std.testing.expect(!std.mem.eql(
         u8,
         &final_status.cutover_provider_identity,

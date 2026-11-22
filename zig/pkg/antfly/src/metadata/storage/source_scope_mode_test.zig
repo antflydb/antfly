@@ -100,11 +100,32 @@ pub fn run(a: A) !void {
     defer if (forged) |record| metadata.freeReplicationSourceStatus(a, record);
     try std.testing.expect(forged == null);
     try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
-    try store.applyStandaloneCommand(group, .{ .claim_replication_source_cutover = .{
-        .expected_replication_sources_json = table.replication_sources_json,
-        .expected_authority_id = 0,
-        .record = cutover,
+    var original = cutover;
+    original.phase = control.native_bootstrap_preparing_phase;
+    original.cutover_authority_id = 1;
+    original.slot_name = "slot_old";
+    original.publication_name = "pub_old";
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = original,
     } });
+    original.phase = control.native_bootstrap_snapshot_phase;
+    original.cutover_mode = "exported_snapshot";
+    original.prepared_checkpoint = "lsn:0/1000";
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = original,
+    } });
+    var successor = cutover;
+    successor.phase = control.native_bootstrap_preparing_phase;
+    successor.retired_cutover_authority_id = original.cutover_authority_id;
+    successor.retired_slot_name = original.slot_name;
+    successor.retired_publication_name = original.publication_name;
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = successor,
+    } });
+    try store.applyStandaloneCommand(group, .{ .complete_replication_source_retirement = successor });
     var snapshot_status = cutover;
     snapshot_status.cutover_mode = "exported_snapshot";
     snapshot_status.phase = control.native_bootstrap_snapshot_phase;
@@ -159,6 +180,17 @@ pub fn run(a: A) !void {
         defer metadata.freeReplicationSourceStatus(a, protected);
         try std.testing.expectEqualStrings(control.native_bootstrap_applying_phase, protected.phase);
     }
+    var invalid_replacement = successor;
+    invalid_replacement.cutover_authority_id += 1;
+    invalid_replacement.slot_name = "slot_later";
+    invalid_replacement.publication_name = "pub_later";
+    invalid_replacement.retired_cutover_authority_id = applying.cutover_authority_id;
+    invalid_replacement.retired_slot_name = applying.slot_name;
+    invalid_replacement.retired_publication_name = applying.publication_name;
+    try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{
+        .catalog_digest = actor.catalog,
+        .record = invalid_replacement,
+    } });
     applying.snapshot_offset = 1;
     applying.checkpoint = "snapshot_keyset:[42]";
     try store.applyStandaloneCommand(group, .{ .publish_native_replication_bootstrap = .{

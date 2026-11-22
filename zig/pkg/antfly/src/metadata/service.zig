@@ -10760,7 +10760,10 @@ pub const MetadataHttpService = struct {
         if (!replicationCutoverAuthorityMatches(observed, record) or
             !std.mem.eql(u8, observed.phase, record.phase) or observed.snapshot_offset != record.snapshot_offset or
             !std.mem.eql(u8, observed.prepared_checkpoint, record.prepared_checkpoint) or
-            !std.mem.eql(u8, observed.checkpoint, record.checkpoint))
+            !std.mem.eql(u8, observed.checkpoint, record.checkpoint) or
+            observed.retired_cutover_authority_id != record.retired_cutover_authority_id or
+            !std.mem.eql(u8, observed.retired_slot_name, record.retired_slot_name) or
+            !std.mem.eql(u8, observed.retired_publication_name, record.retired_publication_name))
             return error.ReplicationCutoverAuthorityLost;
         try context.ensureActive();
     }

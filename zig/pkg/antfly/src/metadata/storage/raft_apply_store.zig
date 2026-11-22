@@ -6431,15 +6431,9 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             }
         },
         .publish_native_replication_bootstrap => |publication| {
-            const record = publication.record;
-            if (record.table_id == 0 or std.mem.allEqual(u8, &publication.catalog_digest, 0) or
-                !std.mem.eql(u8, record.source_kind, "postgres") or
-                !std.mem.eql(u8, record.cutover_mode, "exported_snapshot") or
-                !source_control.isNativeBootstrapPhase(record.phase) or
-                record.prepared_checkpoint.len == 0 or record.prepared_checkpoint.len > 1024 or
-                record.stream_checkpoint.len != 0 or record.retired_cutover_authority_id != 0)
+            if (std.mem.allEqual(u8, &publication.catalog_digest, 0))
                 return error.InvalidReplicationCutoverIntent;
-            _ = try source_control.nativeSourceProviderBinding(record);
+            try validateNativeReplicationBootstrap(publication.record);
         },
         .complete_replication_source_retirement => |record| {
             if (record.cutover_authority_id == 0 or
@@ -24512,15 +24506,34 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, &digest, &source_control.digest(table.replication_sources_json))) return;
         var status_buffer: [224]u8 = undefined;
         const key = try replicationSourceStatusKeyForGroup(&status_buffer, group_id, record.table_id, record.source_ordinal);
-        const current = try decodeReplicationSourceStatusRecord(a, (try stagingGet(txn, key)) orelse return);
-        if (!source_control.isNativeBootstrapPhase(record.phase) or
-            !std.mem.eql(u8, record.cutover_mode, "exported_snapshot") or
-            record.prepared_checkpoint.len == 0 or record.prepared_checkpoint.len > 1024 or
-            record.stream_checkpoint.len != 0 or record.retired_cutover_authority_id != 0 or
-            current.stream_checkpoint.len != 0 or
+        validateNativeReplicationBootstrap(record) catch return;
+        const raw = try stagingGet(txn, key);
+        if (std.mem.eql(u8, record.phase, source_control.native_bootstrap_preparing_phase)) {
+            if (raw) |bytes| {
+                const previous = try decodeReplicationSourceStatusRecord(a, bytes);
+                if (!source_control.nativeBootstrapCanReplaceExport(previous.phase) or
+                    previous.snapshot_offset != 0 or previous.stream_checkpoint.len != 0)
+                    return;
+                if (replicationCutoverAuthorityIdentityEqual(previous, record)) return;
+                if (previous.retired_cutover_authority_id != 0 or
+                    record.retired_cutover_authority_id != previous.cutover_authority_id or
+                    record.cutover_authority_id == previous.cutover_authority_id or
+                    record.cutover_intent_id != previous.cutover_intent_id or
+                    !std.mem.eql(u8, &record.cutover_config_fingerprint, &previous.cutover_config_fingerprint) or
+                    !std.mem.eql(u8, &record.cutover_provider_identity, &previous.cutover_provider_identity) or
+                    !std.mem.eql(u8, record.external_table, previous.external_table) or
+                    !std.mem.eql(u8, record.retired_slot_name, previous.slot_name) or
+                    !std.mem.eql(u8, record.retired_publication_name, previous.publication_name) or
+                    std.mem.eql(u8, record.slot_name, previous.slot_name) or
+                    std.mem.eql(u8, record.publication_name, previous.publication_name)) return;
+            } else if (record.retired_cutover_authority_id != 0) return;
+            return self.putReplicationSourceStatusTxn(txn, group_id, key, record);
+        }
+        const current = try decodeReplicationSourceStatusRecord(a, raw orelse return);
+        if (current.stream_checkpoint.len != 0 or
             !replicationCutoverAuthorityIdentityEqual(current, record) or
             !replicationCutoverRetirementEqual(current, record)) return;
-        if (std.mem.eql(u8, current.phase, "cutover_preparing")) {
+        if (std.mem.eql(u8, current.phase, source_control.native_bootstrap_preparing_phase) or std.mem.eql(u8, current.phase, "cutover_preparing")) {
             // Claim the fresh exported cut before any legacy snapshot or
             // stream can pass through a completed phase for this authority.
             if (!std.mem.eql(u8, record.phase, source_control.native_bootstrap_snapshot_phase) or
@@ -28901,6 +28914,26 @@ pub const RaftApplyStore = struct {
         return try self.alloc.dupe(u8, table.name);
     }
 };
+
+fn validateNativeReplicationBootstrap(record: metadata.ReplicationSourceStatusRecord) !void {
+    if (record.table_id == 0 or !std.mem.eql(u8, record.source_kind, "postgres") or
+        record.external_table.len == 0 or !source_control.isNativeBootstrapPhase(record.phase) or
+        record.stream_checkpoint.len != 0)
+        return error.InvalidReplicationCutoverIntent;
+    _ = try source_control.nativeSourceProviderBinding(record);
+    if (std.mem.eql(u8, record.phase, source_control.native_bootstrap_preparing_phase)) {
+        const retiring = record.retired_cutover_authority_id != 0;
+        if (!std.mem.eql(u8, record.cutover_mode, "exported_snapshot_pending") or
+            record.prepared_checkpoint.len != 0 or record.snapshot_offset != 0 or
+            retiring != (record.retired_slot_name.len != 0) or
+            retiring != (record.retired_publication_name.len != 0))
+            return error.InvalidReplicationCutoverIntent;
+    } else if (!std.mem.eql(u8, record.cutover_mode, "exported_snapshot") or
+        record.prepared_checkpoint.len == 0 or record.prepared_checkpoint.len > 1024 or
+        record.retired_cutover_authority_id != 0 or record.retired_slot_name.len != 0 or
+        record.retired_publication_name.len != 0)
+        return error.InvalidReplicationCutoverIntent;
+}
 
 fn replicationCutoverAuthorityIdentityEqual(
     a: metadata.ReplicationSourceStatusRecord,
