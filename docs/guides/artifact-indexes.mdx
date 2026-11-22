@@ -452,7 +452,9 @@ GCS external-I/O support in v0.3.0-rc.6 alone is insufficient.
 
 An output budget belongs under `execution`, not in a replacement OCR recipe.
 For an existing artifact, retain its public descriptor fields and omit the
-write-only producer fields so Antfly preserves the stored recipe and credentials:
+write-only producer fields so Antfly preserves the stored recipe and credentials.
+An explicit `transcriber`, `producer`, or `producer_json` replaces the producer;
+only omission inherits it:
 
 ```http
 PUT /db/v1/tables/documents/artifacts/document_units_v1/enrichment
@@ -495,3 +497,8 @@ Acceptance is not completion: inspect manifests and all consumer-index readiness
 before declaring recovery successful. Model, prompt, rendering and extraction
 policy changes can invalidate existing results. Chunking, embeddings and graph
 changes rebuild their downstream artifacts while reusing extracted text.
+
+Policy-only updates are persisted separately from the frozen publication catalog,
+so they preserve accepted publication proofs as well as extraction fingerprints.
+Incomplete-only retries inspect coverage and generation from one manifest
+snapshot. Changing a model, prompt or source recipe still changes semantic identity.

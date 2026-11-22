@@ -5314,7 +5314,7 @@ pub const ChunkOutputTarget = struct {
     model: []const u8,
     /// False retains this model as a planning boundary while skipping its inference; used for independent output repairs.
     execute: ?bool = null,
-    /// Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped.
+    /// Execution-only repair mask for accepted receipts. A sub_index of 4294967295 skips all outputs at that ordinal. Other entries skip individual sub-windows. Masks leave recipe and boundary identities unchanged.
     skip_windows: ?[]const std.json.Value = null,
     required: ?bool = null,
     model_identity: ?[]const u8 = null,
@@ -16975,7 +16975,7 @@ pub const ExactSortError = struct {
     }
 };
 
-/// Non-semantic execution policy for one producer or index maintenance operation. Updates affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply.
+/// Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply.
 pub const ExecutionPolicy = struct {
     /// Invocation output-token budget for reader/generator assets and document-extraction OCR pages. Overrides producer max_tokens at execution only; it does not change the stored recipe, source fingerprint, or completed outputs. A lower value does not retroactively reject accepted output. Omit to use the producer budget.
     max_output_tokens_per_item: ?u32 = null,

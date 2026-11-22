@@ -19,7 +19,7 @@ const std = @import("std");
 /// producer JSON. Omission retains the admitted producer of the same kind;
 /// explicit producer configuration still replaces it.
 pub fn inheritProducer(alloc: std.mem.Allocator, root: std.json.ObjectMap, name: []const u8, replacement: *std.json.Value) !void {
-    if (replacement.* != .object or replacement.object.contains("producer_json") or replacement.object.contains("producer")) return;
+    if (replacement.* != .object or replacement.object.contains("producer_json") or replacement.object.contains("producer") or replacement.object.contains("transcriber")) return;
     const kind = replacement.object.get("kind") orelse return;
     if (kind != .string) return;
     if (root.get("enrichments")) |items| if (try inheritFrom(alloc, items, name, kind.string, replacement)) return;
@@ -38,7 +38,7 @@ fn inheritFrom(alloc: std.mem.Allocator, items: std.json.Value, name: []const u8
         const candidate = entry.object.get("name") orelse continue;
         const old_kind = entry.object.get("kind") orelse continue;
         if (candidate != .string or old_kind != .string or !std.mem.eql(u8, candidate.string, name) or !std.mem.eql(u8, old_kind.string, kind)) continue;
-        for ([_][]const u8{ "producer_json", "producer" }) |field| if (entry.object.get(field)) |value| {
+        for ([_][]const u8{ "producer_json", "producer", "transcriber" }) |field| if (entry.object.get(field)) |value| {
             try replacement.object.put(alloc, field, value);
             return true;
         };
@@ -128,4 +128,19 @@ test "execution update retains omitted private producer from root or inline decl
         try inheritProducer(replacement.arena.allocator(), catalog.value.object, "units", &replacement.value);
         try std.testing.expectEqualStrings("replacement", replacement.value.object.get("producer_json").?.string);
     }
+}
+
+test "transcription shorthand replaces explicit producers and survives execution updates" {
+    const a = std.testing.allocator;
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, "{\"enrichments\":[{\"name\":\"units\",\"kind\":\"asset\",\"producer_json\":\"old\"}]}", .{});
+    defer catalog.deinit();
+    var replacement = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"units\",\"kind\":\"asset\",\"transcriber\":{\"provider\":\"antfly\",\"model\":\"whisper\"}}", .{});
+    defer replacement.deinit();
+    try inheritProducer(replacement.arena.allocator(), catalog.value.object, "units", &replacement.value);
+    try std.testing.expect(!replacement.value.object.contains("producer_json"));
+    catalog.value.object.get("enrichments").?.array.items[0] = replacement.value;
+    var update = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"units\",\"kind\":\"asset\",\"execution\":{\"batch_items\":2}}", .{});
+    defer update.deinit();
+    try inheritProducer(update.arena.allocator(), catalog.value.object, "units", &update.value);
+    try std.testing.expect(update.value.object.contains("transcriber"));
 }

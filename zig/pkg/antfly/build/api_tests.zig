@@ -1036,6 +1036,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     write_implementation_imports.runtime = @import("lake_execution_tests.zig").sourceImports(b, antfly_imports);
     write_implementation_imports.configure(b, write_implementation_module, true, true);
     write_implementation_module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const artifact_policy_local_filters = &.{ "enrichment shorthand local PUT", "privacy reprocess continuations" };
+    const artifact_policy_local_tests = b.addTest(.{
+        .root_module = write_implementation_module,
+        .filters = artifact_policy_local_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-artifact-execution-policy-local-api-test", "Verify native producer PUT normalization and policy cursor transport")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_policy_local_tests, artifact_policy_local_filters).step);
+
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
         .target = target,

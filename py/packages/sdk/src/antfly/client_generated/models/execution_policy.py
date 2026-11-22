@@ -12,9 +12,10 @@ T = TypeVar("T", bound="ExecutionPolicy")
 
 @_attrs_define
 class ExecutionPolicy:
-    """Non-semantic execution policy for one producer or index maintenance operation. Updates affect future invocations
-    without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly
-    use the bounded reprocess APIs. Node/provider ceilings still apply.
+    """Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the
+    frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry
+    incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider
+    ceilings still apply.
 
         Attributes:
             max_output_tokens_per_item (int | Unset): Invocation output-token budget for reader/generator assets and

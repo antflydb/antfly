@@ -22,62 +22,87 @@ pub const Coverage = struct {
     retryable: bool = false,
 };
 
+// Decode only the completion header. Unknown child ranges, merge operations
+// and retained unit bodies are skipped by the typed streaming JSON parser.
+const ManifestHeader = struct {
+    const Merge = struct { status: ?[]const u8 = null };
+    generation: u64 = 0,
+    route_type: ?[]const u8 = null,
+    merge_plan: ?Merge = null,
+    merge: ?Merge = null,
+    merge_status: ?[]const u8 = null,
+    last_error: ?std.json.Value = null,
+    unsupported_reason: ?[]const u8 = null,
+    incomplete_unit_count: u64 = 0,
+    retryable_incomplete_unit_count: u64 = 0,
+    ocr_failed_count: u64 = 0,
+    ocr_retryable_failed_count: u64 = 0,
+    ocr_failed_page_numbers: []const u64 = &.{},
+    ocr_failure_details: []const struct { retryable: bool = false } = &.{},
+
+    fn coverage(self: @This()) Coverage {
+        var value: Coverage = .{
+            .failed = (if (self.unsupported_reason) |reason| reason.len != 0 else false) or
+                self.incomplete_unit_count != 0 or self.retryable_incomplete_unit_count != 0 or
+                self.ocr_failed_count != 0 or self.ocr_retryable_failed_count != 0 or
+                self.ocr_failed_page_numbers.len != 0 or self.ocr_failure_details.len != 0,
+            .retryable = self.retryable_incomplete_unit_count != 0 or self.ocr_retryable_failed_count != 0,
+        };
+        for (self.ocr_failure_details) |detail| value.retryable = value.retryable or detail.retryable;
+        return value;
+    }
+
+    fn state(self: @This()) PublicationState {
+        const route = self.route_type orelse return .pending;
+        if (route.len == 0) return .pending;
+        if (std.mem.eql(u8, route, "error") or self.last_error != null) return .failed;
+        var published = false;
+        if (self.merge_plan orelse self.merge) |merge| {
+            const status = merge.status orelse return .pending;
+            if (std.mem.eql(u8, status, "failed")) return .failed;
+            if (!std.mem.eql(u8, status, "converged")) return .pending;
+            published = true;
+        }
+        if (self.merge_status) |status| {
+            if (std.mem.eql(u8, status, "failed")) return .failed;
+            if (!std.mem.eql(u8, status, "converged")) return .pending;
+            published = true;
+        }
+        if (!published) return .pending;
+        return if (self.coverage().failed) .failed else .complete;
+    }
+};
+
+fn parseHeader(alloc: std.mem.Allocator, manifest: []const u8) !std.json.Parsed(ManifestHeader) {
+    return std.json.parseFromSlice(ManifestHeader, alloc, manifest, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDocumentExtractionManifest,
+    };
+}
+
 pub fn inspect(alloc: std.mem.Allocator, manifest: []const u8) !Coverage {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest, .{});
+    var parsed = try parseHeader(alloc, manifest);
     defer parsed.deinit();
-    return inspectValue(parsed.value);
+    return parsed.value.coverage();
 }
 
-/// Complete means published, error-free and fully covered, not just converged.
+/// Coverage and generation come from the same immutable manifest snapshot.
+pub const Snapshot = struct {
+    generation: u64 = 0,
+    state: PublicationState = .pending,
+    pub fn complete(self: Snapshot) bool {
+        return self.state == .complete;
+    }
+};
+
+pub fn snapshot(alloc: std.mem.Allocator, manifest: []const u8) !Snapshot {
+    var parsed = try parseHeader(alloc, manifest);
+    defer parsed.deinit();
+    return .{ .generation = parsed.value.generation, .state = parsed.value.state() };
+}
+
 pub fn isComplete(alloc: std.mem.Allocator, manifest: []const u8) !bool {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
-    const status = parsed.value.object.get("merge_status") orelse return false;
-    if (status != .string or !std.mem.eql(u8, status.string, "converged")) return false;
-    if (parsed.value.object.get("last_error")) |err| if (err != .null) return false;
-    return !(try inspectValue(parsed.value)).failed;
-}
-
-fn inspectValue(value: std.json.Value) !Coverage {
-    if (value != .object) return error.InvalidDocumentExtractionManifest;
-    var coverage: Coverage = .{};
-    if (value.object.get("unsupported_reason")) |reason| {
-        if (reason != .string and reason != .null) return error.InvalidDocumentExtractionManifest;
-        coverage.failed = reason == .string and reason.string.len > 0;
-    }
-    for ([_][]const u8{ "incomplete_unit_count", "retryable_incomplete_unit_count" }) |field| {
-        if (value.object.get(field)) |count| {
-            if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
-            coverage.failed = coverage.failed or count.integer > 0;
-            if (std.mem.eql(u8, field, "retryable_incomplete_unit_count")) coverage.retryable = coverage.retryable or count.integer > 0;
-        }
-    }
-    if (value.object.get("ocr_failed_count")) |count| {
-        if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
-        coverage.failed = coverage.failed or count.integer > 0;
-    }
-    if (value.object.get("ocr_retryable_failed_count")) |count| {
-        if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
-        coverage.retryable = coverage.retryable or count.integer > 0;
-        coverage.failed = coverage.failed or coverage.retryable;
-    }
-    if (value.object.get("ocr_failed_page_numbers")) |pages| {
-        if (pages != .array) return error.InvalidDocumentExtractionManifest;
-        coverage.failed = coverage.failed or pages.array.items.len > 0;
-    }
-    if (value.object.get("ocr_failure_details")) |details| {
-        if (details != .array) return error.InvalidDocumentExtractionManifest;
-        coverage.failed = coverage.failed or details.array.items.len > 0;
-        for (details.array.items) |detail| {
-            if (detail != .object) return error.InvalidDocumentExtractionManifest;
-            if (detail.object.get("retryable")) |retryable| {
-                if (retryable != .bool) return error.InvalidDocumentExtractionManifest;
-                coverage.retryable = coverage.retryable or retryable.bool;
-            }
-        }
-    }
-    return coverage;
+    return (try snapshot(alloc, manifest)).complete();
 }
 
 test "document extraction completion retains retryable page debt" {
@@ -124,26 +149,7 @@ test "missing modality producers and transcription failures remain incomplete" {
 /// complete extraction. Parse once; never inspect retained child bodies.
 pub const PublicationState = enum { pending, failed, complete };
 pub fn publicationState(alloc: std.mem.Allocator, manifest: []const u8) !PublicationState {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest, .{});
-    defer parsed.deinit();
-    const value = parsed.value;
-    if (value != .object) return error.InvalidDocumentExtractionManifest;
-    const route = value.object.get("route_type") orelse return .pending;
-    if (route != .string or route.string.len == 0) return .pending;
-    if (std.mem.eql(u8, route.string, "error") or value.object.get("last_error") != null) return .failed;
-    if (value.object.get("merge_plan") orelse value.object.get("merge")) |merge| {
-        if (merge != .object) return error.InvalidDocumentExtractionManifest;
-        const status = merge.object.get("status") orelse return .pending;
-        if (status != .string) return error.InvalidDocumentExtractionManifest;
-        if (std.mem.eql(u8, status.string, "failed")) return .failed;
-        if (!std.mem.eql(u8, status.string, "converged")) return .pending;
-    }
-    if (value.object.get("merge_status")) |status| {
-        if (status != .string) return error.InvalidDocumentExtractionManifest;
-        if (std.mem.eql(u8, status.string, "failed")) return .failed;
-        if (!std.mem.eql(u8, status.string, "converged")) return .pending;
-    }
-    return if ((try inspectValue(value)).failed) .failed else .complete;
+    return (try snapshot(alloc, manifest)).state;
 }
 
 test "publication health separates readable partial and pending extraction from success" {
@@ -157,7 +163,26 @@ test "publication health separates readable partial and pending extraction from 
 
 test "incomplete selection preserves only published error-free coverage" {
     const a = std.testing.allocator;
-    try std.testing.expect(try isComplete(a, "{\"merge_status\":\"converged\",\"ocr_failed_count\":0}"));
-    inline for (.{ "{}", "{\"merge_status\":\"pending\"}", "{\"merge_status\":\"converged\",\"ocr_failed_count\":1}", "{\"merge_status\":\"converged\",\"incomplete_unit_count\":1}", "{\"merge_status\":\"converged\",\"last_error\":{\"code\":\"Canceled\"}}" }) |manifest|
+    const published = "{\"route_type\":\"pdf\",\"generation\":7,\"merge_plan\":{\"status\":\"converged\"},\"ocr_failed_count\":0}";
+    const view = try snapshot(a, published);
+    try std.testing.expect(view.complete());
+    try std.testing.expectEqual(@as(u64, 7), view.generation);
+    try std.testing.expect(try isComplete(a, published));
+    inline for (.{ "{}", "{\"route_type\":\"pdf\",\"merge_plan\":{\"status\":\"pending\"}}", "{\"route_type\":\"pdf\",\"merge_plan\":{\"status\":\"converged\"},\"ocr_failed_count\":1}", "{\"route_type\":\"pdf\",\"merge_plan\":{\"status\":\"converged\"},\"incomplete_unit_count\":1}" }) |manifest|
         try std.testing.expect(!try isComplete(a, manifest));
+    try std.testing.expectError(error.InvalidDocumentExtractionManifest, snapshot(a, "{\"generation\":-1}"));
+}
+
+test "completion header skips large retained payloads" {
+    const a = std.testing.allocator;
+    const retained = try a.alloc(u8, 512 * 1024);
+    defer a.free(retained);
+    @memset(retained, 'x');
+    const raw = try std.fmt.allocPrint(a, "{{\"route_type\":\"pdf\",\"generation\":7,\"merge_plan\":{{\"status\":\"converged\",\"operations\":[{{\"retained_payload\":\"{s}\"}}]}},\"ocr_failed_count\":0}}", .{retained});
+    defer a.free(raw);
+    var memory: [8192]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&memory);
+    const header = try snapshot(bounded.allocator(), raw);
+    try std.testing.expect(header.complete());
+    try std.testing.expectEqual(@as(u64, 7), header.generation);
 }

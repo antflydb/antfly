@@ -7584,12 +7584,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 0;
             const to_generation = from_generation + 1;
+            const must_force = force_reprocess and (request.reprocess_generation == 0 or from_generation < request.reprocess_generation);
 
             const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
             defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
             // As in async replay, checksum opt-in requires verified bytes;
             // metadata-only legacy fingerprints cannot prove that provenance.
-            if (!force_reprocess) {
+            if (!must_force) {
                 if (metadata_fingerprint) |fingerprint| {
                     if (try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
                 }
@@ -7680,7 +7681,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
             const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
-            if (metadata_fingerprint == null and !force_reprocess and
+            if (metadata_fingerprint == null and !must_force and
                 try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
 
             // Downloaded bytes, inspection state, and decoded extraction results are
