@@ -1028,6 +1028,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{
             .ptr = self,
             .supports_transaction_producer_phases = true,
+            .validates_local_decision_route = true,
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
@@ -1038,6 +1039,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
@@ -6893,7 +6895,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
     ) !void {
-        return self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, req, .{});
+        return self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, req, .{}, 0);
     }
 
     fn applyTransactionGroupLocalWithContext(
@@ -6903,12 +6905,19 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
         context: request_operation.RequestContext,
+        decision_epoch: u64,
     ) !void {
         try context.ensureActive();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
-        var lease = try self.acquireTransactionOwner(alloc, group_id, table_name, req, context);
+        var lease = if (decision_epoch != 0) try self.acquireWithControls(group_id, table_name, .{ .cancellation = context.cancellation, .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io }) else try self.acquireTransactionOwner(alloc, group_id, table_name, req, context);
         defer lease.deinit();
+        if (decision_epoch != 0) {
+            const route = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, decision_epoch, group_id, context.cancellation);
+            const expected = route.route.identity_namespace;
+            const actual = lease.entry.identity;
+            if (actual.table_id != expected.table_id or actual.shard_id != expected.shard_id or actual.range_id != expected.range_id) return error.DecisionNotProposed;
+        }
         try context.ensureActive();
         var response = try lease.owner().replicatedBatchJson(table_name, request_json);
         defer response.deinit();
@@ -7014,7 +7023,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .retain_terminal = retain_terminal,
                 .participants = participants,
             } },
-        }, active);
+        }, active, 0);
         return {};
     }
 
@@ -7076,18 +7085,33 @@ pub const ProvisionedKernelOwnerSource = struct {
         txn_id: db_types.TxnId,
         status: db_types.TxnStatus,
         commit_version: u64,
-        _: u64,
+        topology_epoch: u64,
         sync_level: db_types.SyncLevel,
     ) !?void {
+        return txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
+    }
+
+    fn txnResolveGroupLocalWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        status: db_types.TxnStatus,
+        commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_types.SyncLevel,
+        cancellation: db_types.CancellationToken,
+    ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
+        try self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, .{
             .sync_level = sync_level,
             .transaction = .{ .resolve = .{
                 .txn_id = txn_id,
                 .status = status,
                 .commit_version = commit_version,
             } },
-        });
+        }, .{ .cancellation = cancellation }, topology_epoch);
         return {};
     }
 

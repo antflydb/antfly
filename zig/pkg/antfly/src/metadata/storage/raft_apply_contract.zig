@@ -302,6 +302,7 @@ pub const CatalogProjectionRequest = union(enum) {
     report_cursor: u64,
     read_control_stores: []const u64,
     owner_readiness: @import("../api.zig").OwnerReadinessRequest,
+    decision_admission: @import("../api.zig").DecisionAdmissionRequest,
     owner_readiness_transitions: @import("../api.zig").OwnerReadinessRequest,
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,

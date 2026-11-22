@@ -182,7 +182,9 @@ pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
 /// Version 125 coordinates catalog history and publication feeds.
 /// Version 126 persists physical owners in retained history plans.
 /// Version 127 plans distinct feed roots for ranges sharing a storage namespace.
-pub const current_version: u16 = 127;
+pub const compact_session_compare_version: u16 = 128;
+pub const spliced_session_record_version: u16 = 129;
+pub const current_version: u16 = spliced_session_record_version;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

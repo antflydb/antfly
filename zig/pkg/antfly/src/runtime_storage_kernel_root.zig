@@ -129,6 +129,9 @@ comptime {
     exportInternal(&storage_kernel_exports.metadataSessionReadOpen, "antfly_metadata_session_read_open");
     exportInternal(&storage_kernel_exports.metadataSessionReadInvoke, "antfly_metadata_session_read_invoke");
     exportInternal(&storage_kernel_exports.metadataSessionReadClose, "antfly_metadata_session_read_close");
+    exportInternal(&storage_kernel_exports.metadataSessionCursorOpen, "antfly_metadata_session_cursor_open");
+    exportInternal(&storage_kernel_exports.metadataSessionCursorInvoke, "antfly_metadata_session_cursor_invoke");
+    exportInternal(&storage_kernel_exports.metadataSessionCursorClose, "antfly_metadata_session_cursor_close");
     exportInternal(&storage_kernel_exports.metadataApplyStoreBindHotStandby, "antfly_metadata_apply_store_bind_ha");
     exportInternal(&storage_kernel_exports.metadataApplyStoreAddListeners, "antfly_metadata_apply_store_add_listeners");
     exportInternal(&storage_kernel_exports.metadataApplyStoreRemoveListeners, "antfly_metadata_apply_store_remove_listeners");

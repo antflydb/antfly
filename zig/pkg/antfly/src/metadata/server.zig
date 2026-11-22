@@ -121,9 +121,13 @@ const MetadataSessions = struct {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return svc.localMetadataLeadershipTerm();
     }
-    fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64) !void {
+    fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64, submitted: *bool) !bool {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .apply_transaction_sessions = bytes }, expected_term);
+        const receipt = try svc.proposeSessionCommandObserved(bytes, expected_term, submitted);
+        const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
+        var txn = try projected.openSessionRead(svc.alloc, svc.metadata_group_id);
+        defer txn.abort();
+        return @import("transaction_session_record.zig").readApplyResult(&txn, svc.alloc, svc.metadata_group_id, receipt.term, receipt.index);
     }
 };
 

@@ -128,6 +128,7 @@ pub const TableApi = struct {
         WriteUnavailable,
         WritePrecommitReadUnavailable,
         ConstraintActivationUnavailable,
+        TransactionPrepareAbortedRowPolicyDenied,
         WriteDefinitelyAbortedUnavailable,
         HAWriteDurabilityPending,
         OutcomeUnknown,
@@ -1873,9 +1874,14 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
             .json = true,
             .retry_after_seconds = 1,
         },
+        error.TransactionPrepareAbortedRowPolicyDenied => return .{
+            .status = 403,
+            .body = try alloc.dupe(u8, "{\"status\":\"aborted\",\"error\":\"row_policy_denied\",\"code\":\"row_policy_denied\",\"message\":\"Row policy denied the write.\",\"retryable\":false}"),
+            .json = true,
+        },
         error.WriteDefinitelyAbortedUnavailable => return .{
             .status = 503,
-            .body = try alloc.dupe(u8, "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .body = try alloc.dupe(u8, "{\"status\":\"aborted\",\"error\":\"transaction_precommit_aborted\",\"code\":\"transaction_precommit_aborted\",\"message\":\"The transaction did not commit. Retrying the batch is safe.\",\"retryable\":true,\"retry_after_ms\":1000}"),
             .json = true,
             .retry_after_seconds = 1,
         },
@@ -3984,7 +3990,8 @@ test "public table batch handler maps write unavailable errors" {
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
         .{ .err = error.WritePrecommitReadUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_read_unavailable\",\"message\":\"a required integrity read is unavailable; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.ConstraintActivationUnavailable, .status = 503, .body = "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
-        .{ .err = error.WriteDefinitelyAbortedUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
+        .{ .err = error.TransactionPrepareAbortedRowPolicyDenied, .status = 403, .body = "{\"status\":\"aborted\",\"error\":\"row_policy_denied\",\"code\":\"row_policy_denied\",\"message\":\"Row policy denied the write.\",\"retryable\":false}", .json = true },
+        .{ .err = error.WriteDefinitelyAbortedUnavailable, .status = 503, .body = "{\"status\":\"aborted\",\"error\":\"transaction_precommit_aborted\",\"code\":\"transaction_precommit_aborted\",\"message\":\"The transaction did not commit. Retrying the batch is safe.\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.IntegrityTopologyBusy, .status = 409, .body = "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{
             .err = error.OutcomeUnknown,

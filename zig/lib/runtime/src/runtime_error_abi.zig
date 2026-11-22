@@ -1186,6 +1186,9 @@ pub const Detail = enum(c_int) {
     invalid_pg_spool,
     query_canceled,
     transaction_prepare_aborted_unavailable,
+    decision_not_proposed,
+    pre_dispatch_catalog_generation_changed,
+    pre_dispatch_decision_admission_unavailable,
 };
 
 pub const Status = extern struct {
@@ -1825,6 +1828,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnknownGroup => status(.not_found, .unknown_group),
         error.TxnNotFound => status(.not_found, .txn_not_found),
         error.Conflict => status(.conflict, .conflict),
+        error.TransactionPrepareAbortedUnavailable => status(.retryable, .transaction_prepare_aborted_unavailable),
+        error.PreDispatchDecisionAdmissionUnavailable => status(.retryable, .pre_dispatch_decision_admission_unavailable),
+        error.PreDispatchCatalogGenerationChanged => status(.conflict, .pre_dispatch_catalog_generation_changed),
+        error.DecisionNotProposed => status(.conflict, .decision_not_proposed),
         error.DecisionConflict => status(.conflict, .decision_conflict),
         error.TableTransitionActive => status(.conflict, .table_transition_active),
         error.SchemaInUse => status(.conflict, .schema_in_use),
@@ -2285,7 +2292,6 @@ pub fn statusFromError(err: anyerror) Status {
         error.PgSpoolCorrupt => status(.corrupt, .pg_spool_corrupt),
         error.InvalidPgSpool => status(.invalid_argument, .invalid_pg_spool),
         error.QueryCanceled => status(.cancelled, .query_canceled),
-        error.TransactionPrepareAbortedUnavailable => status(.retryable, .transaction_prepare_aborted_unavailable),
 
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
@@ -2969,6 +2975,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .txn_not_found => "TxnNotFound",
         .conflict => "Conflict",
         .decision_conflict => "DecisionConflict",
+        .transaction_prepare_aborted_unavailable => "TransactionPrepareAbortedUnavailable",
+        .pre_dispatch_decision_admission_unavailable => "PreDispatchDecisionAdmissionUnavailable",
+        .pre_dispatch_catalog_generation_changed => "PreDispatchCatalogGenerationChanged",
+        .decision_not_proposed => "DecisionNotProposed",
         .table_transition_active => "TableTransitionActive",
         .schema_in_use => "SchemaInUse",
         .transaction_too_large => "TransactionTooLarge",
@@ -3400,7 +3410,6 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .pg_spool_corrupt => "PgSpoolCorrupt",
         .invalid_pg_spool => "InvalidPgSpool",
         .query_canceled => "QueryCanceled",
-        .transaction_prepare_aborted_unavailable => "TransactionPrepareAbortedUnavailable",
     };
 }
 

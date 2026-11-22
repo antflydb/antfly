@@ -94,6 +94,7 @@ pub const CatalogSource = struct {
         /// Snapshot slices and all transitively referenced bytes must remain
         /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
+        admin_snapshot_with_budget: ?*const fn (*anyopaque, RoutingBudget) anyerror!metadata_api.AdminSnapshot = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         export_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 = null,
         catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
@@ -105,6 +106,9 @@ pub const CatalogSource = struct {
         /// owned by the caller. Authoritative captures must still cross the
         /// source's read barrier; an eventual cache hit never proves absence.
         acquire_routing_generation: ?*const fn (ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) anyerror!*RoutingGeneration = null,
+        /// Opportunistic local reference only. Admission can verify the
+        /// target table on its metadata cut when the cache is cold or busy.
+        cached_routing_generation: ?*const fn (*anyopaque) ?*RoutingGeneration = null,
         /// Authoritative table fence and membership of an optional parked group.
         repair_route: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: ?u64, budget: RoutingBudget) anyerror!?RepairRoute = null,
         /// Allocation-efficient point projection used by mutation routing.
@@ -116,6 +120,7 @@ pub const CatalogSource = struct {
         linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         /// Fresh metadata barrier with a fixed-size result, independent of jobs.
         owner_readiness: ?*const fn (*anyopaque, metadata_api.OwnerReadinessRequest, RoutingBudget) anyerror!metadata_api.OwnerReadiness = null,
+        decision_admission: ?*const fn (*anyopaque, metadata_api.DecisionAdmissionRequest, RoutingBudget) anyerror!metadata_api.DecisionAdmission = null,
         privacy_policy_binding: ?*const fn (*anyopaque, []const u8, ?u64) anyerror!metadata_api.PrivacyPolicyBinding = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         /// Request-scoped route capabilities may pin DB identity through this
@@ -147,6 +152,17 @@ pub const CatalogSource = struct {
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
+    }
+
+    pub fn adminSnapshotWithBudget(self: CatalogSource, routing_budget: RoutingBudget) !metadata_api.AdminSnapshot {
+        try routing_budget.checkpoint();
+        var snapshot = if (self.vtable.admin_snapshot_with_budget) |capture|
+            try capture(self.ptr, routing_budget)
+        else
+            try self.adminSnapshot();
+        errdefer self.freeAdminSnapshot(&snapshot);
+        try routing_budget.checkpoint();
+        return snapshot;
     }
 
     pub fn restoreScopeForGroup(self: CatalogSource, table_name: []const u8, group_id: u64) !?[32]u8 {
@@ -223,11 +239,13 @@ pub const CatalogSource = struct {
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .catalog_identity = metadataServiceCatalogIdentity,
                 .acquire_routing_generation = metadataServiceAcquireRoutingGeneration,
+                .cached_routing_generation = metadataServiceCachedRoutingGeneration,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
                 .owner_readiness = metadataServiceOwnerReadiness,
+                .decision_admission = metadataServiceDecisionAdmission,
                 .privacy_policy_binding = metadataServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
@@ -247,11 +265,13 @@ pub const CatalogSource = struct {
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .catalog_identity = metadataHttpServiceCatalogIdentity,
                 .acquire_routing_generation = metadataHttpServiceAcquireRoutingGeneration,
+                .cached_routing_generation = metadataHttpServiceCachedRoutingGeneration,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
                 .owner_readiness = metadataHttpServiceOwnerReadiness,
+                .decision_admission = metadataHttpServiceDecisionAdmission,
                 .privacy_policy_binding = metadataHttpServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
@@ -271,11 +291,13 @@ pub const CatalogSource = struct {
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
                 .catalog_identity = metadataServerCatalogIdentity,
                 .acquire_routing_generation = metadataServerAcquireRoutingGeneration,
+                .cached_routing_generation = metadataServerCachedRoutingGeneration,
                 .routing_snapshot = metadataServerRoutingSnapshot,
                 .table_routing_snapshot = metadataServerTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServerLinearizableTableRoutingSnapshot,
                 .owner_readiness = metadataServerOwnerReadiness,
+                .decision_admission = metadataServerDecisionAdmission,
                 .privacy_policy_binding = metadataServerPrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServerFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServerWaitForRoutingChange,
@@ -627,6 +649,10 @@ pub const RoutingSession = struct {
 
     const RepairRoutingView = struct { table_id: u64, fence: u64 };
 
+    pub fn tableRanges(self: *const RoutingSession, table_id: u64) []const *const metadata_table_manager.RangeRecord {
+        return if (self.table_range_refs.get(table_id)) |index| index.ranges else &.{};
+    }
+
     /// Full-span repair fence, calculated once with the same ordered group
     /// IDs as the persisted repair job cursor.
     fn repairRoutingView(self: *const RoutingSession, table_name: []const u8, budget: RoutingBudget) !?RepairRoutingView {
@@ -714,6 +740,7 @@ pub const RoutingSession = struct {
         .restore_scope_for_group = restoreScopeForGroup,
         .restore_plan_for_group = restorePlanForGroup,
         .admin_snapshot = adminSnapshot,
+        .admin_snapshot_with_budget = adminSnapshotWithBudget,
         .free_admin_snapshot = freeAdminSnapshot,
         .routing_snapshot = routingSnapshot,
         .linearizable_routing_snapshot = linearizableRoutingSnapshot,
@@ -742,6 +769,10 @@ pub const RoutingSession = struct {
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         return try cast(ptr).base.adminSnapshot();
+    }
+
+    fn adminSnapshotWithBudget(ptr: *anyopaque, routing_budget: RoutingBudget) !metadata_api.AdminSnapshot {
+        return cast(ptr).base.adminSnapshotWithBudget(routing_budget);
     }
 
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -1356,10 +1387,30 @@ pub fn resolveGroupForKeyFromRanges(
     ranges: []const *const metadata_table_manager.RangeRecord,
     key: []const u8,
 ) ?u64 {
-    for (ranges) |range| {
-        if (rangeContainsKey(range.*, key)) return range.group_id;
+    // Ranges are sorted by start key. The predecessor is the only possible
+    // owner, including at an exact split boundary or in a keyspace gap.
+    const upper = std.sort.upperBound(*const metadata_table_manager.RangeRecord, ranges, key, struct {
+        fn compare(needle: []const u8, range: *const metadata_table_manager.RangeRecord) std.math.Order {
+            return std.mem.order(u8, needle, range.start_key);
+        }
+    }.compare);
+    if (upper == 0) return null;
+    const range = ranges[upper - 1];
+    return if (rangeContainsKey(range.*, key)) range.group_id else null;
+}
+
+test "distributed txn routes sorted boundary keys and rejects gaps" {
+    const Range = metadata_table_manager.RangeRecord;
+    const items = [_]Range{
+        .{ .group_id = 1, .table_id = 8, .start_key = "a", .end_key = "c" },
+        .{ .group_id = 2, .table_id = 8, .start_key = "d", .end_key = "f" },
+        .{ .group_id = 3, .table_id = 8, .start_key = "f", .end_key = null },
+    };
+    const ranges = [_]*const Range{ &items[0], &items[1], &items[2] };
+    for ([_][]const u8{ "", "a", "b", "c", "d", "e", "f", "z" }, [_]?u64{ null, 1, 1, null, 2, 2, 3, 3 }) |key, expected| {
+        try std.testing.expectEqual(expected, resolveGroupForKeyFromRanges(&ranges, key));
     }
-    return null;
+    try std.testing.expectEqual(@as(?u64, null), resolveGroupForKeyFromRanges(&.{}, "a"));
 }
 
 /// One authoritative, compact table projection suitable for write admission.
@@ -1560,15 +1611,20 @@ pub fn transactionRoutingSnapshot(
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer if (!transferred) metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
-    sortRangeRefs(ranges);
+    const epoch = sortedTransactionTopologyEpoch(table.*, ranges);
 
     transferred = true;
     return .{
         .catalog = catalog,
         .snapshot = snapshot,
         .ranges = ranges,
-        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+        .topology_epoch = epoch,
     };
+}
+
+pub fn sortedTransactionTopologyEpoch(table: metadata_table_manager.TableRecord, ranges: []const *const metadata_table_manager.RangeRecord) u64 {
+    sortRangeRefs(ranges);
+    return topologyEpochFromSortedRanges(table, ranges);
 }
 
 /// Whether a table with this name currently exists in the catalog. Used by
@@ -1702,11 +1758,123 @@ pub fn validateTransactionTopologyEpoch(
     table_name: []const u8,
     expected_epoch: u64,
 ) !void {
+    return validateTransactionEpoch(alloc, catalog, table_name, expected_epoch, false);
+}
+
+/// Bind the first-pass decision to its catalog and ranges using the existing
+/// wire fence. Older owners reject this token when comparing their range epoch.
+/// Zero is reserved exclusively for decision recovery.
+pub fn transactionDecisionEpoch(snapshot: *const metadata_api.AdminSnapshot, topology_epoch: u64) u64 {
+    return decisionEpochForAuthority(snapshot.status.metadata_group_id, snapshot.status.metadata_incarnation, topology_epoch);
+}
+
+pub fn decisionEpochForAuthority(metadata_group: u64, incarnation: ?metadata_api.MetadataClusterIncarnation, topology_epoch: u64) u64 {
+    var hash = std.hash.Wyhash.init(topology_epoch);
+    hash.update("antfly/txn-decision/v1");
+    var group: [8]u8 = undefined;
+    std.mem.writeInt(u64, &group, metadata_group, .little);
+    hash.update(&group);
+    if (incarnation) |id| hash.update(&id);
+    return @max(1, hash.final());
+}
+
+pub fn decisionCatalog(catalog: CatalogSource) CatalogSource {
+    if (catalog.vtable == &RoutingSession.vtable) return decisionCatalog(RoutingSession.cast(catalog.ptr).base);
+    return catalog;
+}
+
+pub fn generationDecisionRoute(generation: *RoutingGeneration, table_name: []const u8, group_id: u64, budget: RoutingBudget) !metadata_api.CatalogRouteFence {
+    const session = &generation.indexed;
+    const view = try session.tableRoutingView(table_name, budget);
+    var fence = (try RoutingSession.routeFence(session, group_id)) orelse return error.TopologyChanged;
+    if (fence.table_id != view.table_id) return error.TopologyChanged;
+    fence.protocol = metadata_api.CatalogRouteFence.decision_protocol;
+    return fence;
+}
+
+pub fn raftDecisionRoute(alloc: std.mem.Allocator, source: CatalogSource, table_name: []const u8, epoch: u64, group: u64, budget: RoutingBudget) !metadata_api.CatalogRouteFence {
+    const catalog = decisionCatalog(source);
+    if (catalog.vtable.acquire_routing_generation) |acquire| {
+        const generation = try acquire(catalog.ptr, budget, true);
+        defer generation.release();
+        const fence = try generationDecisionRoute(generation, table_name, group, budget);
+        if (epoch != fence.topology_epoch and epoch != decisionEpochForAuthority(fence.metadata_group_id, fence.metadata_incarnation, fence.topology_epoch)) return error.TopologyChanged;
+        return fence;
+    }
+    // Private immutable catalogs may supply only a bounded snapshot. This
+    // selection runs before Raft dispatch and holds no proposal admission.
+    var fence = (try checkedTransactionRoute(alloc, catalog, table_name, epoch, true, group)) orelse return error.TopologyChanged;
+    fence.protocol = metadata_api.CatalogRouteFence.decision_protocol;
+    return fence;
+}
+
+pub fn validateRaftDecision(source: CatalogSource, table_name: []const u8, fence: metadata_api.CatalogRouteFence, budget: RoutingBudget) !void {
+    const catalog = decisionCatalog(source);
+    const capture = catalog.vtable.decision_admission orelse return error.CatalogRouteFenceUnsupported;
+    try budget.checkpoint();
+    const revision: ?u64 = verified: {
+        const peek = catalog.vtable.cached_routing_generation orelse break :verified null;
+        const generation = peek(catalog.ptr) orelse break :verified null;
+        defer generation.release();
+        const route = generationDecisionRoute(generation, table_name, fence.route.group_id, budget) catch |err| switch (err) {
+            error.TableNotFound, error.TopologyChanged => break :verified null,
+            else => return err,
+        };
+        if (route.catalog_revision != 0 and route.metadata_incarnation != null and route.metadata_group_id == fence.metadata_group_id and std.meta.eql(route.metadata_incarnation, fence.metadata_incarnation) and
+            route.table_id == fence.table_id and route.topology_epoch == fence.topology_epoch and std.meta.eql(route.route, fence.route)) break :verified route.catalog_revision;
+        break :verified null;
+    };
+    const check = try capture(catalog.ptr, .{ .table_id = fence.table_id, .table_name = table_name, .route_check = .{
+        .verified_revision = revision,
+        .topology_epoch = fence.topology_epoch,
+        .route = fence.route,
+    } }, budget);
+    if (!check.stable or check.metadata_group_id != fence.metadata_group_id or !std.meta.eql(check.metadata_incarnation, fence.metadata_incarnation)) return error.TopologyChanged;
+    if (!check.route_checked and revision != check.catalog_revision) return error.CatalogRouteFenceUnsupported;
+    try budget.checkpoint();
+}
+
+pub fn localDecisionRoute(alloc: std.mem.Allocator, source: CatalogSource, table_name: []const u8, epoch: u64, group: u64, cancellation: @import("antfly_cancellation").CancellationToken) !metadata_api.CatalogRouteFence {
+    const catalog = decisionCatalog(source);
+    var budget = catalog.budget(null);
+    budget.deadline_ns = budget.nowNs() +| @as(u64, metadata_api.catalog_route_default_deadline_ms) * std.time.ns_per_ms;
+    budget.cancellation = cancellation;
+    const fence = raftDecisionRoute(alloc, catalog, table_name, epoch, group, budget) catch |err| switch (err) {
+        error.TableNotFound, error.TopologyChanged => return error.DecisionNotProposed,
+        else => return err,
+    };
+    if (catalog.vtable.acquire_routing_generation != null) validateRaftDecision(catalog, table_name, fence, budget) catch |err| switch (err) {
+        error.TableNotFound, error.TopologyChanged => return error.DecisionNotProposed,
+        else => return err,
+    };
+    return fence;
+}
+
+pub fn validateTransactionEpoch(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, expected_epoch: u64, decision: bool) !void {
+    _ = try checkedTransactionRoute(alloc, catalog, table_name, expected_epoch, decision, null);
+}
+
+/// Select the final Raft owner's route from the very snapshot that passed
+/// decision admission. The leader rechecks this fence under its proposal gate.
+pub fn checkedTransactionRoute(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, expected_epoch: u64, decision: bool, group: ?u64) !?metadata_api.CatalogRouteFence {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
-    if (expected_epoch != 0 and (try topologyEpochFromSnapshot(alloc, &snapshot, table.*)) != expected_epoch) return error.TopologyChanged;
+    if (expected_epoch == 0) return null;
+    const topology_epoch = try topologyEpochFromSnapshot(alloc, &snapshot, table.*);
+    if (expected_epoch != topology_epoch and (!decision or expected_epoch != transactionDecisionEpoch(&snapshot, topology_epoch))) return error.TopologyChanged;
+    const group_id = group orelse return null;
+    const range = findRangeForTableGroup(snapshot.ranges, table.table_id, group_id) orelse return error.TopologyChanged;
+    const range_id = metadata_table_manager.rangeDocIdentityRangeId(range);
+    return .{
+        .metadata_group_id = snapshot.status.metadata_group_id,
+        .metadata_incarnation = snapshot.status.metadata_incarnation,
+        .catalog_revision = 0,
+        .table_id = table.table_id,
+        .topology_epoch = topology_epoch,
+        .route = .{ .group_id = group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table.table_id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(range), .range_id = range_id } },
+    };
 }
 
 pub fn validateTopologyEpoch(
@@ -1826,12 +1994,12 @@ pub fn validateTransactionTopologyStable(
     return validateTransactionTopologyStableSnapshot(&snapshot, table.*);
 }
 
-fn validateTransactionTopologyStableSnapshot(
+pub fn validateTransactionTopologyStableSnapshot(
     snapshot: *const metadata_api.AdminSnapshot,
     table: metadata_table_manager.TableRecord,
 ) !void {
     for (snapshot.split_transitions) |transition| {
-        if (!transitionPhaseActive(transition.phase)) continue;
+        if (!blocksTransactionRouting(transition)) continue;
         if (transition.table_contract.table_id == table.table_id or
             std.mem.eql(u8, transition.table_contract.table_name, table.name))
         {
@@ -1845,8 +2013,7 @@ fn validateTransactionTopologyStableSnapshot(
         }
     }
     for (snapshot.merge_transitions) |transition| {
-        if (!transitionPhaseActive(transition.phase)) continue;
-        if (onlineMergeAllowsTransactions(transition)) continue;
+        if (!blocksTransactionRouting(transition)) continue;
         if (transition.table_contract.table_id == table.table_id or
             std.mem.eql(u8, transition.table_contract.table_name, table.name))
         {
@@ -1861,7 +2028,7 @@ fn validateTransactionTopologyStableSnapshot(
     }
 }
 
-fn onlineMergeAllowsTransactions(transition: metadata_transition_state.MergeTransitionRecord) bool {
+pub fn onlineMergeAllowsTransactions(transition: metadata_transition_state.MergeTransitionRecord) bool {
     const online = transition.online orelse return false;
     switch (online.phase) {
         .admit, .publish, .snapshot, .tail => {},
@@ -1871,6 +2038,12 @@ fn onlineMergeAllowsTransactions(transition: metadata_transition_state.MergeTran
     // merely an online-looking phase on an ordinary or mismatched record.
     online.validateRecord(transition) catch return false;
     return online.scope.authority == .raft and online.scope.fence.role == .merge_source;
+}
+
+pub fn blocksTransactionRouting(transition: anytype) bool {
+    if (!transitionPhaseActive(transition.phase)) return false;
+    if (@TypeOf(transition) == metadata_transition_state.MergeTransitionRecord) return !onlineMergeAllowsTransactions(transition);
+    return true;
 }
 
 fn transitionPhaseActive(phase: metadata_transition_state.TransitionPhase) bool {
@@ -3026,6 +3199,11 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataServiceCachedRoutingGeneration(ptr: *anyopaque) ?*RoutingGeneration {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return svc.catalog_projection_reader.cachedRoutingGeneration();
+}
+
 fn metadataServiceAcquireRoutingGeneration(ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) !*RoutingGeneration {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     if (authoritative) {
@@ -3068,6 +3246,11 @@ fn metadataServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: 
 fn metadataServiceOwnerReadiness(ptr: *anyopaque, request: metadata_api.OwnerReadinessRequest, budget: RoutingBudget) !metadata_api.OwnerReadiness {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     return svc.ownerReadiness(request, budget);
+}
+
+fn metadataServiceDecisionAdmission(ptr: *anyopaque, request: metadata_api.DecisionAdmissionRequest, budget: RoutingBudget) !metadata_api.DecisionAdmission {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return svc.decisionAdmission(request, budget);
 }
 
 fn metadataServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
@@ -3126,6 +3309,11 @@ fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataHttpServiceCachedRoutingGeneration(ptr: *anyopaque) ?*RoutingGeneration {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return svc.catalog_projection_reader.cachedRoutingGeneration();
+}
+
 fn metadataHttpServiceAcquireRoutingGeneration(ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) !*RoutingGeneration {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     if (authoritative) {
@@ -3168,6 +3356,11 @@ fn metadataHttpServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_na
 fn metadataHttpServiceOwnerReadiness(ptr: *anyopaque, request: metadata_api.OwnerReadinessRequest, budget: RoutingBudget) !metadata_api.OwnerReadiness {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return svc.ownerReadiness(request, budget);
+}
+
+fn metadataHttpServiceDecisionAdmission(ptr: *anyopaque, request: metadata_api.DecisionAdmissionRequest, budget: RoutingBudget) !metadata_api.DecisionAdmission {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return svc.decisionAdmission(request, budget);
 }
 
 fn metadataHttpServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
@@ -3226,6 +3419,11 @@ fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Admi
     srv.freeAdminSnapshot(snapshot);
 }
 
+fn metadataServerCachedRoutingGeneration(ptr: *anyopaque) ?*RoutingGeneration {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return srv.svc.catalog_projection_reader.cachedRoutingGeneration();
+}
+
 fn metadataServerAcquireRoutingGeneration(ptr: *anyopaque, budget: RoutingBudget, authoritative: bool) !*RoutingGeneration {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     if (authoritative) {
@@ -3268,6 +3466,11 @@ fn metadataServerLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: [
 fn metadataServerOwnerReadiness(ptr: *anyopaque, request: metadata_api.OwnerReadinessRequest, budget: RoutingBudget) !metadata_api.OwnerReadiness {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return srv.svc.ownerReadiness(request, budget);
+}
+
+fn metadataServerDecisionAdmission(ptr: *anyopaque, request: metadata_api.DecisionAdmissionRequest, budget: RoutingBudget) !metadata_api.DecisionAdmission {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return srv.svc.decisionAdmission(request, budget);
 }
 
 fn metadataServerPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
@@ -3779,6 +3982,23 @@ fn consumerTests() type {
                 fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
                     return @as(*metadata_api.AdminSnapshot, @ptrCast(@alignCast(ptr))).*;
                 }
+                fn acquire(ptr: *anyopaque, budget: RoutingBudget, _: bool) !*RoutingGeneration {
+                    const cut = try snapshot(ptr);
+                    return RoutingGeneration.create(std.testing.allocator, .{ .metadata_group_id = cut.status.metadata_group_id, .metadata_incarnation = cut.status.metadata_incarnation, .tables = cut.tables, .ranges = cut.ranges }, budget);
+                }
+                fn admit(ptr: *anyopaque, req: metadata_api.DecisionAdmissionRequest, budget: RoutingBudget) !metadata_api.DecisionAdmission {
+                    try budget.checkpoint();
+                    const cut = try snapshot(ptr);
+                    const table = tables_api.findTableByName(&cut, req.table_name) orelse return error.TableNotFound;
+                    var stable = if (validateTransactionTopologyStableSnapshot(&cut, table.*)) true else |_| false;
+                    if (stable) if (req.route_check) |check| {
+                        const gen = try acquire(ptr, budget, false);
+                        defer gen.release();
+                        const current = try generationDecisionRoute(gen, req.table_name, check.route.group_id, budget);
+                        stable = current.table_id == req.table_id and current.topology_epoch == check.topology_epoch and std.meta.eql(current.route, check.route);
+                    };
+                    return .{ .stable = stable, .route_checked = req.route_check != null, .metadata_group_id = cut.status.metadata_group_id, .metadata_incarnation = cut.status.metadata_incarnation, .catalog_revision = 1 };
+                }
                 fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
             var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "rows" }};
@@ -3808,8 +4028,90 @@ fn consumerTests() type {
                 .split_transitions = &.{},
                 .merge_transitions = &merges,
             };
-            const source: CatalogSource = .{ .ptr = &snapshot, .vtable = &.{ .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } };
+            const source: CatalogSource = .{ .ptr = &snapshot, .vtable = &.{ .decision_admission = Source.admit, .acquire_routing_generation = Source.acquire, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } };
             const epoch = try transactionTopologyEpoch(std.testing.allocator, source, "rows");
+            const decision = transactionDecisionEpoch(&snapshot, epoch);
+            const fence = (try checkedTransactionRoute(std.testing.allocator, source, "rows", decision, true, 2)).?;
+            try std.testing.expectEqual(epoch, fence.topology_epoch);
+            try std.testing.expectEqual(@as(u64, 4), fence.route.range_id);
+            try std.testing.expectEqual(@as(u64, 1), fence.metadata_group_id);
+            try std.testing.expectError(error.TopologyChanged, checkedTransactionRoute(std.testing.allocator, source, "rows", decision, true, 7));
+            // Exercise both ends of the routed batch dispatch. Replace the
+            // leader catalog after the caller issues its fence, before proposal.
+            const writes = @import("table_writes.zig");
+            const types = @import("antfly_local_sources").storage_db_types;
+            const Probe = struct {
+                source: *writes.ProvisionedTableWriteSource,
+                catalog: *metadata_api.AdminSnapshot,
+                replace: bool = false,
+                accepted: usize = 0,
+                fn unbound(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: types.BatchRequest) !void {
+                    return error.UnexpectedUnfencedDecision;
+                }
+                fn routed(raw: *anyopaque, a: std.mem.Allocator, route: metadata_api.CatalogRouteFence, table: []const u8, req: types.BatchRequest, cancel: types.CancellationToken) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(@as(u64, 2), route.route.group_id);
+                    try std.testing.expect(req.transaction.? == .resolve);
+                    try std.testing.expectEqual(metadata_api.CatalogRouteFence.decision_protocol, route.protocol);
+                    const bytes = try std.json.Stringify.valueAlloc(a, route, .{});
+                    defer a.free(bytes);
+                    const wire = try std.json.parseFromSlice(metadata_api.CatalogRouteFence, a, bytes, .{});
+                    defer wire.deinit();
+                    try std.testing.expect(wire.value.protocol != metadata_api.catalog_route_fence_protocol_current);
+                    if (self.replace) self.catalog.status.metadata_incarnation = @splat(7);
+                    var admitted = try self.source.acquireProposalAdmission(a, table, route, std.math.maxInt(u64), cancel, true);
+                    defer admitted.deinit();
+                    self.accepted += 1;
+                }
+            };
+            var owner = writes.ProvisionedTableWriteSource.init("unused", source);
+            defer owner.deinit();
+            var probe: Probe = .{ .source = &owner, .catalog = &snapshot };
+            _ = owner.withRaftBatcher(.{ .ptr = &probe, .vtable = &.{ .batch_group = Probe.unbound, .batch_group_local = Probe.unbound, .batch_group_routed_with_cancellation = Probe.routed } });
+            try std.testing.expect((try owner.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .committed, 1, decision, .write, .none)) != null);
+            probe.replace = true;
+            try std.testing.expectError(error.DecisionNotProposed, owner.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .committed, 1, decision, .write, .none));
+            try std.testing.expectEqual(@as(usize, 1), probe.accepted);
+            // The kernel owner validates under its writer lease. The changed
+            // outer catalog catches a redundant check before this handoff.
+            const Local = struct {
+                epoch: u64,
+                calls: usize = 0,
+
+                fn resolve(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: types.TxnId, _: types.TxnStatus, _: u64, observed: u64, _: types.SyncLevel, cancellation: types.CancellationToken) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(self.epoch, observed);
+                    try std.testing.expectEqual(@as(u64, 2), group);
+                    try std.testing.expect(cancellation.ptr == raw);
+                    self.calls += 1;
+                    return {};
+                }
+            };
+            var local: Local = .{ .epoch = decision };
+            var delegated = writes.ProvisionedTableWriteSource.init("unused", source);
+            defer delegated.deinit();
+            const token: types.CancellationToken = .{ .ptr = &local };
+            _ = delegated.withLocalWriteSource(.{ .ptr = &local, .validates_local_decision_route = true, .vtable = &.{ .batch = undefined, .txn_resolve_group_local_with_cancellation = Local.resolve } });
+            try std.testing.expect((try delegated.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .aborted, 0, decision, .write, token)) != null);
+            delegated.local_write_source.?.validates_local_decision_route = false;
+            try std.testing.expectError(error.DecisionNotProposed, delegated.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .aborted, 0, decision, .write, token));
+            try std.testing.expectEqual(@as(usize, 1), local.calls);
+            const CancelWait = struct {
+                calls: usize = 0,
+                fn check(ptr: *const anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+                    self.calls += 1;
+                    if (self.calls > 1) return error.Canceled;
+                }
+            };
+            var waiting: CancelWait = .{};
+            delegated.testingMarkGroupOperationActive("rows", 2);
+            try std.testing.expectError(error.Canceled, delegated.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .aborted, 0, decision, .write, .{ .ptr = &waiting, .check_fn = CancelWait.check }));
+            try std.testing.expectEqual(@as(usize, 0), delegated.testingGroupOperationWaiterCount("rows", 2));
+            try std.testing.expectEqual(@as(usize, 1), local.calls);
+            try std.testing.expectError(error.TopologyChanged, validateTransactionEpoch(std.testing.allocator, source, "rows", decision, true));
+            try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch);
+            snapshot.status.metadata_incarnation = null;
             inline for (std.meta.tags(@import("../metadata/online_merge.zig").Phase)) |phase| {
                 merges[0] = initial;
                 merges[0].online.?.phase = phase;

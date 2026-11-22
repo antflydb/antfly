@@ -12778,8 +12778,12 @@ pub const DataServer = struct {
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try fence.validate();
+        const clock = antfly.public_api.table_catalog.RoutingBudget.initIo(null, self.dataRaftIo());
+        var signal = antfly.raft.transport.http_common.RequestCancellation.fromToken(fence.admission_cancellation);
         try self.proposeRaftBatchGroup(alloc, fence.route.group_id, table_name, req, .{
+            .admission_deadline_ns = clock.deadlineFrom(.{ .deadline_ns = fence.admission_deadline_ns, .io = fence.admission_deadline_io }),
             .discovery = .catalog,
+            .cancellation = if (fence.admission_cancellation.ptr != null) &signal else null,
             .visibility_cancellation = cancellation,
             .write_route_fence = fence,
         });
@@ -14948,12 +14952,13 @@ pub const DataServer = struct {
                     }
                     const admission_deadline_ns = admission_source.catalog.budget(null).nowNs() +|
                         (deadline_ns - admission_now_ns);
-                    routed_write_admission = try admission_source.acquireRoutedWriteAdmission(
+                    routed_write_admission = try admission_source.acquireProposalAdmission(
                         alloc,
                         table_name,
                         fence,
                         admission_deadline_ns,
                         route.visibility_cancellation,
+                        req.transaction != null and req.transaction.? == .resolve,
                     );
                 }
                 // A split destination is admitted by its exact transition,
@@ -28346,16 +28351,19 @@ const RemoteMetadataSource = struct {
             .io = runtime_io_abi.Borrow.init(&self.io),
             .vtable = &.{
                 .admin_snapshot = remoteAdminSnapshot,
+                .admin_snapshot_with_budget = remoteAdminSnapshotWithBudget,
                 .export_catalog = remoteExportCatalog,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .catalog_identity = remoteCatalogIdentity,
                 .acquire_routing_generation = remoteAcquireRoutingGeneration,
+                .cached_routing_generation = remoteCachedRoutingGeneration,
                 .repair_route = remoteRepairRoute,
                 .routing_snapshot = remoteRoutingSnapshot,
                 .table_routing_snapshot = remoteTableRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = remoteLinearizableTableRoutingSnapshot,
                 .owner_readiness = remoteOwnerReadiness,
+                .decision_admission = remoteDecisionAdmission,
                 .privacy_policy_binding = remotePrivacyPolicyBinding,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .wait_for_routing_change = remoteWaitForRoutingChange,
@@ -29241,6 +29249,16 @@ const RemoteMetadataSource = struct {
         return try self.fetchSnapshotForHead(try self.fetchHead());
     }
 
+    fn remoteAdminSnapshotWithBudget(ptr: *anyopaque, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.AdminSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var cancellation = antfly.common.http.http_common.RequestCancellation.fromToken(budget.cancellation);
+        return self.fetchSnapshotWithBudget(.{
+            .deadline_ns = budget.deadline_ns orelse (self.awakeNs() +| remote_metadata_snapshot_timeout_ns),
+            .io = self.io,
+            .cancellation = &cancellation,
+        });
+    }
+
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         if (try self.cachedDiagnosticSnapshot()) |snapshot| return snapshot;
@@ -29295,6 +29313,15 @@ const RemoteMetadataSource = struct {
             if (mutex.tryLock()) return;
             try self.io.sleep(.fromMilliseconds(1), .awake);
         }
+    }
+
+    fn remoteCachedRoutingGeneration(ptr: *anyopaque) ?*antfly.public_api.table_catalog.RoutingGeneration {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        if (!self.cache_mutex.tryLock()) return null;
+        defer self.cache_mutex.unlock();
+        const generation = self.authoritative_routing_generation orelse if (self.cached_routing_snapshot) |snapshot| snapshot.generation else return null;
+        generation.retain();
+        return generation;
     }
 
     fn cachedRoutingGenerationFresh(self: *RemoteMetadataSource, routing_budget: antfly.public_api.table_catalog.RoutingBudget) !?*antfly.public_api.table_catalog.RoutingGeneration {
@@ -29538,6 +29565,14 @@ const RemoteMetadataSource = struct {
     }
 
     fn remoteOwnerReadiness(ptr: *anyopaque, input: antfly.metadata_api.OwnerReadinessRequest, routing_budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.OwnerReadiness {
+        return remoteAdmission(antfly.metadata_api.OwnerReadiness, ptr, input, routing_budget);
+    }
+
+    fn remoteDecisionAdmission(ptr: *anyopaque, input: antfly.metadata_api.DecisionAdmissionRequest, routing_budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.DecisionAdmission {
+        return remoteAdmission(antfly.metadata_api.DecisionAdmission, ptr, input, routing_budget);
+    }
+
+    fn remoteAdmission(comptime Result: type, ptr: *anyopaque, input: anytype, routing_budget: antfly.public_api.table_catalog.RoutingBudget) !Result {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         try routing_budget.checkpoint();
         var signal = antfly.common.http.http_common.RequestCancellation.fromToken(routing_budget.cancellation);
@@ -29553,9 +29588,15 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var client = self.metadataClient(arena.allocator());
-            var parsed = client.fetchOwnerReadiness(self.base_uris[index], input, budget) catch |err| {
+            var parsed = (if (Result == antfly.metadata_api.OwnerReadiness) client.fetchOwnerReadiness(self.base_uris[index], input, budget) else client.fetchDecisionAdmission(self.base_uris[index], input, budget)) catch |err| {
                 try routing_budget.checkpoint();
                 if (err == error.Cancelled or err == error.Canceled) return error.Canceled;
+                if (comptime Result == antfly.metadata_api.DecisionAdmission) {
+                    if (err == error.UnsupportedOperation) {
+                        last_err = err;
+                        continue;
+                    }
+                }
                 last_err = if (err == error.UnsupportedOperation) error.StorageReadTemporarilyUnavailable else normalizeCatalogRoutingSnapshotError(err);
                 continue;
             };

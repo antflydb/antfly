@@ -4181,6 +4181,19 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     defer retained.abort();
     try std.testing.expectEqualStrings("\xff\x00", try retained.get(key));
     try std.testing.expectError(error.InvalidArgument, retained.get("outside-session-namespace"));
+    {
+        var raw_read: ?*anyopaque = null;
+        try std.testing.expectEqual(abi.Status.ok, abi.antfly_metadata_session_read_open(store.handle, &.{ .group_id = group }, &raw_read));
+        var raw_cursor: ?*anyopaque = null;
+        const opened = abi.antfly_metadata_session_cursor_open(raw_read, &raw_cursor);
+        abi.antfly_metadata_session_read_close(raw_read);
+        try std.testing.expectEqual(abi.Status.ok, opened);
+        defer abi.antfly_metadata_session_cursor_close(raw_cursor);
+        var output: abi.OwnedBytes = .{};
+        defer abi.antfly_storage_owner_buffer_destroy(&output);
+        try std.testing.expectEqual(abi.Status.ok, abi.antfly_metadata_session_cursor_invoke(raw_cursor, &.{ .operation = .seek_at_or_after, .key = .fromSlice(key), .length = 1 }, &output));
+        try std.testing.expectEqualStrings(key, output.slice()[4..]);
+    }
     const next = try records.encode(a, .{ .changes = &.{.{ .key = "receipt", .expected = "\xff\x00", .value = "\x80committed" }} });
     defer a.free(next);
     try store.applyStandaloneCommand(group, .{ .apply_transaction_sessions = next });
@@ -4188,13 +4201,48 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     var current = try store.openSessionRead(a, group);
     defer current.abort();
     try std.testing.expectEqualStrings("\x80committed", try current.get(key));
-    var cursor = try current.openCursor();
+    {
+        var reader = try store.openSessionRead(a, group);
+        var ranged = reader.openReadScope(a) catch |err| {
+            reader.abort();
+            return err;
+        };
+        reader.abort();
+        defer ranged.close();
+        try std.testing.expectEqualStrings("commit", try ranged.getRange(key, 1, 6));
+        try std.testing.expectError(error.EndOfStream, ranged.getRange(key, 8, 8));
+        try std.testing.expectError(error.EndOfStream, ranged.getRange(key, 20, 0));
+        try std.testing.expectError(error.InvalidArgument, ranged.getRange("outside-session-namespace", 0, 1));
+        var old = try retained.openReadScope(a);
+        defer old.close();
+        try std.testing.expectEqualStrings("\x00", try old.getRange(key, 1, 1));
+        // Non-session rows have no derived prefix-cache entry. Ordinary
+        // range reads still reach the retained canonical value.
+        try std.testing.expectEqualStrings("\xff", try old.getRange(key, 0, 1));
+        try std.testing.expectError(error.EndOfStream, old.probePrefix(key, 1));
+    }
+    var parent = try store.openSessionRead(a, group);
+    var cursor = parent.openCursor() catch |err| {
+        parent.abort();
+        return err;
+    };
+    parent.abort();
     {
         defer cursor.close();
         try std.testing.expectEqualStrings(key, (try cursor.last()).?.key);
         try std.testing.expectEqualStrings("\x80committed", (try cursor.seekAtOrAfter(key)).?.value);
         try std.testing.expect((try cursor.next()) == null);
     }
+    const session = records.session_prefix ++ "00112233445566778899aabbccddeeff";
+    const session_key = try records.keyAlloc(a, group, session);
+    defer a.free(session_key);
+    const large = try a.alloc(u8, 256 << 10);
+    defer a.free(large);
+    @memset(large, 'z');
+    @memcpy(large[0..6], "header");
+    const addition = try records.encode(a, .{ .changes = &.{.{ .key = session, .expected = null, .value = large }} });
+    defer a.free(addition);
+    try store.applyStandaloneCommand(group, .{ .apply_transaction_sessions = addition });
     const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
     defer a.free(snapshot);
     var restored = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = target_path, .no_sync = true });
@@ -4203,6 +4251,78 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     var recovered = try restored.openSessionRead(a, group);
     defer recovered.abort();
     try std.testing.expectEqualStrings("\x80committed", try recovered.get(key));
+    var scoped = try recovered.openReadScope(a);
+    defer scoped.close();
+    try std.testing.expectEqualStrings("header", try scoped.getRange(session_key, 0, 6));
+    try std.testing.expectEqualStrings("header", try scoped.probePrefix(session_key, 6));
+    const prefix = try records.keyAlloc(a, group, records.session_prefix);
+    defer a.free(prefix);
+    try std.testing.expectEqual(@as(u64, 0), try retained.countPrefix(prefix));
+    try std.testing.expectEqual(@as(u64, 1), try recovered.countPrefix(prefix));
+    try std.testing.expectError(error.InvalidArgument, recovered.countPrefix("outside-session-namespace"));
+
+    // Exercise the same opaque read-back and deletion used after Raft apply.
+    const oversized = try a.alloc(u8, records.max_bytes + 1);
+    defer a.free(oversized);
+    const base_len = records.max_bytes - 512;
+    const header = "{\"id\":1,\"execution_plan\":\"";
+    @memset(oversized, 'z');
+    @memcpy(oversized[0..header.len], header);
+    const base = oversized[0..base_len];
+    const Blake3 = std.crypto.hash.Blake3;
+    var digest: [Blake3.digest_length]u8 = undefined;
+    Blake3.hash(large, &digest, .{});
+    const neighbor = session ++ "-next";
+    const neighbor_key = try records.keyAlloc(a, group, neighbor);
+    defer a.free(neighbor_key);
+    const create = try records.encode(a, .{ .changes = &.{
+        .{ .key = session, .expected = &digest, .value = base, .expected_is_digest = true },
+        .{ .key = neighbor, .expected = null, .value = "neighbor" },
+    } });
+    defer a.free(create);
+    try restored.applyStandaloneCommand(group, .{ .apply_transaction_sessions = create });
+    oversized[oversized.len - 1] = '}';
+    const patch = (try records.receiptSplice(a, base, oversized)).?;
+    defer a.free(patch);
+    Blake3.hash(base, &digest, .{});
+    const update = try records.encode(a, .{ .changes = &.{.{
+        .key = session,
+        .expected = &digest,
+        .value = patch,
+        .expected_is_digest = true,
+        .value_is_splice = true,
+    }} });
+    defer a.free(update);
+    try restored.applyStandaloneCommand(group, .{ .apply_transaction_sessions = update });
+    {
+        var expanded = try restored.openSessionRead(a, group);
+        defer expanded.abort();
+        try std.testing.expectEqualSlices(u8, oversized, try expanded.get(session_key));
+        var page_arena = std.heap.ArenaAllocator.init(a);
+        defer page_arena.deinit();
+        const rows = try expanded.readPrefixPage(page_arena.allocator(), session_key, null, 128);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expectEqualStrings(session_key, rows[0].key);
+        try std.testing.expectEqualSlices(u8, oversized[0..128], rows[0].value);
+        const rest = try expanded.readPrefixPage(page_arena.allocator(), session_key, rows[0].key, 128);
+        try std.testing.expectEqual(@as(usize, 1), rest.len);
+        try std.testing.expectEqualStrings(neighbor_key, rest[0].key);
+        var scan = try expanded.openCursor();
+        defer scan.close();
+        scan.setKeysOnly();
+        const row = (try scan.seekAtOrAfter(session_key)).?;
+        try std.testing.expectEqualStrings(session_key, row.key);
+        try std.testing.expectEqual(@as(usize, 0), row.value.len);
+        try std.testing.expectEqualStrings(neighbor_key, (try scan.next()).?.key);
+        try std.testing.expectEqualStrings(session_key, (try scan.prev()).?.key);
+    }
+    Blake3.hash(oversized, &digest, .{});
+    const remove = try records.encode(a, .{ .changes = &.{.{ .key = session, .expected = &digest, .value = null, .expected_is_digest = true }} });
+    defer a.free(remove);
+    try restored.applyStandaloneCommand(group, .{ .apply_transaction_sessions = remove });
+    var after = try restored.openSessionRead(a, group);
+    defer after.abort();
+    try std.testing.expectError(error.NotFound, after.get(session_key));
 }
 
 test "opaque metadata apply owner preserves semantic error identity" {

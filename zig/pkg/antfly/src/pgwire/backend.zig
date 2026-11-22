@@ -43,8 +43,10 @@ pub const Identity = struct {
     release: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
+pub const CursorCapture = enum { none, if_select, require_select };
+
 pub const Request = struct {
-    capture_cursor_authority: bool = false,
+    capture_cursor_authority: CursorCapture = .none,
     completion: ?*@import("completion.zig").Completion = null,
     completion_allocator: ?std.mem.Allocator = null,
     statement: []const u8,

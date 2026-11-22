@@ -312,6 +312,33 @@ pub const CatalogRoutingSnapshot = struct {
 };
 
 /// Selected physical owners, bound to the same namespace as their routing cut.
+pub const DecisionAdmissionRequest = struct {
+    table_id: u64,
+    table_name: []const u8,
+    route_check: ?RouteCheck = null,
+    table_batch: ?TableBatch = null,
+
+    pub const TableCheck = struct { table_id: u64, table_name: []const u8, topology_epoch: u64 };
+    pub const TableBatch = struct { verified_revision: u64, tables: []const TableCheck };
+
+    pub const RouteCheck = struct {
+        topology_epoch: u64,
+        route: CatalogGroupRoute,
+        // The caller already verified this exact route on this revision.
+        verified_revision: ?u64 = null,
+    };
+};
+pub const DecisionAdmission = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation,
+    catalog_revision: u64,
+    stable: bool,
+    route_checked: bool = false,
+    tables_checked: bool = false,
+    /// Enlisted table that failed a batched check, when the failure is table-specific.
+    rejected_table_id: ?u64 = null,
+};
+
 pub const OwnerReadinessRequest = struct {
     table_id: u64,
     owners: []const Owner,

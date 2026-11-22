@@ -240,6 +240,7 @@ pub const CursorOptions = struct {
 /// evolving. Higher layers should only depend on capabilities they actively
 /// require.
 pub const Capabilities = struct {
+    max_atomic_compare_write_bytes: ?usize = null,
     ordered_ranges: bool = true,
     reverse_ranges: bool = false,
     cursors: bool = true,

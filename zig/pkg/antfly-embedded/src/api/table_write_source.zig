@@ -93,6 +93,8 @@ pub const TableWriteSource = struct {
     supports_transaction_producers: bool = false,
     /// Reviewed BEGIN/PREPARE callbacks preserve explicit native origin.
     supports_transaction_producer_phases: bool = false,
+    /// Resolve validates the epoch against the acquired storage owner before apply.
+    validates_local_decision_route: bool = false,
 
     pub const VTable = struct {
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
@@ -669,6 +671,15 @@ pub const TableWriteSource = struct {
         /// offsets for existing consumers; missing capability is unsupported.
         native_history_consumer_control: ?*const fn (*anyopaque, history_consumer.Command) anyerror!history_consumer.Result = null,
         native_history_page: ?*const fn (*anyopaque, std.mem.Allocator, history_page.Request) anyerror!history_page.Page = null,
+        commit_transaction_with_fresh_id: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            begin_timestamp: u64,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
     };
 
     pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
@@ -1066,6 +1077,21 @@ pub const TableWriteSource = struct {
         return producerOutcome(producer, try BoundaryAbi.call("commit_transaction_with_id_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation }));
     }
 
+    pub fn commitTransactionAttempt(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        first_attempt: bool,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        if (first_attempt) if (self.vtable.commit_transaction_with_fresh_id) |call|
+            return BoundaryAbi.call("commit_transaction_with_fresh_id", self.boundary_dispatch, call, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation });
+        return self.commitTransactionWithIdAndCancellation(alloc, txn_id, begin_timestamp, tables, sync_level, cancellation);
+    }
+
     pub fn acknowledgeTransactionCommit(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1196,8 +1222,10 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
-        const fn_ptr = self.vtable.txn_resolve_group_local_with_cancellation orelse
+        const fn_ptr = self.vtable.txn_resolve_group_local_with_cancellation orelse {
+            try cancellation.check();
             return try self.txnResolveGroupLocal(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+        };
         return try BoundaryAbi.call("txn_resolve_group_local_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation });
     }
 
