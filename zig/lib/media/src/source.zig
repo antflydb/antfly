@@ -60,6 +60,7 @@ pub const Range = struct {
     /// May return a short read. Returning zero before the declared end is EOF.
     read_at: *const fn (*anyopaque, u64, []u8, Control) anyerror!usize,
     sparse_read_at: ?*const fn (*anyopaque, u64, []u8, Control) anyerror!usize = null,
+    isolated_read_at: ?*const fn (*anyopaque, u64, []u8, Control) anyerror!usize = null,
     length: u64,
 };
 pub const Storage = union(enum) { borrowed: []const u8, range: Range };
@@ -138,19 +139,23 @@ pub const Source = struct {
         return self.readControlled(offset, size, .{});
     }
     pub fn readReclaiming(self: *Source, offset: u64, size: usize, reclaimer: ?admission.Reclaimer) !Lease {
-        return self.readWithControl(offset, size, .{}, reclaimer, false);
+        return self.readWithControl(offset, size, .{}, reclaimer, .normal);
     }
     pub fn readControlled(self: *Source, offset: u64, size: usize, caller: Control) !Lease {
-        return self.readWithControl(offset, size, caller, null, false);
+        return self.readWithControl(offset, size, caller, null, .normal);
     }
     /// Reads a small or isolated span without the transport's normal read-ahead.
     pub fn readSparse(self: *Source, offset: u64, size: usize) !Lease {
         return self.readSparseControlled(offset, size, .{});
     }
     pub fn readSparseControlled(self: *Source, offset: u64, size: usize, control: Control) !Lease {
-        return self.readWithControl(offset, size, control, null, true);
+        return self.readWithControl(offset, size, control, null, .sparse);
     }
-    fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, sparse: bool) !Lease {
+    /// Reads an isolated extent without replacing an adapter's forward cache.
+    pub fn readIsolated(self: *Source, offset: u64, size: usize) !Lease {
+        return self.readWithControl(offset, size, .{}, null, .isolated);
+    }
+    fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, mode: enum { normal, sparse, isolated }) !Lease {
         const owner = self.physical orelse self;
         const io = std.Io.Threaded.global_single_threaded.io();
         const controls = ReadControl{ .source = owner.control, .worker = self.control };
@@ -185,7 +190,11 @@ pub const Source = struct {
         var reservation = try self.admitBytes(size, reclaimer);
         errdefer reservation.deinit();
         const range = self.storage.range;
-        const read_at = if (sparse) range.sparse_read_at orelse range.read_at else range.read_at;
+        const read_at = switch (mode) {
+            .normal => range.read_at,
+            .sparse => range.sparse_read_at orelse range.read_at,
+            .isolated => range.isolated_read_at orelse range.sparse_read_at orelse range.read_at,
+        };
         if (range.borrow_at) |borrow| {
             if (serial) try owner.provider_gate.lock(control);
             defer if (serial) owner.provider_gate.unlock();

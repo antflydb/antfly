@@ -351,7 +351,7 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
             if (parts.len != 1) collector.apple_packet_layout = false;
             var offset = packet.offset;
             for (parts.sizes[0..parts.len], 0..) |part_size, part_id| {
-                var header = if (part_id != 0) try reader.input.readSparse(offset, @min(32, part_size)) else null;
+                var header = if (part_id != 0) try reader.input.readIsolated(offset, @min(32, part_size)) else null;
                 defer if (header) |*lease| lease.deinit();
                 const bytes = if (header) |lease| lease.bytes else prefix.bytes[0..@min(prefix.bytes.len, part_size)];
                 const picture = try vp9.inspect(bytes, &references, options.decoder.max_pixels);
