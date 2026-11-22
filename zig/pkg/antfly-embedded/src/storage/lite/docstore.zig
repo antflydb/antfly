@@ -7385,8 +7385,7 @@ const RuntimeStore = struct {
         errdefer file.close();
         // An independently restored path can reuse a replay generation. Its
         // checkpoint cannot certify visibility for the retained namespace.
-        if ((try file.file.stat(io)).inode != (try store.file.file.stat(io)).inode)
-            return error.EnrichmentSourceChanged;
+        if (!file.sameDataFile(&store.file)) return error.EnrichmentSourceChanged;
         file.page_cache_policy = .metadata_only;
         return .{ .file = file, .prefix = self.prefix, .arena = .init(store.allocator) };
     }

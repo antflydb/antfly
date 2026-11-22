@@ -632,7 +632,9 @@ const FdEntry = struct {
 var fd_registry_mutex: Io.Mutex = .init;
 var fd_registry: std.AutoHashMapUnmanaged(file_identity.NativeFileIdentity, *FdEntry) = .empty;
 // An fd whose identity could not be read may belong to any live entry.
-var unidentified_descriptors: ?*FdEntry = null;
+// Resolve this one before opening any more uncached descriptors.
+var unidentified_descriptor: ?*FdEntry = null;
+var test_fail_process_fd_identity = false;
 
 /// Resolves `db_path` to an absolute, symlink-resolved path before
 /// `openSized` derives its own `<db_path>.aflite-lock` sidecar name from
@@ -701,6 +703,7 @@ fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
             return entry;
         }
     } else |err| if (err != error.FileNotFound) return RegionError.RegionUnavailable;
+    if (!resolveUnidentifiedDescriptor()) return RegionError.RegionUnavailable;
     const page = std.heap.page_allocator;
     // Reserve memory before opening a descriptor we might be unable to
     // close without dropping another handle's process-scoped locks.
@@ -713,22 +716,49 @@ fn acquireProcessFd(io: Io, region_path: []const u8) RegionError!*FdEntry {
     return registerOpenedProcessFd(pending, raw_fd);
 }
 
+fn processFdIdentity(fd: std.posix.fd_t) !file_identity.NativeFileIdentity {
+    if (builtin.is_test and test_fail_process_fd_identity) return error.InputOutput;
+    return file_identity.nativeFileIdentity(fd);
+}
+
+// Caller holds fd_registry_mutex. Moving the spare does not acquire
+// a region reference, so its lifetime follows the existing descriptor.
+fn retainSpareDescriptor(entry: *FdEntry, spare: *FdEntry) void {
+    spare.spare_descriptors = entry.spare_descriptors;
+    entry.spare_descriptors = spare;
+}
+
+fn resolveUnidentifiedDescriptor() bool {
+    const pending = unidentified_descriptor orelse return true;
+    if (fd_registry.count() == 0) {
+        closeSpareDescriptors(pending);
+    } else {
+        const identity = processFdIdentity(pending.fd) catch return false;
+        if (fd_registry.get(identity)) |entry| {
+            retainSpareDescriptor(entry, pending);
+        } else {
+            closeSpareDescriptors(pending);
+        }
+    }
+    unidentified_descriptor = null;
+    return true;
+}
+
 // Caller holds fd_registry_mutex and has reserved one free registry slot.
 fn registerOpenedProcessFd(pending: *FdEntry, raw_fd: std.posix.fd_t) RegionError!*FdEntry {
     pending.* = .{ .identity = undefined, .fd = raw_fd, .refs = 1 };
-    const identity = file_identity.nativeFileIdentity(raw_fd) catch {
+    const identity = processFdIdentity(raw_fd) catch {
         if (fd_registry.count() == 0) {
             closeSpareDescriptors(pending);
         } else {
-            pending.spare_descriptors = unidentified_descriptors;
-            unidentified_descriptors = pending;
+            std.debug.assert(unidentified_descriptor == null);
+            unidentified_descriptor = pending;
         }
         return RegionError.RegionUnavailable;
     };
     pending.identity = identity;
     if (fd_registry.get(identity)) |entry| {
-        pending.spare_descriptors = entry.spare_descriptors;
-        entry.spare_descriptors = pending;
+        retainSpareDescriptor(entry, pending);
         entry.refs += 1;
         return entry;
     }
@@ -758,10 +788,7 @@ fn releaseProcessFd(io: Io, entry: *FdEntry) void {
         _ = std.posix.system.close(entry.fd);
         _ = fd_registry.remove(entry.identity);
         closeSpareDescriptors(entry.spare_descriptors);
-        if (fd_registry.count() == 0) {
-            closeSpareDescriptors(unidentified_descriptors);
-            unidentified_descriptors = null;
-        }
+        _ = resolveUnidentifiedDescriptor();
         entry.claimed_slots.deinit(std.heap.page_allocator);
         std.heap.page_allocator.destroy(entry);
     }
@@ -3473,6 +3500,42 @@ test "shared lock region: reader slots are visible across a second handle" {
 // child), since that's the only way to actually observe whether a
 // liveness byte is still held (the self-slot guard in `isSlotDead` means
 // this same process can never usefully probe its own slots).
+test "shared lock region: identity failures retain only one unresolved descriptor" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const first_path = try std.fs.path.join(a, &.{ buf[0..dir_len], "registered.lock" });
+    defer a.free(first_path);
+    const retry_path = try std.fs.path.join(a, &.{ buf[0..dir_len], "retry.lock" });
+    defer a.free(retry_path);
+    const blocked_path = try std.fs.path.join(a, &.{ buf[0..dir_len], "blocked.lock" });
+    defer a.free(blocked_path);
+
+    const first = try acquireProcessFd(io, first_path);
+    defer releaseProcessFd(io, first);
+
+    test_fail_process_fd_identity = true;
+    defer test_fail_process_fd_identity = false;
+    try std.testing.expectError(error.RegionUnavailable, acquireProcessFd(io, retry_path));
+    const pending = unidentified_descriptor orelse return error.MissingSpareDescriptor;
+    for (0..3) |_| {
+        try std.testing.expectError(error.RegionUnavailable, acquireProcessFd(io, blocked_path));
+        try std.testing.expect(unidentified_descriptor == pending);
+    }
+    try std.testing.expectError(error.FileNotFound, file_identity.nativePathIdentity(blocked_path));
+
+    const cached = try acquireProcessFd(io, first_path);
+    releaseProcessFd(io, cached);
+    test_fail_process_fd_identity = false;
+    const recovered = try acquireProcessFd(io, retry_path);
+    defer releaseProcessFd(io, recovered);
+    try std.testing.expect(unidentified_descriptor == null);
+    try std.testing.expect(first != recovered);
+}
+
 test "shared lock region: post-open identity collision retains the registered descriptor" {
     const a = std.testing.allocator;
     const io = std.testing.io;
