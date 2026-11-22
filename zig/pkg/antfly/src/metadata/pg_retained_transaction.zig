@@ -218,6 +218,12 @@ pub fn Producer(comptime Policy: type) type {
             const context = try self.policy.context(request);
             var captured = try self.source.capturePhysical(a, state.definition.?, context);
             defer captured.deinit();
+            // The publication worker qualifies topology before preparing each
+            // candidate. If routing changes between that pass and this read,
+            // restart the worker so it can stage or reject the new handoff.
+            captured.validateInstalledRoutes(state) catch |err| switch (err) {
+                error.ChangefeedResynchronizationRequired => return error.TopologyChanged,
+            };
             // An issued cursor pins the first participant even when another
             // root advances between admission and spool verification.
             for (state.cursors) |receipt| if (std.meta.eql(receipt.before, slot.mapped_cursor)) {

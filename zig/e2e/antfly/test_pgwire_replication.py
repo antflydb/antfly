@@ -135,7 +135,14 @@ def test_pg_recvlogical_resume_after_restart(
                 return
             if (
                 retry_uncommitted
-                and "ERROR:  53300: A consistent SQL statement read" in result.stderr
+                and (
+                    "ERROR:  53300: A consistent SQL statement read" in result.stderr
+                    or (
+                        len(statements) == 1
+                        and "ERROR:  40001: The mutation conflicted with a concurrent change and was not committed."
+                        in result.stderr
+                    )
+                )
                 and (
                     len(statements) == 1
                     or len(result.stdout.splitlines()) < len(statements) - 1
