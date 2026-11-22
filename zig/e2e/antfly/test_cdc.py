@@ -2991,19 +2991,58 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
                 f"{activation_feed}/ack",
                 json={"cursor": activation_cursor},
             )
-            artifacts.reject_artifact_uploads.clear()
-            recovery = wait_until(
-                lambda: published_at(saved_catalog["current-snapshot-id"]),
-                timeout_s=120,
-                interval_s=0.5,
+            # Recover from the durable catalog and feed state while the
+            # artifact store still rejects publication uploads.
+            server.pause(crash=True)
+            server.resume()
+            recovered_before_publication = _changefeed_call(
+                client, "GET", server.api_url + table + "/lake/catalog"
+            ).json()["metadata"]
+            assert (
+                recovered_before_publication["current-snapshot-id"]
+                == saved_catalog["current-snapshot-id"]
             )
-            assert recovery, server.debug_logs()
-            activated = _changefeed_call(
+            assert wait_until(accepted_and_committed, timeout_s=30, interval_s=0.5)
+            assert publication_progress()["published_snapshot"] == str(initial_snapshot)
+            still_waiting = _changefeed_call(
                 client,
                 "GET",
                 f"{activation_feed}/events",
                 params={"after": activation_cursor},
             )
+            assert still_waiting.json()["events"] == []
+            activation_cursor = still_waiting.headers["Antfly-Changefeed-Cursor"]
+            _changefeed_call(
+                client,
+                "POST",
+                f"{activation_feed}/ack",
+                json={"cursor": activation_cursor},
+            )
+            artifacts.reject_artifact_uploads.clear()
+            recovery = wait_until(
+                lambda: published_at(saved_catalog["current-snapshot-id"]),
+                # A crash can leave a build attempt leased for five minutes.
+                # Give its successor time to acquire the fence and rebuild.
+                timeout_s=420,
+                interval_s=0.5,
+            )
+            assert recovery, server.debug_logs()
+
+            def activated_page():
+                nonlocal activation_cursor
+                response = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{activation_feed}/events",
+                    params={"after": activation_cursor},
+                )
+                if response.json()["events"]:
+                    return response
+                activation_cursor = response.headers["Antfly-Changefeed-Cursor"]
+                return None
+
+            activated = wait_until(activated_page, timeout_s=30, interval_s=0.5)
+            assert activated is not None, server.debug_logs()
             events = activated.json()["events"]
             assert len(events) == 1
             assert events[0]["kind"] == "publication_activated"
