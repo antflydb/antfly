@@ -8788,11 +8788,11 @@ test "distributed txn graph admission reserves terminal and acknowledgement capa
     const id: db_mod.types.TxnId = @splat(9);
     const first = try registry.beginGraphExecution(a, id, 1, "alice", &request, &tables);
     defer first.plan.deinit();
-    const key = try makeSessionKey(a, id);
-    defer a.free(key);
-    var read = try store.beginRead();
-    registry.max_record_bytes = (try read.get(key)).len;
-    read.abort();
+    var persisted = (try durable.load(id)).?;
+    defer persisted.deinit(a);
+    const mandatory = try encodeSessionRecordWithListingLimit(a, persisted, 0);
+    defer a.free(mandatory);
+    registry.max_record_bytes = mandatory.len;
     try std.testing.expectError(error.SessionRecordTooLarge, registry.beginGraphExecution(a, @splat(10), 1, "alice", &request, &tables));
     registry.max_record_bytes.? += 256 + 6 * "docs".len;
     const second = try registry.beginGraphExecution(a, @splat(10), 1, "alice", &request, &tables);
