@@ -4284,6 +4284,12 @@ test "committed history completion admission freezes the coordinator plan with b
         var manager = try TxnManager.init(a, &store);
         defer manager.deinit();
         try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{ .writes = &.{.{ .key = marker_key, .value = "first-begin" }} });
+        {
+            var enrollment = try store.beginWriteTxn();
+            defer enrollment.abort();
+            const history = @import("committed_history.zig");
+            try std.testing.expectError(error.HistoryPreparedTransactionsPresent, history.admitAtWithCompletionProof(&enrollment, namespace, @splat(9), 4 * 1024 * 1024, 1000, 1, null, true));
+        }
         try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{ .writes = &.{.{ .key = marker_key, .value = "confirmed-retry" }} });
         const plan_key = makeSidecarKey(completion_admission_prefix, admission.transaction_id);
         const plan_bytes = try manager.getAlloc(a, &plan_key);

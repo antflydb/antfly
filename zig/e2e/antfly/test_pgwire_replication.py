@@ -196,11 +196,11 @@ def test_pg_recvlogical_resume_after_restart(
             for fields in (line.split("|") for line in result)
         ]
 
-    def stream_command(output, name="smoke_slot"):
+    def stream_command(output):
         return [
             client,
             *connection,
-            f"--slot={name}",
+            "--slot=smoke_slot",
             "--start",
             "--no-loop",
             "--status-interval=1",
@@ -216,9 +216,9 @@ def test_pg_recvlogical_resume_after_restart(
         ]
 
     @contextmanager
-    def stream(output, *, expect_disconnect=False, name="smoke_slot"):
+    def stream(output, *, expect_disconnect=False):
         with output.with_suffix(".log").open("wb") as log:
-            reader = subprocess.Popen(stream_command(output, name), env=env, stderr=log)
+            reader = subprocess.Popen(stream_command(output), env=env, stderr=log)
             try:
                 yield reader
             except Exception as exc:
@@ -879,8 +879,9 @@ def test_pg_recvlogical_resume_after_restart(
                     )
                     expect_markers([b"after-merge"], floor)
                     assert all(marker not in resumed.read_bytes() for marker in markers)
-        active_slot = "smoke_slot"
         if not export_snapshot and not multi_table and not cross_node:
+            (previous_slot,) = catalog_slot()
+            previous_lsn = previous_slot[4]
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")
             rejected_output = tmp_path / "rejected-identity.bin"
             rejected = subprocess.run(
@@ -897,12 +898,56 @@ def test_pg_recvlogical_resume_after_restart(
             assert catalog_slot() == []
             sql("DROP PUBLICATION changes")
             sql("CREATE PUBLICATION changes FOR TABLE smoke")
-            active_slot = "after_identity"
-            slot("--create-slot", "--plugin=pgoutput", name=active_slot)
+            recreation_errors = set()
+
+            def recreate_slot():
+                result = subprocess.run(
+                    [
+                        client,
+                        *connection,
+                        "--slot=smoke_slot",
+                        "--create-slot",
+                        "--plugin=pgoutput",
+                    ],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=40,
+                )
+                if result.returncode != 0:
+                    recreation_errors.add(result.stderr.strip())
+                    assert any(
+                        reason in result.stderr
+                        for reason in (
+                            "ReplicationSlotActive",
+                            "HistoryPreparedTransactionsPresent",
+                        )
+                    ), result.stderr
+                    return False
+                return True
+
+            assert wait_until(recreate_slot, timeout_s=60), sorted(recreation_errors)
+            (recreated_slot,) = catalog_slot()
+            previous_position = tuple(int(part, 16) for part in previous_lsn.split("/"))
+            recreated_position = tuple(
+                int(part, 16) for part in recreated_slot[4].split("/")
+            )
+            assert recreated_position > previous_position
+            stale_output = tmp_path / "stale-slot.bin"
+            stale = subprocess.run(
+                [*stream_command(stale_output), f"--startpos={previous_lsn}"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            assert stale.returncode != 0
+            assert "ChangefeedResynchronizationRequired" in stale.stderr
+            assert not stale_output.exists() or not stale_output.read_bytes()
             sql("INSERT INTO smoke (id, content) VALUES (16, 'pre-schema-value')")
             sql("ALTER TABLE smoke ADD COLUMN additional TEXT")
             evolved = tmp_path / "evolved.bin"
-            with stream(evolved, name=active_slot) as reader:
+            with stream(evolved) as reader:
                 sql(
                     "INSERT INTO smoke (id, content, additional) "
                     "VALUES (17, 'post-schema-content', 'post-schema-added-value')"
@@ -925,8 +970,8 @@ def test_pg_recvlogical_resume_after_restart(
                 sql(
                     "CREATE PUBLICATION truncates FOR TABLE smoke WITH (publish = 'truncate')"
                 )
-        slot("--drop-slot", name=active_slot)
-        assert catalog_slot(name=active_slot) == []
+        slot("--drop-slot")
+        assert catalog_slot() == []
         sql("DROP PUBLICATION changes")
         assert catalog_publication() == []
     except Exception:

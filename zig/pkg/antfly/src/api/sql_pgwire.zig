@@ -1296,6 +1296,28 @@ pub const CatalogSlotEnrollment = struct {
             var parsed = try control.parse(work, bytes);
             defer parsed.deinit();
             const state = parsed.value;
+            if (state.phase == .closing and std.meta.eql(state.definition.?.owner, owner))
+                return error.ReplicationSlotActive;
+            if (state.phase == .deleted) {
+                if (!std.meta.eql(state.authority, authority) or !std.meta.eql(state.definition.?.owner, owner))
+                    return error.ChangefeedConflict;
+                try policy.authorizeRoot(.{ .definition = definition }, root.namespace, maintenance);
+                try port.mutate(work, .{
+                    .id = id,
+                    .authority = authority,
+                    .owner = owner,
+                    .authorization = state.definition.?.authorization,
+                    .expected_revision = state.revision,
+                    .expected_epoch = state.epoch,
+                    .mutation = .{ .recreate_slot = .{
+                        .definition = definition,
+                        .now = now,
+                        .expires_at = now +| CatalogRetainedStream.history_lease_seconds,
+                        .bootstrap_expires_at = if (export_snapshot) now +| control.max_bootstrap_seconds else 0,
+                    } },
+                }, maintenance);
+                continue;
+            }
             if (state.phase != .empty and (!std.meta.eql(state.authority, authority) or
                 !std.meta.eql(state.definition.?.identity(), definition.identity()))) return error.ChangefeedConflict;
             const current = if (state.phase == .empty) control.State{ .definition = definition } else state;
@@ -1335,7 +1357,7 @@ pub const CatalogSlotEnrollment = struct {
                             else => return err,
                         };
                         try policy.validateRoot(state, root.namespace, root.fence, root.table_name, maintenance);
-                        write.mutation = .{ .seal = .{ .cut = cut, .slot = .{ .database = slots.database, .name = command.slot, .binding = binding } } };
+                        write.mutation = .{ .seal = .{ .cut = cut, .slot = .{ .database = slots.database, .name = command.slot, .binding = binding, .consistent_lsn = @max(1, state.slot_lsn_floor) } } };
                         return SlotCommands.create(port, a, command, write, now, maintenance);
                     }
                     continue;

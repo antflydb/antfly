@@ -28,6 +28,7 @@ pub const slot_snapshot_start_protocol_version: u16 = 124;
 pub const provider_history_protocol_version: u16 = 125;
 pub const physical_history_protocol_version: u16 = 126;
 pub const shared_namespace_plan_protocol_version: u16 = 127;
+pub const slot_recreation_protocol_version: u16 = 133;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -359,6 +360,19 @@ pub const State = struct {
     cursors: []const Delivery = &.{},
     reset_reason: Reset = .none,
     slot: ?pg_slot.State = null,
+    /// New slots that reuse a name must reject offsets from all prior lives.
+    slot_lsn_floor: u64 = 0,
+
+    pub fn jsonStringify(self: State, writer: anytype) @TypeOf(writer.*).Error!void {
+        try writer.beginObject();
+        inline for (@typeInfo(State).@"struct".field_names) |name| {
+            if (!std.mem.eql(u8, name, "slot_lsn_floor") or self.slot_lsn_floor != 0) {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn rootIndex(self: State, namespace: Namespace) !usize {
         var low: usize = 0;
         var high = self.roots.len;
@@ -483,6 +497,8 @@ pub const State = struct {
     }
     pub fn validate(self: State) !void {
         if (self.version != 1 or self.roots.len > max_roots or self.cursors.len > max_cursors) return error.InvalidChangefeed;
+        if (self.slot_lsn_floor != 0 and (self.epoch < 2 or self.slot_lsn_floor < 2)) return error.InvalidChangefeed;
+        if (self.slot) |slot| if (slot.consistent_lsn < self.slot_lsn_floor) return error.InvalidChangefeed;
         if (self.phase == .empty) {
             if (self.revision != 0 or self.epoch != 0 or nz(self.id) or nz(self.authority) or self.authority_sequence != 0 or self.definition != null or
                 self.created_at != 0 or self.expires_at != 0 or self.bootstrap_expires_at != 0 or self.renewal_pending or nz(self.cut) or self.roots.len != 0 or self.cursors.len != 0 or
@@ -672,6 +688,7 @@ pub const Mutation = union(enum) {
     root_control: struct { namespace: Namespace, operation: RootControlMutation },
     slot: pg_slot.Mutation,
     create: struct { id: Id, definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
+    recreate_slot: struct { definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
     plan_roots: []const RootPlan,
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
@@ -704,6 +721,7 @@ pub const Mutation = union(enum) {
     restart: struct { definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
     pub fn requiredProtocol(self: Mutation) u16 {
         switch (self) {
+            .recreate_slot => return slot_recreation_protocol_version,
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
             .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
@@ -730,6 +748,12 @@ pub const Mutation = union(enum) {
 
     pub fn validate(self: Mutation) !void {
         switch (self) {
+            .recreate_slot => |value| {
+                try value.definition.validate();
+                try slotDefinition(value.definition);
+                try lease(value.now, value.expires_at);
+                try bootstrapLease(value.definition.start, value.now, value.expires_at, value.bootstrap_expires_at);
+            },
             .root_control => |v| {
                 if (!nz(v.namespace)) return error.InvalidChangefeed;
                 try v.operation.validate();
@@ -1007,6 +1031,26 @@ pub const Mutation = union(enum) {
                 try lease(create.now, create.expires_at);
                 try bootstrapLease(create.definition.start, create.now, create.expires_at, create.bootstrap_expires_at);
                 next = .{ .id = create.id, .epoch = 1, .authority = stamp.incarnation, .definition = create.definition, .phase = .enrolling, .created_at = create.now, .expires_at = create.expires_at, .bootstrap_expires_at = create.bootstrap_expires_at };
+            },
+            .recreate_slot => |create| {
+                if (state.phase != .deleted or !equal(state.definition.?.owner, create.definition.owner)) return error.ChangefeedConflict;
+                const floor = if (state.slot) |previous|
+                    std.math.add(u64, previous.next_lsn, 1) catch return error.ChangefeedConflict
+                else if (state.slot_lsn_floor != 0)
+                    state.slot_lsn_floor
+                else
+                    return error.ChangefeedConflict;
+                next = .{
+                    .id = state.id,
+                    .epoch = std.math.add(u64, state.epoch, 1) catch return error.ChangefeedConflict,
+                    .authority = state.authority,
+                    .definition = create.definition,
+                    .phase = .enrolling,
+                    .created_at = create.now,
+                    .expires_at = create.expires_at,
+                    .bootstrap_expires_at = create.bootstrap_expires_at,
+                    .slot_lsn_floor = floor,
+                };
             },
             .plan_roots => |plans| {
                 if (state.phase != .enrolling or state.roots.len != 0 or plans.len == 0 or plans.len > max_roots) return error.ChangefeedConflict;
@@ -1443,7 +1487,7 @@ pub const Mutation = union(enum) {
                 if (!equal(restart.definition.owner, state.definition.?.owner)) return error.ChangefeedConflict;
                 try lease(restart.now, restart.expires_at);
                 try bootstrapLease(restart.definition.start, restart.now, restart.expires_at, restart.bootstrap_expires_at);
-                next = .{ .id = state.id, .epoch = std.math.add(u64, state.epoch, 1) catch return error.ChangefeedConflict, .authority = state.authority, .definition = restart.definition, .phase = .enrolling, .created_at = restart.now, .expires_at = restart.expires_at, .bootstrap_expires_at = restart.bootstrap_expires_at };
+                next = .{ .id = state.id, .epoch = std.math.add(u64, state.epoch, 1) catch return error.ChangefeedConflict, .authority = state.authority, .definition = restart.definition, .phase = .enrolling, .created_at = restart.now, .expires_at = restart.expires_at, .bootstrap_expires_at = restart.bootstrap_expires_at, .slot_lsn_floor = state.slot_lsn_floor };
             },
         }
         if (next.slot) |slot| if (next.phase == .closing or next.phase == .reset_required) {
@@ -2326,6 +2370,46 @@ fn testSlotStateAt(a: A, lsn: u64) !State {
     try std.testing.expectEqual(lsn, state.slot.?.confirmed_lsn);
     return step(a, state, .{ .slot = .{ .acquire = .{ .actor = @splat(2), .expected = 0, .now = 100, .expires = 150 } } });
 }
+test "recreating a retired logical slot preserves its LSN high water and fences former writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const original = try testSlotStateAt(a, 4096);
+    var definition = original.definition.?;
+    definition.authorization = @splat(91);
+    const recreate: Mutation = .{ .recreate_slot = .{ .definition = definition, .now = 102, .expires_at = 1000 } };
+    try std.testing.expectError(error.ChangefeedConflict, step(a, original, recreate));
+    var state = try step(a, original, .close);
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, recreate));
+    state = try step(a, state, .{ .release_root = .{ .namespace = testNamespace(7), .ownership_epoch = 1, .proof = @splat(19) } });
+    state = try step(a, state, .finish_close);
+    var wrong_owner = recreate;
+    wrong_owner.recreate_slot.definition.owner = @splat(92);
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, wrong_owner));
+    const write: Write = .{
+        .id = state.id,
+        .authority = state.authority,
+        .owner = state.definition.?.owner,
+        .authorization = state.definition.?.authorization,
+        .expected_revision = state.revision,
+        .expected_epoch = state.epoch,
+        .mutation = recreate,
+    };
+    try std.testing.expectEqual(slot_recreation_protocol_version, requiredProtocolEncoded(try encodeWrite(a, write)));
+    state = try write.apply(a, state, state.authority_sequence + 1);
+    try std.testing.expectError(error.ChangefeedConflict, write.apply(a, state, state.authority_sequence + 1));
+    try std.testing.expectEqual(original.epoch + 1, state.epoch);
+    try std.testing.expectEqual(@as(u64, 4097), state.slot_lsn_floor);
+    var parsed = try parse(a, try encode(a, state));
+    defer parsed.deinit();
+    state = try step(a, parsed.value, .{ .plan_roots = &.{.{ .namespace = testNamespace(7), .ownership_epoch = 1 }} });
+    state = try step(a, state, .{ .enroll = .{ .namespace = testNamespace(7), .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .consumer_epoch = 7, .start = 15 } });
+    const configuration: pg_slot.Configuration = .{ .database = @splat(1), .name = "slot", .consistent_lsn = state.slot_lsn_floor };
+    state = try step(a, state, .{ .seal = .{ .cut = @splat(8), .slot = configuration } });
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, state.slot.?.restartAt(4096));
+    try std.testing.expectEqual(@as(u64, 4097), try state.slot.?.restartAt(0));
+}
+
 test "changefeed logical slot confirms native ACK atomically and fences ordinary acknowledgements" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

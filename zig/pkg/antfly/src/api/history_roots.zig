@@ -837,6 +837,7 @@ pub fn enrollRoot(client: *MetadataClient, policy: anytype, a: A, state: control
         .expires_at_seconds = state.expires_at,
         .policy_revision = policy_revision,
         .require_commit_clock = table.contract == .native_relational,
+        .allow_published_completions = state.slot_lsn_floor != 0,
     };
     const command: native.Command = if (definition.start == .snapshot_then_changes)
         .{ .capture_bootstrap = .{ .grant = grant, .expires_at_seconds = state.bootstrap_expires_at } }

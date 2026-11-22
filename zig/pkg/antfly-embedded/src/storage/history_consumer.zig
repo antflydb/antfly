@@ -45,6 +45,7 @@ pub const Grant = struct {
     limit: u64 = history.default_limit,
     /// Establish the timestamped row-write protocol before recording the cut.
     require_commit_clock: bool = false,
+    allow_published_completions: bool = false,
     retained_start: ?u64 = null,
     split_origin: ?history.SplitOrigin = null,
 
@@ -56,6 +57,10 @@ pub const Grant = struct {
         }
         if (self.require_commit_clock) {
             try jw.objectField("require_commit_clock");
+            try jw.write(true);
+        }
+        if (self.allow_published_completions) {
+            try jw.objectField("allow_published_completions");
             try jw.write(true);
         }
         if (self.retained_start) |start| {
@@ -71,6 +76,7 @@ pub const Grant = struct {
 
     pub fn validate(self: Grant) !void {
         if (!nonzero(self.namespace) or !nonzero(self.authority) or self.sequence == 0 or !nonzero(self.consumer) or !nonzero(self.definition) or self.expires_at_seconds == 0 or self.policy_revision == 0) return error.InvalidHistoryAdmission;
+        if (self.allow_published_completions and (!self.require_commit_clock or self.retained_start != null)) return error.InvalidHistoryAdmission;
         if (self.split_origin) |origin| {
             if (!origin.valid() or self.retained_start == null or self.retained_start.? != 0)
                 return error.InvalidHistoryAdmission;
@@ -179,7 +185,7 @@ pub fn enroll(txn: anytype, grant: Grant) !history.Consumer {
     if (try history.load(txn)) |native| for (native.consumers) |consumer| {
         if (consumer.epoch != 0 and same(consumer.id, grant.consumer)) return error.HistoryConsumerConflict;
     };
-    const consumer = try history.admitAt(txn, grant.namespace, grant.consumer, grant.limit, grant.expires_at_seconds, grant.policy_revision, grant.retained_start);
+    const consumer = try history.admitAtWithCompletionProof(txn, grant.namespace, grant.consumer, grant.limit, grant.expires_at_seconds, grant.policy_revision, grant.retained_start, grant.allow_published_completions);
     slot.* = .{ .id = consumer.id, .epoch = consumer.epoch, .grant = grant.sequence, .definition = grant.definition };
     try txn.put(key, &state.encode());
     return consumer;

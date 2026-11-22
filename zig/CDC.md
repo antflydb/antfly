@@ -41,9 +41,11 @@ verifies writes to both split participants, confirmed LSN advancement, and
 continuation after the merge and serving-node failover. These fixtures use
 three metadata nodes and three data nodes on a single host.
 Changing replica identity invalidates the old slot binding and returns a
-resynchronization error before streaming. Recreate the publication and use a
-fresh slot name when the publication binding changes. Dropped names remain
-reserved by the durable slot record.
+resynchronization error before streaming. Recreate the publication and slot
+when the binding changes. The same owner can reuse a slot name once the
+previous slot's history and spool cleanup completes. The new consistent LSN
+is higher than any LSN assigned to the previous slot. Bootstrap the consumer
+from the new slot and its consistent cut.
 Publications advertise `pubtruncate=false` and reject requests to publish
 TRUNCATE. Where Antfly SQL TRUNCATE is supported, it replaces the table
 generation and invalidates the previous binding.

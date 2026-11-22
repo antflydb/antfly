@@ -541,6 +541,10 @@ pub fn admit(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, e
 }
 
 pub fn admitAt(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, expires: u64, policy_revision: u64, retained_start: ?u64) !Consumer {
+    return admitAtWithCompletionProof(txn, namespace, id, limit, expires, policy_revision, retained_start, false);
+}
+
+pub fn admitAtWithCompletionProof(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, expires: u64, policy_revision: u64, retained_start: ?u64, allow_published_completions: bool) !Consumer {
     if (std.mem.allEqual(u8, &id, 0) or limit < transaction_overhead + frame.chunk_bytes) return error.InvalidHistoryAdmission;
     var state = (try load(txn)) orelse State{ .namespace = namespace, .limit = limit };
     try requireNamespace(txn, state, namespace);
@@ -556,7 +560,22 @@ pub fn admitAt(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64,
         var cursor = try txn.openCursor();
         defer cursor.close();
         if (try cursor.seekAtOrAfter(intents_prefix)) |entry| if (std.mem.startsWith(u8, entry.key, intents_prefix)) return error.HistoryPreparedTransactionsPresent;
-        if (try cursor.seekAtOrAfter(completion.admission_prefix)) |entry| if (std.mem.startsWith(u8, entry.key, completion.admission_prefix)) return error.HistoryPreparedTransactionsPresent;
+        var admission = try cursor.seekAtOrAfter(completion.admission_prefix);
+        while (admission) |entry| : (admission = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, completion.admission_prefix)) break;
+            if (!allow_published_completions) return error.HistoryPreparedTransactionsPresent;
+            if (entry.key.len != completion.admission_prefix.len + 16) return error.HistoryCorrupt;
+            const transaction_id = entry.key[completion.admission_prefix.len..][0..16].*;
+            // Publication keeps the admission alongside the immutable
+            // certificate for historical readers. It has already consumed
+            // the transaction's reservation and is no longer a prepare.
+            const published = try optional(txn, &completionRetainedKey(transaction_id));
+            const certificate = try optional(txn, &completionCertificateKey(transaction_id));
+            if ((published == null) != (certificate == null)) return error.HistoryCorrupt;
+            if (published == null) return error.HistoryPreparedTransactionsPresent;
+            _ = try RetainedCompletion.decode(published.?);
+            if ((try CompletionCredit.load(txn, transaction_id)).bytes != 0) return error.HistoryCorrupt;
+        }
     }
     for (&state.consumers) |*consumer| if (consumer.epoch == 0) {
         state.epoch = std.math.add(u64, state.epoch, 1) catch return error.HistoryCorrupt;

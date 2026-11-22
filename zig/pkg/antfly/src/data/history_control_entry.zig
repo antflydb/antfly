@@ -22,9 +22,15 @@ const control = @import("antfly_local_sources").api_local_table_writes.table_wri
 pub const required_protocol_version = @import("../common/data_raft_protocol.zig").batch_history_control_protocol_version;
 pub fn requiredProtocol(command: control.Command) u16 {
     return switch (command) {
-        .capture_bootstrap, .release_bootstrap => @import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version,
+        .capture_bootstrap => |input| if (input.grant.allow_published_completions)
+            @import("../common/data_raft_protocol.zig").batch_history_reenrollment_protocol_version
+        else
+            @import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version,
+        .release_bootstrap => @import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version,
         .configure_policy, .inspect_policy => @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version,
-        .enroll => |grant| if (grant.split_origin != null)
+        .enroll => |grant| if (grant.allow_published_completions)
+            @import("../common/data_raft_protocol.zig").batch_history_reenrollment_protocol_version
+        else if (grant.split_origin != null)
             @import("../common/data_raft_protocol.zig").batch_split_origin_enrollment_protocol_version
         else if (grant.retained_start != null)
             @import("../common/data_raft_protocol.zig").batch_history_retained_enrollment_protocol_version
@@ -137,6 +143,15 @@ test "history control entry binds bounded immutable owner data and requires acti
     var clocked_decoded = try decode(a, clocked_bytes);
     defer clocked_decoded.deinit();
     try std.testing.expectEqualDeep(clocked, clocked_decoded.value());
+    var reenrollment = clocked;
+    reenrollment.history_control.command.enroll.allow_published_completions = true;
+    reenrollment.protocol = @import("../common/data_raft_protocol.zig").batch_history_reenrollment_protocol_version;
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, reenrollment, reenrollment.protocol - 1));
+    const reenrollment_bytes = try encode(a, reenrollment, reenrollment.protocol);
+    defer a.free(reenrollment_bytes);
+    var reenrollment_decoded = try decode(a, reenrollment_bytes);
+    defer reenrollment_decoded.deinit();
+    try std.testing.expectEqualDeep(reenrollment, reenrollment_decoded.value());
     var retained = clocked;
     retained.history_control.command.enroll.retained_start = 0;
     retained.protocol = @import("../common/data_raft_protocol.zig").batch_history_retained_enrollment_protocol_version;
