@@ -1905,8 +1905,11 @@ pub const StreamingReplicationRunner = struct {
         if (state.closing or state.retired or !phaseAllowsStreaming(status.phase)) return;
         if (!std.meta.eql(scope.provider, try nativeSourceProviderBinding(status)))
             return error.ReplicationCutoverAuthorityLost;
-        const accepted: ?[]const u8 = if (state.accepted.sequence != 0) state.accepted.checkpoint else null;
-        const resume_cut = accepted orelse checkpointForStreaming(status) orelse return error.ReplicationCutoverAuthorityLost;
+        // A legacy status checkpoint cannot prove which transactions the
+        // destination already owns. Scoped streaming resumes from its own
+        // accepted frontier once bootstrap has established it.
+        if (state.accepted.sequence == 0) return error.ReplicationCutoverAuthorityLost;
+        const resume_cut = state.accepted.checkpoint;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1950,7 +1953,7 @@ pub const StreamingReplicationRunner = struct {
         try @import("../api/source_destination_completion.zig").stage(service, admission, a, scope, control.digest(table.replication_sources_json), .{
             .batch_id = checkpoint,
             .checkpoint = checkpoint,
-            .expected_checkpoint = accepted,
+            .expected_checkpoint = resume_cut,
             .payload_digest = control.digest(payload),
             .accepted_at_ns = platform_time.realtimeNs(),
         }, requests, context);
