@@ -16,6 +16,7 @@
 //! Target-owned descriptor execution and storage hooks. A backend installs
 //! its own table as a unit; deriving other compute operations from a native
 //! table never inherits native tensor casts into a device implementation.
+const ops = @import("ops.zig");
 const CT = @import("../graph/backend_contracts.zig").CT;
 const kernel_descriptor = @import("kernel_descriptor.zig");
 const physical_storage = @import("physical_storage.zig");
@@ -33,11 +34,22 @@ pub const OwnedPayloadServices = struct {
 /// caller's already admitted ordinary cache destination; it creates no slot
 /// authority or physical-storage credit.
 pub const ProjectionMode = enum { query, apply };
+/// Receiver-owned, append-only cache banks. The decoder has already matched
+/// the position to its committed prefix and reserved both banks.
+pub const QkvCacheRow = struct {
+    keys: CT,
+    values: CT,
+    position: usize,
+    capacity: usize,
+};
 pub const DenseDecoderServices = struct {
     available: *const fn (*anyopaque) bool,
     weight_access: enum { shared, acquired } = .shared,
     heldWeightF32: *const fn (*anyopaque, *const anyopaque, CT, ?[]const u8) anyerror!@import("../execution/storage_ownership.zig").Plane,
     projectionInto: *const fn (*anyopaque, *const kernel_descriptor.Descriptor, []const CT, CT, ProjectionMode) anyerror!bool,
+    /// Optional query storage is borrowed, or null to allocate just the query.
+    /// K/V are written directly into the specified row of the cache banks.
+    projectionQkvCacheRow: ?*const fn (*anyopaque, *const ops.DecoderRuntimeApplyLinearQkvRequest, QkvCacheRow, ?CT) anyerror!?CT = null,
 };
 pub const VTable = struct {
     /// Canonical full compute-table identity. Copying ordinary math callbacks

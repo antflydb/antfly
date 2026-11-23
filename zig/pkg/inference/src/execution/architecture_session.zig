@@ -9781,9 +9781,13 @@ const layaCudaWorkspace = cuda_weights.layaCudaWorkspace;
 const attentionFfnWorkspace = @import("stage_workspace.zig").attentionFfn;
 
 test "native stage geometry resolves Whisper encoder and decoder output residency" {
-    var arch: ArchSession = undefined;
-    arch.arch_config = .{ .whisper = .{} };
-    arch.task = .generic;
+    const a = std.testing.allocator;
+    var arch = ArchSession{
+        .allocator = a,
+        .arch_config = .{ .whisper = .{} },
+        .backend_type = .native,
+        .backend_data = .{ .native = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty } },
+    };
     const input = Tensor{ .data = &.{}, .dtype = .f32, .shape = &.{ 1, 80, 3000 }, .name = "input_features", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false };
     const encoder = (try archRunGeometry(&arch, .{ .tensors = &.{input} }, 8)).?;
     try std.testing.expectEqual(@as(usize, 3000), encoder.sequence);

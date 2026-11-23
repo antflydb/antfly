@@ -40522,10 +40522,54 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return value.ndim() == 2 and value.dim(0) == r and value.dim(1) == c;
     }
 
+    /// Borrow only a stack encoding header. The live slab owns the buffer
+    /// until the command encoder takes its own reference.
+    fn cacheProjectionRow(slab: MetalTensor, position: usize, capacity: usize, columns: usize) !MetalTensor {
+        if (!sameDenseProjectionShape(slab, capacity, columns) or columns == 0 or position >= capacity) return error.InvalidDecoderPosition;
+        const row_bytes = try std.math.mul(usize, columns, @sizeOf(f32));
+        const slab_bytes = try std.math.mul(usize, capacity, row_bytes);
+        if (slab.deviceByteLen() != slab_bytes) return error.InvalidTensorShape;
+        var row = MetalTensor.empty;
+        row.device = .{
+            .ref = slab.device.?.ref,
+            .byte_offset = try std.math.add(usize, slab.deviceByteOffset(), try std.math.mul(usize, position, row_bytes)),
+            .byte_len = row_bytes,
+        };
+        row.shape_len = 2;
+        row.shape_buf[0] = 1;
+        row.shape_buf[1] = @intCast(columns);
+        return row;
+    }
+
+    fn denseDecoderProjectionQkvCacheRow(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest, cache: @import("kernel_backend.zig").QkvCacheRow, query: ?CT) !?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input = denseDeviceF32(request.input) orelse return null;
+        const key_bank = (try self.projectionDestination(cache.keys)) orelse return null;
+        const value_bank = (try self.projectionDestination(cache.values)) orelse return null;
+        if (input.device.?.ref.runtime != key_bank.device.?.ref.runtime) return null;
+        const key_row = try cacheProjectionRow(key_bank.*, cache.position, cache.capacity, request.kv_out_dim);
+        const value_row = try cacheProjectionRow(value_bank.*, cache.position, cache.capacity, request.kv_out_dim);
+        if (projectionRangesOverlap(key_bank.*, value_bank.*) or projectionRangesOverlap(input, key_row) or projectionRangesOverlap(input, value_row)) return error.InvalidAssignedAlias;
+        if (query) |output| {
+            const q = (try self.projectionDestination(output)) orelse return null;
+            if (projectionRangesOverlap(q.*, input) or projectionRangesOverlap(q.*, key_bank.*) or projectionRangesOverlap(q.*, value_bank.*)) return error.InvalidAssignedAlias;
+            if (!try metal_runtime.tryApplyDenseRuntimeLinearQkvAssigned(self.provider_impl, request.q_slot, request.k_slot, request.v_slot, input, 1, request.in_dim, request.q_out_dim, request.kv_out_dim, q.*, key_row, value_row, null)) return null;
+            q.invalidateHostMirror();
+            key_bank.invalidateHostMirror();
+            value_bank.invalidateHostMirror();
+            return output;
+        }
+        const q = (try self.applyLinearQkvIntoDeviceRows(request, input, key_row, value_row)) orelse return null;
+        key_bank.invalidateHostMirror();
+        value_bank.invalidateHostMirror();
+        return try self.ctFromOwnedMetalTensor(q);
+    }
+
     const dense_decoder_services: @import("kernel_backend.zig").DenseDecoderServices = .{
         .available = denseDecoderAvailable,
         .heldWeightF32 = denseDecoderHeldWeight,
         .projectionInto = denseDecoderProjectionInto,
+        .projectionQkvCacheRow = denseDecoderProjectionQkvCacheRow,
     };
 
     fn projectionDestination(self: *MetalCompute, value: CT) !?*MetalTensor {
@@ -40565,32 +40609,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer self.retireTemporaryWorkspaceValue(&linear_input);
         if (!linear_input.isDevice()) return null;
         if (projectionRangesOverlap(linear_input, k_metal.*) or projectionRangesOverlap(linear_input, v_metal.*)) return error.InvalidAssignedAlias;
-        const q = (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvInto(
-            self.provider_impl,
-            request.q_slot,
-            request.k_slot,
-            request.v_slot,
-            linear_input,
-            request.in_dim,
-            request.q_out_dim,
-            request.kv_out_dim,
-            k_metal.*,
-            v_metal.*,
-        )) orelse (try metal_runtime.tryApplyDenseRuntimeLinearQkvInto(
-            self.provider_impl,
-            request.q_slot,
-            request.k_slot,
-            request.v_slot,
-            linear_input,
-            request.in_dim,
-            request.q_out_dim,
-            request.kv_out_dim,
-            k_metal.*,
-            v_metal.*,
-        )) orelse return null;
+        const q = (try self.applyLinearQkvIntoDeviceRows(request, linear_input, k_metal.*, v_metal.*)) orelse return null;
         k_metal.invalidateHostMirror();
         v_metal.invalidateHostMirror();
         return try self.ctFromOwnedMetalTensor(q);
+    }
+
+    fn applyLinearQkvIntoDeviceRows(self: *MetalCompute, request: *const ops.DecoderRuntimeApplyLinearQkvRequest, input: MetalTensor, key: MetalTensor, value: MetalTensor) !?MetalTensor {
+        return (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvInto(
+            self.provider_impl,
+            request.q_slot,
+            request.k_slot,
+            request.v_slot,
+            input,
+            request.in_dim,
+            request.q_out_dim,
+            request.kv_out_dim,
+            key,
+            value,
+        )) orelse try metal_runtime.tryApplyDenseRuntimeLinearQkvInto(
+            self.provider_impl,
+            request.q_slot,
+            request.k_slot,
+            request.v_slot,
+            input,
+            request.in_dim,
+            request.q_out_dim,
+            request.kv_out_dim,
+            key,
+            value,
+        );
     }
 
     fn decoderRuntimeApplyLinearIntoOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest, out: CT) anyerror!bool {
@@ -56225,6 +56273,40 @@ const PreparedDenseRegionFixture = struct {
                     .q_out_dim = 64,
                     .kv_out_dim = 64,
                 };
+                const shared = @import("../execution/dense_decoder_backend.zig");
+                const sentinel: [128]f32 = @splat(-7);
+                const keys = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&sentinel, &.{ 2, 64 }));
+                defer cb.free(keys);
+                const vals = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&sentinel, &.{ 2, 64 }));
+                defer cb.free(vals);
+                const query = (try cb.allocUninitF32Shape(&.{ 1, 64 })) orelse return error.MissingPhysicalStorage;
+                defer cb.free(query);
+                const row = @import("kernel_backend.zig").QkvCacheRow{ .keys = keys, .values = vals, .position = 1, .capacity = 2 };
+                var invalid = row;
+                invalid.position = 2;
+                try std.testing.expectError(error.InvalidDecoderPosition, shared.projectionQkvCacheRow(&cb, &request, invalid, query));
+                invalid = row;
+                invalid.keys = vals;
+                try std.testing.expectError(error.InvalidAssignedAlias, shared.projectionQkvCacheRow(&cb, &request, invalid, query));
+                const overlapping = (try cb.allocUninitF32Shape(&.{ 3, 64 })) orelse return error.MissingPhysicalStorage;
+                defer cb.free(overlapping);
+                const early = try cb.sliceRows2D(a, overlapping, 0, 2, 64);
+                defer cb.free(early);
+                const late = try cb.sliceRows2D(a, overlapping, 1, 2, 64);
+                defer cb.free(late);
+                invalid.keys = early;
+                invalid.values = late;
+                try std.testing.expectError(error.InvalidAssignedAlias, shared.projectionQkvCacheRow(&cb, &request, invalid, query));
+                try std.testing.expectEqual(query, (try shared.projectionQkvCacheRow(&cb, &request, row, query)).?);
+                const result_query = try cb.toFloat32(query, a);
+                defer a.free(result_query);
+                for (result_query, expected[0]) |got, want| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+                for ([_]CT{ keys, vals }, expected[1..3]) |bank, expected_row| {
+                    const contents = try cb.toFloat32(bank, a);
+                    defer a.free(contents);
+                    try std.testing.expectEqualSlices(f32, sentinel[0..64], contents[0..64]);
+                    for (contents[64..], expected_row) |got, want| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+                }
                 try std.testing.expectError(error.InvalidAssignedAlias, cb.decoderRuntimeApplyLinearQkvInto(&request, k, k));
                 const q = (try cb.decoderRuntimeApplyLinearQkvInto(&request, k, v)) orelse return error.LinearSlotPreparationDeclined;
                 defer cb.free(q);

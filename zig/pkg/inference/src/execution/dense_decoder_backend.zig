@@ -56,6 +56,12 @@ pub fn projectionInto(cb: *const ops.ComputeBackend, descriptor: *const ops.kern
     return selected.projectionInto(cb.ptr, descriptor, inputs, output, mode);
 }
 
+pub fn projectionQkvCacheRow(cb: *const ops.ComputeBackend, request: *const ops.DecoderRuntimeApplyLinearQkvRequest, row: @import("../ops/kernel_backend.zig").QkvCacheRow, query: ?ops.CT) !?ops.CT {
+    const selected = services(cb) orelse return null;
+    const apply = selected.projectionQkvCacheRow orelse return null;
+    return apply(cb.ptr, request, row, query);
+}
+
 test "dense services reject foreign tables before model tensor or context access" {
     const std = @import("std");
     const native = @import("../ops/native_compute.zig");

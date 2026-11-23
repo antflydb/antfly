@@ -2131,42 +2131,57 @@ fn decoderBlockCached(
     // no blit splits the command sequence.
     var proj: Projections = undefined;
     var in_place = false;
-    if (cache.preallocated() and w.qkv_slots != null and start + dec_seq <= cache.capacity) {
+    var borrowed_cache_banks = false;
+    if (cache.preallocated() and w.qkv_slots != null and total <= cache.capacity) {
         const slots = w.qkv_slots.?;
-        const k_dst = try cb.sliceRows2D(allocator, layer_cache.k_self.?, start, dec_seq, d_model);
-        var dst_live = true;
-        errdefer if (dst_live) stepRelease(cb, profile, k_dst);
-        const v_dst = try cb.sliceRows2D(allocator, layer_cache.v_self.?, start, dec_seq, d_model);
-        errdefer if (dst_live) stepRelease(cb, profile, v_dst);
-        var q_in_place: ?CT = null;
-        if (dec_seq == 1) {
-            q_in_place = try cb.decoderRuntimeApplyLinearQkvInto(&.{
-                .q_slot = slots[0],
-                .k_slot = slots[1],
-                .v_slot = slots[2],
-                .input = normed,
-                .in_dim = d_model,
-                .q_out_dim = d_model,
-                .kv_out_dim = d_model,
-            }, k_dst, v_dst);
-        } else {
-            const k_ok = try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[1], .input = normed, .in_dim = d_model, .out_dim = d_model }, k_dst);
-            const v_ok = k_ok and try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[2], .input = normed, .in_dim = d_model, .out_dim = d_model }, v_dst);
-            if (v_ok) q_in_place = try stepLinear(cb, profile, w.q, normed, dec_seq, d_model, d_model);
+        const request = ops.DecoderRuntimeApplyLinearQkvRequest{
+            .q_slot = slots[0],
+            .k_slot = slots[1],
+            .v_slot = slots[2],
+            .input = normed,
+            .in_dim = d_model,
+            .q_out_dim = d_model,
+            .kv_out_dim = d_model,
+        };
+        if (start != 0 and dec_seq == 1 and profile.assigned == null) {
+            const keys = layer_cache.k_self.?;
+            const values = layer_cache.v_self.?;
+            if (try dense_backend.projectionQkvCacheRow(cb, &request, .{ .keys = keys, .values = values, .position = start, .capacity = cache.capacity }, null)) |q| {
+                proj = .{ .q = q, .k = keys, .v = values };
+                borrowed_cache_banks = true;
+                in_place = true;
+                profile.fused_qkv += 1;
+                profile.in_place_kv += 1;
+            }
         }
-        if (q_in_place) |q| {
-            proj = .{ .q = q, .k = k_dst, .v = v_dst };
-            in_place = true;
-            profile.fused_qkv += 1;
-            profile.in_place_kv += 1;
-        } else {
-            stepRelease(cb, profile, k_dst);
-            stepRelease(cb, profile, v_dst);
+        if (!in_place) {
+            const k_dst = try cb.sliceRows2D(allocator, layer_cache.k_self.?, start, dec_seq, d_model);
+            var dst_live = true;
+            errdefer if (dst_live) stepRelease(cb, profile, k_dst);
+            const v_dst = try cb.sliceRows2D(allocator, layer_cache.v_self.?, start, dec_seq, d_model);
+            errdefer if (dst_live) stepRelease(cb, profile, v_dst);
+            var q_in_place: ?CT = null;
+            if (dec_seq == 1) {
+                q_in_place = try cb.decoderRuntimeApplyLinearQkvInto(&request, k_dst, v_dst);
+            } else {
+                const k_ok = try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[1], .input = normed, .in_dim = d_model, .out_dim = d_model }, k_dst);
+                const v_ok = k_ok and try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[2], .input = normed, .in_dim = d_model, .out_dim = d_model }, v_dst);
+                if (v_ok) q_in_place = try stepLinear(cb, profile, w.q, normed, dec_seq, d_model, d_model);
+            }
+            if (q_in_place) |q| {
+                proj = .{ .q = q, .k = k_dst, .v = v_dst };
+                in_place = true;
+                profile.fused_qkv += 1;
+                profile.in_place_kv += 1;
+            } else {
+                stepRelease(cb, profile, k_dst);
+                stepRelease(cb, profile, v_dst);
+            }
+            dst_live = false;
         }
-        dst_live = false;
     }
     if (!in_place) proj = try projectQkv(cb, w, normed, dec_seq, d_model, profile);
-    var kv_consumed = false;
+    var kv_consumed = borrowed_cache_banks;
     defer {
         stepRelease(cb, profile, proj.q);
         if (!kv_consumed) {
