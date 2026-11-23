@@ -3587,7 +3587,8 @@ pub fn decoderRuntimeDenseAttentionInto(
     }
     if (workspace) |tensor| {
         const device = tensor.device orelse return error.InvalidTensorShape;
-        if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or tensor.isReadOnlyPhysical() or tensor.deviceByteLen() < workspace_bytes) return error.InvalidTensorShape;
+        if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or tensor.isReadOnlyPhysical() or
+            tensor.deviceByteOffset() != 0 or tensor.deviceByteLen() < workspace_bytes) return error.InvalidTensorShape;
         for (inputs) |operand| {
             if (operand.deviceHandle() == tensor.deviceHandle() and
                 @import("../ops/kernel_geometry.zig").byteRangesOverlap(@intCast(operand.deviceByteOffset()), operand.deviceByteLen(), @intCast(tensor.deviceByteOffset()), workspace_bytes)) return error.InvalidAssignedAlias;

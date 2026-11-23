@@ -3197,13 +3197,7 @@ pub const Frame = struct {
         errdefer self.clearNativeProgramViews(cleanup);
         self.native_program_view_pins = try self.pool.allocator.alloc(usize, self.storages.len);
         @memset(self.native_program_view_pins, 0);
-        const needs_resources = cb.kind() == .cuda or (cb.kind() == .metal and blk: {
-            for (self.pool.kernels) |maybe| if (maybe) |kernel| {
-                if (kernel.workspace_bytes != 0) break :blk true;
-            };
-            break :blk false;
-        });
-        if (needs_resources) {
+        if (cb.kind() == .cuda) {
             self.program_resources = try self.pool.allocator.alloc(ProgramResources, graph.nodeCount());
             for (self.program_resources) |*resource| resource.* = .{};
         }

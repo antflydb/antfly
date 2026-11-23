@@ -11997,7 +11997,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.InvalidAttentionShape;
         const bytes = try metal_runtime.denseAttentionWorkspaceBytes(runtime, descriptor.operation.dense_attention_rows);
-        return if (bytes != 0) .{ .byte_size = bytes, .alignment = 256 } else .{};
+        // Metal scratch is a dedicated buffer bound at offset zero. The SDK
+        // layout aligns the second plane internally, independent of the F32 view.
+        return .{ .byte_size = bytes };
     }
 
     fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../execution/kernel_route.zig").Prepare) anyerror!?@import("../execution/kernel_route.zig").Owned {
@@ -58090,6 +58092,91 @@ const CompleteMetalRegularRopeBudget = struct {
         try std.testing.expectEqual(memory.AdmissionAmounts{}, domain.controller.snapshot());
     }
 };
+
+test "complete Metal ModelProgram funds and binds nonzero attention workspace" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const shared = try @import("../backends/compute_context.zig").SharedBackendContext.init(a, .metal, std.testing.io);
+    defer shared.release();
+    const cb = shared.computeBackend();
+
+    const rows = 16;
+    const width = 64;
+    const dim = 32;
+    const query = ml.graph.Shape.init(.f32, &.{ rows, width });
+    const key = ml.graph.Shape.init(.f32, &.{ rows, dim });
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const q = try builder.parameter("q", query);
+    const k = try builder.parameter("k", key);
+    const v = try builder.parameter("v", key);
+    const output = try graph.addNode(.{
+        .op = .{ .fused_gqa_causal_attention = .{ .batch = 1, .seq_len = rows, .kv_seq_len = rows, .functional_kv = true, .num_heads = 2, .num_kv_heads = 1, .head_dim = dim } },
+        .output_shape = query,
+        .inputs = .{ q, k, v, ml.graph.null_node },
+        .num_inputs = 3,
+    });
+    try graph.markOutput(output);
+
+    var program = try @import("../execution/program.zig").ModelProgram.init(a, &graph, &.{
+        .{ .name = "q", .node_id = q, .kind = .input },
+        .{ .name = "k", .node_id = k, .kind = .input },
+        .{ .name = "v", .node_id = v, .kind = .input },
+    });
+    defer program.deinit();
+    var budget: ?CompleteMetalRegularRopeBudget = null;
+    defer if (budget) |*value| value.deinit();
+    var executable = try @import("../execution/executable.zig").prepare(a, &program, &cb, .partitioned);
+    defer executable.deinitWithCleanup(if (budget) |*value| value.cleanup() else .{});
+    const q_node = program.id_map[q];
+    const k_node = program.id_map[k];
+    const v_node = program.id_map[v];
+    const output_node = program.id_map[output];
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{
+        .{ .node_id = q_node, .value = .{ .imported_host = .{ .logical = query, .target = .metal, .owned_ingress = true } } },
+        .{ .node_id = k_node, .value = .{ .imported_host = .{ .logical = key, .target = .metal, .owned_ingress = true } } },
+        .{ .node_id = v_node, .value = .{ .imported_host = .{ .logical = key, .target = .metal, .owned_ingress = true } } },
+    })) orelse return error.MissingPreparedKernelRoute;
+    defer routes.releaseWithCleanup(if (budget) |*value| value.cleanup() else .{});
+    const witness = routes.pool.completeOwnedPayload() orelse return error.MissingCompleteAttentionPayload;
+    try std.testing.expectEqual(.device, witness.accounting_class);
+    const plan = routes.pool.kernels[output_node] orelse return error.MissingPreparedKernelRoute;
+    if (plan.workspace_bytes == 0) return error.SkipZigTest;
+    const bytes = 2 * rows * dim * @sizeOf(u16);
+    try std.testing.expectEqual(@as(usize, bytes), plan.workspace_bytes);
+    budget = try CompleteMetalRegularRopeBudget.init(routes.pool, rows * width * @sizeOf(f32));
+
+    const input_values: [rows * width]f32 = @splat(0);
+    const key_values: [rows * dim]f32 = @splat(0);
+    const value_values: [rows * dim]f32 = @splat(3);
+    var q_input = try tensor_mod.Tensor.initFloat32(a, "q", &.{ rows, width }, &input_values);
+    defer q_input.deinit();
+    var k_input = try tensor_mod.Tensor.initFloat32(a, "k", &.{ rows, dim }, &key_values);
+    defer k_input.deinit();
+    var v_input = try tensor_mod.Tensor.initFloat32(a, "v", &.{ rows, dim }, &value_values);
+    defer v_input.deinit();
+    var result = try executable.run(a, .{
+        .host_inputs = &.{
+            .{ .node_id = q_node, .value = &q_input },
+            .{ .node_id = k_node, .value = &k_input },
+            .{ .node_id = v_node, .value = &v_input },
+        },
+        .prepared_routes = routes,
+        .storage_admission = budget.?.capability(),
+        .collect_partition_stats = true,
+        .activation_readbacks = .forbidden,
+    });
+    defer result.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+    try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+    const usage = result.stats.planned_storage orelse return error.MissingDeclaredWorkspaceTelemetry;
+    try std.testing.expectEqual(@as(u64, bytes), usage.workspace.requested_live_bytes);
+    const values = try cb.toFloat32(result.outputs[0], a);
+    defer a.free(values);
+    for (values) |value| try std.testing.expectApproxEqAbs(@as(f32, 3), value, 0.005);
+}
 
 test "complete Metal ModelProgram derives queued regular RoPE positions with caps held outputs and live overrides" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
