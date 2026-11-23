@@ -40309,24 +40309,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    fn projectionDestination(self: *MetalCompute, value: CT) !?*MetalTensor {
+        const buffer = toBuf(value);
+        if (buffer.integer_storage or buffer.lazy_multiply != null or hasHostView(buffer) or bufHasAnyQuantizedStorage(buffer)) return null;
+        const tensor = if (buffer.metal_tensor) |*present| present else return null;
+        if (tensor.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        const device = tensor.device orelse return null;
+        if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or tensor.dtype != .f32 or tensor.deviceHandle() == null) return null;
+        return tensor;
+    }
+
+    fn projectionRangesOverlap(left: MetalTensor, right: MetalTensor) bool {
+        return left.deviceHandle() == right.deviceHandle() and
+            kernel_geometry.byteRangesOverlap(@intCast(left.deviceByteOffset()), left.deviceByteLen(), @intCast(right.deviceByteOffset()), right.deviceByteLen());
+    }
+
     fn decoderRuntimeApplyLinearQkvIntoOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const k_buf = toBuf(k_out);
-        const v_buf = toBuf(v_out);
-        if (bufHasAnyQuantizedStorage(k_buf) or bufHasAnyQuantizedStorage(v_buf)) return null;
-        const k_metal = if (k_buf.metal_tensor) |*tensor| tensor else return null;
-        const v_metal = if (v_buf.metal_tensor) |*tensor| tensor else return null;
-        if (!k_metal.isDevice() or !v_metal.isDevice()) return null;
+        const k_metal = (try self.projectionDestination(k_out)) orelse return null;
+        const v_metal = (try self.projectionDestination(v_out)) orelse return null;
+        if (projectionRangesOverlap(k_metal.*, v_metal.*)) return error.InvalidAssignedAlias;
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer self.retireTemporaryWorkspaceValue(&input);
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
         defer self.retireTemporaryWorkspaceValue(&linear_input);
         if (!linear_input.isDevice()) return null;
-        var k_mt = try k_metal.retainedCopy();
-        defer self.retireTemporaryWorkspaceValue(&k_mt);
-        var v_mt = try v_metal.retainedCopy();
-        defer self.retireTemporaryWorkspaceValue(&v_mt);
-        if (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvInto(
+        if (projectionRangesOverlap(linear_input, k_metal.*) or projectionRangesOverlap(linear_input, v_metal.*)) return error.InvalidAssignedAlias;
+        const q = (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvInto(
             self.provider_impl,
             request.q_slot,
             request.k_slot,
@@ -40335,10 +40345,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.in_dim,
             request.q_out_dim,
             request.kv_out_dim,
-            k_mt,
-            v_mt,
-        )) |q| return try self.ctFromOwnedMetalTensor(q);
-        const q = (try metal_runtime.tryApplyDenseRuntimeLinearQkvInto(
+            k_metal.*,
+            v_metal.*,
+        )) orelse (try metal_runtime.tryApplyDenseRuntimeLinearQkvInto(
             self.provider_impl,
             request.q_slot,
             request.k_slot,
@@ -40347,44 +40356,43 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.in_dim,
             request.q_out_dim,
             request.kv_out_dim,
-            k_mt,
-            v_mt,
+            k_metal.*,
+            v_metal.*,
         )) orelse return null;
+        k_metal.invalidateHostMirror();
+        v_metal.invalidateHostMirror();
         return try self.ctFromOwnedMetalTensor(q);
     }
 
     fn decoderRuntimeApplyLinearIntoOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest, out: CT) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const out_buf = toBuf(out);
-        if (bufHasAnyQuantizedStorage(out_buf)) return false;
-        const out_metal = if (out_buf.metal_tensor) |*tensor| tensor else return false;
-        if (!out_metal.isDevice()) return false;
+        const out_metal = (try self.projectionDestination(out)) orelse return false;
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer self.retireTemporaryWorkspaceValue(&input);
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
         defer self.retireTemporaryWorkspaceValue(&linear_input);
         if (!linear_input.isDevice()) return false;
         const rows: usize = @intCast(linear_input.dim(0));
-        var out_mt = try out_metal.retainedCopy();
-        defer self.retireTemporaryWorkspaceValue(&out_mt);
-        if (try metal_runtime.tryApplyQuantizedRuntimeLinearInto(
+        if (projectionRangesOverlap(linear_input, out_metal.*)) return error.InvalidAssignedAlias;
+        const wrote = (try metal_runtime.tryApplyQuantizedRuntimeLinearInto(
             self.provider_impl,
             request.slot,
             linear_input,
             rows,
             request.in_dim,
             request.out_dim,
-            out_mt,
-        )) return true;
-        return metal_runtime.decoderRuntimeApplyLinearDeviceInto(
+            out_metal.*,
+        )) or (try metal_runtime.decoderRuntimeApplyLinearDeviceInto(
             self.provider_impl,
             request.slot,
             linear_input,
             rows,
             request.in_dim,
             request.out_dim,
-            out_mt,
-        );
+            out_metal.*,
+        ));
+        if (wrote) out_metal.invalidateHostMirror();
+        return wrote;
     }
 
     fn decoderRuntimeBeginPlannedComputeScopeOp(ctx: *anyopaque) anyerror!bool {
@@ -55755,6 +55763,7 @@ const PreparedDenseRegionFixture = struct {
             var nodes: [7]ml.graph.NodeId = undefined;
             var values: [7]CT = undefined;
             var expected: [3][]f32 = undefined;
+            var slots: [3]usize = undefined;
             nodes[0] = input;
             values[0] = resident;
             var parameters: usize = 1;
@@ -55774,7 +55783,7 @@ const PreparedDenseRegionFixture = struct {
                 const reference_weight = try reference.getWeight(name);
                 defer reference.free(reference_weight);
                 const output, const reference_output = if (index == 1) unbiased: {
-                    _ = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = null, .in_dim = 64, .out_dim = 64 })) orelse return error.LinearSlotPreparationDeclined;
+                    slots[index] = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = null, .in_dim = 64, .out_dim = 64 })) orelse return error.LinearSlotPreparationDeclined;
                     break :unbiased .{ try builder.linearNoBias(input, weight_node, 1, 64, 64), try reference.linearNoBias(source, reference_weight, 1, 64, 64) };
                 } else biased: {
                     const bias_node = try builder.parameter(bias_name, bias_shape);
@@ -55785,13 +55794,38 @@ const PreparedDenseRegionFixture = struct {
                     parameters += 1;
                     const reference_bias = try reference.fromFloat32Shape(&bias_data, &.{64});
                     defer reference.free(reference_bias);
-                    _ = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = bias, .in_dim = 64, .out_dim = 64 })) orelse return error.LinearSlotPreparationDeclined;
+                    slots[index] = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = bias, .in_dim = 64, .out_dim = 64 })) orelse return error.LinearSlotPreparationDeclined;
                     break :biased .{ try builder.linear(input, weight_node, bias_node, 1, 64, 64), try reference.linear(source, reference_weight, reference_bias, 1, 64, 64) };
                 };
                 defer reference.free(reference_output);
                 try graph.markOutput(output);
                 expected[index] = try reference.toFloat32(reference_output, a);
                 produced += 1;
+            }
+            if (count == 3) {
+                const slab = (try cb.allocUninitF32Shape(&.{ 2, 64 })) orelse return error.MissingPhysicalStorage;
+                defer cb.free(slab);
+                const k = try cb.sliceRows2D(a, slab, 0, 1, 64);
+                defer cb.free(k);
+                const v = try cb.sliceRows2D(a, slab, 1, 1, 64);
+                defer cb.free(v);
+                const request = ops.DecoderRuntimeApplyLinearQkvRequest{
+                    .q_slot = slots[0],
+                    .k_slot = slots[1],
+                    .v_slot = slots[2],
+                    .input = resident,
+                    .in_dim = 64,
+                    .q_out_dim = 64,
+                    .kv_out_dim = 64,
+                };
+                try std.testing.expectError(error.InvalidAssignedAlias, cb.decoderRuntimeApplyLinearQkvInto(&request, k, k));
+                const q = (try cb.decoderRuntimeApplyLinearQkvInto(&request, k, v)) orelse return error.LinearSlotPreparationDeclined;
+                defer cb.free(q);
+                for ([_]CT{ q, k, v }, expected) |value, wanted| {
+                    const actual = try cb.toFloat32(value, a);
+                    defer a.free(actual);
+                    for (actual, wanted) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
+                }
             }
             try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..count]);
         }
