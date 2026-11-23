@@ -207,7 +207,7 @@ fn runWorker(path: [:0]const u8, cfg: Config, indexed: bool, worker: usize) Work
             .sparse => std.fmt.bufPrint(&vector_buf, ",\"_embeddings\":{{\"vec\":{{\"indices\":[{d},{d}],\"values\":[1.0,0.5]}}}}", .{ worker * 1000 + slot, sparseSequenceDim(sequence) }) catch unreachable,
             .dense => std.fmt.bufPrint(&vector_buf, ",\"_embeddings\":{{\"vec\":[{d},1,0,0,{d},{d},{d},{d}]}}", .{ worker + 1, dense[0], dense[1], dense[2], dense[3] }) catch unreachable,
         };
-        const request = std.fmt.bufPrint(&request_buf, "{{\"inserts\":{{\"w{d}-{d}\":{{\"text\":\"{s}\"{s}}}}},\"sync_level\":\"{s}\"}}", .{ worker, slot, t, embeddings, sync_level }) catch unreachable;
+        const request = std.fmt.bufPrint(&request_buf, "{{\"inserts\":{{\"w{d}-{d}\":{{\"text\":\"seed {s}\"{s}}}}},\"sync_level\":\"{s}\"}}", .{ worker, slot, t, embeddings, sync_level }) catch unreachable;
         const code = batch(handle, request);
         switch (code) {
             .ok => {
@@ -244,6 +244,12 @@ fn runReader(path: [:0]const u8, cfg: Config, indexed: bool) WorkerResult {
         const code = api.antfly_db_search_json(handle, .fromSlice(query), &response);
         const latency: u64 = @intCast(nowNs() - started);
         if (code == .ok) {
+            if (indexed and cfg.index == .text and
+                (response.ptr == null or std.mem.indexOf(u8, response.ptr.?[0..response.len], "\"_id\"") == null))
+            {
+                result.other += 1;
+                break;
+            }
             result.reads += 1;
             result.read_ns += latency;
             result.read_max_ns = @max(result.read_max_ns, latency);
@@ -379,6 +385,9 @@ fn verifyDense(handle: ?*anyopaque, worker: usize, slot: usize, sequence: u64, o
         if (hit._distance) |distance| exact = exact or @abs(distance) < 0.001;
     }
     if (count == 0) out.missing += 1 else if (count != 1 or !exact) out.stale += 1;
+    // Dense verification also exercises the unfiltered routing tree.
+    const routed = try std.fmt.bufPrint(&query_buf, "{{\"embeddings\":{{\"vec\":[{d},1,0,0,{d},{d},{d},{d}]}},\"indexes\":[\"vec\"],\"limit\":16}}", .{ worker + 1, dense[0], dense[1], dense[2], dense[3] });
+    if (!try responseHasKey(handle, routed, key)) out.missing += 1;
 }
 
 fn verify(path: [:0]const u8, cfg: Config, indexed: bool, results: []const WorkerResult) !Verification {

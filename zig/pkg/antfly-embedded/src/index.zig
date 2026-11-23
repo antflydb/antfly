@@ -1624,6 +1624,8 @@ pub const IndexSnapshot = struct {
     graph_ordinal_mutex: std.atomic.Mutex = .unlocked,
     graph_ordinal_incomplete: bool = false,
     segments: []SegmentEntry,
+    segment_lookup_mu: std.atomic.Mutex = .unlocked,
+    segment_lookup: ?std.AutoHashMapUnmanaged(u64, usize) = null,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
     collection_doc_count: ?u32 = null,
     collection_field_lens: ?std.StringHashMapUnmanaged(u64) = null,
@@ -1672,6 +1674,19 @@ pub const IndexSnapshot = struct {
             if (self.references.fetchSub(1, .acq_rel) == 1) a.destroy(self);
         }
     };
+    pub fn segmentIndex(self: *const IndexSnapshot, id: u64) !?usize {
+        const owner = @constCast(self.inventory_owner orelse self);
+        while (!owner.segment_lookup_mu.tryLock()) spinOrYield();
+        defer owner.segment_lookup_mu.unlock();
+        if (owner.segment_lookup == null) {
+            var lookup = std.AutoHashMapUnmanaged(u64, usize).empty;
+            try lookup.ensureTotalCapacity(owner.alloc, @intCast(owner.segments.len));
+            for (owner.segments, 0..) |segment, i| lookup.putAssumeCapacity(segment.id, i);
+            owner.segment_lookup = lookup;
+        }
+        return owner.segment_lookup.?.get(id);
+    }
+
     fn awaitBinding(self: *const IndexSnapshot, flight: *BindingFlight, cancelable: bool) !void {
         const protection = if (!cancelable) (if (self.read_context_io) |io| io.swapCancelProtection(.blocked) else null) else null;
         defer {
@@ -2015,6 +2030,7 @@ pub const IndexSnapshot = struct {
         self.quiesceOwnedSources();
         const alloc = self.alloc;
         self.graph_predicates.deinit(alloc);
+        if (self.segment_lookup) |*lookup| lookup.deinit(alloc);
         self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
         while (entries.next()) |entry| {
@@ -4876,17 +4892,15 @@ pub const IndexWriter = struct {
 
         const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
 
+        var retiring = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer retiring.deinit(scratch_alloc);
+        try retiring.ensureTotalCapacity(scratch_alloc, @intCast(old_ids.len));
+        for (old_ids) |id| retiring.putAssumeCapacity(id, {});
+
         var keep_count: usize = 0;
         var retire_count: usize = 0;
         for (old.segments) |*seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
-            if (is_old) {
+            if (retiring.contains(seg.id)) {
                 retire_count += 1;
             } else {
                 keep_count += 1;
@@ -4900,14 +4914,7 @@ pub const IndexWriter = struct {
         var idx: usize = 0;
         var ret_idx: usize = 0;
         for (old.segments) |seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
-            if (is_old) {
+            if (retiring.contains(seg.id)) {
                 retired[ret_idx] = seg;
                 ret_idx += 1;
             } else {
@@ -5213,21 +5220,19 @@ pub const IndexWriter = struct {
         self.lockMutex();
         defer self.mu.unlock();
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
-        for (snap.segments) |*seg| {
-            if (seg.id != seg_id) continue;
-            seg.shared.lockDeletionExclusive();
-            defer seg.shared.unlockDeletionExclusive();
-            if (seg.shared.deleted == null) seg.shared.deleted = roaring.RoaringBitmap.init(self.alloc);
-            var added: u32 = 0;
-            for (local_ids) |local_id| {
-                if (local_id >= seg.reader.doc_count) continue;
-                if (seg.shared.deleted.?.contains(local_id)) continue;
-                try seg.shared.deleted.?.add(local_id);
-                updateMissingLiveCountsForDeletedDocs(seg.shared, &.{local_id}, true);
-                added += 1;
-            }
-            _ = seg.shared.deleted_count.fetchAdd(added, .acq_rel);
-            return;
+        const index = (try snap.segmentIndex(seg_id)) orelse return;
+        const seg = &snap.segments[index];
+        seg.shared.lockDeletionExclusive();
+        defer seg.shared.unlockDeletionExclusive();
+        if (seg.shared.deleted == null) seg.shared.deleted = roaring.RoaringBitmap.init(self.alloc);
+        var added: u32 = 0;
+        defer _ = seg.shared.deleted_count.fetchAdd(added, .acq_rel);
+        for (local_ids) |local_id| {
+            if (local_id >= seg.reader.doc_count) continue;
+            if (seg.shared.deleted.?.contains(local_id)) continue;
+            try seg.shared.deleted.?.add(local_id);
+            updateMissingLiveCountsForDeletedDocs(seg.shared, &.{local_id}, true);
+            added += 1;
         }
     }
 

@@ -18517,6 +18517,17 @@ pub const NativeFile = struct {
     }
 
     pub fn vacuumWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !VacuumReport {
+        return self.vacuumWithFormat(cancel, false);
+    }
+
+    /// Upgrade under writer path authority by publishing a replacement inode.
+    /// A failed preparation leaves the original header and checkpoints intact.
+    pub fn requireVersionedTextFormat(self: *NativeFile) !void {
+        if (self.header.versioned_text_required and !self.header.versioned_text_fence_pending) return;
+        _ = try self.vacuumWithFormat(null, true);
+    }
+
+    fn vacuumWithFormat(self: *NativeFile, cancel: ?*const maintenance.CancelToken, versioned_text_required: bool) !VacuumReport {
         if (self.read_only) return error.ReadOnly;
         // Through the registry, like every other exclusive grant on this
         // inode: a raw `acquireDataRewriteLock` here would self-conflict
@@ -18533,34 +18544,10 @@ pub const NativeFile = struct {
         if (try self.regionForInode()) |region| if (region.minimumPinnedSequence() != null) return error.WouldBlock;
         var image = try self.prepareVacuum(cancel);
         defer image.deinit();
+        image.prepared.header.versioned_text_required = image.prepared.header.versioned_text_required or versioned_text_required;
+        image.prepared.header.versioned_text_fence_pending = false;
         try self.publishVacuum(&image);
         return image.report;
-    }
-
-    /// The writer path lease fences other writers. An existing read pin
-    /// continues to own its prior checkpoint. Fresh legacy opens reject
-    /// the high version byte before they read the checkpoint.
-    pub fn requireVersionedTextFormat(self: *NativeFile) !void {
-        if (self.read_only) return error.ReadOnly;
-        if (self.header.versioned_text_required and !self.header.versioned_text_fence_pending) return;
-        const io = self.runtimeIo();
-        var raw: [header_size]u8 = undefined;
-        try readHeaderExactAt(self.file, io, &raw);
-        const disk = try decodeHeader(&raw);
-        if (!disk.versioned_text_required) {
-            const marked: u8 = raw[text_fence_version_byte_offset] | 0x80;
-            try self.file.writePositionalAll(io, &.{marked}, text_fence_version_byte_offset);
-        }
-        if (!disk.versioned_text_required or disk.versioned_text_fence_pending) {
-            // An open after an interrupted migration must repeat this
-            // barrier even if the marked byte is already visible.
-            self.syncRedoData() catch return error.OutcomeUnknown;
-            // This certificate can survive only after the fence was synced.
-            // Losing it merely repeats a barrier on the next writable open.
-            try self.file.writePositionalAll(io, &.{text_fence_synced_byte}, text_fence_synced_offset);
-        }
-        self.header.versioned_text_required = true;
-        self.header.versioned_text_fence_pending = false;
     }
 
     pub fn publishVacuum(self: *NativeFile, image: *VacuumImage) !void {
@@ -42651,11 +42638,7 @@ test "lite header format fence migrates and survives a generation rewrite" {
         var writer = try NativeFile.createWithIo(alloc, io, path, .{});
         defer writer.close();
         try writer.putDocument("doc", "retained");
-        const identity = writer.dataIdentity().?;
-        const size = (try writer.file.stat(io)).size;
         try writer.requireVersionedTextFormat();
-        try std.testing.expectEqual(identity, writer.dataIdentity().?);
-        try std.testing.expectEqual(size, (try writer.file.stat(io)).size);
         try std.testing.expect(writer.header.versioned_text_required);
         _ = try writer.vacuum();
     }
@@ -42678,13 +42661,12 @@ test "lite header format fence reopens after uncertain migration publication" {
         var writer = try NativeFile.createWithIo(alloc, io, path, .{});
         defer writer.close();
         try writer.putDocument("doc", "retained");
-        try writer.file.writePositionalAll(io, &.{0x80}, text_fence_version_byte_offset);
+        writer.failNextGenerationDirectorySyncForTest();
+        try std.testing.expectError(error.OutcomeUnknown, writer.requireVersionedTextFormat());
     }
     var writer = try NativeFile.openWithIo(alloc, io, path, .{});
     defer writer.close();
-    try std.testing.expect(writer.header.versioned_text_fence_pending);
     try writer.requireVersionedTextFormat();
-    try std.testing.expect(!writer.header.versioned_text_fence_pending);
     try std.testing.expect(writer.header.versioned_text_required);
     const value = (try writer.getDocumentAlloc(alloc, "doc")).?;
     defer alloc.free(value);

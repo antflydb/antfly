@@ -844,6 +844,12 @@ pub const Backend = struct {
             self.replacement = null;
         }
 
+        /// The caller holds mutation admission for this backend.
+        pub fn get(self: *const PreparedMirror, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            const state = self.replacement orelse self.backend.state;
+            return state.state.get(namespace, key);
+        }
+
         pub fn publish(self: *PreparedMirror) void {
             const replacement = self.replacement orelse return;
             lockBackend(self.backend);

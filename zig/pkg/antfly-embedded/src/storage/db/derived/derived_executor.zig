@@ -254,6 +254,7 @@ const ManualRuntime = struct {
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     backlog: backlog_tracker_mod.Tracker,
+    backlog_mutex: std.atomic.Mutex = .unlocked,
     workers: std.ArrayListUnmanaged(ManualWorker) = .empty,
 
     pub fn deinit(self: *ManualRuntime) void {
@@ -366,22 +367,32 @@ const ManualRuntime = struct {
     }
 
     fn trackBacklogBytes(self: *ManualRuntime, sequence: u64, bytes: u64) !void {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         return try self.backlog.track(self.alloc, sequence, bytes);
     }
 
     fn admitBacklogBytes(self: *ManualRuntime, bytes: u64) !BacklogAdmission {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         return try self.backlog.admit(self.alloc, bytes);
     }
 
     fn commitBacklogAdmission(self: *ManualRuntime, sequence: u64, admission: *BacklogAdmission) void {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         self.backlog.commitAdmission(sequence, admission);
     }
 
     fn backlogThrottleTargetSequence(self: *ManualRuntime) ?u64 {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         return self.backlog.throttleTargetSequence();
     }
 
     fn releaseBacklogThrough(self: *ManualRuntime, sequence: u64) void {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         self.backlog.releaseThrough(sequence);
     }
 
@@ -478,7 +489,7 @@ const ManualRuntime = struct {
         const min_applied = computeMinApplied(self.workers.items);
         if (min_applied > 0) {
             try self.truncate_fn(self.ctx, min_applied);
-            self.backlog.releaseThrough(min_applied);
+            self.releaseBacklogThrough(min_applied);
         }
     }
 
@@ -528,7 +539,7 @@ const ManualRuntime = struct {
         const min_applied = computeMinApplied(self.workers.items);
         if (min_applied > 0) {
             try self.truncate_fn(self.ctx, min_applied);
-            self.backlog.releaseThrough(min_applied);
+            self.releaseBacklogThrough(min_applied);
         }
     }
 };

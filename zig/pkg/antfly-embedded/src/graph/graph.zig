@@ -8550,7 +8550,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn applyInlinePublicationToServing(self: *GraphIndex, publication: *const InlineEdgePublication) !void {
-        try self.publishCatalogDelta(publication.forward_mutations, publication.reverse_mutations, publication.counters);
+        try self.publishCatalogDelta(publication.forward_mutations, publication.reverse_mutations, publication.counters, false);
     }
 
     pub fn refreshCatalogDelta(self: *GraphIndex, forward: []const native_catalog_backend.Mutation, reverse: []const native_catalog_backend.Mutation) !void {
@@ -8580,21 +8580,29 @@ pub const GraphIndex = struct {
             if (!mutation.is_delete and mutation.value.len != 8) return error.UnsupportedRefresh;
             field.* = if (mutation.is_delete) 0 else std.mem.readInt(u64, mutation.value[0..8], .little);
         }
-        try self.publishCatalogDelta(forward, reverse, counters);
+        try self.publishCatalogDelta(forward, reverse, counters, true);
         if (has_contributor_writes) self.contributor_ordering_enabled.store(true, .release);
     }
 
-    fn publishCatalogDelta(self: *GraphIndex, forward_mutations: []const native_catalog_backend.Mutation, reverse_mutations: []const native_catalog_backend.Mutation, counters: Stats) !void {
+    fn publishCatalogDelta(self: *GraphIndex, forward_mutations: []const native_catalog_backend.Mutation, reverse_mutations: []const native_catalog_backend.Mutation, counters: Stats, verify_pair: bool) !void {
         const forward = self.outgoing_owner.native_catalog;
         const reverse = self.reverse_owner.native_catalog;
-        errdefer {
+        errdefer if (!verify_pair) {
             forward.invalidateMirror();
             reverse.invalidateMirror();
-        }
+        };
         var next_forward = try forward.prepareExternalMirror(forward_mutations);
         defer next_forward.deinit();
         var next_reverse = try reverse.prepareExternalMirror(reverse_mutations);
         defer next_reverse.deinit();
+        if (verify_pair) {
+            const key = try outgoingReadGenerationKeyAlloc(self.alloc, self.index_name);
+            defer self.alloc.free(key);
+            const outgoing = next_forward.get(.{}, key) catch return error.UnsupportedRefresh;
+            const incoming = next_reverse.get(.{}, graph_read_generation_key) catch return error.UnsupportedRefresh;
+            if (outgoing.len != 8 or incoming.len != 8 or !std.mem.eql(u8, outgoing, incoming))
+                return error.UnsupportedRefresh;
+        }
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         next_forward.publish();
         next_reverse.publish();
@@ -22241,6 +22249,7 @@ test "graph private writer view advances both catalogs without serving queued ed
     const served = try graph.getEdges(alloc, "a", "rel", .out);
     defer GraphIndex.freeEdges(alloc, served);
     try std.testing.expectEqual(@as(usize, 0), served.len);
+    try std.testing.expectError(error.UnsupportedRefresh, graph.refreshCatalogDelta(first.forwardMutations(), &.{}));
     try graph.refreshCatalogDelta(first.forwardMutations(), first.reverseMutations());
     try std.testing.expectEqual(first.counters, graph.committedStats());
     for ([_]struct { key: []const u8, direction: EdgeDirection }{

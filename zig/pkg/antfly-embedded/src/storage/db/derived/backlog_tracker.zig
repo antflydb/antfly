@@ -38,15 +38,23 @@ pub const Tracker = struct {
     pub const Admission = struct {
         reservation: ?resource_manager_mod.Reservation = null,
         retained_bytes: u64 = 0,
+        pending: ?*std.atomic.Value(usize) = null,
 
         pub fn cancel(self: *Admission) void {
             if (self.reservation) |*reservation| reservation.release();
+            self.finish();
+        }
+
+        fn finish(self: *Admission) void {
+            if (self.pending) |pending| _ = pending.fetchSub(1, .release);
             self.* = .{};
         }
     };
 
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    pending_admissions: std.atomic.Value(usize) = .init(0),
+    released_through: u64 = 0,
     retained_bytes: u64 = 0,
     accounted_bytes: u64 = 0,
     // Once entry allocation fails, retain exact aggregate accounting and force
@@ -80,10 +88,7 @@ pub const Tracker = struct {
             self.observe(self.accounted_bytes +| retained_bytes);
             return;
         }
-        self.entries.append(alloc, .{
-            .sequence = sequence,
-            .retained_bytes = retained_bytes,
-        }) catch {
+        self.entries.ensureUnusedCapacity(alloc, 1 + self.pending_admissions.load(.acquire)) catch {
             self.overflow_first_sequence = sequence;
             self.overflow_last_sequence = sequence;
             self.overflow_bytes = retained_bytes;
@@ -91,6 +96,7 @@ pub const Tracker = struct {
             self.observe(self.accounted_bytes +| retained_bytes);
             return;
         };
+        self.insertOrdered(.{ .sequence = sequence, .retained_bytes = retained_bytes });
         self.retained_bytes +|= retained_bytes;
         self.observe(self.accounted_bytes +| retained_bytes);
     }
@@ -101,11 +107,14 @@ pub const Tracker = struct {
     /// post-commit transfer is allocation-free.
     pub fn admit(self: *Tracker, alloc: Allocator, bytes: u64) !Admission {
         const manager = self.resource_manager orelse return .{};
-        try self.entries.ensureUnusedCapacity(alloc, 1);
+        try self.entries.ensureUnusedCapacity(alloc, 1 + self.pending_admissions.load(.acquire));
         const retained_bytes = retainedCharge(bytes);
+        const reservation = try manager.reserveImmediate(.derived_backlog, retained_bytes);
+        _ = self.pending_admissions.fetchAdd(1, .release);
         return .{
-            .reservation = try manager.reserveImmediate(.derived_backlog, retained_bytes),
+            .reservation = reservation,
             .retained_bytes = retained_bytes,
+            .pending = &self.pending_admissions,
         };
     }
 
@@ -113,22 +122,34 @@ pub const Tracker = struct {
     /// commit atomically. This operation is deliberately allocation-free and
     /// cannot fail after the source mutation is durable.
     pub fn commitAdmission(self: *Tracker, sequence: u64, admission: *Admission) void {
-        if (admission.reservation == null) {
-            admission.* = .{};
+        if (admission.reservation == null or sequence <= self.released_through) {
+            admission.cancel();
             return;
         }
-        self.entries.appendAssumeCapacity(.{
+        self.insertOrdered(.{
             .sequence = sequence,
             .retained_bytes = admission.retained_bytes,
             .reservation = admission.reservation,
         });
         self.retained_bytes +|= admission.retained_bytes;
-        admission.reservation = null;
-        admission.retained_bytes = 0;
+        admission.finish();
+    }
+
+    fn insertOrdered(self: *Tracker, entry: Entry) void {
+        var position = self.entries.items.len;
+        if (position != 0 and self.entries.items[position - 1].sequence > entry.sequence) {
+            var first: usize = 0;
+            while (first < position) {
+                const mid = first + (position - first) / 2;
+                if (self.entries.items[mid].sequence <= entry.sequence) first = mid + 1 else position = mid;
+            }
+        }
+        self.entries.insertAssumeCapacity(position, entry);
     }
 
     pub fn releaseThrough(self: *Tracker, sequence: u64) void {
         if (self.resource_manager == null) return;
+        self.released_through = @max(self.released_through, sequence);
         var write_index: usize = 0;
         var released_observed: u64 = 0;
         var released_total: u64 = 0;
@@ -288,6 +309,29 @@ test "derived backlog admission transfers exact precommit capacity" {
     tracker.releaseThrough(6);
     try std.testing.expectEqual(admitted_charge, manager.sliceStats(.derived_backlog).used_bytes);
     tracker.releaseThrough(7);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
+}
+
+test "derived backlog admission reserves slots for queued writers and ignores retired sequences" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var tracker = Tracker.init(&manager);
+    defer tracker.deinit(std.testing.allocator);
+
+    var pending: [32]Tracker.Admission = @splat(.{});
+    defer for (&pending) |*admission| admission.cancel();
+    for (&pending) |*admission| admission.* = try tracker.admit(std.testing.allocator, 1);
+
+    tracker.releaseThrough(1);
+    var i = pending.len;
+    while (i > 0) {
+        i -= 1;
+        tracker.commitAdmission(i + 1, &pending[i]);
+    }
+    try std.testing.expectEqual(pending.len - 1, tracker.entries.items.len);
+    for (tracker.entries.items, 2..) |entry, sequence| {
+        try std.testing.expectEqual(sequence, entry.sequence);
+    }
+    tracker.releaseThrough(pending.len);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
 }
 

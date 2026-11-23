@@ -2275,10 +2275,14 @@ pub const PersistentIndex = struct {
             for (additions.items) |*entry| entry.data.deinit(self.alloc);
             for (bitmaps.items) |*bitmap| if (bitmap.*) |*owned| owned.deinit();
         }
-        const current = self.writer.acquireSnapshot();
-        defer current.release();
-        var present = std.AutoHashMapUnmanaged(u64, void).empty;
-        for (current.segments) |segment| try present.put(alloc, segment.id, {});
+        const has_segment_changes = for (keys.items) |key| {
+            const namespace = key.namespace.?;
+            if (std.mem.eql(u8, namespace, l0_namespace) or
+                (std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?) and
+                    std.mem.startsWith(u8, key.key, meta_active_segment_prefix))) break true;
+        } else false;
+        const current = if (has_segment_changes) self.writer.acquireSnapshot() else null;
+        defer if (current) |snap| snap.release();
         for (keys.items) |key| {
             const namespace = key.namespace.?;
             const segment_id = if (std.mem.eql(u8, namespace, l0_namespace)) id: {
@@ -2289,11 +2293,12 @@ pub const PersistentIndex = struct {
                 if (encoded.len != 8) return error.InvalidSegmentCounter;
                 break :id std.mem.readInt(u64, encoded[0..8], .big);
             } else continue;
+            const exists = (try current.?.segmentIndex(segment_id)) != null;
             if (key.is_delete) {
-                if (present.contains(segment_id)) try removed.append(alloc, segment_id);
+                if (exists) try removed.append(alloc, segment_id);
                 continue;
             }
-            if (present.contains(segment_id)) continue;
+            if (exists) continue;
             const bytes = if (isL0SegmentId(segment_id)) key.value else regular_segment_bytes.get(segment_id) orelse return error.UnsupportedRefresh;
             try additions.ensureUnusedCapacity(alloc, 1);
             try bitmaps.ensureUnusedCapacity(alloc, 1);
@@ -5031,32 +5036,29 @@ pub const PersistentIndex = struct {
         defer locations.mutex.unlock();
         const snap = self.writer.acquireSnapshot();
         defer snap.release();
-        var present = std.AutoHashMapUnmanaged(u64, *const index_mod.SegmentEntry).empty;
-        defer present.deinit(self.alloc);
-        for (snap.segments) |*segment| try present.put(self.alloc, segment.id, segment);
         var refreshed = false;
         for (versions) |version| {
             var location = locations.map.get(version);
-            if (location == null or !present.contains(location.?.seg_id)) {
+            if (location == null or (try snap.segmentIndex(location.?.seg_id)) == null) {
                 if (!refreshed) {
-                    try self.indexVersionLocationsLocked(snap, &present);
+                    try self.indexVersionLocationsLocked(snap);
                     refreshed = true;
                 }
                 location = locations.map.get(version);
             }
             const found = location orelse continue;
-            if (!present.contains(found.seg_id)) continue;
+            if ((try snap.segmentIndex(found.seg_id)) == null) continue;
             try self.writer.applyCommittedDeletes(found.seg_id, &.{found.local_id});
             _ = locations.map.remove(version);
         }
     }
 
-    fn indexVersionLocationsLocked(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, present: *const std.AutoHashMapUnmanaged(u64, *const index_mod.SegmentEntry)) !void {
+    fn indexVersionLocationsLocked(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot) !void {
         const locations = &self.version_locations;
         var retired = std.ArrayListUnmanaged(u64).empty;
         defer retired.deinit(self.alloc);
         var indexed_it = locations.indexed.keyIterator();
-        while (indexed_it.next()) |seg_id| if (!present.contains(seg_id.*)) try retired.append(self.alloc, seg_id.*);
+        while (indexed_it.next()) |seg_id| if ((try snap.segmentIndex(seg_id.*)) == null) try retired.append(self.alloc, seg_id.*);
         for (retired.items) |seg_id| {
             const versions = locations.indexed.fetchRemove(seg_id).?.value;
             defer self.alloc.free(versions);

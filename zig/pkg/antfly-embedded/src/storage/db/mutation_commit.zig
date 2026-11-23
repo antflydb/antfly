@@ -3960,6 +3960,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // artifact is exactly as narrow as the empty case this gate
             // originally required -- not a batch with unrelated/multiple
             // artifact effects needing the slow path's own ordering.
+            // These callers publish effects outside the native transaction
+            // while holding the DB apply lock. Keep them on the ordinary path.
+            const allow_queued_index_publication = opts.committed_batch_effects_observer == null and
+                review_plan == null and next_table_catalog == null and persisted_range == null and
+                !shouldAppendSplitDelta(self) and
+                S.ownerField(self, "local_execution").*.replication_async_batch_mirror == null and
+                S.ownerField(self, "local_execution").*.replication_async_effect_mirror == null;
             var inline_graph_publication: ?*InlineGraphPublication = null;
             var inline_graph_handled_name: []const u8 = &.{};
             defer if (inline_graph_publication) |prepared| prepared.abort();
@@ -3991,7 +3998,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // one durable commit per write instead of guessing from the
             // aggregate fsync/commit counts alone.
             const graph_write_batch = materialized_derived_batch != null and materialized_derived_batch.?.graph_writes.len != 0;
-            const graph_gate_ok = append_derived_replay and effective_req.sync_level == .full_index and
+            const graph_gate_ok = allow_queued_index_publication and append_derived_replay and effective_req.sync_level == .full_index and
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.graph_writes.len == 1 and
                 materialized_derived_batch.?.graph_deletes.len == 0 and
@@ -4056,7 +4063,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var inline_sparse_handled_name: []const u8 = &.{};
             defer if (inline_sparse_publication) |prepared| prepared.abort();
             defer if (inline_sparse_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_sparse_handled_name));
-            if (append_derived_replay and effective_req.sync_level == .full_index and
+            if (allow_queued_index_publication and append_derived_replay and effective_req.sync_level == .full_index and
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.sparse_embeddings.len == 1 and
                 materialized_derived_batch.?.deleted_keys.len == 0 and
@@ -4099,7 +4106,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var inline_dense_handled_name: []const u8 = &.{};
             defer if (inline_dense_publication) |prepared| prepared.abort();
             defer if (inline_dense_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_dense_handled_name));
-            if (append_derived_replay and effective_req.sync_level == .full_index and
+            if (allow_queued_index_publication and append_derived_replay and effective_req.sync_level == .full_index and
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.dense_embeddings.len == 1 and
                 materialized_derived_batch.?.deleted_keys.len == 0 and
@@ -4475,6 +4482,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                 }
             }
+            const queued_index_publication = inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null;
+            const BacklogCompletion = struct {
+                executor: *derived_executor_mod.Executor,
+                admission: *derived_executor_mod.BacklogAdmission,
+                sequence: u64,
+
+                fn run(ptr: *anyopaque, outcome: anyerror!u64) void {
+                    const context: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = outcome catch return;
+                    context.executor.commitBacklogAdmission(context.sequence, context.admission);
+                }
+            };
+            var backlog_completion: BacklogCompletion = .{
+                .executor = S.ownerField(self, "executor").*,
+                .admission = &backlog_admission,
+                .sequence = sequence,
+            };
+            if (queued_index_publication and append_derived_replay)
+                commit_participants.completion = .{ .ptr = &backlog_completion, .run = BacklogCompletion.run };
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
                 if (commit_participants.len != 0) commit_participants.participant() else null;
             const commit_participant = if (generated_acceptance) |*acceptance| acceptance.participant() else if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null;
@@ -4631,11 +4657,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.committed_batch_effects_observer) |observer| {
                 try observer.observe(if (append_derived_replay) replay_payload else "");
             }
-            if (pending_identity_visibility_summary) |summary| {
+            if (!queued_index_publication) if (pending_identity_visibility_summary) |summary| {
                 S.ownerField(self, "core").*.identity_visibility.summary = summary;
                 self.clearLiveDocSetCache();
                 self.clearNonVisibleDocSetCache();
-            }
+            };
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
                 active_profile.store_write_count += @intCast(write_buffers.store_writes.items.len);
@@ -4651,7 +4677,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.split_delta_ns, split_delta_start_ns);
             }
 
-            if (append_derived_replay) {
+            if (append_derived_replay and !queued_index_publication) {
                 const append_replay_journal_start_ns = monotonicTimeNs();
                 S.ownerField(self, "executor").*.commitBacklogAdmission(sequence, &backlog_admission);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
@@ -4829,6 +4855,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (indexed_lane_yielded) {
                 const hook = opts.writer_lane_release_before_wait.?;
                 try hook.resume_after_indexed_wait.?(hook.ptr);
+            }
+            if (queued_index_publication and pending_identity_visibility_summary != null) {
+                try self.lockApplyForPortableRuntime();
+                defer S.ownerField(self, "core").*.unlockApply();
+                const core = S.ownerField(self, "core").*;
+                // A later member may already be durable. Read the current
+                // committed summary instead of reinstalling a stale snapshot.
+                core.identity_visibility.summary = doc_identity.visibilitySummaryFromStore(core.store) catch null;
+                core.identity_visibility.clearLive();
+                core.identity_visibility.clearNonvisible();
             }
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();

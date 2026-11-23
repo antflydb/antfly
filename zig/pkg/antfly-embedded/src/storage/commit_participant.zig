@@ -390,6 +390,11 @@ pub const List = struct {
     items: [max_participants]Participant = undefined,
     len: usize = 0,
 
+    completion: ?struct {
+        ptr: *anyopaque,
+        run: *const fn (*anyopaque, anyerror!u64) void,
+    } = null,
+
     pub fn append(self: *List, new_participant: Participant) !void {
         if (self.len >= max_participants) return error.TooManyCommitParticipants;
         self.items[self.len] = new_participant;
@@ -431,6 +436,7 @@ pub const List = struct {
     fn completeQueued(ptr: *anyopaque, outcome: anyerror!u64) void {
         const self: *List = @ptrCast(@alignCast(ptr));
         for (self.items[0..self.len]) |p| if (p.queued) |queued| queued.complete(queued.ptr, outcome);
+        if (self.completion) |callback| callback.run(callback.ptr, outcome);
     }
 
     /// Borrowed only for as long as `self` itself is: the returned
