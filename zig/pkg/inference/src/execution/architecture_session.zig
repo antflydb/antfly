@@ -13745,34 +13745,59 @@ pub const StagedExecution = struct {
         return .{ .ptr = self, .close_fn = closeFrontendCache };
     }
 
-    fn metalAudioScratch(raw: *anyopaque, cb: *const ops.ComputeBackend, key: u64, inputs: []const ops.CT) anyerror!void {
+    fn metalAudioScratch(raw: *anyopaque, cb: *const ops.ComputeBackend, keys: []const u64, inputs: []const ops.CT) anyerror!void {
         if (comptime !build_options.enable_metal) return;
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
         if (!self.active or self.cb.ptr != cb.ptr or self.cb.vtable != cb.vtable or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return;
         const model = self.model_retention orelse return;
         const pin = if (model.admission_domain) |*value| value else return;
         const Metal = @import("../ops/metal_compute.zig").MetalCompute;
-        const request = (try Metal.pendingAudioScratch(cb, key, inputs)) orelse return;
-        try pause(self);
-
-        var bank = Metal.fundAudioScratch(cb, request, pin) catch |err| {
-            try acquire(self);
-            switch (err) {
-                error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.PreparedCacheGrowthChanged, error.MissingCacheRetirementDomain => return,
-                else => return err,
+        const Upgrade = @import("audio_schedule.zig").Plan.ScratchUpgrade;
+        var requests: [12]Upgrade = undefined;
+        if (keys.len > requests.len) return error.UnsupportedPreparedAudioCache;
+        var count: usize = 0;
+        for (keys) |key| {
+            const request = (try Metal.pendingAudioScratch(cb, key, inputs)) orelse continue;
+            for (requests[0..count]) |known| {
+                if (known.key == request.key) break;
+            } else {
+                requests[count] = request;
+                count += 1;
             }
+        }
+        if (count == 0) return;
+
+        try pause(self);
+        var banks: [12]?Metal.FundedAudioBank = @splat(null);
+        defer for (&banks) |*value| {
+            if (value.*) |*bank| bank.discardAfterResume();
         };
-        // A cold cache candidate must not starve the original stage permit.
-        // Retire it outside the gates before retrying the original execution.
+        for (requests[0..count], banks[0..count]) |request, *value| {
+            value.* = Metal.fundAudioScratch(cb, request, pin) catch |err| switch (err) {
+                error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.PreparedCacheGrowthChanged, error.MissingCacheRetirementDomain => continue,
+                else => {
+                    try acquire(self);
+                    return err;
+                },
+            };
+        }
+        // Cold candidates must not starve the original stage permit. Retire
+        // them outside the gates before retrying the original execution.
         self.enter(self.control, true) catch {
-            const settlement = bank.discardOutsideExecution();
+            var settlement: ?anyerror = null;
+            for (&banks) |*value| if (value.*) |*bank| {
+                bank.discardOutsideExecution() catch |err| {
+                    if (settlement == null) settlement = err;
+                };
+                value.* = null;
+            };
             try acquire(self);
-            try settlement;
+            if (settlement) |err| return err;
             return;
         };
-        var published = false;
-        defer if (!published) bank.discardAfterResume();
-        published = try Metal.publishAudioScratch(cb, request, &bank);
+        for (requests[0..count], banks[0..count]) |request, *value| if (value.*) |*bank| {
+            if (try Metal.publishAudioScratch(cb, request, bank)) value.* = null;
+        };
     }
 
     fn audioCache(raw: *anyopaque, cb: *const ops.ComputeBackend, request: @import("audio_schedule.zig").AudioRecipe, live_inputs: []const *ops.CT) anyerror!ops.EmbeddingCacheScope {
