@@ -10011,6 +10011,10 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
                 try std.testing.expectEqualStrings("docs", call.resolve.table);
                 return std.json.Stringify.valueAlloc(alloc, domain.ResolvedTable{ .table_id = 7, .name = "docs" }, .{});
             }
+            if (call == .write_validation) {
+                try std.testing.expectEqualStrings("docs", call.write_validation);
+                return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/projection.zig").WriteValidation{ .schema_json = "" }, .{});
+            }
             if (call != .resolve_many) return error.UnexpectedCatalogCall;
             const request = call.resolve_many;
             const resolved = try alloc.alloc(?[]const u8, request.storage_names.len);
