@@ -52467,8 +52467,9 @@ const MediaOutputExecution = struct {
         }
         if (state.registry.count > self.config.targets[i].speakerConfig().max_speakers) return error.InvalidSpeakerCheckpoint;
         if (state.next_window > state.memory_window) {
-            self.node.host_caches.media_index_cache.remember(std.heap.smp_allocator, identity, .{ .speaker_analysis = state.snapshot(provider.sample_rate) }, self.speaker_cache_admission.?);
-            state.memory_window = state.next_window;
+            if (self.node.host_caches.media_index_cache.rememberSpeaker(std.heap.smp_allocator, identity, state.snapshot(provider.sample_rate), self.speaker_cache_admission.?)) {
+                state.memory_window = state.next_window;
+            }
             if (state.disk_cursor) |cursor| self.node.host_caches.media_index_cache.recordSpeakerDisk(identity, cursor);
         }
         return state;
@@ -53524,8 +53525,9 @@ const MediaOutputExecution = struct {
             if (!self.leader(i) or !state.valid or !state.cacheable or state.next_window == 0) continue;
             const snapshot = state.snapshot(provider.sample_rate);
             if (state.next_window > state.memory_window) {
-                self.node.host_caches.media_index_cache.remember(std.heap.smp_allocator, state.identity, .{ .speaker_analysis = snapshot }, self.speaker_cache_admission.?);
-                state.memory_window = state.next_window;
+                if (self.node.host_caches.media_index_cache.rememberSpeaker(std.heap.smp_allocator, state.identity, snapshot, self.speaker_cache_admission.?)) {
+                    state.memory_window = state.next_window;
+                }
             }
             if (self.node.host_caches.media_index_cache.speakerDisk(state.identity)) |cursor| if (cursor.window > state.disk_window) {
                 state.disk_cursor = cursor;
