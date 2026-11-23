@@ -7684,6 +7684,7 @@ pub const AntflyApiHandler = struct {
     fn reserveFencedTransaction(context: operation_contract.RequestContext, server: *ApiHttpServer, completion: *@import("../pgwire/completion.zig").Completion) !void {
         try context.ensureActive();
         try @import("sql/session/completion.zig").reserveOnOwner(server, completion);
+        try context.ensureActive();
     }
 
     fn prepareFencedTransaction(context: operation_contract.RequestContext, txn_id: db_mod.types.TxnId) !void {
