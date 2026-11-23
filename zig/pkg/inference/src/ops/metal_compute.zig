@@ -47,10 +47,15 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
                 r.seq_len > std.math.maxInt(u32) or r.position_offset > std.math.maxInt(u32) - (r.seq_len - 1)) return false;
         },
         .norm => |norm| {
-            if (norm.dim == 0 or descriptor.output_shape.rank() != 2 or
-                descriptor.output_shape.dim(1) != norm.dim or
+            const rank = descriptor.output_shape.rank();
+            if (norm.dim == 0 or descriptor.output_shape.dim(rank - 1) != norm.dim or
                 descriptor.input_shapes[1].rank() != 1 or descriptor.input_shapes[1].numElements().? != norm.dim) return false;
-            if (norm.kind == .layer and (descriptor.input_shapes[2].rank() != 1 or descriptor.input_shapes[2].numElements().? != norm.dim)) return false;
+            switch (norm.kind) {
+                .rms => if (rank != 2) return false,
+                .layer => if (!descriptor.input_shapes[0].eq(descriptor.output_shape) or
+                    descriptor.elements() / norm.dim > std.math.maxInt(u32) or
+                    descriptor.input_shapes[2].rank() != 1 or descriptor.input_shapes[2].numElements().? != norm.dim) return false,
+            }
         },
         .add_mul_scalar => if (descriptor.elements() == 0 or descriptor.elements() > std.math.maxInt(u32) or
             !descriptor.input_shapes[0].eq(descriptor.output_shape) or !descriptor.input_shapes[1].eq(descriptor.output_shape) or

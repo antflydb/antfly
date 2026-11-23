@@ -7545,7 +7545,8 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, layer_norm, dot, fus
     var graph = Graph.init(a);
     defer graph.deinit();
     var builder = ml.graph.Builder.init(&graph);
-    const shape = Shape.init(.f32, &.{ 8, 64 });
+    const input_shape: []const i64 = if (kind == .layer_norm) &.{ 2, 4, 64 } else &.{ 8, 64 };
+    const shape = Shape.init(.f32, input_shape);
     const input_node = try builder.parameter("x", shape);
     const rhs_shape: []const i64 = switch (kind) {
         .dot => &.{ 64, 4 },
@@ -7589,7 +7590,7 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, layer_norm, dot, fus
             .fused_scalar => 512,
         }
     ]f32 = @splat(3);
-    var input = try Tensor.initFloat32(a, "x", &.{ 8, 64 }, &values);
+    var input = try Tensor.initFloat32(a, "x", input_shape, &values);
     defer input.deinit();
     var gamma = try Tensor.initFloat32(a, "gamma", rhs_shape, &gains);
     defer gamma.deinit();
