@@ -20776,6 +20776,16 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         try self.ctx.recordProfileEnd(pair);
         arena.timing_replay = replay;
     };
+    const observation = @import("../../execution/runtime_observation.zig");
+    if (capture) {
+        observation.cudaAudioResult(.recorded_and_launched);
+    } else if (replay) {
+        observation.cudaAudioResult(.replayed);
+    } else if (published_directly) {
+        observation.cudaAudioResult(.eager_assigned);
+    } else {
+        observation.cudaAudioResult(.eager_copied);
+    }
     self.audio_arena_executes += 1;
     out_owned = false;
     return out;

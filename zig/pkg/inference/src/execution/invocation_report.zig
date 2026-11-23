@@ -48,6 +48,7 @@ pub const Report = struct {
     metal_command_waits: ?u64 = null,
     /// Actual accepted driver API/topology units, not completed device kernels.
     cuda: ?runtime.Cuda = null,
+    cuda_audio: ?@import("runtime_observation.zig").CudaAudio = null,
     cuda_periodic_workspace: ?runtime.PeriodicWorkspace = null,
     resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
@@ -151,6 +152,7 @@ pub const Report = struct {
         }
         if (value.runtime.submission) |submission| {
             report.implementation_entries = submission.backend_entries;
+            report.cuda_audio = submission.cuda_audio;
             report.native_assigned_dispatches = submission.native_assigned_dispatches;
             report.metal_encoded_dispatches = submission.metal_encoded_dispatches;
             report.metal_vendor_encodes = submission.metal_vendor_encodes;

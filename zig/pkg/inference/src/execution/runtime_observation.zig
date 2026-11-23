@@ -343,9 +343,34 @@ noinline fn cudaKernelEnabled(context: usize, function: usize, stream: usize, co
     }
 }
 
+/// Published CUDA audio results by physical route on the submitting thread.
+pub const CudaAudio = struct {
+    eager_assigned: u64 = 0,
+    eager_copied: u64 = 0,
+    recorded_and_launched: u64 = 0,
+    replayed: u64 = 0,
+
+    fn since(self: CudaAudio, before: CudaAudio) ?CudaAudio {
+        var result: CudaAudio = .{};
+        var observed = false;
+        inline for (@typeInfo(CudaAudio).@"struct".field_names) |field| {
+            @field(result, field) = @field(self, field) -| @field(before, field);
+            observed = observed or @field(result, field) != 0;
+        }
+        return if (observed) result else null;
+    }
+};
+
+threadlocal var cuda_audio: CudaAudio = .{};
+
+pub inline fn cudaAudioResult(comptime route: @import("std").meta.FieldEnum(CudaAudio)) void {
+    if (enabled()) @field(cuda_audio, @tagName(route)) +|= 1;
+}
+
 pub const Counters = struct {
     native_assigned_dispatches: u64 = 0,
     backend_entries: Entries = .{},
+    cuda_audio: ?CudaAudio = null,
     metal_encoded_dispatches: ?u64 = null,
     metal_command_submissions: ?u64 = null,
     metal_command_waits: ?u64 = null,
@@ -373,6 +398,7 @@ fn metalCounters() [4]u64 {
 pub const Scope = struct {
     active: bool = false,
     native_start: u64 = 0,
+    cuda_audio_start: CudaAudio = .{},
     entry_start: [entry_slots]EntryCounts = @splat(.{}),
     metal_start: [4]u64 = @splat(0),
 
@@ -381,11 +407,11 @@ pub const Scope = struct {
     pub fn init() Scope {
         native_depth += 1;
         if (comptime build_options.enable_metal) termite_metal_observation_begin();
-        return .{ .active = true, .native_start = native_dispatches, .entry_start = entryStarts(), .metal_start = metalCounters() };
+        return .{ .active = true, .native_start = native_dispatches, .cuda_audio_start = cuda_audio, .entry_start = entryStarts(), .metal_start = metalCounters() };
     }
 
     pub fn snapshot(self: Scope) Counters {
-        var result = Counters{ .native_assigned_dispatches = native_dispatches -| self.native_start, .backend_entries = entriesSince(self.entry_start) };
+        var result = Counters{ .native_assigned_dispatches = native_dispatches -| self.native_start, .backend_entries = entriesSince(self.entry_start), .cuda_audio = cuda_audio.since(self.cuda_audio_start) };
         if (comptime build_options.enable_metal) {
             const after = metalCounters();
             result.metal_encoded_dispatches = after[0] -| self.metal_start[0];
@@ -1104,4 +1130,21 @@ test "Native Call bank observations copy optional lifetime gauges through nested
     fresh.begin();
     defer _ = fresh.finish();
     try a.expect(fresh.native_program_bank == null);
+}
+
+test "CUDA audio result observations preserve nested route counts and disabled scopes" {
+    const testing = @import("std").testing;
+    cudaAudioResult(.eager_copied);
+    var outer = Scope.init();
+    defer outer.deinit();
+    try testing.expect(outer.snapshot().cuda_audio == null);
+    cudaAudioResult(.recorded_and_launched);
+    {
+        var inner = Scope.init();
+        defer inner.deinit();
+        cudaAudioResult(.replayed);
+        cudaAudioResult(.eager_assigned);
+        try testing.expectEqualDeep(CudaAudio{ .replayed = 1, .eager_assigned = 1 }, inner.snapshot().cuda_audio.?);
+    }
+    try testing.expectEqualDeep(CudaAudio{ .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1 }, outer.snapshot().cuda_audio.?);
 }
