@@ -699,6 +699,8 @@ class CdcUploadFault(OwnerLinkFault):
         self.committed_transactions = {}
         self.reclaimed = threading.Event()
         self.replacement = None
+        self.upload_observations = deque(maxlen=32)
+        self.first_chunk = None
 
     @staticmethod
     def wire_bytes(value):
@@ -762,13 +764,14 @@ class CdcUploadFault(OwnerLinkFault):
     def drop_reply(self, index, body):
         command = self.upload(body)
         with self.lock:
-            if (
-                not self.armed
-                or self.healed
-                or self.original is not None
-                or command is None
-                or not body.get("_upload_applied")
-            ):
+            if not self.armed or self.healed or self.original is not None:
+                return False
+            confirmed_chunk = body.get("_observed_first_chunk")
+            if confirmed_chunk is not None:
+                self.original = confirmed_chunk
+                self.reply_dropped.set()
+                return True
+            if command is None or not body.get("_upload_applied"):
                 return False
             if command["action"] != self.window.removeprefix("cdc_"):
                 return False
@@ -782,7 +785,47 @@ class CdcUploadFault(OwnerLinkFault):
 
     def observe_response(self, index, body, response):
         super().observe_response(index, body, response)
+        command = self.upload(body)
+        with self.lock:
+            if self.armed and command is not None:
+                if (
+                    self.window == "cdc_chunk"
+                    and command["action"] == "chunk"
+                    and command["ordinal"] == 0
+                    and len(command["spec"]["chunk_hashes"]) > 1
+                ):
+                    self.first_chunk = body
+                self.upload_observations.append(
+                    (
+                        command["action"],
+                        command.get("ordinal"),
+                        len(command["spec"]["chunk_hashes"]),
+                        response.status_code,
+                    )
+                )
         if response.status_code != 200:
+            return
+        if body.get("_fault_path", "").endswith("/source-plan/observe-v1"):
+            # A chunk can commit while its command result is unconfirmed.
+            # The next qualified read can prove the same partial upload.
+            with self.lock:
+                first = self.first_chunk
+                if (
+                    self.armed
+                    and first is not None
+                    and body.get("source_owner") == first["source_owner"]
+                    and body.get("query", {}).get("spec") == first["command"]["spec"]
+                ):
+                    status = (response.json().get("observation") or {}).get(
+                        "status"
+                    ) or {}
+                    if (
+                        status.get("present")
+                        and status.get("seal") is None
+                        and status.get("fence") is None
+                        and self.wire_bytes(status["received"]) == b"\x01" + bytes(15)
+                    ):
+                        body["_observed_first_chunk"] = first
             return
         if body.get("_fault_path", "").endswith("/history/decision-v1"):
             decision = response.json().get("decision") or {}
@@ -796,7 +839,6 @@ class CdcUploadFault(OwnerLinkFault):
                     token = int(record["source_scope"]["token"])
                     identity = self.wire_bytes(body["transaction_id"]).hex()
                     self.committed_transactions.setdefault(token, set()).add(identity)
-        command = self.upload(body)
         if command is None:
             return
         applied = (response.json().get("outcome") or {}).get("applied")
@@ -1060,7 +1102,14 @@ def test_native_cdc_upload_survives_checkpoint_owner_merge(
             SELECT 'fault-' || i, repeat('x', 280000), 'gold'
             FROM generate_series(1, 6) AS i
         """)
-        assert fault.reply_dropped.wait(90), cluster.debug_logs()
+        if not fault.reply_dropped.wait(90):
+            with fault.lock:
+                uploads = list(fault.upload_observations)
+            pytest.fail(
+                f"upload replies={uploads} checkpoint_advanced={checkpoint() != before} "
+                f"row_delivered={current_document('fault-1') is not None}\n"
+                f"{cluster.debug_logs()}"
+            )
         owner = fault.original["source_owner"]
         donor = int(owner["group_id"])
         view = snapshot()
