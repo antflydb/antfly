@@ -342,7 +342,11 @@ fn assessDeviceNodes(
                 result.literals += 1;
             },
             .view => {
-                if (!@import("owned_alias.zig").denseActivation(pool, slot, target)) {
+                // Transfer proof covers the backing even when the producer
+                // still requires invocation validation.
+                const transfer_view = scope == .provider and slot.roles.transfer_source and
+                    pool.attestsTransferView(slot, size);
+                if (!transfer_view and !@import("owned_alias.zig").denseActivation(pool, slot, target)) {
                     if (@import("antfly_platform").env.getenvBool("TERMITE_GRAPH_PARTITION_REPORT")) {
                         const root = @import("metadata_alias.zig").fullSpanRoot(&pool.plan, slot.node_id, slot.backend);
                         std.debug.print("graph-partition-report alias rejected node={d} op={s} shape={any} root={s}\n", .{

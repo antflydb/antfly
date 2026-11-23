@@ -1028,6 +1028,49 @@ pub const Pool = struct {
         const slot = self.plan.slotForNode(node) orelse return null;
         return if (self.plan.allocationForSlot(slot.id)) |allocation| allocation.id else null;
     }
+    fn isDenseTransferPlane(plane: @import("storage_ownership.zig").Plane, backend: ops.BackendKind, shape: ml.graph.Shape, bytes: u64, epoch: u64) bool {
+        const expected_storage: @FieldType(@TypeOf(plane.descriptor), "storage") = switch (backend) {
+            .native => .host_f32,
+            .cuda => .cuda_buffer,
+            .metal => .metal_buffer,
+            else => return false,
+        };
+        return plane.role == .primary and plane.descriptor.current_backend == backend and
+            plane.descriptor.resident_backend == backend and plane.descriptor.storage == expected_storage and
+            plane.descriptor.shape.eq(shape) and plane.descriptor.quant_format == null and
+            plane.descriptor.view_source == null and @import("metadata_alias.zig").dense(shape, plane.descriptor.strides) and plane.logical_bytes == bytes and
+            plane.readable_bytes == bytes and plane.byte_offset == 0 and plane.storage_epoch == epoch;
+    }
+
+    pub fn attestsTransferView(self: *const Pool, slot: buffers.LogicalSlot, bytes: u64) bool {
+        const selected = if (self.selection) |*value| value else return false;
+        if (slot.kind != .view or slot.roles.graph_output) return false;
+        const aliases = @import("metadata_alias.zig");
+        var view = slot;
+        var depth: usize = 0;
+        while (view.kind == .view) : (depth += 1) {
+            if (depth >= self.plan.slots.len or view.node_id >= selected.plane_counts.len or
+                selected.plane_counts[view.node_id] != 1 or view.backend != slot.backend) return false;
+            const index = selected.enabledAliasIndex(view.node_id) orelse return false;
+            if (index >= self.metadata_aliases.len) return false;
+            const alias = self.metadata_aliases[index];
+            const parent_id = view.source_slot orelse return false;
+            if (parent_id >= self.plan.slots.len) return false;
+            const parent = self.plan.slots[parent_id];
+            if (parent.backend != slot.backend or parent.allocation != view.allocation or alias.source != parent.node_id or
+                parent.node_id >= selected.plane_counts.len or selected.plane_counts[parent.node_id] == 0) return false;
+            const expected = alias.apply(selected.planes[parent.node_id][0]) orelse return false;
+            if (!std.meta.eql(expected, selected.planes[view.node_id][0])) return false;
+            view = parent;
+        }
+        if (view.kind != .allocation and view.kind != .constant) return false;
+        const root_bytes = aliases.logicalBytes(view.desc.shape) orelse return false;
+        if (!isDenseTransferPlane(selected.planes[view.node_id][0], slot.backend, view.desc.shape, root_bytes, selected.epoch)) return false;
+        const output = selected.planes[slot.node_id][0];
+        return aliases.dense(slot.desc.shape, output.descriptor.strides) and output.logical_bytes == bytes and
+            output.readable_bytes == bytes and output.byte_offset <= root_bytes and bytes <= root_bytes - output.byte_offset;
+    }
+
     /// Check that every cross-provider edge binds a dedicated destination
     /// bank and can read the selected producer without materializing storage
     /// outside the physical plan. Executing an admitted schedule also requires
@@ -1053,29 +1096,16 @@ pub const Pool = struct {
             const allocation = self.plan.allocationById(edge.allocation) orelse return false;
             if (allocation.kind != .transfer or allocation.reusable or allocation.backend != target.kind() or
                 allocation.byte_size < edge.byte_size or
-                destination.descriptor.current_backend != target.kind() or destination.descriptor.resident_backend != target.kind() or
-                !destination.descriptor.shape.eq(shape) or destination.logical_bytes != edge.byte_size or
-                destination.readable_bytes != edge.byte_size or destination.storage_epoch != selected.epoch) return false;
+                !isDenseTransferPlane(destination, target.kind(), shape, edge.byte_size, selected.epoch)) return false;
             switch (slot.kind) {
                 .allocation, .constant => {
                     if (edge.source_node >= selected.plane_counts.len or selected.plane_counts[edge.source_node] == 0) return false;
                     const primary = selected.planes[edge.source_node][0];
-                    if (primary.role != .primary or primary.descriptor.current_backend != source.kind() or
-                        primary.descriptor.resident_backend != source.kind() or !primary.descriptor.shape.eq(shape) or
-                        primary.descriptor.quant_format != null or primary.descriptor.view_source != null or
-                        primary.logical_bytes != edge.byte_size or primary.readable_bytes != edge.byte_size or primary.byte_offset != 0) return false;
-                    const expected_storage: @FieldType(@TypeOf(primary.descriptor), "storage") = switch (source.kind()) {
-                        .native => .host_f32,
-                        .cuda => .cuda_buffer,
-                        .metal => .metal_buffer,
-                        else => return false,
-                    };
-                    if (primary.descriptor.storage != expected_storage) return false;
+                    if (!isDenseTransferPlane(primary, source.kind(), shape, edge.byte_size, selected.epoch)) return false;
                 },
-                // These sources have separate dynamic ownership contracts.
-                // Their proof must describe the exact view or ingress backing
-                // that the transfer callback will observe.
-                .runtime_input, .view => return false,
+                .view => if (!self.attestsTransferView(slot.*, edge.byte_size)) return false,
+                // Runtime ingress must attest the backing of the actual input.
+                .runtime_input => return false,
             }
         }
         return true;
@@ -5494,8 +5524,10 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     const shape = ml.graph.Shape.init(.f32, &.{4});
     const literal = try builder.tensorConst(&.{ 1, -2, 3, -4 }, shape);
     const producer = try builder.neg(literal);
-    const on_device = try builder.absOp(producer);
-    const on_host = try builder.neg(on_device);
+    const upload = try builder.reshape(producer, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    const on_device = try builder.absOp(upload);
+    const download = try builder.reshape(on_device, shape);
+    const on_host = try builder.neg(download);
     const output = try builder.absOp(on_host);
     try graph.markOutput(output);
     const reached = try @import("../graph/interpreter.zig").computeReachable(a, &graph);
@@ -5506,16 +5538,16 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     var native = Native.initBorrowed(a, &graph, &host);
     const native_executor = native.partitionExecutor();
     var parts = [_]partition.Partition{
-        .{ .backend = .native, .node_ids = &.{ literal, producer }, .external_inputs = &.{}, .executor = native_executor },
-        .{ .backend = target_kind, .node_ids = &.{on_device}, .external_inputs = &.{.{ .node_id = producer, .source_partition = 0 }} },
-        .{ .backend = .native, .node_ids = &.{on_host}, .external_inputs = &.{.{ .node_id = on_device, .source_partition = 1 }}, .executor = native_executor },
+        .{ .backend = .native, .node_ids = &.{ literal, producer, upload }, .external_inputs = &.{}, .executor = native_executor },
+        .{ .backend = target_kind, .node_ids = &.{ on_device, download }, .external_inputs = &.{.{ .node_id = upload, .source_partition = 0 }} },
+        .{ .backend = .native, .node_ids = &.{on_host}, .external_inputs = &.{.{ .node_id = download, .source_partition = 1 }}, .executor = native_executor },
         .{ .backend = target_kind, .node_ids = &.{output}, .external_inputs = &.{.{ .node_id = on_host, .source_partition = 2 }} },
     };
     const placement: partition.PartitionPlan = .{
         .allocator = a,
         .partitions = &parts,
-        .node_assignment = &.{ 0, 0, 1, 2, 3 },
-        .node_operator_plans = &.{ null, null, null, null, null },
+        .node_assignment = &.{ 0, 0, 0, 1, 1, 2, 3 },
+        .node_operator_plans = &.{ null, null, null, null, null, null, null },
         .owns_executors = false,
     };
     var layout = try buffers.build(a, &graph, &placement, .{});
@@ -5534,10 +5566,18 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     const routes = (try root.prepareRoutes(&.{})) orelse return error.MissingPreparedKernelRoute;
     defer routes.release();
     try std.testing.expect(routes.pool.attestsOwnedTransfers(reached));
+    {
+        const destination = &routes.pool.selection.?.transfer_planes[0].?;
+        const original = destination.*;
+        defer destination.* = original;
+        destination.byte_offset = 4;
+        try std.testing.expect(!routes.pool.attestsOwnedTransfers(reached));
+    }
     try std.testing.expectEqual(.complete, std.meta.activeTag(routes.pool.payload_coverage));
     const proof = routes.pool.completeOwnedPayload() orelse return error.MissingOwnedPayloadWitness;
     try std.testing.expectEqual(@as(usize, 4), proof.operations);
     try std.testing.expectEqual(@as(usize, 1), proof.literals);
+    try std.testing.expectEqual(@as(usize, 2), proof.aliases);
 
     const multi = @import("../graph/multi_executor.zig");
     const device = @import("../graph/device_mesh.zig");
