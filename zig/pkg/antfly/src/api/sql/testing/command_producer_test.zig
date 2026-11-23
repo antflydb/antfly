@@ -52,6 +52,7 @@ const Native = struct {
     scope_reads: usize = 0,
     failure: ?enum { admit, prepare, commit, handoff, ack, cancel } = null,
     fail_before: bool = false,
+    block_ack: bool = false,
     block_cancel: bool = false,
     cancel_on_block: ?*std.atomic.Value(bool) = null,
     original_admissions: usize = 0,
@@ -88,6 +89,10 @@ const Native = struct {
                         else => null,
                     },
                 };
+                if (point == .ack and self.block_ack) {
+                    if (self.cancel_on_block) |signal| signal.store(true, .release);
+                    return error.MetadataMutationOutcomeUnknown;
+                }
                 const lose = point != null and point == self.failure;
                 if (lose) self.failure = null;
                 if (lose and self.fail_before) return error.MetadataMutationOutcomeUnknown;
@@ -657,7 +662,16 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                 defer runtime.deinit();
                 var server = @import("../../http_server.zig").ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &durable, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &native, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
                 defer server.deinit();
+                var canceled: std.atomic.Value(bool) = .init(false);
                 if (phase_index == 0) {
+                    if (fault == .ack and before) {
+                        native.block_ack = true;
+                        native.cancel_on_block = &canceled;
+                        native.wire_epoch = instance;
+                        native.durable_http = true;
+                        native.connection_expiry_ms = 3600001;
+                        native.database = "default";
+                    }
                     try setup(&metadata, &durable, true, &native);
                     try native.until(&durable, .idle, 2);
                     const ticket = try begin(&native, &durable, 60);
@@ -674,10 +688,10 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                     native.failure = fault;
                     native.fail_before = before;
                     var user: ?@import("../../http_server.zig").AuthenticatedIdentity = null;
-                    var owner: @import("../session/session.zig").Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence } };
+                    var owner: @import("../session/session.zig").Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence, .cancellation = .fromAtomic(&canceled) } };
                     const result = try @import("../session/session.zig").Coordinator.commit(&owner, .{ .principal = "alice", .database = "default", .namespace = "public" }, try fixtureMutation(&server.txn_sessions, txn_id));
                     try std.testing.expectEqualDeep(txn_id, result.reconciliation_id);
-                    try std.testing.expect(result.outcome == .committed or result.outcome == .aborted or result.outcome == .unknown);
+                    try std.testing.expect(result.outcome == .committed or result.outcome == .aborted or result.outcome == .unknown or (native.block_ack and result.outcome == .committed_pending));
                     if (fault == null) try std.testing.expectEqual(.committed, result.outcome);
                     var durable_result = (try durable.load(txn_id)).?;
                     defer durable_result.deinit(a);
@@ -696,6 +710,41 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                     defer region.deinit();
                     var owner: coordinator.Registry = .{ .server = &server, .context = .{}, .database_id = 1 };
                     var cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
+                    if (phase_index == 1 and fault == .ack and before) {
+                        native.serial = 50000;
+                        try std.testing.expectEqual(@as(usize, 1), cut.receipts.len);
+                        try std.testing.expectEqual(.committed, cut.receipts[0].status);
+                        try native.until(&durable, .retired, 1001);
+                        var logical = try connections.loadReconciled(&durable, &server.txn_sessions, a, connection, "alice", 0, 1001);
+                        defer logical.deinit();
+                        try std.testing.expectEqual(.idle, logical.value.state);
+                        var ingress: IngressRuntime = .{ .native = &native, .now_ms = 1001 };
+                        const controller: @import("../session/command_execution.zig").Controller = .{
+                            .store = &durable,
+                            .connection = connection,
+                            .principal = "alice",
+                            .actor = actor,
+                            .instance = id(991),
+                            .node = 0,
+                            .standalone = true,
+                            .port = .{ .ptr = &ingress, .call = IngressRuntime.call },
+                            .runtime = ingress.runtime(),
+                        };
+                        try controller.enroll(a, "default");
+                        var successor = (try producer.load(&durable, a, connection)).?;
+                        defer successor.deinit();
+                        var before_ack = try native.port().snapshot(a, successor.value);
+                        defer before_ack.deinit();
+                        var seal = try std.json.parseFromSlice(transactions.ExternalPreparationSeal, a, bytes.external_preparation.?, .{});
+                        defer seal.deinit();
+                        try owner.acknowledgeReceipt(region.allocator(), seal.value.identity);
+                        var after_ack = try native.port().snapshot(a, successor.value);
+                        defer after_ack.deinit();
+                        try std.testing.expectEqualDeep(before_ack.value.scope, after_ack.value.scope);
+                        try std.testing.expectEqualDeep(before_ack.value.owner, after_ack.value.owner);
+                        cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
+                        try std.testing.expectEqual(@as(usize, 0), cut.receipts.len);
+                    }
                     if (cut.records.len == 1 and cut.records[0].phase == .preparing) {
                         // Interrupted preparation may abort, but can never be
                         // promoted to a commit without its durable prepare cut.

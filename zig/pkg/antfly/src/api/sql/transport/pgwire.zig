@@ -2587,7 +2587,7 @@ const OwnedRead = struct {
         self.decision_runtime = try self.native_adapter.decisionRuntime();
         errdefer if (self.decision_runtime) |*active| active.deinit();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
-        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
+        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard, .allow_revision_advance = request.expected_stream_columns != null and plainTableProjection(plan.compiled()) };
         try self.guarded.indexLargeGuard(arena);
         const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
         self.native_adapter.graph_parameters = parameters;
@@ -2599,7 +2599,7 @@ const OwnedRead = struct {
         stream_backend.setting_capture = try self.guarded.settingCapture(arena, &self.native_adapter, plan.compiled());
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
-        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision, .lease_epoch = tenure, .expected_columns = request.expected_stream_columns };
+        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision, .lease_epoch = tenure, .expected_columns = request.expected_stream_columns, .expected_tables = if (self.guarded.allow_revision_advance) self.guarded.expected_guard else null };
         if (plan.compiled().statement == .select) opening.install(&stream_backend);
         const opened = try Pull.Stream.openOwned(try @import("../execution/memory_owner.zig").create(adapter.server.alloc, alloc, adapter.server.shared_resource_manager orelse &adapter.server.local_resource_manager), stream_backend, plan.compiled(), parameters, .{ .result_rows = if (plan.compiled().statement == .copy_to) std.math.maxInt(usize) else request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
@@ -2942,6 +2942,22 @@ const OwnedRead = struct {
 
 const ReadRevision = struct { grants: u64, token: u64 };
 
+// Direct projections have no independently rebound expressions.
+fn plainTableProjection(compiled: *const compiler.Compiled) bool {
+    if (compiled.statement != .select or compiled.parameter_count != 0 or compiled.uses_current_setting) return false;
+    const select = compiled.statement.select;
+    if (select.source) |source| {
+        if (source.* != .table or source.table.search != null or source.table.graph != null or source.table.graph_search != null) return false;
+    } else if (select.table == null) return false;
+    if (select.ctes.len != 0 or select.values_arms.len != 0 or select.set_operation != null or
+        select.predicate != null or select.having != null or select.count_all or select.distinct != null or
+        select.windows.len != 0 or select.group_by.len != 0 or select.order_by.len != 0 or select.locking != null) return false;
+    for (select.columns) |column| {
+        if (column.expression) |expression| if (expression.* != .column) return false;
+    }
+    return true;
+}
+
 // Capture the exact executable binding before either kind of reader can touch
 // rows. Preserve existing after-write receipt validation on the same binding.
 const CursorAdmission = struct {
@@ -2952,6 +2968,7 @@ const CursorAdmission = struct {
     admitted: ReadRevision,
     lease_epoch: ?u128,
     expected_columns: ?[]const wire.Column = null,
+    expected_tables: ?[]const u8 = null,
     previous: @FieldType(catalog.Backend, "execution_binding_validator") = null,
     captured: ?RetainedRead = null,
 
@@ -2963,6 +2980,14 @@ const CursorAdmission = struct {
     fn capture(raw: *anyopaque, scratch: std.mem.Allocator, binding: describe_sql.BoundStatement) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.previous) |validator| try validator.validate(validator.ptr, scratch, binding);
+        if (self.expected_tables) |expected| {
+            const revision = self.native.revision orelse return error.CatalogGenerationChanged;
+            if (revision != std.mem.readInt(u64, expected[0..8], .little)) {
+                const current = (try statementBindingGuard(scratch, revision, binding)) orelse return error.CatalogGenerationChanged;
+                defer scratch.free(current);
+                if (!std.mem.eql(u8, expected[8..], current[8..])) return error.CatalogGenerationChanged;
+            }
+        }
         if (self.expected_columns) |expected| {
             if (expected.len != binding.columns.len) return error.CachedPlanResultTypeChanged;
             for (expected, binding.columns) |column, current| {
@@ -4283,14 +4308,20 @@ const GuardedCatalog = struct {
     authority: *Authority,
     revision: *const ?u64,
     expected_guard: ?[]const u8,
+    allow_revision_advance: bool = false,
     probe: ?*DescriptionProbe = null,
     indexed_entries: BindingEntries = .empty,
 
     fn indexLargeGuard(self: *GuardedCatalog, a: std.mem.Allocator) !void {
         const envelope = self.expected_guard orelse return;
-        const bytes = (try splitBinding(envelope)).targets;
+        const bound = try splitBinding(envelope);
+        const bytes = bound.targets;
         self.expected_guard = bytes;
-        if (@import("../catalog/ddl_binding.zig").Guard.isDdl(bytes) or std.mem.startsWith(u8, bytes, view_binding_magic)) return;
+        if (bound.incarnation == null) self.allow_revision_advance = false;
+        if (@import("../catalog/ddl_binding.zig").Guard.isDdl(bytes) or std.mem.startsWith(u8, bytes, view_binding_magic)) {
+            self.allow_revision_advance = false;
+            return;
+        }
         var targets = try GuardTargets.init(bytes);
         if (targets.count <= 8) return;
         errdefer self.indexed_entries.deinit(a);
@@ -4303,7 +4334,10 @@ const GuardedCatalog = struct {
     fn verify(self: *GuardedCatalog, table: catalog.Table) !void {
         const bytes = self.expected_guard orelse return;
         if (std.mem.startsWith(u8, bytes, view_binding_magic) or @import("../catalog/ddl_binding.zig").Guard.isDdl(bytes)) return;
-        const revision = self.revision.* orelse (table.scope orelse return error.InvalidSqlBackendResponse).revision;
+        const revision = if (self.allow_revision_advance)
+            std.mem.readInt(u64, bytes[0..8], .little)
+        else
+            self.revision.* orelse (table.scope orelse return error.InvalidSqlBackendResponse).revision;
         if (self.indexed_entries.count() == 0) return verifyBindingGuard(bytes, revision, table);
         if (std.mem.readInt(u64, bytes[0..8], .little) != revision or !self.indexed_entries.contains(BindingEntry.of(table))) return error.CatalogGenerationChanged;
     }
@@ -5958,8 +5992,8 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
             if (tag == 'D') rows += 1;
         }
         try std.testing.expectEqual(@as(usize, 1), rows);
-        try std.testing.expectEqual(@as(usize, 2 + @as(usize, @intFromBool(change)) + @as(usize, @intFromBool(!guarded))), source.catalog_stamp_reads.load(.monotonic));
-        try std.testing.expectEqual(@as(usize, if (change and guarded) 2 else 1), Frames.admission_attempts);
+        try std.testing.expectEqual(@as(usize, if (guarded) 2 else if (change) 4 else 3), source.catalog_stamp_reads.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 1), Frames.admission_attempts);
         const catalog_calls = source.catalog_reads.load(.monotonic);
         if (!guarded) baseline[scenario] = catalog_calls else if (!change) {
             try std.testing.expectEqual(baseline[scenario] - 1, catalog_calls);
