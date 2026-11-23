@@ -6614,8 +6614,12 @@ pub const CudaCompute = struct {
             if (dim < 0) return error.InvalidShape;
             count = try std.math.mul(usize, count, @intCast(dim));
         }
-        const bytes = try dtype.byteCount(count);
-        const device = try allocDeviceBuffer(self, bytes);
+        return self.createEmbeddingGemma2TensorWithBacking(shape, count, dtype, try dtype.byteCount(count));
+    }
+
+    fn createEmbeddingGemma2TensorWithBacking(self: *CudaCompute, shape: []const i64, count: usize, dtype: tensor_mod.DType, backing_bytes: usize) !CT {
+        if (backing_bytes < try dtype.byteCount(count)) return error.InvalidShape;
+        const device = try allocDeviceBuffer(self, backing_bytes);
         errdefer {
             var owned = device;
             releaseDeviceBuffer(self, &owned);
@@ -20727,10 +20731,13 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     var execution_scope = if (replay) null else try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
     if (capture) try SourceLinearTemporary.validateArenaCapture(self, &execution_scope.?);
-    const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
+    // Eager execution can bind the final write even when the learned
+    // allocation has padding. The shape and element count stay logical.
+    const published_directly = !replay and !capture;
+    const backing_bytes = if (published_directly) output.bytes else output_bytes;
+    const out = try self.createEmbeddingGemma2TensorWithBacking(first_input.shape, first_input.elem_count, .f32, backing_bytes);
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
-    const published_directly = !replay and !capture and output.bytes == output_bytes;
     const output_bank = if (published_directly) tensorFromCt(out).buffer else if (storage.external_output) arena.buffers[1] else try audioBufferView(arena.buffers[0], output.offset, output.bytes);
     if (published_directly or storage.external_output) {
         if (execution_scope) |*scope| try scope.bindPublishedOutput(output_bank.ptr, output.bytes);
@@ -20815,11 +20822,12 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         observation.cudaAudioResult(.recorded_and_launched);
     } else if (replay) {
         observation.cudaAudioResult(.replayed);
-    } else if (published_directly) {
-        observation.cudaAudioResult(.eager_assigned);
     } else {
-        observation.cudaAudioResult(.eager_copied);
+        observation.cudaAudioResult(.eager_assigned);
     }
+    // Report the logical tensor extent to callers. The allocation ledger and
+    // temp pool still recover the full backing size from the buffer token.
+    tensorFromCt(out).buffer.len = output_bytes;
     self.audio_arena_executes += 1;
     out_owned = false;
     return out;
