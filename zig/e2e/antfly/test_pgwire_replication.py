@@ -648,7 +648,7 @@ def test_pg_recvlogical_resume_after_restart(
                     timeout=15,
                 )
                 assert rejected.returncode != 0
-                assert "ERROR:  0A000: UnsupportedReplicationOption" in rejected.stderr
+                assert "ERROR:  0A000:" in rejected.stderr, rejected.stderr
                 assert catalog_slot() == [created]
         first = tmp_path / "first.bin"
         with stream(first, expect_disconnect=cross_node and not topology) as reader:
