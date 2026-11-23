@@ -106,11 +106,18 @@ pub fn recover(
     if (current.committed.sequence != current.accepted.sequence) {
         const worker: Completion = .{ .recovery = admission.coordinator.recovery };
         if (try worker.run(a, current, current.accepted.reference, fence, context) != .complete) {
-            // Routine propagation can span several rounds. Once the original
-            // attempt is old enough, publish an unresolved recovery error.
-            const now = @import("antfly_platform").time.realtimeNs();
-            if (now -| manifest.begin_timestamp >= 30 * std.time.ns_per_s)
-                return error.SourceOutcomeUnresolved;
+            if (current.closing) return;
+            const now = @max(1, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            if (current.completion_wait_since_ms) |since| {
+                if (now -| since < source.completion_wait_timeout_ms) return;
+                if (current.stream_failure) |failure| {
+                    if (failure.terminal or std.mem.eql(u8, failure.code, source.completion_wait_error)) return;
+                }
+            }
+            mutate(svc, a, binding, catalog_digest, current, .{ .observe_completion_wait = now }, context) catch |err| switch (err) {
+                error.TableTopologyProtocolUpgradeRequired => {},
+                else => return err,
+            };
             return;
         }
         const reference = try std.fmt.allocPrint(a, "{x}:{d}", .{ &manifest.admission_digest, manifest.commit_version });

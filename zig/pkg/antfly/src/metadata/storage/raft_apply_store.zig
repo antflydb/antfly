@@ -16135,7 +16135,7 @@ pub const RaftApplyStore = struct {
             if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
         } else if ((write.mutation != .configure and write.mutation != .begin_legacy_handover) or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
         switch (write.mutation) {
-            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages, .begin_legacy_handover, .observe_stream_failure => {
+            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages, .begin_legacy_handover, .observe_stream_failure, .observe_completion_wait => {
                 const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return,
@@ -16268,7 +16268,7 @@ pub const RaftApplyStore = struct {
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         if (next.native_bootstrap_checkpoint != null and
             (next.accepted.sequence != state.accepted.sequence or next.committed.sequence != state.committed.sequence or
-                next.closing != state.closing or next.retired != state.retired or write.mutation == .observe_stream_failure))
+                next.closing != state.closing or next.retired != state.retired or write.mutation == .observe_stream_failure or write.mutation == .observe_completion_wait))
         {
             self.notifyProjectionListeners(.{
                 .kind = .replication_source_status,

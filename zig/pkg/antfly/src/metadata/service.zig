@@ -11570,9 +11570,10 @@ pub const MetadataHttpService = struct {
         const control = @import("source_control.zig");
         const scope = state.scope orelse return;
         var reporting = context;
-        // Reporting has its own bounded budget, while retaining cancellation.
-        reporting.deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s;
-        reporting.deadline_io = null;
+        // Reporting shares the caller's round deadline and cancellation.
+        reporting = try reporting.platformDeadline();
+        const report_limit = platform_time.monotonicNs() +| std.time.ns_per_s;
+        reporting.deadline_ns = @min(reporting.deadline_ns orelse report_limit, report_limit);
         try ensureCdcWorkPermit(self);
         const raw = try control.readOnService(self, a, scope.table_id, scope.source_id, reporting);
         defer a.free(raw);

@@ -190,7 +190,8 @@ pub const iceberg_acceptance_status_version: u16 = 132;
 /// Version 136 retires absent public feed roots with catalog authority.
 /// Version 137 transfers a qualified legacy checkpoint into fenced source control.
 /// Version 138 persists scoped PostgreSQL stream health within the actor revision.
-pub const current_version: u16 = @import("source_control.zig").scoped_stream_lifecycle_protocol_version;
+/// Version 139 tracks scoped completion wait independently of plan creation.
+pub const current_version: u16 = @import("source_control.zig").scoped_completion_health_protocol_version;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

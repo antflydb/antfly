@@ -542,12 +542,27 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
         fn boundedPage(self: *Self, a: A, state: control.State, selector: control.Table, next: CommittedGroup, start: control.Position, bound: ?control.Position, limits: delivery.Limits, request: Context) !Page {
             const batch = next.indexed.committed.group.batch;
             const from = start.event / 2;
-            const stop = if (bound) |target|
+            var stop = if (bound) |target|
                 if (target.sequence == start.sequence) target.event / 2 else batch.changes.len
             else
                 @min(batch.changes.len, @as(usize, from) + @min(limits.events, 64));
             if (from > stop or stop > batch.changes.len or stop - from > 64)
                 return error.ChangefeedResynchronizationRequired;
+            while (true) {
+                const rendered = self.boundedPageWindow(a, state, selector, next, start, from, stop, bound != null, limits, request) catch |err| switch (err) {
+                    error.IcebergChangefeedImageBudgetExceeded => {
+                        if (bound != null or stop - from <= 1) return error.ChangefeedBackpressure;
+                        stop = from + (stop - from) / 2;
+                        continue;
+                    },
+                    else => return err,
+                };
+                return rendered;
+            }
+        }
+
+        fn boundedPageWindow(self: *Self, a: A, state: control.State, selector: control.Table, next: CommittedGroup, start: control.Position, from: usize, stop: usize, replaying: bool, limits: delivery.Limits, request: Context) !Page {
+            const batch = next.indexed.committed.group.batch;
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -565,10 +580,16 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 if (entry) |key| try keys.append(scratch, key);
             }
             const prior_images = if (next.indexed.committed.interval.parent) |parent|
-                try cursor.lookupSnapshotRows(scratch, next.before_table.?, parent, self.metadata, batch.key_fields, keys.items, request, self.options)
+                cursor.lookupSnapshotRows(scratch, next.before_table.?, parent, self.metadata, batch.key_fields, keys.items, request, self.options) catch |err| switch (err) {
+                    error.IcebergChangefeedImageBudgetExceeded => if (replaying or stop - from == 1) null else return err,
+                    else => return err,
+                }
             else
                 null;
-            const committed_images = try cursor.lookupSnapshotRows(scratch, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, keys.items, request, self.options);
+            const committed_images = cursor.lookupSnapshotRows(scratch, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, keys.items, request, self.options) catch |err| switch (err) {
+                error.IcebergChangefeedImageBudgetExceeded => if (replaying or stop - from == 1) null else return err,
+                else => return err,
+            };
 
             var events: std.ArrayList(wire_json.Raw) = .empty;
             var occupied = overhead;
@@ -607,13 +628,13 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 const total = occupied +| bytes +| @as(u64, @intFromBool(events.items.len != 0));
                 if (total > limits.bytes or events.items.len == limits.events) {
                     if (ordinal == from and overhead +| bytes > delivery.max_page_bytes) return error.ChangefeedEventTooLarge;
-                    if (bound != null or ordinal == from) return error.ChangefeedBackpressure;
+                    if (replaying or ordinal == from) return error.ChangefeedBackpressure;
                     break;
                 }
                 try events.append(scratch, .{ .value = try std.json.Stringify.valueAlloc(scratch, event, .{}) });
                 occupied = total;
             }
-            if (bound != null and ordinal != stop) return error.ChangefeedBackpressure;
+            if (replaying and ordinal != stop) return error.ChangefeedBackpressure;
             const complete = ordinal == batch.changes.len;
             const visible = start.event % 2 != 0 or events.items.len != 0;
             const next_offset = @as(u32, @intCast(ordinal * 2)) + @intFromBool(visible);

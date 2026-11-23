@@ -150,7 +150,7 @@ pub fn lookupSnapshotRows(
             const index = indexes.get(identity) orelse return null;
             if (result[index] != null) return error.InvalidLakeKey;
             retained_bytes +|= try json.size(row.value);
-            if (retained_bytes > @import("../metadata/changefeed_delivery.zig").max_page_bytes) return null;
+            if (retained_bytes > @import("../metadata/changefeed_delivery.zig").max_page_bytes) return error.IcebergChangefeedImageBudgetExceeded;
             result[index] = try sources.api_json_helpers.cloneJsonValue(a, row.value);
         }
         if (page.after == null) break;
