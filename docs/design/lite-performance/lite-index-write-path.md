@@ -36,7 +36,7 @@ every index type's write path:
   rewrites global counters and a read-generation key; algebraic rewrites
   aggregate rows, whole HLL sketches and an `applied_generation` key. Each is
   serialized, and several are hot keys every writer contends on.
-- **A full reopen per foreign commit** (writes until stage 4). `lite_connection.zig` `refreshImpl`
+- **A full reopen per foreign commit** (still, for writes). `lite_connection.zig` `refreshImpl`
   reopens the runtime whenever another process committed; every index is then
   rebuilt from the catalog (the native-catalog backend mirrors whole scopes in
   memory: HBC nodes, sparse postings, graph adjacency). In process mode this
@@ -232,24 +232,31 @@ doc map, as full-text has) before it pays.
    flusher; per-transaction hot-key writes removed. Full-text level-0
    records are folded by ordinary merges, which check each input at the
    tip (`l0/` present) rather than in this process's mirror.
-4. Incremental cross-process refresh. Done for reads and writes of document
-   rows, full-text and sparse indexes: after another process commits, a
-   runtime catches up in place instead of reopening.
+4. Incremental cross-process refresh. Done for reads of document rows,
+   full-text and sparse indexes: after another process commits, a read
+   catches its runtime up in place instead of reopening.
    `refreshCrossProcessRedoOverlay` adopts the page bound other writers raised
-   (`SharedRedoOverlay.pageBoundThrough`). A write needs nothing more from the
-   allocator, which rebuilds from the checkpoint's free map, and only a fold
-   (which reopens) changes that. The replay sequence and redo tail resync from
-   the file once its adoption epoch moves. Index workers are raised to the
+   (`SharedRedoOverlay.pageBoundThrough`). Index workers are raised to the
    durable progress other processes recorded (`raiseWorkersToDurableProgress`),
-   as a reopen would start them. Without that, a worker replayed another
-   process's already-applied records and revived versions they had
-   overwritten: the stale results an earlier attempt saw. The revival itself
-   came from merges: a replay published a second copy of a version already
-   in the dead set, and a merge that dropped one copy pruned the version from
-   the dead set while the other copy still carried it. A replay now skips
-   every copy whose version the tip already covers
-   (`PersistentIndex.versionCoveredAtTip`), so a version lives in one segment
-   and pruning stays safe.
+   as a reopen would start them.
+   A write still reopens after another process's commit
+   (`Owner.writer_reopen_pending`). Letting it refresh in place works: the
+   allocator rebuilds from the checkpoint's free map, which only a fold (a
+   reopen) changes, and the replay sequence and redo tail resync once the
+   adoption epoch moves. But in ReleaseFast it measured no faster across
+   processes (about 500 vs 550 writes/s), and sparse halved (580 vs 1,160),
+   because a sparse refresh reloads the whole mirror. It waits for refreshes
+   that apply only the changed records.
+   Two bugs it exposed are fixed for every path. First, a worker behind
+   durable progress replayed records another process had already applied and
+   published a second copy of a version already in the dead set; a merge that
+   dropped one copy then pruned the version while the other copy still
+   carried it, reviving overwritten text. A replay now skips every copy whose
+   version the tip already covers (`PersistentIndex.versionCoveredAtTip`), so
+   a version lives in one segment and pruning stays safe. Second, a merge on
+   another thread waited for the writer lease held by a producer blocked on
+   that merge's admission; a blocked producer now lends its lease to its
+   runtime's merges (`text_merge_runtime.mergeMayUseLeaseOf`).
    Releasing the writer lease before the durability wait is not possible as
    built: the group leader stages commit participants (full-text `stage`)
    inside `Ticket.wait`, so the waiting writer can be the one publishing.

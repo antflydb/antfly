@@ -1382,12 +1382,12 @@ pub const WriterLane = struct {
                 // `likely_root` runs under it, and `collectRetired` frees an
                 // unpinned root.
                 connection.gate.mutex.lockUncancelable(io);
-                // A maintenance turn's forwarded writes and another process's
-                // commits leave the serving runtime's caches (its replay
+                // A maintenance turn's forwarded writes and a read's in-place
+                // refresh leave the serving runtime's caches (its replay
                 // sequence among them) behind the file: only `refresh`
                 // reconciles them.
                 const take_fast_path = likely_root != null and likely_root == connection.owner.current and
-                    !connection.owner.foreground_runtime_stale and
+                    !connection.owner.foreground_runtime_stale and !connection.owner.writer_reopen_pending and
                     likely_root.?.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch() == likely_root.?.lite_refresh_adoption_epoch and
                     likely_root.?.immutable_query_borrows == 0 and
                     !mightNeedRefreshAdmission(connection, likely_root.?, intent);
@@ -2414,6 +2414,9 @@ pub const Owner = struct {
     /// `test_background_turn_count == 0`, a delta here is wholly
     /// attributable to the calling writes themselves.
     test_refresh_count: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
+    /// A read refreshed `current` in place after other writers' commits; the
+    /// next refresh under writer authority reopens it.
+    writer_reopen_pending: bool = false,
     /// Refreshes `refreshInPlace` served without reopening the runtime.
     test_in_place_refresh_count: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
     /// Per-owner, test-local running total of `native.NativeFile.
@@ -2562,6 +2565,8 @@ pub const Owner = struct {
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
             if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
+            // A read refreshed this runtime in place; a write reopens it.
+            if (!fast_only and self.writer_reopen_pending) self.foreground_runtime_stale = true;
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const maintenance_references_clear = current.maintenance_references == 0 or
                 (current == self.maintenance_turn_root and current.maintenance_references == 1);
@@ -2658,17 +2663,17 @@ pub const Owner = struct {
                 return current;
             }
             // Other processes' redo-only commits that changed document rows
-            // and full-text index records: catch this runtime up in place, for
-            // a read without the writer lease. A write can use it too: the
-            // allocator rebuilds from the free map, which only a fold (a
-            // reopen here) changes; the replay sequence and redo tail resync
-            // from the file once its adoption epoch moves; index workers are
-            // raised to durable progress (`raiseWorkersToDurableProgress`).
-            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and
+            // and full-text index records: a read catches this runtime up in
+            // place, without the writer lease. Writes still reopen: in
+            // ReleaseFast, refreshing a writer in place measured no faster
+            // across processes and about half as fast for sparse, whose
+            // refresh reloads its whole mirror (lite-index-write-path.md).
+            if (fast_only and !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and
                 !needsOutcomeReconciliation(current) and file.redo != null and
                 try refreshInPlace(current, file, probe))
             {
                 if (comptime h.builtin.is_test) _ = self.test_in_place_refresh_count.fetchAdd(1, .release);
+                self.writer_reopen_pending = true;
                 try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
                 for (self.connections.items) |connection| {
                     for (connection.table_handles.items) |id| {
@@ -2804,6 +2809,7 @@ pub const Owner = struct {
         // may still be draining when it is replaced (W5).
         if (self.current) |outgoing| if (outgoing.owned_lite_backend.?.native_docstore) |outgoing_store| outgoing_store.ensureDurableForReuse();
         self.foreground_runtime_stale = false;
+        self.writer_reopen_pending = false;
         replacement.lite_refresh_adoption_epoch = replacement.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
         replacement.lite_runtime_sequence = replacement.owned_lite_backend.?.native_docstore.?.file.committedSequence();
         self.installStoreHooks(replacement);
@@ -8923,11 +8929,9 @@ test "capi native separate writer processes refresh full-text in place" {
     try std.testing.expect(!try Search.found(id, "parentfirst", "\"doc-0\""));
     try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > in_place_before);
     try std.testing.expect(owner.current.? == runtime_before);
-    // This runtime still writes, without reopening, and its write supersedes
-    // the child's. Its index workers start from the child's durable progress:
-    // replaying the child's records again revived versions they overwrote.
+    // This runtime still writes, and its write supersedes the child's. No
+    // version the child overwrote comes back.
     try Search.write(id, "doc-0", "parentagain");
-    try std.testing.expect(owner.current.? == runtime_before);
     try std.testing.expect(try Search.found(id, "parentagain", "\"doc-0\""));
     try std.testing.expect(!try Search.found(id, "childwrote6", "\"doc-0\""));
     try std.testing.expect(!try Search.found(id, "childwrote4", "\"doc-0\""));
