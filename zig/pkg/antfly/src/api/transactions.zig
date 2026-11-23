@@ -10992,6 +10992,7 @@ fn decodeOwnedSealedRecovery(alloc: std.mem.Allocator, id: db_mod.types.TxnId, b
         commit_execution_started: bool = false,
         terminal_abort: bool = false,
         execution_plan: ?[]const u8 = null,
+        external_preparation: ?[]const u8 = null,
         terminal_commit: ?struct {
             status: TerminalCommitStatus,
             coordinator_group_id: ?u64,
@@ -11007,7 +11008,7 @@ fn decodeOwnedSealedRecovery(alloc: std.mem.Allocator, id: db_mod.types.TxnId, b
     defer decoded.deinit();
     const header = decoded.value;
     if (header.session_format != 2 and header.session_format != 3) return error.InvalidTransactionSessionRecord;
-    if ((header.owner_node_id orelse sessionOwnerNodeId(id)) != owner) return null;
+    if ((header.owner_node_id orelse sessionOwnerNodeId(id)) != owner or header.external_preparation != null) return null;
     const plan = header.execution_plan orelse return null;
     if (!header.commit_execution_started) return error.InvalidTransactionSessionRecord;
     const hex = header.commit_body_digest orelse return error.InvalidTransactionSessionRecord;
@@ -12734,7 +12735,11 @@ test "distributed txn stage validation rejects atomically and preserves prior sa
             return error.ForeignKeyParentMissing;
         }
     };
-    try std.testing.expectError(error.ForeignKeyParentMissing, registry.stageValidated(alloc, session_mutation, &request, .{ .ptr = &calls, .validate = Validator.validate }));
+    var rejected = try parseStageWriteRequest(alloc,
+        \\{"table":"docs","key":"b","document":{"id":2}}
+    );
+    defer rejected.deinit(alloc);
+    try std.testing.expectError(error.ForeignKeyParentMissing, registry.stageValidated(alloc, session_mutation, &rejected, .{ .ptr = &calls, .validate = Validator.validate }));
     try std.testing.expectEqual(@as(usize, 1), calls);
     var committed = (try registry.cloneCommitRequest(alloc, session.txn_id, null)).?;
     defer committed.deinit(alloc);

@@ -40631,9 +40631,13 @@ test "distributed txn public commit preparation signs physical participants and 
         fn catalog(_: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             switch (call) {
                 .resolve_many => |request| {
-                    try std.testing.expectEqual(@as(usize, 1), request.storage_names.len);
-                    try std.testing.expectEqualStrings("docs", request.storage_names[0]);
-                    return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 4, .tables = &.{}, .logical_names = &.{"docs"} }, .{});
+                    const resolved = try alloc.alloc(?[]const u8, request.storage_names.len);
+                    defer alloc.free(resolved);
+                    for (request.storage_names, resolved) |name, *logical| {
+                        try std.testing.expectEqualStrings("docs", name);
+                        logical.* = "docs";
+                    }
+                    return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 4, .tables = &.{}, .logical_names = resolved }, .{});
                 },
                 .policy_publication_status => |table_id| {
                     try std.testing.expect(context.row_policy_install_authority);

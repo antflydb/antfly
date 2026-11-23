@@ -10075,7 +10075,11 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
             }
         }
     }
-    var public_batch = try client.fetchBatch(base, "docs", "{\"inserts\":{\"public-row\":{}},\"source_producer\":\"legacy_cdc\"}");
+    var private_batch = try client.fetchBatchResponse(base, "docs", "{\"inserts\":{\"rejected-producer-row\":{}},\"source_producer\":\"legacy_cdc\"}");
+    defer private_batch.deinit(a);
+    try std.testing.expectEqual(@as(u16, 400), private_batch.status);
+    try std.testing.expect(try db.get(a, "rejected-producer-row") == null);
+    var public_batch = try client.fetchBatch(base, "docs", "{\"inserts\":{\"public-row\":{}}}");
     defer public_batch.deinit(a);
     const public_row = (try db.get(a, "public-row")) orelse return error.TestExpectedProducerRow;
     defer a.free(public_row);
