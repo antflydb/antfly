@@ -3363,6 +3363,22 @@ components:
           items:
             type: object
             additionalProperties: true
+        sources:
+          type: array
+          description: Each declared context source with its effective tracking. A ranked query (or a source declared `snapshot`) keeps the artifact `unverified`.
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              kind:
+                type: string
+                enum: [document, query, graph]
+              tracking:
+                type: string
+                enum: [live, snapshot]
+              ranked:
+                type: boolean
         current:
           type: boolean
           description: |
@@ -17598,11 +17614,28 @@ paths:
               $ref: "indexes.yaml#/components/schemas/EnrichmentConfig"
       responses:
         "201":
-          description: Artifact enrichment registered
+          description: |
+            Artifact enrichment registered. With `context_sources`, reports each
+            source's effective tracking (`live` or `snapshot`) and, for a
+            snapshot, the ranking clause that made it one (or `declared`).
           content:
             application/json:
               schema:
                 type: object
+                properties:
+                  context_sources:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        kind:
+                          type: string
+                          enum: [document, query, graph]
+                        tracking:
+                          type: string
+                          enum: [live, snapshot]
+                        reason:
+                          type: string
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":

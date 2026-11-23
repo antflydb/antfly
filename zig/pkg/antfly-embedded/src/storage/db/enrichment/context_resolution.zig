@@ -877,7 +877,7 @@ test "ordered top-N, graph traversal, and snapshot search resolve with exact sub
     var config = try ctx.parsePublicJson(alloc,
         \\{"latest":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}},"order_by":{"field":"at","order":"desc"}},"fields":["title"],"max_documents":2},
         \\ "cites":{"graph":{"graph_index":"refs","edge_types":["cites"],"depth":2},"fields":["title"],"max_documents":10},
-        \\ "solar":{"search":{"text":"solar","text_field":"title","k":5},"fields":["title"],"tracking":"snapshot"}}
+        \\ "solar":{"query":{"text":"solar","text_field":"title","k":5},"fields":["title"]}}
     , "");
     defer config.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -948,9 +948,9 @@ test "snapshot sources run a full bound QueryRequest through the host query engi
     defer tables.deinit();
     for ([_][2][]const u8{ .{ "n1", "{\"title\":\"a solar\"}" }, .{ "n2", "{\"title\":\"b wind\"}" }, .{ "n3", "{\"title\":\"c solar\"}" } }) |r| try tables.put("own", r[0], r[1]);
     var config = try ctx.parsePublicJson(alloc,
-        \\{"hybrid":{"search":{"request":{"semantic_search":{"$source":"/topic"},"indexes":["emb"],
+        \\{"hybrid":{"query":{"semantic_search":{"$source":"/topic"},"indexes":["emb"],
         \\  "full_text_search":{"match":{"$source":"/topic"},"field":"title"},"merge_config":{"strategy":"rrf"},
-        \\  "filter_query":{"field":"lang","term":"en"},"limit":1}},"fields":["title"],"tracking":"snapshot"}}
+        \\  "filter_query":{"field":"lang","term":"en"},"limit":1},"fields":["title"]}}
     , "");
     defer config.deinit();
     try testing.expectEqual(@as(u32, 1), config.sources[0].search.k);
@@ -965,11 +965,11 @@ test "snapshot sources run a full bound QueryRequest through the host query engi
     // Every `$source` was substituted before the host saw the request.
     try testing.expect(std.mem.indexOf(u8, tables.last_request.?, "$source") == null);
     try testing.expect(std.mem.indexOf(u8, tables.last_request.?, "\"match\":\"solar\"") != null);
-    // Requests must be snapshots, and may not page or retarget.
-    try testing.expectError(error.UnsupportedContextPredicate, ctx.parsePublicJson(alloc,
-        \\{"h":{"search":{"request":{"semantic_search":"x"}},"fields":["t"]}}
+    // Ranked queries are snapshots, and may not page or retarget.
+    try testing.expectError(error.ContextSourceRequiresSnapshot, ctx.parsePublicJson(alloc,
+        \\{"h":{"query":{"semantic_search":"x"},"fields":["t"],"tracking":"live"}}
     , ""));
     try testing.expectError(error.UnsupportedContextPredicate, ctx.parsePublicJson(alloc,
-        \\{"h":{"search":{"request":{"semantic_search":"x","offset":10}},"fields":["t"],"tracking":"snapshot"}}
+        \\{"h":{"query":{"semantic_search":"x","offset":10},"fields":["t"]}}
     , ""));
 }

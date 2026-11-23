@@ -191,7 +191,7 @@ def test_cross_table_context_sources_follow_source_changes(
         sync_level="full_index",
     )
 
-    stateful_api.put(
+    registered = stateful_api.put(
         f"/tables/{people}/artifacts/brief/enrichment",
         _enrichment(
             echo_generator,
@@ -207,6 +207,8 @@ def test_cross_table_context_sources_follow_source_changes(
             },
         ),
     )
+    # Registration reports each source's effective tracking.
+    assert registered["context_sources"]["peers"] == {"kind": "query", "tracking": "live"}, registered
     stateful_api.batch_write(
         people,
         inserts={
@@ -268,6 +270,9 @@ def test_cross_table_context_sources_follow_source_changes(
     plain = stateful_api.get(deps_path)
     assert plain["freshness"]["state"] == "current"
     assert "current" not in plain
+    assert plain["sources"] == [
+        {"name": "peers", "kind": "query", "tracking": "live", "ranked": False}
+    ], plain
 
     # Reverse lineage: the source row's dependents across tables.
     impact = stateful_api.post(
@@ -377,3 +382,26 @@ def test_distributed_context_source_admission(stateful_api, echo_generator):
     )
     assert _status(response) == 400, getattr(response, "text", response)
     assert "context_source_cycle" in getattr(response, "text", ""), getattr(response, "text", response)
+
+    # A ranking clause makes a query a snapshot; asserting live is refused
+    # rather than silently downgraded, and the default reports the reason.
+    ranked = {
+        "related": {
+            "query": {"table": right, "full_text_search": {"query": "acme"}, "limit": 5},
+            "fields": ["title"],
+        }
+    }
+    pinned = {name: dict(spec, tracking="live") for name, spec in ranked.items()}
+    response = stateful_api._request(
+        "PUT", f"/tables/{left}/artifacts/related/enrichment", _enrichment(echo_generator, pinned)
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    assert "context_source_requires_snapshot" in getattr(response, "text", ""), getattr(response, "text", response)
+    registered = stateful_api.put(
+        f"/tables/{left}/artifacts/related/enrichment", _enrichment(echo_generator, ranked)
+    )
+    assert registered["context_sources"]["related"] == {
+        "kind": "query",
+        "tracking": "snapshot",
+        "reason": "full_text_search",
+    }, registered

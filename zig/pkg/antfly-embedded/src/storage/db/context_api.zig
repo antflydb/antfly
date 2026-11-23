@@ -48,8 +48,31 @@ pub fn dependenciesJsonAlloc(alloc: std.mem.Allocator, db: anytype, doc_key: []c
             emitted += 1;
         }
     }
+    try out.appendSlice(alloc, "],\"sources\":[");
+    try appendSourcesTracking(alloc, &out, db, artifact);
     try out.appendSlice(alloc, "]}");
     return out.toOwnedSlice(alloc);
+}
+
+/// Each declared source of `artifact` with its effective tracking: ranked
+/// queries (and sources declared `snapshot`) never make the artifact
+/// `current`, which is why its freshness reads `unverified`.
+fn appendSourcesTracking(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), db: anytype, artifact: []const u8) !void {
+    const entry = db.core.index_manager.getEnrichment(.asset, artifact) orelse return;
+    if (entry.context_sources_json.len == 0) return;
+    var config = ctx.parseStoredJson(alloc, entry.context_sources_json) catch return;
+    defer config.deinit();
+    for (config.sources, 0..) |source, i| {
+        if (i != 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "{\"name\":");
+        try ctx.appendJsonString(alloc, out, source.name);
+        // Ranked retrieval is declared as a `query` with ranking clauses.
+        const kind: []const u8 = switch (source.kind) {
+            .search => "query",
+            else => @tagName(source.kind),
+        };
+        try out.print(alloc, ",\"kind\":\"{s}\",\"tracking\":\"{s}\",\"ranked\":{}}}", .{ kind, @tagName(source.tracking), source.kind == .search });
+    }
 }
 
 /// One shard's impact rows for an input key: direct dependents confirmed

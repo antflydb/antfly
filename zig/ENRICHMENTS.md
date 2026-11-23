@@ -890,11 +890,24 @@ resolution scan. Everything outside the top-level conjunction is a residual
 tree evaluated per subscriber, so negations and disjunctions stay exact. The
 public form of the declaration is kept verbatim for reads.
 
-Snapshot `search` sources take either the shorthands or a full public
-`QueryRequest` (`search.request`): scored full-text, semantic and hybrid
-search, rerankers, filters, and ordering, with `$source` bindings anywhere.
-The host's query engine runs the bound request; members render in rank order
-and publish `unverified`.
+A `query` with any ranking clause (`full_text_search`, `semantic_search`,
+`embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`,
+`graph_queries`, `limit`, or the `text`/`vector` shorthands) is a ranked
+retrieval: the whole query is a public `QueryRequest` with `$source` bindings
+anywhere, run by the host's query engine; members render in rank order. Its
+membership depends on the whole corpus, so it is a snapshot and publishes
+`unverified`. Internally it is stored as the `search` source kind, which is not
+public grammar.
+
+`tracking` is the second knob. Left out, each source gets the strongest
+guarantee it supports (`live` for filters, `snapshot` for ranked queries) and
+registration reports the effective tracking per source, naming the ranking
+clause that made a snapshot one. Declaring `tracking: live` asserts the
+guarantee: a ranked query is then rejected (`context_source_requires_snapshot`)
+instead of silently losing it, so an edit that adds a ranking clause cannot
+quietly turn a `require_current` source into a snapshot. Declaring
+`tracking: snapshot` opts a filter out of live tracking. The dependency report
+lists every source with its effective tracking.
 
 A predicate is admitted for live tracking only when a single row's
 membership can be decided from that row alone, so a changed row's previous
@@ -911,7 +924,7 @@ and next values determine exactly which dependents change:
 | `_artifacts.<name>` fields and predicates | yes | logical rows include generated artifacts; generated records stage notices |
 | `bool`/`should`/`must_not`/`disjuncts` | yes | residual tree evaluated per subscriber on the previous and next row |
 | wildcard, regexp, fuzzy, date/IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches` | yes | lowered at admission to the storage per-row filter; evaluated per subscriber and pushed into resolution scans |
-| scored full-text, `query_string`, `multi_match`, nearest-k, hybrid, reranked | snapshot only (`search.request`) | membership is relative to the corpus |
+| scored full-text, `query_string`, `multi_match`, nearest-k, hybrid, reranked | snapshot only (a ranking clause in the `query`) | membership is relative to the corpus |
 
 Equality conjuncts build the tuple a dependent subscribes to. Every other
 conjunct is *residual*: the dependent's resolved parameters (range bounds,
@@ -975,8 +988,8 @@ also rejects a context source reading a table that this table's
 resolvers promote into from the enrichment's own output (directly or through
 downstream artifacts).
 
-`tracking: snapshot` sources (required for `search`, optional for any other
-kind) register no subscriptions. Their dependents publish with freshness
+Snapshot sources (every ranked query, and any source declared
+`tracking: snapshot`) register no subscriptions. Their dependents publish with freshness
 `unverified` and `validated_at_ms`, rebuild on `refresh_interval` through the
 due-ordered refresh queue or manually, and keep full lineage, so audit and
 impact analysis still work.
@@ -1098,7 +1111,7 @@ not a decision explanation.
 | Embedded single DB | own-table document, query (all live predicates, top-N), graph, and snapshot sources |
 | Embedded Lite (multi-table) | cross-table sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
 | Ordered (Raft) publication | dependency state commits with the artifact through replicated publish intents |
-| Distributed server tables | every source kind (document, query with all live predicates and top-N, graph, `_artifacts` fields, snapshot search without `semantic_search`), own table and across tables; declared through the enrichment endpoint; HTTP dependency state, `require_current` barrier, and impact |
+| Distributed server tables | every source kind (document, query with all live predicates and top-N, graph, `_artifacts` fields, ranked queries without `semantic_search`), own table and across tables; declared through the enrichment endpoint; HTTP dependency state, `require_current` barrier, and impact |
 
 ### Distributed tables
 
@@ -1189,7 +1202,7 @@ Distributed tables expose the dependency state over HTTP:
 Context reads run in the background with no caller, so they execute as the
 principal that declared the enrichment. At admission the declarer must be
 able to read every source table, and its effective row filter on each
-source table is conjoined into query and search sources in the stored
+source table is conjoined into query sources (filters and ranked) in the stored
 declaration (so it is part of the subscription identity, is evaluated by
 storage on every resolution, and drives invalidation). Document and graph
 sources read rows by key or edge and cannot carry a filter: they are

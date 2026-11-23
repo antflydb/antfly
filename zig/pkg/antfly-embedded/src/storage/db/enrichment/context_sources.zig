@@ -61,6 +61,9 @@ pub const max_row_tuples: usize = 256;
 pub const Error = error{
     InvalidContextSourcesConfig,
     UnsupportedContextPredicate,
+    /// A query with ranking clauses declared `tracking: live`: relevance
+    /// ranking depends on the whole corpus, so it can only be a snapshot.
+    ContextSourceRequiresSnapshot,
     ContextBudgetExceeded,
     RequiredContextMissing,
     InvalidContextBinding,
@@ -694,6 +697,88 @@ fn uintField(field: std.json.Value, min: u64, max: u64) Error!u64 {
     return v;
 }
 
+/// Query clauses that rank by relevance. Their membership depends on the
+/// whole corpus (term statistics, competing documents, rerankers), so a
+/// query using any of them is a snapshot: it registers no subscriptions and
+/// its dependents are never `current`. Every other query clause decides a
+/// row's membership from that row alone and is tracked live.
+pub const ranking_clauses = [_][]const u8{
+    "full_text_search", "semantic_search", "embeddings",   "indexes",     "merge_config",
+    "reranker",         "exclusion_query", "graph_queries", "limit",       "text",
+    "text_field",       "vector",          "vector_index",  "k",
+};
+const search_shorthands = [_][]const u8{ "text", "text_field", "vector", "vector_index", "k" };
+
+/// The first ranking clause of a public `query` object, if any.
+pub fn rankingClause(query: std.json.ObjectMap) ?[]const u8 {
+    inline for (ranking_clauses) |clause| if (query.get(clause) != null) return clause;
+    return null;
+}
+
+/// Public `query` with ranking clauses, as the internal ranked-retrieval
+/// target: the shorthands as they are, otherwise every clause but `table`
+/// as one QueryRequest (`filter_query` included). A live `order_by` has no
+/// meaning under relevance ranking and is rejected.
+fn rankedTargetAlloc(a: Allocator, query: std.json.ObjectMap) Error!std.json.ObjectMap {
+    if (query.get("order_by") != null) return error.UnsupportedContextPredicate;
+    var shorthand = false;
+    inline for (search_shorthands) |clause| if (query.get(clause) != null) {
+        shorthand = true;
+    };
+    if (shorthand) return query;
+    var target: std.json.ObjectMap = .empty;
+    var request: std.json.ObjectMap = .empty;
+    var it = query.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "table")) {
+            try target.put(a, "table", entry.value_ptr.*);
+        } else try request.put(a, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    try target.put(a, "request", .{ .object = request });
+    return target;
+}
+
+/// Effective tracking of each source of an admitted public declaration:
+/// `{"<name>":{"kind","tracking","reason"?}}`. A snapshot names why: the
+/// ranking clause that made it one, or `declared`.
+pub fn trackingSummaryJsonAlloc(alloc: Allocator, sources_value: std.json.Value) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    if (sources_value == .object) {
+        var first = true;
+        var it = sources_value.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+            const spec = entry.value_ptr.object;
+            var kind: []const u8 = "document";
+            var reason: ?[]const u8 = null;
+            inline for (.{ "document", "query", "graph" }) |k| if (spec.get(k)) |target| {
+                kind = k;
+                if (comptime std.mem.eql(u8, k, "query")) {
+                    if (target == .object) reason = rankingClause(target.object);
+                }
+            };
+            const declared = if (spec.get("tracking")) |t| (if (t == .string) t.string else "live") else "live";
+            const snapshot = reason != null or std.mem.eql(u8, declared, "snapshot");
+            if (snapshot and reason == null) reason = "declared";
+            if (!first) try out.append(alloc, ',');
+            first = false;
+            try appendJsonString(alloc, &out, entry.key_ptr.*);
+            try out.appendSlice(alloc, ":{\"kind\":");
+            try appendJsonString(alloc, &out, kind);
+            try out.appendSlice(alloc, if (snapshot) ",\"tracking\":\"snapshot\"" else ",\"tracking\":\"live\"");
+            if (reason) |r| {
+                try out.appendSlice(alloc, ",\"reason\":");
+                try appendJsonString(alloc, &out, r);
+            }
+            try out.append(alloc, '}');
+        }
+    }
+    try out.append(alloc, '}');
+    return out.toOwnedSlice(alloc);
+}
+
 fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, opts: ParseOptions) Error!Source {
     if (!validName(name)) return error.InvalidContextSourcesConfig;
     if (value != .object) return error.InvalidContextSourcesConfig;
@@ -702,6 +787,7 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, opts: Pars
     var seen_required = false;
     var seen_max_documents = false;
     var seen_max_candidates = false;
+    var seen_tracking = false;
     var fields = std.ArrayListUnmanaged([]const u8).empty;
     var it = value.object.iterator();
     while (it.next()) |entry| {
@@ -713,6 +799,17 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, opts: Pars
             seen_target = true;
             if (field != .object) return error.InvalidContextSourcesConfig;
             source.kind = k;
+            if (!opts.allow_identity) switch (k) {
+                // Ranked retrieval is declared as a `query` with ranking
+                // clauses; the internal kind is not public grammar.
+                .search => return error.InvalidContextSourcesConfig,
+                .query => if (rankingClause(field.object) != null) {
+                    source.kind = .search;
+                    try parseTarget(a, &source, try rankedTargetAlloc(a, field.object), opts);
+                    continue;
+                },
+                else => {},
+            };
             try parseTarget(a, &source, field.object, opts);
         } else if (std.mem.eql(u8, key, "fields")) {
             if (field != .array or field.array.items.len == 0 or field.array.items.len > max_fields)
@@ -740,6 +837,7 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, opts: Pars
         } else if (std.mem.eql(u8, key, "tracking")) {
             if (field != .string) return error.InvalidContextSourcesConfig;
             source.tracking = std.meta.stringToEnum(Tracking, field.string) orelse return error.InvalidContextSourcesConfig;
+            seen_tracking = true;
         } else if (std.mem.eql(u8, key, "refresh_interval")) {
             if (field != .string) return error.InvalidContextSourcesConfig;
             source.refresh_interval_ms = parseDurationMs(field.string) orelse return error.InvalidContextSourcesConfig;
@@ -750,9 +848,14 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, opts: Pars
     if (source.kind != .document and seen_required) return error.InvalidContextSourcesConfig;
     if ((source.kind == .document or source.kind == .search) and seen_max_documents) return error.InvalidContextSourcesConfig;
     if (source.kind != .query and seen_max_candidates) return error.InvalidContextSourcesConfig;
-    // Ranked retrieval has no exact per-row membership test: it may only be
-    // consumed as an explicitly unverified snapshot.
-    if (source.kind == .search and source.tracking != .snapshot) return error.UnsupportedContextPredicate;
+    // Ranked retrieval has no exact per-row membership test: it is always a
+    // snapshot. `tracking` defaults to it; asserting `live` is refused so a
+    // ranking clause can never silently downgrade a source the caller relies
+    // on being current.
+    if (source.kind == .search) {
+        if (seen_tracking and source.tracking != .snapshot) return error.ContextSourceRequiresSnapshot;
+        source.tracking = .snapshot;
+    }
     if (source.refresh_interval_ms != 0 and source.tracking != .snapshot) return error.InvalidContextSourcesConfig;
     if (source.kind == .search) source.max_documents = source.search.k;
     std.mem.sort([]const u8, fields.items, {}, struct {
@@ -3807,11 +3910,11 @@ test "ordered top-N relevance follows the recorded boundary" {
     try testing.expect(try subscriberRelevant(alloc, source, partial, "k9", older, older2, null));
 }
 
-test "graph and snapshot search sources bind and validate" {
+test "graph and ranked query sources bind and validate" {
     const alloc = testing.allocator;
     var config = try parsePublicJson(alloc,
         \\{"cites":{"graph":{"graph_index":"refs","edge_types":["cites"],"depth":2,"max_fanout":5},"fields":["title"],"max_documents":20},
-        \\ "similar_docs":{"search":{"vector":{"$source":"/embedding"},"vector_index":"dense","k":5},"fields":["title"],"tracking":"snapshot","refresh_interval":"1h"}}
+        \\ "similar_docs":{"query":{"vector":{"$source":"/embedding"},"vector_index":"dense","k":5},"fields":["title"],"refresh_interval":"1h"}}
     , "");
     defer config.deinit();
     var bindings = try bindTest(alloc, &config, "{\"embedding\":[0.1,0.2]}");
@@ -3829,10 +3932,44 @@ test "graph and snapshot search sources bind and validate" {
     var again = try parseStoredJson(alloc, stored);
     defer again.deinit();
     try testing.expectEqualSlices(u8, &config.digest(), &again.digest());
-    // Ranked retrieval cannot be tracked live; depth and fanout are bounded.
-    try testing.expectError(error.UnsupportedContextPredicate, parsePublicJson(alloc,
+    // A ranking clause makes a query a snapshot; asserting live is refused,
+    // the internal kind is not public grammar, and a live top-N `order_by`
+    // has no meaning under relevance ranking. Depth and fanout are bounded.
+    var ranked = try parsePublicJson(alloc,
+        \\{"s":{"query":{"text":"solar","text_field":"body","k":5},"fields":["t"]}}
+    , "");
+    defer ranked.deinit();
+    try testing.expectEqual(SourceKind.search, ranked.sources[0].kind);
+    try testing.expectEqual(Tracking.snapshot, ranked.sources[0].tracking);
+    try testing.expectError(error.ContextSourceRequiresSnapshot, parsePublicJson(alloc,
+        \\{"s":{"query":{"text":"solar","text_field":"body","k":5},"fields":["t"],"tracking":"live"}}
+    , ""));
+    try testing.expectError(error.InvalidContextSourcesConfig, parsePublicJson(alloc,
         \\{"s":{"search":{"text":"solar","text_field":"body","k":5},"fields":["t"]}}
     , ""));
+    try testing.expectError(error.UnsupportedContextPredicate, parsePublicJson(alloc,
+        \\{"s":{"query":{"full_text_search":{"query":"x"},"order_by":{"field":"at"}},"fields":["t"]}}
+    , ""));
+    // A filter stays live unless declared a snapshot.
+    var filter = try parsePublicJson(alloc,
+        \\{"f":{"query":{"filter_query":{"field":"k","term":"v"}},"fields":["t"],"tracking":"snapshot"}}
+    , "");
+    defer filter.deinit();
+    try testing.expectEqual(SourceKind.query, filter.sources[0].kind);
+    try testing.expectEqual(Tracking.snapshot, filter.sources[0].tracking);
+    // The response summary names what made each source a snapshot.
+    const summary_value = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"live":{"query":{"filter_query":{"field":"k","term":"v"}},"fields":["t"]},
+        \\ "ranked":{"query":{"semantic_search":"x","indexes":["e"]},"fields":["t"]},
+        \\ "pinned":{"query":{"filter_query":{"field":"k","term":"v"}},"fields":["t"],"tracking":"snapshot"},
+        \\ "org":{"document":{"key_from":"/o"},"fields":["t"]}}
+    , .{});
+    defer summary_value.deinit();
+    const summary = try trackingSummaryJsonAlloc(alloc, summary_value.value);
+    defer alloc.free(summary);
+    try testing.expectEqualStrings(
+        \\{"live":{"kind":"query","tracking":"live"},"ranked":{"kind":"query","tracking":"snapshot","reason":"semantic_search"},"pinned":{"kind":"query","tracking":"snapshot","reason":"declared"},"org":{"kind":"document","tracking":"live"}}
+    , summary);
     try testing.expectError(error.InvalidContextSourcesConfig, parsePublicJson(alloc,
         \\{"g":{"graph":{"graph_index":"refs","depth":4},"fields":["t"]}}
     , ""));

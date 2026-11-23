@@ -830,13 +830,13 @@ test "distributed admission refuses snapshot searches that need a query embeddin
     const Case = struct { raw: []const u8, admitted: bool };
     for ([_]Case{
         .{ .raw = 
-        \\{"h":{"search":{"table":"orgs","request":{"semantic_search":"x","indexes":["emb"]}},"fields":["t"],"tracking":"snapshot"}}
+        \\{"h":{"query":{"table":"orgs","semantic_search":"x","indexes":["emb"]},"fields":["t"]}}
         , .admitted = false },
         .{ .raw = 
-        \\{"h":{"search":{"table":"orgs","request":{"semantic_search":{"$source":"/topic"},"indexes":["emb"]}},"fields":["t"],"tracking":"snapshot"}}
+        \\{"h":{"query":{"table":"orgs","semantic_search":{"$source":"/topic"},"indexes":["emb"]},"fields":["t"]}}
         , .admitted = false },
         .{ .raw = 
-        \\{"h":{"search":{"table":"orgs","request":{"full_text_search":{"query":"acme"}}},"fields":["t"],"tracking":"snapshot"}}
+        \\{"h":{"query":{"table":"orgs","full_text_search":{"query":"acme"}},"fields":["t"]}}
         , .admitted = true },
     }) |case| {
         const value = try std.json.parseFromSliceLeaky(std.json.Value, a, case.raw, .{});
