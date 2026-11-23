@@ -541,7 +541,7 @@ pub fn acknowledge(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
 }
 // A bounded probe can persist partial progress without discarding other owners.
 pub fn remaining(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, receipt: wire.Receipt, context: operation.RequestContext) !wire.Receipt {
-    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11 and receipt.version != 12) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return .{ .unknown = true, .outcomes = try alloc.dupe(wire.Outcome, receipt.outcomes) };
+    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11 and receipt.version != 12) or receipt.outcomes.len > wire.max_outcomes) return .{ .unknown = true, .outcomes = try alloc.dupe(wire.Outcome, receipt.outcomes) };
     var pending: std.ArrayList(wire.Outcome) = .empty;
     errdefer pending.deinit(alloc);
     for (receipt.outcomes, 0..) |outcome, index| {
@@ -549,10 +549,18 @@ pub fn remaining(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, re
             try pending.appendSlice(alloc, receipt.outcomes[index..]);
             break;
         };
-        const complete = settled(server, alloc, .{ .outcomes = &.{outcome} }, context) catch false;
-        if (!complete) try pending.append(alloc, outcome);
+        if (receipt.unknown and outcome.registration_node_id == null) {
+            try pending.append(alloc, outcome);
+            continue;
+        }
+        const named: wire.Receipt = .{ .outcomes = &.{outcome} };
+        const complete = settled(server, alloc, named, context) catch false;
+        // A mixed receipt stays unknown. Its independently named, settled
+        // references have no later whole-receipt acknowledgement to await.
+        const retired = complete and (!receipt.unknown or (acknowledge(server, alloc, named, context) catch false));
+        if (!retired) try pending.append(alloc, outcome);
     }
-    return .{ .outcomes = try pending.toOwnedSlice(alloc) };
+    return .{ .unknown = receipt.unknown, .outcomes = try pending.toOwnedSlice(alloc) };
 }
 
 pub const OwnerRequest = struct { transaction_id: [16]u8 = @splat(0), reference_id: [16]u8, action: enum { pin, prepare, observe, quiesce, abandon, status, acknowledge, forget }, consumer_node_id: ?u64 = null, resume_publication: ?bool = null, managed: bool = false, retired_through: u64 = 0 };
