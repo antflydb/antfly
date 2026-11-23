@@ -2587,7 +2587,7 @@ const OwnedRead = struct {
         self.decision_runtime = try self.native_adapter.decisionRuntime();
         errdefer if (self.decision_runtime) |*active| active.deinit();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
-        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard, .allow_revision_advance = request.expected_stream_columns != null and plainTableProjection(plan.compiled()) };
+        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard, .allow_revision_advance = request.expected_stream_columns != null and tableOnlyPreparedRead(plan.compiled()) };
         try self.guarded.indexLargeGuard(arena);
         const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
         self.native_adapter.graph_parameters = parameters;
@@ -2942,16 +2942,26 @@ const OwnedRead = struct {
 
 const ReadRevision = struct { grants: u64, token: u64 };
 
-// Direct projections have no independently rebound expressions.
-fn plainTableProjection(compiled: *const compiler.Compiled) bool {
+// These scan clauses bind only to the table layout captured by the guard.
+fn tableOnlyPreparedRead(compiled: *const compiler.Compiled) bool {
     if (compiled.statement != .select or compiled.parameter_count != 0 or compiled.uses_current_setting) return false;
     const select = compiled.statement.select;
     if (select.source) |source| {
         if (source.* != .table or source.table.search != null or source.table.graph != null or source.table.graph_search != null) return false;
     } else if (select.table == null) return false;
     if (select.ctes.len != 0 or select.values_arms.len != 0 or select.set_operation != null or
-        select.predicate != null or select.having != null or select.count_all or select.distinct != null or
-        select.windows.len != 0 or select.group_by.len != 0 or select.order_by.len != 0 or select.locking != null) return false;
+        select.having != null or select.count_all or select.distinct != null or
+        select.windows.len != 0 or select.group_by.len != 0 or select.locking != null) return false;
+    if (select.predicate) |predicate| switch (predicate.*) {
+        .is_null => {},
+        .scalar => |expr| {
+            if (expr.* != .unary or (expr.unary.op != .is_null and expr.unary.op != .is_not_null) or expr.unary.operand.* != .column) return false;
+        },
+        else => return false,
+    };
+    for (select.order_by) |order| {
+        if (order.expression) |expression| if (expression.* != .column) return false;
+    }
     for (select.columns) |column| {
         if (column.expression) |expression| if (expression.* != .column) return false;
     }
@@ -5904,10 +5914,25 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
     defer a.free(schema);
     var directory = try local.common_test_directory.TestDirectory.init("sql-prepared-admission-native");
     defer directory.cleanup();
+    var changed_declaration = try compiler.compile(a, "CREATE TABLE usage_records(id TEXT,status INTEGER)", .{});
+    defer changed_declaration.deinit();
+    const changed_schema = try local.sql_ddl_runtime.createSchemaAlloc(a, changed_declaration.statement.create_table);
+    defer a.free(changed_schema);
+    var schema_arena = std.heap.ArenaAllocator.init(a);
+    defer schema_arena.deinit();
+    const scratch = schema_arena.allocator();
+    var changed_layout = try std.json.parseFromSliceLeaky(std.json.Value, scratch, changed_schema, .{});
+    try changed_layout.object.put(scratch, "version", .{ .integer = 2 });
+    const replacement_schema = try std.json.Stringify.valueAlloc(scratch, changed_layout, .{});
     var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } });
     defer db.close();
     try db.setSchemaJson(a, schema);
-    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"id\":\"row\",\"status\":\"open\"}" }} });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"id\":\"zulu\",\"status\":\"open\"}" },
+        .{ .key = "b", .value = "{\"id\":null,\"status\":null}" },
+        .{ .key = "c", .value = "{\"id\":\"alpha\",\"status\":\"open\"}" },
+        .{ .key = "d", .value = "{\"id\":\"mike\",\"status\":\"open\"}" },
+    } });
     var ranges = [_]local.common_topology_records.RangeRecord{.{ .table_id = 7, .group_id = 7, .range_id = 1, .start_key = "", .doc_identity_shard_id = 1, .doc_identity_range_id = 1 }};
     var source: Source = .{ .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }}, .reads = .{reads.BoundTableReadSource.init("usage_records", 7, &db, raft.read_gate.alreadyReadSafeBarrier())}, .ranges = &ranges };
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
@@ -5930,7 +5955,9 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
     // Bind re-enters the compatibility path before delivering any rows.
     source.catalog_epoch = .{ .incarnation = @splat(1), .revision = 1 };
     const Frames = struct {
+        const Change = enum { none, unrelated, layout };
         var admission_attempts: usize = 0;
+        var schema_after_bind: ?[]const u8 = null;
         fn observeAdmission(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !?wire.ReadStream {
             admission_attempts += 1;
             return Adapter.openStream(raw, alloc, identity, request);
@@ -5945,12 +5972,21 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
             const valid = try Adapter.descriptionCurrent(raw, alloc, identity, request, description);
             const owner: *Adapter = @ptrCast(@alignCast(raw));
             const fixture: *Source = @ptrCast(@alignCast(owner.server.source.ptr));
-            if (valid) fixture.catalog_revision += 1;
+            if (valid) {
+                fixture.catalog_revision += 1;
+                if (schema_after_bind) |replacement| fixture.records[0].schema_json = replacement;
+            }
             return valid;
         }
     };
     var baseline: [2]usize = undefined;
-    for ([_]bool{ false, true }) |guarded| for ([_]bool{ false, true }, 0..) |change, scenario| {
+    for ([_][]const u8{
+        "SELECT id FROM usage_records",
+        "SELECT id FROM usage_records WHERE status IS NOT NULL ORDER BY id",
+    }, 0..) |statement, projection| for ([_]bool{ false, true }) |guarded| for ([_]Frames.Change{ .none, .unrelated, .layout }, 0..) |change, scenario| {
+        if (change == .layout and (!guarded or projection == 0)) continue;
+        Frames.schema_after_bind = if (change == .layout) replacement_schema else null;
+        source.records[0].schema_json = schema;
         source.catalog_revision = 7;
         source.catalog_stamp_reads.store(0, .monotonic);
         source.catalog_reads.store(0, .monotonic);
@@ -5962,7 +5998,9 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
         try input.writer.writeInt(u32, 196608, .big);
         try input.writer.writeAll(startup);
         try Frames.write(&input.writer, 'p', "secret\x00");
-        try Frames.write(&input.writer, 'P', "plan\x00SELECT id FROM usage_records\x00\x00\x00");
+        const parse = try std.fmt.allocPrint(a, "plan\x00{s}\x00\x00\x00", .{statement});
+        defer a.free(parse);
+        try Frames.write(&input.writer, 'P', parse);
         try Frames.write(&input.writer, 'B', "portal\x00plan\x00\x00\x00\x00\x00\x00\x00");
         try Frames.write(&input.writer, 'E', "portal\x00\x00\x00\x00\x00");
         try Frames.write(&input.writer, 'S', "");
@@ -5975,30 +6013,59 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
         var vtable = backend.vtable.*;
         vtable.open_stream = Frames.observeAdmission;
         vtable.guarded_select_stream = guarded;
-        if (change) vtable.description_current = Frames.bindThenChange;
+        if (change != .none) vtable.description_current = Frames.bindThenChange;
         backend.vtable = &vtable;
         var session: Protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = backend, .reader = &reader, .writer = &output.writer };
         defer session.deinit();
         try session.run();
         var frames: Protocol.Cursor = .{ .bytes = output.written() };
+        const expected: []const ?[]const u8 = if (projection == 0)
+            &.{ "zulu", null, "alpha", "mike" }
+        else
+            &.{ "alpha", "mike", "zulu" };
         var rows: usize = 0;
+        var errors: usize = 0;
         while (frames.offset < frames.bytes.len) {
             const tag = try frames.int(u8);
             const bytes = try frames.take((try frames.int(u32)) - 4);
             if (tag == 'E') {
+                if (change == .layout) {
+                    try std.testing.expect(std.mem.indexOf(u8, bytes, "C40001\x00") != null);
+                    errors += 1;
+                    continue;
+                }
                 std.debug.print("prepared protocol error: {s}\n", .{bytes});
                 return error.UnexpectedPreparedQueryError;
             }
-            if (tag == 'D') rows += 1;
+            if (tag == 'D') {
+                try std.testing.expect(rows < expected.len);
+                var row: Protocol.Cursor = .{ .bytes = bytes };
+                try std.testing.expectEqual(@as(u16, 1), try row.int(u16));
+                const len = try row.int(i32);
+                if (expected[rows]) |value| {
+                    try std.testing.expectEqual(@as(i32, @intCast(value.len)), len);
+                    try std.testing.expectEqualStrings(value, try row.take(@intCast(len)));
+                } else {
+                    try std.testing.expectEqual(@as(i32, -1), len);
+                }
+                try std.testing.expectEqual(bytes.len, row.offset);
+                rows += 1;
+            }
         }
-        try std.testing.expectEqual(@as(usize, 1), rows);
-        try std.testing.expectEqual(@as(usize, if (guarded) 2 else if (change) 4 else 3), source.catalog_stamp_reads.load(.monotonic));
+        if (change == .layout) {
+            try std.testing.expectEqual(@as(usize, 1), errors);
+            try std.testing.expectEqual(@as(usize, 0), rows);
+            try std.testing.expectEqual(@as(usize, 1), Frames.admission_attempts);
+            continue;
+        }
+        try std.testing.expectEqual(expected.len, rows);
+        try std.testing.expectEqual(@as(usize, if (guarded) 2 else if (change != .none) 4 else 3), source.catalog_stamp_reads.load(.monotonic));
         try std.testing.expectEqual(@as(usize, 1), Frames.admission_attempts);
         const catalog_calls = source.catalog_reads.load(.monotonic);
-        if (!guarded) baseline[scenario] = catalog_calls else if (!change) {
-            try std.testing.expectEqual(baseline[scenario] - 1, catalog_calls);
+        if (!guarded) baseline[scenario] = catalog_calls else {
+            try std.testing.expectEqual(baseline[scenario] - @as(usize, if (change != .none) 3 else 1), catalog_calls);
         }
-        std.debug.print("PGWIRE_PREPARED_ADMISSION guarded={} stale={} metadata_calls={d} admissions={d}\n", .{ guarded, change, catalog_calls, Frames.admission_attempts });
+        std.debug.print("PGWIRE_PREPARED_ADMISSION guarded={} stale={} metadata_calls={d} admissions={d}\n", .{ guarded, change != .none, catalog_calls, Frames.admission_attempts });
     };
 }
 
