@@ -55341,7 +55341,7 @@ fn qualifyPlannedMetalCrossAttention(comptime prefix: bool) !void {
     for (query_sizes) |rows| {
         const query_shape = Shape.init(.f32, &.{ rows, dim });
         const queries: [3 * dim]f32 = @splat(0);
-        const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(queries[0 .. rows * dim], &.{ rows, dim }));
+        const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(queries[0 .. rows * dim], &.{ @intCast(rows), dim }));
         defer cb.free(q);
         const descriptor: ops.kernel_descriptor.Descriptor = .{
             .operation = if (prefix) .{ .dense_attention_prefix = .{ .max_key_rows = keys, .num_heads = 1, .head_dim = dim, .all_keys_visible = true } } else .{ .dense_attention_rows = .{ .kind = .cross, .query_rows = rows, .key_rows = keys, .num_heads = 1, .head_dim = dim, .all_keys_visible = true } },
@@ -55369,7 +55369,7 @@ fn qualifyPlannedMetalCrossAttention(comptime prefix: bool) !void {
         defer lease.release();
         const scratch_lease = (try ops.physical_storage.Lease.create(a, cb, scratch_bytes)).?;
         defer scratch_lease.release();
-        const output = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = &.{ rows, dim } })).?;
+        const output = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = &.{ @intCast(rows), dim } })).?;
         defer cb.free(output);
         const scratch = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = scratch_lease, .shape = &.{@intCast(scratch_bytes / @sizeOf(f32))} })).?;
         defer cb.free(scratch);
