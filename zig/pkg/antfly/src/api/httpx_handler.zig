@@ -18238,6 +18238,14 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         try std.testing.expect(try durable.joinRegistration(published));
         try std.testing.expect(!try durable.claimAbandonedRegistration(published, true, .{}));
         try durable.removeRegistration(published);
+        const published_hex = std.fmt.bytesToHex(published, .lower);
+        const mixed = try @import("sql/session/completion.zig").remaining(&server, alloc, .{
+            .unknown = true,
+            .outcomes = &.{.{ .reference_id = &published_hex, .registration_node_id = server.localSessionNodeId() }},
+        }, .{});
+        defer alloc.free(mixed.outcomes);
+        try std.testing.expect(mixed.unknown);
+        try std.testing.expectEqual(@as(usize, 0), mixed.outcomes.len);
         const capacity = @import("completion_outbox.zig").max_window;
         try durable.reserveRegistrations(capacity);
         defer durable.releaseRegistrations(capacity);
